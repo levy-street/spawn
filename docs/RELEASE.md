@@ -179,6 +179,38 @@ distinguished name). Revoke the federated credential quickly if a permitted CI
 run is compromised: it still cannot mint the offline Ed25519 manifest, but
 until it is gone it can request publisher-valid PE signatures.
 
+### The Apple signing identity
+
+The same rule as Windows, arrived at later: **a signing identity is reachable
+only from `master`, and only through a protected environment.** A GitHub
+`environment:` is the sole gate that survives a modified workflow, because an
+attacker who pushes a branch can delete an `if:` but cannot grant themselves an
+environment's secrets — so the Apple credentials must be *environment* secrets,
+not repository secrets. Moving them is a settings change, not a code change, and
+the workflows above assume it has been made:
+
+| | |
+|---|---|
+| `macos-code-signing` | Custom branch policy naming `master` (not `protected_branches` — see the Windows note above, `master` carries no protection rule). Holds `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_PRIVATE_KEY`. |
+| `unsigned-builds` | No protection rules, no secrets. Exists only so `prebuilt.yml` has somewhere to run off master. |
+
+`desktop.yml`'s macOS job is `master`-only outright: it exists to produce signed,
+notarized artifacts, and there is nothing useful it can do from a branch. Build
+the app locally instead.
+
+`prebuilt.yml`'s macOS job still runs on any ref, because it also builds the
+daemon binaries a dev host pulls. It picks its environment by ref, so off master
+it runs in `unsigned-builds`, the certificate resolves empty, and the signing
+step falls back to ad-hoc — which is what it did before the Developer ID was
+introduced. The step also refuses the Developer ID off master on its own, so the
+protection does not rest on the environment alone.
+
+Both workflows pin every third-party action to a commit SHA. A mutable tag like
+`@v0` or `@stable` is a standing invitation: whoever controls it runs code
+inside a job holding the release identity. Re-pin deliberately when upgrading —
+`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` — and keep the tag in the
+trailing comment so the intent stays readable.
+
 ### The Windows signing identity
 
 Provisioned on 2026-08-28; this is the record, not a to-do. Nothing below is a
@@ -227,11 +259,17 @@ To provision this from nothing — a new tenant, or a rotated certificate — se
 [AZURE_SIGNING_SETUP.md](AZURE_SIGNING_SETUP.md).
 
 The Windows prebuilt job deliberately remains buildable while signing is
-being provisioned: when all three Azure secrets are absent it uploads an
-unsigned Actions artifact, while a partial signing configuration is a hard
-failure. An unsigned Windows pair must not be treated as release-ready or
-promoted in Windows-facing UI. Once credentials exist, signing, exact subject,
-timestamp and SignTool verification are hard gates before artifact upload.
+being provisioned: when all three Azure secrets are absent it still builds and,
+**off master**, uploads an unsigned Actions artifact, while a partial signing
+configuration is a hard failure. On `master` an unsigned pair is not uploaded at
+all. That is the fail-closed half, and it matters: `prebuilt-latest` is the prod
+install channel, so an absent Azure identity must leave Windows *missing* from
+the rolling release — the same graceful degradation `linux-aarch64` already has,
+loud at deploy (`publish_prebuilts`) and verify (`SKIP`) time — rather than
+quietly publishing unsigned `.exe`s to users. An unsigned Windows pair must not
+be treated as release-ready or promoted in Windows-facing UI. Once credentials
+exist, signing, exact subject, timestamp and SignTool verification are hard
+gates before artifact upload.
 
 `desktop.yml` is deliberately not tolerant that way — a release build of the app
 either signs or fails. The buildability it gives up is covered instead by the
@@ -314,11 +352,25 @@ compiled into the expected daemon source, and proves `release_counter` equals
 the server/web identity, daemon tree and served binary hashes, and mobile
 identity. A failed signature or counter row is a failed release.
 
-The counter is also the downgrade boundary. Automatic daemon updates never
-downgrade. A deliberate operator retry may bypass the monotonicity check only
-through `POST /api/hosts/{id}/update` with
-`{"allow_downgrade": true}`. Use that override only when the older signed
-release is the intended recovery; it does not permit unsigned updates.
+The counter is also the downgrade boundary, and it takes two keys to cross it.
+Automatic daemon updates never downgrade. A deliberate operator retry asks
+through `POST /api/hosts/{id}/update` with `{"allow_downgrade": true}` — but
+asking is not consent. The daemon honours it only when someone with a shell on
+that host has also armed the rollback:
+
+```
+touch "$SPAWN_CONFIG_DIR/allow-downgrade"     # or ~/.config/spawn/allow-downgrade
+```
+
+The arming expires 30 minutes after that file's mtime, so a forgotten one does
+not become a standing permission, and re-arming is another `touch`. The reason
+for the second key is `docs/TRUST.md`: the control plane is untrusted, and a
+server-side boolean would let a compromised one replay an older validly-signed
+manifest and roll the fleet back to a known-vulnerable release. The signature
+root of trust would still hold — nothing unsigned can be pushed — but rollback
+protection is the one guarantee the counter exists to give, so it is not the
+server's to waive. Use the override only when the older signed release is the
+intended recovery; it does not permit unsigned updates.
 
 ### Proving the updater
 
