@@ -270,6 +270,20 @@ class Settings(BaseSettings):
     # `web_url`, then `public_url`, like every other link the server builds.
     billing_return_url: str | None = None
 
+    # Whether the mobile apps may show a link out to somewhere a plan can be
+    # changed. False at launch, and deliberately server-driven: a binary that
+    # is already in the store cannot be recalled, so the only way to withdraw
+    # this is to flip it here — same day, no resubmission. That the flag can
+    # be turned back off is the point of it, more than that it can be turned
+    # on. `/api/auth/config` advertises it.
+    #
+    # Never part of the refuse-to-boot validator below: false is always a
+    # valid state, and it is what a self-hosted deployment sits at forever.
+    # The effective value is `billing_enabled and billing_mobile_upgrade_link`
+    # — read it that way at every site, so switching billing off can never
+    # leave a link advertised to a shipped app.
+    billing_mobile_upgrade_link: bool = False
+
     @model_validator(mode="after")
     def _refuse_billing_without_its_secrets(self) -> Settings:
         """Billing on with no webhook secret is an unauthenticated grant API.
