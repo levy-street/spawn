@@ -133,7 +133,7 @@ export default function VerifyEmailPage() {
   return (
     <AuthShell
       title="Verify your email"
-      description="Confirm the address attached to your spawnd account."
+      description="Confirm the address attached to your SPAWN D account."
     >
       <Suspense fallback={<Spinner size={20} label="Loading verification" />}>
         <VerifyEmail />

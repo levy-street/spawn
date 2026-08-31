@@ -692,7 +692,7 @@ async def test_installer_accepts_and_ignores_legacy_setup_flags(client, tmp_path
     script = await _install_script_file(client, tmp_path)
     token = "S" * 43
     notice = (
-        "spawn: the --setup flag is no longer needed; "
+        "SPAWN D: the --setup flag is no longer needed; "
         "approval happens through the link spawnd prints"
     )
 
