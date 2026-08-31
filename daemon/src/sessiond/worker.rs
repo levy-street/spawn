@@ -28,6 +28,8 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -570,6 +572,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 None => std::future::pending::<()>().await,
             }
         };
+        // Unix PTY readers naturally reach EOF when the child exits. ConPTY
+        // may retain its output pipe until its master is explicitly dropped.
+        let observe_child_exit = cfg!(windows) && matches!(state, State::Running);
 
         tokio::select! {
             accepted = endpoint::accept_main(&mut main) => {
@@ -710,13 +715,19 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         }
                     }
                     None => {
-                        // Reader thread finished: PTY EOF. Wait for the exit
-                        // report on exit_rx (or synthesize one).
+                        // Reader thread finished: PTY EOF. Usually this wins
+                        // the race with the child monitor. On Windows the
+                        // monitor may instead have closed ConPTY after seeing
+                        // the process exit, in which case it already put the
+                        // worker in Exited and consumed exit_rx.
                         pty_open = false;
-                        let info = (&mut exit_rx).await.unwrap_or(wire::ExitInfo {
-                            exit_code: None,
-                            signal: None,
-                        });
+                        let info = match &state {
+                            State::Exited(info) => info.clone(),
+                            _ => (&mut exit_rx).await.unwrap_or(wire::ExitInfo {
+                                exit_code: None,
+                                signal: None,
+                            }),
+                        };
                         tracing::info!(exit_code = ?info.exit_code, signal = ?info.signal, "session exited");
                         exited_at = Some(tokio::time::Instant::now());
                         if let Some(w) = conn_write.as_mut() {
@@ -732,6 +743,33 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         // can pick the exit up.
                     }
                 }
+            }
+
+            // Observe the stable child handle independently of PTY EOF. ConPTY
+            // can retain its output pipe after the attached process has
+            // exited; waiting only for reader EOF then deadlocks the worker:
+            // the retained master keeps conhost alive, restart tries to signal
+            // an already-dead PID, and no T_EXIT ever reaches the daemon.
+            exited = &mut exit_rx, if observe_child_exit => {
+                let info = exited.unwrap_or(wire::ExitInfo {
+                    exit_code: None,
+                    signal: Some("wait_failed".into()),
+                });
+                // Unix PTYs naturally reach EOF after the child exits. Windows
+                // needs the retained ConPTY master and input senders dropped so
+                // conhost closes its output and the reader can drain to EOF.
+                #[cfg(windows)]
+                {
+                    if let Ok(mut priority) = lifecycle_platform.priority_input.lock() {
+                        if let Some(priority) = priority.take() {
+                            priority.wake.unpark();
+                        }
+                    }
+                    if let Some(exited_pty) = pty.take() {
+                        tokio::task::spawn_blocking(move || drop(exited_pty));
+                    }
+                }
+                state = State::Exited(info);
             }
 
             _ = foreground_poll.tick(), if pty_open => {
@@ -1123,19 +1161,46 @@ fn resolve_windows_start_program(spec: &wire::StartSpec) -> Result<PathBuf> {
 
     for base in bases {
         if base.is_file() {
-            return Ok(base);
+            return Ok(windows_process_path(&base));
         }
         if base.extension().is_none() {
             for extension in &extensions {
                 let extension = extension.strip_prefix('.').unwrap_or(extension);
                 let candidate = base.with_extension(extension);
                 if candidate.is_file() {
-                    return Ok(candidate);
+                    return Ok(windows_process_path(&candidate));
                 }
             }
         }
     }
     bail!("session command was not found in START PATH/PATHEXT")
+}
+
+/// `canonicalize` returns verbatim (`\\?\`) paths on Windows. They are useful
+/// for identity checks, but Windows PowerShell's ConsoleHost exits with
+/// `0xFFFF0000` when argv[0] has that form under ConPTY. Convert canonical DOS
+/// and UNC paths back to the equivalent process command-line spelling only at
+/// this final launch boundary; leave device-namespace paths unchanged.
+#[cfg(windows)]
+fn windows_process_path(path: &std::path::Path) -> PathBuf {
+    let encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let verbatim_unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    let converted = if let Some(rest) = encoded.strip_prefix(verbatim_unc.as_slice()) {
+        let mut ordinary = vec!['\\' as u16, '\\' as u16];
+        ordinary.extend_from_slice(rest);
+        Some(ordinary)
+    } else if let Some(rest) = encoded.strip_prefix(verbatim.as_slice()) {
+        (rest.len() >= 3
+            && rest[1] == ':' as u16
+            && (rest[2] == '\\' as u16 || rest[2] == '/' as u16))
+            .then(|| rest.to_vec())
+    } else {
+        None
+    };
+    converted
+        .map(|wide| PathBuf::from(OsString::from_wide(&wide)))
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 #[cfg(windows)]
@@ -1918,6 +1983,64 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    #[test]
+    fn direct_conpty_keeps_windows_powershell_interactive() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let powershell = windows_process_path(
+            &std::fs::canonicalize(
+                std::path::Path::new(&std::env::var_os("SystemRoot").unwrap())
+                    .join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe"),
+            )
+            .unwrap(),
+        );
+        let mut command = CommandBuilder::new(powershell);
+        command.arg("-NoLogo");
+        command.env_clear();
+        for (key, value) in std::env::vars() {
+            command.env(key, value);
+        }
+        command.cwd(std::env::current_dir().unwrap());
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let _reader = pair.master.try_clone_reader().unwrap();
+        let _writer = pair.master.take_writer().unwrap();
+
+        std::thread::sleep(Duration::from_secs(1));
+        let status = child.try_wait().unwrap();
+        assert!(
+            status.is_none(),
+            "PowerShell exited instead of waiting for ConPTY input: {status:?}"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn process_paths_remove_only_verbatim_dos_and_unc_prefixes() {
+        assert_eq!(
+            windows_process_path(std::path::Path::new(r"\\?\C:\Windows\powershell.exe")),
+            PathBuf::from(r"C:\Windows\powershell.exe")
+        );
+        assert_eq!(
+            windows_process_path(std::path::Path::new(r"\\?\UNC\server\share\tool.exe")),
+            PathBuf::from(r"\\server\share\tool.exe")
+        );
+        assert_eq!(
+            windows_process_path(std::path::Path::new(r"\\?\Volume{abc}\tool.exe")),
+            PathBuf::from(r"\\?\Volume{abc}\tool.exe")
+        );
+    }
 
     #[test]
     fn batch_wrapper_quotes_spaces_and_neutralizes_metacharacters() {
