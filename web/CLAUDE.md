@@ -14,8 +14,8 @@ src/
   app/            one directory per route (App Router)
                   admin/ app/ desktop-build/ device/ download/
                   forgot-password/ hosts/ legion/ login/ onboarding/
-                  reset-password/ security/ sessions/ signup/ trust-ux-demo/
-                  verify-email/ w/
+                  pricing/ privacy/ reset-password/ security/ sessions/
+                  signup/ terms/ trust-ux-demo/ verify-email/ w/
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/ release/
                   onboarding/ profile/ session/ settings/ terminal/ trust/
@@ -49,6 +49,18 @@ public/           static assets
   focused terminal is the exact bug that module exists to prevent, and the
   same file states the arrow sequences the terminal sends for itself, because
   xterm.js's own platform detection is wrong inside this bundle.
+- A billing surface: whether this deployment sells anything is a per-deployment
+  fact carried in the `billing` block of `GET /api/auth/config`, and every
+  billing surface — the pricing link in the masthead and the colophon
+  included — is hidden when `billing.enabled` is false. A self-hosted install
+  must never advertise a shop it does not have. It fails **closed**:
+  `src/lib/billing-server.ts` reads that config from the Next server (the
+  rewrite's own target, since `/api/*` has no server-side URL) and answers
+  `null` when the API cannot be asked, and `null` is not a yes. `/terms` and
+  `/privacy` are *not* conditional — they are legal pages and exist on every
+  deployment — and `/privacy` is the source of truth for the App Store privacy
+  nutrition label and the Play data-safety form, so an answer given to either
+  store has to be findable there.
 - A websocket change: the subprotocol names in `src/lib/ws.ts` and
   `src/lib/alerts.ts` (`spawn.v3`, `spawn.alerts.v1`) are the compatibility
   contract with the server, not a version — a server that requires a different
