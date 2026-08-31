@@ -2477,6 +2477,9 @@ async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
 fn self_update_args(agent_kind: &str) -> Option<&'static [&'static str]> {
     match agent_kind {
         "claude-code" => Some(&["update"]),
+        // `--yes` answers the updater's confirmation prompts; without it the
+        // command can block on stdin, and this runs headless.
+        "hermes" => Some(&["update", "--yes"]),
         _ => None,
     }
 }
@@ -6244,6 +6247,7 @@ mod tests {
     #[test]
     fn self_update_args_only_for_known_kinds() {
         assert_eq!(self_update_args("claude-code"), Some(&["update"][..]));
+        assert_eq!(self_update_args("hermes"), Some(&["update", "--yes"][..]));
         assert_eq!(self_update_args("codex"), None);
         assert_eq!(self_update_args("shell"), None);
     }

@@ -34,6 +34,7 @@ const BUILT_INS = [
     kind: "aider",
     command: "aider --model claude-sonnet-4-6",
   }),
+  agent({ id: "hermes", name: "hermes", kind: "hermes", command: "hermes" }),
 ];
 
 describe("agent identity", () => {
@@ -42,6 +43,7 @@ describe("agent identity", () => {
     ["codex", "codex", "Codex"],
     ["opencode", "opencode", "OpenCode"],
     ["aider", "aider", "Aider Sonnet"],
+    ["hermes", "hermes", "Hermes Agent"],
   ])("recognizes %s", (command, logoKey, displayName) => {
     expect(identifyAgent(command, BUILT_INS)).toMatchObject({ logoKey, displayName });
   });

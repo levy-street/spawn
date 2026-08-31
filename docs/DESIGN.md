@@ -224,7 +224,7 @@ Usage rules:
 - `components/icons/AgentIcon.tsx` — agent identity everywhere (sidebar
   session rows, pane headers, agent switcher). Resolves definition `kind`
   first, then the foreground/command basename: bundled marks for
-  `claude-code`, `codex`, `opencode`, `aider`; terminal glyph for
+  `claude-code`, `codex`, `opencode`, `aider`, `hermes`; terminal glyph for
   `bash|zsh|fish|sh|dash`; first-letter monogram otherwise. Props:
   `{kind?, command?, size?, className?}`.
 - `components/icons/BrandMark.tsx` — the spawnd trident (`Trident`) and the

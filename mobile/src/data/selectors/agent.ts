@@ -26,6 +26,7 @@ const BRANDS: Array<{ needle: string; brand: Brand }> = [
   { needle: "codex", brand: { kind: "codex", displayName: "Codex", logoKey: "codex" } },
   { needle: "opencode", brand: { kind: "opencode", displayName: "OpenCode", logoKey: "opencode" } },
   { needle: "aider", brand: { kind: "aider", displayName: "Aider Sonnet", logoKey: "aider" } },
+  { needle: "hermes", brand: { kind: "hermes", displayName: "Hermes Agent", logoKey: "hermes" } },
 ];
 
 export function commandBasename(command: string | null | undefined): string | null {
