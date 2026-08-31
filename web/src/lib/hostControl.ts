@@ -1347,9 +1347,28 @@ export class HostControlClient {
     // remote-answer race. Buffer them until the offer is on the wire.
     let offerSent = false;
     const pendingLocalCandidates: RTCIceCandidateInit[] = [];
+    let gatheredRelayCandidate = false;
+    let iceFailureLogged = false;
+    const logIceFailure = () => {
+      if (iceFailureLogged) return;
+      iceFailureLogged = true;
+      const diagnostic = gatheredRelayCandidate
+        ? "relay candidates were gathered, but no candidate pair connected"
+        : "no relay candidate was gathered; TURN may be unreachable from this network";
+      console.warn(`SPAWN D host-control ICE connection failed: ${diagnostic}.`, {
+        host_id: this.hostId,
+        rtc_session_id: sessionId,
+      });
+    };
     pc.onicecandidate = (event) => {
       if (!event.candidate || this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt))
         return;
+      if (
+        event.candidate.type === "relay" ||
+        /(?:^|\s)typ\s+relay(?:\s|$)/u.test(event.candidate.candidate)
+      ) {
+        gatheredRelayCandidate = true;
+      }
       const candidate = event.candidate.toJSON();
       if (!offerSent) {
         pendingLocalCandidates.push(candidate);
@@ -1395,6 +1414,7 @@ export class HostControlClient {
     pc.onconnectionstatechange = () => {
       if (this.sessionId !== sessionId || this.pc !== pc) return;
       if (pc.connectionState === "connected") {
+        iceFailureLogged = false;
         this.clearRtcDisconnectedTimer();
         this.clearRtcIceRestartTimer();
       } else if (pc.connectionState === "disconnected") {
@@ -1407,6 +1427,7 @@ export class HostControlClient {
           }, RTC_DISCONNECTED_GRACE_MS);
         }
       } else if (pc.connectionState === "failed") {
+        logIceFailure();
         void this.restartIce("failed");
       } else if (pc.connectionState === "closed") {
         this.failRtc(sessionId);
