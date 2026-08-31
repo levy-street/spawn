@@ -464,9 +464,9 @@ export function WorkspaceGrid({
     queryFn: () => workspaces.list(),
     staleTime: 30_000,
   });
-  // Only read when a pane is duplicated, to relaunch whatever agent the
-  // source is running; a shell needs nothing typed into it.
-  const agentsQ = useQuery({
+  // Warms the registry cache so a duplicate's ensureQueryData resolves from
+  // memory; the duplicate itself awaits the query rather than reading this.
+  useQuery({
     queryKey: ["agents"],
     queryFn: agentsApi.list,
     staleTime: 60_000,
@@ -634,7 +634,13 @@ export function WorkspaceGrid({
           cwd: session.cwd,
           ...(skillIds.length > 0 && { skill_ids: skillIds }),
         });
-        const agent = runningAgent(session, agentsQ.data ?? []);
+        // Awaited rather than read from the hook: a duplicate fired before
+        // the registry query settles would silently copy an agent pane as a
+        // bare shell. Failure falls back to the empty list it used to read.
+        const definitions = await queryClient
+          .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
+          .catch(() => []);
+        const agent = runningAgent(session, definitions);
         if (agent) pendingLaunch.set(created.id, agentRunCommand(agent));
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});
@@ -646,7 +652,7 @@ export function WorkspaceGrid({
         onErrorRef.current?.(error instanceof Error ? error.message : String(error));
       }
     },
-    [agentsQ.data, commitLayout, queryClient, sessionsById, setFocus],
+    [commitLayout, queryClient, sessionsById, setFocus],
   );
   duplicateRef.current = (sourceId, placement) => {
     void duplicatePane(sourceId, placement);

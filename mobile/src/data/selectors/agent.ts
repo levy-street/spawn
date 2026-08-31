@@ -1,7 +1,14 @@
 import type { AgentDef, AgentIdentity, AgentLogoKey, Session } from "@/data/types/domain";
 
-const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash"]);
+const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash", "powershell", "pwsh", "cmd"]);
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/**
+ * The daemon reports the kernel's own name for the foreground process, and on
+ * Windows that carries the executable extension — "claude.exe", "pwsh.exe" —
+ * which no agent definition or shell list spells out. Stripped before every
+ * comparison so the same program reads the same on every platform.
+ */
+const WINDOWS_EXECUTABLE_SUFFIX = /\.(exe|com|bat|cmd|ps1)$/i;
 const SAFE_SHELL_VALUE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 const SAFE_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -29,8 +36,14 @@ export function commandBasename(command: string | null | undefined): string | nu
   return normalized || null;
 }
 
-export function isShellCommand(command: string | null | undefined): boolean {
+/** The basename lowered and shorn of a Windows executable extension. */
+function normalizedBasename(command: string | null | undefined): string | null {
   const basename = commandBasename(command)?.toLowerCase();
+  return basename ? basename.replace(WINDOWS_EXECUTABLE_SUFFIX, "") : null;
+}
+
+export function isShellCommand(command: string | null | undefined): boolean {
+  const basename = normalizedBasename(command);
   return basename ? SHELL_COMMANDS.has(basename) : false;
 }
 
@@ -38,9 +51,9 @@ export function runningAgent(
   foregroundCommand: string | null,
   agents: readonly AgentDef[],
 ): AgentDef | null {
-  const reported = commandBasename(foregroundCommand)?.toLowerCase();
+  const reported = normalizedBasename(foregroundCommand);
   if (!reported || SHELL_COMMANDS.has(reported)) return null;
-  return agents.find((agent) => commandBasename(agent.command)?.toLowerCase() === reported) ?? null;
+  return agents.find((agent) => normalizedBasename(agent.command) === reported) ?? null;
 }
 
 function brandFor(value: string | null | undefined): Brand | null {
@@ -53,7 +66,7 @@ export function identifyAgent(
   agents: readonly AgentDef[],
 ): AgentIdentity {
   const basename = commandBasename(foregroundCommand);
-  if (!basename || SHELL_COMMANDS.has(basename.toLowerCase())) {
+  if (!basename || isShellCommand(foregroundCommand)) {
     return { kind: "shell", displayName: "Shell", logoKey: "shell", monogramSeed: "Shell" };
   }
 

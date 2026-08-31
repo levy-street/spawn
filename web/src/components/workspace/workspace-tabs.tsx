@@ -956,6 +956,12 @@ export function WorkspaceTabs({
         throw new Error(`A workspace holds at most ${MAX_TABS} tabs.`);
       }
       const sessionsById = new Map((sessionsQ.data ?? []).map((item) => [item.id, item]));
+      // Awaited rather than read from the hook: a duplicate fired before the
+      // registry query settles would silently copy every agent pane as a bare
+      // shell. Failure falls back to the empty list it used to read.
+      const definitions = await queryClient
+        .ensureQueryData({ queryKey: ["agents"], queryFn: agents.list })
+        .catch(() => []);
       const copiedIds = new Map<string, string>();
       const created: string[] = [];
       try {
@@ -976,7 +982,7 @@ export function WorkspaceTabs({
           });
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
-          const agent = runningAgent(source, agentsQ.data ?? []);
+          const agent = runningAgent(source, definitions);
           if (agent) pendingLaunch.set(copy.id, agentRunCommand(agent));
         }
         const next = duplicateTab(

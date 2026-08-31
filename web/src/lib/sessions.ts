@@ -1,4 +1,4 @@
-import { agentDisplayName, commandBasename } from "@/lib/agent-identity";
+import { agentDisplayName, commandBasename, stripExecutableSuffix } from "@/lib/agent-identity";
 import type { Agent, Session } from "@/lib/api";
 
 /**
@@ -90,17 +90,18 @@ export function sessionNeedsAttention(session: Session): "waiting" | "dead" | nu
   return null;
 }
 
-const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash"]);
+const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash", "powershell", "pwsh", "cmd"]);
 
 /**
  * True when a reported foreground command is a shell. The daemon reports the
  * process basename only; login shells prefix argv[0] with "-" (e.g. "-zsh"),
- * which the kernel-derived name can carry through.
+ * which the kernel-derived name can carry through, and Windows carries the
+ * executable extension ("pwsh.exe").
  */
 export function isShellCommand(command: string | null | undefined): boolean {
   if (!command) return false;
   const name = command.startsWith("-") ? command.slice(1) : command;
-  return SHELL_COMMANDS.has(name.toLowerCase());
+  return SHELL_COMMANDS.has(stripExecutableSuffix(name.toLowerCase()));
 }
 
 /**
@@ -117,6 +118,11 @@ export function sessionAtShell(session: Session): boolean {
  * command (env assignments skipped, path stripped). Null for a shell prompt,
  * or for a foreground process no agent claims — the caller then treats the
  * session as a plain shell.
+ *
+ * Both sides are compared with the Windows executable extension stripped: a
+ * Windows host reports "claude.exe" for the agent the registry spells
+ * "claude", and an exact match would call that pane a plain shell — which is
+ * how duplicating a Claude Code pane on Windows used to produce an empty one.
  */
 export function runningAgent<T extends Pick<Agent, "command">>(
   session: Pick<Session, "foreground_command"> | undefined,
@@ -125,6 +131,12 @@ export function runningAgent<T extends Pick<Agent, "command">>(
   const reported = session?.foreground_command?.trim();
   if (!reported || isShellCommand(reported)) return null;
   // Login shells prefix argv[0] with "-"; the same can reach any basename.
-  const name = (reported.startsWith("-") ? reported.slice(1) : reported).toLowerCase();
-  return agents.find((agent) => commandBasename(agent.command).toLowerCase() === name) ?? null;
+  const name = stripExecutableSuffix(
+    (reported.startsWith("-") ? reported.slice(1) : reported).toLowerCase(),
+  );
+  return (
+    agents.find(
+      (agent) => stripExecutableSuffix(commandBasename(agent.command).toLowerCase()) === name,
+    ) ?? null
+  );
 }
