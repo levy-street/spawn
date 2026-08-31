@@ -557,6 +557,33 @@ class TestRefusingToBootHalfConfigured:
             _settings(public_url="http://localhost:8000", stripe_webhook_secret=None)
 
 
+class TestTheMobileUpgradeLink:
+    """Off at launch, and never a reason to refuse to boot.
+
+    It is a server setting rather than a build flag because a binary already
+    in a store cannot be recalled: withdrawing the link has to be something
+    that happens this afternoon, without a resubmission.
+    """
+
+    def test_it_is_off_by_default(self):
+        assert Settings(_env_file=None).billing_mobile_upgrade_link is False
+
+    def test_false_is_valid_with_billing_fully_configured(self):
+        assert _settings(billing_mobile_upgrade_link=False).billing_enabled is True
+
+    def test_true_needs_no_extra_configuration_of_its_own(self):
+        assert _settings(billing_mobile_upgrade_link=True).billing_mobile_upgrade_link is True
+
+    def test_it_never_makes_a_billing_free_deployment_refuse_to_start(self):
+        """The effective value is `billing_enabled and this`, so the flag left
+        on with billing off is inert rather than an error."""
+        settings = Settings(
+            _env_file=None, billing_enabled=False, billing_mobile_upgrade_link=True
+        )
+        assert settings.billing_enabled is False
+        assert (settings.billing_enabled and settings.billing_mobile_upgrade_link) is False
+
+
 class TestTheReturnUrl:
     def test_an_explicit_value_wins(self):
         settings = _settings(
