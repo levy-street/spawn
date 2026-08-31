@@ -68,6 +68,19 @@ BUILTIN_AGENTS: list[dict] = [
         "yolo_args": "--yes-always",
         "yolo_env": {},
     },
+    {
+        # Nous Research's agent. The vendor script installs its own Python and
+        # Node runtimes and puts a `hermes` binary on PATH; plain `hermes` is
+        # the documented entry point for an interactive session. Auth is its
+        # own (`hermes setup`, or keys in `~/.hermes/.env` on the host).
+        "name": "hermes",
+        "kind": "hermes",
+        "command": "hermes",
+        "env": {},
+        "install": "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+        "yolo_args": "--yolo",
+        "yolo_env": {},
+    },
 ]
 
 

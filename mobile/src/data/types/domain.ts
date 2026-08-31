@@ -61,7 +61,7 @@ export interface DisplayStatus {
   pulse: boolean;
 }
 
-export type AgentLogoKey = "claude-code" | "codex" | "opencode" | "aider" | "shell";
+export type AgentLogoKey = "claude-code" | "codex" | "opencode" | "aider" | "hermes" | "shell";
 
 export interface AgentIdentity {
   kind: string;

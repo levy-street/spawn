@@ -23,6 +23,7 @@ const IDENTITIES: readonly AgentIdentity[] = [
     monogramSeed: "OpenCode",
   },
   { kind: "aider", displayName: "Aider Sonnet", logoKey: "aider", monogramSeed: "Aider" },
+  { kind: "hermes", displayName: "Hermes Agent", logoKey: "hermes", monogramSeed: "Hermes" },
   { kind: "shell", displayName: "Shell", logoKey: "shell", monogramSeed: "Shell" },
 ];
 
@@ -31,6 +32,7 @@ const PLATES: Record<AgentLogoKey, { backgroundColor: string; borderColor: strin
   codex: { backgroundColor: "#FFFFFF", borderColor: "rgba(0,0,0,0.10)" },
   opencode: { backgroundColor: "#000000", borderColor: "rgba(255,255,255,0.20)" },
   aider: { backgroundColor: "#10231B", borderColor: "rgba(255,255,255,0.10)" },
+  hermes: { backgroundColor: "#FFFFFF", borderColor: "rgba(0,0,0,0.10)" },
   shell: { backgroundColor: "#1C2128", borderColor: "rgba(255,255,255,0.10)" },
 };
 
@@ -64,7 +66,7 @@ describe("spawnd brand artwork", () => {
 });
 
 describe("agent brand plates", () => {
-  test("renders distinct fixed artwork for all five known identities", async () => {
+  test("renders distinct fixed artwork for all six known identities", async () => {
     await render(
       <ThemeProvider>
         <View>
