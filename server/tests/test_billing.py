@@ -22,7 +22,13 @@ from spawn_server.config import InsecureConfigurationError, Settings, get_settin
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Host, HostKeyClaim, Subscription, User
 
-pytestmark = pytest.mark.anyio
+# Deliberately no `pytestmark = pytest.mark.anyio`. `asyncio_mode = "auto"`
+# in pyproject.toml already runs these, and adding the anyio mark on top of it
+# puts the test in one event loop and the `app` fixture's engine in another —
+# invisible on aiosqlite, but every test that opens its own session dies on
+# asyncpg with "got Future attached to a different loop". That makes the
+# SPAWN_TEST_EXTERNAL_SERVICES=1 run, which is the only place a lock or a
+# real constraint can be observed at all, silently dark.
 
 PRICE_COVEN = "price_test_coven"
 PRICE_LEGION = "price_test_legion"
@@ -356,9 +362,17 @@ class TestMayAddHost:
         assert decision.allowed is True
         assert decision.host_limit is None
 
-    async def test_the_account_lock_is_a_no_op_on_sqlite(self, app, billing_on):
-        """SQLAlchemy's SQLite dialect emits no FOR UPDATE, which is correct
-        rather than a gap — the answer must be the same either way."""
+    async def test_taking_the_lock_does_not_change_the_answer(self, app, billing_on):
+        """The lock serialises; it must never decide anything.
+
+        On SQLite this is nearly vacuous — the dialect emits no locking clause
+        at all, which is correct rather than a gap, since one connection cannot
+        exhibit the race. Under SPAWN_TEST_EXTERNAL_SERVICES=1 it is real:
+        PostgreSQL takes `FOR NO KEY UPDATE` here, and this asserts that doing
+        so neither changes the count nor blocks on the foreign key's own
+        `FOR KEY SHARE` on the same row. Whether it actually serialises two
+        concurrent pairings is `tests/test_billing_enforcement.py`'s question.
+        """
         async with get_sessionmaker()() as session:
             user = await _user(session, "locked@example.com")
             session.add(Host(owner_user_id=user.id, name="first"))
