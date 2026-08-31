@@ -306,11 +306,22 @@ fn wait_for_daemon_exit(config_dir: &Path, timeout: Duration) {
 
 #[cfg(windows)]
 pub(super) fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
+    let server = super::registered_server(config_dir, server);
+    if query_xml(config_dir).is_some()
+        && configured_server(config_dir)
+            .is_none_or(|configured| !super::same_origin(&configured, &server))
+    {
+        let name = task_name(config_dir);
+        let _ = super::control::send(config_dir, super::control::ControlCommand::Shutdown);
+        let _ = schtasks(&["/End", "/TN", &name]);
+        wait_for_daemon_exit(config_dir, Duration::from_secs(5));
+        return install(config_dir, &server);
+    }
     if super::control::send(config_dir, super::control::ControlCommand::Reconnect).is_ok() {
         return Ok(());
     }
     if query_xml(config_dir).is_none() {
-        return install(config_dir, server);
+        return install(config_dir, &server);
     }
     let breakaway = crate::state::read(config_dir)
         .ok()
@@ -386,6 +397,13 @@ pub(super) fn diagnostic(config_dir: &Path) -> Option<String> {
     (!required.iter().all(|field| xml.contains(field))).then(|| {
         "the registered Task Scheduler XML differs from SPAWN D's canonical definition".into()
     })
+}
+
+#[cfg(windows)]
+pub(super) fn configured_server(config_dir: &Path) -> Option<String> {
+    let xml = query_xml(config_dir)?;
+    let arguments = super::xml_element(&xml, "Arguments")?;
+    super::extract_server_argument(&arguments)
 }
 
 #[cfg(windows)]

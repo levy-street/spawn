@@ -463,6 +463,7 @@ fn precondition_reasons_are_short_stable_classes() {
         BlockReason::Unwritable
     );
     assert_eq!(BlockReason::Disabled.as_str(), "disabled");
+    assert_eq!(BlockReason::LocalBuild.as_str(), "local_build");
     assert_eq!(BlockReason::Unwritable.as_str(), "unwritable");
     assert_eq!(
         BlockReason::UnsupportedTarget.as_str(),
@@ -481,6 +482,7 @@ fn plain_cli_outcomes_are_byte_stable() {
         UpdateFailure::new(UpdateStage::Verify, "manifest_bad_signature").to_string(),
         "verify: manifest_bad_signature"
     );
+    assert!(cli_no_update_line("local_build").contains("SPAWND_ALLOW_LOCAL_SELF_UPDATE=1"));
 }
 
 #[test]

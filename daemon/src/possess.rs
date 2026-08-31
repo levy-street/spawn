@@ -152,6 +152,8 @@ enum ResumeAction {
     Update,
     /// Sign in again, alongside what is already here.
     NewAccount,
+    /// Open the in-place machine management menu.
+    Manage,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,7 +220,11 @@ fn resume_action(existing: &[PathBuf]) -> ResumeAction {
     }
     let single = existing.len() == 1;
     let keep = if single {
-        format!("Keep {}", instance_account(&existing[0]))
+        let server = crate::manage::instance_server(&existing[0])
+            .and_then(|server| Url::parse(&server).ok())
+            .map(|server| origin_label(&server))
+            .unwrap_or_else(|| "server unknown".into());
+        format!("Keep {} ({server})", instance_account(&existing[0]))
     } else {
         format!("Keep all {} accounts", existing.len())
     };
@@ -244,6 +250,10 @@ fn resume_options(single: bool) -> Vec<(&'static str, &'static str)> {
         options.push(("Approve a new browser or device", "run the sign-in again"));
     }
     options.push(("Add another account", "sign in again, alongside this one"));
+    options.push((
+        "Manage this machine",
+        "connections, approvals, sessions, accounts",
+    ));
     options.push(("Check for a newer SPAWN D", "update the daemon in place"));
     options
 }
@@ -253,6 +263,7 @@ fn resume_choice(picked: usize, single: bool) -> ResumeAction {
         (0, _) => ResumeAction::Keep,
         (1, true) => ResumeAction::Reauthorize,
         (1, false) | (2, true) => ResumeAction::NewAccount,
+        (2, false) | (3, true) => ResumeAction::Manage,
         _ => ResumeAction::Update,
     }
 }
@@ -345,6 +356,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
                 return Ok(());
             }
             ResumeAction::Update => return crate::update::run_cli(server_cli).await,
+            ResumeAction::Manage => return crate::manage::run_menu(server_cli, false).await,
             // Falls through to the ceremony below.
             ResumeAction::NewAccount => {}
         }
@@ -628,11 +640,66 @@ pub async fn exorcise(server_cli: Option<String>, args: ExorciseArgs) -> Result<
         match existing.len() {
             0 => config::config_dir()?, // legacy single instance in the base
             1 => existing.pop().unwrap(),
-            _ => bail!("multiple instances on this host; pass --config-dir <dir> or --all"),
+            _ => {
+                let labels = existing
+                    .iter()
+                    .map(|dir| instance_account(dir))
+                    .collect::<Vec<_>>();
+                let details = existing
+                    .iter()
+                    .map(|dir| {
+                        crate::manage::instance_server(dir)
+                            .unwrap_or_else(|| "server unknown".into())
+                    })
+                    .collect::<Vec<_>>();
+                let mut options = labels
+                    .iter()
+                    .zip(&details)
+                    .map(|(label, detail)| (label.as_str(), detail.as_str()))
+                    .collect::<Vec<_>>();
+                options.push(("Cancel", "remove nothing"));
+                let picked = crate::tui::prompt_choice(
+                    "CHOOSE AN ACCOUNT INSTANCE TO EXORCISE",
+                    &options,
+                    options.len() - 1,
+                );
+                let Some(dir) = existing.get(picked) else {
+                    println!("spawn: exorcise cancelled.");
+                    return Ok(());
+                };
+                dir.clone()
+            }
         }
     };
     exorcise_one(explicit.as_ref(), &dir).await;
     println!("spawn: exorcised.");
+    Ok(())
+}
+
+/// Remove one already-resolved account instance. The interactive management
+/// menu confirms with arrow keys before calling this; the scripting command
+/// may either pass `--yes` or use the ordinary line confirmation.
+pub(crate) async fn exorcise_specific(
+    server_cli: Option<String>,
+    dir: &Path,
+    yes: bool,
+) -> Result<()> {
+    force_file_store();
+    let explicit = match server_cli {
+        Some(raw) => Some(config::server_url(Some(raw))?),
+        None => None,
+    };
+    if !yes
+        && !crate::tui::confirm(&format!(
+            "Exorcise SPAWN D account instance {}?",
+            instance_account(dir)
+        ))?
+    {
+        println!("spawn: exorcise cancelled.");
+        return Ok(());
+    }
+    exorcise_one(explicit.as_ref(), dir).await;
+    println!("spawn: exorcised {}.", instance_account(dir));
     Ok(())
 }
 
@@ -669,7 +736,7 @@ async fn exorcise_one(explicit: Option<&Url>, dir: &Path) {
 
 /// A daemon revokes its own host registration. 401/404 are treated as success
 /// (the registration is already gone).
-async fn deregister_self(server: &Url, token: &str) -> Result<()> {
+pub(crate) async fn deregister_self(server: &Url, token: &str) -> Result<()> {
     let url = config::api_url(server, "/api/hosts/self")?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -921,18 +988,20 @@ mod tests {
     /// mapping is pinned rather than left to index arithmetic.
     #[test]
     fn the_resume_menu_maps_every_row_to_an_action() {
-        assert_eq!(resume_options(true).len(), 3);
+        assert_eq!(resume_options(true).len(), 4);
         assert_eq!(resume_choice(0, true), ResumeAction::Keep);
         assert_eq!(resume_choice(1, true), ResumeAction::Reauthorize);
         assert_eq!(resume_choice(2, true), ResumeAction::NewAccount);
-        assert_eq!(resume_choice(3, true), ResumeAction::Update);
+        assert_eq!(resume_choice(3, true), ResumeAction::Manage);
+        assert_eq!(resume_choice(4, true), ResumeAction::Update);
 
         // With several accounts there is no single instance to re-approve, so
         // that row is absent and everything below it moves up one.
-        assert_eq!(resume_options(false).len(), 2);
+        assert_eq!(resume_options(false).len(), 3);
         assert_eq!(resume_choice(0, false), ResumeAction::Keep);
         assert_eq!(resume_choice(1, false), ResumeAction::NewAccount);
-        assert_eq!(resume_choice(2, false), ResumeAction::Update);
+        assert_eq!(resume_choice(2, false), ResumeAction::Manage);
+        assert_eq!(resume_choice(3, false), ResumeAction::Update);
     }
 
     #[test]

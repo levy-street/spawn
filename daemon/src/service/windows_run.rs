@@ -166,11 +166,19 @@ pub(super) fn uninstall(config_dir: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub(super) fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
+    let server = super::registered_server(config_dir, server);
+    if registry_get_string(RUN_KEY, &value_name(config_dir))?.is_some()
+        && configured_server(config_dir)
+            .is_none_or(|configured| !super::same_origin(&configured, &server))
+    {
+        uninstall(config_dir)?;
+        return install(config_dir, &server);
+    }
     if super::control::send(config_dir, super::control::ControlCommand::Reconnect).is_ok() {
         return Ok(());
     }
     if registry_get_string(RUN_KEY, &value_name(config_dir))?.is_none() {
-        return install(config_dir, server);
+        return install(config_dir, &server);
     }
     let record = read_launch_record(&launch_record_path(config_dir)?)?;
     start_watchdog(&record)?;
@@ -242,6 +250,13 @@ pub(super) fn diagnostic(config_dir: &Path) -> Option<String> {
         return Some("the SPAWN D watchdog launch record is invalid".into());
     }
     None
+}
+
+#[cfg(windows)]
+pub(super) fn configured_server(config_dir: &Path) -> Option<String> {
+    read_launch_record(&launch_record_path(config_dir).ok()?)
+        .ok()
+        .map(|record| record.server)
 }
 
 #[cfg(windows)]

@@ -659,10 +659,8 @@ impl Ui {
         self.with(move |state| state.status = Some(text));
     }
 
-    /// A line of scrollback above the live region. In plain mode this is the
-    /// historical `spawn: <text>` line, unchanged.
-    pub fn log(&self, text: &str) {
-        log_line(text);
+    pub fn clear_status(&self) {
+        self.with(|state| state.status = None);
     }
 
     /// Scrollback that is already fully formatted (a panel, a QR code). Plain
@@ -866,29 +864,6 @@ impl Drop for Spinner {
             }
         }
     }
-}
-
-/// Wait for the operator to press Enter. Returns immediately when stdin is not
-/// a terminal, so an unattended install never stalls on a prompt nobody sees.
-///
-/// `install.sh` reattaches /dev/tty before exec'ing the daemon, which is what
-/// makes this reachable at all under `curl … | sh`.
-pub fn press_enter(prompt: &str) -> bool {
-    if !std::io::stdin().is_terminal() {
-        return false;
-    }
-    if !prompt.is_empty() {
-        let styled = styled_stdout();
-        let mut out = anstream::stdout();
-        let _ = write!(out, "  {} ", dim(prompt, styled));
-        let _ = out.flush();
-    }
-    let mut line = String::new();
-    // EOF (the terminal went away mid-prompt) reads as "did not ask for it".
-    let answered = matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0);
-    // The terminal echoed the Enter that ended the read: one row.
-    frame_pushed_down(1);
-    answered
 }
 
 /// Tell the live region the cursor moved down `lines` rows outside `draw`.
@@ -1396,19 +1371,17 @@ mod tests {
         ui.begin(0, "[ RUNNING ]");
         thread::sleep(Duration::from_millis(600));
         ui.complete(0, "Charlies-MacBook-Pro");
-        ui.begin(1, "[ WAITING FOR YOU ]");
+        ui.begin(1, "[ APPROVE THIS LOGIN ]");
         ui.block(
             render_panel(
-                "APPROVE THIS HOST",
+                "APPROVE THIS LOGIN",
                 &[
                     String::new(),
-                    dim("open this link on any device:", true),
+                    dim("Press Enter to open the approval page, or open this link on any signed-in device:", true),
                     bold(
                         "http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8",
                         true,
                     ),
-                    String::new(),
-                    bold("press Enter to open it here", true),
                 ],
                 terminal_width(),
                 true,
@@ -1417,10 +1390,10 @@ mod tests {
         );
         for elapsed in 0..24 {
             ui.status(&format!(
-                "waiting for approval — {elapsed}s · link expires in 29 min"
+                "waiting for you to approve — this screen moves on by itself once you do ({elapsed}s)"
             ));
             if elapsed == 12 {
-                ui.log("opened your browser to approve this host.");
+                log_line("opened your browser to approve this login.");
             }
             thread::sleep(Duration::from_millis(100));
         }

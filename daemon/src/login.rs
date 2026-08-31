@@ -10,6 +10,8 @@
 //!   5. On success store {access_token, host_id, server_url}.
 
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -32,6 +34,10 @@ use crate::proto::{
 /// registration in the authenticated account's config dir.
 pub struct LoginOutcome {
     pub account_id: Option<String>,
+    /// An explicitly selected server was also written into an existing
+    /// background-service registration, so the caller must not start a second
+    /// foreground daemon for the same instance.
+    pub service_reconfigured: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +81,7 @@ pub async fn run_with_ui(
     let force_qr = args.qr;
     let no_qr = args.no_qr;
     let no_browser = args.no_browser;
+    let server_was_explicit = server_cli.is_some();
     // Persist before starting the ceremony so retries and interrupted logins
     // never rotate identity. A corrupt existing seed fails closed.
     let mut stored = creds::load().context("loading stored credentials")?;
@@ -157,7 +164,7 @@ pub async fn run_with_ui(
     let opener_available = browser_opener_available();
     let browser_behavior =
         browser_behavior(std::io::stdin().is_terminal(), opener_available, no_browser);
-    ui.begin(1, "[ WAITING FOR YOU ]");
+    ui.begin(1, "[ APPROVE THIS LOGIN ]");
 
     // The QR carries the full URL including the locally-appended #k= fragment.
     // A camera transfers it out of band; fragments never reach the HTTP server.
@@ -179,15 +186,14 @@ pub async fn run_with_ui(
         &approval_plain_lines(false, &approve_url, qr.as_deref()),
     );
 
-    // A keyboard gets an explicit Enter offer; without one, launch immediately.
-    // `--no-browser` suppresses both paths while leaving the link and QR rules
-    // unchanged.
+    // The Enter offer must never stand between this machine and the poll loop.
+    // A detached terminal reader opens the URL independently while polling
+    // starts below. The completion flag makes a late Enter inert after an
+    // approval from another device has already landed.
+    let approval_done = Arc::new(AtomicBool::new(false));
+    let _approval_listener = ApprovalListener::new(Arc::clone(&approval_done));
     if browser_behavior.offer_enter {
-        // The panel above already carries the instruction, so the prompt
-        // itself prints nothing — it only waits for the key.
-        if crate::tui::press_enter("") && open_browser(&approve_url) {
-            ui.log("opened your browser.");
-        }
+        spawn_enter_offer(&approve_url, Arc::clone(&approval_done));
     } else if browser_behavior.open_immediately {
         open_browser(&approve_url);
     }
@@ -233,13 +239,13 @@ pub async fn run_with_ui(
                 let remaining = start.expires_in.saturating_sub(elapsed.as_secs());
                 let minutes = remaining.div_ceil(60);
                 println!(
-                    "spawn: still waiting — {} s elapsed (link expires in {minutes} min)",
+                    "spawn: waiting for you to approve — {} s elapsed (link expires in {minutes} min)",
                     elapsed.as_secs()
                 );
             }
             if !hint_shown && elapsed >= Duration::from_secs(60) {
                 hint_shown = true;
-                println!("spawn: Still waiting — is the browser open? The link is above; it works on any device.");
+                println!("spawn: Still waiting for you — approve in the open browser or use the link above on any signed-in device.");
             }
         }
 
@@ -281,6 +287,10 @@ pub async fn run_with_ui(
         };
 
         if poll_has_success_fields(&body) {
+            approval_done.store(true, Ordering::Release);
+            ui.complete(1, "approved");
+            ui.begin(2, "[ SPAWN D IS STORING ]");
+            ui.status("you approved this login — SPAWN D is storing credentials");
             let account_id = body.account_id.clone();
             let host_id = match commit_poll_success(
                 &mut stored,
@@ -292,13 +302,24 @@ pub async fn run_with_ui(
             ) {
                 Ok(host_id) => host_id,
                 Err(error) => {
-                    ui.fail(1, "approval failed");
+                    ui.fail(2, "credentials not stored");
                     return Err(error);
                 }
             };
-            ui.complete(1, "approved");
+            let service_reconfigured = if server_was_explicit {
+                reconfigure_installed_service(&server).map_err(|error| {
+                    ui.fail(2, "service not updated");
+                    crate::login::background_service_error(&error)
+                })?
+            } else {
+                false
+            };
             ui.complete(2, &format!("host {host_id}"));
-            return Ok(LoginOutcome { account_id });
+            ui.clear_status();
+            return Ok(LoginOutcome {
+                account_id,
+                service_reconfigured,
+            });
         }
 
         match body.error.as_deref() {
@@ -364,9 +385,11 @@ fn approval_panel(
             .collect()
     };
     let lead = if browser_opened {
-        "opened your browser. didn't open? use this link on any device:"
+        "Your browser is open. If it did not appear, open this link on any signed-in device:"
+    } else if interactive {
+        "Press Enter to open the approval page in your browser, or open this link on any signed-in device:"
     } else {
-        "open this link on any device:"
+        "Open this link on any signed-in device to approve this login:"
     };
     let mut rows = vec![String::new()];
     rows.extend(prose(lead));
@@ -377,13 +400,7 @@ fn approval_panel(
             .iter()
             .map(|line| hyperlink(approve_url, &bold(line, true), true)),
     );
-    if interactive {
-        // The instruction belongs beside the link it acts on, not adrift below
-        // the progress frame where the next repaint would sit on top of it.
-        rows.push(String::new());
-        rows.push(bold("press Enter to open it here", true));
-    }
-    render_panel("APPROVE THIS HOST", &rows, width, true)
+    render_panel("APPROVE THIS LOGIN", &rows, width, true)
 }
 
 /// The one value on screen that has to be compared by eye, given the weight
@@ -467,7 +484,8 @@ fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str
         "spawn:   the link carries this host's identity key (the part after '#');".to_owned(),
         "spawn:   your browser checks it automatically before asking you to approve.".to_owned(),
         String::new(),
-        "spawn: waiting for approval…".to_owned(),
+        "spawn: waiting for you to approve — this command moves on by itself once you do."
+            .to_owned(),
     ]);
     lines
 }
@@ -475,19 +493,69 @@ fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str
 /// The live status line, rebuilt each tick so elapsed and expiry stay current.
 fn waiting_status(elapsed: u64, expires_in: u64) -> String {
     let minutes = expires_in.saturating_sub(elapsed).div_ceil(60);
-    format!("waiting for approval — {elapsed}s · link expires in {minutes} min")
+    format!(
+        "waiting for you to approve — this screen moves on by itself once you do ({elapsed}s) · expires in {minutes} min"
+    )
+}
+
+/// Read the one optional Enter in parallel with device-code polling.
+///
+/// A standard thread is intentional: the platform listener polls the terminal
+/// in short intervals and exits when approval finishes, while a Tokio blocking
+/// task would be joined during runtime shutdown. It never holds stdin while
+/// waiting, so a later TUI prompt cannot be starved after phone approval.
+fn spawn_enter_offer(approve_url: &str, approval_done: Arc<AtomicBool>) {
+    let approve_url = approve_url.to_owned();
+    std::thread::spawn(move || {
+        if crate::platform::wait_for_enter_until(&approval_done)
+            && !approval_done.load(Ordering::Acquire)
+            && open_browser(&approve_url)
+        {
+            #[cfg(unix)]
+            crate::tui::frame_pushed_down(1);
+            crate::tui::log_line("opened your browser; approve the login there.");
+        }
+    });
+}
+
+struct ApprovalListener {
+    done: Arc<AtomicBool>,
+}
+
+impl ApprovalListener {
+    fn new(done: Arc<AtomicBool>) -> Self {
+        Self { done }
+    }
+}
+
+impl Drop for ApprovalListener {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+/// Reinstall an existing unit after an explicit server migration. Fresh login
+/// commands have no unit to rewrite; an installed one must be reloaded now or
+/// its old `--server` and the new credentials create a permanent crash loop.
+fn reconfigure_installed_service(server: &url::Url) -> Result<bool> {
+    let config_dir = crate::config::config_dir()?;
+    if !crate::service::status(&config_dir).installed {
+        return Ok(false);
+    }
+    crate::service::install(&config_dir, server.as_str())?;
+    Ok(true)
 }
 
 fn approval_link_block(browser_opened: bool, approve_url: &str) -> String {
     if browser_opened {
         format!(
-            "spawn: opened your browser to approve this host.\n\
-             spawn:   didn't open? use this link on any device:\n\
+            "spawn: opened your browser to approve this login.\n\
+             spawn:   didn't open? use this link on any signed-in device:\n\
              spawn:   {approve_url}\n\n"
         )
     } else {
         format!(
-            "spawn: approve this host in your browser — open this link on any device:\n\
+            "spawn: approve this login — open this link on any signed-in device:\n\
              spawn:   {approve_url}\n\n"
         )
     }
@@ -1434,11 +1502,11 @@ mod tests {
     fn plain_login_link_block_is_byte_stable() {
         assert_eq!(
             approval_link_block(false, "https://spawnd.dev/device?ref=x#k=y"),
-            "spawn: approve this host in your browser — open this link on any device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
+            "spawn: approve this login — open this link on any signed-in device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
         );
         assert_eq!(
             approval_link_block(true, "https://spawnd.dev/device?ref=x#k=y"),
-            "spawn: opened your browser to approve this host.\nspawn:   didn't open? use this link on any device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
+            "spawn: opened your browser to approve this login.\nspawn:   didn't open? use this link on any signed-in device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
         );
     }
 
@@ -1486,13 +1554,13 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "spawn: approve this host in your browser — open this link on any device:",
+                "spawn: approve this login — open this link on any signed-in device:",
                 "spawn:   https://spawnd.dev/device?ref=x#k=y",
                 "",
                 "spawn:   the link carries this host's identity key (the part after '#');",
                 "spawn:   your browser checks it automatically before asking you to approve.",
                 "",
-                "spawn: waiting for approval…",
+                "spawn: waiting for you to approve — this command moves on by itself once you do.",
             ]
         );
     }
@@ -1516,7 +1584,8 @@ mod tests {
         for interactive in [true, false] {
             let panel = approval_panel(false, url, 88, interactive);
             let plain = strip_sgr(&panel.join("\n")).to_lowercase();
-            assert!(plain.contains("open this link on any device"), "{plain}");
+            assert!(plain.contains("open this link on any"), "{plain}");
+            assert!(plain.contains("signed-in device"), "{plain}");
             assert!(plain.contains("device?ref=dif2cg14xj3maek4"), "{plain}");
             assert!(
                 !plain.contains("pairing code"),
@@ -1547,8 +1616,8 @@ mod tests {
         // the operator to select 90-odd characters by hand.
         assert!(joined.contains("\u{1b}]8;;"), "no hyperlink marker");
         assert!(joined.contains(url), "the link target must be the full URL");
-        // The instruction sits with the link, inside the same frame.
-        assert!(joined.contains("press Enter to open it here"));
+        // The action comes first and sits with the link, inside the same frame.
+        assert!(joined.contains("Press Enter to open the approval page"));
 
         // Without a keyboard there is nothing to press, so the line is absent.
         let headless = approval_panel(false, url, 88, false);
@@ -1558,10 +1627,13 @@ mod tests {
     #[test]
     fn the_opened_browser_variant_keeps_its_own_lead_lines() {
         let lines = approval_plain_lines(true, "https://x/y", None);
-        assert_eq!(lines[0], "spawn: opened your browser to approve this host.");
+        assert_eq!(
+            lines[0],
+            "spawn: opened your browser to approve this login."
+        );
         assert_eq!(
             lines[1],
-            "spawn:   didn't open? use this link on any device:"
+            "spawn:   didn't open? use this link on any signed-in device:"
         );
         assert_eq!(lines[2], "spawn:   https://x/y");
     }
@@ -1579,16 +1651,16 @@ mod tests {
     fn the_waiting_status_counts_down_the_real_expiry() {
         assert_eq!(
             waiting_status(0, 1800),
-            "waiting for approval — 0s · link expires in 30 min"
+            "waiting for you to approve — this screen moves on by itself once you do (0s) · expires in 30 min"
         );
         assert_eq!(
             waiting_status(33, 1800),
-            "waiting for approval — 33s · link expires in 30 min"
+            "waiting for you to approve — this screen moves on by itself once you do (33s) · expires in 30 min"
         );
         // Past expiry must not underflow into a huge number.
         assert_eq!(
             waiting_status(9_000, 1800),
-            "waiting for approval — 9000s · link expires in 0 min"
+            "waiting for you to approve — this screen moves on by itself once you do (9000s) · expires in 0 min"
         );
     }
 

@@ -17,6 +17,8 @@ struct StatusOutput {
 #[derive(Debug, Serialize)]
 struct InstanceStatus {
     account: String,
+    account_id: String,
+    host_name: Option<String>,
     config_dir: String,
     server: String,
     /// A stored daemon token exists; scripts test this instead of parsing the
@@ -25,10 +27,22 @@ struct InstanceStatus {
     connection: String,
     service: crate::service::ServiceStatus,
     sessions: usize,
+    session_workers: Vec<String>,
     version: String,
     update: String,
     host_key: Option<String>,
     browser_pins: usize,
+    browser_connections: Vec<BrowserConnectionStatus>,
+    compatibility_notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserConnectionStatus {
+    pin_id: Option<String>,
+    device_id: String,
+    name: Option<String>,
+    platform: Option<String>,
+    fingerprint: Option<String>,
 }
 
 pub async fn run(
@@ -71,27 +85,96 @@ fn instance_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
 async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<InstanceStatus> {
     let _guard = ConfigDirGuard::set(dir);
     let stored = crate::creds::load().context("loading stored credentials")?;
-    let server = crate::config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
+    let server =
+        crate::config::server_url_for_instance(server_cli.clone(), stored.server_url.as_deref())?;
     let heartbeat = crate::state::read(dir).ok().flatten();
     let connection = connection_text(heartbeat.as_ref());
     let sessions = heartbeat.as_ref().map_or(0, |state| state.sessions);
     let update = release_state(&server).await;
     let host_key = crate::creds::host_identity(&stored)?.map(|identity| identity.fingerprint);
+    let mut account_id = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "default".into());
+    let mut account = account_id.clone();
+    let mut host_name = None;
+    let mut compatibility_notes = Vec::new();
+    let mut browser_connections = stored
+        .browser_pins()
+        .iter()
+        .map(|pin| BrowserConnectionStatus {
+            pin_id: None,
+            device_id: pin.device_id().to_string(),
+            name: None,
+            platform: None,
+            fingerprint: Some(pin.fingerprint().to_owned()),
+        })
+        .collect::<Vec<_>>();
+    if stored.is_logged_in() {
+        match crate::manage::HostClient::load(server_cli) {
+            Ok(client) => {
+                let (host_result, pins_result) = tokio::join!(client.host(), client.pins());
+                match host_result {
+                    Ok(Some(host)) => {
+                        account_id = host.account.id.clone();
+                        account = host.account_label().to_owned();
+                        host_name = Some(host.name);
+                    }
+                    Ok(None) => compatibility_notes.push(
+                        "your server doesn't support named account details yet; showing the account UUID"
+                            .into(),
+                    ),
+                    Err(error) => compatibility_notes
+                        .push(format!("named account details unavailable: {error}")),
+                }
+                match pins_result {
+                    Ok(Some(pins)) => {
+                        browser_connections = pins
+                            .into_iter()
+                            .map(|pin| BrowserConnectionStatus {
+                                pin_id: Some(pin.pin_id),
+                                device_id: pin.device_id,
+                                name: pin.name,
+                                platform: pin.platform,
+                                fingerprint: None,
+                            })
+                            .collect();
+                    }
+                    Ok(None) => compatibility_notes.push(
+                        "your server doesn't support named browser connections yet; showing local identities"
+                            .into(),
+                    ),
+                    Err(error) => compatibility_notes
+                        .push(format!("named browser connections unavailable: {error}")),
+                }
+            }
+            Err(error) => {
+                compatibility_notes.push(format!("server inventory unavailable: {error}"))
+            }
+        }
+    }
+    let mut session_workers = crate::worker_backend::discover_ids()
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    session_workers.sort();
     Ok(InstanceStatus {
-        account: dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "default".into()),
+        account,
+        account_id,
+        host_name,
         config_dir: dir.display().to_string(),
         server: server.to_string(),
         signed_in: stored.is_logged_in(),
         connection,
         service: crate::service::status(dir),
         sessions,
+        session_workers,
         version: crate::version::build_version(),
         update,
         host_key,
-        browser_pins: stored.browser_pins().len(),
+        browser_pins: browser_connections.len(),
+        browser_connections,
+        compatibility_notes,
     })
 }
 
@@ -138,6 +221,13 @@ fn format_age(connected_at: i64) -> String {
 }
 
 async fn release_state(server: &url::Url) -> String {
+    if crate::version::is_local_build()
+        && !std::env::var("SPAWND_ALLOW_LOCAL_SELF_UPDATE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        return "local build; automatic update disabled (override: SPAWND_ALLOW_LOCAL_SELF_UPDATE=1)"
+            .into();
+    }
     #[derive(serde::Deserialize)]
     struct Release {
         daemon: Option<Daemon>,
@@ -172,12 +262,26 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
     use std::fmt::Write;
 
     let mut text = String::new();
+    let _ = writeln!(text, "SPAWN D on {}", output.host);
+    let _ = writeln!(
+        text,
+        "Account instances on this machine: {}",
+        output.instances.len()
+    );
     for (index, instance) in output.instances.iter().enumerate() {
-        if index > 0 {
-            text.push('\n');
+        text.push('\n');
+        if output.instances.len() > 1 {
+            let _ = writeln!(text, "Instance {}", index + 1);
         }
-        let _ = writeln!(text, "SPAWN D on {}", output.host);
-        let _ = writeln!(text, "  account      {}", instance.account);
+        let account = if instance.account == instance.account_id {
+            instance.account.clone()
+        } else {
+            format!("{} ({})", instance.account, instance.account_id)
+        };
+        let _ = writeln!(text, "  account      {account}");
+        if let Some(host_name) = &instance.host_name {
+            let _ = writeln!(text, "  machine      {host_name}");
+        }
         let _ = writeln!(text, "  server       {}", instance.server);
         let _ = writeln!(text, "  connection   {}", instance.connection);
         let service = if instance.service.running {
@@ -188,7 +292,14 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
             "not installed".into()
         };
         let _ = writeln!(text, "  service      {service}");
-        let _ = writeln!(text, "  sessions     {} running", instance.sessions);
+        let _ = writeln!(
+            text,
+            "  sessions     {} reported running",
+            instance.sessions
+        );
+        for worker in &instance.session_workers {
+            let _ = writeln!(text, "               session {worker}");
+        }
         let _ = writeln!(
             text,
             "  version      {} · {}",
@@ -201,13 +312,29 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
             abbreviate(fingerprint)
         };
         let _ = writeln!(text, "  host key     {shown}");
-        let _ = writeln!(text, "  browser pins {}", instance.browser_pins);
-    }
-    let others = output.instances.len().saturating_sub(1);
-    if others == 0 {
-        text.push_str("\nOther instances on this machine: none\n");
-    } else {
-        let _ = writeln!(text, "\nOther instances on this machine: {others}");
+        let _ = writeln!(
+            text,
+            "  browsers     {} approved connection(s)",
+            instance.browser_pins
+        );
+        for pin in &instance.browser_connections {
+            let name = pin
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("browser {}", abbreviate(&pin.device_id)));
+            let detail = pin
+                .platform
+                .as_deref()
+                .filter(|platform| !platform.trim().is_empty())
+                .or(pin.fingerprint.as_deref())
+                .unwrap_or("details unavailable");
+            let _ = writeln!(text, "               {name} — {detail}");
+        }
+        for note in &instance.compatibility_notes {
+            let _ = writeln!(text, "  note         {note}");
+        }
     }
     text
 }
@@ -271,6 +398,8 @@ mod tests {
             host: "mac-studio".into(),
             instances: vec![InstanceStatus {
                 account: "9f1c2d3e".into(),
+                account_id: "9f1c2d3e".into(),
+                host_name: Some("mac-studio".into()),
                 config_dir: "/tmp/spawn/9f1c2d3e".into(),
                 server: "https://spawnd.dev/".into(),
                 signed_in: true,
@@ -284,21 +413,39 @@ mod tests {
                     stderr_log: None,
                 },
                 sessions: 2,
+                session_workers: vec!["00000000-0000-0000-0000-000000000001".into()],
                 version: "0.4.2".into(),
                 update: "up to date".into(),
                 host_key: Some("SHA256:Yr0kQmVd12345678".into()),
                 browser_pins: 3,
+                browser_connections: vec![BrowserConnectionStatus {
+                    pin_id: Some("pin-1".into()),
+                    device_id: "device-1".into(),
+                    name: Some("Charlie's MacBook".into()),
+                    platform: Some("macOS".into()),
+                    fingerprint: None,
+                }],
+                compatibility_notes: Vec::new(),
             }],
         };
         let plain = format_plain(&output, 0);
         assert!(plain.starts_with("SPAWN D on mac-studio\n"));
+        assert!(plain.contains("Account instances on this machine: 1\n"));
         assert!(plain.contains("  connection   connected · 42 min · last error: none\n"));
         assert!(plain.contains("  service      running (launchd app.spawn.spawnd.3f9ac3e1)\n"));
-        assert!(plain.ends_with("Other instances on this machine: none\n"));
+        assert!(plain.contains("Charlie's MacBook — macOS\n"));
+        assert!(!plain.contains("Other instances on this machine"));
 
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["host"], "mac-studio");
         assert_eq!(json["instances"][0]["sessions"], 2);
+        assert_eq!(
+            json["instances"][0]["session_workers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(json["instances"][0]["service"]["running"], true);
         assert_eq!(json["instances"][0]["browser_pins"], 3);
     }

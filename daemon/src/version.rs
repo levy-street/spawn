@@ -7,6 +7,7 @@
 pub const BUILD_VERSION: &str = env!("SPAWND_BUILD_VERSION");
 pub const DAEMON_TREE: &str = env!("SPAWND_DAEMON_TREE");
 pub const BUILD_COUNTER_RAW: &str = env!("SPAWND_BUILD_COUNTER");
+pub const OFFICIAL_BUILD_RAW: &str = env!("SPAWND_OFFICIAL_BUILD");
 
 pub fn build_version() -> String {
     BUILD_VERSION.to_string()
@@ -22,6 +23,13 @@ pub fn daemon_tree() -> Option<&'static str> {
 /// made outside git have no counter and therefore no local downgrade floor.
 pub fn build_counter() -> Option<u64> {
     BUILD_COUNTER_RAW.parse().ok()
+}
+
+/// Local/source builds stay under the developer's control. They never accept
+/// an automatic server update unless the runtime override explicitly permits
+/// replacing them.
+pub fn is_local_build() -> bool {
+    OFFICIAL_BUILD_RAW != "1"
 }
 
 /// Stable, machine-readable identity emitted by `spawn-worker --version`.

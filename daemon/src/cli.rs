@@ -60,10 +60,20 @@ pub enum Command {
     Disconnect,
     /// Wipe the complete stored credential record, including browser pins.
     Logout(LogoutArgs),
-    /// Wipe all local SPAWN D state without contacting the server.
+    /// Wipe local SPAWN D state, with an opt-in server-side host removal.
     Reset(ResetArgs),
     /// Print credential state and redacted host/browser fingerprints.
     Status(StatusArgs),
+    /// Open the arrow-key menu for connections, approvals, sessions, and accounts.
+    Manage,
+    /// List or remove browser connections for this machine.
+    Pins(PinsArgs),
+    /// List or approve pending device requests for this account.
+    Approvals(ApprovalsArgs),
+    /// List or stop individual session workers.
+    Sessions(SessionsArgs),
+    /// List or remove account instances on this machine.
+    Instances(InstancesArgs),
     /// Internal HKCU Run watchdog entry point.
     #[command(name = "__watchdog", hide = true)]
     Watchdog(WatchdogArgs),
@@ -168,6 +178,74 @@ pub struct StatusArgs {
 
 #[derive(Debug, Args)]
 #[command(
+    after_help = "Examples:\n  spawnd pins\n  spawnd pins remove <PIN_ID>\n  spawnd pins clear --yes"
+)]
+pub struct PinsArgs {
+    #[command(subcommand)]
+    pub command: Option<PinsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PinsCommand {
+    /// Remove one browser connection by pin ID.
+    Remove { pin_id: String },
+    /// Remove every browser connection from this machine.
+    Clear {
+        /// Skip the destructive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "Examples:\n  spawnd approvals\n  spawnd approvals approve <REQUEST_ID>")]
+pub struct ApprovalsArgs {
+    #[command(subcommand)]
+    pub command: Option<ApprovalsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApprovalsCommand {
+    /// Approve one pending device request by request ID.
+    Approve { request_id: String },
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "Examples:\n  spawnd sessions\n  spawnd sessions kill <SESSION_ID>")]
+pub struct SessionsArgs {
+    #[command(subcommand)]
+    pub command: Option<SessionsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionsCommand {
+    /// Stop one local session worker by session UUID.
+    Kill { session_id: String },
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  spawnd instances\n  spawnd instances exorcise <ACCOUNT> --yes"
+)]
+pub struct InstancesArgs {
+    #[command(subcommand)]
+    pub command: Option<InstancesCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InstancesCommand {
+    /// Deregister and remove one account instance.
+    Exorcise {
+        /// Account/instance directory name shown by `spawnd instances`.
+        instance: String,
+        /// Skip the destructive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+#[command(
     after_help = "Examples:\n  spawnd doctor\n  spawnd doctor --json   # for scripts and support bundles"
 )]
 pub struct DoctorArgs {
@@ -186,13 +264,17 @@ pub struct LogoutArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    long_about = "Wipe all local SPAWN D state without contacting the server.\n\nThis removes this machine's SPAWN D identity, sign-in, and approvals — but never your files or the sessions' working directories. The server is not contacted.",
-    after_help = "Examples:\n  spawnd reset\n  spawnd reset --yes"
+    long_about = "Wipe all local SPAWN D state, with an opt-in offer to remove the server-side host too.\n\nThis removes this machine's SPAWN D identity, sign-in, and approvals — but never your files or the sessions' working directories.",
+    after_help = "Examples:\n  spawnd reset\n  spawnd reset --yes\n  spawnd reset --yes --remove-host"
 )]
 pub struct ResetArgs {
     /// Skip confirmations, including the running-worker confirmation.
     #[arg(long)]
     pub yes: bool,
+
+    /// Also remove this host from the account before wiping local credentials.
+    #[arg(long)]
+    pub remove_host: bool,
 }
 
 pub const TOP_LEVEL_HELP: &str = r#"spawnd — the SPAWN D daemon. It possesses a machine and answers to your account.
@@ -206,6 +288,7 @@ Summoning:
 
 Every day:
   status       What this machine knows: account, connection, service, sessions.
+  manage       Manage connections, approvals, sessions, and account instances.
   doctor       Run every health check; each failure comes with its fix.
   reconnect    Drop and re-establish the server connection right now.
   disconnect   Stop the background daemon. Nothing is removed.
@@ -215,6 +298,10 @@ Account:
   login        Re-run the browser approval for this machine.
   logout       Sign this machine out. Its identity is kept for next time.
   reset        Wipe all local SPAWN D state on this machine. Last resort.
+  pins         List/remove this machine's approved browser connections.
+  approvals    List/approve pending device requests.
+  sessions     List/stop individual session workers.
+  instances    List/remove account instances on this machine.
 
 Advanced:
   run          Run the daemon in the foreground (what the service runs).

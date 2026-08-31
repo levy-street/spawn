@@ -162,6 +162,64 @@ pub fn read(config_dir: &Path) -> Result<Option<StateFile>> {
         .map(Some)
 }
 
+const ICE_SERVER_CACHE: &str = "ice-server-urls.json";
+
+/// Remember only the non-secret URLs from the latest server-provided ICE
+/// configuration. TURN usernames and credentials are deliberately never put
+/// on disk; doctor needs listener reachability, not admission secrets.
+pub fn remember_ice_server_urls(
+    config_dir: &Path,
+    urls: impl IntoIterator<Item = String>,
+) -> Result<()> {
+    let mut urls = urls
+        .into_iter()
+        .filter(|url| url.len() <= 2_048)
+        .filter(|url| {
+            let lower = url.to_ascii_lowercase();
+            ["stun:", "stuns:", "turn:", "turns:"]
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+        })
+        .take(32)
+        .collect::<Vec<_>>();
+    urls.sort();
+    urls.dedup();
+    if urls.is_empty() || read_ice_server_urls(config_dir).is_ok_and(|current| current == urls) {
+        return Ok(());
+    }
+    crate::platform::create_private_dir_all(config_dir)?;
+    let path = config_dir.join(ICE_SERVER_CACHE);
+    let temporary = config_dir.join(format!(
+        ".{ICE_SERVER_CACHE}.tmp.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = crate::platform::create_private_file_new(&temporary)?;
+        file.write_all(&serde_json::to_vec(&urls)?)?;
+        file.sync_all()?;
+        crate::platform::durable_replace(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+pub fn read_ice_server_urls(config_dir: &Path) -> Result<Vec<String>> {
+    let path = config_dir.join(ICE_SERVER_CACHE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if bytes.len() > 64 * 1024 {
+        anyhow::bail!("ICE server URL cache is oversized")
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))
+}
+
 pub fn heartbeat_is_fresh(config_dir: &Path, max_age: std::time::Duration) -> bool {
     fs::metadata(state_path(config_dir))
         .and_then(|metadata| metadata.modified())

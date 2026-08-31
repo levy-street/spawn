@@ -4,6 +4,7 @@ use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
@@ -304,6 +305,54 @@ pub fn enable_raw_mode() -> Option<RawModeGuard> {
     cfmakeraw(&mut raw);
     tcsetattr(&stdin, SetArg::TCSANOW, &raw).ok()?;
     Some(RawModeGuard { saved })
+}
+
+/// Wait for a complete terminal line without holding Rust's global stdin lock.
+///
+/// In canonical mode `poll` reports readable only after Enter (or EOF), so the
+/// eventual `read_line` cannot remain blocked. Checking `done` between short
+/// polls lets an approval completed on another device retire this listener
+/// before a later prompt needs stdin.
+pub fn wait_for_enter_until(done: &AtomicBool) -> bool {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    let mut descriptor = nix::libc::pollfd {
+        fd: nix::libc::STDIN_FILENO,
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+    while !done.load(Ordering::Acquire) {
+        // SAFETY: descriptor points to one live pollfd for the duration of the
+        // call; poll neither retains nor takes ownership of it.
+        let ready = unsafe { nix::libc::poll(&mut descriptor, 1, 100) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if ready == 0 {
+            continue;
+        }
+        if descriptor.revents & nix::libc::POLLIN == 0 {
+            if descriptor.revents & (nix::libc::POLLERR | nix::libc::POLLHUP | nix::libc::POLLNVAL)
+                != 0
+            {
+                return false;
+            }
+            continue;
+        }
+        if done.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut line = String::new();
+        return matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0);
+    }
+    false
 }
 
 impl Drop for RawModeGuard {

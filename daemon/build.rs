@@ -37,6 +37,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SPAWND_DAEMON_TREE_OVERRIDE");
     println!("cargo:rerun-if-env-changed=SPAWND_BUILD_COUNTER_OVERRIDE");
     println!("cargo:rerun-if-env-changed=SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE");
+    println!("cargo:rerun-if-env-changed=SPAWND_OFFICIAL_BUILD");
 
     let tree_override = std::env::var("SPAWND_DAEMON_TREE_OVERRIDE").unwrap_or_default();
     let tree = Command::new("git")
@@ -81,6 +82,23 @@ fn main() {
                 .unwrap_or_default()
         });
     println!("cargo:rustc-env=SPAWND_BUILD_COUNTER={counter}");
+
+    // Only the protected master prebuilt workflow produces the install
+    // channel's release binaries. Everything else is a local/development
+    // build and must not silently replace itself from whichever server it is
+    // testing. Packagers outside that workflow can opt in at build time.
+    let official_override = std::env::var("SPAWND_OFFICIAL_BUILD")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let protected_master_build = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+        && std::env::var("GITHUB_REF").as_deref() == Ok("refs/heads/master");
+    println!(
+        "cargo:rustc-env=SPAWND_OFFICIAL_BUILD={}",
+        if official_override || protected_master_build {
+            "1"
+        } else {
+            "0"
+        }
+    );
 
     let release_keys = std::env::var("SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE")
         .ok()

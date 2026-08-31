@@ -6,6 +6,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -38,11 +39,11 @@ use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode,
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, ReadConsoleInputW, SetConsoleMode,
     CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
     ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, INPUT_RECORD, KEY_EVENT,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
 use windows_sys::Win32::System::Threading::{
@@ -836,6 +837,49 @@ pub fn enable_raw_mode() -> Option<RawModeGuard> {
         handle: handle as isize,
         saved,
     })
+}
+
+/// Consume console key records until Enter, checking `done` every 100 ms.
+///
+/// This uses the console event API instead of `stdin().read_line`, because a
+/// line read cannot be cancelled after another device approves the login and
+/// would retain stdin across any prompt that follows the ceremony.
+pub fn wait_for_enter_until(done: &AtomicBool) -> bool {
+    // SAFETY: GetStdHandle returns a process-owned borrowed console handle.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    while !done.load(Ordering::Acquire) {
+        // SAFETY: handle remains process-owned and valid for this wait.
+        match unsafe { WaitForSingleObject(handle, 100) } {
+            WAIT_TIMEOUT => continue,
+            WAIT_OBJECT_0 => {}
+            _ => return false,
+        }
+        if done.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut record = INPUT_RECORD::default();
+        let mut read = 0_u32;
+        // SAFETY: record and read are valid out-pointers for a single event;
+        // the borrowed console handle is not closed by this call.
+        if unsafe { ReadConsoleInputW(handle, &mut record, 1, &mut read) } == 0 || read == 0 {
+            return false;
+        }
+        if record.EventType as u32 == KEY_EVENT {
+            // SAFETY: EventType identifies the active union member.
+            let key = unsafe { record.Event.KeyEvent };
+            if key.bKeyDown != 0 {
+                // SAFETY: UnicodeChar is the active representation for the W API.
+                let character = unsafe { key.uChar.UnicodeChar };
+                if character == b'\r' as u16 || character == b'\n' as u16 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn raw_console_mode(saved: u32) -> u32 {

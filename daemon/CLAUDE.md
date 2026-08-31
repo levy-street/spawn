@@ -41,9 +41,13 @@ src/
                  pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
-  state.rs       atomic local daemon heartbeat contract (`state.json`)
+  state.rs       atomic local daemon heartbeat contract (`state.json`) and the
+                 non-secret ICE URL cache used by doctor reachability probes
   status.rs      human/JSON status across local account instances
-  doctor.rs      the ordered 14-check local health report, plus the Windows
+  manage.rs      daemon-authenticated host inventory and the arrow-key machine
+                 management menu plus scriptable pin/approval/session/instance
+                 commands
+  doctor.rs      the ordered 15-check local health report, plus the Windows
                  agent-shell dependency diagnostic
   lifecycle.rs   reconnect, disconnect, logout, and local reset commands
   version.rs     the version the daemon reports; build.rs stamps the source
@@ -325,11 +329,19 @@ harness builds may set `SPAWND_DAEMON_TREE_OVERRIDE`,
 `SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE`. `SPAWND_ALLOW_UNSIGNED_UPDATE=1` is a
 local-development-only escape hatch that skips the signature and counter
 checks, emits one warning, and must never be used by production tooling.
+Local/development builds do not self-update at all unless
+`SPAWND_ALLOW_LOCAL_SELF_UPDATE=1` explicitly permits the server release to
+replace them. Official prebuilts are stamped only by the protected master
+workflow (or a packager setting `SPAWND_OFFICIAL_BUILD=1` at build time).
 
 The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
-`status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,
-`reset`, and foreground-only `run`. `possess --new-account` creates another
-isolated account instance. On Windows, `possess --service-mode task|run`
+`status`, `manage`, `pins`, `approvals`, `sessions`, `instances`, `doctor`,
+`reconnect`, `disconnect`, `update`, `login`, `logout`, `reset`, and
+foreground-only `run`. `manage` is the arrow-key UI; the four inventory nouns
+are its scriptable equivalents. `reset` offers to remove the authenticated
+server-side host before wiping local credentials, and `--remove-host` makes
+that opt-in explicit for unattended use. `possess --new-account` creates
+another isolated account instance. On Windows, `possess --service-mode task|run`
 selects and persists the instance's background manager; a denied task
 breakaway is offered as a switch to the Run watchdog on the next `possess`.
 `run` writes `state.json` atomically (`<config_dir>` on Unix,

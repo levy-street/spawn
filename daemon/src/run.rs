@@ -1954,6 +1954,16 @@ async fn dispatch_loop(
                         tracing::warn!("rejecting mixed signed/raw RTC offer");
                         continue;
                     }
+                    if let Ok(config_dir) = crate::config::config_dir() {
+                        let urls = ice_servers
+                            .iter()
+                            .flat_map(|server| server.urls.iter().cloned());
+                        if let Err(error) =
+                            crate::state::remember_ice_server_urls(&config_dir, urls)
+                        {
+                            tracing::warn!(%error, "remembering configured ICE server URLs for doctor");
+                        }
+                    }
                     // A signed offer must prove possession of a key this host
                     // trusts — directly pinned, or reached through a carried
                     // endorsement chain to an anchor — and describe exactly this

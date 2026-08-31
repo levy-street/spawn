@@ -26,6 +26,7 @@ mod host_preview;
 mod host_signal;
 mod lifecycle;
 mod login;
+mod manage;
 mod platform;
 mod possess;
 mod proto;
@@ -80,8 +81,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
         Command::Login(args) => {
             let no_run = args.no_run;
-            login::run(cli.server.clone(), args).await?;
-            if no_run {
+            let outcome = login::run(cli.server.clone(), args).await?;
+            if no_run || outcome.service_reconfigured {
                 return Ok(());
             }
             tracing::info!("login complete; transitioning to run");
@@ -102,6 +103,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Reset(args) => lifecycle::reset(args, explicit_config).await,
         Command::Status(args) => {
             status::run(cli.server.clone(), args, explicit_config, cli.verbose).await
+        }
+        Command::Manage => manage::run_menu(cli.server.clone(), explicit_config).await,
+        Command::Pins(args) => manage::run_pins(cli.server.clone(), args).await,
+        Command::Approvals(args) => manage::run_approvals(cli.server.clone(), args).await,
+        Command::Sessions(args) => manage::run_sessions(args).await,
+        Command::Instances(args) => {
+            manage::run_instances(cli.server.clone(), args, explicit_config).await
         }
         Command::Watchdog(args) => service::run_watchdog(&args.instance).await,
         Command::UpdateHandoff(args) => update::relaunch_after_parent_exit(args.parent_pid),

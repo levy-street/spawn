@@ -292,6 +292,53 @@ pub(super) fn xml_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+fn xml_element(contents: &str, element: &str) -> Option<String> {
+    let open = format!("<{element}>");
+    let close = format!("</{element}>");
+    let rest = contents.split_once(&open)?.1;
+    let value = rest.split_once(&close)?.0;
+    Some(xml_unescape(value))
+}
+
+fn launchd_server(contents: &str) -> Option<String> {
+    let rest = contents.split_once("<string>--server</string>")?.1;
+    xml_element(rest, "string")
+}
+
+pub(super) fn extract_server_argument(arguments: &str) -> Option<String> {
+    let rest = arguments.split_once("--server")?.1.trim_start();
+    if let Some(rest) = rest.strip_prefix('"') {
+        let mut value = String::new();
+        let mut escaped = false;
+        for character in rest.chars() {
+            if escaped {
+                value.push(character);
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                return Some(value.replace("%%", "%"));
+            } else {
+                value.push(character);
+            }
+        }
+        None
+    } else {
+        rest.split_whitespace()
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.replace("%%", "%"))
+    }
+}
+
 fn launchd_plist(config_dir: &Path, bin: &Path, server: &str, state: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -444,7 +491,7 @@ fn registered_server(config_dir: &Path, chosen: &str) -> String {
 }
 
 /// Origin comparison in the same terms `run` uses to accept or refuse a unit.
-fn same_origin(left: &str, right: &str) -> bool {
+pub(crate) fn same_origin(left: &str, right: &str) -> bool {
     match (
         crate::creds::canonical_server_origin(left),
         crate::creds::canonical_server_origin(right),
@@ -623,16 +670,8 @@ pub fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let uid = nix::unistd::Uid::effective().as_raw();
-        let target = format!("gui/{uid}/{}", launchd_label(config_dir));
-        let result = Command::new("launchctl")
-            .args(["kickstart", "-k", &target])
-            .status()
-            .context("running launchctl kickstart")?;
-        if !result.success() {
-            bail!("launchctl kickstart failed")
-        }
-        return Ok(());
+        let server = registered_server(config_dir, server);
+        return launchd_install(config_dir, &server);
     }
     #[cfg(windows)]
     {
@@ -643,14 +682,56 @@ pub fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let name = systemd_unit_name(config_dir);
-        if !systemctl(&["restart", &name])? {
-            bail!("systemctl --user restart {name} failed")
-        }
-        return Ok(());
+        let server = registered_server(config_dir, server);
+        return systemd_install(config_dir, &server);
     }
     #[allow(unreachable_code)]
     install(config_dir, server)
+}
+
+/// The server origin currently baked into this instance's installed service.
+/// Doctor compares it to credentials without starting or rewriting anything.
+pub fn configured_server(config_dir: &Path) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = launchd_plist_path(config_dir)?;
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        return launchd_server(&contents)
+            .context("launchd plist has no --server argument")
+            .map(Some);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = systemd_unit_path(config_dir)?;
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let exec = contents
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .context("systemd unit has no ExecStart")?;
+        return extract_server_argument(exec)
+            .context("systemd unit has no --server argument")
+            .map(Some);
+    }
+    #[cfg(windows)]
+    {
+        return Ok(match preferred_mode(config_dir) {
+            ServiceMode::Task => windows_task::configured_server(config_dir),
+            ServiceMode::Run => windows_run::configured_server(config_dir),
+        });
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = config_dir;
+        Ok(None)
+    }
 }
 
 /// Windows background manager selected per account instance. The preference
@@ -921,6 +1002,25 @@ mod tests {
         assert!(plist.contains("&amp;")); // the '&' in the path is escaped
         assert!(!plist.contains(" & ")); // no raw ampersand leaked
         assert!(plist.contains("<key>KeepAlive</key><true/>"));
+        assert_eq!(
+            launchd_server(&plist).as_deref(),
+            Some("https://spawnd.dev")
+        );
+    }
+
+    #[test]
+    fn installed_server_extractors_reverse_the_daemon_writers() {
+        let dir = Path::new("/srv/spawn/alice");
+        let server = "https://example.test/a%20b?x=1&y=2";
+        let unit = systemd_unit_contents(dir, Path::new("/usr/bin/spawnd"), server);
+        let exec = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .unwrap();
+        assert_eq!(extract_server_argument(exec).as_deref(), Some(server));
+
+        let plist = launchd_plist(dir, Path::new("/usr/bin/spawnd"), server, Path::new("/tmp"));
+        assert_eq!(launchd_server(&plist).as_deref(), Some(server));
     }
 
     fn instance_with_server(server: Option<&str>) -> tempfile::TempDir {

@@ -9,15 +9,6 @@ use crate::cli::{LogoutArgs, ResetArgs};
 pub async fn reconnect(server_cli: Option<String>, explicit_config: bool) -> Result<()> {
     for dir in selected_dirs(explicit_config)? {
         let _guard = ConfigDirGuard::set(&dir);
-        #[cfg(unix)]
-        {
-            if let Some(state) = crate::state::read(&dir).ok().flatten() {
-                if crate::state::pid_is_alive(state.pid) && send_sighup(state.pid) {
-                    println!("spawn: reconnect requested for {}.", instance_name(&dir));
-                    continue;
-                }
-            }
-        }
         let stored = crate::creds::load().context("loading stored credentials")?;
         let server = crate::config::server_url_for_instance(
             server_cli.clone(),
@@ -80,6 +71,20 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
         return Ok(());
     }
 
+    let remove_host = args.remove_host
+        || (!args.yes
+            && crate::tui::prompt_choice(
+                "REMOVE THE SERVER-SIDE HOST TOO?",
+                &[
+                    ("Keep the account entry", "wipe only this machine"),
+                    (
+                        "Remove it from the account",
+                        "also releases this machine's claimed identity key",
+                    ),
+                ],
+                0,
+            ) == 1);
+
     let mut workers = Vec::new();
     for dir in &dirs {
         let _guard = ConfigDirGuard::set(dir);
@@ -126,8 +131,40 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
     }
     println!("spawn: terminated {terminated} session worker(s).");
 
+    let mut server_cleanup_failed = false;
     for dir in dirs {
         let _guard = ConfigDirGuard::set(&dir);
+        if remove_host {
+            match crate::creds::load() {
+                Ok(stored) => {
+                    if let (Some(token), Some(_host_id)) =
+                        (stored.access_token.as_deref(), stored.host_id)
+                    {
+                        match crate::config::server_url_for_instance(
+                            None,
+                            stored.server_url.as_deref(),
+                        ) {
+                            Ok(server) => {
+                                if let Err(error) =
+                                    crate::possess::deregister_self(&server, token).await
+                                {
+                                    server_cleanup_failed = true;
+                                    tracing::warn!(%error, "removing the server-side host during reset");
+                                }
+                            }
+                            Err(error) => {
+                                server_cleanup_failed = true;
+                                tracing::warn!(%error, "resolving the server-side host during reset");
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    server_cleanup_failed = true;
+                    tracing::warn!(%error, "loading the server-side host during reset");
+                }
+            }
+        }
         let _ = crate::service::uninstall(&dir);
         crate::creds::reset_local_credentials()?;
         crate::service::purge_local_instance_data(&dir)?;
@@ -137,7 +174,13 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
             }
         }
     }
-    println!("spawn: This machine is clean. The old entry may still show under Hosts on the web — remove it there.");
+    if remove_host && !server_cleanup_failed {
+        println!("spawn: This machine is clean, and its server-side host was removed.");
+    } else if remove_host {
+        println!("spawn: This machine is clean. SPAWN D could not remove every server-side host; an old entry may still appear in the app.");
+    } else {
+        println!("spawn: This machine is clean. Its account entry was kept on the server.");
+    }
     println!("spawn: To set up again: spawnd possess.");
     Ok(())
 }
@@ -159,17 +202,6 @@ fn instance_name(dir: &Path) -> String {
     dir.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "default".into())
-}
-
-#[cfg(unix)]
-fn send_sighup(pid: u32) -> bool {
-    i32::try_from(pid).is_ok_and(|pid| {
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            Some(nix::sys::signal::Signal::SIGHUP),
-        )
-        .is_ok()
-    })
 }
 
 struct ConfigDirGuard(Option<std::ffi::OsString>);

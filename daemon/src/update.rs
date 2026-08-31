@@ -96,6 +96,7 @@ impl std::error::Error for UpdateFailure {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockReason {
     Disabled,
+    LocalBuild,
     Unwritable,
     UnsupportedTarget,
     WorkerMissing,
@@ -107,6 +108,7 @@ impl BlockReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::LocalBuild => "local_build",
             Self::Unwritable => "unwritable",
             Self::UnsupportedTarget => "unsupported_target",
             Self::WorkerMissing => "worker_missing",
@@ -452,12 +454,16 @@ pub async fn apply(
 ) -> Result<AppliedUpdate, UpdateFailure> {
     log_stage(UpdateStage::Precondition);
     let permit = acquire_update()?;
+    guard_local_build()?;
     let preconditions = evaluate_preconditions().map_err(UpdateFailure::from)?;
     apply_guarded(server_origin, &request, preconditions, permit).await
 }
 
 pub async fn apply_from_release(server: &Url) -> Result<HttpUpdateOutcome, UpdateFailure> {
     log_stage(UpdateStage::Precondition);
+    if crate::version::is_local_build() && !local_build_update_override() {
+        return Ok(HttpUpdateOutcome::NoUpdate("local_build"));
+    }
     let permit = acquire_update()?;
     let preconditions = evaluate_preconditions().map_err(UpdateFailure::from)?;
     log_stage(UpdateStage::Download);
@@ -776,7 +782,24 @@ fn finish_cli_update(applied: AppliedUpdate, _server: &Url) -> Result<()> {
 }
 
 fn cli_no_update_line(reason: &str) -> String {
+    if reason == "local_build" {
+        return "SPAWN D is running a local/development build; automatic update is disabled. Set SPAWND_ALLOW_LOCAL_SELF_UPDATE=1 to replace it deliberately."
+            .into();
+    }
     format!("SPAWN D daemon update not applied ({reason}).")
+}
+
+fn local_build_update_override() -> bool {
+    std::env::var("SPAWND_ALLOW_LOCAL_SELF_UPDATE")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn guard_local_build() -> Result<(), UpdateFailure> {
+    if crate::version::is_local_build() && !local_build_update_override() {
+        Err(BlockReason::LocalBuild.into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Re-check the co-installed worker identity and publish the result through
@@ -1196,6 +1219,9 @@ fn acquire_from(flag: &AtomicBool) -> Result<UpdatePermit<'_>, UpdateFailure> {
 }
 
 fn evaluate_preconditions() -> Result<Preconditions, BlockReason> {
+    if crate::version::is_local_build() && !local_build_update_override() {
+        return Err(BlockReason::LocalBuild);
+    }
     let disabled = std::env::var_os("SPAWND_NO_SELF_UPDATE").is_some_and(|value| !value.is_empty());
     let daemon_path = std::env::current_exe().ok().and_then(resolve_file);
     let worker_path = resolve_program(crate::worker_backend::worker_bin());

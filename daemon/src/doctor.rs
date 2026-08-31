@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use anyhow::{bail, Context};
 use serde::Serialize;
 use sha2::Digest;
 
@@ -60,7 +61,7 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
     let version = crate::version::build_version();
     let config_dir = crate::config::config_dir().ok();
     let credentials = crate::creds::load();
-    let mut checks = Vec::with_capacity(if cfg!(windows) { 15 } else { 14 });
+    let mut checks = Vec::with_capacity(if cfg!(windows) { 16 } else { 15 });
 
     checks.push(match &credentials {
         Ok(_) => ok(1, "credentials", "readable"),
@@ -246,6 +247,13 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
     let capability = crate::update::capability();
     checks.push(if capability.self_update {
         ok(11, "self-update ready", "install dir writable")
+    } else if capability.blocked == Some("local_build") {
+        warn(
+            11,
+            "self-update ready",
+            "local/development build; automatic update disabled",
+            "set SPAWND_ALLOW_LOCAL_SELF_UPDATE=1 only when you deliberately want the server release to replace this build",
+        )
     } else if capability.blocked == Some("unwritable") {
         warn(
             11,
@@ -269,7 +277,11 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
         Some(dir) => permissions_check(dir),
         None => skip(13, "file permissions", "config unavailable"),
     });
-    checks.push(probe_udp().await);
+    checks.push(probe_udp(config_dir.as_deref()).await);
+    checks.push(service_server_check(
+        config_dir.as_deref(),
+        credentials.as_ref().ok(),
+    ));
     #[cfg(windows)]
     checks.push(windows_agent_shell_check());
 
@@ -326,7 +338,7 @@ fn windows_agent_shell_check_for(
 ) -> Check {
     if claude && !powershell && !git_bash {
         return fail(
-            15,
+            16,
             "agent shell",
             "Claude Code has neither PowerShell nor Git Bash",
             "install PowerShell or Git for Windows, then run spawnd doctor again",
@@ -334,7 +346,7 @@ fn windows_agent_shell_check_for(
     }
     if !powershell && !comspec {
         return fail(
-            15,
+            16,
             "agent shell",
             "no PowerShell or COMSPEC shell is available",
             "repair Windows PowerShell or install PowerShell 7",
@@ -342,14 +354,14 @@ fn windows_agent_shell_check_for(
     }
     if claude && !git_bash {
         return warn(
-            15,
+            16,
             "agent shell",
             "Claude Code can use PowerShell, but Bash-tool functionality is degraded",
             "install Git for Windows for full Claude Code tool compatibility",
         );
     }
     ok(
-        15,
+        16,
         "agent shell",
         if claude {
             "Claude Code shell dependencies available"
@@ -359,6 +371,41 @@ fn windows_agent_shell_check_for(
             "COMSPEC fallback available"
         },
     )
+}
+
+fn service_server_check(
+    config_dir: Option<&Path>,
+    credentials: Option<&crate::creds::StoredCreds>,
+) -> Check {
+    let (Some(config_dir), Some(stored)) = (config_dir, credentials) else {
+        return skip(15, "service server", "config or credentials unavailable");
+    };
+    if !crate::service::status(config_dir).installed {
+        return skip(15, "service server", "background service not installed");
+    }
+    let Some(stored_server) = stored.server_url.as_deref() else {
+        return skip(15, "service server", "credentials have no server");
+    };
+    match crate::service::configured_server(config_dir) {
+        Ok(Some(unit_server)) if crate::service::same_origin(&unit_server, stored_server) => ok(
+            15,
+            "service server",
+            format!("unit and credentials both use {stored_server}"),
+        ),
+        Ok(Some(unit_server)) => fail(
+            15,
+            "service server",
+            format!("unit uses {unit_server}; credentials use {stored_server}"),
+            "spawnd reconnect — rewrites the service unit from these credentials and reloads it",
+        ),
+        Ok(None) => skip(15, "service server", "background service not installed"),
+        Err(error) => fail(
+            15,
+            "service server",
+            format!("cannot read the service unit: {error}"),
+            "spawnd reconnect — rewrites the service unit from these credentials and reloads it",
+        ),
+    }
 }
 
 struct HealthProbe {
@@ -529,6 +576,11 @@ async fn probe_sign_in(server: &url::Url, token: &str) -> Check {
             "server rejected this machine",
             "this machine was signed out or removed — spawnd login to re-approve it",
         ),
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => warning(
+            5,
+            "sign-in accepted",
+            "This server is older and does not expose the machine-management check yet",
+        ),
         Ok(response) => fail(
             5,
             "sign-in accepted",
@@ -640,56 +692,251 @@ fn permissions_check(config_dir: &Path) -> Check {
     }
 }
 
-async fn probe_udp() -> Check {
-    match tokio::time::timeout(Duration::from_secs(2), stun_binding_probe()).await {
-        Ok(Ok(())) => ok(14, "media path", "UDP STUN reply received"),
-        _ => warning(
-            14,
-            "media path",
-            "UDP to the relay looks blocked; terminals may not connect from outside this network.",
-        ),
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IceEndpointKind {
+    Stun,
+    Turn,
 }
 
-async fn stun_binding_probe() -> anyhow::Result<()> {
-    // The current server sends ICE configuration only inside session frames,
-    // so the doctor uses the server's default STUN endpoint for its standalone
-    // media-path check. This is a real binding exchange, not merely a local
-    // socket bind.
-    let address = tokio::net::lookup_host(("stun.l.google.com", 19_302))
-        .await?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("STUN endpoint did not resolve"))?;
-    let bind = if address.is_ipv6() {
-        "[::]:0"
+#[derive(Debug, Clone)]
+struct IceUdpEndpoint {
+    label: String,
+    host: String,
+    port: u16,
+    kind: IceEndpointKind,
+}
+
+async fn probe_udp(config_dir: Option<&Path>) -> Check {
+    let configured = config_dir
+        .and_then(|dir| crate::state::read_ice_server_urls(dir).ok())
+        .unwrap_or_default();
+    let using_default = configured.is_empty();
+    let urls = if using_default {
+        vec!["stun:stun.l.google.com:19302".to_owned()]
     } else {
-        "0.0.0.0:0"
+        configured
     };
-    let socket = tokio::net::UdpSocket::bind(bind).await?;
-    socket.connect(address).await?;
-    let mut request = [0_u8; 20];
-    request[0..2].copy_from_slice(&1_u16.to_be_bytes());
-    request[4..8].copy_from_slice(&0x2112_A442_u32.to_be_bytes());
-    let nonce = sha2::Sha256::digest(format!(
-        "{}:{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    request[8..20].copy_from_slice(&nonce[..12]);
-    socket.send(&request).await?;
-    let mut response = [0_u8; 1024];
-    let size = socket.recv(&mut response).await?;
-    if size < 20
-        || response[0..2] != 0x0101_u16.to_be_bytes()
-        || response[4..8] != 0x2112_A442_u32.to_be_bytes()
-        || response[8..20] != request[8..20]
-    {
-        anyhow::bail!("invalid STUN binding response")
+    let has_turn = urls.iter().any(|url| {
+        let url = url.to_ascii_lowercase();
+        url.starts_with("turn:") || url.starts_with("turns:")
+    });
+    let mut unsupported = Vec::new();
+    let mut invalid = Vec::new();
+    let mut endpoints = Vec::new();
+    for url in &urls {
+        match parse_ice_udp_endpoint(url) {
+            Ok(Some(endpoint)) => endpoints.push(endpoint),
+            Ok(None) => unsupported.push(url.clone()),
+            Err(error) => invalid.push(format!("{url} ({error})")),
+        }
     }
-    Ok(())
+    let has_udp_turn = endpoints
+        .iter()
+        .any(|endpoint| endpoint.kind == IceEndpointKind::Turn);
+    if has_turn && !has_udp_turn {
+        return fail(
+            14,
+            "TURN/STUN reachability",
+            "the configured TURN servers are TCP/TLS-only; this daemon needs a UDP turn: URL",
+            "add a reachable UDP turn: URL to the server's ICE configuration",
+        );
+    }
+    if endpoints.is_empty() {
+        let detail = if invalid.is_empty() {
+            "no UDP TURN/STUN endpoint is configured".to_owned()
+        } else {
+            format!("no usable UDP TURN/STUN endpoint: {}", invalid.join(", "))
+        };
+        return fail(
+            14,
+            "TURN/STUN reachability",
+            detail,
+            "configure a reachable UDP stun: or turn: endpoint on the SPAWN D server",
+        );
+    }
+
+    let mut probes = tokio::task::JoinSet::new();
+    for endpoint in endpoints {
+        probes.spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                stun_binding_probe(&endpoint.host, endpoint.port),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out"))
+            .and_then(std::convert::identity);
+            (endpoint, result)
+        });
+    }
+    let mut reached = Vec::new();
+    let mut failed = Vec::new();
+    let mut turn_reached = false;
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok((endpoint, Ok(()))) => {
+                turn_reached |= endpoint.kind == IceEndpointKind::Turn;
+                reached.push(endpoint.label);
+            }
+            Ok((endpoint, Err(error))) => failed.push(format!("{} ({error})", endpoint.label)),
+            Err(error) => failed.push(format!("probe task failed ({error})")),
+        }
+    }
+
+    if has_udp_turn && !turn_reached {
+        return fail(
+            14,
+            "TURN/STUN reachability",
+            format!(
+                "configured UDP TURN is unreachable: {}",
+                if failed.is_empty() {
+                    "no listener replied".to_owned()
+                } else {
+                    failed.join(", ")
+                }
+            ),
+            "allow outbound UDP to the configured TURN listener; remote terminals need its relay path",
+        );
+    }
+    if reached.is_empty() {
+        return fail(
+            14,
+            "TURN/STUN reachability",
+            format!(
+                "no TURN/STUN listener replied over UDP: {}",
+                failed.join(", ")
+            ),
+            "allow outbound UDP to the configured TURN/STUN listeners",
+        );
+    }
+    if !failed.is_empty() || !invalid.is_empty() {
+        let mut problems = failed;
+        problems.extend(invalid);
+        return warn(
+            14,
+            "TURN/STUN reachability",
+            format!(
+                "UDP reached {}; unreachable configuration: {}",
+                reached.join(", "),
+                problems.join(", ")
+            ),
+            "check DNS and outbound UDP for each configured TURN/STUN listener",
+        );
+    }
+    let source = if using_default {
+        "default STUN (no server-provided ICE offer has been observed yet)"
+    } else {
+        "configured TURN/STUN"
+    };
+    let ignored = if unsupported.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} TCP/TLS endpoint(s) are not usable by this daemon",
+            unsupported.len()
+        )
+    };
+    ok(
+        14,
+        "TURN/STUN reachability",
+        format!("{source} replied over UDP: {}{ignored}", reached.join(", ")),
+    )
+}
+
+fn parse_ice_udp_endpoint(raw: &str) -> anyhow::Result<Option<IceUdpEndpoint>> {
+    let (scheme, remainder) = raw.split_once(':').context("missing ICE URL scheme")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let kind = match scheme.as_str() {
+        "stun" => IceEndpointKind::Stun,
+        "turn" => IceEndpointKind::Turn,
+        "stuns" | "turns" => return Ok(None),
+        _ => bail!("unsupported ICE URL scheme"),
+    };
+    let remainder = remainder.trim_start_matches("//");
+    let (authority, query) = remainder
+        .split_once('?')
+        .map_or((remainder, ""), |parts| parts);
+    if query
+        .split('&')
+        .any(|part| part.eq_ignore_ascii_case("transport=tcp"))
+    {
+        return Ok(None);
+    }
+    let default_port = 3_478;
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']').context("unterminated IPv6 address")?;
+        let port = suffix
+            .strip_prefix(':')
+            .filter(|value| !value.is_empty())
+            .map(str::parse)
+            .transpose()
+            .context("invalid ICE listener port")?
+            .unwrap_or(default_port);
+        (host.to_owned(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        let port = port.parse().context("invalid ICE listener port")?;
+        (host.to_owned(), port)
+    } else {
+        (authority.to_owned(), default_port)
+    };
+    if host.trim().is_empty() {
+        bail!("missing ICE listener host")
+    }
+    Ok(Some(IceUdpEndpoint {
+        label: format!("{scheme}:{authority}"),
+        host,
+        port,
+        kind,
+    }))
+}
+
+async fn stun_binding_probe(host: &str, port: u16) -> anyhow::Result<()> {
+    let addresses = tokio::net::lookup_host((host, port))
+        .await?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        bail!("listener did not resolve")
+    }
+    let mut last_error = None;
+    for address in addresses {
+        let attempt = async {
+            let bind = if address.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
+            let socket = tokio::net::UdpSocket::bind(bind).await?;
+            socket.connect(address).await?;
+            let mut request = [0_u8; 20];
+            request[0..2].copy_from_slice(&1_u16.to_be_bytes());
+            request[4..8].copy_from_slice(&0x2112_A442_u32.to_be_bytes());
+            let nonce = sha2::Sha256::digest(format!(
+                "{}:{}:{address}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            request[8..20].copy_from_slice(&nonce[..12]);
+            socket.send(&request).await?;
+            let mut response = [0_u8; 1024];
+            let size = socket.recv(&mut response).await?;
+            if size < 20
+                || response[0..2] != 0x0101_u16.to_be_bytes()
+                || response[4..8] != 0x2112_A442_u32.to_be_bytes()
+                || response[8..20] != request[8..20]
+            {
+                bail!("invalid STUN binding response")
+            }
+            Ok(())
+        };
+        match tokio::time::timeout(Duration::from_secs(1), attempt).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => last_error = Some(anyhow::anyhow!("timed out")),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("listener did not reply")))
 }
 
 fn ok(id: u8, name: &'static str, detail: impl Into<String>) -> Check {
@@ -827,7 +1074,8 @@ mod tests {
             "self-update ready",
             "version",
             "file permissions",
-            "media path",
+            "TURN/STUN reachability",
+            "service server",
         ];
         #[cfg(windows)]
         let names = {
@@ -884,6 +1132,34 @@ mod tests {
             })
             .status,
             CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn ice_probe_parses_configured_udp_and_rejects_tcp_only_urls() {
+        let stun = parse_ice_udp_endpoint("stun:stun.example.test:19302")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stun.host, "stun.example.test");
+        assert_eq!(stun.port, 19_302);
+        assert_eq!(stun.kind, IceEndpointKind::Stun);
+
+        let turn = parse_ice_udp_endpoint("turn:[2001:db8::1]:3479?transport=udp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.host, "2001:db8::1");
+        assert_eq!(turn.port, 3_479);
+        assert_eq!(turn.kind, IceEndpointKind::Turn);
+
+        assert!(
+            parse_ice_udp_endpoint("turn:relay.example:3478?transport=tcp")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_ice_udp_endpoint("turns:relay.example:443?transport=tcp")
+                .unwrap()
+                .is_none()
         );
     }
 }
