@@ -1539,7 +1539,13 @@ function startPossessionPoll(): void {
         syncPossessionSteps("online");
         preferences = await invoke<Preferences>("app_preferences");
         render();
-        window.setTimeout(() => void guarded(() => invoke("open_app")), SUCCESS_BEAT_MS);
+        // Through the done gate like any finished run: it reads for a beat,
+        // opens the product on its own, and owns the card that explains an
+        // opening that fails.
+        window.setTimeout(() => {
+          setScreen("done");
+          window.setTimeout(() => void guarded(() => invoke("open_app")), DONE_BEAT_MS);
+        }, SUCCESS_BEAT_MS);
         return;
       }
       if (possession.status === "failed") {
