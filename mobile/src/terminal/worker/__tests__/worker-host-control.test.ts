@@ -5,7 +5,10 @@ interface WorkerHarness {
     ctl: {
       readyState: string;
       bufferedAmount: number;
+      bufferedAmountLowThreshold: number;
       send: jest.Mock;
+      addEventListener: jest.Mock;
+      removeEventListener: jest.Mock;
     };
   };
   post: jest.Mock;
@@ -35,7 +38,8 @@ describe("offline host-control worker", () => {
 
   test("keeps host writes under the 256 KiB SCTP high-water mark", () => {
     expect(TERMINAL_WORKER_HTML).toContain("const BUFFERED_HIGH_WATER = 256 * 1024");
-    expect(TERMINAL_WORKER_HTML).toContain("state.ctl.bufferedAmount > BUFFERED_HIGH_WATER");
+    expect(TERMINAL_WORKER_HTML).toContain("channel.bufferedAmount <= BUFFERED_HIGH_WATER");
+    expect(TERMINAL_WORKER_HTML).toContain('"bufferedamountlow"');
     expect(TERMINAL_WORKER_HTML).toContain("const STREAM_TIMEOUT_MS = 60_000");
     expect(TERMINAL_WORKER_HTML).toContain(
       'if (type === "chunk" || type === "end") await waitForWritable()',
@@ -45,9 +49,19 @@ describe("offline host-control worker", () => {
   test("does not acknowledge a chunk until worker backpressure clears", async () => {
     jest.useFakeTimers();
     const send = jest.fn();
+    let writable: (() => void) | null = null;
     const harness: WorkerHarness = {
       state: {
-        ctl: { readyState: "open", bufferedAmount: 256 * 1024 + 1, send },
+        ctl: {
+          readyState: "open",
+          bufferedAmount: 256 * 1024 + 1,
+          bufferedAmountLowThreshold: 0,
+          send,
+          addEventListener: jest.fn((_type: string, listener: () => void) => {
+            writable = listener;
+          }),
+          removeEventListener: jest.fn(),
+        },
       },
       post: jest.fn(),
       error: jest.fn(),
@@ -67,7 +81,10 @@ describe("offline host-control worker", () => {
       await Promise.resolve();
       expect(send).not.toHaveBeenCalled();
       harness.state.ctl.bufferedAmount = 0;
-      await jest.advanceTimersByTimeAsync(10);
+      (writable as (() => void) | null)?.();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
       expect(send).toHaveBeenCalledTimes(1);
       expect(harness.post).toHaveBeenCalledWith(
         expect.objectContaining({ type: "host-response", requestId: "chunk-command", ok: true }),

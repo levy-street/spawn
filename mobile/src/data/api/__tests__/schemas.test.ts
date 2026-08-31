@@ -3,15 +3,21 @@ import { AgentOutSchema } from "@/data/api/schemas/agents";
 import { TokenResponseSchema } from "@/data/api/schemas/auth";
 import {
   BrowserDeviceOutSchema,
+  DevicePendingRequestSchema,
   DevicePendingResponseSchema,
   DevicePollResponseSchema,
 } from "@/data/api/schemas/devices";
 import { HostOutSchema } from "@/data/api/schemas/hosts";
 import { ProfileOutSchema } from "@/data/api/schemas/legion";
+import { ReleaseSchema } from "@/data/api/schemas/release";
 import { SessionOutSchema } from "@/data/api/schemas/sessions";
 import { SessionAccessOutSchema, SkillOutSchema } from "@/data/api/schemas/skills";
 import { WorkspaceTemplateOutSchema } from "@/data/api/schemas/templates";
-import { BrowserEndorsementRecordSchema, TrustBundleOutSchema } from "@/data/api/schemas/trust";
+import {
+  BrowserEndorsementRecordSchema,
+  HostPinsOutSchema,
+  TrustBundleOutSchema,
+} from "@/data/api/schemas/trust";
 import { WorkspaceOutSchema, WorkspacePatchSchema } from "@/data/api/schemas/workspaces";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
@@ -104,13 +110,57 @@ it("round-trips browser-device and pairing response JSON", () => {
     host_key_fingerprint: "SHA256:host",
   };
   expect(DevicePendingResponseSchema.parse(pending)).toEqual(pending);
+  expect(DevicePendingRequestSchema.parse({ approval_ref: "approval-ref-123" })).toEqual({
+    approval_ref: "approval-ref-123",
+  });
   expect(DevicePollResponseSchema.parse({ error: "authorization_pending" })).toEqual({
     error: "authorization_pending",
   });
 });
 
 it("round-trips host response JSON", () => {
-  expect(HostOutSchema.parse(host)).toEqual(host);
+  expect(HostOutSchema.parse(host)).toEqual({ ...host, daemon_tree: null, update: null });
+  expect(
+    HostOutSchema.parse({
+      ...host,
+      daemon_tree: "9a8b",
+      update: {
+        state: "available",
+        latest_version: "0.1.0+gabc",
+        error: null,
+        requested_at: null,
+      },
+    }),
+  ).toMatchObject({ daemon_tree: "9a8b", update: { state: "available" } });
+});
+
+it("parses the release contract and defaults identities from older servers", () => {
+  expect(ReleaseSchema.parse({})).toEqual({
+    server: { commit: null, dirty: false },
+    web: { build_id: null },
+    daemon: null,
+    mobile: { tree: null, runtime_version: null },
+    protocols: { daemon: null, browser: null, alerts: null },
+  });
+  expect(
+    ReleaseSchema.parse({
+      mobile: { tree: "mobile-tree", runtime_version: "0.1.0" },
+      daemon: {
+        version: "0.1.0+gabc",
+        commit: "commit",
+        tree: "daemon-tree",
+        targets: {
+          "darwin-aarch64": {
+            spawnd_sha256: "spawnd",
+            spawn_worker_sha256: "worker",
+          },
+        },
+      },
+    }),
+  ).toMatchObject({
+    mobile: { tree: "mobile-tree", runtime_version: "0.1.0" },
+    daemon: { tree: "daemon-tree" },
+  });
 });
 
 it("round-trips session and capability response JSON", () => {
@@ -213,6 +263,31 @@ it("round-trips trust response JSON", () => {
     signature: "signature",
   };
   expect(BrowserEndorsementRecordSchema.parse(endorsement)).toEqual(endorsement);
+  expect(
+    HostPinsOutSchema.parse({
+      pins: [
+        {
+          browser_device_id: UUID_A,
+          delivered: false,
+          undelivered_reason: "pin_limit",
+        },
+      ],
+      capacity: { used: 28, max: 32 },
+    }),
+  ).toEqual({
+    pins: [
+      {
+        browser_device_id: UUID_A,
+        delivered: false,
+        undelivered_reason: "pin_limit",
+      },
+    ],
+    capacity: { used: 28, max: 32 },
+  });
+  expect(HostPinsOutSchema.parse([UUID_A])).toEqual({
+    pins: [{ browser_device_id: UUID_A, delivered: true, undelivered_reason: null }],
+    capacity: null,
+  });
 });
 
 it("round-trips Legion/profile response JSON", () => {

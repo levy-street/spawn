@@ -7,7 +7,11 @@ import {
   useMemo,
   useRef,
 } from "react";
+import { StyleSheet, View } from "react-native";
 
+import { Button } from "@/components/ui/button";
+import { Text } from "@/components/ui/text";
+import { authToken } from "@/data/api/auth-token";
 import { buildAlertsSocketUrl } from "@/data/api/socket-urls";
 import { qk } from "@/data/queryKeys";
 import { AlertSocketClient } from "@/data/realtime/alert-socket";
@@ -20,10 +24,12 @@ import {
   retireRegisteredGenerations,
 } from "@/data/realtime/lifecycle";
 import { createProductionNetworkSource } from "@/data/realtime/network-source";
+import { publishPinUndeliveredEvent } from "@/data/realtime/pin-undelivered-events";
 import { subscribeSessionSignalFrames } from "@/data/realtime/session-signal";
 import { retireAll, type SocketState } from "@/data/realtime/socket";
 import { useAlertStore } from "@/data/stores/alerts";
 import { useConnectionStore } from "@/data/stores/connection";
+import { layer, useTheme } from "@/theme";
 
 export interface RealtimeProviderProps extends PropsWithChildren {
   networkSource?: NetworkSource;
@@ -67,6 +73,7 @@ export function RealtimeProvider({
   const queryClient = useQueryClient();
   const alertClientRef = useRef<AlertSocketClient | null>(null);
   const alertSocketState = useConnectionStore((state) => state.alertSocket);
+  const theme = useTheme();
 
   useEffect(() => {
     const alertClient = new AlertSocketClient(buildAlertsSocketUrl);
@@ -111,6 +118,9 @@ export function RealtimeProvider({
       if (frame.type === "alert") {
         const { type: _type, ...alert } = frame;
         useAlertStore.getState().receive(alert);
+      } else if (frame.type === "trust" && frame.event === "host.pin_undelivered") {
+        const { type: _type, ...event } = frame;
+        publishPinUndeliveredEvent(event);
       }
       applyFrame(frame);
     });
@@ -120,9 +130,22 @@ export function RealtimeProvider({
     const unsubscribeHostFrames = subscribeHostSignalFrames((_hostId, frame) => {
       applyFrame(frame);
     });
+    let disposed = false;
+    let tokenCheck = 0;
+    const reconcileToken = async () => {
+      const check = ++tokenCheck;
+      const token = await authToken.get().catch(() => null);
+      if (disposed || check !== tokenCheck) return;
+      if (token === null) alertClient.retire();
+      else alertClient.connect();
+    };
+    const unsubscribeToken = authToken.subscribe(() => void reconcileToken());
     const lifecycle = installRealtimeLifecycle({
       retireAll: (reason) => {
-        retireAll();
+        // Keep signalling live while surfaces send an ICE-restart offer for
+        // an interface handoff. A half-open peer is still caught by its ping
+        // watchdog; offline/background boundaries retire everything eagerly.
+        if (reason !== "interface-change") retireAll();
         retireRegisteredGenerations(reason);
       },
       resume: {
@@ -136,8 +159,9 @@ export function RealtimeProvider({
       ...(activeNetworkSource ? { networkSource: activeNetworkSource } : {}),
     });
 
-    alertClient.connect();
+    void reconcileToken();
     return () => {
+      disposed = true;
       lifecycle.dispose();
       retireAll();
       retireRegisteredGenerations("background");
@@ -145,6 +169,7 @@ export function RealtimeProvider({
       unsubscribeAlertFrames();
       unsubscribeSessionFrames();
       unsubscribeHostFrames();
+      unsubscribeToken();
       alertClient.close();
       alertClientRef.current = null;
     };
@@ -162,7 +187,35 @@ export function RealtimeProvider({
     [alertSocketState],
   );
 
-  return <RealtimeContext.Provider value={value}>{children}</RealtimeContext.Provider>;
+  return (
+    <RealtimeContext.Provider value={value}>
+      {children}
+      {alertSocketState === "failed" ? (
+        <View
+          accessibilityRole="alert"
+          style={[
+            styles.paused,
+            {
+              backgroundColor: theme.colors.popover,
+              borderColor: theme.colors.border,
+              gap: theme.space(2),
+              padding: theme.space(2),
+              zIndex: layer.toast,
+            },
+          ]}
+        >
+          <Text variant="caption">Live updates paused —</Text>
+          <Button
+            onPress={() => alertClientRef.current?.hardReconnect()}
+            size="sm"
+            variant="outline"
+          >
+            Retry
+          </Button>
+        </View>
+      ) : null}
+    </RealtimeContext.Provider>
+  );
 }
 
 export function useRealtime(): RealtimeContextValue {
@@ -172,3 +225,16 @@ export function useRealtime(): RealtimeContextValue {
   }
   return value;
 }
+
+const styles = StyleSheet.create({
+  paused: {
+    alignItems: "center",
+    borderWidth: StyleSheet.hairlineWidth,
+    bottom: 0,
+    flexDirection: "row",
+    justifyContent: "center",
+    left: 0,
+    position: "absolute",
+    right: 0,
+  },
+});

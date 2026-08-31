@@ -27,13 +27,16 @@ const fetchMock = jest.fn();
 function mockResponse(
   status: number,
   body: unknown = undefined,
-  options: { statusText?: string; jsonError?: Error } = {},
+  options: { statusText?: string; jsonError?: Error; cookie?: string } = {},
 ): Response {
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText: options.statusText ?? "",
-    headers: { get: () => null } as unknown as Headers,
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === "set-cookie" ? (options.cookie ?? null) : null,
+    } as unknown as Headers,
     json: options.jsonError
       ? jest.fn(async () => {
           throw options.jsonError;
@@ -51,8 +54,23 @@ beforeAll(() => {
 beforeEach(() => {
   fetchMock.mockReset();
   jest.mocked(authToken.clear).mockClear();
+  jest.mocked(authToken.captureFromResponse).mockClear();
   mockTokenState.value = null;
   fetchMock.mockResolvedValue(mockResponse(200, { ok: true }));
+});
+
+it("adopts a renewed cookie from a non-login response", async () => {
+  const response = mockResponse(200, { workspaces: [] }, { cookie: "spawn_session=renewed" });
+  fetchMock.mockResolvedValue(response);
+  jest.mocked(authToken.captureFromResponse).mockImplementationOnce(async () => {
+    mockTokenState.value = "renewed";
+    return "renewed";
+  });
+
+  await api("/api/workspaces");
+
+  expect(authToken.captureFromResponse).toHaveBeenCalledWith(response);
+  expect(mockTokenState.value).toBe("renewed");
 });
 
 it("injects bearer and JSON headers when a token exists", async () => {

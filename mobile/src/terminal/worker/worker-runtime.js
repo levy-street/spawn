@@ -3,7 +3,7 @@
   "use strict";
 
   const BRIDGE_VERSION = 1;
-  const MAX_INPUT_BYTES = 64 * 1024;
+  const MAX_INPUT_BYTES = 16 * 1024;
   const TELEMETRY_DELAY_MS = 8;
   const FIT_DEBOUNCE_MS = 60;
   /** Floor for the type when this viewer is matching someone else's grid. */
@@ -18,6 +18,12 @@
   const FLING_MAX_VELOCITY = 6;
   /** How much of the screen one synthesised page key is worth. */
   const PAGE_KEY_FRACTION = 0.5;
+  /**
+   * Whether ⌥ and ⌘ are on the hardware keyboard attached to this device —
+   * an iPad with a Magic Keyboard is the case that matters.
+   */
+  const APPLE_MODIFIERS = /^(Mac|iPad|iPhone|iPod)/.test(navigator.platform || "");
+  const DELETE = "\u007f";
   const state = {
     mode: null,
     scopeId: null,
@@ -53,6 +59,9 @@
     clipboardSequence: 0,
     search: null,
     disconnectTimer: null,
+    restartTimer: null,
+    statsTimer: null,
+    pendingRestartRequests: new Set(),
     stopped: false,
   };
 
@@ -131,6 +140,27 @@
     api.telemetry({ type: "scroll-state", scroll });
   };
 
+  /**
+   * The bytes a Mac keyboard's ⌥ or ⌘ arrow owes the shell, or null. The same
+   * table the browser app keeps in `web/src/lib/keyboard-chords.ts`, and for
+   * the same two reasons: xterm decides ⌥ from its own `isMac`, which is
+   * false on an iPad, so ⌥← comes out as the Windows spelling no shell here
+   * binds; and it drops every ⌘ chord unread, so the ends of the line were
+   * simply missing. `ESC b` / `ESC f` and Ctrl-A / Ctrl-E are what readline,
+   * zsh, fish and the TUI prompts people run all understand.
+   */
+  function appleArrowBytes(event) {
+    if (event.ctrlKey || event.shiftKey || event.altKey === event.metaKey) return null;
+    if (event.altKey) {
+      if (event.key === "ArrowLeft") return "\u001bb";
+      if (event.key === "ArrowRight") return "\u001bf";
+      return null;
+    }
+    if (event.key === "ArrowLeft") return "\u0001";
+    if (event.key === "ArrowRight") return "\u0005";
+    return null;
+  }
+
   function clipboardRequest(operation, text) {
     const requestId = `clipboard-${++state.clipboardSequence}`;
     return new Promise((resolve, reject) => {
@@ -163,6 +193,64 @@
     const textarea = document.querySelector(".xterm-helper-textarea");
     if (textarea && document.activeElement === textarea) textarea.blur();
     terminal.focus();
+  }
+
+  /**
+   * Turns an edit to xterm's hidden textarea into terminal keystrokes.
+   *
+   * Android keyboards can autocorrect by replacing any suffix of the textarea,
+   * even though that suffix has already gone to the PTY. xterm 5.5 assumes every
+   * IME change is an append and sends the entire accumulated textarea when that
+   * assumption fails. Rewind only the changed suffix, then type its replacement.
+   */
+  function textareaEditSequence(previous, next) {
+    const previousCharacters = Array.from(previous);
+    const nextCharacters = Array.from(next);
+    let unchanged = 0;
+    while (
+      unchanged < previousCharacters.length &&
+      unchanged < nextCharacters.length &&
+      previousCharacters[unchanged] === nextCharacters[unchanged]
+    ) {
+      unchanged += 1;
+    }
+    return (
+      DELETE.repeat(previousCharacters.length - unchanged) +
+      nextCharacters.slice(unchanged).join("")
+    );
+  }
+
+  /**
+   * Replaces xterm 5.5's lossy keyCode=229 fallback on Android WebView.
+   *
+   * This deliberately leaves xterm's normal composition path alone. It only
+   * substitutes `_handleAnyTextareaChanges`, which xterm calls for Android IME
+   * edits delivered outside a composition. The pending baseline is shared by
+   * overlapping events so fast input cannot make an earlier timer resend or
+   * drop its neighbour.
+   */
+  function installAndroidTextareaDiff(terminal) {
+    if (!/Android/i.test(navigator.userAgent)) return;
+    const textarea = terminal.textarea;
+    const compositionHelper = terminal._core?._compositionHelper;
+    if (!textarea || !compositionHelper) return;
+
+    let pendingPrevious = null;
+    let pendingTimer = null;
+    compositionHelper._handleAnyTextareaChanges = () => {
+      if (pendingPrevious === null) pendingPrevious = textarea.value;
+      if (pendingTimer !== null) clearTimeout(pendingTimer);
+      pendingTimer = setTimeout(() => {
+        pendingTimer = null;
+        const previous = pendingPrevious;
+        pendingPrevious = null;
+        if (previous === null || compositionHelper._isComposing) return;
+
+        const input = textareaEditSequence(previous, textarea.value);
+        compositionHelper._dataAlreadySent = "";
+        if (input.length > 0) terminal.input(input, true);
+      }, 0);
+    };
   }
 
   function configureTextarea() {
@@ -441,6 +529,7 @@
   }
 
   function initializeTerminal(message) {
+    const forwardTerminalLink = (_event, uri) => api.post({ type: "link", url: uri });
     const terminal = new Terminal({
       allowProposedApi: true,
       convertEol: false,
@@ -453,6 +542,7 @@
       scrollOnUserInput: true,
       smoothScrollDuration: 0,
       theme: { ...message.theme },
+      linkHandler: { activate: forwardTerminalLink },
     });
     const fitAddon = new FitAddon.FitAddon();
     const unicodeAddon = new Unicode11Addon.Unicode11Addon();
@@ -461,9 +551,7 @@
     terminal.loadAddon(unicodeAddon);
     terminal.unicode.activeVersion = "11";
     terminal.loadAddon(serializeAddon);
-    terminal.loadAddon(
-      new WebLinksAddon.WebLinksAddon((_event, uri) => api.post({ type: "link", url: uri })),
-    );
+    terminal.loadAddon(new WebLinksAddon.WebLinksAddon(forwardTerminalLink));
     terminal.loadAddon(
       new ClipboardAddon.ClipboardAddon(undefined, {
         readText: async () => String(await clipboardRequest("clipboard-read")),
@@ -490,6 +578,21 @@
     const container = document.getElementById("terminal");
     watchSurfaceSize(container);
     if (container) installTouchScroll(container);
+    terminal.attachCustomKeyEventHandler((event) => {
+      const arrow = APPLE_MODIFIERS ? appleArrowBytes(event) : null;
+      if (!arrow) return true;
+      // Suppress every event of the press, not just the keydown: returning
+      // false does not preventDefault on its own, and a second path through
+      // the same press would send the sequence twice.
+      if (event.type === "keydown") {
+        event.preventDefault();
+        if (api.sessionReady?.()) {
+          terminal.scrollToBottom();
+          api.sendPty?.(encoder.encode(arrow));
+        }
+      }
+      return false;
+    });
     terminal.onData((data) => {
       if (!api.sessionReady?.()) return;
       const filtered = data.replace(/\u001b\[(?:\?|>)[0-9;]*c/g, "");
@@ -507,6 +610,7 @@
     document.addEventListener("selectionchange", () => {
       api.post({ type: "native-selection", active: documentSelection().length > 0 });
     });
+    installAndroidTextareaDiff(terminal);
     configureTextarea();
     applyTheme(message.theme);
     api.post({ type: "ready", renderer: state.renderer });
@@ -638,6 +742,18 @@
       state.fontSize = message.fontSize;
       if (message.mode === "session" && !state.term) initializeTerminal(message);
       else api.post({ type: "ready", renderer: null });
+      if (message.skipLoopbackProbe === true) {
+        api.capability.dataChannel = api.capability.peerConnection;
+        api.capability.loopback = api.capability.peerConnection;
+        api.capabilityProbeComplete = true;
+      } else if (typeof message.cachedLoopback === "boolean") {
+        api.capability.dataChannel = api.capability.peerConnection;
+        api.capability.loopback = message.cachedLoopback;
+        api.capabilityProbeComplete = true;
+      } else if (!api.capabilityProbeStarted) {
+        api.capabilityProbeStarted = true;
+        void probeLoopback();
+      }
       if (api.capabilityProbeComplete) {
         api.post({
           type: "diagnostic",
@@ -657,18 +773,12 @@
     }
   }
 
-  let lastRaw = null;
-  let lastRawAt = 0;
   const listener = (event) => {
     if (typeof event.data !== "string") return;
-    const now = performance.now();
-    if (event.data === lastRaw && now - lastRawAt < 1) return;
-    lastRaw = event.data;
-    lastRawAt = now;
     void receiveMessage(event.data);
   };
-  window.addEventListener("message", listener);
-  document.addEventListener("message", listener);
+  const bridgeTarget = /Android/i.test(navigator.userAgent) ? document : window;
+  bridgeTarget.addEventListener("message", listener);
 
   api.sendPty = (bytes) => {
     if (!state.pty || state.pty.readyState !== "open") return false;
@@ -700,6 +810,7 @@
     renderer: null,
   };
   api.capabilityProbeComplete = false;
+  api.capabilityProbeStarted = false;
 
   async function probeLoopback() {
     if (!api.capability.peerConnection) {
@@ -740,6 +851,4 @@
       api.post({ type: "diagnostic", diagnostic: { ...api.capability, renderer: state.renderer } });
     }
   }
-
-  void probeLoopback();
 })();

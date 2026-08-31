@@ -1,9 +1,11 @@
 export const qk = {
   me: () => ["me"] as const,
   authConfig: () => ["auth-config"] as const,
+  release: () => ["release"] as const,
 
   hosts: () => ["hosts"] as const,
   host: (hostId: string) => ["host", hostId] as const,
+  hostPins: (hostId: string) => ["trust", "host-pins", hostId] as const,
   hostAgents: (hostId: string) => ["host-agents", hostId] as const,
 
   sessions: () => ["sessions"] as const,

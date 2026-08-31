@@ -67,8 +67,8 @@ export function HostListView({
       ListEmptyComponent={
         <EmptyState
           style={styles.emptyState}
-          action={<Button onPress={onConnect}>Connect a host</Button>}
-          description="Run the installer and spawnd login on a Mac or Linux machine."
+          action={<Button onPress={onConnect}>Add a machine</Button>}
+          description="After installation, run spawnd possess on that machine."
           icon="Server"
           title="No hosts are connected yet."
         />
@@ -145,7 +145,7 @@ export function HostListScreen() {
         <AppHeader
           actions={[
             {
-              accessibilityLabel: "Connect a host",
+              accessibilityLabel: "Add a machine",
               icon: "Plus",
               onPress: () => router.push("/onboarding/host"),
               testID: "hosts-connect-action",

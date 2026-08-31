@@ -36,6 +36,9 @@ async def _create_host(email: str, *, name: str = "box", **columns) -> str:
     sm = get_sessionmaker()
     async with sm() as session:
         user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        # An online fixture represents a currently connected daemon. Presence
+        # serialization now also requires its heartbeat to be fresh.
+        columns.setdefault("last_seen_at", datetime.now(UTC))
         host = Host(owner_user_id=user.id, name=name, status="online", **columns)
         session.add(host)
         await session.commit()

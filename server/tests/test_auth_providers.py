@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from sqlalchemy import func, select
 
-from spawn_server.config import get_settings
+from spawn_server.config import Settings, get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import AuthIdentity, User
 from spawn_server.routes import auth_providers
@@ -114,6 +114,38 @@ async def test_provider_start_is_hidden_when_provider_is_not_configured(client):
 
     start = await client.get("/api/auth/oauth/google/start", follow_redirects=False)
     assert start.status_code == 404
+
+
+async def test_native_redirect_default_accepts_mobile_and_desktop_but_rejects_unknown(
+    client, configured_providers, monkeypatch
+):
+    default_redirects = "spawn://auth/oauth,spawn://oauth/callback"
+    assert Settings.model_fields["oauth_native_redirect_uris"].default == default_redirects
+    monkeypatch.setenv("SPAWN_OAUTH_NATIVE_REDIRECT_URIS", default_redirects)
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    for redirect_uri in ("spawn://auth/oauth", "spawn://oauth/callback"):
+        response = await client.get(
+            "/api/auth/oauth/google/start",
+            params={"redirect_uri": redirect_uri},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+
+    unknown = await client.get(
+        "/api/auth/oauth/google/start",
+        params={"redirect_uri": "spawn://oauth/callback/extra"},
+        follow_redirects=False,
+    )
+    assert unknown.status_code == 400
+    assert unknown.json()["detail"] == "redirect_uri is not an allowed native redirect"
+
+
+def test_native_redirect_environment_override_replaces_defaults(monkeypatch):
+    monkeypatch.setenv("SPAWN_OAUTH_NATIVE_REDIRECT_URIS", "example-app://oauth/callback")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    assert get_settings().oauth_native_redirect_uri_list == ["example-app://oauth/callback"]
 
 
 async def test_google_login_links_existing_manual_account_by_verified_email(
@@ -275,3 +307,129 @@ async def test_provider_login_redirects_to_relative_return_to(
     )
     assert callback.status_code == 302, callback.text
     assert callback.headers["location"] == return_to
+
+
+async def _native_code(client, monkeypatch, *, email: str, challenge: str | None) -> str:
+    """Run a native provider sign-in to completion and return its one-time code."""
+
+    async def fake_exchange(**_kwargs):
+        return ProviderProfile(
+            provider="google",
+            provider_user_id=f"google-sub-{email}",
+            email=email,
+            email_verified=True,
+        )
+
+    monkeypatch.setattr(auth_providers, "_exchange_provider_code", fake_exchange)
+    params = {"redirect_uri": "spawn://auth/oauth"}
+    if challenge is not None:
+        params |= {"code_challenge": challenge, "code_challenge_method": "S256"}
+    start = await client.get(
+        "/api/auth/oauth/google/start", params=params, follow_redirects=False
+    )
+    assert start.status_code == 302, start.text
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = await client.get(
+        "/api/auth/oauth/google/callback",
+        params={"state": state, "code": "provider-code"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302, callback.text
+    location = callback.headers["location"]
+    assert location.startswith("spawn://auth/oauth?")
+    return parse_qs(urlparse(location).query)["code"][0]
+
+
+def _challenge_for(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+async def test_native_exchange_code_is_bound_to_the_client_that_started_the_flow(
+    client, configured_providers, monkeypatch
+):
+    """The login-CSRF this closes.
+
+    Without PKCE the one-time code proves only *which account* signed in, never
+    *who asked*. An attacker completes OAuth with their own account, takes the
+    resulting `spawn://auth/oauth?code=...` link, and lures someone into opening
+    it; that person's app signs into the attacker's account — and on desktop,
+    where the host gate possesses on arrival, hands over their computer.
+    """
+    verifier = "v" * 64
+    code = await _native_code(
+        client, monkeypatch, email="pkce@example.com", challenge=_challenge_for(verifier)
+    )
+
+    # The victim's app has no verifier for a flow it never started.
+    stolen = await client.post("/api/auth/oauth/exchange", json={"code": code})
+    assert stolen.status_code == 400
+    assert stolen.json()["detail"] == "this sign-in code was not issued to this app"
+
+    # And a spent code stays spent, so the real client cannot rescue it either.
+    replay = await client.post(
+        "/api/auth/oauth/exchange", json={"code": code, "code_verifier": verifier}
+    )
+    assert replay.status_code == 400
+    assert replay.json()["detail"] == "this sign-in code is invalid or has expired"
+
+
+async def test_native_exchange_accepts_the_matching_verifier_and_refuses_a_wrong_one(
+    client, configured_providers, monkeypatch
+):
+    verifier = "w" * 64
+    challenge = _challenge_for(verifier)
+
+    wrong = await _native_code(
+        client, monkeypatch, email="pkce-wrong@example.com", challenge=challenge
+    )
+    refused = await client.post(
+        "/api/auth/oauth/exchange", json={"code": wrong, "code_verifier": "x" * 64}
+    )
+    assert refused.status_code == 400
+    assert refused.json()["detail"] == "this sign-in code was not issued to this app"
+
+    good = await _native_code(
+        client, monkeypatch, email="pkce-good@example.com", challenge=challenge
+    )
+    accepted = await client.post(
+        "/api/auth/oauth/exchange", json={"code": good, "code_verifier": verifier}
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["user"]["email"] == "pkce-good@example.com"
+
+
+async def test_native_exchange_without_a_challenge_still_works_for_older_apps(
+    client, configured_providers, monkeypatch
+):
+    """A build that predates PKCE must keep signing in through an updated server."""
+    code = await _native_code(client, monkeypatch, email="legacy@example.com", challenge=None)
+    accepted = await client.post("/api/auth/oauth/exchange", json={"code": code})
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["user"]["email"] == "legacy@example.com"
+
+
+async def test_start_refuses_a_plain_or_malformed_code_challenge(client, configured_providers):
+    plain = await client.get(
+        "/api/auth/oauth/google/start",
+        params={
+            "redirect_uri": "spawn://auth/oauth",
+            "code_challenge": "a" * 43,
+            "code_challenge_method": "plain",
+        },
+        follow_redirects=False,
+    )
+    assert plain.status_code == 400
+    assert plain.json()["detail"] == "only the S256 code challenge method is supported"
+
+    malformed = await client.get(
+        "/api/auth/oauth/google/start",
+        params={
+            "redirect_uri": "spawn://auth/oauth",
+            "code_challenge": "too-short",
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    assert malformed.status_code == 400
+    assert malformed.json()["detail"] == "code_challenge is malformed"

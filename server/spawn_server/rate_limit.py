@@ -92,9 +92,17 @@ async def enforce(request: Request, rule: RateLimit) -> None:
 
     if not get_settings().rate_limit_enabled:
         return
+    await enforce_identifier(client_key(request), rule)
+
+
+async def enforce_identifier(identifier: str, rule: RateLimit) -> None:
+    """Count a trusted caller identifier against ``rule``."""
+
+    if not get_settings().rate_limit_enabled:
+        return
     now = int(time.time())
     window_start = now - (now % rule.window_seconds)
-    key = f"spawn:rl:{rule.name}:{client_key(request)}:{window_start}"
+    key = f"spawn:rl:{rule.name}:{identifier}:{window_start}"
 
     count = await _hit_redis(key, rule.window_seconds)
     if count is None:

@@ -16,9 +16,13 @@
 #   3. Neither module may read the request payload at all. Payload parsing lives
 #      in host_control.rs, so argv cannot be fed from a client-supplied key by
 #      construction rather than by review.
-#   4. Ambient authority is consumed at exactly two sites: the home root and the
-#      private preview staging directory. A third would be a new escape from
-#      the capability sandbox.
+#   4. Ambient directory authority is consumed at four reviewed source sites:
+#      the host-file home root, the cfg-exclusive Unix/Windows upload roots, and
+#      the validated private-directory platform helper used for preview staging.
+#      Any other site would be a new escape from the capability sandbox.
+#      The one raw openat is separately pinned through its capability anchor,
+#      relative path, and flags: it only reopens an already-held directory for
+#      fsync and must never become an ambient CWD-relative open.
 #
 # Deliberately a literal-source check, per docs/GUARD_POLICY.md: it greps for
 # markers, never prose.
@@ -81,10 +85,42 @@ if grep -qF 'payload_string(' "$DESKTOP" "$PREVIEW"; then
   fail "launch modules must not read request payloads"
 fi
 
-# 4. Ambient authority is consumed at exactly two reviewed sites.
-ambient="$(grep -rho 'open_ambient_dir' daemon/src --include='*.rs' | wc -l | tr -d ' ')"
-if [[ "$ambient" != "2" ]]; then
-  fail "expected exactly 2 open_ambient_dir sites in daemon/src, found $ambient"
+# 4. Ambient authority is consumed only at the exact reviewed sites.
+ambient="$(
+  rg -n --color never 'open_ambient_dir' daemon/src --glob '*.rs' \
+    | sed -E 's/^([^:]+):[0-9]+:/\1:/' \
+    | sort
+)"
+expected_ambient='daemon/src/host_files.rs:        let root = Dir::open_ambient_dir(&root_capability, ambient_authority())?;
+daemon/src/platform/unix.rs:    Dir::open_ambient_dir(path, ambient_authority())
+daemon/src/upload.rs:        CapDir::open_ambient_dir(Path::new("/"), ambient_authority())?,
+daemon/src/upload.rs:        let current = CapDir::open_ambient_dir(&root, ambient_authority())?;'
+if [[ "$ambient" != "$expected_ambient" ]]; then
+  printf 'host-desktop-launch: unexpected ambient directory authority sites:\n%s\n' "$ambient" >&2
+  fail "ambient directory authority escaped its reviewed inventory"
+fi
+
+# cap-std holds Linux directories with O_PATH, which fsync rejects. The Unix
+# platform leaf therefore reopens `.` relative to the held capability. Pin the
+# complete raw openat shape as well as its inventory: changing `dir` to CWD or
+# changing `.` to an ambient path would otherwise create a new authority root.
+raw_directory_opens="$(
+  while IFS= read -r file; do
+    awk '
+      /rustix::fs::openat\(/ { remaining = 6 }
+      remaining > 0 { print FILENAME ":" $0; remaining-- }
+    ' "$file"
+  done < <(rg -l --color never 'rustix::fs::openat\(' daemon/src --glob '*.rs' | sort)
+)"
+expected_raw_directory_opens='daemon/src/platform/unix.rs:    let sync_handle = rustix::fs::openat(
+daemon/src/platform/unix.rs:        dir,
+daemon/src/platform/unix.rs:        Path::new("."),
+daemon/src/platform/unix.rs:        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+daemon/src/platform/unix.rs:        rustix::fs::Mode::empty(),
+daemon/src/platform/unix.rs:    )'
+if [[ "$raw_directory_opens" != "$expected_raw_directory_opens" ]]; then
+  printf 'host-desktop-launch: unexpected raw directory opens:\n%s\n' "$raw_directory_opens" >&2
+  fail "raw directory open escaped its reviewed capability-relative shape"
 fi
 
 # 5. The gates on `desktop.open` are all still present.
@@ -97,13 +133,24 @@ self_test() {
   fixture="$(mktemp -d)"
   trap 'rm -rf "$fixture"' RETURN
 
-  mkdir -p "$fixture/daemon/src"
+  mkdir -p "$fixture/daemon/src/platform"
   cp "$DESKTOP" "$PREVIEW" "$fixture/daemon/src/"
-  # The real tree has two; the fixture only copies the two launch modules, so
-  # stand in a file carrying both ambient sites.
-  printf '%s\n%s\n' 'open_ambient_dir' 'open_ambient_dir' >"$fixture/daemon/src/roots.rs"
-  # host_preview.rs already contains one; drop the fixture's extra.
-  printf '%s\n' 'open_ambient_dir' >"$fixture/daemon/src/roots.rs"
+  printf '%s\n' \
+    '        let root = Dir::open_ambient_dir(&root_capability, ambient_authority())?;' \
+    >"$fixture/daemon/src/host_files.rs"
+  printf '%s\n' \
+    '        CapDir::open_ambient_dir(Path::new("/"), ambient_authority())?,' \
+    '        let current = CapDir::open_ambient_dir(&root, ambient_authority())?;' \
+    >"$fixture/daemon/src/upload.rs"
+  printf '%s\n' \
+    '    Dir::open_ambient_dir(path, ambient_authority())' \
+    '    let sync_handle = rustix::fs::openat(' \
+    '        dir,' \
+    '        Path::new("."),' \
+    '        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,' \
+    '        rustix::fs::Mode::empty(),' \
+    '    )' \
+    >"$fixture/daemon/src/platform/unix.rs"
 
   HOST_DESKTOP_LAUNCH_ROOT="$fixture" "$script_path" >/dev/null ||
     fail "self-test: an unmodified copy did not pass"
@@ -129,6 +176,16 @@ self_test() {
   fi
   printf '%s\n' "$original" >"$fixture/daemon/src/host_desktop.rs"
 
+  local original_unix
+  original_unix="$(cat "$fixture/daemon/src/platform/unix.rs")"
+  sed 's/^        dir,$/        rustix::fs::CWD,/' \
+    "$fixture/daemon/src/platform/unix.rs" >"$fixture/unsafe-openat"
+  mv "$fixture/unsafe-openat" "$fixture/daemon/src/platform/unix.rs"
+  if HOST_DESKTOP_LAUNCH_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    fail "self-test: an ambient raw directory open passed"
+  fi
+  printf '%s\n' "$original_unix" >"$fixture/daemon/src/platform/unix.rs"
+
   # Removing a gate must fail closed.
   grep -v '0o111' "$fixture/daemon/src/host_desktop.rs" >"$fixture/stripped"
   mv "$fixture/stripped" "$fixture/daemon/src/host_desktop.rs"
@@ -137,9 +194,9 @@ self_test() {
   fi
   printf '%s\n' "$original" >"$fixture/daemon/src/host_desktop.rs"
 
-  printf '%s\n' 'open_ambient_dir' >>"$fixture/daemon/src/roots.rs"
+  printf '%s\n' 'open_ambient_dir' >"$fixture/daemon/src/roots.rs"
   if HOST_DESKTOP_LAUNCH_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
-    fail "self-test: a third ambient-authority site passed"
+    fail "self-test: an extra ambient-authority site passed"
   fi
 
   printf '%s\n' "host-desktop-launch self-test passed"

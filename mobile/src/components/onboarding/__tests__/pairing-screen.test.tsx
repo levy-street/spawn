@@ -6,8 +6,22 @@ const mockBack = jest.fn();
 const mockCanGoBack = jest.fn(() => true);
 const mockReplace = jest.fn();
 const mockRefetch = jest.fn(async () => undefined);
+const mockHostPairingStep = jest.fn((_props: unknown) => null);
+let mockSearchParams: Record<string, string> = {};
+let mockMeQuery: {
+  data: { user: { id: string } } | undefined;
+  isError: boolean;
+  isPending: boolean;
+  refetch: typeof mockRefetch;
+} = {
+  data: undefined,
+  isError: false,
+  isPending: true,
+  refetch: mockRefetch,
+};
 
 jest.mock("expo-router", () => ({
+  useLocalSearchParams: () => mockSearchParams,
   useRouter: () => ({
     back: mockBack,
     canGoBack: mockCanGoBack,
@@ -24,16 +38,11 @@ jest.mock("react-native-keyboard-controller", () => {
 });
 
 jest.mock("@tanstack/react-query", () => ({
-  useQuery: () => ({
-    data: undefined,
-    isError: false,
-    isPending: true,
-    refetch: mockRefetch,
-  }),
+  useQuery: () => mockMeQuery,
 }));
 
 jest.mock("@/components/onboarding/host-pairing-step", () => ({
-  HostPairingStep: () => null,
+  HostPairingStep: (props: unknown) => mockHostPairingStep(props),
 }));
 
 jest.mock("@/data/api/endpoints/account", () => ({
@@ -62,6 +71,14 @@ describe("PairingScreen", () => {
     mockCanGoBack.mockReset();
     mockCanGoBack.mockReturnValue(true);
     mockReplace.mockClear();
+    mockHostPairingStep.mockClear();
+    mockSearchParams = {};
+    mockMeQuery = {
+      data: undefined,
+      isError: false,
+      isPending: true,
+      refetch: mockRefetch,
+    };
   });
 
   it("renders one shared header over an edge-to-edge themed ground", async () => {
@@ -91,5 +108,30 @@ describe("PairingScreen", () => {
 
     expect(mockBack).not.toHaveBeenCalled();
     expect(mockReplace).toHaveBeenCalledWith("/hosts");
+  });
+
+  it("hands the link ceremony fields to the host step", async () => {
+    mockSearchParams = {
+      approvalRef: "approval-ref-123",
+      hostKey: "host-key-123",
+      fragmentMalformed: "true",
+    };
+    mockMeQuery = {
+      data: { user: { id: "11111111-1111-4111-8111-111111111111" } },
+      isError: false,
+      isPending: false,
+      refetch: mockRefetch,
+    };
+
+    await render(<PairingScreen />, { wrapper });
+
+    expect(mockHostPairingStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "11111111-1111-4111-8111-111111111111",
+        initialApprovalRef: "approval-ref-123",
+        initialHostKey: "host-key-123",
+        initialLinkMalformed: true,
+      }),
+    );
   });
 });

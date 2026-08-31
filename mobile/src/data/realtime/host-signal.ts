@@ -1,3 +1,4 @@
+import { authToken } from "@/data/api/auth-token";
 import { buildHostSocketUrl } from "@/data/api/socket-urls";
 import { registerRealtimeGenerationTarget } from "@/data/realtime/lifecycle";
 import type { SignalChannel } from "@/data/realtime/session-signal";
@@ -5,8 +6,13 @@ import { ReconnectingSocket, type SocketState } from "@/data/realtime/socket";
 import { useConnectionStore } from "@/data/stores/connection";
 
 export const HOST_SIGNAL_PROTOCOL = "spawn.host.v1";
-const SIGNAL_RECONNECT_CAP_MS = 10_000;
-const SIGNAL_RECONNECT_STEP_MS = 500;
+const SIGNAL_RECONNECT_CAP_MS = 30_000;
+const SIGNAL_RECONNECT_BASE_MS = 500;
+
+function signalReconnectDelay(attempt: number, random: number): number {
+  const base = Math.min(SIGNAL_RECONNECT_CAP_MS, SIGNAL_RECONNECT_BASE_MS * 2 ** attempt);
+  return Math.round(base * (0.7 + Math.max(0, Math.min(1, random)) * 0.6));
+}
 
 type SignalFrameObserver = (hostId: string, frame: unknown) => void;
 const FRAME_OBSERVERS = new Set<SignalFrameObserver>();
@@ -37,13 +43,16 @@ class HostSignalChannel implements SignalChannel {
     this.socket = new ReconnectingSocket({
       url: () => buildHostSocketUrl(hostId),
       protocol: HOST_SIGNAL_PROTOCOL,
-      watchdogMs: null,
-      reconnectDelayMs: (attempt) =>
-        Math.min(SIGNAL_RECONNECT_CAP_MS, SIGNAL_RECONNECT_STEP_MS * (attempt + 1)),
-      maxReconnectAttempt: SIGNAL_RECONNECT_CAP_MS / SIGNAL_RECONNECT_STEP_MS,
+      authorization: () => authToken.get(),
+      watchdogMs: 80_000,
+      watchdogFrameTypes: ["ping"],
+      reconnectDelayMs: signalReconnectDelay,
+      maxReconnectAttempt: 64,
     });
     this.unregisterGenerationTarget = registerRealtimeGenerationTarget({
-      retire: () => this.socket.retire(),
+      retire: (reason) => {
+        if (reason !== "interface-change") this.socket.retire();
+      },
       reopen: () => this.socket.connect(),
     });
     this.unsubscribers = [
@@ -82,6 +91,10 @@ class HostSignalChannel implements SignalChannel {
     return this.socket.state;
   }
 
+  get closeInfo() {
+    return this.socket.closeInfo;
+  }
+
   send(frame: unknown): void {
     this.socket.send(frame);
   }
@@ -91,6 +104,10 @@ class HostSignalChannel implements SignalChannel {
     return () => {
       this.listeners.delete(fn);
     };
+  }
+
+  onState(fn: (state: SocketState) => void): () => void {
+    return this.socket.subscribe(fn);
   }
 
   close(): void {

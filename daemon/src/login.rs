@@ -9,6 +9,7 @@
 //!   4. Poll /api/auth/device/poll until success / expiry / denial.
 //!   5. On success store {access_token, host_id, server_url}.
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -33,7 +34,47 @@ pub struct LoginOutcome {
     pub account_id: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("login interrupted")]
+pub struct LoginInterrupted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct UserFacingError(String);
+
+/// The ceremony's own steps. `possess` runs the same three and appends its own.
+pub const LOGIN_STEPS: [&str; 3] = [
+    "Register this machine",
+    "Approve in your browser",
+    "Store credentials",
+];
+
+/// What the operator can do while the live region waits. Never a key prompt:
+/// under `curl … | sh` the shell owns stdin and no keyboard is available.
+pub const WAITING_HINT: &str = "ctrl-c to stop; nothing is registered";
+
+pub fn ceremony_title() -> String {
+    format!("POSSESSING {}", detect_hostname())
+}
+
 pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOutcome> {
+    let ui = crate::tui::Ui::start(&ceremony_title(), &LOGIN_STEPS, WAITING_HINT);
+    let outcome = run_with_ui(server_cli, args, &ui).await;
+    ui.finish();
+    outcome
+}
+
+/// The ceremony proper, drawing into a caller-owned live region so `possess`
+/// can carry the same frame through installing the background service.
+pub async fn run_with_ui(
+    server_cli: Option<String>,
+    args: LoginArgs,
+    ui: &crate::tui::Ui,
+) -> Result<LoginOutcome> {
+    ui.begin(0, "[ RUNNING ]");
+    let force_qr = args.qr;
+    let no_qr = args.no_qr;
+    let no_browser = args.no_browser;
     // Persist before starting the ceremony so retries and interrupted logins
     // never rotate identity. A corrupt existing seed fails closed.
     let mut stored = creds::load().context("loading stored credentials")?;
@@ -63,23 +104,24 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         host_key_algorithm: identity.algorithm,
         host_public_key: &identity.public_key,
     };
-    let start: DeviceStartResponse = client
+    let start_response = client
         .post(start_url.as_str())
         .json(&start_req)
         .send()
         .await
-        .context("POST /api/auth/device/start")?
-        .error_for_status()?
+        .map_err(|error| connect_error(&server, &error))?;
+    ensure_login_http_status(&server, start_response.status())?;
+    let start: DeviceStartResponse = start_response
         .json()
         .await
-        .context("decoding device/start response")?;
+        .map_err(|_| user_error(format!("{} answered, but it isn't a SPAWN D server. Re-run the install command from the app — it carries the right address.", server_origin(&server))))?;
 
     // Prove possession before activating the human-visible user code. The
     // private seed stays inside creds; only the fixed-width signature leaves.
     let possession_signature =
         creds::sign_host_pair_possession(&stored, &start.device_code, &start.approval_nonce)?;
     let possession_url = config::api_url(&server, "/api/auth/device/possession")?;
-    let possession: DevicePossessionResponse = client
+    let possession_response = client
         .post(possession_url.as_str())
         .json(&DevicePossessionRequest {
             device_code: &start.device_code,
@@ -90,16 +132,19 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         })
         .send()
         .await
-        .context("POST /api/auth/device/possession")?
-        .error_for_status()?
+        .map_err(|error| connect_error(&server, &error))?;
+    ensure_login_http_status(&server, possession_response.status())?;
+    let possession: DevicePossessionResponse = possession_response
         .json()
         .await
-        .context("decoding device/possession response")?;
+        .map_err(|_| user_error(format!("{} answered, but it isn't a SPAWN D server. Re-run the install command from the app — it carries the right address.", server_origin(&server))))?;
     if !possession.verified || possession.version != 1 {
+        ui.fail(0, "unsupported server");
         return Err(anyhow!(
             "device/possession returned an unsupported verification state"
         ));
     }
+    ui.complete(0, &host_name);
 
     // Match a browser login's ease: open the approval page directly, carrying a
     // handle so it lands on the approval with nothing to type, and poll to
@@ -109,50 +154,112 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     // public key as a `#k=` fragment appended LOCALLY — see `approval_url` for
     // why that is the ceremony's out-of-band host-key check.
     let approve_url = approval_url(&server, &start, &identity.public_key)?;
-    if open_browser(&approve_url) {
-        println!("spawn: opened your browser to approve this host.");
-        println!("spawn:   didn't open? use this link on any device:");
-    } else {
-        println!("spawn: approve this host in your browser — open this link on any device:");
-    }
-    println!("spawn:   {approve_url}");
-    println!();
+    let opener_available = browser_opener_available();
+    let browser_behavior =
+        browser_behavior(std::io::stdin().is_terminal(), opener_available, no_browser);
+    ui.begin(1, "[ WAITING FOR YOU ]");
 
-    // The link's fragment carries the key check; the fingerprint stays printed
-    // for the fallback (a browser that never received the fragment — retyped
-    // URL, older page — falls back to comparing exactly this value).
-    println!("spawn:   the link carries this host's identity key (the part after '#');");
-    println!("spawn:   your browser checks it automatically before asking you to approve.");
-    println!("spawn:   asked to compare a fingerprint instead? it must be exactly:");
-    println!("spawn:     {}", identity.fingerprint);
-    println!();
-    // The app's "enter a pairing code" fallback exists for exactly the case
-    // where this link cannot travel (no browser here, approving from another
-    // device). It is only reachable if the code is actually shown somewhere,
-    // and this terminal is that somewhere.
-    println!("spawn:   can't use the link? in the app, choose \"enter a pairing code\"");
-    println!("spawn:   and type: {}", start.user_code);
-    println!();
-    println!("spawn: waiting for approval…");
+    // The QR carries the full URL including the locally-appended #k= fragment.
+    // A camera transfers it out of band; fragments never reach the HTTP server.
+    //
+    // The browser is no longer opened before this point, so the old
+    // "did opening fail?" input is gone: the question is simply whether this
+    // machine has a browser to offer at all. Headless hosts get the QR.
+    let qr = (!no_qr && (force_qr || !opener_available))
+        .then(|| render_qr(&approve_url).ok())
+        .flatten();
+
+    ui.block(
+        approval_panel(
+            false,
+            &approve_url,
+            ui.width(),
+            browser_behavior.offer_enter,
+        ),
+        &approval_plain_lines(false, &approve_url, qr.as_deref()),
+    );
+
+    // A keyboard gets an explicit Enter offer; without one, launch immediately.
+    // `--no-browser` suppresses both paths while leaving the link and QR rules
+    // unchanged.
+    if browser_behavior.offer_enter {
+        // The panel above already carries the instruction, so the prompt
+        // itself prints nothing — it only waits for the key.
+        if crate::tui::press_enter("") && open_browser(&approve_url) {
+            ui.log("opened your browser.");
+        }
+    } else if browser_behavior.open_immediately {
+        open_browser(&approve_url);
+    }
+    if ui.is_rich() {
+        if let Some(qr) = &qr {
+            ui.block(qr.lines().map(str::to_owned).collect(), &[]);
+        }
+    }
+    ui.status(&waiting_status(0, start.expires_in));
 
     // 2. poll
     let poll_url = config::api_url(&server, "/api/auth/device/poll")?;
     let mut interval = Duration::from_secs(start.interval.max(1));
+    let started_waiting = tokio::time::Instant::now();
     let poll_body = DevicePollRequest {
         device_code: &start.device_code,
         host_key_algorithm: identity.algorithm,
         host_public_key: &identity.public_key,
     };
 
+    let mut elapsed_shown = false;
+    let mut hint_shown = false;
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            interrupted = tokio::signal::ctrl_c() => {
+                interrupted.context("ctrl-c handler")?;
+                ui.fail(1, "approval stopped");
+                crate::tui::log_line("stopped. Nothing was registered — run spawnd possess to start again.");
+                return Err(LoginInterrupted.into());
+            }
+        }
 
-        let resp = client
-            .post(poll_url.as_str())
-            .json(&poll_body)
-            .send()
-            .await
-            .context("POST /api/auth/device/poll")?;
+        let elapsed = started_waiting.elapsed();
+        // Rich mode carries elapsed and expiry continuously in the status line,
+        // so the periodic reminders would only repeat what is already on screen.
+        // Plain mode has no live line and keeps them, unchanged.
+        if ui.is_rich() {
+            ui.status(&waiting_status(elapsed.as_secs(), start.expires_in));
+        } else {
+            if !elapsed_shown && elapsed >= Duration::from_secs(30) {
+                elapsed_shown = true;
+                let remaining = start.expires_in.saturating_sub(elapsed.as_secs());
+                let minutes = remaining.div_ceil(60);
+                println!(
+                    "spawn: still waiting — {} s elapsed (link expires in {minutes} min)",
+                    elapsed.as_secs()
+                );
+            }
+            if !hint_shown && elapsed >= Duration::from_secs(60) {
+                hint_shown = true;
+                println!("spawn: Still waiting — is the browser open? The link is above; it works on any device.");
+            }
+        }
+
+        let resp = tokio::select! {
+            response = client.post(poll_url.as_str()).json(&poll_body).send() => {
+                match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        ui.fail(1, "approval failed");
+                        return Err(connect_error(&server, &error));
+                    }
+                }
+            }
+            interrupted = tokio::signal::ctrl_c() => {
+                interrupted.context("ctrl-c handler")?;
+                ui.fail(1, "approval stopped");
+                crate::tui::log_line("stopped. Nothing was registered — run spawnd possess to start again.");
+                return Err(LoginInterrupted.into());
+            }
+        };
 
         let status = resp.status();
         // 200 with body that may carry either {access_token, host_id} or {error: ...}.
@@ -162,42 +269,255 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
             || status == StatusCode::FORBIDDEN
             || status == StatusCode::GONE)
         {
+            ui.fail(1, "approval failed");
             return Err(anyhow!("device/poll: HTTP {status}"));
         }
-        let body: DevicePollResponse =
-            resp.json().await.context("decoding device/poll response")?;
+        let body: DevicePollResponse = match resp.json().await {
+            Ok(body) => body,
+            Err(error) => {
+                ui.fail(1, "approval failed");
+                return Err(error).context("decoding device/poll response");
+            }
+        };
 
         if poll_has_success_fields(&body) {
             let account_id = body.account_id.clone();
-            let host_id = commit_poll_success(
+            let host_id = match commit_poll_success(
                 &mut stored,
                 body,
                 &identity,
                 &server,
                 &start.approval_nonce,
                 creds::save,
-            )?;
-            println!("spawn: logged in. host_id = {host_id}");
+            ) {
+                Ok(host_id) => host_id,
+                Err(error) => {
+                    ui.fail(1, "approval failed");
+                    return Err(error);
+                }
+            };
+            ui.complete(1, "approved");
+            ui.complete(2, &format!("host {host_id}"));
             return Ok(LoginOutcome { account_id });
         }
 
         match body.error.as_deref() {
-            Some("authorization_pending") | None => {
-                // keep polling
-            }
+            Some("authorization_pending") | None => {}
             Some("slow_down") => {
                 interval += Duration::from_secs(5);
                 tracing::debug!(?interval, "server requested slow_down");
             }
             Some("expired_token") => {
-                return Err(anyhow!("device code expired; run `spawnd login` again"));
+                ui.fail(1, "approval expired");
+                return Err(user_error("The approval expired before anyone finished it. Run spawnd possess again for a fresh one."));
             }
             Some("denied") => {
-                return Err(anyhow!("login was denied"));
+                ui.fail(1, "approval declined");
+                return Err(user_error(
+                    "The approval was declined in the browser. Nothing was registered.",
+                ));
+            }
+            Some("key_conflict") => {
+                ui.fail(1, "approval failed");
+                return Err(user_error(key_conflict_copy()));
+            }
+            Some("pin_conflict") => {
+                ui.fail(1, "approval failed");
+                return Err(user_error("The browser that approved this machine doesn't match its earlier approval. Approve again from a browser you've used with this host before — or remove the host on the web and start fresh."));
+            }
+            Some("pin_limit") => {
+                ui.fail(1, "approval failed");
+                return Err(user_error("This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again."));
             }
             Some(other) => {
+                ui.fail(1, "approval failed");
                 return Err(anyhow!("device/poll returned error: {other}"));
             }
+        }
+    }
+}
+
+/// The live-region panel for the approval: the only thing on screen the
+/// operator has to act on, given its own frame so it stops competing with the
+/// ceremony's commentary for attention.
+///
+/// It offers one thing: the link. There used to be a pairing code to type into
+/// the app and this machine's fingerprint beside it, and together they read as
+/// three ways to approve where there is one. The link carries the host's key
+/// in its fragment, so the browser or phone that opens it checks the identity
+/// itself — there is nothing here for a person to compare or to type.
+fn approval_panel(
+    browser_opened: bool,
+    approve_url: &str,
+    width: usize,
+    interactive: bool,
+) -> Vec<String> {
+    use crate::tui::{bold, dim, hyperlink, render_panel, wrap_plain, wrap_words};
+    let inner = width.saturating_sub(4);
+    // Every row is wrapped to the frame's interior: prose by word, the URL by
+    // force. An unwrapped row pushes the border out and the whole panel goes
+    // ragged on a narrow terminal.
+    let prose = |text: &str| -> Vec<String> {
+        wrap_words(text, inner)
+            .iter()
+            .map(|l| dim(l, true))
+            .collect()
+    };
+    let lead = if browser_opened {
+        "opened your browser. didn't open? use this link on any device:"
+    } else {
+        "open this link on any device:"
+    };
+    let mut rows = vec![String::new()];
+    rows.extend(prose(lead));
+    // Every wrapped segment carries the same OSC 8 target, so the whole run is
+    // clickable rather than just the first line.
+    rows.extend(
+        wrap_plain(approve_url, inner)
+            .iter()
+            .map(|line| hyperlink(approve_url, &bold(line, true), true)),
+    );
+    if interactive {
+        // The instruction belongs beside the link it acts on, not adrift below
+        // the progress frame where the next repaint would sit on top of it.
+        rows.push(String::new());
+        rows.push(bold("press Enter to open it here", true));
+    }
+    render_panel("APPROVE THIS HOST", &rows, width, true)
+}
+
+/// The one value on screen that has to be compared by eye, given the weight
+/// that job deserves: its own line, bold and accented, with air around it.
+///
+/// A fingerprint set as dim inline prose is a security check dressed as
+/// decoration — it reads as a serial number to skip past rather than the thing
+/// standing between this machine and whoever else asked to hold it. Every
+/// place one is shown for comparison uses this.
+fn fingerprint_rows(fingerprint: &str, inner: usize) -> Vec<String> {
+    use crate::tui::{accent, bold, wrap_plain};
+    let mut rows = vec![String::new()];
+    rows.extend(
+        wrap_plain(fingerprint, inner.saturating_sub(4))
+            .iter()
+            .map(|line| format!("    {}", accent(&bold(line, true), true))),
+    );
+    rows.push(String::new());
+    rows
+}
+
+/// The browser-side half of the ceremony's out-of-band check.
+///
+/// The server told us which browser approved this host; nothing it said proves
+/// that browser is the reader's. Only the reader can close that gap, by
+/// comparing this against what their browser shows under Access — so the ask
+/// has to be legible, and has to say what a mismatch means.
+fn browser_fingerprint_panel(fingerprint: &str, width: usize) -> Vec<String> {
+    use crate::tui::{dim, render_panel, wrap_words};
+    let inner = width.saturating_sub(4);
+    let prose = |text: &str| -> Vec<String> {
+        wrap_words(text, inner)
+            .iter()
+            .map(|l| dim(l, true))
+            .collect()
+    };
+    let mut rows = vec![String::new()];
+    rows.extend(prose(
+        "the browser that approved this machine is pinned to it now. under Access it shows:",
+    ));
+    rows.extend(fingerprint_rows(fingerprint, inner));
+    rows.extend(prose(
+        "not what you see there? that approval came from somewhere else — remove this host in the app and start again.",
+    ));
+    render_panel("CHECK YOUR BROWSER SHOWS THIS", &rows, width, true)
+}
+
+/// The same check for pipes, CI and `NO_COLOR`.
+fn browser_fingerprint_plain_lines(fingerprint: &str) -> Vec<String> {
+    vec![
+        "spawn: the browser that approved this machine is pinned to it now.".to_owned(),
+        "spawn:   under Access it shows:".to_owned(),
+        String::new(),
+        format!("spawn:     {fingerprint}"),
+        String::new(),
+        "spawn:   not what you see there? that approval came from somewhere else —".to_owned(),
+        "spawn:   remove this host in the app and start again.".to_owned(),
+    ]
+}
+
+/// What piped output, CI and `NO_COLOR` see instead of the panel: the same
+/// single offer — the link — with a line saying why there is nothing else to
+/// compare or type. The pairing code used to be printed here too, and the
+/// app's "enter a pairing code" screen existed only because this terminal
+/// was the one place the code was shown; neither is a way in any more.
+fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str>) -> Vec<String> {
+    let mut lines: Vec<String> = approval_link_block(browser_opened, approve_url)
+        .trim_end_matches('\n')
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.push(String::new());
+    if let Some(qr) = qr {
+        lines
+            .push("spawn:   Scan this with your phone, or open the link on any device:".to_owned());
+        lines.push(String::new());
+        lines.extend(qr.trim_end_matches('\n').lines().map(str::to_owned));
+        lines.push(String::new());
+    }
+    lines.extend([
+        "spawn:   the link carries this host's identity key (the part after '#');".to_owned(),
+        "spawn:   your browser checks it automatically before asking you to approve.".to_owned(),
+        String::new(),
+        "spawn: waiting for approval…".to_owned(),
+    ]);
+    lines
+}
+
+/// The live status line, rebuilt each tick so elapsed and expiry stay current.
+fn waiting_status(elapsed: u64, expires_in: u64) -> String {
+    let minutes = expires_in.saturating_sub(elapsed).div_ceil(60);
+    format!("waiting for approval — {elapsed}s · link expires in {minutes} min")
+}
+
+fn approval_link_block(browser_opened: bool, approve_url: &str) -> String {
+    if browser_opened {
+        format!(
+            "spawn: opened your browser to approve this host.\n\
+             spawn:   didn't open? use this link on any device:\n\
+             spawn:   {approve_url}\n\n"
+        )
+    } else {
+        format!(
+            "spawn: approve this host in your browser — open this link on any device:\n\
+             spawn:   {approve_url}\n\n"
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrowserBehavior {
+    offer_enter: bool,
+    open_immediately: bool,
+}
+
+fn browser_behavior(
+    interactive: bool,
+    opener_available: bool,
+    no_browser: bool,
+) -> BrowserBehavior {
+    if no_browser || !opener_available {
+        BrowserBehavior {
+            offer_enter: false,
+            open_immediately: false,
+        }
+    } else if interactive {
+        BrowserBehavior {
+            offer_enter: true,
+            open_immediately: false,
+        }
+    } else {
+        BrowserBehavior {
+            offer_enter: false,
+            open_immediately: true,
         }
     }
 }
@@ -252,7 +572,13 @@ fn approval_url(
 /// launcher was started. Never blocks and never fails login — on a headless host
 /// (no display) or where no opener exists, the caller prints the URL instead.
 fn open_browser(url: &str) -> bool {
+    #[cfg(windows)]
+    {
+        crate::platform::open_url(url).is_ok()
+    }
+    #[cfg(not(windows))]
     use std::process::{Command, Stdio};
+    #[cfg(not(windows))]
     let mut _cmd: Option<Command> = None;
     #[cfg(target_os = "macos")]
     {
@@ -265,6 +591,7 @@ fn open_browser(url: &str) -> bool {
             _cmd = Some(Command::new("xdg-open"));
         }
     }
+    #[cfg(not(windows))]
     match _cmd {
         Some(mut cmd) => cmd
             .arg(url)
@@ -275,6 +602,117 @@ fn open_browser(url: &str) -> bool {
             .is_ok(),
         None => false,
     }
+}
+
+fn browser_opener_available() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new("/usr/bin/open").is_file()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
+            && command_on_path("xdg-open")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn command_on_path(command: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| directory.join(command).is_file())
+    })
+}
+
+fn render_qr(value: &str) -> Result<String> {
+    use qrcode::types::Color;
+
+    let code = qrcode::QrCode::new(value.as_bytes()).context("encoding approval QR")?;
+    let width = code.width();
+    let quiet = 2usize;
+    let module = |x: isize, y: isize| -> bool {
+        if x < 0 || y < 0 || x >= width as isize || y >= width as isize {
+            false
+        } else {
+            code[(x as usize, y as usize)] == Color::Dark
+        }
+    };
+    let mut rendered = String::new();
+    for y in (-(quiet as isize)..(width + quiet) as isize).step_by(2) {
+        rendered.push_str("     ");
+        for x in -(quiet as isize)..(width + quiet) as isize {
+            rendered.push(match (module(x, y), module(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
+fn key_conflict_copy() -> &'static str {
+    "This machine was set up before, under a different SPAWN D account, and\n\
+     spawn: that account still holds its identity. Nothing was changed.\n\
+     spawn:   • To use it under THAT account: sign in there and approve as usual.\n\
+     spawn:   • To hand it to THIS account: remove the host from the old account's\n\
+     spawn:     Hosts page first, then run  spawnd possess  again.\n\
+     spawn:   • To keep both accounts on this machine:  spawnd possess --new-account"
+}
+
+pub(crate) fn user_error(message: impl Into<String>) -> anyhow::Error {
+    UserFacingError(message.into()).into()
+}
+
+pub(crate) fn background_service_error(error: &anyhow::Error) -> anyhow::Error {
+    user_error(format!(
+        "Couldn't install the background service ({error}). The daemon still works in the foreground: spawnd run. To retry the service: spawnd reconnect."
+    ))
+}
+
+fn server_origin(server: &url::Url) -> String {
+    server.origin().ascii_serialization()
+}
+
+fn connect_error(server: &url::Url, error: &reqwest::Error) -> anyhow::Error {
+    let rendered = error.to_string().to_ascii_lowercase();
+    let origin = server_origin(server);
+    let host = server.host_str().unwrap_or("the server");
+    if rendered.contains("dns") || rendered.contains("resolve") {
+        user_error(format!("Can't find {host}. Check the server address — spawnd status shows what this machine uses."))
+    } else if rendered.contains("certificate") || rendered.contains("tls") {
+        user_error(format!("Secure connection to {origin} failed. If this machine's clock is wrong, fix that first (spawnd doctor checks it)."))
+    } else {
+        user_error(format!(
+            "{origin} didn't answer. Is the machine online? A firewall or VPN may be blocking it."
+        ))
+    }
+}
+
+fn ensure_login_http_status(server: &url::Url, status: StatusCode) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    if matches!(status.as_u16(), 502 | 503) {
+        return Err(user_error(format!(
+            "{} is having trouble (HTTP {}). Try again in a minute.",
+            server_origin(server),
+            status.as_u16()
+        )));
+    }
+    Err(user_error(format!(
+        "{} answered, but it isn't a SPAWN D server. Re-run the install command from the app — it carries the right address.",
+        server_origin(server)
+    )))
 }
 
 fn poll_has_success_fields(body: &DevicePollResponse) -> bool {
@@ -413,7 +851,7 @@ where
         // Retain the proof itself, not a verdict about it, so every later load
         // re-derives the verdict rather than trusting this one.
         let browser_pin = if approval_verified {
-            println!("spawn: browser approval proof verified");
+            crate::tui::log_line("browser approval proof verified");
             creds::attach_browser_approval_proof(
                 browser_pin,
                 body.account_id
@@ -426,13 +864,18 @@ where
             )
             .context("retaining the verified browser approval proof")?
         } else {
-            println!("spawn: warning: this server supplied no browser approval proof");
+            crate::tui::log_line("warning: this server supplied no browser approval proof");
             browser_pin
         };
         // The proof cannot tell a substituted browser key from the real one, so
         // the operator confirms this fingerprint matches the one their browser
-        // shows. This is the only check a hostile server cannot pass.
-        println!("spawn: verify browser fingerprint: {browser_key_fingerprint}");
+        // shows. This is the only check a hostile server cannot pass — and it
+        // is worth exactly as much as the reader's chance of noticing it, so
+        // it gets a panel rather than a line that scrolls past.
+        crate::tui::log_block(
+            browser_fingerprint_panel(browser_key_fingerprint, crate::tui::terminal_width()),
+            &browser_fingerprint_plain_lines(browser_key_fingerprint),
+        );
         let owned_token = std::mem::take(
             &mut **token
                 .as_mut()
@@ -471,7 +914,7 @@ fn verify_poll_identity(body: &DevicePollResponse, identity: &HostIdentity) -> R
     Ok(())
 }
 
-fn detect_hostname() -> String {
+pub(crate) fn detect_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
@@ -958,5 +1401,312 @@ mod tests {
         )
         .expect("a pre-0022 server must still be able to pair");
         assert!(persisted.get());
+    }
+
+    #[test]
+    fn browser_opening_respects_interactivity_and_no_browser() {
+        assert_eq!(
+            browser_behavior(true, true, false),
+            BrowserBehavior {
+                offer_enter: true,
+                open_immediately: false,
+            }
+        );
+        assert_eq!(
+            browser_behavior(false, true, false),
+            BrowserBehavior {
+                offer_enter: false,
+                open_immediately: true,
+            }
+        );
+        for interactive in [true, false] {
+            assert_eq!(
+                browser_behavior(interactive, true, true),
+                BrowserBehavior {
+                    offer_enter: false,
+                    open_immediately: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn plain_login_link_block_is_byte_stable() {
+        assert_eq!(
+            approval_link_block(false, "https://spawnd.dev/device?ref=x#k=y"),
+            "spawn: approve this host in your browser — open this link on any device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
+        );
+        assert_eq!(
+            approval_link_block(true, "https://spawnd.dev/device?ref=x#k=y"),
+            "spawn: opened your browser to approve this host.\nspawn:   didn't open? use this link on any device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
+        );
+    }
+
+    #[test]
+    fn the_approval_panel_stays_square_around_a_real_length_url() {
+        // A live approval URL carries an opaque ref and a key fragment and runs
+        // well past any frame, so the wrap path is the normal case, not an edge.
+        let url = format!(
+            "http://localhost:3000/device?ref={}#k={}",
+            "dGfl0YzRgEM6YrY9JVVDVPaIRWu8eEKrYhv-7LxiQJw".repeat(2),
+            "iyfYTSKbL12bH3OGWAov2LH2qOvK6vokuRQfRdZMaUc"
+        );
+        assert!(url.len() > 150, "the fixture must actually overflow");
+        for width in [crate::tui::MIN_FRAME_COLUMNS, 72, 92] {
+            let panel = approval_panel(false, &url, width, true);
+            let widths: Vec<usize> = panel.iter().map(|l| crate::tui::display_width(l)).collect();
+            assert!(
+                widths.iter().all(|w| *w == width),
+                "ragged panel at width {width}: {widths:?}"
+            );
+        }
+        // Every character of the URL must survive the wrap — a truncated
+        // approval link is worse than an ugly one.
+        let panel = approval_panel(false, &url, 72, true);
+        let chunks = crate::tui::wrap_plain(&url, 72 - 4);
+        assert_eq!(chunks.concat(), url, "wrapping dropped part of the URL");
+        for chunk in &chunks {
+            assert!(
+                panel.iter().any(|line| strip_sgr(line).contains(chunk)),
+                "the panel is missing a piece of the approval URL: {chunk}"
+            );
+        }
+    }
+
+    fn strip_sgr(text: &str) -> String {
+        crate::tui::strip_styles(text)
+    }
+
+    #[test]
+    fn plain_approval_output_offers_the_link_and_nothing_to_type() {
+        // The live region is a tty-only affordance. Anything piped — CI, a
+        // smoke script, `NO_COLOR` — sees the same single offer as the panel,
+        // byte for byte.
+        let lines = approval_plain_lines(false, "https://spawnd.dev/device?ref=x#k=y", None);
+        assert_eq!(
+            lines,
+            vec![
+                "spawn: approve this host in your browser — open this link on any device:",
+                "spawn:   https://spawnd.dev/device?ref=x#k=y",
+                "",
+                "spawn:   the link carries this host's identity key (the part after '#');",
+                "spawn:   your browser checks it automatically before asking you to approve.",
+                "",
+                "spawn: waiting for approval…",
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_approval_url_line_is_byte_stable() {
+        let url = "https://spawnd.dev/device?ref=x#k=y";
+        assert_eq!(
+            approval_plain_lines(false, url, None)[1],
+            format!("spawn:   {url}")
+        );
+    }
+
+    /// One way to approve: the link. The pairing code and the fingerprint
+    /// used to sit under it, and the three together read as three routes
+    /// where there is one — the link carries the key, so nothing here is
+    /// for a person to type or compare.
+    #[test]
+    fn the_approval_panel_offers_the_link_and_nothing_else() {
+        let url = "http://localhost:3000/device?ref=dIF2cG14Xj3maek4#k=WsMbPmvzNwEnoPV1I";
+        for interactive in [true, false] {
+            let panel = approval_panel(false, url, 88, interactive);
+            let plain = strip_sgr(&panel.join("\n")).to_lowercase();
+            assert!(plain.contains("open this link on any device"), "{plain}");
+            assert!(plain.contains("device?ref=dif2cg14xj3maek4"), "{plain}");
+            assert!(
+                !plain.contains("pairing code"),
+                "a code to type is a second way in: {plain}"
+            );
+            assert!(
+                !plain.contains("sha256"),
+                "a fingerprint to compare is a third: {plain}"
+            );
+            assert!(!plain.contains("key"), "{plain}");
+            assert!(!plain.contains("no link"), "{plain}");
+        }
+        let plain = approval_plain_lines(false, url, None)
+            .join("\n")
+            .to_lowercase();
+        assert!(!plain.contains("pairing code"), "{plain}");
+        assert!(!plain.contains("sha256"), "{plain}");
+        assert!(!plain.contains("type"), "{plain}");
+    }
+
+    #[test]
+    fn the_approval_link_is_clickable_and_says_how_to_open_it() {
+        let url = "http://localhost:3000/device?ref=dIF2cG14Xj3maek4#k=WsMbPmvzNwEnoPV1I";
+        let panel = approval_panel(false, url, 88, true);
+        let joined = panel.join("\n");
+
+        // OSC 8, so the terminal makes the link clickable rather than leaving
+        // the operator to select 90-odd characters by hand.
+        assert!(joined.contains("\u{1b}]8;;"), "no hyperlink marker");
+        assert!(joined.contains(url), "the link target must be the full URL");
+        // The instruction sits with the link, inside the same frame.
+        assert!(joined.contains("press Enter to open it here"));
+
+        // Without a keyboard there is nothing to press, so the line is absent.
+        let headless = approval_panel(false, url, 88, false);
+        assert!(!headless.join("\n").contains("press Enter"));
+    }
+
+    #[test]
+    fn the_opened_browser_variant_keeps_its_own_lead_lines() {
+        let lines = approval_plain_lines(true, "https://x/y", None);
+        assert_eq!(lines[0], "spawn: opened your browser to approve this host.");
+        assert_eq!(
+            lines[1],
+            "spawn:   didn't open? use this link on any device:"
+        );
+        assert_eq!(lines[2], "spawn:   https://x/y");
+    }
+
+    #[test]
+    fn a_qr_is_carried_through_the_plain_lines_unaltered() {
+        let lines = approval_plain_lines(false, "https://x/y", Some("##\n#.\n"));
+        assert!(lines.contains(&"##".to_owned()) && lines.contains(&"#.".to_owned()));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Scan this with your phone")));
+    }
+
+    #[test]
+    fn the_waiting_status_counts_down_the_real_expiry() {
+        assert_eq!(
+            waiting_status(0, 1800),
+            "waiting for approval — 0s · link expires in 30 min"
+        );
+        assert_eq!(
+            waiting_status(33, 1800),
+            "waiting for approval — 33s · link expires in 30 min"
+        );
+        // Past expiry must not underflow into a huge number.
+        assert_eq!(
+            waiting_status(9_000, 1800),
+            "waiting for approval — 9000s · link expires in 0 min"
+        );
+    }
+
+    /// The check a hostile server cannot pass has to be legible, square, and
+    /// say what a mismatch means — a fingerprint nobody reads is decoration.
+    #[test]
+    fn the_browser_fingerprint_gets_a_panel_not_a_passing_line() {
+        let rows = browser_fingerprint_panel("SHA256:HtC4Xxqpdeh3Yfgd", 72);
+        let plain = strip_sgr(&rows.join("\n"));
+        assert!(plain.contains("SHA256:HtC4Xxqpdeh3Yfgd"));
+        assert!(plain.contains("Access"));
+        assert!(plain.contains("remove this host"));
+        let widths: Vec<usize> = rows.iter().map(|r| crate::tui::display_width(r)).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "ragged panel: {widths:?}"
+        );
+        let lines = browser_fingerprint_plain_lines("SHA256:HtC4Xxqpdeh3Yfgd");
+        assert!(lines.iter().any(|l| l.contains("SHA256:HtC4Xxqpdeh3Yfgd")));
+    }
+
+    /// Every fingerprint shown for comparison gets the same treatment: its own
+    /// line, with air, never buried in a run of dim prose.
+    #[test]
+    fn a_fingerprint_stands_alone_wherever_it_is_shown() {
+        let panel = browser_fingerprint_panel("SHA256:zzz", 72);
+        let plain: Vec<String> = panel.iter().map(|r| strip_sgr(r)).collect();
+        let row = plain
+            .iter()
+            .find(|r| r.contains("SHA256:zzz"))
+            .expect("the fingerprint is on some row");
+        // Nothing else shares the row it is on.
+        let content = row.trim_matches(|c| c == '│' || c == ' ');
+        assert_eq!(content, "SHA256:zzz", "fingerprint shares its row: {row:?}");
+    }
+
+    #[test]
+    fn qr_encodes_the_full_fragment_bearing_approval_url() {
+        let full = "https://spawnd.dev/device?ref=opaque#k=host-public-key";
+        let qr = qrcode::QrCode::new(full.as_bytes()).unwrap();
+        let rendered = render_qr(full).unwrap();
+        assert!(qr.width() > 0);
+        assert!(rendered.contains(['█', '▀', '▄']));
+        assert!(!rendered.contains(full));
+    }
+
+    #[test]
+    fn key_conflict_uses_the_three_option_transcript() {
+        let copy = key_conflict_copy();
+        assert!(copy.contains("To use it under THAT account"));
+        assert!(copy.contains("To hand it to THIS account"));
+        assert!(copy.contains("spawnd possess --new-account"));
+        assert!(copy.contains("Nothing was changed."));
+    }
+
+    #[tokio::test]
+    async fn fake_server_observes_current_start_and_possession_shapes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let read = first.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(!request.contains("setup_token"));
+            let start = r#"{"device_code":"code","user_code":"ABCD-EFGH","approval_nonce":"nonce","verification_uri":"http://127.0.0.1/device","interval":1,"expires_in":1800}"#;
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{start}",
+                        start.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut second_request = vec![0u8; 4096];
+            let _ = second.read(&mut second_request).await.unwrap();
+            let possession = r#"{"verified":true,"version":1}"#;
+            second
+                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{possession}", possession.len()).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let origin = url::Url::parse(&format!("http://{address}/")).unwrap();
+        let client = reqwest::Client::new();
+        let start: DeviceStartResponse = client
+            .post(origin.join("start").unwrap())
+            .json(&DeviceStartRequest {
+                host_name: "host",
+                os: "linux",
+                arch: "x86_64",
+                version: "0.1.0",
+                host_key_algorithm: "ed25519",
+                host_public_key: "host-key",
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(start.user_code, "ABCD-EFGH");
+        let possession: DevicePossessionResponse = client
+            .post(origin.join("possession").unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(possession.verified);
+        assert_eq!(possession.version, 1);
+        server.await.unwrap();
     }
 }

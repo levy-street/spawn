@@ -1,8 +1,11 @@
 "use client";
 
 import Link from "next/link";
+import { HostHealthPanel } from "@/components/hosts/host-health-panel";
 import { CapacityBar, LegionDot, RunningLabel } from "@/components/legion/legion-parts";
+import { HostUpdateBadge } from "@/components/release/HostUpdateDialog";
 import { useHostCapacity } from "@/hooks/useHostCapacity";
+import { formatHostPlatform } from "@/lib/host-platform";
 import {
   bucketFill,
   bucketOf,
@@ -62,8 +65,9 @@ export function LegionHostCard({
         >
           {host.name}
         </Link>
+        <HostUpdateBadge host={host} />
         <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-          {online ? host.os || "online" : "offline"}
+          {online ? formatHostPlatform(host) : "offline"}
         </span>
       </header>
 
@@ -101,6 +105,8 @@ export function LegionHostCard({
           )}
         </div>
       )}
+
+      {!online && <HostHealthPanel host={host} compact />}
 
       <footer className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border pt-2.5">
         <span className="font-mono text-[10px] tabular-nums text-muted-foreground">

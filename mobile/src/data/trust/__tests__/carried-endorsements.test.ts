@@ -3,8 +3,26 @@ import type { AccountEndorsementRecord } from "@/data/api/schemas/trust";
 import {
   type CarriedEndorsementApi,
   loadCarriedEndorsements,
+  loadMemoizedCarriedEndorsements,
 } from "@/data/trust/carried-endorsements";
+import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
+
+const mockListBrowserDevices = jest.fn(async () => []);
+
+jest.mock("@/data/api/endpoints/devices", () => ({
+  listBrowserDevices: () => mockListBrowserDevices(),
+}));
+
+jest.mock("@/data/api/endpoints/trust", () => ({
+  listAccountEndorsements: jest.fn(async () => []),
+  listHostPins: jest.fn(async () => []),
+}));
+
+jest.mock("@/lib/crypto/identity", () => ({
+  activeDeviceIdentityAccount: () => "00000000-0000-4000-8000-000000000001",
+  deviceIdentity: { publicKey: async () => new Uint8Array(32) },
+}));
 
 const ACCOUNT_ID = "00000000-0000-4000-8000-000000000001";
 const THIS_DEVICE_ID = "00000000-0000-4000-8000-000000000002";
@@ -110,5 +128,28 @@ describe("loadCarriedEndorsements", () => {
       towardThisDevice.signature,
       upstream.signature,
     ]);
+  });
+});
+
+describe("loadMemoizedCarriedEndorsements", () => {
+  beforeEach(() => {
+    mockListBrowserDevices.mockClear();
+    invalidateDeviceHostTrust();
+  });
+
+  test("shares one read across a burst of reconnects", async () => {
+    await loadMemoizedCarriedEndorsements();
+    await loadMemoizedCarriedEndorsements();
+    expect(mockListBrowserDevices).toHaveBeenCalledTimes(1);
+  });
+
+  test("reads again once an approval may have landed", async () => {
+    await loadMemoizedCarriedEndorsements();
+    // The verdict and the edges are one view of this device's admission, and
+    // refreshing the verdict against edges cached from before the approval is
+    // what left a phone told it was trusted while it re-offered refused proof.
+    invalidateDeviceHostTrust();
+    await loadMemoizedCarriedEndorsements();
+    expect(mockListBrowserDevices).toHaveBeenCalledTimes(2);
   });
 });

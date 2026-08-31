@@ -2,8 +2,8 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { type FormEvent, Suspense, useState } from "react";
 import { AuthShell } from "@/components/onboarding/auth-shell";
 import { OAuthButtons } from "@/components/onboarding/oauth-buttons";
 import { Button } from "@/components/ui/button";
@@ -11,18 +11,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, auth } from "@/lib/api";
 import { useAuthConfig } from "@/lib/auth";
+import { safeNext, withNext } from "@/lib/safe-next";
 
-/**
- * Where to land after login: the `?next=` AuthGate set, but only when it is a
- * same-origin absolute path. Rejects protocol-relative (`//host`) and absolute
- * URLs so `next` can't become an open redirect.
- */
-function safeNext(raw: string | null): string {
-  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return "/app";
-  return raw;
-}
-
-export default function LoginPage() {
+function LoginPageContent() {
   const router = useRouter();
   const queryClient = useQueryClient();
   const { config, loading: configLoading, error: configError } = useAuthConfig();
@@ -30,6 +21,14 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // Read during render rather than in an effect: computed after paint, the
+  // signup link spends its first frames as a bare "/signup", and a fast click
+  // in that window drops the approval this visit came from.
+  const next = useSearchParams().get("next");
+  const returnTo = safeNext(next);
+  // Carried on to signup, so someone who arrives from a host approval link and
+  // then creates an account still lands back on that approval.
+  const signupHref = withNext("/signup", next);
 
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
@@ -39,7 +38,7 @@ export default function LoginPage() {
       const result = await auth.login({ email, password });
       queryClient.setQueryData(["me"], { user: result.user });
       void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace(safeNext(new URLSearchParams(window.location.search).get("next")));
+      router.replace(returnTo);
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "Login failed");
     } finally {
@@ -53,7 +52,11 @@ export default function LoginPage() {
       description="Sign in to reach the shells running across your machines."
     >
       <div className="space-y-5">
-        <OAuthButtons providers={config?.providers ?? []} returnTo="/app" loading={configLoading} />
+        <OAuthButtons
+          providers={config?.providers ?? []}
+          returnTo={returnTo}
+          loading={configLoading}
+        />
         {configError ? (
           <p className="text-sm text-muted-foreground" role="status">
             Social sign-in is temporarily unavailable. Email sign-in still works.
@@ -107,7 +110,7 @@ export default function LoginPage() {
         <p className="text-center text-sm text-ash">
           No account?{" "}
           <Link
-            href="/signup"
+            href={signupHref}
             className="inline-flex min-h-11 items-center font-medium text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
           >
             Create one
@@ -115,5 +118,23 @@ export default function LoginPage() {
         </p>
       </div>
     </AuthShell>
+  );
+}
+
+export default function LoginPage() {
+  // useSearchParams needs a boundary to suspend against during prerender.
+  return (
+    <Suspense
+      fallback={
+        <AuthShell
+          title="Welcome back"
+          description="Sign in to reach the shells running across your machines."
+        >
+          <div className="min-h-64" />
+        </AuthShell>
+      }
+    >
+      <LoginPageContent />
+    </Suspense>
   );
 }

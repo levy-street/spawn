@@ -5,9 +5,11 @@ import {
   DEFAULT_RATIO,
   MAX_RATIO,
   MIN_RATIO,
+  memberSide,
   normalizeSplit,
   readStoredSplit,
   SPLIT_STORAGE_KEY,
+  splitFor,
   splitStore,
 } from "./split-store";
 
@@ -17,7 +19,7 @@ import {
  * a file's tests in order, which is what makes that a reset and not a hope.
  */
 function reset(): void {
-  splitStore.close();
+  splitStore.clear();
   splitStore.setRendered(null);
   splitStore.setRatio(DEFAULT_RATIO);
 }
@@ -68,11 +70,43 @@ describe("clampRatio", () => {
   });
 });
 
+describe("memberSide", () => {
+  const pair = { primaryId: "a", secondaryId: "b" };
+
+  test("names the half a workspace holds", () => {
+    expect(memberSide(pair, "a")).toBe("primary");
+    expect(memberSide(pair, "b")).toBe("secondary");
+  });
+
+  test("a workspace outside the pair is in neither half", () => {
+    expect(memberSide(pair, "c")).toBeNull();
+    expect(memberSide(pair, null)).toBeNull();
+    expect(memberSide(null, "a")).toBeNull();
+  });
+});
+
+describe("splitFor", () => {
+  const pair = { primaryId: "a", secondaryId: "b" };
+
+  test("either member of the pair draws the whole pair", () => {
+    expect(splitFor(pair, "a")).toEqual(pair);
+    // The right-hand workspace, opened directly: the same window, with the
+    // address bar about the other half of it.
+    expect(splitFor(pair, "b")).toEqual(pair);
+  });
+
+  test("a third workspace draws itself, and parks the pair", () => {
+    expect(splitFor(pair, "c")).toBeNull();
+    expect(splitFor(pair, null)).toBeNull();
+    expect(splitFor(null, "a")).toBeNull();
+  });
+});
+
 describe("normalizeSplit", () => {
   test("survives anything storage could hand back", () => {
     for (const garbage of [null, undefined, 7, "split", [], true, { ratio: "half" }]) {
       expect(normalizeSplit(garbage)).toEqual({
-        secondaryId: null,
+        pair: null,
         renderedSecondaryId: null,
         ratio: DEFAULT_RATIO,
         activeSide: "primary",
@@ -81,47 +115,55 @@ describe("normalizeSplit", () => {
   });
 
   test("keeps a usable pair and clamps the ratio it came with", () => {
-    expect(normalizeSplit({ secondaryId: "b", ratio: 0.9 })).toEqual({
-      secondaryId: "b",
+    expect(normalizeSplit({ primaryId: "a", secondaryId: "b", ratio: 0.9 })).toEqual({
+      pair: { primaryId: "a", secondaryId: "b" },
       renderedSecondaryId: null,
       ratio: MAX_RATIO,
       activeSide: "primary",
     });
   });
 
-  test("rejects an empty or non-string second workspace", () => {
-    expect(normalizeSplit({ secondaryId: "" }).secondaryId).toBeNull();
-    expect(normalizeSplit({ secondaryId: 12 }).secondaryId).toBeNull();
+  test("half an arrangement is not one", () => {
+    // Including what the older storage shape wrote, which named the second
+    // workspace and left the first to the route.
+    expect(normalizeSplit({ secondaryId: "b" }).pair).toBeNull();
+    expect(normalizeSplit({ primaryId: "a" }).pair).toBeNull();
+    expect(normalizeSplit({ primaryId: "a", secondaryId: "" }).pair).toBeNull();
+    expect(normalizeSplit({ primaryId: 12, secondaryId: "b" }).pair).toBeNull();
+    expect(normalizeSplit({ primaryId: "a", secondaryId: "a" }).pair).toBeNull();
   });
 
   test("never restores which half was last typed in", () => {
-    // A reload starts at the routed workspace by definition, so a stored
+    // A reload starts at whichever half the URL names, so a stored
     // "secondary" would hand the keyboard to a half nobody had touched yet.
-    expect(normalizeSplit({ secondaryId: "b", activeSide: "secondary" }).activeSide).toBe(
-      "primary",
-    );
+    expect(
+      normalizeSplit({ primaryId: "a", secondaryId: "b", activeSide: "secondary" }).activeSide,
+    ).toBe("primary");
   });
 });
 
 describe("readStoredSplit", () => {
   test("restores a written arrangement", () => {
-    withStorage(fakeStorage({ [SPLIT_STORAGE_KEY]: '{"secondaryId":"b","ratio":0.3}' }), () => {
-      expect(readStoredSplit()).toEqual({
-        secondaryId: "b",
-        renderedSecondaryId: null,
-        ratio: 0.3,
-        activeSide: "primary",
-      });
-    });
+    withStorage(
+      fakeStorage({ [SPLIT_STORAGE_KEY]: '{"primaryId":"a","secondaryId":"b","ratio":0.3}' }),
+      () => {
+        expect(readStoredSplit()).toEqual({
+          pair: { primaryId: "a", secondaryId: "b" },
+          renderedSecondaryId: null,
+          ratio: 0.3,
+          activeSide: "primary",
+        });
+      },
+    );
   });
 
   test("a single workspace is the answer when storage is empty, corrupt, or refusing", () => {
     withStorage(fakeStorage(), () => {
-      expect(readStoredSplit().secondaryId).toBeNull();
+      expect(readStoredSplit().pair).toBeNull();
     });
     withStorage(fakeStorage({ [SPLIT_STORAGE_KEY]: "{not json" }), () => {
       expect(readStoredSplit()).toEqual({
-        secondaryId: null,
+        pair: null,
         renderedSecondaryId: null,
         ratio: DEFAULT_RATIO,
         activeSide: "primary",
@@ -135,7 +177,7 @@ describe("readStoredSplit", () => {
       },
       () => {
         expect(readStoredSplit()).toEqual({
-          secondaryId: null,
+          pair: null,
           renderedSecondaryId: null,
           ratio: DEFAULT_RATIO,
           activeSide: "primary",
@@ -146,40 +188,49 @@ describe("readStoredSplit", () => {
 });
 
 describe("splitStore", () => {
-  test("opens beside the routed workspace and notifies once per change", () => {
+  test("arranges a pair and notifies once per change", () => {
     reset();
     let notified = 0;
     const unsubscribe = splitStore.subscribe(() => {
       notified += 1;
     });
 
-    splitStore.open("b", "a");
-    expect(splitStore.get().secondaryId).toBe("b");
+    splitStore.setPair("a", "b");
+    expect(splitStore.get().pair).toEqual({ primaryId: "a", secondaryId: "b" });
     expect(notified).toBe(1);
 
-    // Re-opening the same pair changes nothing, so nothing re-renders.
-    splitStore.open("b", "a");
+    // Re-asserting the same pair changes nothing, so nothing re-renders.
+    splitStore.setPair("a", "b");
     expect(notified).toBe(1);
 
     unsubscribe();
-    splitStore.close();
+    splitStore.clear();
     expect(notified).toBe(1);
   });
 
-  test("refuses a workspace beside itself, and refuses no workspace at all", () => {
+  test("refuses a workspace beside itself, and refuses half a pair", () => {
     reset();
-    splitStore.open("a", "a");
-    expect(splitStore.get().secondaryId).toBeNull();
-    splitStore.open("", "a");
-    expect(splitStore.get().secondaryId).toBeNull();
+    splitStore.setPair("a", "a");
+    expect(splitStore.get().pair).toBeNull();
+    splitStore.setPair("a", null);
+    expect(splitStore.get().pair).toBeNull();
+    splitStore.setPair("", "b");
+    expect(splitStore.get().pair).toBeNull();
   });
 
-  test("replacing the second workspace leaves the seam where the user put it", () => {
+  test("the same two workspaces the other way round is a different window", () => {
+    reset();
+    splitStore.setPair("a", "b");
+    splitStore.setPair("b", "a");
+    expect(splitStore.get().pair).toEqual({ primaryId: "b", secondaryId: "a" });
+  });
+
+  test("rearranging leaves the seam where the user put it", () => {
     reset();
     splitStore.setRatio(0.65);
-    splitStore.open("b", "a");
-    splitStore.open("c", "a");
-    expect(splitStore.get().secondaryId).toBe("c");
+    splitStore.setPair("a", "b");
+    splitStore.setPair("a", "c");
+    expect(splitStore.get().pair).toEqual({ primaryId: "a", secondaryId: "c" });
     expect(splitStore.get().ratio).toBe(0.65);
   });
 
@@ -193,68 +244,91 @@ describe("splitStore", () => {
     expect(splitStore.get().ratio).toBe(DEFAULT_RATIO);
   });
 
-  test("close keeps the routed workspace and hands the keyboard back to it", () => {
-    reset();
-    splitStore.open("b", "a");
-    splitStore.setActiveSide("secondary");
-    splitStore.close();
-    expect(splitStore.get().secondaryId).toBeNull();
-    expect(splitStore.get().activeSide).toBe("primary");
-  });
-
-  test("promoteSecondary returns the workspace to navigate to and clears the pair", () => {
-    reset();
-    splitStore.open("b", "a");
-    splitStore.setActiveSide("secondary");
-    expect(splitStore.promoteSecondary()).toBe("b");
-    expect(splitStore.get().secondaryId).toBeNull();
-    expect(splitStore.get().activeSide).toBe("primary");
-    // Nothing left to promote; the caller must not be sent anywhere.
-    expect(splitStore.promoteSecondary()).toBeNull();
-  });
-
   test("the active half is a split-only fact", () => {
     reset();
     splitStore.setActiveSide("secondary");
     expect(splitStore.get().activeSide).toBe("primary");
-    splitStore.open("b", "a");
+    splitStore.setPair("a", "b");
     splitStore.setActiveSide("secondary");
     expect(splitStore.get().activeSide).toBe("secondary");
   });
 });
 
-describe("splitStore.reconcile", () => {
-  test("navigating to the workspace already beside this one makes it the window", () => {
+describe("splitStore.unsplit", () => {
+  test("keeping the half you are already on moves nobody", () => {
     reset();
-    splitStore.open("b", "a");
+    splitStore.setPair("a", "b");
     splitStore.setActiveSide("secondary");
-    splitStore.reconcile("b", new Set(["a", "b"]));
-    expect(splitStore.get().secondaryId).toBeNull();
+    expect(splitStore.unsplit("a", "a")).toBeNull();
+    expect(splitStore.get().pair).toBeNull();
     expect(splitStore.get().activeSide).toBe("primary");
   });
 
-  test("a workspace that is no longer listed drops out of the arrangement", () => {
+  test("keeping the other half hands the caller somewhere to go", () => {
     reset();
-    splitStore.open("b", "a");
-    splitStore.reconcile("a", new Set(["a"]));
-    expect(splitStore.get().secondaryId).toBeNull();
+    splitStore.setPair("a", "b");
+    // Routed at the left half and keeping the right one — the address bar has
+    // to follow, or it would be about a workspace no longer on screen.
+    expect(splitStore.unsplit("b", "a")).toBe("b");
+    expect(splitStore.get().pair).toBeNull();
   });
 
-  test("a still-listed workspace is left alone", () => {
+  test("dissolving a parked pair leaves the page you are on alone", () => {
     reset();
-    splitStore.open("b", "a");
-    splitStore.reconcile("a", new Set(["a", "b"]));
-    expect(splitStore.get().secondaryId).toBe("b");
+    splitStore.setPair("a", "b");
+    // Working in some third workspace: the split is only a row in the rail
+    // from here, and putting it away is not a reason to navigate.
+    expect(splitStore.unsplit("a", "c")).toBeNull();
+    expect(splitStore.get().pair).toBeNull();
+  });
+});
+
+describe("splitStore.followRoute", () => {
+  test("arriving at a half hands it the keyboard", () => {
+    reset();
+    splitStore.setPair("a", "b");
+    splitStore.followRoute("b");
+    expect(splitStore.get().activeSide).toBe("secondary");
+    splitStore.followRoute("a");
+    expect(splitStore.get().activeSide).toBe("primary");
+  });
+
+  test("arriving anywhere else starts over at the first half", () => {
+    reset();
+    splitStore.setPair("a", "b");
+    splitStore.setActiveSide("secondary");
+    splitStore.followRoute("c");
+    expect(splitStore.get().activeSide).toBe("primary");
+    // And the arrangement itself is untouched: it is parked, not dismantled.
+    expect(splitStore.get().pair).toEqual({ primaryId: "a", secondaryId: "b" });
+  });
+});
+
+describe("splitStore.reconcile", () => {
+  test("a workspace that is no longer listed takes the arrangement with it", () => {
+    reset();
+    splitStore.setPair("a", "b");
+    splitStore.reconcile(new Set(["a"]));
+    expect(splitStore.get().pair).toBeNull();
+
+    // Either end of it, not just the second one.
+    splitStore.setPair("a", "b");
+    splitStore.reconcile(new Set(["b"]));
+    expect(splitStore.get().pair).toBeNull();
+  });
+
+  test("a pair whose workspaces both still exist is left alone", () => {
+    reset();
+    splitStore.setPair("a", "b");
+    splitStore.reconcile(new Set(["a", "b", "c"]));
+    expect(splitStore.get().pair).toEqual({ primaryId: "a", secondaryId: "b" });
   });
 
   test("a list that has not loaded yet is not evidence of anything", () => {
     reset();
-    splitStore.open("b", "a");
-    splitStore.reconcile("a", null);
-    expect(splitStore.get().secondaryId).toBe("b");
-    // Null still cannot save a pair the route itself has dissolved.
-    splitStore.reconcile("b", null);
-    expect(splitStore.get().secondaryId).toBeNull();
+    splitStore.setPair("a", "b");
+    splitStore.reconcile(null);
+    expect(splitStore.get().pair).toEqual({ primaryId: "a", secondaryId: "b" });
   });
 });
 
@@ -266,11 +340,11 @@ describe("splitStore.setRendered", () => {
       notified += 1;
     });
 
-    // The narrow window: the pair is kept so widening restores it, while
-    // nothing is drawn beside the primary. Anything reading the arrangement
-    // to decide what to paint has to be able to tell these two apart.
-    splitStore.open("b", "a");
-    expect(splitStore.get().secondaryId).toBe("b");
+    // A pair parked behind some other workspace: the arrangement stands, and
+    // nothing of it is on screen. Anything reading the split to decide what
+    // to paint has to be able to tell those two apart.
+    splitStore.setPair("a", "b");
+    expect(splitStore.get().pair).toEqual({ primaryId: "a", secondaryId: "b" });
     expect(splitStore.get().renderedSecondaryId).toBeNull();
 
     splitStore.setRendered("b");
@@ -285,12 +359,12 @@ describe("splitStore.setRendered", () => {
 
   test("outlives the pair, which is what a close animation needs", () => {
     reset();
-    splitStore.open("b", "a");
+    splitStore.setPair("a", "b");
     splitStore.setRendered("b");
-    splitStore.close();
+    splitStore.clear();
     // The container still has the outgoing half mounted and collapsing, so
     // the drawn fact stays true until it says otherwise.
-    expect(splitStore.get().secondaryId).toBeNull();
+    expect(splitStore.get().pair).toBeNull();
     expect(splitStore.get().renderedSecondaryId).toBe("b");
     splitStore.setRendered(null);
     expect(splitStore.get().renderedSecondaryId).toBeNull();
@@ -302,15 +376,15 @@ describe("splitStore persistence", () => {
     const storage = fakeStorage();
     withStorage(storage, () => {
       reset();
-      splitStore.open("b", "a");
+      splitStore.setPair("a", "b");
       splitStore.setRatio(0.4);
       splitStore.setActiveSide("secondary");
-      // A measurement of this device's window right now. Restoring it would
-      // assert a half was drawn before anything had been measured.
+      // A fact about what is mounted right now. Restoring it would assert a
+      // half was drawn before anything had been rendered.
       splitStore.setRendered("b");
     });
     const written = storage.getItem?.(SPLIT_STORAGE_KEY) ?? "";
-    expect(JSON.parse(written)).toEqual({ secondaryId: "b", ratio: 0.4 });
+    expect(JSON.parse(written)).toEqual({ primaryId: "a", secondaryId: "b", ratio: 0.4 });
   });
 
   test("a storage that refuses writes still rearranges the window", () => {
@@ -323,8 +397,8 @@ describe("splitStore persistence", () => {
       },
       () => {
         reset();
-        splitStore.open("b", "a");
-        expect(splitStore.get().secondaryId).toBe("b");
+        splitStore.setPair("a", "b");
+        expect(splitStore.get().pair).toEqual({ primaryId: "a", secondaryId: "b" });
       },
     );
     reset();

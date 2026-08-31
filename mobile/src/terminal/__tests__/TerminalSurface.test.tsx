@@ -150,6 +150,7 @@ describe("TerminalSurface", () => {
   });
 
   test("retires in background and reconnects after foregrounding", async () => {
+    jest.useFakeTimers();
     let listener: ((state: AppStateStatus) => void) | undefined;
     const appState = jest.spyOn(AppState, "addEventListener").mockImplementation((_type, next) => {
       listener = next;
@@ -159,10 +160,22 @@ describe("TerminalSurface", () => {
     await act(() => mockWebViewProps.onLoad?.());
     await act(() => listener?.("active"));
     expect(mockOpen).toHaveBeenCalledTimes(1);
+    await act(() => listener?.("inactive"));
+    await act(() => jest.advanceTimersByTime(3_000));
+    expect(mockClose).not.toHaveBeenCalled();
     await act(() => listener?.("background"));
+    await act(() => jest.advanceTimersByTime(2_999));
+    expect(mockClose).not.toHaveBeenCalled();
+    await act(() => listener?.("active"));
+    await act(() => jest.advanceTimersByTime(1));
+    expect(mockClose).not.toHaveBeenCalled();
+    expect(mockOpen).toHaveBeenCalledTimes(1);
+    await act(() => listener?.("background"));
+    await act(() => jest.advanceTimersByTime(3_000));
     expect(mockClose).toHaveBeenCalledTimes(1);
     await act(() => listener?.("active"));
     expect(mockOpen).toHaveBeenCalledTimes(2);
     appState.mockRestore();
+    jest.useRealTimers();
   });
 });

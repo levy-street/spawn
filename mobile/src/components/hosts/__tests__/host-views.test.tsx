@@ -1,14 +1,23 @@
 import { fireEvent, render, screen } from "@testing-library/react-native";
+import * as Clipboard from "expo-clipboard";
 import { AccessibilityInfo } from "react-native";
 import {
   codexAgent,
   offlineHost,
   onlineHost,
   runningSession,
+  windowsHost,
 } from "@/components/hosts/__tests__/fixtures";
-import { HostDetailView } from "@/components/hosts/host-detail-view";
+import {
+  HostDetailView,
+  hostDoctorPresentation,
+  hostPinCapacityWarning,
+} from "@/components/hosts/host-detail-view";
 import { HostListView } from "@/components/hosts/host-list-screen";
+import { HostOutSchema } from "@/data/api/schemas/hosts";
 import { ThemeProvider } from "@/theme";
+
+jest.mock("expo-clipboard", () => ({ setStringAsync: jest.fn(async () => undefined) }));
 
 describe("host list and detail rendering", () => {
   beforeEach(() => {
@@ -86,10 +95,11 @@ describe("host list and detail rendering", () => {
     // Both fixtures share a spec; the offline one keeps it and loses the meter.
     expect(screen.getAllByText(/12 cores · 24 GiB/)).toHaveLength(2);
 
-    // What is on the machine, not just how many of it.
+    // What is on the machine, not just how many of it — and not who it is
+    // waiting on: a session needing a person is the workspace's to say.
     expect(screen.getByTestId(`host-running-${onlineHost.id}`)).toBeOnTheScreen();
     expect(screen.getByText("Codex")).toBeOnTheScreen();
-    expect(screen.getByTestId(`host-attention-${onlineHost.id}`)).toBeOnTheScreen();
+    expect(screen.queryByText(/need you/)).toBeNull();
 
     // An offline machine reports no capacity, and a stale meter is worse than
     // none — the spec still says what the machine is.
@@ -112,7 +122,7 @@ describe("host list and detail rendering", () => {
     );
 
     for (const value of [
-      "macOS/arm64",
+      "macOS · ARM64",
       "1.4.2",
       "ed25519",
       "XOCTsSKj9-Z7qRynE70szG_DNBeHiLzEBOCG1clQbz8",
@@ -126,5 +136,199 @@ describe("host list and detail rendering", () => {
     expect(screen.queryByText(/restart daemon/i)).not.toBeOnTheScreen();
     expect(screen.queryByText(/update daemon/i)).not.toBeOnTheScreen();
     expect(screen.queryByText(/daemon logs/i)).not.toBeOnTheScreen();
+  });
+
+  test("formats Windows consistently without changing the generic host UI", async () => {
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={windowsHost}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Windows · x64")).toBeOnTheScreen();
+    expect(screen.getByText("Windows · x64 · daemon 1.4.2")).toBeOnTheScreen();
+  });
+
+  test("surfaces daemon update state on host rows and facts", async () => {
+    const outdated = {
+      ...onlineHost,
+      update: {
+        state: "available" as const,
+        latest_version: "2.0.0",
+        error: null,
+        requested_at: null,
+      },
+    };
+    const list = await render(
+      <ThemeProvider>
+        <HostListView
+          hosts={[outdated]}
+          onConnect={jest.fn()}
+          onOpen={jest.fn()}
+          onOpenActions={jest.fn()}
+          onRefresh={jest.fn()}
+          refreshing={false}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("update available")).toBeOnTheScreen();
+    await list.unmount();
+
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={{ ...outdated, update: { ...outdated.update, state: "updating" } }}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
+
+  test("selects every offline mini-doctor case and collapses it online", () => {
+    const now = Date.parse("2026-08-22T02:00:00Z");
+    expect(hostDoctorPresentation({ ...offlineHost, last_seen_at: null }, now)).toEqual({
+      kind: "never-connected",
+      message: "SPAWN D hasn't checked in from this machine yet. On it, run: spawnd doctor",
+      command: "spawnd doctor",
+    });
+    expect(
+      hostDoctorPresentation(
+        {
+          ...offlineHost,
+          last_disconnect: { at: "2026-08-22T01:59:00Z", reason: "auth_rejected" },
+        },
+        now,
+      ),
+    ).toEqual({
+      kind: "auth-rejected",
+      message: "old-laptop can't sign in. On that machine, run: spawnd login",
+      command: "spawnd login",
+    });
+    expect(
+      hostDoctorPresentation(
+        {
+          ...offlineHost,
+          update: {
+            state: "failed",
+            latest_version: "2.0.0",
+            error: "update failed",
+            requested_at: null,
+          },
+        },
+        now,
+      ),
+    ).toEqual({
+      kind: "stale-version",
+      message:
+        "old-laptop runs 1.4.2. On it, run: spawnd update (or it will self-update when idle).",
+      command: "spawnd update",
+    });
+    expect(hostDoctorPresentation(offlineHost, now)).toEqual({
+      kind: "plain-offline",
+      message:
+        "Last seen 2h ago (connection dropped). If the machine is on, run spawnd doctor there.",
+      command: "spawnd doctor",
+    });
+    expect(hostDoctorPresentation(onlineHost, now)).toEqual({
+      kind: "online",
+      message: "Daemon 1.4.2",
+      command: null,
+    });
+  });
+
+  test("accepts older host responses without last_disconnect", () => {
+    const parsed = HostOutSchema.parse(offlineHost);
+    expect(parsed.last_disconnect).toBeUndefined();
+  });
+
+  test("renders the helper only for an offline host", async () => {
+    const offline = await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={{ ...offlineHost, last_seen_at: null }}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("Something wrong?")).toBeOnTheScreen();
+    expect(screen.getByTestId("host-doctor-never-connected")).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("button", { name: "Copy spawnd doctor" }));
+    expect(Clipboard.setStringAsync).toHaveBeenCalledWith("spawnd doctor");
+    await offline.unmount();
+
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={onlineHost}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.queryByText("Something wrong?")).toBeNull();
+    expect(screen.getByText(/daemon 1\.4\.2/i)).toBeOnTheScreen();
+  });
+
+  test("warns at 28 approvals and marks a pin the host did not receive", async () => {
+    expect(hostPinCapacityWarning({ used: 27, max: 32 })).toBeNull();
+    expect(hostPinCapacityWarning({ used: 28, max: 32 })).toBe(
+      "This host is close to its limit of approving devices (28 of 32). Remove devices you no longer use under Access.",
+    );
+
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          browserDevices={[
+            {
+              id: "11111111-1111-4111-8111-111111111111",
+              key_algorithm: "ed25519",
+              public_key: "phone-key",
+              label: "Work phone",
+              created_at: "2026-08-01T00:00:00Z",
+              revoked_at: null,
+            },
+          ]}
+          host={onlineHost}
+          hostPins={{
+            capacity: { used: 28, max: 32 },
+            pins: [
+              {
+                browser_device_id: "11111111-1111-4111-8111-111111111111",
+                delivered: false,
+                undelivered_reason: "invalid_chain",
+              },
+            ],
+          }}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Approving devices · 28 of 32")).toBeOnTheScreen();
+    expect(screen.getByText("Not delivered")).toBeOnTheScreen();
+    expect(screen.getByTestId("host-device-capacity-warning")).toBeOnTheScreen();
   });
 });

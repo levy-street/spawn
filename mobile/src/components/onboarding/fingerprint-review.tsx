@@ -13,6 +13,7 @@ export interface FingerprintReviewProps {
   approving: boolean;
   ceremony: PendingPairingCeremony;
   phoneFingerprint: string;
+  lead?: string;
   reapprovingRevokedPin?: boolean;
   onApprove: () => void;
   onBack: () => void;
@@ -24,6 +25,7 @@ export function FingerprintReview({
   approving,
   ceremony,
   phoneFingerprint,
+  lead,
   reapprovingRevokedPin = false,
   onApprove,
   onBack,
@@ -32,6 +34,7 @@ export function FingerprintReview({
 }: FingerprintReviewProps) {
   const theme = useTheme();
   const [confirmed, setConfirmed] = useState(false);
+  const linkVerified = ceremony.linkVerifiedHostKey !== null;
 
   const pinCopy = (() => {
     if (reapprovingRevokedPin) {
@@ -42,8 +45,9 @@ export function FingerprintReview({
     }
     return "Approval saves this exact host key on this phone before registering it with the server.";
   })();
-  const approvalLabel =
-    reapprovingRevokedPin || ceremony.pinState === "active"
+  const approvalLabel = linkVerified
+    ? `Approve ${ceremony.hostName}`
+    : reapprovingRevokedPin || ceremony.pinState === "active"
       ? "Approve this host again"
       : "Fingerprint matches, approve";
 
@@ -51,30 +55,36 @@ export function FingerprintReview({
     <View style={styles.container}>
       <View style={styles.heading}>
         <Text accessibilityRole="header" variant="title">
-          Check the fingerprint for {ceremony.hostName}
+          {linkVerified
+            ? `Approve ${ceremony.hostName}`
+            : `Check the fingerprint for ${ceremony.hostName}`}
         </Text>
         <Text color="mutedForeground">
-          Confirm the terminal shows this exact value. If it differs, stop—the connection may be
-          intercepted.
+          {linkVerified
+            ? "This phone verified the host's identity against the link from its terminal. Approving grants all your devices access to it."
+            : (lead ??
+              "Confirm the terminal shows this exact value. If it differs, stop—the connection may be intercepted.")}
         </Text>
       </View>
 
       <PairingCountdown deadlineMs={ceremony.expiresAtMs} onExpired={onExpired} />
 
-      <Card style={styles.fingerprintWell} variant="flat">
-        <View style={styles.fingerprintHeading}>
-          <Icon color="foreground" name="Fingerprint" size={spacing[5]} />
-          <Text variant="label">Host fingerprint</Text>
-        </View>
-        <Text
-          accessibilityLabel={`Host fingerprint ${ceremony.hostFingerprint}`}
-          selectable
-          style={styles.fingerprint}
-          variant="mono"
-        >
-          {ceremony.hostFingerprint}
-        </Text>
-      </Card>
+      {linkVerified ? null : (
+        <Card style={styles.fingerprintWell} variant="flat">
+          <View style={styles.fingerprintHeading}>
+            <Icon color="foreground" name="Fingerprint" size={spacing[5]} />
+            <Text variant="label">Host fingerprint</Text>
+          </View>
+          <Text
+            accessibilityLabel={`Host fingerprint ${ceremony.hostFingerprint}`}
+            selectable
+            style={styles.fingerprint}
+            variant="mono"
+          >
+            {ceremony.hostFingerprint}
+          </Text>
+        </Card>
+      )}
 
       <View style={styles.phoneIdentity}>
         <View style={styles.fingerprintHeading}>
@@ -87,7 +97,9 @@ export function FingerprintReview({
           {phoneFingerprint}
         </Text>
         <Text color="mutedForeground" variant="caption">
-          After approval, the machine will print this phone fingerprint for comparison.
+          {linkVerified
+            ? "This phone signs the approval with this identity."
+            : "After approval, the machine will print this phone fingerprint for comparison."}
         </Text>
       </View>
 
@@ -103,41 +115,45 @@ export function FingerprintReview({
         </Text>
       </Card>
 
-      <Pressable
-        accessibilityLabel="I compared the host fingerprint and it matches"
-        accessibilityRole="checkbox"
-        accessibilityState={{ checked: confirmed, disabled: approving }}
-        disabled={approving}
-        onPress={() => setConfirmed((value) => !value)}
-        style={styles.confirmation}
-      >
-        <View
-          style={[
-            styles.checkbox,
-            {
-              backgroundColor: confirmed ? theme.colors.foreground : theme.colors.background,
-              borderColor: confirmed ? theme.colors.foreground : theme.colors.border,
-              borderRadius: theme.radii.sm,
-            },
-          ]}
+      {linkVerified ? null : (
+        <Pressable
+          accessibilityLabel="I compared the host fingerprint and it matches"
+          accessibilityRole="checkbox"
+          accessibilityState={{ checked: confirmed, disabled: approving }}
+          disabled={approving}
+          onPress={() => setConfirmed((value) => !value)}
+          style={styles.confirmation}
         >
-          {confirmed ? <Icon color="background" name="Check" size={spacing[4]} /> : null}
-        </View>
-        <Text style={styles.confirmationCopy} weight="medium">
-          I compared the host fingerprint and it matches.
-        </Text>
-      </Pressable>
+          <View
+            style={[
+              styles.checkbox,
+              {
+                backgroundColor: confirmed ? theme.colors.foreground : theme.colors.background,
+                borderColor: confirmed ? theme.colors.foreground : theme.colors.border,
+                borderRadius: theme.radii.sm,
+              },
+            ]}
+          >
+            {confirmed ? <Icon color="background" name="Check" size={spacing[4]} /> : null}
+          </View>
+          <Text style={styles.confirmationCopy} weight="medium">
+            I compared the host fingerprint and it matches.
+          </Text>
+        </Pressable>
+      )}
 
-      <Button onPress={onMismatch} variant="link">
-        The fingerprint does not match
-      </Button>
+      {linkVerified ? null : (
+        <Button onPress={onMismatch} variant="link">
+          The fingerprint does not match
+        </Button>
+      )}
 
       <View style={styles.actions}>
         <Button disabled={approving} onPress={onBack} variant="outline">
           Back
         </Button>
         <Button
-          disabled={!confirmed}
+          disabled={!linkVerified && !confirmed}
           loading={approving}
           onPress={onApprove}
           style={styles.approve}

@@ -4,11 +4,18 @@ import { useQuery } from "@tanstack/react-query";
 import { Plus, Radio, RadioTower } from "lucide-react";
 import { useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
+import { ConnectHostSection } from "@/components/hosts/connect-host";
 import { LegionHostCard } from "@/components/legion/LegionHostCard";
 import { Stat } from "@/components/legion/legion-parts";
 import { AppShell } from "@/components/nav/AppShell";
-import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { hosts, sessions } from "@/lib/api";
 import { formatBytes, summarizeLegion, summaryLine } from "@/lib/legion";
@@ -35,6 +42,7 @@ export default function LegionPage() {
 
 function LegionBody() {
   const [liveMetrics, setLiveMetrics] = useState(false);
+  const [addMachineOpen, setAddMachineOpen] = useState(false);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, refetchInterval: 15_000 });
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -59,20 +67,26 @@ function LegionBody() {
               {loading ? "Counting your machines…" : summaryLine(summary)}
             </p>
           </div>
-          <Button
-            type="button"
-            variant={liveMetrics ? "default" : "outline"}
-            size="sm"
-            aria-pressed={liveMetrics}
-            onClick={() => setLiveMetrics((value) => !value)}
-          >
-            {liveMetrics ? (
-              <RadioTower className="size-4" aria-hidden />
-            ) : (
-              <Radio className="size-4" aria-hidden />
-            )}
-            {liveMetrics ? "Live" : "Go live"}
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" size="sm" onClick={() => setAddMachineOpen(true)}>
+              <Plus className="size-4" aria-hidden />
+              Add a machine
+            </Button>
+            <Button
+              type="button"
+              variant={liveMetrics ? "default" : "outline"}
+              size="sm"
+              aria-pressed={liveMetrics}
+              onClick={() => setLiveMetrics((value) => !value)}
+            >
+              {liveMetrics ? (
+                <RadioTower className="size-4" aria-hidden />
+              ) : (
+                <Radio className="size-4" aria-hidden />
+              )}
+              {liveMetrics ? "Live" : "Go live"}
+            </Button>
+          </div>
         </header>
 
         <section
@@ -110,10 +124,10 @@ function LegionBody() {
               variant="outline"
               size="sm"
               className="mt-4"
-              onClick={() => openSettings("hosts")}
+              onClick={() => setAddMachineOpen(true)}
             >
               <Plus className="size-4" aria-hidden />
-              Possess a machine
+              Add a machine
             </Button>
           </div>
         ) : (
@@ -126,17 +140,31 @@ function LegionBody() {
              * looking at, so the surface that shows it should ask for one more. */}
             <button
               type="button"
-              onClick={() => openSettings("hosts")}
+              onClick={() => setAddMachineOpen(true)}
               className="group/slot flex min-h-28 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
             >
               <Plus
                 className="size-5 transition-transform duration-150 group-hover/slot:rotate-90"
                 aria-hidden
               />
-              <span className="text-sm">Possess another machine</span>
+              <span className="text-sm">Add a machine</span>
             </button>
           </div>
         )}
+        <Dialog open={addMachineOpen} onOpenChange={setAddMachineOpen}>
+          <DialogContent size="lg">
+            <DialogHeader>
+              <DialogTitle>Add a machine</DialogTitle>
+              <DialogDescription>
+                Install SPAWN D, approve the machine, and keep this window open until it comes
+                online.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="overflow-y-auto px-4 pb-4">
+              <ConnectHostSection frameless />
+            </div>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   );

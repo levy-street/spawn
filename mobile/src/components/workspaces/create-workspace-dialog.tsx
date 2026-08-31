@@ -7,6 +7,10 @@ import { Dialog } from "@/components/ui/dialog";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import {
+  type WorkspaceFolder,
+  WorkspaceFolderSheet,
+} from "@/components/workspaces/workspace-folder-sheet";
 import type { WorkspaceIconChoice } from "@/components/workspaces/workspace-icon";
 import { WorkspaceIconPicker } from "@/components/workspaces/workspace-icon-picker";
 import type { WorkspaceTemplateOut } from "@/data/api/schemas/templates";
@@ -19,6 +23,8 @@ export interface CreateWorkspaceDraft {
   name: string;
   templateId: string | null;
   iconChoice: WorkspaceIconChoice | null;
+  /** Where it opens. Null keeps the workspace unplaced, as it was before. */
+  folder: WorkspaceFolder | null;
 }
 
 export interface CreateWorkspaceDialogProps {
@@ -43,6 +49,8 @@ export function CreateWorkspaceDialog({
   const [name, setName] = useState("");
   const [templateId, setTemplateId] = useState<string>(BLANK_TEMPLATE);
   const [iconChoice, setIconChoice] = useState<WorkspaceIconChoice | null>(null);
+  const [folder, setFolder] = useState<WorkspaceFolder | null>(null);
+  const [folderVisible, setFolderVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -50,6 +58,8 @@ export function CreateWorkspaceDialog({
     setName("");
     setTemplateId(BLANK_TEMPLATE);
     setIconChoice(null);
+    setFolder(null);
+    setFolderVisible(false);
     setError(null);
   }, [visible]);
 
@@ -82,6 +92,9 @@ export function CreateWorkspaceDialog({
       name: trimmed,
       templateId: templateId === BLANK_TEMPLATE ? null : templateId,
       iconChoice,
+      // A template carries its own saved home; the folder chosen here is for
+      // the blank workspace that has none.
+      folder: templateId === BLANK_TEMPLATE ? folder : null,
     });
   };
 
@@ -131,11 +144,45 @@ export function CreateWorkspaceDialog({
               value={templateId}
             />
           </Field>
+          {templateId === BLANK_TEMPLATE ? (
+            <Field
+              hint={
+                folder
+                  ? `Opens on ${folder.hostName}.`
+                  : "Optional. Terminals in this workspace start here."
+              }
+              label="Folder"
+            >
+              <Button
+                disabled={busy}
+                onPress={() => setFolderVisible(true)}
+                testID="create-workspace-folder"
+                variant="outline"
+              >
+                {folder ? folderLabel(folder.path) : "Choose a folder"}
+              </Button>
+            </Field>
+          ) : null}
           <WorkspaceIconPicker name={name} onChange={setIconChoice} value={iconChoice} />
         </View>
       </Screen>
+      <WorkspaceFolderSheet
+        initial={folder}
+        onDismiss={() => setFolderVisible(false)}
+        onPick={(picked) => {
+          setFolder(picked);
+          setFolderVisible(false);
+        }}
+        visible={folderVisible}
+      />
     </Dialog>
   );
+}
+
+/** The tail of a path, which is what tells two folders apart on a phone. */
+function folderLabel(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
 }
 
 const styles = StyleSheet.create({

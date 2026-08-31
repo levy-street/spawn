@@ -15,6 +15,7 @@ from spawn_server.push import (
     send_alert_push,
     send_approval_push,
 )
+from spawn_server.routes import push as push_routes
 
 TOKEN = "ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]"
 OTHER_TOKEN = "ExponentPushToken[bbbbbbbbbbbbbbbbbbbbbb]"
@@ -102,6 +103,61 @@ class TestRegistration:
         assert second.json()["id"] == first.json()["id"]
         assert second.json()["label"] == "iPhone 17"
 
+    async def test_a_token_that_appears_mid_request_is_adopted_not_a_500(
+        self, client, monkeypatch
+    ):
+        """The check-then-act window, forced open.
+
+        Registering looks the token up and then inserts it, and the app
+        re-registers on every connection attempt — so tapping "Ask again" a few
+        times is enough for two requests to find no row and both insert one.
+        In production that surfaced as
+        `duplicate key value violates unique constraint "ix_push_devices_token"`
+        and a 500 at a phone whose only crime was asking twice.
+
+        Racing real requests cannot be relied on to land inside that window, so
+        this makes the first lookup miss a row that genuinely exists — which is
+        precisely what the losing request sees.
+        """
+        _, winner_headers = await _account(client, "winner@example.com")
+        loser_id, loser_headers = await _account(client, "loser@example.com")
+
+        first = await client.post(
+            "/api/notifications/devices",
+            json={"token": TOKEN, "platform": "ios", "label": "winner"},
+            headers=winner_headers,
+        )
+        assert first.status_code == 200
+
+        real_select = push_routes.select
+        lookups = 0
+
+        def blind_first_lookup(*args, **kwargs):
+            nonlocal lookups
+            lookups += 1
+            statement = real_select(*args, **kwargs)
+            # Only the first lookup is blinded; the recovery path must be able
+            # to find the row it collided with.
+            return statement.where(PushDevice.token == "no-such-token") if lookups == 1 else statement
+
+        monkeypatch.setattr(push_routes, "select", blind_first_lookup)
+
+        second = await client.post(
+            "/api/notifications/devices",
+            json={"token": TOKEN, "platform": "ios", "label": "loser"},
+            headers=loser_headers,
+        )
+        assert second.status_code == 200
+        assert second.json()["id"] == first.json()["id"]
+
+        sm = get_sessionmaker()
+        async with sm() as session:
+            rows = list((await session.execute(select(PushDevice))).scalars())
+        assert len(rows) == 1
+        # The request that lost the race still got what it asked for.
+        assert rows[0].user_id == loser_id
+        assert rows[0].label == "loser"
+
     async def test_a_handset_handed_to_another_account_stops_alerting_the_first(self, client):
         first_user, first_headers = await _account(client, "one@example.com")
         _, second_headers = await _account(client, "two@example.com")
@@ -154,6 +210,48 @@ class TestRegistration:
         )
         assert response.status_code == 401
 
+    async def test_registration_prunes_push_devices_disabled_over_ninety_days(self, client):
+        from datetime import UTC, datetime, timedelta
+
+        user_id, headers = await _account(client, "push-retention@example.com")
+        now = datetime.now(UTC)
+        sm = get_sessionmaker()
+        async with sm() as session:
+            session.add_all(
+                [
+                    PushDevice(
+                        user_id=user_id,
+                        token="ExponentPushToken[old-disabled]",
+                        platform="ios",
+                        disabled_at=now - timedelta(days=91),
+                        created_at=now - timedelta(days=100),
+                        last_seen_at=now - timedelta(days=100),
+                    ),
+                    PushDevice(
+                        user_id=user_id,
+                        token="ExponentPushToken[recent-disabled]",
+                        platform="ios",
+                        disabled_at=now - timedelta(days=89),
+                        created_at=now - timedelta(days=100),
+                        last_seen_at=now - timedelta(days=100),
+                    ),
+                ]
+            )
+            await session.commit()
+
+        response = await client.post(
+            "/api/notifications/devices",
+            json={"token": "ExponentPushToken[new-live]", "platform": "ios"},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        async with sm() as session:
+            tokens = set((await session.execute(select(PushDevice.token))).scalars())
+        assert tokens == {
+            "ExponentPushToken[recent-disabled]",
+            "ExponentPushToken[new-live]",
+        }
+
 
 class TestDelivery:
     async def _register(self, client, headers, token: str) -> None:
@@ -179,9 +277,10 @@ class TestDelivery:
             return httpx.Response(200, json={"data": [{"status": "ok"}, {"status": "ok"}]})
 
         sm = get_sessionmaker()
-        async with sm() as session, httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as http:
+        async with (
+            sm() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        ):
             sent = await send_alert_push(
                 session=session,
                 user_id=user_id,
@@ -213,9 +312,10 @@ class TestDelivery:
             )
 
         sm = get_sessionmaker()
-        async with sm() as session, httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as http:
+        async with (
+            sm() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        ):
             sent = await send_alert_push(
                 session=session,
                 user_id=user_id,
@@ -248,9 +348,10 @@ class TestDelivery:
             calls += 1
             return httpx.Response(200, json={"data": []})
 
-        async with sm() as session, httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as http:
+        async with (
+            sm() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        ):
             sent = await send_alert_push(
                 session=session,
                 user_id=user_id,
@@ -271,9 +372,10 @@ class TestDelivery:
             raise httpx.ConnectError("push service is down")
 
         sm = get_sessionmaker()
-        async with sm() as session, httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as http:
+        async with (
+            sm() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        ):
             sent = await send_alert_push(
                 session=session,
                 user_id=user_id,
@@ -295,9 +397,10 @@ class TestDelivery:
             return httpx.Response(200, json={"data": [{"status": "ok"}]})
 
         sm = get_sessionmaker()
-        async with sm() as session, httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as http:
+        async with (
+            sm() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        ):
             sent = await send_alert_push(
                 session=session,
                 user_id=user_id,
@@ -356,9 +459,10 @@ class TestApprovalPush:
             return httpx.Response(200, json={"data": [{"status": "ok"}]})
 
         sm = get_sessionmaker()
-        async with sm() as session, httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as http:
+        async with (
+            sm() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        ):
             sent = await send_approval_push(
                 session=session,
                 user_id=user_id,
@@ -382,9 +486,10 @@ class TestApprovalPush:
             return httpx.Response(200, json={"data": [{"status": "ok"}]})
 
         sm = get_sessionmaker()
-        async with sm() as session, httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as http:
+        async with (
+            sm() as session,
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+        ):
             sent = await send_approval_push(
                 session=session,
                 user_id=user_id,

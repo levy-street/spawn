@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..db import get_session
+from ..host_status import derived_host_status, stamp_stale_disconnect
 from ..legion import HISTORY_DAYS, TOP_AGENTS, parse_agents, streaks, utc_day
 from ..models import Host, LegionDay, Session, User
 
@@ -87,7 +88,13 @@ async def get_profile(
             agent_tally[name] = agent_tally.get(name, 0) + count
 
     current_streak, longest_streak = streaks([row.day for row in all_days], today)
-    online = [host for host in hosts if host.status == "online"]
+    now = datetime.now(UTC)
+    stale_changed = False
+    for host in hosts:
+        stale_changed = stamp_stale_disconnect(host, now) or stale_changed
+    if stale_changed:
+        await session.commit()
+    online = [host for host in hosts if derived_host_status(host, now) == "online"]
 
     totals = schemas.LegionTotalsOut(
         hosts=len(hosts),
@@ -139,7 +146,7 @@ async def get_profile(
                 id=host.id,
                 name=host.name,
                 os=host.os,
-                status=host.status,
+                status=derived_host_status(host, now),
                 cpu_cores=host.cpu_cores,
                 memory_bytes=host.memory_bytes,
                 gpu=host.gpu,

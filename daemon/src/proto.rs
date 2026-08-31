@@ -108,6 +108,21 @@ pub enum Outbound {
         os: String,
         arch: String,
         version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_tree: Option<String>,
+        self_update: bool,
+        self_update_blocked: Option<String>,
+        /// A mismatched co-installed worker is repairable by reapplying the
+        /// current release, so it is reported separately from blockers.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        worker_mismatch: bool,
+        /// New daemons keep established peer-to-peer channels alive while the
+        /// control websocket reconnects. Old servers ignore both additions.
+        keeps_peers_across_reconnect: bool,
+        live_bindings: Vec<LiveRtcBinding>,
+        /// Allows the server to include `ice_transport_policy` on session
+        /// offers without triggering the old host/session discriminator trap.
+        session_ice_policy: bool,
         existing_sessions: Vec<Uuid>,
         /// What this machine is — cores, memory, CPU model, GPU. Sent once, on
         /// registration, because none of it changes while the daemon runs.
@@ -136,6 +151,22 @@ pub enum Outbound {
     },
     #[serde(rename = "host.pong")]
     HostPong { request_id: String },
+    #[serde(rename = "host.pin_adopt_failed")]
+    HostPinAdoptFailed {
+        browser_device_id: String,
+        reason: String,
+    },
+    #[serde(rename = "host.pin_adopted")]
+    HostPinAdopted { browser_device_id: String },
+    #[serde(rename = "daemon.update_result")]
+    DaemonUpdateResult {
+        request_id: String,
+        ok: bool,
+        tree: String,
+        version_before: String,
+        stage: Option<String>,
+        error: Option<String>,
+    },
     #[serde(rename = "session.exit")]
     SessionExit {
         session_id: Uuid,
@@ -239,6 +270,17 @@ pub enum Outbound {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveRtcBinding {
+    pub session_id: String,
+    pub binding_nonce: String,
+    pub binding_generation: u64,
+    pub scope_type: String,
+    pub scope_id: Uuid,
+    pub protocol: String,
+    pub protocol_version: u16,
+}
+
 // ---------------------------------------------------------------------------
 // Server → daemon
 // ---------------------------------------------------------------------------
@@ -258,10 +300,19 @@ pub struct InboundBrowserPin {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonUpdateArtifact {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Inbound {
     Registered {
         host_id: Uuid,
+        /// Optional daemon-token rotation. Old servers omit it.
+        #[serde(default)]
+        access_token: Option<String>,
         /// Account the host belongs to. Server-supplied, and safe to be: it is
         /// only an input to endorsement verification, so a wrong value makes
         /// the signature fail rather than admitting anything.
@@ -300,6 +351,17 @@ pub enum Inbound {
     HostHeartbeat,
     #[serde(rename = "host.ping")]
     HostPing { request_id: String },
+    #[serde(rename = "daemon.update")]
+    DaemonUpdate {
+        request_id: String,
+        version: String,
+        tree: String,
+        target: String,
+        spawnd: DaemonUpdateArtifact,
+        spawn_worker: DaemonUpdateArtifact,
+        #[serde(default)]
+        allow_downgrade: bool,
+    },
     #[serde(rename = "host.agents.check")]
     HostAgentsCheck {
         request_id: String,
@@ -350,15 +412,14 @@ pub enum Inbound {
         /// anchor (device mesh §3). Empty for a directly-pinned browser.
         /// Bounded at the wire: a set larger than the daemon's independent cap
         /// rejects the whole frame (see the deserializer).
-        #[serde(
-            default,
-            deserialize_with = "deserialize_bounded_carried_endorsements"
-        )]
+        #[serde(default, deserialize_with = "deserialize_bounded_carried_endorsements")]
         carried_endorsements: Vec<CarriedEndorsement>,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
         #[serde(default)]
         ice_transport_policy: Option<String>,
+        #[serde(default)]
+        ice_restart: bool,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
@@ -393,6 +454,71 @@ pub enum Inbound {
         #[serde(default)]
         protocol_version: Option<u16>,
     },
+    /// The server refusing a frame this daemon sent
+    /// (`spawn_server.ws.reliability.ErrorFrameSender`).
+    ///
+    /// Without this variant the frame did not parse at all and was discarded
+    /// as malformed, content-free and unattributed — so a daemon whose
+    /// signalling the server was rejecting on every connection said only
+    /// "discarding malformed JSON daemon control frame" and there was no way,
+    /// from a running system, to learn which frame or why. That is the whole
+    /// value here: both fields are short server-authored constants, and
+    /// [`BoundedServerText`] keeps them that way in the log.
+    #[serde(rename = "error")]
+    Error {
+        code: BoundedServerText,
+        #[serde(default)]
+        frame_type: Option<BoundedServerText>,
+    },
+}
+
+/// A short string from the server, safe to put in a log line.
+///
+/// The daemon deliberately never logs a server frame's contents — an SDP, a
+/// token, or serde's own error text quoting either (see `ws::classify`). These
+/// two fields are the exception the protocol allows: a refusal code and the
+/// name of the frame it refers to, both protocol constants. They are still
+/// server-authored, so they are bounded and stripped of anything that is not
+/// an ordinary identifier character before they are believed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedServerText(String);
+
+impl BoundedServerText {
+    const MAX_CHARS: usize = 48;
+
+    fn sanitize(raw: &str) -> Self {
+        let text: String = raw
+            .chars()
+            .take(Self::MAX_CHARS)
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                    character
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        Self(text)
+    }
+}
+
+impl std::fmt::Display for BoundedServerText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedServerText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::sanitize(&raw))
+    }
+}
+
+impl Serialize for BoundedServerText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +663,10 @@ pub struct DevicePossessionRequest<'a> {
 pub struct DevicePossessionResponse {
     pub verified: bool,
     pub version: u8,
+    // A pre-0065 server still answers this field; it is ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub attended: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -569,6 +699,151 @@ pub struct DevicePollResponse {
 }
 
 #[cfg(test)]
+mod daemon_update_wire_tests {
+    use super::*;
+
+    #[test]
+    fn register_carries_self_update_identity_and_capability() {
+        let value = serde_json::to_value(Outbound::Register {
+            host_name: "workstation".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            version: "0.1.0+g123456789abc".into(),
+            daemon_tree: Some("a".repeat(40)),
+            self_update: true,
+            self_update_blocked: None,
+            worker_mismatch: false,
+            keeps_peers_across_reconnect: true,
+            live_bindings: vec![LiveRtcBinding {
+                session_id: "signal-1".into(),
+                binding_nonce: "a".repeat(32),
+                binding_generation: 7,
+                scope_type: "session".into(),
+                scope_id: Uuid::nil(),
+                protocol: "spawn.pty".into(),
+                protocol_version: 2,
+            }],
+            session_ice_policy: true,
+            existing_sessions: Vec::new(),
+            spec: None,
+            supports_account_chains: true,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "register");
+        assert_eq!(value["daemon_tree"], "a".repeat(40));
+        assert_eq!(value["self_update"], true);
+        assert!(value["self_update_blocked"].is_null());
+        assert_eq!(value["keeps_peers_across_reconnect"], true);
+        assert_eq!(value["session_ice_policy"], true);
+        assert_eq!(value["live_bindings"][0]["binding_generation"], 7);
+
+        let without_tree = serde_json::to_value(Outbound::Register {
+            host_name: "workstation".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            version: "0.1.0".into(),
+            daemon_tree: None,
+            self_update: false,
+            self_update_blocked: Some("worker_missing".into()),
+            worker_mismatch: false,
+            keeps_peers_across_reconnect: true,
+            live_bindings: Vec::new(),
+            session_ice_policy: true,
+            existing_sessions: Vec::new(),
+            spec: None,
+            supports_account_chains: true,
+        })
+        .unwrap();
+        assert!(without_tree.get("daemon_tree").is_none());
+        assert_eq!(without_tree["self_update_blocked"], "worker_missing");
+    }
+
+    #[test]
+    fn daemon_update_and_result_match_the_exact_wire_names() {
+        let request: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "daemon.update",
+            "request_id": "11111111-2222-4333-8444-555555555555",
+            "version": "0.1.0+g123456789abc",
+            "tree": "a".repeat(40),
+            "target": "darwin-aarch64",
+            "spawnd": {
+                "path": "/api/install/spawnd/darwin-aarch64",
+                "sha256": "b".repeat(64)
+            },
+            "spawn_worker": {
+                "path": "/api/install/spawn-worker/darwin-aarch64",
+                "sha256": "c".repeat(64)
+            }
+        }))
+        .expect("daemon.update wire parses");
+        assert!(matches!(
+            request,
+            Inbound::DaemonUpdate { ref target, .. } if target == "darwin-aarch64"
+        ));
+
+        let result = serde_json::to_value(Outbound::DaemonUpdateResult {
+            request_id: "11111111-2222-4333-8444-555555555555".into(),
+            ok: false,
+            tree: "a".repeat(40),
+            version_before: "0.1.0+g000000000000".into(),
+            stage: Some("verify".into()),
+            error: Some("sha256_mismatch".into()),
+        })
+        .unwrap();
+        assert_eq!(result["type"], "daemon.update_result");
+        assert_eq!(result["stage"], "verify");
+        assert_eq!(result["error"], "sha256_mismatch");
+    }
+
+    #[test]
+    fn pin_adoption_ack_and_nack_use_the_contract_frames() {
+        let adopted = serde_json::to_value(Outbound::HostPinAdopted {
+            browser_device_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+        })
+        .unwrap();
+        assert_eq!(adopted["type"], "host.pin_adopted");
+        assert_eq!(
+            adopted["browser_device_id"],
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        );
+        let failed = serde_json::to_value(Outbound::HostPinAdoptFailed {
+            browser_device_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+            reason: "pin_limit".into(),
+        })
+        .unwrap();
+        assert_eq!(failed["type"], "host.pin_adopt_failed");
+        assert_eq!(failed["reason"], "pin_limit");
+    }
+
+    #[test]
+    fn registered_token_rotation_is_optional_for_old_servers() {
+        let old: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "registered",
+            "host_id": "11111111-2222-4333-8444-555555555555"
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            Inbound::Registered {
+                access_token: None,
+                ..
+            }
+        ));
+
+        let rotated: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "registered",
+            "host_id": "11111111-2222-4333-8444-555555555555",
+            "access_token": "rotated-token"
+        }))
+        .unwrap();
+        assert!(matches!(
+            rotated,
+            Inbound::Registered { access_token: Some(token), .. } if token == "rotated-token"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod signed_rtc_relay_tests {
     use super::*;
 
@@ -585,7 +860,9 @@ mod signed_rtc_relay_tests {
             "protocol": "spawn.pty",
             "protocol_version": 2,
             "signed_envelope": wire,
-            "ice_servers": []
+            "ice_servers": [],
+            "ice_transport_policy": "relay",
+            "ice_restart": true
         });
         let parsed: Inbound = serde_json::from_value(frame).expect("signed relay shape");
         assert!(matches!(
@@ -593,8 +870,10 @@ mod signed_rtc_relay_tests {
             Inbound::RtcOffer {
                 sdp: None,
                 signed_envelope: Some(ref preserved),
+                ice_transport_policy: Some(ref policy),
+                ice_restart: true,
                 ..
-            } if preserved == wire
+            } if preserved == wire && policy == "relay"
         ));
     }
 
@@ -878,6 +1157,10 @@ mod device_pair_response_tests {
             serde_json::from_str(r#"{"verified":true,"version":1}"#).unwrap();
         assert!(body.verified);
         assert_eq!(body.version, 1);
+        assert!(!body.attended, "current servers omit the legacy field");
+        let pre_0065: DevicePossessionResponse =
+            serde_json::from_str(r#"{"verified":true,"version":1,"attended":true}"#).unwrap();
+        assert!(pre_0065.attended, "the pre-0065 field remains tolerated");
 
         for rejected in [
             r#"{"verified":true,"version":1,"error":"denied"}"#,
@@ -940,5 +1223,81 @@ mod device_poll_tests {
             r#"{"browser_device_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","browser_device_id":"11111111-2222-4333-8444-555555555555"}"#
         )
         .is_err());
+    }
+
+    /// The server's refusal frame, exactly as
+    /// `spawn_server.ws.reliability.ErrorFrameSender` writes it.
+    ///
+    /// Before this variant existed the daemon could not parse this frame at
+    /// all: a server refusing every `rtc.answer` produced nothing in the
+    /// daemon's log but "discarding malformed JSON daemon control frame", with
+    /// no code, no frame name, and no way to tell it apart from a frame the
+    /// server had no business sending.
+    #[test]
+    fn the_servers_refusal_frame_parses_and_stays_bounded() {
+        let frame = r#"{"type": "error", "code": "invalid_frame", "frame_type": "rtc.answer"}"#;
+        match serde_json::from_str::<Inbound>(frame).expect("the server's own error frame parses") {
+            Inbound::Error { code, frame_type } => {
+                assert_eq!(code.to_string(), "invalid_frame");
+                assert_eq!(
+                    frame_type.map(|kind| kind.to_string()).as_deref(),
+                    Some("rtc.answer")
+                );
+            }
+            other => panic!("the server's error frame parsed as {other:?}"),
+        }
+
+        // `frame_type` is null whenever the refused frame had no usable type.
+        let untyped = r#"{"type": "error", "code": "invalid_frame", "frame_type": null}"#;
+        match serde_json::from_str::<Inbound>(untyped).expect("a null frame_type parses") {
+            Inbound::Error { frame_type, .. } => assert!(frame_type.is_none()),
+            other => panic!("parsed as {other:?}"),
+        }
+
+        // Both fields reach a log line, so a hostile server may not use them to
+        // write one: everything but an ordinary identifier character is
+        // replaced, and the length is capped.
+        let hostile = format!(
+            r#"{{"type": "error", "code": {}, "frame_type": {}}}"#,
+            serde_json::to_string(&"x".repeat(500)).unwrap(),
+            serde_json::to_string("a\nb\u{1b}[31m").unwrap(),
+        );
+        match serde_json::from_str::<Inbound>(&hostile).expect("a hostile error frame parses") {
+            Inbound::Error { code, frame_type } => {
+                assert_eq!(code.to_string().len(), BoundedServerText::MAX_CHARS);
+                let kind = frame_type.expect("present").to_string();
+                assert_eq!(kind, "a?b??31m");
+                assert!(!kind.contains('\n') && !kind.contains('\u{1b}'));
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// The exact host-scope candidate frame the server relays, byte for byte
+    /// as `spawn_server.ws.host._signal_payload` builds it around a candidate
+    /// `spawn_server.ws.browser._valid_rtc_candidate` has sanitized.
+    ///
+    /// A frame this daemon cannot parse is discarded content-free — the log
+    /// says only "discarding malformed JSON daemon control frame" and there is
+    /// no way to tell from a running system whether the server sent something
+    /// new or something it sends on every connection. This test is that
+    /// answer, kept next to the parser it protects.
+    #[test]
+    fn the_servers_host_candidate_frame_parses() {
+        let frame = r#"{"type": "rtc.candidate", "session_id": "1aeaea29-1880-4c9f-9b7e-7b0d9627af15", "scope_type": "host", "scope_id": "d3914d3d-2d62-47f7-9d88-85d84e1ef79c", "protocol": "spawn.host.ctl", "protocol_version": 1, "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "binding_generation": 1, "candidate": {"candidate": "candidate:842163049 1 udp 1677729535 33cde59c-1be0-47b5-9ae5-786881bd0089.local 50123 typ host generation 0 ufrag Xk4b network-cost 999", "sdpMid": "0", "usernameFragment": "Xk4b", "sdpMLineIndex": 0}}"#;
+        let parsed: Inbound = serde_json::from_str(frame).expect("the server's own frame parses");
+        match parsed {
+            Inbound::RtcCandidate {
+                session_id,
+                scope_type,
+                candidate,
+                ..
+            } => {
+                assert_eq!(session_id, "1aeaea29-1880-4c9f-9b7e-7b0d9627af15");
+                assert_eq!(scope_type.as_deref(), Some("host"));
+                assert!(candidate.get("candidate").is_some());
+            }
+            other => panic!("the server's candidate frame parsed as {other:?}"),
+        }
     }
 }

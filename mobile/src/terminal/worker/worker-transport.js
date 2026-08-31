@@ -4,6 +4,9 @@
   const api = globalThis.spawnWorker;
   const state = api.state;
   const CHANNEL_OPTIONS = Object.freeze({ ordered: true });
+  state.restartTimer ??= null;
+  state.statsTimer ??= null;
+  state.pendingRestartRequests ??= new Set();
 
   function protocolTuple() {
     return state.mode === "session"
@@ -46,7 +49,96 @@
     // only thing that tells the operator why, so it wins over the generic text.
     api.error("channel_closed", reason || `${label} closed before the session retired.`, true);
     api.post({ type: "state", state: "reconnecting" });
-    teardown(false);
+    teardown(true);
+  }
+
+  async function requestSignedOffer(pc, iceRestart) {
+    const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
+    await pc.setLocalDescription(offer);
+    const tuple = protocolTuple();
+    const requestId = crypto.randomUUID();
+    const transcript = {
+      signalKind: "offer",
+      protocolVersion: tuple.protocolVersion,
+      sessionId: state.rtcSessionId,
+      scopeType: tuple.scopeType,
+      scopeId: state.scopeId,
+      senderRole: "browser",
+      intendedPeerIdentityPublicKey: state.hostKey,
+      sdp: offer.sdp,
+    };
+    state.pendingSign.set(requestId, transcript);
+    if (iceRestart) state.pendingRestartRequests.add(requestId);
+    api.post({ type: "sign-request", requestId, transcript });
+  }
+
+  function scheduleStats() {
+    clearTimeout(state.statsTimer);
+    if (!state.pc || state.pc.connectionState !== "connected") return;
+    state.statsTimer = setTimeout(async () => {
+      const pc = state.pc;
+      if (!pc || pc.connectionState !== "connected") return;
+      try {
+        const stats = await pc.getStats();
+        let selected = null;
+        const records = new Map();
+        stats.forEach((entry) => {
+          records.set(entry.id, entry);
+          if (entry.type === "candidate-pair" && entry.state === "succeeded" && entry.nominated) {
+            selected = entry;
+          }
+        });
+        const local = selected ? records.get(selected.localCandidateId) : null;
+        const remote = selected ? records.get(selected.remoteCandidateId) : null;
+        const candidateTypes = [local?.candidateType, remote?.candidateType];
+        const kind = candidateTypes.includes("relay")
+          ? "relay"
+          : candidateTypes.some((value) => value === "srflx" || value === "prflx")
+            ? "stun"
+            : candidateTypes.includes("host")
+              ? "direct"
+              : "unknown";
+        const rttMs =
+          typeof selected?.currentRoundTripTime === "number"
+            ? Math.round(selected.currentRoundTripTime * 1_000)
+            : null;
+        api.post({ type: "connection-info", info: { kind, rttMs } });
+      } catch {
+        // Stats are diagnostic only; an older WebKit must not affect the channel.
+      } finally {
+        scheduleStats();
+      }
+    }, 5_000);
+  }
+
+  async function restartPeer(message = {}, cause = "connection lost") {
+    const pc = state.pc;
+    if (!pc || pc.connectionState === "closed" || state.restartTimer !== null) {
+      if (!pc) channelFailed("RTCPeerConnection");
+      return;
+    }
+    clearTimeout(state.disconnectTimer);
+    state.disconnectTimer = null;
+    if (Array.isArray(message.iceServers) && typeof pc.setConfiguration === "function") {
+      const relayOnly = message.iceTransportPolicy === "relay";
+      pc.setConfiguration({
+        iceServers: message.iceServers,
+        iceTransportPolicy: relayOnly ? "relay" : "all",
+      });
+    }
+    pc.restartIce?.();
+    await requestSignedOffer(pc, true);
+    state.restartTimer = setTimeout(() => {
+      state.restartTimer = null;
+      if (state.pc?.connectionState !== "connected") {
+        channelFailed(
+          "ICE restart",
+          cause === "network changed"
+            ? "The network changed and the terminal connection could not be restored."
+            : "The host connection was lost and could not be restored.",
+        );
+      }
+    }, 10_000);
   }
 
   function configureChannel(channel, kind) {
@@ -66,6 +158,7 @@
   }
 
   async function startPeer(message) {
+    if (state.pc?.connectionState === "connected" && message.forceRebuild !== true) return;
     if (state.pc && state.rtcSessionId === message.rtcSessionId) return;
     teardown(false);
     state.stopped = false;
@@ -73,9 +166,13 @@
     state.bindingNonce = message.bindingNonce;
     state.bindingGeneration = null;
     state.offerSent = false;
+    // Either the operator's deployment says every peer relays, or this client
+    // was asked to prove it can. Native used to read neither, so a relay-only
+    // deployment kept the phone hunting for direct paths that do not exist.
+    const relayOnly = message.forceRelay === true || message.iceTransportPolicy === "relay";
     const pc = new RTCPeerConnection({
       iceServers: message.iceServers,
-      iceTransportPolicy: message.forceRelay ? "relay" : "all",
+      iceTransportPolicy: relayOnly ? "relay" : "all",
     });
     state.pc = pc;
     if (state.mode === "session") {
@@ -100,37 +197,26 @@
       else state.pendingLocalCandidates.push(frame);
     };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed") channelFailed("RTCPeerConnection");
+      if (pc.connectionState === "failed") void restartPeer();
       if (pc.connectionState === "disconnected") {
         clearTimeout(state.disconnectTimer);
-        state.disconnectTimer = setTimeout(() => channelFailed("RTCPeerConnection"), 5_000);
+        state.disconnectTimer = setTimeout(() => void restartPeer(), 5_000);
       } else if (pc.connectionState === "connected") {
         clearTimeout(state.disconnectTimer);
+        clearTimeout(state.restartTimer);
+        state.restartTimer = null;
+        scheduleStats();
       }
     };
     api.post({ type: "state", state: "connecting" });
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    const tuple = protocolTuple();
-    const requestId = crypto.randomUUID();
-    const transcript = {
-      signalKind: "offer",
-      protocolVersion: tuple.protocolVersion,
-      sessionId: state.rtcSessionId,
-      scopeType: tuple.scopeType,
-      scopeId: state.scopeId,
-      senderRole: "browser",
-      intendedPeerIdentityPublicKey: state.hostKey,
-      sdp: offer.sdp,
-    };
-    state.pendingSign.set(requestId, transcript);
-    api.post({ type: "sign-request", requestId, transcript });
+    await requestSignedOffer(pc, false);
   }
 
   async function acceptSignResponse(message) {
     const transcript = state.pendingSign.get(message.requestId);
     if (!transcript) return;
     state.pendingSign.delete(message.requestId);
+    const iceRestart = state.pendingRestartRequests.delete(message.requestId);
     if (!message.signature) {
       api.error("signal_signing", message.error ?? "Signal signing failed.");
       return;
@@ -154,6 +240,7 @@
       type: "rtc.offer",
       ...outerTuple(),
       signed_envelope: JSON.stringify(envelope),
+      ...(iceRestart ? { ice_restart: true } : {}),
     };
     if (Array.isArray(message.carriedEndorsements) && message.carriedEndorsements.length > 0) {
       offerFrame.carried_endorsements = message.carriedEndorsements;
@@ -229,7 +316,11 @@
       emitSignal({ type: "rtc.close", ...outerTuple() });
     }
     clearTimeout(state.disconnectTimer);
+    clearTimeout(state.restartTimer);
+    clearTimeout(state.statsTimer);
     state.disconnectTimer = null;
+    state.restartTimer = null;
+    state.statsTimer = null;
     for (const channel of [state.pty, state.ctl]) {
       if (!channel) continue;
       channel.onclose = null;
@@ -244,6 +335,7 @@
     state.pendingLocalCandidates.splice(0);
     state.pendingRemoteCandidates.splice(0);
     state.pendingSign.clear();
+    state.pendingRestartRequests.clear();
   }
 
   api.handleTransportMessage = async (message) => {
@@ -256,6 +348,9 @@
         break;
       case "signal-frame":
         await acceptSignal(message.frame);
+        break;
+      case "network-changed":
+        await restartPeer(message, "network changed");
         break;
       case "request-replay":
         api.requestReplay?.(message.fromOffset);

@@ -12,6 +12,11 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import { AgentIcon } from "@/components/icons/AgentIcon";
+import {
+  HostUpdateBadge,
+  HostUpdateDialog,
+  useHostUpdate,
+} from "@/components/release/HostUpdateDialog";
 import { toast } from "@/components/ui/toast";
 import {
   type Agent,
@@ -63,7 +68,7 @@ function choiceLabel(choice: Choice): string {
 }
 
 /**
- * The floating pane launcher: a + pinned to the bottom-right of the viewport.
+ * The pane launcher: a + sunk into the bottom-right corner of the viewport.
  * Hovering (or focusing) it fans out one icon per thing a pane can run —
  * shell, each installed agent, the file explorer. Tapping an icon creates the
  * pane at the workspace's home folder, auto-placed in the open tab; dragging
@@ -139,6 +144,7 @@ export function LauncherFab({
   const target = tabHome(workspace.layout, tabId, workspace);
   const homeHost = (hostsQ.data ?? []).find((host) => host.id === target?.host_id) ?? null;
   const home = homeHost && target ? { host: homeHost, cwd: target.cwd } : null;
+  const hostUpdate = useHostUpdate(home?.host ?? null);
 
   const createM = useMutation({
     mutationFn: async ({
@@ -269,6 +275,15 @@ export function LauncherFab({
     : home.host.status !== "online"
       ? `${home.host.name} is offline`
       : undefined;
+
+  const launch = (input: {
+    choice: Choice;
+    placement?: Rect;
+    dock?: { targetId: string; zone: DockZone };
+  }) => {
+    if (!home) return;
+    hostUpdate.promptHostUpdate(home.host, () => createM.mutate(input));
+  };
 
   const layoutRef = useRef(workspace.layout);
   layoutRef.current = workspace.layout;
@@ -435,7 +450,7 @@ export function LauncherFab({
       if (!drag) return;
       if (!drag.started) {
         // A tap: create at home, auto-placed in the open tab.
-        createM.mutate({ choice: drag.choice });
+        launch({ choice: drag.choice });
         return;
       }
       // Whatever the outline last promised — deriving it again from the
@@ -445,14 +460,14 @@ export function LauncherFab({
       const drop = drag.drop;
       if (!drop) return;
       if (drop.kind === "opening") {
-        createM.mutate({ choice: drag.choice, placement: drop.rect });
+        launch({ choice: drag.choice, placement: drop.rect });
       } else if (drop.kind === "dock") {
-        createM.mutate({
+        launch({
           choice: drag.choice,
           dock: { targetId: drop.targetId, zone: drop.zone },
         });
       } else {
-        createM.mutate({ choice: drag.choice });
+        launch({ choice: drag.choice });
       }
     };
     const onCancel = () => endDrag();
@@ -500,19 +515,19 @@ export function LauncherFab({
     {
       key: "shell",
       label: "New shell window",
-      icon: <SquareTerminal className="size-5.5" aria-hidden />,
+      icon: <SquareTerminal className="size-4.5" aria-hidden />,
       choice: { kind: "shell" },
     },
     ...(agentsQ.data ?? []).map((agent) => ({
       key: agent.id,
       label: `New ${agent.name} window`,
-      icon: <AgentIcon kind={agent.kind} size={22} className="rounded" aria-hidden />,
+      icon: <AgentIcon kind={agent.kind} size={18} className="rounded" aria-hidden />,
       choice: { kind: "agent" as const, agent },
     })),
     {
       key: "files",
       label: "New file explorer window",
-      icon: <FolderTree className="size-5.5" aria-hidden />,
+      icon: <FolderTree className="size-4.5" aria-hidden />,
       choice: { kind: "files" },
     },
   ];
@@ -535,7 +550,10 @@ export function LauncherFab({
         // One pill that grows from a circle: the items sit inside it and are
         // revealed by the container's own width, not a separate tray.
         className={cn(
-          "group/fab right-4 z-40 flex items-center rounded-2xl border border-border bg-popover shadow-lg",
+          // Pinned into the corner rather than floating over it: it meets both
+          // edges, so only the corner it turns towards the canvas is rounded
+          // and only the two sides facing the canvas carry a border.
+          "group/fab right-0 z-40 flex items-center rounded-tl-2xl border-l border-t border-border bg-popover shadow-lg",
           // Split, the button hangs off its own half — two viewport-fixed
           // launchers would sit on the same pixel, one hiding the other. A
           // single workspace stays fixed rather than being pinned to a half
@@ -543,11 +561,17 @@ export function LauncherFab({
           // so it keeps clearing the safe area and the modifier bar however
           // the content panel is inset or clipped.
           split ? "absolute" : "fixed",
-          "bottom-[calc(1rem+var(--safe-bottom))]",
-          // Clear of the touch modifier bar on phones.
-          "[@media(pointer:coarse)]:bottom-[calc(4.5rem+var(--safe-bottom))]",
+          "bottom-[var(--safe-bottom)]",
+          // Sat on the touch modifier bar on phones, flush against its top.
+          "[@media(pointer:coarse)]:bottom-[calc(3.5rem+var(--safe-bottom))]",
         )}
       >
+        {home && (
+          <HostUpdateBadge
+            host={home.host}
+            className="absolute -top-7 right-0 shadow-sm shadow-black/10"
+          />
+        )}
         <div
           role="toolbar"
           aria-label="New window launcher"
@@ -580,11 +604,11 @@ export function LauncherFab({
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") {
                   event.preventDefault();
-                  if (!disabled) createM.mutate({ choice: item.choice });
+                  if (!disabled) launch({ choice: item.choice });
                 }
               }}
               className={cn(
-                "grid size-11 shrink-0 cursor-grab touch-none place-items-center rounded-xl text-muted-foreground",
+                "grid size-9 shrink-0 cursor-grab touch-none place-items-center rounded-xl text-muted-foreground",
                 "transition-all duration-200 ease-swift",
                 showItems
                   ? "translate-x-0 scale-100 opacity-100"
@@ -604,8 +628,10 @@ export function LauncherFab({
           onClick={() => setOpen((current) => !current)}
           className={cn(
             // The one primary action on the canvas: a filled square button,
-            // easing into its hover tint rather than snapping to it.
-            "grid shrink-0 place-items-center rounded-2xl",
+            // easing into its hover tint rather than snapping to it. Nothing
+            // here scales: pinned flush, a plate that grew on hover would push
+            // itself off both edges.
+            "grid shrink-0 place-items-center",
             "transition-all duration-200 ease-swift",
             bin
               ? // Anything in flight, it is the bin: drop here to discard. It
@@ -615,17 +641,28 @@ export function LauncherFab({
                 // holds its size. Real width/height, not a scale: the jiggle
                 // owns `transform`, and an animation's transform beats the
                 // utility's, so a scale-* here would never render.
-                "size-14 bin-jiggle bg-destructive/15 text-destructive group-data-[trash-hover]/fab:size-16 group-data-[trash-hover]/fab:bg-destructive/30"
-              : "size-12 bg-primary text-primary-foreground hover:scale-105 hover:opacity-90 active:scale-95",
-            showItems && "rotate-45",
+                "size-12 bin-jiggle bg-destructive/15 text-destructive group-data-[trash-hover]/fab:size-14 group-data-[trash-hover]/fab:bg-destructive/30"
+              : "size-10 bg-primary text-primary-foreground hover:opacity-90 active:opacity-80",
+            // Shut, the plate is the whole pill and wears its one rounded
+            // corner; open, that corner belongs to the drawer's far end and
+            // the plate squares off into the middle of the pill.
+            !showItems && "rounded-tl-2xl",
           )}
         >
           {/* The plate grows, the glyph does not: the icon holds the same
-              size the + had, so what reads as changing is the target. */}
+              size the + had, so what reads as changing is the target. The
+              turn to a × is the glyph's alone — turning the plate would spin
+              its one rounded corner away from the canvas. */}
           {bin ? (
-            <Trash2 className="size-5" aria-hidden />
+            <Trash2 className="size-4.5" aria-hidden />
           ) : (
-            <Plus className="size-5" aria-hidden />
+            <Plus
+              className={cn(
+                "size-4.5 transition-transform duration-200 ease-swift",
+                showItems && "rotate-45",
+              )}
+              aria-hidden
+            />
           )}
         </button>
       </div>
@@ -647,6 +684,7 @@ export function LauncherFab({
           {choiceLabel(dragging.choice)}
         </div>
       )}
+      <HostUpdateDialog {...hostUpdate.dialogProps} />
     </>
   );
 }

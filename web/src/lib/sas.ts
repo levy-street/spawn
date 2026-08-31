@@ -64,7 +64,9 @@ export async function verifyCommit(
 /** The short authentication string both endpoints display, from the keys/nonces
  * each side sees. `digits` defaults to 6 ("NNN NNN") — the daemon-matched host
  * value, byte-frozen by the shared test vectors — and the device↔device ceremony
- * asks for 4 ("NN NN"). Split into two even-ish groups for readability. */
+ * asks for 4 ("NNNN"). Six digits are split into two groups, because carrying
+ * six across a room in one run is where people drop a digit; four is short
+ * enough to hold whole, and a gap inside it only invited typing the space. */
 export async function sas(
   hostKey: Uint8Array,
   browserKey: Uint8Array,
@@ -76,6 +78,7 @@ export async function sas(
   const n = ((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0;
   const code = n % 10 ** digits;
   const s = code.toString().padStart(digits, "0");
+  if (digits <= 4) return s;
   const half = Math.ceil(digits / 2);
   return `${s.slice(0, half)} ${s.slice(half)}`;
 }

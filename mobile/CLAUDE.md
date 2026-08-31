@@ -22,8 +22,8 @@ src/
   components/     UI grouped by product area
                   admin/ alerts/ auth/ brand/ files/ gestures/ hosts/
                   launcher/ layout/ longtail/ media/ nav/ onboarding/
-                  settings/ terminal-ui/ trust/ ui/ workspace-detail/
-                  workspaces/
+                  release/ settings/ terminal-ui/ trust/ ui/
+                  workspace-detail/ workspaces/
   data/           everything that talks to the server or holds client state
     api/          HTTP client and endpoints
     queries/      TanStack Query hooks; keys live in queryKeys.ts
@@ -35,8 +35,8 @@ src/
     layout/       persisted layout state
     __tests__/    data-layer tests
   lib/            platform glue: crypto/, oauth, apple-auth, push,
-                  notifications, secure-storage, haptics, linking, motion/,
-                  providers, validation
+                  notifications, release-watcher, updates, secure-storage,
+                  haptics, linking, motion/, providers, share, validation
   terminal/       terminal surface components
   theme/          design tokens — every colour, spacing, and type value
 assets/           icons and splash
@@ -54,6 +54,11 @@ scripts/, docs/   build helpers and app-specific notes
   `data/queries/` with its key in `queryKeys.ts`. Components never fetch
   directly.
 - Client-only state: `data/stores/`.
+- Realtime: the subprotocol names in `data/realtime/` (`spawn.v3`,
+  `spawn.alerts.v1`) are the compatibility contract with the server, not a
+  version — a server that requires a different one refuses the socket with a
+  `protocol.required` frame, which is what routes into the update path. Read
+  "The wire protocols" in `docs/RELEASE.md` before changing one.
 - Tests colocate in the nearest `__tests__/` directory (jest).
 
 ## Conventions
@@ -64,6 +69,22 @@ scripts/, docs/   build helpers and app-specific notes
 - Anything that touches the native layer — a dependency with native code, a
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.
+
+## Running it against a local server
+
+```bash
+npm run dev --onboarding      # from the repo root: server, web, daemon reset, Metro
+npm run dev --mobile          # Metro alongside a normal dev run
+```
+
+Both print `exp://<this machine's LAN address>:8081` to type into Expo Go. The
+address is the point: `src/data/api/config.ts` derives the dev API URL from the
+Metro host it connected to, because in Expo Go "localhost" is the *phone*. So a
+LAN Metro is what aims the app at the machine running the server, and `--tunnel`
+or a Metro on `127.0.0.1` silently falls back to a localhost the phone cannot
+reach. `scripts/dev.sh` clears `EXPO_PUBLIC_API_URL` before starting Metro for
+the same reason — set, it outranks that derivation and would point a local app
+at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
 
 ## Before calling a change done
 

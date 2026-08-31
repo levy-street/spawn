@@ -1,13 +1,16 @@
 import { render } from "@testing-library/react-native";
 import type { ForwardedRef } from "react";
+import { type StyleProp, StyleSheet, type ViewStyle } from "react-native";
 
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { TerminalSurface } from "@/terminal/TerminalSurface";
 import type { HostTransport, SessionTransport } from "@/terminal/transport/types";
 import { isWorkerBootstrapNavigation, WORKER_BASE_URL } from "@/terminal/worker/navigation-policy";
+import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
 
 type CapturedWebViewProps = Record<string, unknown> & {
   allowsLinkPreview?: boolean;
+  containerStyle?: StyleProp<ViewStyle>;
   javaScriptCanOpenWindowsAutomatically?: boolean;
   onOpenWindow?: (event: { nativeEvent: { targetUrl: string } }) => void;
   onShouldStartLoadWithRequest?: (request: { url: string }) => boolean;
@@ -92,6 +95,10 @@ describe("worker navigation containment", () => {
     expect(isWorkerBootstrapNavigation({ url: `${workerUrl}?external` }, workerUrl)).toBe(false);
   });
 
+  test("prevents the embedded worker document from opening network connections", () => {
+    expect(TERMINAL_WORKER_HTML).toContain("connect-src 'none'");
+  });
+
   test("routes every terminal URL through the strict callback and intercepts _blank", async () => {
     const onLink = jest.fn();
     await render(
@@ -133,5 +140,8 @@ describe("worker navigation containment", () => {
     expect(props.allowsLinkPreview).toBe(false);
     expect(props.setSupportMultipleWindows).toBe(false);
     expect(props.javaScriptCanOpenWindowsAutomatically).toBe(false);
+    // The library's own container would otherwise grow to fill the column the
+    // worker is mounted in, shoving a screen's toolbar down to meet it.
+    expect(StyleSheet.flatten(props.containerStyle)).toMatchObject({ position: "absolute" });
   });
 });

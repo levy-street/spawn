@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -18,9 +19,10 @@ from fastapi import (
 from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, schemas
+from .. import auth, release, schemas
 from ..db import get_session, get_sessionmaker
 from ..host_key_claims import lock_host_key_claim
+from ..host_status import derived_host_status, stamp_stale_disconnect
 from ..models import (
     Agent,
     DeviceCode,
@@ -42,6 +44,8 @@ MAX_RECENT_DIRS = 8
 _AUTO_UPDATE_IN_FLIGHT: set[tuple[str, str, str]] = set()
 _AUTO_UPDATE_TASKS: set[asyncio.Task[None]] = set()
 _AUTO_UPDATE_CHECK_TASK: asyncio.Task[None] | None = None
+DAEMON_UPDATE_RATE_SECONDS = 15.0
+_DAEMON_UPDATE_REQUESTED_AT: dict[str, float] = {}
 
 
 def _utcnow() -> datetime:
@@ -56,17 +60,24 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt
 
 
-def _to_out(host: Host, session_count: int) -> schemas.HostOut:
+def _to_out(host: Host, session_count: int, *, now: datetime | None = None) -> schemas.HostOut:
+    derived_status = derived_host_status(host, now)
     return schemas.HostOut(
         id=host.id,
         name=host.name,
         os=host.os,
         arch=host.arch,
         version=host.version,
+        daemon_tree=host.daemon_tree,
+        update=release.host_update_state(host),
         host_key_algorithm=host.host_key_algorithm,
         host_public_key=host.host_public_key,
-        status=host.status,
+        status=derived_status,
         last_seen_at=host.last_seen_at,
+        last_disconnect=schemas.HostDisconnectOut(
+            at=host.last_disconnect_at,
+            reason=host.last_disconnect_reason,
+        ),
         session_count=session_count,
         supports_account_chains=host.supports_account_chains,
         cpu_cores=host.cpu_cores,
@@ -77,8 +88,8 @@ def _to_out(host: Host, session_count: int) -> schemas.HostOut:
         # An offline host's last reading is a stale reading. Reporting it would
         # draw a live-looking meter for a machine that is gone, so the buckets
         # go with the daemon and only the spec (which is still true) stays.
-        cpu_bucket=host.cpu_bucket if host.status == "online" else None,
-        mem_bucket=host.mem_bucket if host.status == "online" else None,
+        cpu_bucket=host.cpu_bucket if derived_status == "online" else None,
+        mem_bucket=host.mem_bucket if derived_status == "online" else None,
         capacity_at=host.capacity_at,
     )
 
@@ -246,9 +257,7 @@ async def _run_auto_update(*, user_id: str, host_id: str, agent_id: str, target:
         else:
             raw_result = await get_broker().request_agent_install(daemon, target=target)
             result = (
-                schemas.HostAgentInstallResult.model_validate(
-                    raw_result.get("result", raw_result)
-                )
+                schemas.HostAgentInstallResult.model_validate(raw_result.get("result", raw_result))
                 if raw_result is not None
                 else None
             )
@@ -365,8 +374,7 @@ async def run_auto_update_checks_once() -> None:
         checked = schemas.HostAgentList.model_validate(result)
         now = _utcnow()
         by_agent = {
-            agent_id: (policy_id, user_id, target)
-            for policy_id, user_id, agent_id, target in items
+            agent_id: (policy_id, user_id, target) for policy_id, user_id, agent_id, target in items
         }
 
         async with sm() as session:
@@ -439,9 +447,15 @@ async def list_hosts(
     rows = (
         (await session.execute(select(Host).where(Host.owner_user_id == user.id))).scalars().all()
     )
+    now = _utcnow()
+    changed = False
+    for host in rows:
+        changed = stamp_stale_disconnect(host, now) or changed
+    if changed:
+        await session.commit()
     out: list[schemas.HostOut] = []
     for h in rows:
-        out.append(_to_out(h, await _session_count(session, h, user)))
+        out.append(_to_out(h, await _session_count(session, h, user), now=now))
     return out
 
 
@@ -452,7 +466,10 @@ async def get_host(
     user: User = Depends(auth.current_user),
 ) -> schemas.HostOut:
     h = await _get_owned_host(session, host_id, user)
-    return _to_out(h, await _session_count(session, h, user))
+    now = _utcnow()
+    if stamp_stale_disconnect(h, now):
+        await session.commit()
+    return _to_out(h, await _session_count(session, h, user), now=now)
 
 
 @router.patch("/{host_id}", response_model=schemas.HostOut)
@@ -467,7 +484,80 @@ async def patch_host(
         h.name = body.name
     await session.commit()
     await session.refresh(h)
-    return _to_out(h, await _session_count(session, h, user))
+    now = _utcnow()
+    if stamp_stale_disconnect(h, now):
+        await session.commit()
+    return _to_out(h, await _session_count(session, h, user), now=now)
+
+
+def _enforce_daemon_update_rate(host_id: str) -> None:
+    now = time.monotonic()
+    previous = _DAEMON_UPDATE_REQUESTED_AT.get(host_id)
+    if previous is not None and now - previous < DAEMON_UPDATE_RATE_SECONDS:
+        raise HTTPException(status_code=429, detail="daemon update requested too recently")
+    _DAEMON_UPDATE_REQUESTED_AT[host_id] = now
+    if len(_DAEMON_UPDATE_REQUESTED_AT) > 10_000:
+        cutoff = now - DAEMON_UPDATE_RATE_SECONDS
+        stale = [
+            key
+            for key, requested_at in _DAEMON_UPDATE_REQUESTED_AT.items()
+            if requested_at < cutoff
+        ]
+        for key in stale:
+            _DAEMON_UPDATE_REQUESTED_AT.pop(key, None)
+
+
+@router.post(
+    "/{host_id}/update",
+    response_model=schemas.HostUpdateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def update_host_daemon(
+    host_id: str,
+    response: Response,
+    body: schemas.HostUpdateRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostUpdateResponse:
+    host = await _get_owned_host(session, host_id, user)
+    _enforce_daemon_update_rate(host_id)
+    manifest = release.read_prebuilt_manifest()
+    update_state = release.host_update_state(host, manifest)
+    if update_state.state == "current" and not host.worker_mismatch:
+        response.status_code = status.HTTP_200_OK
+        return schemas.HostUpdateResponse(update=update_state)
+
+    daemon = get_broker().get_daemon_for_host(host_id)
+    if host.status != "online" or daemon is None:
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+    if update_state.state in {"unsupported", "unknown"}:
+        detail = update_state.error or "daemon release information is unavailable"
+        raise HTTPException(status_code=409, detail=detail)
+    if update_state.state == "updating":
+        return schemas.HostUpdateResponse(update=update_state)
+    if manifest is None:
+        raise HTTPException(status_code=409, detail="daemon release information is unavailable")
+
+    payload = release.mark_update_requested(
+        host,
+        manifest,
+        allow_downgrade=body.allow_downgrade if body is not None else False,
+    )
+    if payload is None:
+        raise HTTPException(
+            status_code=409,
+            detail="no update is available for this daemon target",
+        )
+    await session.commit()
+    await session.refresh(host)
+
+    if not await get_broker().request_daemon_update(daemon, payload):
+        host.update_state = "failed"
+        host.update_error = "update request could not be delivered"
+        await session.commit()
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+
+    return schemas.HostUpdateResponse(update=release.host_update_state(host, manifest))
 
 
 @router.get("/{host_id}/agents", response_model=schemas.HostAgentList)
@@ -534,9 +624,7 @@ async def list_recent_dirs(
         .all()
     )
     return schemas.RecentDirList(
-        dirs=[
-            schemas.RecentDirOut(path=row.path, last_used_at=row.last_used_at) for row in rows
-        ]
+        dirs=[schemas.RecentDirOut(path=row.path, last_used_at=row.last_used_at) for row in rows]
     )
 
 
@@ -556,9 +644,7 @@ async def ping_host_control(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post(
-    "/{host_id}/agents/{agent_id}/install", response_model=schemas.HostAgentInstallResult
-)
+@router.post("/{host_id}/agents/{agent_id}/install", response_model=schemas.HostAgentInstallResult)
 async def install_host_agent(
     host_id: str,
     agent_id: str,

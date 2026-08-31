@@ -94,3 +94,14 @@ jest.mock("react-native-keyboard-controller", () => {
     useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }),
   };
 });
+
+/**
+ * The WebView library reaches for its native module at import time, so any file
+ * that transitively imports a host transport surface dies before a test can
+ * run. Nothing in a test drives a terminal worker, so the view is inert here —
+ * a test that needs one mocks the module itself, which takes precedence.
+ */
+jest.mock("react-native-webview", () => {
+  const { View } = require("react-native") as typeof import("react-native");
+  return { __esModule: true, default: View, WebView: View };
+});

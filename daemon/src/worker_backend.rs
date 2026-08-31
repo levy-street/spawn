@@ -1,16 +1,16 @@
 //! spawnd-side supervision of mandatory session workers (docs/SESSIOND.md).
 //!
 //! For each session, spawnd:
-//! - spawns `spawn-worker` in its own process group (so it survives spawnd
-//!   restarts and upgrades),
-//! - connects to its unix socket and drives the framed `sessiond::wire`
+//! - spawns `spawn-worker` outside the supervisor's lifetime boundary (so it
+//!   survives spawnd restarts and upgrades),
+//! - connects to its protected local endpoint and drives the framed `sessiond::wire`
 //!   protocol,
 //! - bridges worker output into the per-session outbox → forwarder →
 //!   {WS sink, DataChannel direct sinks} pipeline,
 //! - delivers fixed-size TERM/KILL requests through the worker's independent
-//!   lifecycle socket, where stable child ownership guards the signal,
-//! - adopts already-running workers after a restart by scanning the socket
-//!   directory (the worker greets every connection with `Hello`).
+//!   lifecycle endpoint, where stable child ownership guards the signal,
+//! - adopts already-running workers after a restart from protected endpoint
+//!   discovery metadata (the worker greets every connection with `Hello`).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use sha2::{Digest, Sha256};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -62,9 +60,10 @@ fn worker_frame_limit(frame_type: u8) -> Option<usize> {
 #[cfg(test)]
 pub(crate) static WORKER_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Directory holding worker sockets and scrollback dirs:
-/// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir — with
-/// one hard constraint: the unix-socket paths it hands out must fit the
+/// Directory holding worker sockets or Windows endpoint metadata:
+/// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir on
+/// Unix, or `%LOCALAPPDATA%/spawn/state/<instance>/workers` on Windows. Unix
+/// has one hard constraint: the socket paths it hands out must fit the
 /// platform's `sun_path` limit (104 bytes on macOS). macOS has no
 /// `XDG_RUNTIME_DIR`, so the fallback lands in
 /// `~/Library/Application Support/spawn/workers`; the `<uuid>.lifecycle.sock`
@@ -77,14 +76,21 @@ pub fn worker_dir() -> Result<PathBuf> {
         // operator's to answer for and surfaces loudly at bind time.
         PathBuf::from(dir)
     } else {
-        let tag = config_root_tag();
-        choose_worker_dir(
-            dirs::runtime_dir(),
-            &tag,
-            || Ok(config::config_dir()?.join("workers")),
-            socket_dir_fits,
-            || short_worker_dir(&tag),
-        )?
+        #[cfg(unix)]
+        {
+            let tag = endpoint::config_root_tag();
+            choose_worker_dir(
+                dirs::runtime_dir(),
+                &tag,
+                || Ok(config::config_dir()?.join("workers")),
+                socket_dir_fits,
+                || short_worker_dir(&tag),
+            )?
+        }
+        #[cfg(windows)]
+        {
+            crate::service::instance_state_dir(&config::config_dir()?)?.join("workers")
+        }
     };
     endpoint::ensure_private_dir(&dir)?;
     Ok(dir)
@@ -95,34 +101,13 @@ pub fn worker_dir() -> Result<PathBuf> {
 /// `$XDG_RUNTIME_DIR` and `/tmp`, so without this they would land in the same
 /// worker dir and adopt each other's workers on restart. Empty for the default
 /// single instance, which keeps its path byte-for-byte unchanged.
-fn config_root_tag() -> String {
-    root_tag_for(
-        std::env::var_os("SPAWN_CONFIG_DIR")
-            .filter(|v| !v.is_empty())
-            .as_deref(),
-    )
-}
-
-fn root_tag_for(root: Option<&std::ffi::OsStr>) -> String {
-    match root {
-        None => String::new(),
-        Some(root) => {
-            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
-            let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-            format!(
-                "-{:02x}{:02x}{:02x}{:02x}",
-                digest[0], digest[1], digest[2], digest[3]
-            )
-        }
-    }
-}
-
 /// Prefer the runtime dir, fall back to the config dir — but only while the
 /// choice can still hold a full-length socket path; otherwise take `short`.
 /// `config_workers`/`short` are thunks so neither is materialized (the config
 /// dir is created as a side effect) unless actually chosen. Factored out and
 /// parameterized on `fits`/`short` so the divert branch is unit-testable on a
 /// host whose real `sun_path` limit wouldn't trip it.
+#[cfg(unix)]
 fn choose_worker_dir(
     runtime_dir: Option<PathBuf>,
     tag: &str,
@@ -144,23 +129,26 @@ fn choose_worker_dir(
 }
 
 /// The longest socket leaf `worker_dir()` ever hosts: `<uuid>.lifecycle.sock`
-/// (`wire::lifecycle_socket_path`). A UUID renders as 36 characters.
+/// (the endpoint module's lifecycle derivation). A UUID renders as 36 characters.
+#[cfg(unix)]
 const LONGEST_SOCKET_LEAF_LEN: usize = 36 + ".lifecycle.sock".len();
 
 /// Usable `sun_path` length: the fixed buffer minus its NUL terminator.
 /// macOS/BSD carry a 104-byte buffer → 103; Linux 108 → 107.
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 const SUN_PATH_STRLEN_MAX: usize = 103;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const SUN_PATH_STRLEN_MAX: usize = 107;
 
 /// Whether `dir/<longest-leaf>` still fits an addressable socket path.
+#[cfg(unix)]
 fn path_fits(dir_len: usize, sun_path_strlen_max: usize) -> bool {
     // dir + '/' + leaf, and the address as a whole still needs its NUL.
     dir_len + 1 + LONGEST_SOCKET_LEAF_LEN <= sun_path_strlen_max
 }
 
 /// Whether every socket `worker_dir()` will bind under `dir` fits `sun_path`.
+#[cfg(unix)]
 fn socket_dir_fits(dir: &std::path::Path) -> bool {
     path_fits(
         dir.as_os_str().as_encoded_bytes().len(),
@@ -174,6 +162,7 @@ fn socket_dir_fits(dir: &std::path::Path) -> bool {
 /// node we don't own — so a hostile `/tmp` entry can't redirect the daemon.
 /// (`std::env::temp_dir()` is deliberately avoided: `$TMPDIR` on macOS is a
 /// ~50-char path that would defeat the whole point.)
+#[cfg(unix)]
 fn short_worker_dir(tag: &str) -> Result<PathBuf> {
     let uid = nix::unistd::Uid::effective().as_raw();
     let base = PathBuf::from("/tmp").join(format!("spawn-{uid}{tag}"));
@@ -182,91 +171,136 @@ fn short_worker_dir(tag: &str) -> Result<PathBuf> {
     Ok(base.join("workers"))
 }
 
-fn socket_path(dir: &std::path::Path, session_id: Uuid) -> PathBuf {
-    dir.join(format!("{session_id}.sock"))
+fn session_endpoint(dir: &std::path::Path, session_id: Uuid) -> Result<endpoint::Endpoint> {
+    endpoint::endpoint_for(dir, &endpoint::config_root_tag(), session_id)
 }
 
 fn log_dir(dir: &std::path::Path, session_id: Uuid) -> PathBuf {
     dir.join(format!("{session_id}.scrollback"))
 }
 
+/// Preserve the explicit worker-directory override as a complete test/operator
+/// fixture. The default Windows layout separates transient endpoint metadata
+/// from encrypted scrollback and detached stderr logs.
+#[cfg(windows)]
+fn windows_log_dir(worker_dir: &std::path::Path, session_id: Uuid) -> Result<PathBuf> {
+    let root = if std::env::var_os("SPAWND_WORKER_DIR").is_some_and(|value| !value.is_empty()) {
+        worker_dir.to_path_buf()
+    } else {
+        crate::service::instance_log_dir(&config::config_dir()?)?.join("workers")
+    };
+    endpoint::ensure_private_dir(&root)?;
+    Ok(log_dir(&root, session_id))
+}
+
 /// Resolve the spawn-worker binary: `$SPAWND_WORKER_BIN` → sibling of the
 /// running spawnd → bare name (PATH).
-fn worker_bin() -> PathBuf {
+pub(crate) fn worker_bin() -> PathBuf {
     if let Some(bin) = std::env::var_os("SPAWND_WORKER_BIN").filter(|v| !v.is_empty()) {
         return PathBuf::from(bin);
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join("spawn-worker");
+            let sibling = dir.join(crate::platform::executable_name("spawn-worker"));
             if sibling.exists() {
                 return sibling;
             }
         }
     }
-    PathBuf::from("spawn-worker")
+    PathBuf::from(crate::platform::executable_name("spawn-worker"))
 }
 
 /// Launch a fresh worker for `session.create` and start the login shell inside it.
 pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
+    crate::update::ensure_worker_pair().await?;
     let dir = worker_dir()?;
-    let socket = socket_path(&dir, spec.session_id);
+    let worker_endpoint = session_endpoint(&dir, spec.session_id)?;
+    #[cfg(unix)]
     let logs = log_dir(&dir, spec.session_id);
-    let reservation = match endpoint::try_reserve(&socket)? {
+    #[cfg(windows)]
+    let logs = windows_log_dir(&dir, spec.session_id)?;
+    let reservation = match endpoint::try_reserve(&worker_endpoint)? {
         LockAttempt::Acquired(lock) => lock,
         LockAttempt::Busy => bail!("worker endpoint is already owned"),
     };
     let bin = worker_bin();
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("--socket")
-        .arg(&socket)
-        .arg("--session-id")
-        .arg(spec.session_id.to_string())
-        .arg("--log-dir")
-        .arg(&logs)
-        .arg("--lock-fd")
-        .arg(reservation.raw_fd().to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit());
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Own process group: the worker (and its session) must not die with
-        // spawnd. Note: under systemd, spawnd's unit needs KillMode=process
-        // for this to survive `systemctl restart` (docs/SESSIOND.md).
-        cmd.process_group(0);
-        let lock_fd = reservation.raw_fd();
-        // Clear CLOEXEC only in the post-fork child. The multithreaded
-        // supervisor never exposes this reservation to unrelated concurrent
-        // child launches.
-        unsafe {
-            cmd.pre_exec(move || {
-                let flags = nix::libc::fcntl(lock_fd, nix::libc::F_GETFD);
-                if flags < 0
-                    || nix::libc::fcntl(lock_fd, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC)
-                        < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    let worker_pid = {
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("--socket")
+            .arg(worker_endpoint.main_arg())
+            .arg("--session-id")
+            .arg(spec.session_id.to_string())
+            .arg("--log-dir")
+            .arg(&logs)
+            .arg("--lock-fd")
+            .arg(reservation.raw_fd().to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        {
+            use std::os::unix::process::CommandExt;
+            // Own process group: the worker (and its session) must not die with
+            // spawnd. Note: under systemd, spawnd's unit needs KillMode=process
+            // for this to survive `systemctl restart` (docs/SESSIOND.md).
+            cmd.process_group(0);
+            let lock_fd = reservation.raw_fd();
+            // SAFETY: Clear CLOEXEC only in the post-fork child. The
+            // multithreaded supervisor never exposes this reservation to
+            // unrelated concurrent child launches.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let flags = nix::libc::fcntl(lock_fd, nix::libc::F_GETFD);
+                    if flags < 0
+                        || nix::libc::fcntl(
+                            lock_fd,
+                            nix::libc::F_SETFD,
+                            flags & !nix::libc::FD_CLOEXEC,
+                        ) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
-    }
-    let child_result = cmd
-        .spawn()
-        .with_context(|| format!("spawning {}", bin.display()));
-    let child = child_result?;
+        let child_result = cmd
+            .spawn()
+            .with_context(|| format!("spawning {}", bin.display()));
+        let child = child_result?;
+        child.id()
+    };
+    #[cfg(windows)]
+    let spawned_worker = {
+        let args = vec![
+            std::ffi::OsString::from("--pipe-name"),
+            worker_endpoint.main_arg().to_os_string(),
+            std::ffi::OsString::from("--session-id"),
+            std::ffi::OsString::from(spec.session_id.to_string()),
+            std::ffi::OsString::from("--log-dir"),
+            logs.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--metadata-dir"),
+            dir.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--reservation-handle"),
+            std::ffi::OsString::from(reservation.raw_value().to_string()),
+        ];
+        endpoint::spawn_worker(&bin, &args, &reservation)
+            .with_context(|| format!("spawning {}", bin.display()))?
+    };
+    #[cfg(windows)]
+    let worker_pid = spawned_worker.pid;
     drop(reservation);
-    tracing::info!(session_id = %spec.session_id, worker_pid = child.id(), "spawned session worker");
+    tracing::info!(session_id = %spec.session_id, worker_pid, "spawned session worker");
     // Move the worker into its per-session CPU scope before the shell spawns
     // (T_START below) so the whole session tree inherits the cgroup.
-    crate::cpu_scopes::enroll_worker(spec.session_id, child.id()).await;
+    crate::cpu_scopes::enroll_worker(spec.session_id, worker_pid).await;
 
-    let mut stream = connect_with_retry(&socket, CONNECT_TIMEOUT)
+    let mut stream = connect_with_retry(&worker_endpoint, CONNECT_TIMEOUT)
         .await
         .context("connecting to session worker")?;
     let hello = read_hello(&mut stream, spec.session_id).await?;
+    #[cfg(windows)]
+    drop(spawned_worker); // Retain the verified process handle through HELLO.
     if hello.state != "awaiting_start" {
         bail!("worker is not available for a new session");
     }
@@ -307,7 +341,7 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
             cwd: started.cwd,
             cols: spec.cols,
             rows: spec.rows,
-            lifecycle_socket: wire::lifecycle_socket_path(&socket),
+            endpoint: worker_endpoint,
             lifecycle_instance: hello.instance_id,
             stream,
         },
@@ -318,7 +352,10 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
 /// Workers never emit the new frame types unsubscribed, so old workers (no
 /// advertisement) and old daemons (no subscription) both stay on the legacy
 /// replay-only flow.
-async fn subscribe_history(stream: &mut UnixStream, hello: &wire::Hello) -> Result<()> {
+async fn subscribe_history(
+    stream: &mut endpoint::SupervisorSideStream,
+    hello: &wire::Hello,
+) -> Result<()> {
     if hello.history {
         wire::write_frame(stream, wire::T_HISTORY_SUB, &[])
             .await
@@ -331,14 +368,14 @@ async fn subscribe_history(stream: &mut UnixStream, hello: &wire::Hello) -> Resu
 /// `Ok(None)` when no live worker socket exists for this session.
 pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
     let dir = worker_dir()?;
-    let socket = socket_path(&dir, session_id);
-    if !socket.exists() {
+    let worker_endpoint = session_endpoint(&dir, session_id)?;
+    if !endpoint::endpoint_exists(&worker_endpoint) {
         return Ok(None);
     }
-    let mut stream = match connect_with_retry(&socket, ADOPT_CONNECT_TIMEOUT).await {
+    let mut stream = match connect_with_retry(&worker_endpoint, ADOPT_CONNECT_TIMEOUT).await {
         Ok(s) => s,
         Err(_) => {
-            cleanup_crashed_worker_endpoints(&socket);
+            cleanup_crashed_worker_endpoints(&worker_endpoint);
             return Ok(None);
         }
     };
@@ -364,7 +401,7 @@ pub async fn adopt(session_id: Uuid) -> Result<Option<pty::Launched>> {
                 .context("worker did not retain its cwd capability root")?,
             cols: hello.cols.max(1),
             rows: hello.rows.max(1),
-            lifecycle_socket: wire::lifecycle_socket_path(&socket),
+            endpoint: worker_endpoint,
             lifecycle_instance: hello.instance_id,
             stream,
         },
@@ -378,7 +415,8 @@ pub fn socket_exists(session_id: Uuid) -> bool {
     let Ok(dir) = worker_dir() else {
         return false;
     };
-    socket_path(&dir, session_id).exists()
+    session_endpoint(&dir, session_id)
+        .is_ok_and(|worker_endpoint| endpoint::endpoint_exists(&worker_endpoint))
 }
 
 /// Session ids with a worker socket present (candidates for adoption).
@@ -386,18 +424,7 @@ pub fn discover_ids() -> Vec<Uuid> {
     let Ok(dir) = worker_dir() else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let stem = name.strip_suffix(".sock")?;
-            Uuid::parse_str(stem).ok()
-        })
-        .collect()
+    endpoint::discover_ids(&dir, &endpoint::config_root_tag())
 }
 
 /// Wire a connected worker stream into the standard per-session plumbing:
@@ -407,9 +434,9 @@ struct WorkerConnection {
     cwd: String,
     cols: u16,
     rows: u16,
-    lifecycle_socket: PathBuf,
+    endpoint: endpoint::Endpoint,
     lifecycle_instance: Uuid,
-    stream: UnixStream,
+    stream: endpoint::SupervisorSideStream,
 }
 
 fn assemble(session_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::Launched {
@@ -417,7 +444,7 @@ fn assemble(session_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::La
         cwd,
         cols,
         rows,
-        lifecycle_socket,
+        endpoint,
         lifecycle_instance,
         stream,
     } = connection;
@@ -428,7 +455,7 @@ fn assemble(session_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::La
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>(pty::WORKER_COMMAND_QUEUE_DEPTH);
     let (exit_tx, exit_rx) = oneshot::channel::<ExitReason>();
 
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, write_half) = endpoint::split_supervisor(stream);
     let pending: PendingReplays = Default::default();
     let alive = Arc::new(AtomicBool::new(true));
 
@@ -453,7 +480,7 @@ fn assemble(session_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::La
         session_id,
         cwd,
         cmd_tx,
-        lifecycle: pty::SessionLifecycle::new(lifecycle_socket, lifecycle_instance),
+        lifecycle: pty::SessionLifecycle::new(endpoint, lifecycle_instance),
         alive,
         cols,
         rows,
@@ -474,7 +501,7 @@ const MAX_PENDING_REPLAYS: usize = 8;
 /// cmd channel → framed writes. Ends when the handle (and its cmd_tx) is
 /// dropped, which also closes the worker connection's write side.
 async fn run_writer(
-    mut write_half: tokio::net::unix::OwnedWriteHalf,
+    mut write_half: endpoint::SupervisorWriteHalf,
     mut cmd_rx: mpsc::Receiver<WorkerCmd>,
     pending: PendingReplays,
     alive: Arc<AtomicBool>,
@@ -540,7 +567,7 @@ fn fail_pending_replays(pending: &PendingReplays) {
 
 /// framed reads → outbox (output), replay responses, exit report.
 async fn run_reader(
-    mut read_half: tokio::net::unix::OwnedReadHalf,
+    mut read_half: endpoint::SupervisorReadHalf,
     outbox_tx: mpsc::Sender<pty::OutputChunk>,
     control: ForwarderControl,
     exit_tx: oneshot::Sender<ExitReason>,
@@ -628,14 +655,12 @@ async fn run_reader(
                     }
                 }
             }
-            Ok(Some((wire::T_FOREGROUND, payload))) => {
-                match wire::decode_foreground(&payload) {
-                    Ok(basename) => control.note_foreground(session_id, basename).await,
-                    Err(error) => {
-                        tracing::warn!(%session_id, %error, "invalid worker foreground frame");
-                    }
+            Ok(Some((wire::T_FOREGROUND, payload))) => match wire::decode_foreground(&payload) {
+                Ok(basename) => control.note_foreground(session_id, basename).await,
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "invalid worker foreground frame");
                 }
-            }
+            },
             Ok(Some((wire::T_EXIT, payload))) => {
                 let payload = Zeroizing::new(payload);
                 let info: wire::ExitInfo = wire::decode_json(&payload).unwrap_or(wire::ExitInfo {
@@ -689,39 +714,24 @@ fn send_replay_result(waiter: ReplayWaiter, result: pty::WorkerReplayResult) {
     let _ = waiter.send(result);
 }
 
-async fn connect_with_retry(socket: &std::path::Path, timeout: Duration) -> Result<UnixStream> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match UnixStream::connect(socket).await {
-            Ok(stream) => {
-                if endpoint::validate_private_socket(socket).is_ok()
-                    && endpoint::validate_stream_peer(&stream).is_ok()
-                {
-                    return Ok(stream);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow!("worker endpoint validation failed"));
-                }
-            }
-            Err(_) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow!("worker endpoint unreachable"));
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+async fn connect_with_retry(
+    worker_endpoint: &endpoint::Endpoint,
+    timeout: Duration,
+) -> Result<endpoint::SupervisorSideStream> {
+    endpoint::connect_main(worker_endpoint, tokio::time::Instant::now() + timeout).await
 }
 
-fn cleanup_crashed_worker_endpoints(socket: &std::path::Path) {
-    let Ok(LockAttempt::Acquired(_lock)) = endpoint::try_reserve(socket) else {
+fn cleanup_crashed_worker_endpoints(worker_endpoint: &endpoint::Endpoint) {
+    let Ok(LockAttempt::Acquired(lock)) = endpoint::try_reserve(worker_endpoint) else {
         return;
     };
-    let _ = endpoint::remove_stale_socket(socket);
-    let _ = endpoint::remove_stale_socket(&wire::lifecycle_socket_path(socket));
+    let _ = endpoint::remove_stale(worker_endpoint, &lock);
 }
 
-async fn read_hello(stream: &mut UnixStream, expected_session_id: Uuid) -> Result<wire::Hello> {
+async fn read_hello(
+    stream: &mut endpoint::SupervisorSideStream,
+    expected_session_id: Uuid,
+) -> Result<wire::Hello> {
     let frame = tokio::time::timeout(
         CONNECT_TIMEOUT,
         wire::read_frame_limited(stream, |frame_type| {
@@ -747,16 +757,17 @@ async fn read_hello(stream: &mut UnixStream, expected_session_id: Uuid) -> Resul
     Ok(hello)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use tokio::net::UnixStream;
 
     #[test]
     fn longest_socket_leaf_tracks_the_real_lifecycle_name() {
         // The length guard is only correct while it matches the actual longest
         // socket the worker binds. A nil UUID gives the canonical 36 chars.
         let socket = std::path::Path::new("/x").join(format!("{}.sock", Uuid::nil()));
-        let leaf = wire::lifecycle_socket_path(&socket);
+        let leaf = socket.with_extension("lifecycle.sock");
         let leaf = leaf.file_name().unwrap().to_string_lossy();
         assert!(leaf.ends_with(".lifecycle.sock"));
         assert_eq!(leaf.len(), LONGEST_SOCKET_LEAF_LEN);
@@ -821,9 +832,9 @@ mod tests {
 
     #[test]
     fn config_root_tag_isolates_distinct_roots_and_is_empty_by_default() {
-        assert_eq!(root_tag_for(None), "");
-        let alice = root_tag_for(Some(std::ffi::OsStr::new("/srv/spawn/alice")));
-        let bob = root_tag_for(Some(std::ffi::OsStr::new("/srv/spawn/bob")));
+        assert_eq!(endpoint::root_tag_for(None), "");
+        let alice = endpoint::root_tag_for(Some(std::ffi::OsStr::new("/srv/spawn/alice")));
+        let bob = endpoint::root_tag_for(Some(std::ffi::OsStr::new("/srv/spawn/bob")));
         assert_ne!(alice, bob);
         assert!(alice.starts_with('-') && alice.len() == 9); // '-' + 8 hex
     }
@@ -865,7 +876,8 @@ mod tests {
     async fn unreachable_endpoint_error_does_not_echo_its_path() {
         let dir = tempfile::tempdir().unwrap();
         let private_name = "private-endpoint-name.sock";
-        let error = connect_with_retry(&dir.path().join(private_name), Duration::from_millis(1))
+        let worker_endpoint = endpoint::endpoint_for(dir.path(), "", Uuid::new_v4()).unwrap();
+        let error = connect_with_retry(&worker_endpoint, Duration::from_millis(1))
             .await
             .unwrap_err()
             .to_string();
@@ -998,7 +1010,7 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe");
         exe.parent()
             .and_then(|deps| deps.parent())
-            .map(|debug| debug.join("spawn-worker"))
+            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
             .expect("worker bin path")
     }
 
@@ -1056,7 +1068,13 @@ mod tests {
         let _env_lock = WORKER_TEST_ENV_LOCK.lock().await;
         let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
         let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
-        let dir = tempfile::tempdir().expect("tempdir");
+        // Keep the explicit override below the smallest Unix `sun_path`
+        // limit; macOS's default TMPDIR is itself long enough to overflow the
+        // lifecycle socket leaf before the test reaches the launch contract.
+        let dir = tempfile::Builder::new()
+            .prefix("spawn-wb-")
+            .tempdir_in("/tmp")
+            .expect("short tempdir");
         std::env::set_var("SPAWND_WORKER_DIR", dir.path());
         std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
 

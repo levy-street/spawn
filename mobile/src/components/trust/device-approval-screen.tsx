@@ -29,6 +29,7 @@ import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
+import { describeDeviceRegistrationFailure } from "@/data/trust/registration";
 import { haptics } from "@/lib/haptics";
 import { fontSize, spacing } from "@/theme";
 
@@ -66,6 +67,10 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
   const accountId = me.data?.user.id;
   const phoneQuery = useRegisteredPhone(accountId);
   const phone = phoneQuery.data;
+  // What actually went wrong: a keychain that refused the key and a server
+  // that refused the device need different things from the reader, and only
+  // one of them is a Try again.
+  const registrationFailure = describeDeviceRegistrationFailure(phoneQuery.error);
   const devicesQuery = useAccountDevices(phoneQuery.isSuccess);
   const endorsements = usePendingEndorsements(accountId ?? "", phone?.id ?? null);
   const approvals = useDeviceHostApprovals(true);
@@ -94,7 +99,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
     mutationFn: (deviceId: string) => requestDeviceApproval(deviceId),
     onError: () =>
       setError(
-        "Could not tell your other devices that this one is waiting. Approve it from one of them, or use a pairing code below.",
+        "Could not tell your other devices that this one is waiting. Approve it from one of them, or connect a host from this phone below.",
       ),
   });
 
@@ -173,7 +178,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
                 ? "You can go back and open a terminal. This screen keeps watching in case that changes."
                 : waiting
                   ? "Open SPAWN D on a device that already works. A prompt is waiting there."
-                  : "A host only answers devices whose key it has pinned, and no other device is registered to vouch for this one. Use a pairing code below."}
+                  : "A host only answers devices whose key it has pinned, and no other device is registered to vouch for this one. Connect a host from this phone below."}
             </Text>
           </View>
         </View>
@@ -188,13 +193,14 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
       {phoneQuery.isError ? (
         <View style={styles.section}>
           <Text accessibilityRole="alert" color="destructive" variant="body">
-            {phoneQuery.error instanceof Error
-              ? `This device could not register its identity: ${phoneQuery.error.message}`
-              : "This device could not register its identity."}
+            {registrationFailure.reason} It cannot approve devices.
+            {registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`}
           </Text>
-          <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
-            Try again
-          </Button>
+          {registrationFailure.canRetry ? (
+            <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
+              Try again
+            </Button>
+          ) : null}
         </View>
       ) : null}
 
@@ -281,11 +287,12 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
           <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
-                Run <Text variant="mono">spawnd login</Text> on the host and enter the code it
-                prints. That approves this device directly, without another one.
+                Possess a host directly: run the command it gives you on that machine, then open the
+                link its terminal prints on this phone — scan the QR it can show, or open the link
+                here. Approving from this phone trusts it without another device.
               </Text>
               <Button onPress={() => router.push("/onboarding/host")} variant="outline">
-                Enter a pairing code
+                Connect a host
               </Button>
             </View>
           </ListBlock>

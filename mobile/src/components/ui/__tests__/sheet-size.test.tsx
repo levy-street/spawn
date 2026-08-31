@@ -1,7 +1,7 @@
 import { render } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 import { Dimensions, Text as NativeText, StyleSheet } from "react-native";
-import { SafeAreaProvider } from "react-native-safe-area-context";
+import { SafeAreaInsetsContext, SafeAreaProvider } from "react-native-safe-area-context";
 
 import { Sheet } from "@/components/ui/sheet";
 import { chrome, ThemeProvider } from "@/theme";
@@ -36,6 +36,18 @@ const METRICS = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
   insets: { top: 47, right: 0, bottom: 34, left: 0 },
 };
+
+// The window's real insets, which a sheet at window level has to be able to
+// reach even when the tree above it says otherwise.
+jest.mock("react-native-safe-area-context", () => ({
+  ...(jest.requireActual(
+    "react-native-safe-area-context",
+  ) as typeof import("react-native-safe-area-context")),
+  initialWindowMetrics: {
+    frame: { x: 0, y: 0, width: 390, height: 844 },
+    insets: { top: 47, right: 0, bottom: 34, left: 0 },
+  },
+}));
 
 function Providers({ children }: PropsWithChildren): React.JSX.Element {
   return (
@@ -77,6 +89,27 @@ describe("Sheet size", () => {
     );
     expect(panel["height"]).toBe(panel["maxHeight"]);
     expect(content["flex"]).toBe(1);
+    await screen.unmount();
+  });
+
+  it("keeps its clearance under a dialog that zeroes the top inset", async () => {
+    // A dialog hands its children `top: 0` — its own header already clears the
+    // status bar. A sheet raised from inside one is not inside it, though: on
+    // iOS it is a window-level overlay, and taking that zero at face value put
+    // a tall sheet's grabber under the clock.
+    const screen = await render(
+      <SafeAreaInsetsContext.Provider value={{ ...METRICS.insets, top: 0 }}>
+        <Sheet onDismiss={jest.fn()} size="tall" visible>
+          <NativeText>Drawer body</NativeText>
+        </Sheet>
+      </SafeAreaInsetsContext.Provider>,
+      { wrapper: Providers },
+    );
+
+    const panel = StyleSheet.flatten(screen.getByTestId("sheet-panel").props["style"]);
+    expect(panel["height"]).toBe(
+      Dimensions.get("window").height - METRICS.insets.top - chrome.sheetTopClearance,
+    );
     await screen.unmount();
   });
 });

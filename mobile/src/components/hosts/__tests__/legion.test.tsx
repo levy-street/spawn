@@ -5,18 +5,22 @@ import {
   offlineHost,
   onlineHost,
   runningSession,
+  windowsHost,
 } from "@/components/hosts/__tests__/fixtures";
 import { CapacityMeter } from "@/components/hosts/capacity-meter";
 import { LegionHostCard } from "@/components/hosts/legion-host-card";
 import { fleetRollup } from "@/data/selectors/host";
 import { ThemeProvider } from "@/theme";
 
+const mockLiveCapacityProbe = jest.fn((_props: unknown) => null);
+
 jest.mock("@/components/hosts/live-capacity-probe", () => ({
-  LiveCapacityProbe: () => null,
+  LiveCapacityProbe: (props: unknown) => mockLiveCapacityProbe(props),
 }));
 
 describe("Legion fleet surface", () => {
   beforeEach(() => {
+    mockLiveCapacityProbe.mockClear();
     jest.spyOn(AccessibilityInfo, "isReduceMotionEnabled").mockResolvedValue(true);
   });
 
@@ -87,5 +91,64 @@ describe("Legion fleet surface", () => {
     expect(screen.getByText("1 live session")).toBeOnTheScreen();
     expect(screen.getByText("1 need you")).toBeOnTheScreen();
     expect(screen.getByText("Codex")).toBeOnTheScreen();
+  });
+
+  test("marks hosts whose daemon is updating", async () => {
+    await render(
+      <ThemeProvider>
+        <LegionHostCard
+          agents={[]}
+          host={{
+            ...onlineHost,
+            update: {
+              state: "updating",
+              latest_version: "2.0.0",
+              error: null,
+              requested_at: "2026-08-25T00:00:00Z",
+            },
+          }}
+          liveEnabled={false}
+          onOpen={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
+
+  test("formats a live Windows host while retaining the generic fleet card", async () => {
+    await render(
+      <ThemeProvider>
+        <LegionHostCard
+          agents={[]}
+          host={windowsHost}
+          liveEnabled={false}
+          onOpen={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Windows · x64")).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Open studio-pc" })).toBeOnTheScreen();
+  });
+
+  test("pauses a live-capacity probe while its card is outside the viewport", async () => {
+    await render(
+      <ThemeProvider>
+        <LegionHostCard
+          agents={[]}
+          host={onlineHost}
+          liveEnabled
+          onOpen={jest.fn()}
+          probeEnabled={false}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(mockLiveCapacityProbe).toHaveBeenCalledWith(
+      expect.objectContaining({ enabled: false, hostId: onlineHost.id }),
+    );
   });
 });

@@ -7,6 +7,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { LegionHostDetail } from "@/components/legion/LegionHostDetail";
 import { CapacityBar, LegionDot, RunningIcons } from "@/components/legion/legion-parts";
 import { SidebarIconSlot, SidebarRowLabel, sidebarRowClass } from "@/components/nav/sidebar-parts";
+import { HostUpdateBadge } from "@/components/release/HostUpdateDialog";
 import { useArmedMotion } from "@/components/ui/armed-motion";
 import { Collapse } from "@/components/ui/collapse";
 import { useHoverIntent } from "@/components/ui/hover-intent";
@@ -280,6 +281,7 @@ function HostRow({
           >
             {row.host.name}
           </span>
+          <HostUpdateBadge host={row.host} />
           {/* What is on the machine, not how much: "2 Claude, 1 Codex" is the
            * thing worth knowing, and a bare 5 was never it. */}
           <RunningIcons running={row.running} fallbackCount={row.live} />

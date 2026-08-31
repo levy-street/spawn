@@ -4,11 +4,15 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { ApiError, type BrowserDevice, browserDevices } from "./api";
 import {
+  adoptBrowserDeviceIdentity,
+  BrowserDeviceIdentityError,
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
   loadBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
+import { takeDesktopDeviceHandover } from "./desktop-device-handover";
+import { CryptoUnavailableError } from "./signed-signal";
 
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
 
@@ -161,7 +165,12 @@ async function registerBrowserDevice(
     allowExplicitBrowserIdentityReplacement(userId, marker.publicKey);
   }
 
-  const identity = await loadOrCreateBrowserDeviceIdentity(userId);
+  // Inside the desktop app's window this page IS the app's device: the app
+  // leaves its identity on the way in, and it replaces whatever this page
+  // minted for itself before (desktop-device-handover.ts).
+  const carried = takeDesktopDeviceHandover(userId);
+  const adopted = carried === null ? null : await adoptBrowserDeviceIdentity(userId, carried);
+  const identity = adopted?.identity ?? (await loadOrCreateBrowserDeviceIdentity(userId));
   const signature = await createBrowserDeviceRegistrationProof(identity, userId);
   let device: BrowserDevice;
   try {
@@ -205,13 +214,122 @@ async function registerBrowserDevice(
   ) {
     throw new Error("browser registration response did not match the submitted active key");
   }
+  if (adopted?.replacedPublicKeyWire) {
+    void retireSupersededDevice(adopted.replacedPublicKeyWire, device.id);
+  }
   return { status: "ready", device, publicKey: identity.publicKeyWire };
+}
+
+/**
+ * Revoke the roster row of the key this page just stopped being: a device
+ * nobody can use any more, which would otherwise sit in every roster as a
+ * stranger waiting to be approved. Best effort — the row is cosmetic once
+ * its key is gone from here — and never the account root, which only a
+ * passkey ceremony may replace.
+ */
+async function retireSupersededDevice(publicKey: string, revokedByDeviceId: string): Promise<void> {
+  try {
+    const rows = await browserDevices.list();
+    const row = rows.find(
+      (device) => device.public_key === publicKey && device.revoked_at === null,
+    );
+    if (row === undefined || row.is_root) return;
+    await browserDevices.revoke(row.id, publicKey, revokedByDeviceId);
+  } catch (cause) {
+    console.warn(
+      "spawn: the device this page used to be could not be retired:",
+      cause instanceof Error ? cause.message : cause,
+    );
+  }
 }
 
 export function browserIdentityConnectionsAllowed(
   state: BrowserDeviceRegistrationState | undefined,
 ): boolean {
   return state?.status === "ready";
+}
+
+/**
+ * Why registration failed, said in a way the reader can do something about.
+ *
+ * Every failure used to read the same line — registration failed, reload to
+ * retry — which is true of a dropped request and a flat lie about a browser
+ * that cannot make the key at all, or a saved key that has become unreadable.
+ * Reloading those runs the same code into the same wall for ever, and the one
+ * sentence on screen is the only place a reader can learn otherwise.
+ *
+ * The cause is separated from the remedy so each surface can put its own
+ * consequence between them, and `canRetry` says whether running registration
+ * again could plausibly land differently.
+ */
+export interface BrowserDeviceRegistrationFailure {
+  /** What went wrong, as a complete sentence. */
+  readonly reason: string;
+  /** What would change it, where anything the reader controls would. */
+  readonly remedy: string | null;
+  /** Whether registering again could succeed without the reader doing anything. */
+  readonly canRetry: boolean;
+}
+
+export function describeBrowserDeviceRegistrationFailure(
+  error: unknown,
+): BrowserDeviceRegistrationFailure {
+  if (error instanceof CryptoUnavailableError) {
+    return {
+      reason: "This browser cannot create the Ed25519 key SPAWN D signs with.",
+      remedy: "A current Chrome, Safari, Edge or Firefox can.",
+      canRetry: false,
+    };
+  }
+  if (error instanceof BrowserDeviceIdentityError) {
+    switch (error.code) {
+      case "storage_unavailable":
+        return {
+          reason: "This browser has nowhere to keep SPAWN D's key.",
+          remedy: "A private window, or site data turned off for this site, does that.",
+          canRetry: false,
+        };
+      case "storage_failure":
+        return {
+          reason: "This browser could not save SPAWN D's key.",
+          remedy: null,
+          canRetry: true,
+        };
+      case "corrupt_record":
+        return {
+          reason: "The key this browser saved for SPAWN D is unreadable.",
+          remedy: "Clearing this site's data lets it mint a new one.",
+          canRetry: false,
+        };
+      case "capacity_exceeded":
+        return {
+          reason: "This browser is holding keys for too many accounts.",
+          remedy: "Clearing this site's data lets it mint a new one.",
+          canRetry: false,
+        };
+      case "invalid_account":
+      case "key_mismatch":
+        return {
+          reason: "The key this browser holds does not belong to this account.",
+          remedy: null,
+          canRetry: false,
+        };
+    }
+  }
+  if (error instanceof ApiError) {
+    return {
+      reason: `The server refused this browser's identity: ${error.message}`,
+      remedy: null,
+      // A refusal on the merits stays a refusal; only an overloaded or broken
+      // server is worth asking again.
+      canRetry: error.status >= 500 || error.status === 429,
+    };
+  }
+  return {
+    reason: "This browser's identity could not be registered.",
+    remedy: null,
+    canRetry: true,
+  };
 }
 
 export function browserDeviceRegistrationQueryKey(userId: string) {

@@ -36,10 +36,10 @@ export interface AlertEvent {
  * looking at, which is not the device it happened on. They are a separate
  * frame `type` so the alert validation below stays exactly as narrow.
  */
-export type TrustEventKind = "device.approval_requested" | "device.approval_resolved";
+export type DeviceTrustEventKind = "device.approval_requested" | "device.approval_resolved";
 
-export interface TrustEvent {
-  event: TrustEventKind;
+export interface DeviceTrustEvent {
+  event: DeviceTrustEventKind;
   request_id: string;
   browser_device_id: string;
   label: string | null;
@@ -49,20 +49,68 @@ export interface TrustEvent {
   at: string;
 }
 
+export interface HostPinUndeliveredEvent {
+  event: "host.pin_undelivered";
+  host_id: string;
+  browser_device_id: string;
+  reason: "pin_limit" | "invalid_chain" | "other";
+  at: string;
+}
+
+export type TrustEvent = DeviceTrustEvent | HostPinUndeliveredEvent;
+
+/**
+ * A data-changed frame: some resource this account can see was written, by
+ * any client or by a daemon. Content-free on purpose — the frame says what
+ * *kind* of thing changed and the reader refetches what it already knows how
+ * to fetch, so the socket's content discipline holds. `origin` echoes the
+ * mutating client's `X-Spawn-Client` id, letting that client skip the
+ * refetch it would only race with its own optimistic write.
+ */
+export interface DataEvent {
+  resource: string;
+  id: string | null;
+  origin: string | null;
+  at: string;
+}
+
 /** Frames the socket can deliver. `alerts.ping` is an idle keepalive. */
 export type AlertFrame =
   | ({ type: "alert" } & AlertEvent)
   | ({ type: "trust" } & TrustEvent)
+  | ({ type: "data" } & DataEvent)
   | { type: "alerts.ping" };
 
 const TRUST_EVENT_KINDS = new Set<string>([
   "device.approval_requested",
   "device.approval_resolved",
+  "host.pin_undelivered",
 ]);
 
 function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
   const event = record.event;
   if (typeof event !== "string" || !TRUST_EVENT_KINDS.has(event)) return null;
+  if (event === "host.pin_undelivered") {
+    if (
+      typeof record.host_id !== "string" ||
+      !record.host_id ||
+      typeof record.browser_device_id !== "string" ||
+      !record.browser_device_id ||
+      (record.reason !== "pin_limit" &&
+        record.reason !== "invalid_chain" &&
+        record.reason !== "other")
+    ) {
+      return null;
+    }
+    return {
+      type: "trust",
+      event,
+      host_id: record.host_id,
+      browser_device_id: record.browser_device_id,
+      reason: record.reason,
+      at: typeof record.at === "string" ? record.at : "",
+    };
+  }
   const requestId = record.request_id;
   const deviceId = record.browser_device_id;
   if (typeof requestId !== "string" || !requestId) return null;
@@ -70,12 +118,30 @@ function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
   const status = record.status;
   return {
     type: "trust",
-    event: event as TrustEventKind,
+    event: event as DeviceTrustEventKind,
     request_id: requestId,
     browser_device_id: deviceId,
     label: typeof record.label === "string" ? record.label : null,
     fingerprint: typeof record.fingerprint === "string" ? record.fingerprint : null,
     status: status === "approved" || status === "denied" ? status : null,
+    at: typeof record.at === "string" ? record.at : "",
+  };
+}
+
+function parseDataFrame(record: Record<string, unknown>): AlertFrame | null {
+  const resource = record.resource;
+  // The resource is matched against the reader's own map, not a list here:
+  // an unknown one is a future server talking, and it costs nothing.
+  if (typeof resource !== "string" || !resource || resource.length > 64) return null;
+  const id = record.id;
+  if (id != null && (typeof id !== "string" || id.length > 64)) return null;
+  const origin = record.origin;
+  if (origin != null && (typeof origin !== "string" || origin.length > 64)) return null;
+  return {
+    type: "data",
+    resource,
+    id: id ?? null,
+    origin: origin ?? null,
     at: typeof record.at === "string" ? record.at : "",
   };
 }
@@ -98,6 +164,7 @@ export function parseAlertFrame(raw: string): AlertFrame | null {
   const frame = parsed as Record<string, unknown>;
   if (frame.type === "alerts.ping") return { type: "alerts.ping" };
   if (frame.type === "trust") return parseTrustFrame(frame);
+  if (frame.type === "data") return parseDataFrame(frame);
   if (frame.type !== "alert") return null;
   if (typeof frame.event !== "string" || !EVENT_KINDS.has(frame.event)) return null;
   if (typeof frame.session_id !== "string" || !frame.session_id) return null;

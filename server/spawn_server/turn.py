@@ -16,10 +16,23 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
+import json
+import logging
+import re
 import time
 from typing import Any
 
 from .config import Settings
+
+log = logging.getLogger("spawn.turn")
+
+_ICE_URL = re.compile(
+    r"\A(?P<scheme>stun|stuns|turn|turns):"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)"
+    r"(?::(?P<port>[0-9]{1,5}))?"
+    r"(?:\?transport=(?P<transport>udp|tcp))?\Z"
+)
 
 
 def mint_turn_credential(secret: str, *, label: str, ttl_seconds: int) -> tuple[str, str]:
@@ -39,3 +52,98 @@ def ice_servers_for_session(settings: Settings, *, label: str) -> list[dict[str,
         )
         servers.append({"urls": urls, "username": username, "credential": credential})
     return servers
+
+
+def _urls_of(server: dict[str, Any]) -> list[str]:
+    raw = server.get("urls")
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [value for value in raw if isinstance(value, str)]
+    return []
+
+
+def ice_transport_policy(ice_servers: list[dict[str, Any]]) -> str:
+    """``"relay"`` when the only way out is the TURN relay.
+
+    Configuring nothing but TURN servers is how an operator says "every peer
+    goes through the relay" — there is no direct path to offer. Every channel
+    reads it from here so the answer cannot differ between the terminal, the
+    host control channel, and the daemon.
+    """
+    urls = [url for server in ice_servers for url in _urls_of(server)]
+    relay_only = bool(urls) and all(url.startswith(("turn:", "turns:")) for url in urls)
+    return "relay" if relay_only else "all"
+
+
+def validate_ice_url(value: object) -> str:
+    """Return one validated STUN/TURN URL or raise a configuration error."""
+
+    if not isinstance(value, str):
+        raise ValueError("ICE URL must be a string")
+    match = _ICE_URL.fullmatch(value)
+    if match is None:
+        raise ValueError(f"malformed ICE URL: {value!r}")
+    host = match.group("host")
+    if host.startswith("["):
+        try:
+            parsed = ipaddress.ip_address(host[1:-1])
+        except ValueError as exc:
+            raise ValueError(f"malformed ICE URL host: {value!r}") from exc
+        if parsed.version != 6:
+            raise ValueError(f"bracketed ICE URL host is not IPv6: {value!r}")
+    elif all(character.isdigit() or character == "." for character in host):
+        try:
+            parsed = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError(f"malformed ICE URL IPv4 host: {value!r}") from exc
+        if parsed.version != 4:
+            raise ValueError(f"ICE URL host is not IPv4: {value!r}")
+    else:
+        for label in host.split("."):
+            if not label or len(label) > 63 or not label[0].isalnum() or not label[-1].isalnum():
+                raise ValueError(f"malformed ICE URL hostname: {value!r}")
+    port = match.group("port")
+    if port is not None and not (1 <= int(port) <= 65535):
+        raise ValueError(f"ICE URL port is out of range: {value!r}")
+    return value
+
+
+def validate_ice_config(settings: Settings) -> list[str]:
+    """Validate every configured URL and return the credential-free URL list."""
+
+    try:
+        static_raw = json.loads(settings.webrtc_ice_servers)
+    except json.JSONDecodeError as exc:
+        raise ValueError("SPAWN_WEBRTC_ICE_SERVERS must be valid JSON") from exc
+    if not isinstance(static_raw, list):
+        raise ValueError("SPAWN_WEBRTC_ICE_SERVERS must be a JSON array")
+
+    urls: list[str] = []
+    for index, server in enumerate(static_raw):
+        if not isinstance(server, dict):
+            raise ValueError(f"ICE server {index} must be an object")
+        raw_urls = server.get("urls")
+        candidates = [raw_urls] if isinstance(raw_urls, str) else raw_urls
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(f"ICE server {index} must have one or more URLs")
+        for candidate in candidates:
+            urls.append(validate_ice_url(candidate))
+    for candidate in settings.turn_url_list:
+        urls.append(validate_ice_url(candidate))
+    return urls
+
+
+def validate_and_log_ice_config(settings: Settings) -> None:
+    """Startup guard and one credential-free operational summary."""
+
+    urls = validate_ice_config(settings)
+    policy = ice_transport_policy(ice_servers_for_session(settings, label="startup"))
+    log.info("effective WebRTC ICE URLs=%s policy=%s", urls, policy)
+    turn_urls = [url for url in urls if url.startswith(("turn:", "turns:"))]
+    if turn_urls and not any(
+        match is not None and match.group("scheme") == "turn" and match.group("transport") != "tcp"
+        for value in turn_urls
+        if (match := _ICE_URL.fullmatch(value)) is not None
+    ):
+        log.warning("TURN is configured without a UDP turn: URL; daemon relay is unavailable")

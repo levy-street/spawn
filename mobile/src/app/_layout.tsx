@@ -9,6 +9,7 @@ import { useCallback, useEffect } from "react";
 import { AlertPresenter } from "@/components/alerts/alert-presenter";
 import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
 import { useCardAnimation } from "@/components/nav/navigation-reset";
+import { HostUpdateNotifier } from "@/components/release/host-update-notifier";
 import { useToast } from "@/components/ui/toast";
 import { authToken } from "@/data/api/auth-token";
 import { AuthGate } from "@/lib/auth-gate";
@@ -20,6 +21,7 @@ import {
   takePendingAuthenticatedLink,
 } from "@/lib/linking";
 import { AppProviders } from "@/lib/providers";
+import { SessionRenewal } from "@/lib/session-renewal";
 import { useTheme } from "@/theme";
 
 void SplashScreen.preventAutoHideAsync();
@@ -104,7 +106,9 @@ function RootNavigator(): React.JSX.Element {
       />
       <IncomingLinkCoordinator />
       <AuthGate>
+        <SessionRenewal />
         <AlertPresenter />
+        <HostUpdateNotifier />
         <Stack
           screenOptions={{
             ...ROOT_CARD_OPTIONS,

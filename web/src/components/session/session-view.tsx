@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
 import { ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";

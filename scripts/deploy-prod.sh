@@ -33,11 +33,28 @@ Environment:
                           Set to 0 to only pull and restart.
   SPAWN_DEPLOY_WEB_ORIGIN Origin the post-deploy smoke check probes on the
                           host. Default: derived from web/package.json.
+  SPAWN_DEPLOY_PUBLIC_ORIGIN
+                          Public nginx origin used for the WebSocket upgrade
+                          smoke check. Default: https://spawnd.dev.
   SPAWN_DEPLOY_SMOKE      Post-deploy smoke check. Default: 1. Set to 0 only
                           when the host has no proxied /healthz to probe.
   SPAWN_DEPLOY_SMOKE_ATTEMPTS
                           Probes before the smoke check gives up (2s apart).
                           Default: 20.
+  SPAWN_DEPLOY_MOBILE     Publish the mobile OTA when mobile/ changed.
+                          Default: 1. Set to 0 to print the command instead.
+  SPAWN_DEPLOY_MOBILE_CHANNEL
+                          EAS channel for that OTA. Inferred as `production`
+                          only for master deploys of https://spawnd.dev; any
+                          other origin must name it, because publishing a dev
+                          build to the production channel reaches every phone.
+  SPAWN_DEPLOY_PREBUILTS Publish the verified prebuilt-latest binaries and
+                          manifest. Default: 1. Set to 0 only as an explicit
+                          emergency override; daemons will not auto-update.
+  SPAWN_RELEASE_SIGNING_KEY
+                          Ed25519 seed used to sign daemon manifests. Default:
+                          ~/.config/spawn/release-signing.key. Required when
+                          prebuilts are published; never copied to the host.
 
 The proxy target:
 
@@ -68,6 +85,20 @@ quote_env() {
   local value="$2"
   printf '%s=%q ' "$name" "$value"
 }
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=release-lib.sh
+source "$script_dir/release-lib.sh"
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  [[ "$#" -eq 1 ]] || die "--self-test takes no other arguments"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required for --self-test"
+  command -v uv >/dev/null 2>&1 || die "uv is required for --self-test"
+  release_contract_self_test || die "release contract self-test failed"
+  "$script_dir/health-check.sh" --self-test || die "connection probe self-test failed"
+  printf 'deploy-prod: self-test ok\n'
+  exit 0
+fi
 
 host=""
 proxy_target_flag=""
@@ -110,6 +141,9 @@ host="${host:-${SPAWN_DEPLOY_HOST:-}}"
 
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v uv >/dev/null 2>&1 || die "uv is required"
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside the spawn repo"
 cd "$repo_root"
@@ -183,38 +217,87 @@ api_proxy_target="${api_proxy_target%/}"
 smoke="${SPAWN_DEPLOY_SMOKE:-1}"
 smoke_attempts="${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"
 web_origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
+public_origin="${SPAWN_DEPLOY_PUBLIC_ORIGIN:-https://spawnd.dev}"
 
-# A rolling prebuilt may lag master when its workflow is cancelled or cannot
-# start. That is harmless only while daemon/ is unchanged: otherwise the
-# installer hands out a client for a different control protocol than the server
-# being deployed. Compare trees rather than commit IDs so web/server-only
-# commits do not unnecessarily block a release.
-prebuilt_manifest_matches_daemon() {
-  local manifest="$1"
-  local target_ref="$2"
-  local prebuilt_commit
-
-  [[ -f "$manifest" ]] || return 1
-  IFS= read -r prebuilt_commit < "$manifest"
-  [[ "$prebuilt_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
-  git cat-file -e "$prebuilt_commit^{commit}" 2>/dev/null || return 1
-  git diff --quiet "$prebuilt_commit" "$target_ref" -- daemon
+prebuilt_tmp="$(mktemp -d)"
+cleanup_prebuilt_tmp() {
+  rm -rf -- "$prebuilt_tmp"
 }
+trap cleanup_prebuilt_tmp EXIT
 
-# Fail before touching production when a reachable release is known stale.
-# An unavailable release remains best-effort as before; the installer can use
-# its source-build fallback. Re-check after deployment too, because the rolling
-# release can move between this preflight and publication.
-if [[ "${SPAWN_DEPLOY_PREBUILTS:-1}" == "1" ]] && command -v gh >/dev/null 2>&1; then
-  preflight_tmp="$(mktemp -d)"
-  if gh release download prebuilt-latest --repo levy-street/spawn \
-    --pattern COMMIT --dir "$preflight_tmp" --clobber >/dev/null 2>&1; then
-    if ! prebuilt_manifest_matches_daemon "$preflight_tmp/COMMIT" "$remote_ref"; then
-      rm -rf "$preflight_tmp"
-      die "prebuilt-latest was built from a different daemon tree; wait for the prebuilt workflow or set SPAWN_DEPLOY_PREBUILTS=0 and remove incompatible hosted prebuilts"
+prebuilt_ready=0
+prebuilt_stale=0
+prebuilt_reason="not checked"
+release_commit=""
+release_tree=""
+release_version=""
+release_counter=""
+release_public_key=""
+release_key_id=""
+release_signing_key_file="$(release_signing_key_path)"
+prebuilt_entries=()
+
+target_commit="$(git rev-parse "$remote_ref")"
+target_tree="$(git rev-parse "$remote_ref:daemon")"
+host_probe_env="$(quote_env SPAWN_DEPLOY_PATH "$remote_path")"
+host_current_commit="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
+set -euo pipefail
+cd "$SPAWN_DEPLOY_PATH"
+git rev-parse HEAD
+REMOTE
+)" || die "could not read the production checkout before deployment"
+host_manifest_json="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
+set -euo pipefail
+cat "$SPAWN_DEPLOY_PATH/daemon/target/prebuilt/manifest.json" 2>/dev/null || true
+REMOTE
+)" || die "could not read the production prebuilt manifest before deployment"
+host_manifest_tree="$(manifest_tree_from_json "$host_manifest_json" 2>/dev/null || true)"
+
+prebuilt_setting="${SPAWN_DEPLOY_PREBUILTS:-1}"
+[[ "$prebuilt_setting" == "0" || "$prebuilt_setting" == "1" ]] ||
+  die "SPAWN_DEPLOY_PREBUILTS must be 0 or 1"
+prebuilt_override=0
+if [[ "$prebuilt_setting" == "0" ]]; then
+  prebuilt_override=1
+  printf '%s\n' \
+    'deploy-prod: WARNING: SPAWN_DEPLOY_PREBUILTS=0 overrides the daemon release gate.' \
+    'deploy-prod: WARNING: daemons will refuse unsigned manifests.' \
+    'deploy-prod: WARNING: daemons will not auto-update; users may need to reinstall SPAWN D.' >&2
+else
+  prepare_prebuilt_release
+  if [[ "$prebuilt_ready" == "1" ]]; then
+    if ! release_signing_key_readable "$release_signing_key_file"; then
+      prebuilt_ready=0
+      prebuilt_reason="release signing key is missing or unreadable: $release_signing_key_file"
+    elif ! release_public_key="$(release_signing_public_key "$release_signing_key_file")"; then
+      prebuilt_ready=0
+      prebuilt_reason="release signing key is invalid: $release_signing_key_file"
+    elif ! release_key_id="$(release_signing_key_id "$release_public_key")"; then
+      prebuilt_ready=0
+      prebuilt_reason="could not derive the release signing key id"
+    elif ! release_counter="$(release_counter_for_commit "$release_commit")"; then
+      prebuilt_ready=0
+      prebuilt_reason="could not derive the release counter for $release_commit"
     fi
   fi
-  rm -rf "$preflight_tmp"
+  if [[ "$prebuilt_stale" == "1" ]]; then
+    die "$prebuilt_reason; wait for the prebuilt workflow. To override only in an emergency, set SPAWN_DEPLOY_PREBUILTS=0; daemons will not auto-update and users must reinstall with curl -fsSL https://spawnd.dev/install.sh | sh (Unix) or irm https://spawnd.dev/install.ps1 | iex (PowerShell)"
+  fi
+fi
+
+if tree_changed_but_cannot_publish \
+  "$host_manifest_tree" "$target_tree" "$prebuilt_ready" "$prebuilt_override"; then
+  die "daemon tree changes from ${host_manifest_tree:-<no production manifest>} to $target_tree, but prebuilts cannot be published: $prebuilt_reason.
+  Wait for prebuilt-latest to contain verified COMMIT, TREE, VERSION, and
+  SHA256SUMS assets, or use SPAWN_DEPLOY_PREBUILTS=0 only as an emergency
+  override. Without prebuilts, daemons cannot auto-update; users must reinstall:
+    curl -fsSL https://spawnd.dev/install.sh | sh
+    irm https://spawnd.dev/install.ps1 | iex"
+fi
+
+if [[ "$prebuilt_setting" == "1" && "$prebuilt_ready" != "1" ]]; then
+  printf 'deploy-prod: prebuilt publish unavailable (%s); daemon tree is unchanged, continuing\n' \
+    "$prebuilt_reason" >&2
 fi
 
 printf 'deploy-prod: deploying %s to %s:%s\n' "$remote_ref" "$host" "$remote_path"
@@ -231,6 +314,7 @@ env_prefix="$(
   quote_env SPAWN_DEPLOY_SMOKE "$smoke"
   quote_env SPAWN_DEPLOY_SMOKE_ATTEMPTS "$smoke_attempts"
   quote_env SPAWN_DEPLOY_WEB_ORIGIN "$web_origin"
+  quote_env SPAWN_DEPLOY_PUBLIC_ORIGIN "$public_origin"
 )"
 
 ssh "$host" "${env_prefix}bash -se" <<'REMOTE'
@@ -339,95 +423,233 @@ done
 
 # A unit that is "active" only means the process is up. /healthz is served by
 # the API and reached THROUGH the web app's rewrite, so a 200 here is the one
-# check that exercises the whole chain the browser uses -- nginx aside -- and
-# the only one that would have caught the 2026-08-24 dead-port build.
-if [[ "${SPAWN_DEPLOY_SMOKE:-1}" != "0" ]] && command -v curl >/dev/null 2>&1; then
-  origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
-  if [[ -z "$origin" ]]; then
-    # Whatever port the start script binds is the port to probe, so read it
-    # from there rather than hardcoding a second copy that can drift.
-    web_port="$(grep -o -- '-p [0-9]\{2,\}' web/package.json | head -1 | grep -o '[0-9]\{2,\}' || true)"
-    origin="http://127.0.0.1:${web_port:-3000}"
-  fi
-  code=""
-  for _ in $(seq 1 "${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$origin/healthz" || true)"
-    [[ "$code" == "200" ]] && break
-    sleep 2
-  done
-  if [[ "$code" != "200" ]]; then
-    die "post-deploy smoke check failed: GET $origin/healthz returned ${code:-no response}.
+# check that exercises the HTTP chain the browser uses -- nginx aside -- and
+# the only one that would have caught the 2026-08-24 dead-port build. The
+# anonymous WebSocket probe that follows crosses public nginx as well.
+if [[ "${SPAWN_DEPLOY_SMOKE:-1}" != "0" ]]; then
+  if command -v curl >/dev/null 2>&1; then
+    origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
+    if [[ -z "$origin" ]]; then
+      # Whatever port the start script binds is the port to probe, so read it
+      # from there rather than hardcoding a second copy that can drift.
+      web_port="$(grep -o -- '-p [0-9]\{2,\}' web/package.json | head -1 | grep -o '[0-9]\{2,\}' || true)"
+      origin="http://127.0.0.1:${web_port:-3000}"
+    fi
+    code=""
+    for _ in $(seq 1 "${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"); do
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$origin/healthz" || true)"
+      [[ "$code" == "200" ]] && break
+      sleep 2
+    done
+    if [[ "$code" != "200" ]]; then
+      die "post-deploy smoke check failed: GET $origin/healthz returned ${code:-no response}.
   /healthz is proxied to the API, so this usually means the web app is pointed
   at the wrong API target or the API did not come back up. The services HAVE
   been restarted. Roll back with:
     cd $SPAWN_DEPLOY_PATH && git checkout -B $SPAWN_DEPLOY_BRANCH $old_rev
   then re-run the deploy once the cause is fixed.
   Set SPAWN_DEPLOY_SMOKE=0 if this host genuinely has no proxied /healthz."
+    fi
+    printf 'remote deploy: smoke check ok (%s/healthz -> 200)\n' "$origin"
+  else
+    printf 'remote deploy: WARNING: curl unavailable; HTTP smoke probe skipped\n' >&2
   fi
-  printf 'remote deploy: smoke check ok (%s/healthz -> 200)\n' "$origin"
+
+  if [[ -x scripts/health-check.sh ]]; then
+    if ! scripts/health-check.sh --probe-websocket \
+      "${SPAWN_DEPLOY_PUBLIC_ORIGIN:-https://spawnd.dev}"; then
+      die "post-deploy WebSocket smoke check failed through ${SPAWN_DEPLOY_PUBLIC_ORIGIN:-https://spawnd.dev}.
+  The services HAVE been restarted. Check nginx's /ws/ upgrade headers and
+  Next's API proxy target, then roll back if the public socket cannot upgrade."
+    fi
+  else
+    # Older checkouts and deliberately minimal test hosts do not have the new
+    # probe. This is feature detection for a deployment peer that predates it.
+    printf 'remote deploy: WARNING: scripts/health-check.sh unavailable; WebSocket smoke probe skipped\n' >&2
+  fi
 fi
 
-printf 'remote deploy: complete\n'
+printf 'remote deploy: services updated\n'
 REMOTE
 
-# Publish CI-built prebuilt daemon binaries to the host. Every supported target
-# is built + checksummed by CI (.github/workflows/prebuilt.yml) into the rolling
-# `prebuilt-latest` release; we pull it HERE — the deploy invoker is already
-# GitHub-authed, so prod needs no gh/token — verify it against SHA256SUMS, and
-# scp the bytes into the server's prebuilt dir. The server serves prebuilts over
-# the source-build fallback, so what CI built is exactly what prod hands out
-# (verify with scripts/verify-prebuilts.sh). Best-effort: a miss leaves the
-# from-source fallback intact, and the server reads prebuilts live (no restart).
-#
-# Map of install.py's friendly target name -> release-asset triple. The prebuilt
-# dir uses the friendly name; the release assets use the triple.
-PREBUILT_TARGETS=(
-  "darwin-aarch64:aarch64-apple-darwin"
-  "darwin-x86_64:x86_64-apple-darwin"
-  "linux-x86_64:x86_64-unknown-linux-gnu"
-  "linux-aarch64:aarch64-unknown-linux-gnu"
-)
+# Publish the exact release snapshot verified before deployment. Binaries land
+# through temporary names. The manifest and detached signature are copied to
+# temporary paths and renamed atomically, with the signature made live last.
+# A reader may briefly see a manifest/signature mismatch, which is safe: the
+# daemon rejects it and retries rather than trusting an unsigned identity.
+prebuilts_published=0
 publish_prebuilts() {
-  if [[ "${SPAWN_DEPLOY_PREBUILTS:-1}" != "1" ]]; then
+  if [[ "$prebuilt_setting" != "1" ]]; then
     printf 'deploy-prod: prebuilt publish disabled (SPAWN_DEPLOY_PREBUILTS=0)\n'
-    return 0
+    return
   fi
-  command -v gh >/dev/null 2>&1 || {
-    printf 'deploy-prod: gh not found locally; skipping prebuilt publish\n'
-    return 0
-  }
-  local tmp
-  tmp="$(mktemp -d)"
-  if ! gh release download prebuilt-latest --repo levy-street/spawn --dir "$tmp" --clobber >/dev/null 2>&1; then
-    printf 'deploy-prod: no prebuilt-latest release; skipping prebuilt publish\n'
-    rm -rf "$tmp"
-    return 0
+  if [[ "$prebuilt_ready" != "1" ]]; then
+    printf 'deploy-prod: prebuilt publish skipped (%s)\n' "$prebuilt_reason"
+    return
   fi
-  if ! (cd "$tmp" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
-    printf 'deploy-prod: prebuilt checksum verification failed; not publishing\n' >&2
-    rm -rf "$tmp"
-    return 0
-  fi
-  if ! prebuilt_manifest_matches_daemon "$tmp/COMMIT" "$remote_ref"; then
-    printf 'deploy-prod: prebuilt-latest moved to an incompatible daemon build; not publishing\n' >&2
-    rm -rf "$tmp"
-    return 1
-  fi
-  local pair target triple dest
+
+  local pair target triple dest spawnd_asset worker_asset
+  local spawnd_name worker_name spawnd_tmp worker_tmp mode
   for pair in "${PREBUILT_TARGETS[@]}"; do
     target="${pair%%:*}"
     triple="${pair##*:}"
     dest="$remote_path/daemon/target/prebuilt/$target"
-    if [[ -f "$tmp/spawnd-$triple" && -f "$tmp/spawn-worker-$triple" ]]; then
+    spawnd_asset="$(prebuilt_asset_name "$target" "$triple" spawnd)"
+    worker_asset="$(prebuilt_asset_name "$target" "$triple" spawn-worker)"
+    spawnd_name="$(prebuilt_installed_name "$target" spawnd)"
+    worker_name="$(prebuilt_installed_name "$target" spawn-worker)"
+    spawnd_tmp="$spawnd_name.tmp"
+    worker_tmp="$worker_name.tmp"
+    mode="$(prebuilt_file_mode "$target")"
+    if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
       ssh "$host" "mkdir -p '$dest'"
-      scp -q "$tmp/spawnd-$triple" "$host:$dest/spawnd"
-      scp -q "$tmp/spawn-worker-$triple" "$host:$dest/spawn-worker"
-      ssh "$host" "chmod 755 '$dest/spawnd' '$dest/spawn-worker'"
+      scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$spawnd_tmp"
+      scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$worker_tmp"
+      ssh "$host" "chmod '$mode' '$dest/$spawnd_tmp' '$dest/$worker_tmp' && mv '$dest/$spawnd_tmp' '$dest/$spawnd_name' && mv '$dest/$worker_tmp' '$dest/$worker_name'"
       printf 'deploy-prod: published %s prebuilt to %s\n' "$target" "$host"
-    else
-      printf 'deploy-prod: no %s binaries in prebuilt-latest; skipping\n' "$target"
     fi
   done
-  rm -rf "$tmp"
+
+  local manifest="$prebuilt_tmp/manifest.json"
+  local signature="$prebuilt_tmp/manifest.json.sig"
+  render_prebuilt_manifest \
+    "$release_commit" "$release_tree" "$release_version" \
+    "$release_counter" "$release_key_id" \
+    "${prebuilt_entries[@]}" > "$manifest" ||
+    die "could not render the verified prebuilt manifest"
+  sign_prebuilt_manifest \
+    "$manifest" "$signature" "$release_signing_key_file" ||
+    die "could not sign the verified prebuilt manifest"
+  local prebuilt_root="$remote_path/daemon/target/prebuilt"
+  ssh "$host" "mkdir -p '$prebuilt_root'"
+  scp -q "$manifest" "$host:$prebuilt_root/manifest.json.tmp"
+  scp -q "$signature" "$host:$prebuilt_root/manifest.json.sig.tmp"
+  ssh "$host" "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json' && mv '$prebuilt_root/manifest.json.sig.tmp' '$prebuilt_root/manifest.json.sig'"
+  prebuilts_published=1
+  printf 'deploy-prod: published signed prebuilt manifest for daemon tree %s (key %s)\n' \
+    "$release_tree" "$release_key_id"
 }
-publish_prebuilts || true
+publish_prebuilts
+
+# Prove that the public origin serves the exact signed pair just published.
+# This checks the nginx -> web -> API route, not merely the files over SSH.
+verify_published_manifest_signature() {
+  local served_manifest="$prebuilt_tmp/served-manifest.json"
+  local served_signature="$prebuilt_tmp/served-manifest.json.sig"
+  local attempt
+  for attempt in $(seq 1 "$smoke_attempts"); do
+    if curl -fsS --max-time 10 "$public_origin/api/install/manifest.json" \
+        -o "$served_manifest" &&
+      curl -fsS --max-time 10 "$public_origin/api/install/manifest.json.sig" \
+        -o "$served_signature" &&
+      cmp -s "$prebuilt_tmp/manifest.json" "$served_manifest" &&
+      verify_prebuilt_manifest_signature \
+        "$served_manifest" "$served_signature" "$release_public_key"; then
+      printf 'deploy-prod: verified public daemon manifest signature at %s (key %s)\n' \
+        "$public_origin" "$release_key_id"
+      return 0
+    fi
+    printf 'deploy-prod: public signed manifest not ready (attempt %s)\n' \
+      "$attempt" >&2
+    [[ "$attempt" == "$smoke_attempts" ]] || sleep 2
+  done
+  return 1
+}
+
+if [[ "$prebuilts_published" == "1" ]] &&
+  ! verify_published_manifest_signature; then
+  die "post-deploy daemon manifest signature proof failed through $public_origin.
+  The services and prebuilt files HAVE been updated. Roll back with:
+    ssh $host \"cd $remote_path && git checkout -B $branch $host_current_commit\"
+  then restore or republish the last known-good signed daemon manifest."
+fi
+
+# Fetch /api/release through the same web origin used by the health probe. This
+# happens after manifest publication because the server discovers prebuilts
+# live, without a restart.
+release_probe_env="$(
+  quote_env SPAWN_DEPLOY_PATH "$remote_path"
+  quote_env SPAWN_DEPLOY_WEB_ORIGIN "$web_origin"
+  quote_env SPAWN_DEPLOY_SMOKE_ATTEMPTS "$smoke_attempts"
+)"
+release_json="$(ssh "$host" "${release_probe_env}bash -se" <<'REMOTE'
+set -euo pipefail
+cd "$SPAWN_DEPLOY_PATH"
+command -v curl >/dev/null 2>&1 || {
+  printf 'remote release proof: curl is required\n' >&2
+  exit 1
+}
+origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
+if [[ -z "$origin" ]]; then
+  web_port="$(grep -o -- '-p [0-9]\{2,\}' web/package.json | head -1 | grep -o '[0-9]\{2,\}' || true)"
+  origin="http://127.0.0.1:${web_port:-3000}"
+fi
+payload=""
+for attempt in $(seq 1 "${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"); do
+  if payload="$(curl -fsS --max-time 5 "$origin/api/release" 2>/dev/null)"; then
+    printf '%s' "$payload"
+    exit 0
+  fi
+  printf 'remote release proof: /api/release not ready (attempt %s)\n' "$attempt" >&2
+  sleep 2
+done
+printf 'remote release proof: could not fetch %s/api/release\n' "$origin" >&2
+exit 1
+REMOTE
+)" || die "post-deploy /api/release fetch failed"
+
+expected_daemon_tree=""
+if [[ "$prebuilts_published" == "1" ]]; then
+  expected_daemon_tree="$target_tree"
+fi
+release_matches_expected "$release_json" "$target_commit" "$expected_daemon_tree" ||
+  die "post-deploy /api/release proof failed"
+printf 'deploy-prod: verified /api/release server.commit=%s' "$target_commit"
+if [[ -n "$expected_daemon_tree" ]]; then
+  printf ' daemon.tree=%s' "$expected_daemon_tree"
+fi
+printf '\n'
+
+# The phone ships with the deploy, not after someone remembers it.
+#
+# This used to print a reminder. A reminder is a step that gets skipped on the
+# release where it mattered, and the failure is silent and asymmetric: phones
+# keep running the JavaScript they were built with, so the two frontends drift
+# apart while everything looks fine. Publishing it here is also the only place
+# the *order* is guaranteed — the server is already up, so the bundle phones
+# fetch is never newer than the API it talks to. A workflow firing on a push to
+# master could not promise that.
+#
+# The channel is never guessed. Publishing a dev build to the production
+# channel would push it to every phone in the field, so an origin this script
+# does not recognise prints the command instead of running it.
+if git cat-file -e "$host_current_commit^{commit}" 2>/dev/null &&
+  ! git diff --quiet "$host_current_commit" "$target_commit" -- mobile; then
+  mobile_channel="${SPAWN_DEPLOY_MOBILE_CHANNEL:-}"
+  if [[ -z "$mobile_channel" && "$public_origin" == "https://spawnd.dev" && "$branch" == "master" ]]; then
+    mobile_channel="production"
+  fi
+  mobile_message="$(git log -1 --format=%s "$target_commit")"
+  mobile_args=(-m "$mobile_message" --api-url "$public_origin" --branch "$mobile_channel")
+  [[ "$branch" == "master" ]] || mobile_args+=(--allow-branch)
+
+  if [[ "${SPAWN_DEPLOY_MOBILE:-1}" == "0" ]]; then
+    printf 'deploy-prod: mobile/ changed; publishing skipped (SPAWN_DEPLOY_MOBILE=0)\n'
+    printf "  scripts/update-mobile-prod.sh %s\n" "${mobile_args[*]}"
+  elif [[ -z "$mobile_channel" ]]; then
+    printf 'deploy-prod: mobile/ changed, but no EAS channel is known for %s.\n' "$public_origin" >&2
+    printf '  Set SPAWN_DEPLOY_MOBILE_CHANNEL, or publish it yourself:\n' >&2
+    printf "    scripts/update-mobile-prod.sh -m %q --api-url %q --branch <channel>\n" \
+      "$mobile_message" "$public_origin" >&2
+  else
+    printf 'deploy-prod: mobile/ changed — publishing the OTA to the %s channel\n' "$mobile_channel"
+    if ! "$repo_root/scripts/update-mobile-prod.sh" "${mobile_args[@]}"; then
+      die "the server and web app ARE deployed, but the mobile OTA failed.
+  Phones are still on the previous bundle, which is the safe half of the split.
+  Publish it once the cause is fixed:
+    scripts/update-mobile-prod.sh ${mobile_args[*]}"
+    fi
+  fi
+fi
+
+printf 'deploy-prod: complete\n'

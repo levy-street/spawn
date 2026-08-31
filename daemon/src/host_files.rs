@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use cap_std::{ambient_authority, fs};
+#[cfg(unix)]
 use rustix::fs::{renameat, renameat_with, RenameFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -504,7 +505,6 @@ impl Drop for HostFileOperationPermit {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum HostOperationKind {
     List,
     Stat,
@@ -516,11 +516,12 @@ pub(crate) enum HostOperationKind {
     WriteCommit,
     ReadRange,
     Preview,
+    #[cfg(target_os = "macos")]
     Desktop,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl HostOperationKind {
+    #[cfg(test)]
     const fn index(self) -> usize {
         self as usize
     }
@@ -617,6 +618,7 @@ pub(crate) struct WriteLifecycleTestHooks {
     publication_send_finished: Notify,
     shutdown_started: Notify,
     shutdown_returned: Notify,
+    write_delay_entered: Notify,
     blocking: [BlockingPause; 11],
     effect_boundary: [BlockingPause; 11],
     temporary_cleanup: BlockingPause,
@@ -750,6 +752,14 @@ impl WriteLifecycleTestHooks {
     pub(crate) fn notify_shutdown_returned(&self) {
         self.shutdown_returned.notify_one();
     }
+
+    pub(crate) fn notify_write_delay_entered(&self) {
+        self.write_delay_entered.notify_one();
+    }
+
+    pub(crate) async fn wait_write_delay_entered(&self) {
+        self.write_delay_entered.notified().await;
+    }
 }
 
 impl HostFileService {
@@ -768,8 +778,12 @@ impl HostFileService {
     fn open_root(root: PathBuf) -> FsResult<Self> {
         // Ambient authority is consumed exactly once to acquire the root
         // capability. All request-time operations use `Dir` handles below.
-        let root_display = std::fs::canonicalize(root)?;
-        let root = Dir::open_ambient_dir(&root_display, ambient_authority())?;
+        let root_capability = std::fs::canonicalize(root)?;
+        let root = Dir::open_ambient_dir(&root_capability, ambient_authority())?;
+        #[cfg(unix)]
+        let root_display = root_capability;
+        #[cfg(windows)]
+        let root_display = windows_wire_path(&root_capability);
         Ok(Self {
             root: Arc::new(root),
             root_display: Arc::new(root_display),
@@ -834,14 +848,15 @@ impl HostFileService {
         let trimmed = input.trim();
         let relative = if trimmed.is_empty() || trimmed == "~" {
             PathBuf::new()
-        } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        } else if let Some(rest) = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+        {
             PathBuf::from(rest)
         } else {
             let path = Path::new(trimmed);
             if path.is_absolute() {
-                path.strip_prefix(self.root_display.as_ref())
-                    .map(Path::to_path_buf)
-                    .map_err(|_| FsError::new("outside_root", "path is outside the home root"))?
+                relative_to_root(self.root_display.as_ref(), path)?
             } else {
                 path.to_path_buf()
             }
@@ -1000,7 +1015,7 @@ impl HostFileService {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn stat(&self, input: &str) -> FsResult<FileStat> {
         self.stat_in_session(
             input,
@@ -1137,6 +1152,21 @@ impl HostFileService {
         }
         let components = self.relative_components(input)?;
         let (parent, name) = self.open_parent(&components)?;
+        #[cfg(windows)]
+        {
+            // Windows refuses a directory opened with ordinary file-read
+            // access before we can classify the resulting handle. Preserve
+            // the endpoint's `not_file` contract with a directory-entry
+            // preflight, then still re-check the opened handle below so a
+            // replacement race cannot make a non-file usable.
+            let metadata = parent.symlink_metadata(&name)?;
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
+            if !metadata.is_file() {
+                return Err(FsError::new("not_file", "path is not a regular file"));
+            }
+        }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let mut file = parent
@@ -1210,9 +1240,15 @@ impl HostFileService {
     ) -> FsResult<RangeReadStream> {
         let service = self.clone();
         let input = input.to_string();
-        self.run_blocking(operations, HostOperationKind::ReadRange, move |operations| {
-            service.open_range_read_sync(&input, offset, length, if_version, &cancelled, operations)
-        })
+        self.run_blocking(
+            operations,
+            HostOperationKind::ReadRange,
+            move |operations| {
+                service.open_range_read_sync(
+                    &input, offset, length, if_version, &cancelled, operations,
+                )
+            },
+        )
         .await
     }
 
@@ -1242,6 +1278,16 @@ impl HostFileService {
         }
         let components = self.relative_components(input)?;
         let (parent, name) = self.open_parent(&components)?;
+        #[cfg(windows)]
+        {
+            let metadata = parent.symlink_metadata(&name)?;
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
+            if !metadata.is_file() {
+                return Err(FsError::new("not_file", "path is not a regular file"));
+            }
+        }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let mut file = parent
@@ -1253,7 +1299,7 @@ impl HostFileService {
             return Err(FsError::new("not_file", "path is not a regular file"));
         }
         let size = metadata.len();
-        let version = file_version(&metadata);
+        let version = file_version(&file)?;
         if let Some(expected) = if_version {
             if expected != version {
                 return Err(FsError::new(
@@ -1298,7 +1344,7 @@ impl HostFileService {
         }
         // A file swapped underneath us between the stat and the hash would
         // otherwise be streamed with a digest describing different bytes.
-        if file_version(&file.metadata()?) != version {
+        if file_version(&file)? != version {
             return Err(FsError::new("file_changed", "file changed while hashing"));
         }
         file.seek(SeekFrom::Start(offset))?;
@@ -1406,7 +1452,10 @@ impl HostFileService {
             let after = rustix::fs::fstat(dir.as_fd())
                 .map_err(|_| FsError::new("io_error", "could not stat the directory"))?;
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
-                return Err(FsError::new("file_changed", "target changed during resolution"));
+                return Err(FsError::new(
+                    "file_changed",
+                    "target changed during resolution",
+                ));
             }
             return Ok(LaunchTarget {
                 display,
@@ -1438,7 +1487,10 @@ impl HostFileService {
         let after = rustix::fs::fstat(file.as_fd())
             .map_err(|_| FsError::new("io_error", "could not stat the file"))?;
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
-            return Err(FsError::new("file_changed", "target changed during resolution"));
+            return Err(FsError::new(
+                "file_changed",
+                "target changed during resolution",
+            ));
         }
 
         let size = before.st_size.max(0) as u64;
@@ -1527,7 +1579,7 @@ impl HostFileService {
                 "file is too large to render a preview for",
             ));
         }
-        let version = file_version(&metadata);
+        let version = file_version(&file)?;
         if let Some(expected) = if_version {
             if expected != version {
                 return Err(FsError::new(
@@ -1541,13 +1593,12 @@ impl HostFileService {
             let filled = read_fully(&mut file, &mut head)?;
             head.truncate(filled);
         }
-        use std::os::unix::fs::MetadataExt;
+        let identity = crate::platform::file_identity(&file)?;
         Ok(PreviewSource {
             parent,
             name: name.clone(),
             file,
-            dev: metadata.dev(),
-            ino: metadata.ino(),
+            identity,
             size,
             head,
             version,
@@ -1559,7 +1610,7 @@ impl HostFileService {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn mkdir(&self, input: &str) -> FsResult<String> {
         self.mkdir_in_session(
             input,
@@ -1663,7 +1714,7 @@ impl HostFileService {
             }
         }
         if overwrite {
-            renameat(&parent, &source_name, &parent, name).map_err(rustix_io_error)?;
+            atomic_rename_replace(&parent, &source_name, name)?;
         } else {
             atomic_rename_noreplace(&parent, &source_name, name)?;
         }
@@ -1925,6 +1976,78 @@ impl HostFileService {
     }
 }
 
+#[cfg(windows)]
+fn windows_wire_path(path: &Path) -> PathBuf {
+    use std::path::Prefix;
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let mut output = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) | Prefix::Disk(drive) => {
+            PathBuf::from(format!("{}:\\", drive as char))
+        }
+        Prefix::VerbatimUNC(server, share) | Prefix::UNC(server, share) => {
+            let mut root = OsString::from(r"\\");
+            root.push(server);
+            root.push("\\");
+            root.push(share);
+            root.push("\\");
+            PathBuf::from(root)
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => output.push(".."),
+            Component::Normal(part) => output.push(part),
+        }
+    }
+    output
+}
+
+fn relative_to_root(root: &Path, candidate: &Path) -> FsResult<PathBuf> {
+    #[cfg(unix)]
+    {
+        candidate
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .map_err(|_| FsError::new("outside_root", "path is outside the home root"))
+    }
+    #[cfg(windows)]
+    {
+        let mut root_parts = root.components();
+        let mut candidate_parts = candidate.components();
+        loop {
+            match (root_parts.next(), candidate_parts.next()) {
+                (Some(left), Some(right))
+                    if left
+                        .as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy()) => {}
+                (None, next) => {
+                    let mut relative = PathBuf::new();
+                    if let Some(next) = next {
+                        relative.push(next.as_os_str());
+                    }
+                    for component in candidate_parts {
+                        relative.push(component.as_os_str());
+                    }
+                    return Ok(relative);
+                }
+                _ => {
+                    return Err(FsError::new(
+                        "outside_root",
+                        "path is outside the home root",
+                    ))
+                }
+            }
+        }
+    }
+}
+
 impl PendingWrite {
     pub async fn append(&mut self, sequence: u64, bytes: &[u8]) -> FsResult<()> {
         if sequence != self.next_sequence {
@@ -2062,22 +2185,18 @@ impl PendingWrite {
                 if metadata.file_type().is_symlink() {
                     Err(symlink_error())
                 } else {
-                    renameat(
+                    atomic_rename_replace(
                         self.parent.as_ref(),
                         &self.temporary_name,
-                        self.parent.as_ref(),
                         &self.destination_name,
                     )
-                    .map_err(rustix_io_error)
                 }
             } else {
-                renameat(
+                atomic_rename_replace(
                     self.parent.as_ref(),
                     &self.temporary_name,
-                    self.parent.as_ref(),
                     &self.destination_name,
                 )
-                .map_err(rustix_io_error)
             }
         } else {
             atomic_rename_noreplace(
@@ -2109,6 +2228,7 @@ impl Drop for PendingWrite {
 }
 
 fn atomic_rename_noreplace(parent: &Dir, source: &OsStr, destination: &OsStr) -> FsResult<()> {
+    #[cfg(unix)]
     match renameat_with(parent, source, parent, destination, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTSUP) => {
@@ -2119,10 +2239,28 @@ fn atomic_rename_noreplace(parent: &Dir, source: &OsStr, destination: &OsStr) ->
         }
         Err(error) => Err(rustix_io_error(error)),
     }
+    #[cfg(windows)]
+    {
+        crate::platform::rename_noreplace_at(parent, Path::new(source), Path::new(destination))
+            .map_err(Into::into)
+    }
 }
 
+#[cfg(unix)]
 fn rustix_io_error(error: rustix::io::Errno) -> FsError {
     std::io::Error::from_raw_os_error(error.raw_os_error()).into()
+}
+
+fn atomic_rename_replace(parent: &Dir, source: &OsStr, destination: &OsStr) -> FsResult<()> {
+    #[cfg(unix)]
+    {
+        renameat(parent, source, parent, destination).map_err(rustix_io_error)
+    }
+    #[cfg(windows)]
+    {
+        crate::platform::durable_replace_at(parent, Path::new(source), Path::new(destination))
+            .map_err(Into::into)
+    }
 }
 
 fn nofollow_error(error: std::io::Error) -> FsError {
@@ -2134,7 +2272,7 @@ fn nofollow_error(error: std::io::Error) -> FsError {
 }
 
 fn sync_directory(directory: &Dir) -> FsResult<()> {
-    directory.open(".")?.into_std().sync_all()?;
+    crate::platform::fsync_dir(directory)?;
     Ok(())
 }
 
@@ -2163,8 +2301,7 @@ pub struct PreviewSource {
     pub parent: Dir,
     pub name: OsString,
     pub file: std::fs::File,
-    pub dev: u64,
-    pub ino: u64,
+    pub identity: crate::platform::FileIdentity,
     pub size: u64,
     pub head: Vec<u8>,
     pub version: String,
@@ -2200,7 +2337,10 @@ fn real_path_of(handle: std::os::fd::BorrowedFd<'_>) -> FsResult<PathBuf> {
         )
     };
     if result == -1 {
-        return Err(FsError::new("io_error", "could not resolve the target path"));
+        return Err(FsError::new(
+            "io_error",
+            "could not resolve the target path",
+        ));
     }
     let end = buffer
         .iter()
@@ -2252,16 +2392,11 @@ fn read_fully(file: &mut std::fs::File, buffer: &mut [u8]) -> FsResult<usize> {
 /// so two same-size in-place rewrites inside a single tick are still
 /// indistinguishable. That window is accepted: it closes on the next change to
 /// the file, and closing it entirely would mean hashing content on every read.
-fn file_version(metadata: &std::fs::Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
+fn file_version(file: &std::fs::File) -> FsResult<String> {
     let mut hasher = Sha256::new();
-    hasher.update(metadata.dev().to_le_bytes());
-    hasher.update(metadata.ino().to_le_bytes());
-    hasher.update(metadata.len().to_le_bytes());
-    hasher.update(metadata.mtime().to_le_bytes());
-    hasher.update(metadata.mtime_nsec().to_le_bytes());
+    hasher.update(crate::platform::file_stamp(file)?.version_bytes());
     let digest = format!("{:x}", hasher.finalize());
-    digest[..16].to_string()
+    Ok(digest[..16].to_string())
 }
 
 fn modified_seconds(metadata: &fs::Metadata) -> Option<i64> {
@@ -2284,7 +2419,28 @@ fn validate_name(name: &str) -> FsResult<()> {
     {
         return Err(FsError::new("invalid_name", "file name is invalid"));
     }
+    #[cfg(windows)]
+    {
+        if name.ends_with(['.', ' '])
+            || name
+                .chars()
+                .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+            || windows_reserved_name(name)
+        {
+            return Err(FsError::new("invalid_name", "file name is invalid"));
+        }
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_reserved_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || base
+            .strip_prefix("COM")
+            .or_else(|| base.strip_prefix("LPT"))
+            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
 
 #[cfg(test)]
@@ -2488,8 +2644,7 @@ mod tests {
         let path = temp.path().join("data.bin");
         let pin_mtime = |nanos: u32| {
             let file = std::fs::File::options().write(true).open(&path).unwrap();
-            let modified =
-                std::time::UNIX_EPOCH + std::time::Duration::new(1_755_000_000, nanos);
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_755_000_000, nanos);
             file.set_times(std::fs::FileTimes::new().set_modified(modified))
                 .unwrap();
         };
@@ -2553,7 +2708,8 @@ mod tests {
         drop(file);
         let service = HostFileService::rooted_at(temp.path()).await.unwrap();
         assert_eq!(
-            service.open_preview_source("huge.bin")
+            service
+                .open_preview_source("huge.bin")
                 .await
                 .map(|_| ())
                 .unwrap_err()
@@ -2571,26 +2727,96 @@ mod tests {
             service.list("../escape", 0).await.unwrap_err().code,
             "traversal_rejected"
         );
+        let rooted_traversal = service.root_display.join("..").join("escape");
         assert_eq!(
             service
-                .list(&format!("{}/../escape", temp.path().display()), 0)
+                .list(rooted_traversal.to_string_lossy().as_ref(), 0)
                 .await
                 .unwrap_err()
                 .code,
             "traversal_rejected"
         );
-        assert_eq!(
-            service.list("/tmp", 0).await.unwrap_err().code,
-            "outside_root"
-        );
         #[cfg(unix)]
         {
+            assert_eq!(
+                service.list("/tmp", 0).await.unwrap_err().code,
+                "outside_root"
+            );
             std::os::unix::fs::symlink("/tmp", temp.path().join("link")).unwrap();
             assert_eq!(
                 service.list("link", 0).await.unwrap_err().code,
                 "symlink_rejected"
             );
         }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                service.list(r"C:\Windows", 0).await.unwrap_err().code,
+                "outside_root"
+            );
+            service
+                .list(service.root_display.to_string_lossy().as_ref(), 0)
+                .await
+                .expect("the canonical advertised root is accepted as absolute input");
+
+            // A junction is a directory reparse point standard users can make
+            // without Developer Mode. Keep this case mandatory even when the
+            // runner cannot create a true directory symlink.
+            let junction = temp.path().join("junction");
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&junction)
+                .arg(temp.path().join("safe"))
+                .status()
+                .expect("cmd.exe must be available on Windows CI");
+            assert!(status.success(), "mklink /J failed with {status}");
+            assert_eq!(
+                service.list("junction", 0).await.unwrap_err().code,
+                "symlink_rejected"
+            );
+
+            let link = temp.path().join("directory-symlink");
+            match std::os::windows::fs::symlink_dir(temp.path().join("safe"), &link) {
+                Ok(()) => assert_eq!(
+                    service.list("directory-symlink", 0).await.unwrap_err().code,
+                    "symlink_rejected"
+                ),
+                Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
+                Err(error) => panic!("creating directory symlink failed unexpectedly: {error}"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_absolute_paths_are_compared_case_insensitively() {
+        assert_eq!(
+            windows_wire_path(Path::new(r"\\?\C:\Users\Example\Workspace")),
+            PathBuf::from(r"C:\Users\Example\Workspace")
+        );
+        assert_eq!(
+            windows_wire_path(Path::new(r"\\?\UNC\server\share\Workspace")),
+            PathBuf::from(r"\\server\share\Workspace")
+        );
+        let root = Path::new(r"C:\Users\Example\Workspace");
+        assert_eq!(
+            relative_to_root(root, Path::new(r"c:\users\example\workspace\src\main.rs")).unwrap(),
+            PathBuf::from(r"src\main.rs")
+        );
+        assert_eq!(
+            relative_to_root(root, Path::new(r"C:\Users\Example\Elsewhere"))
+                .unwrap_err()
+                .code,
+            "outside_root"
+        );
+        assert_eq!(
+            relative_to_root(
+                Path::new(r"\\server\share\Workspace"),
+                Path::new(r"\\SERVER\SHARE\workspace\notes.txt")
+            )
+            .unwrap(),
+            PathBuf::from("notes.txt")
+        );
     }
 
     #[tokio::test]

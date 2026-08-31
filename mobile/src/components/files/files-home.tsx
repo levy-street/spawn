@@ -1,6 +1,8 @@
 import { FlashList } from "@shopify/flash-list";
 import { router } from "expo-router";
 import { Pressable, StyleSheet, View } from "react-native";
+import { formatHostPlatform } from "@/components/hosts/host-model";
+import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
 import { Spinner } from "@/components/ui/spinner";
@@ -15,6 +17,10 @@ import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
 export function FilesHome() {
   const theme = useTheme();
   const hosts = useFileHosts();
+  // Browsing is a direct connection to the machine, so it needs that machine to
+  // have approved this device. Asking here beats an explorer that opens onto
+  // "Files unavailable".
+  const gate = useDeviceApprovalGate();
   const rows = sortHosts(hosts.data ?? []);
   if (hosts.isLoading) {
     return (
@@ -62,13 +68,23 @@ export function FilesHome() {
       <FlashList
         data={rows}
         keyExtractor={(host) => host.id}
-        renderItem={({ item }) => <HostFileRow host={item} />}
+        renderItem={({ item }) => (
+          <HostFileRow
+            host={item}
+            onOpen={() =>
+              gate.guard(item.id, () =>
+                router.push({ pathname: "/host/[id]/files", params: { id: item.id } }),
+              )
+            }
+          />
+        )}
       />
+      {gate.overlay}
     </View>
   );
 }
 
-function HostFileRow({ host }: { host: Host }) {
+function HostFileRow({ host, onOpen }: { host: Host; onOpen: () => void }) {
   const theme = useTheme();
   const online = host.status === "online";
   return (
@@ -79,7 +95,7 @@ function HostFileRow({ host }: { host: Host }) {
       disabled={!online}
       onPress={() => {
         haptics.selection();
-        router.push({ pathname: "/host/[id]/files", params: { id: host.id } });
+        onOpen();
       }}
       style={({ pressed }) => [
         styles.hostRow,
@@ -103,7 +119,7 @@ function HostFileRow({ host }: { host: Host }) {
           {host.name}
         </Text>
         <Text color="mutedForeground" numberOfLines={1} variant="caption">
-          {[host.os, host.arch].filter(Boolean).join(" · ") || "Host"}
+          {formatHostPlatform(host)}
         </Text>
       </View>
       <StatusDot

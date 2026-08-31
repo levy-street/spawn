@@ -13,6 +13,7 @@ import { CameraHost } from "@/components/media/camera-host";
 import { ConfirmHost } from "@/components/ui/confirm";
 import { ToastProvider } from "@/components/ui/toast";
 import { RealtimeProvider } from "@/data/realtime/provider";
+import { ReleaseWatcher } from "@/lib/release-watcher";
 import { ThemeProvider, useTheme } from "@/theme";
 
 export const APP_PROVIDER_ORDER = [
@@ -23,6 +24,7 @@ export const APP_PROVIDER_ORDER = [
   "RealtimeProvider",
   "ToastProvider",
   "KeyboardProvider",
+  "ReleaseWatcher",
   "ConfirmHost",
   "CameraHost",
   "Router",
@@ -87,6 +89,7 @@ export function AppProviders({ children }: PropsWithChildren): React.JSX.Element
               <RealtimeProvider>
                 <ToastProvider>
                   <KeyboardProvider>
+                    <ReleaseWatcher />
                     <ConfirmHost />
                     {/* Opened on demand over everything, the nav bar included. */}
                     <CameraHost />

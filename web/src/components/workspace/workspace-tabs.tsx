@@ -47,6 +47,7 @@ import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import {
+  ApiError,
   agents,
   type Host,
   hosts,
@@ -84,7 +85,7 @@ import { FolderPicker } from "./folder-picker";
 import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
-import { type SplitChrome, SplitWorkspaceLabel, UnsplitButton } from "./split-chrome";
+import { type SplitChrome, SplitWorkspaceMenu, UnsplitButton } from "./split-chrome";
 import { useTabHome } from "./tab-home";
 import { type MergeDrop, type MergeRefusal, planMerge, WHOLE_CANVAS } from "./tab-merge";
 import { dockZoneAt, freeRects, wantsDuplicate } from "./workspace-grid-helpers";
@@ -1012,18 +1013,32 @@ export function WorkspaceTabs({
     const sessionIds = tab.layout.tiles
       .filter((tile) => !tile.widget)
       .map((tile) => tile.session_id);
-    if (sessionIds.length > 0) {
+    // Only sessions that still exist earn the "process killed" warning — a
+    // tab holding nothing but dead panes closes without ceremony. Until the
+    // session list has loaded, assume everything is live rather than skip a
+    // destructive confirmation.
+    const known = sessionsQ.data;
+    const liveCount = known
+      ? sessionIds.filter((id) => known.some((session) => session.id === id)).length
+      : sessionIds.length;
+    if (liveCount > 0) {
       const accepted = await confirm({
         title: `Close ${tab.name}?`,
-        body: `${sessionIds.length === 1 ? "Its session" : `Its ${sessionIds.length} sessions`} will be closed and the running ${sessionIds.length === 1 ? "process" : "processes"} killed.`,
+        body: `${liveCount === 1 ? "Its session" : `Its ${liveCount} sessions`} will be closed and the running ${liveCount === 1 ? "process" : "processes"} killed.`,
         confirmLabel: "Close tab",
         destructive: true,
       });
       if (!accepted) return;
+    }
+    if (sessionIds.length > 0) {
       const results = await Promise.allSettled(sessionIds.map((id) => sessions.remove(id)));
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       const failed = results.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected" &&
+          // A session the server has already dropped is the outcome closing
+          // asked for; only a failure that leaves one running keeps the tab.
+          !(result.reason instanceof ApiError && result.reason.status === 404),
       );
       if (failed) {
         onError?.(failed.reason instanceof Error ? failed.reason.message : String(failed.reason));
@@ -1081,6 +1096,18 @@ export function WorkspaceTabs({
     if (name) saveTemplateM.mutate(name.slice(0, 128));
   };
 
+  /**
+   * Where to go once this workspace has been archived or deleted. Only the
+   * half the address bar is about has anywhere to be: the other half of a
+   * split is not the page you are on, and the arrangement it was in is
+   * dissolved by the workspace list refresh above, which leaves the workspace
+   * you were actually working in filling the window.
+   */
+  const leaveAfterRemoval = () => {
+    if (paneScope && !paneScope.routed) return;
+    router.replace("/app");
+  };
+
   const deleteWorkspace = async () => {
     const sessionCount = allTiles(workspace.layout).filter((tile) => !tile.widget).length;
     const accepted = await confirm({
@@ -1101,7 +1128,7 @@ export function WorkspaceTabs({
     }
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
-    router.replace("/app");
+    leaveAfterRemoval();
   };
 
   const submitWorkspaceRename = (event?: FormEvent) => {
@@ -1157,7 +1184,7 @@ export function WorkspaceTabs({
     }
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
-    router.replace("/app");
+    leaveAfterRemoval();
   };
 
   return (
@@ -1178,7 +1205,16 @@ export function WorkspaceTabs({
       className="flex h-11 shrink-0 items-end gap-1.5 overflow-x-auto bg-shell pr-1.5 pb-1.5"
     >
       {splitChrome && (
-        <SplitWorkspaceLabel name={splitChrome.workspaceName} icon={splitChrome.workspaceIcon} />
+        <SplitWorkspaceMenu
+          chrome={splitChrome}
+          onRename={() => {
+            setWorkspaceNameDraft(workspace.name);
+            setRenameWorkspaceOpen(true);
+          }}
+          onChangeIcon={() => setIconOpen(true)}
+          onArchive={() => void archiveWorkspace()}
+          onDelete={() => void deleteWorkspace()}
+        />
       )}
       {orderedTabs.map((tab) => {
         const active = tab.id === activeTabId;

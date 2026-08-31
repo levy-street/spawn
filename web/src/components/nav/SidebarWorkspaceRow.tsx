@@ -253,24 +253,25 @@ export function SidebarWorkspaceRow({
 }
 
 /**
- * One half of a paired row. A real `<button>`, not a link: the two workspaces
- * of a split are both already on screen, so pressing one is a request to work
- * in it, not to go to it. Navigating to the right-hand one would in fact close
- * the split — the route would equal the pair's second workspace, which is the
- * store's definition of "that one is the whole window now".
+ * One half of a paired row. A real `<button>`, not a link: what pressing one
+ * means depends on where you already are. With the pair on screen both
+ * workspaces are in front of you, so it is a request to work in that half;
+ * with the pair parked behind some other workspace it is a navigation, and
+ * arriving at either member is what puts the split back up. The row's owner
+ * decides which — this only reports that a half was pressed.
  */
 function SidebarPairHalf({
   workspace,
   side,
   active,
   attentionCount,
-  onActivate,
+  onOpen,
 }: {
   workspace: Workspace;
   side: SplitSide;
   active: boolean;
   attentionCount: number;
-  onActivate: (side: SplitSide) => void;
+  onOpen: (side: SplitSide, workspaceId: string) => void;
 }) {
   return (
     <button
@@ -280,15 +281,21 @@ function SidebarPairHalf({
       data-pair-half={workspace.id}
       aria-pressed={active}
       title={workspace.name}
-      onClick={() => onActivate(side)}
+      onClick={() => onOpen(side, workspace.id)}
       className={cn(
-        "flex h-(--row-h) min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1.5 text-sm transition-colors",
-        // Both halves are on screen, so neither may read as unvisited. The
-        // one holding the gestures wears the full selection and the other the
-        // same tint at half strength.
-        active
-          ? "bg-accent text-accent-foreground"
-          : "bg-accent/50 text-foreground hover:bg-accent/70",
+        "flex h-full min-w-0 flex-1 items-center gap-1.5 text-sm transition-colors",
+        // The outer edge keeps the row's own inset; the inner one stands off
+        // the control riding the seam, which is out of flow and would
+        // otherwise sit on top of whichever name reached it first.
+        side === "primary" ? "pl-1.5 pr-4" : "pl-4 pr-1.5",
+        // No ground of its own — the row is one plate, and a half that tinted
+        // itself would put the seam back. Which half owns the keyboard is
+        // said in the ink instead: lit against muted, the same pair of weights
+        // an ordinary row uses for visited against not.
+        // Hover lifts the ink and nothing else: a wash over one half would
+        // draw an edge down the middle of the plate, which is the seam this
+        // row exists to not have.
+        active ? "text-accent-foreground" : "text-muted-foreground hover:text-foreground",
       )}
     >
       <span className="relative shrink-0">
@@ -312,13 +319,15 @@ function SidebarPairHalf({
 
 /**
  * A split, as one row holding both of its workspaces side by side in the
- * order they are on screen.
+ * order they are arranged in.
  *
- * Two separate rows would say the workspaces are two independent destinations,
- * which while they are split they are not: one window holds both, and clicking
- * either is a move within it. Drawing them joined, in the same left-to-right
- * order as the halves themselves, is what makes the rail a picture of the
- * window rather than a list that happens to contain it.
+ * Two separate rows would say the workspaces are two independent
+ * destinations, which once they are split they are not: one window holds
+ * both, and opening either brings up the pair. Drawing them joined, in the
+ * same left-to-right order as the halves themselves, is what makes the rail a
+ * picture of the window rather than a list that happens to contain it — and
+ * the row outlives being looked at, so a split you have navigated away from is
+ * still visibly a split waiting for you.
  *
  * Expanded rail only. Collapsed, the two keep their own tiles: two containers
  * and a control between them do not survive a 56px column, and no drag starts
@@ -330,17 +339,22 @@ export function SidebarWorkspacePair({
   activeSide,
   primaryAttention,
   secondaryAttention,
-  onActivate,
+  onOpen,
   onUnsplit,
   onRowPointerDown,
 }: {
   primary: Workspace;
   secondary: Workspace;
-  activeSide: SplitSide;
+  /**
+   * Which half is the window you are working in, or null when the pair is
+   * parked — listed as a split, but not what is on screen.
+   */
+  activeSide: SplitSide | null;
   primaryAttention: number;
   secondaryAttention: number;
-  onActivate: (side: SplitSide) => void;
-  /** Back to one workspace, keeping the routed (left) one. */
+  /** A half was pressed: work in it, or go to it. */
+  onOpen: (side: SplitSide, workspaceId: string) => void;
+  /** Back to one workspace, keeping the left one. */
   onUnsplit: () => void;
   onRowPointerDown?: (event: ReactPointerEvent<HTMLLIElement>) => void;
 }) {
@@ -353,17 +367,29 @@ export function SidebarWorkspacePair({
       data-row-ids={`${primary.id} ${secondary.id}`}
       onPointerDown={onRowPointerDown}
     >
-      {/* The halves sit all but touching and the control rides the seam
-          between them rather than taking a column of its own: out of flow,
-          both halves keep the width, and the icon reads as the join it undoes
+      {/* One plate, not two tiles: the window these workspaces are in is a
+          single thing, so the row that stands for it is a single thing too —
+          one ground, running edge to edge, with no slot of rail showing
+          through the middle to say otherwise. The control rides the seam
+          rather than taking a column of its own: out of flow, both halves
+          keep half the width each, and the icon reads as the join it undoes
           instead of as a third thing in a row of three. */}
-      <div className="relative flex items-center gap-4">
+      <div
+        className={cn(
+          "relative flex h-(--row-h) items-center overflow-hidden rounded-lg transition-colors",
+          // The whole row carries the state, because the whole row is the
+          // window: lit when it is the one you are looking at, and held at
+          // half strength while it is parked behind some other workspace —
+          // still visibly an arrangement, just not this one.
+          activeSide === null ? "bg-accent/50" : "bg-accent",
+        )}
+      >
         <SidebarPairHalf
           workspace={primary}
           side="primary"
           active={activeSide === "primary"}
           attentionCount={primaryAttention}
-          onActivate={onActivate}
+          onOpen={onOpen}
         />
         <Button
           type="button"
@@ -381,11 +407,11 @@ export function SidebarWorkspacePair({
           className={cn(
             // Both halves are flex-1, so half the row is exactly the seam.
             "absolute left-1/2 top-1/2 z-10 size-7 -translate-x-1/2 -translate-y-1/2",
-            // No plate at rest: the mark alone straddles the gap, and the
-            // tiles either side are what give it its shape. A ground only
-            // appears under the pointer, where it is answering a hover rather
-            // than decorating a seam.
-            "rounded-full text-muted-foreground hover:bg-accent hover:text-foreground",
+            // No plate at rest: the mark alone sits on the row's own ground,
+            // marking the join without cutting it. A wash only appears under
+            // the pointer, where it is answering a hover rather than drawing
+            // a seam that is not there.
+            "rounded-full text-muted-foreground hover:bg-foreground/10 hover:text-foreground",
           )}
         >
           <Unlink className="size-3.5" aria-hidden />
@@ -395,7 +421,7 @@ export function SidebarWorkspacePair({
           side="secondary"
           active={activeSide === "secondary"}
           attentionCount={secondaryAttention}
-          onActivate={onActivate}
+          onOpen={onOpen}
         />
       </div>
     </li>

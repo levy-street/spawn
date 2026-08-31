@@ -1,5 +1,5 @@
-import { expect, test } from "@playwright/test";
-import { fileEntry, fileListing, HOST_ID, host, mockApp, session } from "./app-mocks";
+import { expect, type Page, test } from "@playwright/test";
+import { fileEntry, fileListing, HOST_ID, host, mockApp, session, windowsHost } from "./app-mocks";
 
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000009";
 const otherHost = {
@@ -172,6 +172,85 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
     .toMatchObject({ path: "/Users/tester/projects/readme.md", recursive: false });
 });
 
+test("Windows file operations preserve native drive paths", async ({ page }) => {
+  const listed: Array<string | null> = [];
+  const mkdirs: unknown[] = [];
+  const renames: unknown[] = [];
+  const deletes: unknown[] = [];
+  await mockApp(page, {
+    hosts: [windowsHost],
+    files: (_hostId, path) => {
+      listed.push(path);
+      if (path === "C:\\Users\\tester\\Work") {
+        return fileListing({
+          path,
+          home_dir: "C:\\Users\\tester",
+          parent: "C:\\Users\\tester",
+          entries: [fileEntry({ name: "readme.md", path: `${path}\\readme.md`, size: 512 })],
+        });
+      }
+      return fileListing({
+        path: "C:\\Users\\tester",
+        home_dir: "C:\\Users\\tester",
+        parent: "C:\\Users",
+        entries: [
+          fileEntry({
+            name: "Work",
+            path: "C:\\Users\\tester\\Work",
+            is_dir: true,
+            size: null,
+          }),
+          fileEntry({ name: "notes.txt", path: "C:\\Users\\tester\\notes.txt" }),
+        ],
+      });
+    },
+    fileMkdir: async (_hostId, body, route) => {
+      mkdirs.push(body);
+      await route.fulfill({ status: 200, json: body });
+    },
+    fileRename: async (_hostId, body, route) => {
+      renames.push(body);
+      await route.fulfill({ status: 200, json: body });
+    },
+    fileDelete: async (_hostId, body, route) => {
+      deletes.push(body);
+      await route.fulfill({ status: 200, json: body });
+    },
+  });
+
+  const deepPath = "C:\\Users\\tester\\Work\\readme.md";
+  await page.goto(`/hosts/${HOST_ID}/files?path=${encodeURIComponent(deepPath)}`);
+  await expect(row(page, "readme.md")).toHaveAttribute("aria-selected", "true");
+
+  await page.getByRole("button", { name: "New folder" }).click();
+  await page.getByLabel("Folder name").fill("scratch");
+  await page.getByLabel("Folder name").press("Enter");
+  await expect.poll(() => mkdirs.at(-1)).toMatchObject({ path: "C:\\Users\\tester\\scratch" });
+
+  const notes = row(page, "notes.txt");
+  await notes.hover();
+  await notes.getByRole("button", { name: "notes.txt actions" }).click();
+  await page.getByRole("menuitem", { name: "Rename" }).click();
+  await page.getByLabel("Rename entry").fill("renamed.txt");
+  await page.getByLabel("Rename entry").press("Enter");
+  await expect
+    .poll(() => renames.at(-1))
+    .toMatchObject({
+      path: "C:\\Users\\tester\\notes.txt",
+      name: "renamed.txt",
+    });
+
+  page.on("dialog", (dialog) => dialog.accept());
+  const readme = row(page, "readme.md");
+  await readme.hover();
+  await readme.getByRole("button", { name: "readme.md actions" }).click();
+  await page.getByRole("menuitem", { name: "Delete" }).click();
+  await expect.poll(() => deletes.at(-1)).toMatchObject({ path: deepPath, recursive: false });
+
+  expect(listed).toContain("C:\\Users\\tester\\Work");
+  expect(listed.some((path) => path?.startsWith("/C:"))).toBe(false);
+});
+
 test("right-click opens a context menu with download and send to host", async ({ page }) => {
   const reads: Array<{ hostId: string; path: string }> = [];
   const uploads: Array<{ hostId: string; dir: string | null }> = [];
@@ -311,4 +390,73 @@ test("a file explorer is added to the workspace as its own pane", async ({ page 
   await expect(pane).toBeVisible();
   await expect(pane.getByRole("tree", { name: "Files" })).toBeVisible();
   await expect.poll(() => requested.length).toBeGreaterThan(0);
+});
+
+/** Enough shapes that a rendered view is unmistakably not the source. */
+const README = `# SPAWN D
+
+A **bold** claim and some _emphasis_.
+
+- one thing
+- another thing
+
+## Getting started
+
+Run \`spawnd login\` and follow the prompts.
+`;
+
+/** A file explorer pane filling the window, holding a README to hover. */
+async function openWideExplorer(page: Page) {
+  const { WORKSPACE_ID, workspace } = await import("./app-mocks");
+  await page.setViewportSize({ width: 1160, height: 900 });
+  await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ host_id: HOST_ID, cwd: "/Users/tester/spawn" })],
+    files: (_hostId, path) =>
+      fileListing({
+        path: path ?? "/Users/tester/spawn",
+        entries: [
+          fileEntry({ name: "infra", path: "/Users/tester/spawn/infra", is_dir: true, size: null }),
+          fileEntry({ name: "README.md", path: "/Users/tester/spawn/README.md", size: 240 }),
+        ],
+      }),
+    fileRead: () => README,
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page.getByRole("button", { name: "Add a window" }).hover();
+  await page.getByRole("button", { name: "New file explorer window" }).click();
+  const pane = page.getByRole("region", { name: /^Files — / });
+  await expect(pane.getByRole("tree", { name: "Files" })).toBeVisible();
+  await pane.getByRole("treeitem").filter({ hasText: "README.md" }).hover();
+  await expect(page.locator("#file-preview-card")).toBeVisible();
+  return pane;
+}
+
+test("a full-width explorer keeps its hover preview over itself, clear of the tree", async ({
+  page,
+}) => {
+  const pane = await openWideExplorer(page);
+  const card = page.locator("#file-preview-card");
+
+  const paneBox = (await pane.boundingBox()) ?? null;
+  const cardBox = (await card.boundingBox()) ?? null;
+  if (!paneBox || !cardBox) throw new Error("no boxes");
+
+  // Over its own panel, not flipped across the window onto the sidebar.
+  expect(cardBox.x).toBeGreaterThan(paneBox.x);
+  expect(cardBox.x + cardBox.width).toBeLessThanOrEqual(paneBox.x + paneBox.width + 1);
+  // And far enough in that the rows it is about are still readable beside it.
+  expect(cardBox.x - paneBox.x).toBeGreaterThanOrEqual(200);
+  await expect(pane.getByRole("treeitem").filter({ hasText: "infra" })).toBeVisible();
+});
+
+test("the hover preview renders markdown, the way the viewer does", async ({ page }) => {
+  await openWideExplorer(page);
+  const card = page.locator("#file-preview-card");
+  // Rendered, not shown as source: headings, a list and inline code.
+  await expect(card.getByRole("heading", { name: "SPAWN D" })).toBeVisible();
+  await expect(card.getByRole("heading", { name: "Getting started" })).toBeVisible();
+  await expect(card.locator("li")).toHaveCount(2);
+  await expect(card.locator("code")).toHaveText("spawnd login");
+  await expect(card.locator("strong")).toHaveText("bold");
 });

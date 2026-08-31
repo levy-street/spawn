@@ -1,6 +1,8 @@
 "use client";
 import { CapacityBar, LegionDot } from "@/components/legion/legion-parts";
 import { SessionStatusDot } from "@/components/ui/status";
+import { hostHealthPanel } from "@/lib/host-health";
+import { formatHostPlatform } from "@/lib/host-platform";
 import type { LegionHostRow } from "@/lib/legion";
 import { bucketFill, capacityLabel, specLine } from "@/lib/legion";
 import { relativeTime, sessionActivityLabel, sessionTitle } from "@/lib/sessions";
@@ -33,6 +35,7 @@ export function LegionHostDetail({ row }: { row: LegionHostRow }) {
   const spec = specLine(host);
   const shown = row.sessions.slice(0, SESSION_LIMIT);
   const overflow = row.sessions.length - shown.length;
+  const health = hostHealthPanel(host);
 
   return (
     <div className="w-64 max-w-[min(18rem,calc(100vw-2rem))] p-3 text-sm">
@@ -46,7 +49,7 @@ export function LegionHostDetail({ row }: { row: LegionHostRow }) {
 
       {(spec || host.cpu_model) && (
         <p className="mt-1.5 font-mono text-[10.5px] leading-4 text-muted-foreground">
-          {[host.os, spec].filter(Boolean).join(" · ")}
+          {[formatHostPlatform(host), spec].filter(Boolean).join(" · ")}
           {host.cpu_model && (
             <>
               <br />
@@ -60,6 +63,15 @@ export function LegionHostDetail({ row }: { row: LegionHostRow }) {
         <div className="mt-2.5 flex flex-col gap-2 border-t border-popover-border pt-2.5">
           <Reading label="CPU" value={row.cpuBucket} />
           <Reading label="MEM" value={row.memBucket} />
+        </div>
+      )}
+
+      {!online && (
+        <div className="mt-2.5 space-y-1 border-t border-popover-border pt-2.5">
+          <p className="font-mono text-[9.5px] uppercase tracking-[0.16em] text-muted-foreground">
+            Something wrong?
+          </p>
+          <p className="text-xs leading-4 text-muted-foreground">{health.message}</p>
         </div>
       )}
 

@@ -3,10 +3,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { Plus, Server } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import { Trident } from "@/components/icons/BrandMark";
 import { AppShell } from "@/components/nav/AppShell";
-import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
@@ -28,7 +27,6 @@ export default function AppEntryPage() {
   const router = useRouter();
   const { user, loading: authLoading, error: authError } = useAuth();
   const { config, loading: configLoading, error: configError } = useAuthConfig();
-  const [skippedHost, setSkippedHost] = useState<boolean | null>(null);
   const hostsQ = useQuery({
     queryKey: ["hosts"],
     queryFn: hosts.list,
@@ -39,14 +37,6 @@ export default function AppEntryPage() {
     queryFn: () => workspaces.list(),
     enabled: Boolean(user),
   });
-
-  useEffect(() => {
-    if (!user) {
-      setSkippedHost(null);
-      return;
-    }
-    setSkippedHost(window.localStorage.getItem("spawn.onboarding.skippedHost") === "true");
-  }, [user]);
 
   const listedHosts = useMemo(() => hostsQ.data ?? [], [hostsQ.data]);
   const orderedWorkspaces = useMemo(
@@ -68,7 +58,6 @@ export default function AppEntryPage() {
     if (
       !user ||
       !config ||
-      skippedHost === null ||
       hostsQ.isLoading ||
       workspacesQ.isLoading ||
       hostsQ.error ||
@@ -81,7 +70,9 @@ export default function AppEntryPage() {
       return;
     }
     if (listedHosts.length === 0) {
-      if (!skippedHost) router.replace("/onboarding?step=host");
+      // Connecting a host is not optional: the product does nothing without
+      // one, and there is no longer a way to say "later".
+      router.replace("/onboarding?step=host");
       return;
     }
     if (orderedWorkspaces.length > 0) {
@@ -101,7 +92,6 @@ export default function AppEntryPage() {
     listedHosts,
     orderedWorkspaces,
     router,
-    skippedHost,
     user,
     workspacesQ.error,
     workspacesQ.isLoading,
@@ -119,13 +109,7 @@ export default function AppEntryPage() {
 
   if (!user) return <AppEntrySpinner />;
 
-  if (
-    configLoading ||
-    skippedHost === null ||
-    hostsQ.isLoading ||
-    workspacesQ.isLoading ||
-    verificationIncomplete
-  ) {
+  if (configLoading || hostsQ.isLoading || workspacesQ.isLoading || verificationIncomplete) {
     return <AppEntrySpinner />;
   }
 
@@ -149,20 +133,6 @@ export default function AppEntryPage() {
     );
   }
 
-  if (listedHosts.length === 0 && skippedHost) {
-    return (
-      <AppShell>
-        <EmptyState
-          className="min-h-[calc(var(--vv-height)-3rem)]"
-          icon={<Server />}
-          title="Connect a host to start a session"
-          body="Install the daemon on a machine you control, then approve its pairing code."
-          action={<Button onClick={() => openSettings("hosts")}>Connect a host</Button>}
-        />
-      </AppShell>
-    );
-  }
-
   if (listedHosts.length > 0 && orderedWorkspaces.length === 0 && !firstOnlineHost) {
     return (
       <AppShell>
@@ -171,7 +141,7 @@ export default function AppEntryPage() {
           icon={<Server />}
           title="Your host is offline"
           body="Bring a daemon online before creating the first workspace."
-          action={<Button onClick={() => openSettings("hosts")}>View hosts</Button>}
+          action={<Button onClick={() => router.push("/legion")}>View hosts</Button>}
         />
       </AppShell>
     );

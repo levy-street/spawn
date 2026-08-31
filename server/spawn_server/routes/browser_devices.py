@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import auth, schemas
 from ..browser_registration import verify_browser_registration_proof
 from ..db import get_session
-from ..models import BrowserDevice, Host, RevokedBrowserKey, User
+from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, User
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/browser-devices", tags=["browser-devices"])
@@ -364,9 +364,7 @@ async def revoke_browser_device(
     # out of the account deny-list. Idempotent: a repeat revoke (or a heal after
     # an interrupted one) finds the tombstone already present and adds nothing.
     if device.revoked_at is not None:
-        tombstone = await session.get(
-            RevokedBrowserKey, (device.owner_user_id, device.public_key)
-        )
+        tombstone = await session.get(RevokedBrowserKey, (device.owner_user_id, device.public_key))
         if tombstone is None:
             session.add(
                 RevokedBrowserKey(
@@ -377,6 +375,13 @@ async def revoke_browser_device(
                     revoked_by_device_id=device.revoked_by_device_id,
                 )
             )
+        # The permanent RevokedBrowserKey row above is the deny-list
+        # authority. HostBrowserPin is only an admission snapshot, so deleting
+        # this device's snapshots now safely reclaims bounded host capacity
+        # without weakening or forgetting the revocation.
+        await session.execute(
+            delete(HostBrowserPin).where(HostBrowserPin.browser_device_id == device.id)
+        )
     try:
         await session.commit()
     except IntegrityError:

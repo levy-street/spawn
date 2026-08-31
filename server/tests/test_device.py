@@ -37,6 +37,7 @@ from spawn_server.host_pair_possession import (
 from spawn_server.models import (
     BrowserDevice,
     DeviceCode,
+    EmailLog,
     Host,
     HostBrowserPin,
     HostKeyClaim,
@@ -130,17 +131,21 @@ async def _start(
     *,
     name: str = "gpu-box-1",
     proved: bool = True,
+    setup_token: str | None = None,
 ) -> dict:
+    payload = {
+        "host_name": name,
+        "os": "linux",
+        "arch": "x86_64",
+        "version": "0.1.0",
+        "host_key_algorithm": "ed25519",
+        "host_public_key": public_key,
+    }
+    if setup_token is not None:
+        payload["setup_token"] = setup_token
     response = await client.post(
         "/api/auth/device/start",
-        json={
-            "host_name": name,
-            "os": "linux",
-            "arch": "x86_64",
-            "version": "0.1.0",
-            "host_key_algorithm": "ed25519",
-            "host_public_key": public_key,
-        },
+        json=payload,
     )
     assert response.status_code == 200, response.text
     start = response.json()
@@ -334,6 +339,8 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     assert success["browser_device_id"] == browser[0]["id"]
     assert success["browser_public_key"] == browser[0]["public_key"]
     assert "private" not in str(success).lower()
+
+
     assert "seed" not in str(success).lower()
 
     replay = await _poll(client, start, public_key)
@@ -351,9 +358,36 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
         pin = await session.get(HostBrowserPin, (success["host_id"], browser[0]["id"]))
         assert pin is not None
         assert pin.browser_public_key == browser[0]["public_key"]
-        assert pin.browser_key_fingerprint == ed25519_key_fingerprint(
-            browser[0]["public_key"]
-        )
+        assert pin.browser_key_fingerprint == ed25519_key_fingerprint(browser[0]["public_key"])
+
+
+async def test_file_sqlite_email_logging_does_not_block_device_approval(
+    file_sqlite_client, monkeypatch, caplog
+):
+    """A verification audit write must not contend with the signup transaction."""
+
+    from spawn_server.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "email_backend", "console", raising=False)
+    user_id, auth = await _signup(file_sqlite_client, "sqlite-email-approval@example.com")
+    browser = await _register_browser(file_sqlite_client, user_id, auth)
+    public_key = _public_key(19)
+    start = await _start(file_sqlite_client, public_key, name="sqlite-email-approval")
+    review = await _review(file_sqlite_client, start, auth)
+
+    approval = await _approve(file_sqlite_client, start, user_id, auth, review, browser)
+    assert approval.status_code == 200, approval.text
+
+    async with get_sessionmaker()() as session:
+        entries = (
+            await session.execute(
+                select(EmailLog).where(EmailLog.to_email == "sqlite-email-approval@example.com")
+            )
+        ).scalars().all()
+    assert [(entry.kind, entry.status) for entry in entries] == [
+        ("email_verify", "not_delivered")
+    ]
+    assert "could not record email log entry" not in caplog.text
 
 
 async def test_host_possession_is_required_before_review_approval_or_token_issue(client):
@@ -386,17 +420,13 @@ async def test_host_possession_is_required_before_review_approval_or_token_issue
         browser,
     )
     assert blocked_approval.status_code == 409
-    assert (await _poll(client, start, public_key)).json() == {
-        "error": "authorization_pending"
-    }
+    assert (await _poll(client, start, public_key)).json() == {"error": "authorization_pending"}
     async with get_sessionmaker()() as session:
         assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
         assert (
             await session.execute(select(func.count(HostKeyClaim.host_public_key)))
         ).scalar_one() == 0
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 0
 
     proof = await _prove_possession(client, start, host_private_key)
     assert proof.status_code == 200, proof.text
@@ -698,9 +728,7 @@ async def _assert_proof_delete_race_linearizes(
     async with get_sessionmaker()() as session:
         assert await session.get(Host, paired["host_id"]) is None
         assert await session.get(DeviceCode, start["device_code"]) is None
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 0
         claim = await session.get(HostKeyClaim, ("ed25519", public_key))
         assert claim is not None
         assert claim.owner_user_id == user_id
@@ -887,9 +915,7 @@ async def test_approval_rejects_stale_nonce_and_substituted_browser_tuple(client
         assert dc.user_id is None
         assert dc.browser_device_id is None
         assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 0
 
 
 async def test_browser_revocation_after_approval_blocks_poll_and_forces_rereview(client):
@@ -913,9 +939,7 @@ async def test_browser_revocation_after_approval_blocks_poll_and_forces_rereview
         assert dc.user_id is None
         assert dc.browser_device_id is None
         assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 0
     assert (await _review(client, start, auth))["approval_nonce"] == review["approval_nonce"]
 
 
@@ -1363,9 +1387,7 @@ async def _assert_concurrent_first_host_ceremonies_all_reuse_one_host(
         assert (
             await session.execute(select(func.count(HostBrowserPin.browser_device_id)))
         ).scalar_one() == 12
-        assert (
-            await session.execute(select(func.count(DeviceCode.device_code)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(DeviceCode.device_code)))).scalar_one() == 0
 
 
 async def test_file_sqlite_concurrent_first_host_ceremonies_reuse_one_host(
@@ -1405,9 +1427,7 @@ async def _assert_approve_revoke_race_has_no_issuance(client, *, email: str, key
     assert (await _poll(client, start, key)).json() == {"error": "authorization_pending"}
     async with get_sessionmaker()() as session:
         assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 0
 
 
 async def _assert_poll_revoke_race_is_transactionally_consistent(
@@ -1417,9 +1437,7 @@ async def _assert_poll_revoke_race_is_transactionally_consistent(
     browser = await _register_browser(client, user_id, auth)
     start = await _start(client, key)
     review = await _review(client, start, auth)
-    assert (
-        await _approve(client, start, user_id, auth, review, browser)
-    ).status_code == 200
+    assert (await _approve(client, start, user_id, auth, review, browser)).status_code == 200
 
     poll, revocation = await asyncio.gather(
         _poll(client, start, key),
@@ -1430,10 +1448,11 @@ async def _assert_poll_revoke_race_is_transactionally_consistent(
     assert "access_token" in body or body == {"error": "authorization_pending"}
     async with get_sessionmaker()() as session:
         host_count = (await session.execute(select(func.count(Host.id)))).scalar_one()
-        pin_count = (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one()
-        assert host_count == pin_count
+        pin_count = (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one()
+        # Revoke now reclaims the immutable pin snapshot in the same
+        # transaction. If poll won, the Host can remain, but its revoked pin
+        # must already be gone and the permanent key tombstone denies it.
+        assert pin_count == 0
         assert host_count == (1 if "access_token" in body else 0)
 
 
@@ -1524,12 +1543,16 @@ async def test_explicit_relogin_adds_an_immutable_second_browser_pin(client):
 
     async with get_sessionmaker()() as session:
         pins = (
-            await session.execute(
-                select(HostBrowserPin)
-                .where(HostBrowserPin.host_id == first["host_id"])
-                .order_by(HostBrowserPin.browser_device_id)
+            (
+                await session.execute(
+                    select(HostBrowserPin)
+                    .where(HostBrowserPin.host_id == first["host_id"])
+                    .order_by(HostBrowserPin.browser_device_id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(pins) == 2
         assert {pin.browser_device_id for pin in pins} == {
             first_browser[0]["id"],
@@ -1548,7 +1571,8 @@ async def test_host_browser_pin_bound_rejects_the_thirty_third_without_partial_r
     first = await _pair(client, user_id, auth, first_browser, public_key)
 
     async with get_sessionmaker()() as session:
-        for _ in range(31):
+        stale_device_id = ""
+        for index in range(31):
             private_key = Ed25519PrivateKey.generate()
             browser_public_key = _wire(private_key.public_key().public_bytes_raw())
             device = BrowserDevice(
@@ -1558,6 +1582,8 @@ async def test_host_browser_pin_bound_rejects_the_thirty_third_without_partial_r
                 public_key=browser_public_key,
             )
             session.add(device)
+            if index == 0:
+                stale_device_id = device.id
             session.add(
                 HostBrowserPin(
                     host_id=first["host_id"],
@@ -1593,6 +1619,30 @@ async def test_host_browser_pin_bound_rejects_the_thirty_third_without_partial_r
             )
         ).scalar_one() == 0
 
+        # A tombstoned raw row is retained in old databases and must not keep
+        # consuming live admission capacity.
+        stale = await session.get(BrowserDevice, stale_device_id)
+        assert stale is not None
+        stale.revoked_at = datetime.now(UTC)
+        await session.commit()
+
+    retry = await _start(client, public_key)
+    retry_review = await _review(client, retry, auth)
+    retry_approved = await _approve(client, retry, user_id, auth, retry_review, overflow_browser)
+    assert retry_approved.status_code == 200, retry_approved.text
+    retry_poll = await _poll(client, retry, public_key)
+    assert retry_poll.status_code == 200, retry_poll.text
+    assert retry_poll.json()["host_id"] == first["host_id"]
+
+    async with get_sessionmaker()() as session:
+        assert (
+            await session.execute(
+                select(func.count(HostBrowserPin.browser_device_id)).where(
+                    HostBrowserPin.host_id == first["host_id"]
+                )
+            )
+        ).scalar_one() == 33
+
 
 async def _assert_pin_capacity_race_admits_exactly_one(
     client, *, email: str, public_key: str
@@ -1603,9 +1653,7 @@ async def _assert_pin_capacity_race_admits_exactly_one(
 
     async with get_sessionmaker()() as session:
         for _ in range(30):
-            browser_public_key = _wire(
-                Ed25519PrivateKey.generate().public_key().public_bytes_raw()
-            )
+            browser_public_key = _wire(Ed25519PrivateKey.generate().public_key().public_bytes_raw())
             device = BrowserDevice(
                 id=str(uuid.uuid4()),
                 owner_user_id=user_id,
@@ -1649,9 +1697,7 @@ async def _assert_pin_capacity_race_admits_exactly_one(
     assert len(successes) == 1, bodies
     assert len(losers) == 1, bodies
     loser = losers[0]
-    assert (await _poll(client, starts[loser], public_key)).json() == {
-        "error": "pin_limit"
-    }
+    assert (await _poll(client, starts[loser], public_key)).json() == {"error": "pin_limit"}
 
     async with get_sessionmaker()() as session:
         assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 1
@@ -1670,8 +1716,10 @@ async def _assert_pin_capacity_race_admits_exactly_one(
             )
         ).scalar_one() == 0
         remaining_codes = (
-            await session.execute(select(DeviceCode).order_by(DeviceCode.device_code))
-        ).scalars().all()
+            (await session.execute(select(DeviceCode).order_by(DeviceCode.device_code)))
+            .scalars()
+            .all()
+        )
         assert len(remaining_codes) == 1
         assert remaining_codes[0].device_code == starts[loser]["device_code"]
         assert remaining_codes[0].status == "pin_limit"
@@ -1784,9 +1832,7 @@ async def test_revocation_fences_every_existing_ceremony_retains_owner_and_allow
                 )
             )
         ).scalar_one() == 0
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 0
         claim = await session.get(HostKeyClaim, ("ed25519", public_key))
         assert claim is not None
         assert claim.owner_user_id == owner_id
@@ -1812,9 +1858,7 @@ async def test_revocation_fences_every_existing_ceremony_retains_owner_and_allow
         assert claim is not None
         assert claim.owner_user_id == owner_id
         assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 1
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 1
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 1
 
 
 def _is_device_poll_claim(statement) -> bool:
@@ -1859,9 +1903,7 @@ async def _assert_delete_poll_race_linearizes(
     paired = await _pair(client, user_id, auth, browser, public_key)
     start = await _start(client, public_key, name="delete-poll-race")
     review = await _review(client, start, auth)
-    assert (
-        await _approve(client, start, user_id, auth, review, browser)
-    ).status_code == 200
+    assert (await _approve(client, start, user_id, auth, review, browser)).status_code == 200
 
     reached = asyncio.Event()
     release = asyncio.Event()
@@ -1912,9 +1954,7 @@ async def _assert_delete_poll_race_linearizes(
     async with get_sessionmaker()() as session:
         assert await session.get(Host, paired["host_id"]) is None
         assert await session.get(DeviceCode, start["device_code"]) is None
-        assert (
-            await session.execute(select(func.count(HostBrowserPin.host_id)))
-        ).scalar_one() == 0
+        assert (await session.execute(select(func.count(HostBrowserPin.host_id)))).scalar_one() == 0
         claim = await session.get(HostKeyClaim, ("ed25519", public_key))
         assert claim is not None
         assert claim.owner_user_id == user_id
@@ -2163,6 +2203,31 @@ async def test_revoking_the_browser_clears_the_retained_approval_proof(client):
         assert row.browser_approval_signature is None
 
 
+async def test_device_start_accepts_and_ignores_legacy_setup_token(client):
+    user_id, auth = await _signup(client, "legacy-setup-token@example.com")
+    browser = await _register_browser(client, user_id, auth)
+    host_key = Ed25519PrivateKey.generate()
+    host_public = _wire(host_key.public_key().public_bytes_raw())
+    start = await _start(
+        client,
+        host_public,
+        name="legacy-setup-token-box",
+        proved=False,
+        setup_token="accepted-and-ignored",
+    )
+
+    possession = await _prove_possession(client, start, host_key)
+    assert possession.status_code == 200, possession.text
+    assert possession.json() == {"verified": True, "version": 1}
+
+    review = await _review(client, start, auth)
+    approval = await _approve(client, start, user_id, auth, review, browser)
+    assert approval.status_code == 200, approval.text
+    poll = await _poll(client, start, host_public)
+    assert poll.status_code == 200, poll.text
+    assert "access_token" in poll.json()
+
+
 async def test_sas_relay_forwards_nonces_and_enforces_commit_reveal_order(client):
     # The server is a dumb relay for the committed-ephemeral SAS: it forwards Cd,
     # Nb/B, and Nd, and enforces that Nd is only recorded once Nb is present
@@ -2200,19 +2265,27 @@ async def test_sas_relay_forwards_nonces_and_enforces_commit_reveal_order(client
     }
 
     # Browser sees the commitment via pending.
-    pending = (await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)).json()
+    pending = (
+        await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)
+    ).json()
     assert pending["sas_commit"] == cd
     assert pending["sas_host_nonce"] is None
 
     # Commit-reveal ordering: the daemon revealing Nd BEFORE the browser's Nb is
     # present must NOT be recorded (a relay can't rush the reveal).
-    r = (await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})).json()
+    r = (
+        await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})
+    ).json()
     assert r["sas_browser_nonce"] is None and r["sas_host_nonce"] is None
 
     # Browser contributes Nb + B.
     ok = await client.post(
         "/api/auth/device/sas",
-        json={"approval_ref": ref, "sas_browser_nonce": nb, "browser_public_key": browser["public_key"]},
+        json={
+            "approval_ref": ref,
+            "sas_browser_nonce": nb,
+            "browser_public_key": browser["public_key"],
+        },
         headers=auth,
     )
     assert ok.status_code == 200, ok.text
@@ -2220,7 +2293,11 @@ async def test_sas_relay_forwards_nonces_and_enforces_commit_reveal_order(client
     # Set-once: a second browser contribution is refused (no swapping Nb later).
     dup = await client.post(
         "/api/auth/device/sas",
-        json={"approval_ref": ref, "sas_browser_nonce": _wire(os.urandom(32)), "browser_public_key": browser["public_key"]},
+        json={
+            "approval_ref": ref,
+            "sas_browser_nonce": _wire(os.urandom(32)),
+            "browser_public_key": browser["public_key"],
+        },
         headers=auth,
     )
     assert dup.status_code == 409
@@ -2232,9 +2309,13 @@ async def test_sas_relay_forwards_nonces_and_enforces_commit_reveal_order(client
     assert r["sas_host_nonce"] is None
 
     # Now the daemon reveals Nd (Nb present) — recorded and echoed.
-    r = (await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})).json()
+    r = (
+        await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})
+    ).json()
     assert r["sas_host_nonce"] == nd
 
     # Browser now sees Nd via pending; it can verify the commit and show the SAS.
-    pending = (await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)).json()
+    pending = (
+        await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)
+    ).json()
     assert pending["sas_host_nonce"] == nd

@@ -186,8 +186,12 @@ terminal state precisely so the residual is a chosen, contained trade.
   session gate) shows the four-digit number, the approver types it, the mutual
   endorsement lands, and the knock closes on it. Both roles run on the phone
   (`data/trust/ceremony.ts`, mirroring `approve-ceremony.ts`). The phone's
-  ceremony sheet keeps *Ask again* and the `spawnd login` pairing code as the
-  no-other-device fallback. A knock also reaches closed phones: the server
+  ceremony sheet keeps *Ask again*; with no other device signed in, the way in
+  is the possession link itself (§4): opened in a browser it makes that browser
+  a device that can answer this knock, and opened on the phone — the QR
+  `spawnd possess` renders, or the link as a universal link — it pins the
+  phone directly. There is no pairing code to type and no setup-claim command
+  any more. A knock also reaches closed phones: the server
   pushes "Approve spawn on iPhone?" to every install of the account except the
   one that asked (push tokens register with their browser device id), at most
   once per two minutes per knock; the tap opens the app, where the prompt takes

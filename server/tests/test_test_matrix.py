@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import stat
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +32,28 @@ def _owner_recovery_smoke_body() -> str:
 
 
 def test_all_shell_scripts_are_executable():
+    if os.name == "nt":
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={REPO_ROOT.as_posix()}",
+                "ls-files",
+                "--stage",
+                "scripts/*.sh",
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        missing = [
+            line.split("\t", 1)[1]
+            for line in result.stdout.splitlines()
+            if not line.startswith("100755 ")
+        ]
+        assert missing == []
+        return
     missing = [
         path.relative_to(REPO_ROOT).as_posix()
         for path in sorted(SCRIPTS_DIR.glob("*.sh"))

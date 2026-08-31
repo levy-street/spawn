@@ -1,3 +1,4 @@
+import { authToken } from "@/data/api/auth-token";
 import { buildAlertsSocketUrl } from "@/data/api/socket-urls";
 import { ReconnectingSocket, type SocketState } from "@/data/realtime/socket";
 
@@ -20,10 +21,10 @@ export interface AlertEvent {
  * whichever device they are looking at, not the one it happened on. A distinct
  * frame `type` keeps the alert validation exactly as narrow as it was.
  */
-export type TrustEventKind = "device.approval_requested" | "device.approval_resolved";
+export type DeviceApprovalTrustEventKind = "device.approval_requested" | "device.approval_resolved";
 
-export interface TrustEvent {
-  event: TrustEventKind;
+export interface DeviceApprovalTrustEvent {
+  event: DeviceApprovalTrustEventKind;
   request_id: string;
   browser_device_id: string;
   label: string | null;
@@ -33,9 +34,33 @@ export interface TrustEvent {
   at: string;
 }
 
+export interface HostPinUndeliveredTrustEvent {
+  event: "host.pin_undelivered";
+  host_id: string;
+  browser_device_id: string;
+  reason: "pin_limit" | "invalid_chain" | "other";
+}
+
+export type TrustEvent = DeviceApprovalTrustEvent | HostPinUndeliveredTrustEvent;
+
+/**
+ * A data-changed frame: some resource this account can see was written, by
+ * any client or by a daemon. Content-free by design — it names what kind of
+ * thing changed and the reader refetches what it already fetches. `origin`
+ * echoes the mutating client's `X-Spawn-Client` id so that client can skip
+ * the refetch it would only race with its own optimistic write.
+ */
+export interface DataEvent {
+  resource: string;
+  id: string | null;
+  origin: string | null;
+  at: string;
+}
+
 export type AlertFrame =
   | ({ type: "alert" } & AlertEvent)
   | ({ type: "trust" } & TrustEvent)
+  | ({ type: "data" } & DataEvent)
   | { type: "alerts.ping" }
   | { type: "protocol.required"; protocol: "spawn.alerts.v1"; version: 1 };
 
@@ -74,12 +99,27 @@ function isAlertEventKind(value: unknown): value is AlertEventKind {
   return value === "agent.finished" || value === "agent.awaiting_input" || value === "session.died";
 }
 
-function isTrustEventKind(value: unknown): value is TrustEventKind {
+function isDeviceApprovalTrustEventKind(value: unknown): value is DeviceApprovalTrustEventKind {
   return value === "device.approval_requested" || value === "device.approval_resolved";
 }
 
 function parseTrustFrame(frame: Record<string, unknown>): AlertFrame | null {
-  if (!isTrustEventKind(frame["event"])) return null;
+  if (frame["event"] === "host.pin_undelivered") {
+    const hostId = frame["host_id"];
+    const deviceId = frame["browser_device_id"];
+    const reason = frame["reason"];
+    if (typeof hostId !== "string" || hostId.length === 0) return null;
+    if (typeof deviceId !== "string" || deviceId.length === 0) return null;
+    if (reason !== "pin_limit" && reason !== "invalid_chain" && reason !== "other") return null;
+    return {
+      type: "trust",
+      event: "host.pin_undelivered",
+      host_id: hostId,
+      browser_device_id: deviceId,
+      reason,
+    };
+  }
+  if (!isDeviceApprovalTrustEventKind(frame["event"])) return null;
   const requestId = frame["request_id"];
   const deviceId = frame["browser_device_id"];
   if (typeof requestId !== "string" || requestId.length === 0) return null;
@@ -93,6 +133,30 @@ function parseTrustFrame(frame: Record<string, unknown>): AlertFrame | null {
     label: typeof frame["label"] === "string" ? frame["label"] : null,
     fingerprint: typeof frame["fingerprint"] === "string" ? frame["fingerprint"] : null,
     status: status === "approved" || status === "denied" ? status : null,
+    at: typeof frame["at"] === "string" ? frame["at"] : "",
+  };
+}
+
+function parseDataFrame(frame: Record<string, unknown>): AlertFrame | null {
+  const resource = frame["resource"];
+  // Matched against the reader's own effect map, not a list here: an unknown
+  // resource is a future server talking, and it maps to no effect.
+  if (typeof resource !== "string" || resource.length === 0 || resource.length > 64) return null;
+  const id = frame["id"];
+  if (id !== undefined && id !== null && (typeof id !== "string" || id.length > 64)) return null;
+  const origin = frame["origin"];
+  if (
+    origin !== undefined &&
+    origin !== null &&
+    (typeof origin !== "string" || origin.length > 64)
+  ) {
+    return null;
+  }
+  return {
+    type: "data",
+    resource,
+    id: typeof id === "string" ? id : null,
+    origin: typeof origin === "string" ? origin : null,
     at: typeof frame["at"] === "string" ? frame["at"] : "",
   };
 }
@@ -111,6 +175,9 @@ export function parseAlertFrame(value: unknown): AlertFrame | null {
   }
   if (frame.type === "trust") {
     return parseTrustFrame(parsed as Record<string, unknown>);
+  }
+  if (frame.type === "data") {
+    return parseDataFrame(parsed as Record<string, unknown>);
   }
   if (frame.type === "protocol.required") {
     return frame.protocol === ALERT_PROTOCOL && frame.version === 1
@@ -159,6 +226,8 @@ export class AlertSocketClient {
     this.socket = new ReconnectingSocket({
       url,
       protocol: ALERT_PROTOCOL,
+      ...(createWebSocket ? {} : { authorization: () => authToken.get() }),
+      watchdogFrameTypes: ["alerts.ping"],
       ...(createWebSocket ? { createWebSocket } : {}),
     });
     this.unsubscribeMessage = this.socket.onMessage((value) => {

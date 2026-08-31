@@ -196,6 +196,10 @@ class AuthProviderState(Base):
     # sitting in the database would be a usable credential; the invite table is
     # keyed on the same hash, so nothing is lost.
     invite_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # PKCE, carried across the provider round trip for native sign-ins. The
+    # client that opens the browser proves at redemption that it is the same
+    # client, so a code lured onto someone else's machine is useless there.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -223,6 +227,9 @@ class AuthProviderExchange(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    # Copied from the state row that minted this code. Non-NULL means the
+    # redeeming client must present the matching verifier.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -272,6 +279,84 @@ class PushDevice(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WebPushSubscription(Base):
+    """One browser that has asked to be told about alerts while it is closed.
+
+    The same intent as `PushDevice` and deliberately not the same table. The
+    two rows agree on almost nothing that matters:
+
+    - **What addresses them.** A phone is a 255-character opaque token handed
+      to one service. A browser is a URL on a host the vendor chose, plus two
+      key blobs the user agent minted (`p256dh`, `auth`) that the server needs
+      in order to encrypt at all. `PushDevice.token` is `String(255)` and NOT
+      NULL, and no honest reading of it holds a URL plus two keys; sharing the
+      table means three new columns that are always NULL for a phone and one
+      column that is always NULL for a browser, plus a `platform` filter on
+      every query that touches either.
+    - **How they are sent.** Expo takes a hundred messages in one POST. Web
+      Push is one encrypted POST per subscription, to a different origin each
+      time, with per-subscription failure handling. There is no fan-out to
+      share.
+    - **What "gone" looks like.** Expo answers 200 with a per-message error;
+      a push service answers 404 or 410 on the request itself.
+
+    What they do share is the account, the advisory `browser_device_id`, and
+    the retirement rule below — three columns and a convention, which is not
+    a table.
+
+    The unique key is the endpoint, for the same reason `PushDevice` keys on
+    the token: it is what the push service actually addresses, and it is what
+    rotates. A browser re-subscribes on its own schedule (a service worker
+    update, a `pushsubscriptionchange`, storage cleared) and the endpoint it
+    comes back with may be new, so registration is idempotent on the endpoint
+    and an endpoint arriving under a different account moves rather than
+    duplicates.
+
+    `disabled_at` is set when the push service says the subscription is gone
+    (404/410), never on a transient failure, and the row is kept so a later
+    re-subscribe is an update. `retry_after` is the other half of that: a
+    service that answers 429 has asked to be left alone until a stated time,
+    and this is where that request is remembered between sends.
+    """
+
+    __tablename__ = "web_push_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Text, not String(n): the endpoint is a URL on a host the browser vendor
+    # picked, and its length is theirs to change.
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    # The subscription's public key (uncompressed P-256 point) and auth secret,
+    # both base64url as the browser serialized them. Stored verbatim so what
+    # goes into the key derivation is exactly what the browser produced.
+    p256dh: Mapped[str] = mapped_column(String(255), nullable=False)
+    auth: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Recognition only, for a future "signed-in devices" screen. Never trusted.
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The browser device (trust identity) this subscription belongs to, so a
+    # knock is never pushed back to the browser that made it. Advisory routing
+    # only: it decides who is NOT told, never who is admitted.
+    browser_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set from a 429's Retry-After. Until it passes, this subscription is
+    # skipped rather than hammered.
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # A unique index rather than a unique column, so the name is ours and
+        # matches the one the migration creates.
+        Index("ix_web_push_subscriptions_endpoint", "endpoint", unique=True),
+    )
 
 
 class TrustBundle(Base):
@@ -370,6 +455,20 @@ class Host(Base):
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    daemon_tree: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    self_update: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    self_update_blocked: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    worker_mismatch: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    update_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    update_tree: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    update_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    update_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # The daemon advertises chain admission at register (mesh R9): once true,
     # the legacy per-host device-endorsement path is refused for this host so a
     # hostile server cannot steer admission onto the weaker rail. Ratchets up
@@ -419,6 +518,10 @@ class Host(Base):
         nullable=True,
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_disconnect_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_disconnect_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # What the machine is. Written once from `register` and stable after that,
     # so nothing here is refreshed per heartbeat. All nullable: a daemon older
     # than the field, or one running with SPAWND_NO_TELEMETRY, reports none of
@@ -527,6 +630,11 @@ class HostBrowserPin(Base):
     # browser keys it already trusts instead of believing this row.
     endorser_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     endorsement_signature: Mapped[str | None] = mapped_column(String(86), nullable=True)
+    # Old daemons send neither adoption ack nor nack, so NULL/NULL remains the
+    # backward-compatible optimistic state. A nack writes the reason; a later
+    # ack clears it and stamps delivered_at.
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    undelivered_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -1029,9 +1137,7 @@ class Workspace(Base):
     # Sidebar ordering, contiguous from 0 per owner. Archived rows leave that
     # space entirely — they order by `archived_at` and their `position` is
     # stale until a restore appends them back at the end.
-    position: Mapped[int] = mapped_column(
-        Integer, default=0, server_default="0", nullable=False
-    )
+    position: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     # The workspace's mark: a small square thumbnail as a self-contained
     # `data:image/(png|webp);base64,...` URL, checked on every write by
     # `schemas.validate_workspace_icon`. Null -> the sidebar draws the name's
@@ -1047,9 +1153,7 @@ class Workspace(Base):
     # session in it stopped. Nothing else moves — `layout` still names the same
     # windows and `position` still holds the slot the row will come back to. A
     # timestamp rather than a flag so the UI can say "archived 3 days ago".
-    archived_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -1108,9 +1212,7 @@ class RecentDir(Base):
     last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
-        UniqueConstraint(
-            "owner_user_id", "host_id", "path", name="uq_recent_dirs_owner_host_path"
-        ),
+        UniqueConstraint("owner_user_id", "host_id", "path", name="uq_recent_dirs_owner_host_path"),
     )
 
 

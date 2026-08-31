@@ -2,7 +2,8 @@
 
 The script under test exists because a bare `eas update` once shipped a
 production bundle with no API URL baked in (eas.json env applies to builds,
-not updates). These tests pin the refusal paths and both bake proofs.
+not updates). These tests pin the refusal paths and the API URL/mobile tree
+bake proofs.
 """
 
 from __future__ import annotations
@@ -13,11 +14,18 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="mobile release scripts require POSIX shell semantics"
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SCRIPT = REPO_ROOT / "scripts" / "update-mobile-prod.sh"
 
 API_URL = "https://spawnd.dev"
 UPDATE_ID = "01a03315-5d3c-7dd7-89e6-4b750ba1d299"
+_EXPECTED_TREE = object()
 
 
 def _run(cmd: list[str], cwd: Path, **kwargs) -> subprocess.CompletedProcess[str]:
@@ -39,7 +47,7 @@ def _git(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _write_executable(path: Path, body: str) -> None:
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -73,10 +81,14 @@ def _init_repo(tmp_path: Path) -> Path:
     return local
 
 
-def _manifest_body(update_id: str, api_url: str | None) -> str:
+def _manifest_body(
+    update_id: str, api_url: str | None, mobile_tree: str | None
+) -> str:
     extra: dict[str, object] = {"eas": {"projectId": "test-project-id"}}
     if api_url is not None:
         extra["apiUrl"] = api_url
+    if mobile_tree is not None:
+        extra["mobileTree"] = mobile_tree
     manifest = {"id": update_id, "extra": {"expoClient": {"extra": extra}}}
     # The real endpoint answers multipart; the script must cope with framing.
     return (
@@ -93,32 +105,50 @@ def _stub_tools(
     *,
     baked_api_url: str | None = API_URL,
     served_api_url: str | None = API_URL,
+    baked_mobile_tree: str | None | object = _EXPECTED_TREE,
+    served_mobile_tree: str | None | object = _EXPECTED_TREE,
     served_update_id: str = UPDATE_ID,
 ) -> tuple[Path, Path]:
     """Fake npx/eas/curl on PATH; git and node stay real."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "calls.log"
+    mobile_tree = _git(["rev-parse", "HEAD:mobile"], tmp_path / "local").stdout.strip()
+    if baked_mobile_tree is _EXPECTED_TREE:
+        baked_mobile_tree = mobile_tree
+    if served_mobile_tree is _EXPECTED_TREE:
+        served_mobile_tree = mobile_tree
 
-    expo_extra = "" if baked_api_url is None else f', "apiUrl": "{baked_api_url}"'
+    expo_extra: dict[str, object] = {"eas": {}}
+    if baked_api_url is not None:
+        expo_extra["apiUrl"] = baked_api_url
+    if isinstance(baked_mobile_tree, str):
+        expo_extra["mobileTree"] = baked_mobile_tree
+    expo_config = json.dumps({"name": "SPAWN D", "extra": expo_extra})
     _write_executable(
         bin_dir / "npx",
         "#!/usr/bin/env bash\n"
         f'echo "npx $*" >> "{log}"\n'
         f"cat <<'JSON'\n"
-        f'{{"name": "spawn", "extra": {{"eas": {{}}{expo_extra}}}}}\n'
+        f"{expo_config}\n"
         f"JSON\n",
     )
     _write_executable(
         bin_dir / "eas",
         "#!/usr/bin/env bash\n"
-        f'echo "eas $* EXPO_PUBLIC_API_URL=${{EXPO_PUBLIC_API_URL:-}}" >> "{log}"\n'
+        f'echo "eas $* EXPO_PUBLIC_API_URL=${{EXPO_PUBLIC_API_URL:-}} EXPO_PUBLIC_SPAWN_MOBILE_TREE=${{EXPO_PUBLIC_SPAWN_MOBILE_TREE:-}}" >> "{log}"\n'
         f"cat <<'JSON'\n"
         f'[{{"id": "{UPDATE_ID}", "platform": "ios"}}]\n'
         f"JSON\n",
     )
     body_file = tmp_path / "manifest.body"
-    body_file.write_text(_manifest_body(served_update_id, served_api_url))
+    body_file.write_text(
+        _manifest_body(
+            served_update_id,
+            served_api_url,
+            served_mobile_tree if isinstance(served_mobile_tree, str) else None,
+        )
+    )
     _write_executable(
         bin_dir / "curl",
         "#!/usr/bin/env bash\n"
@@ -129,7 +159,11 @@ def _stub_tools(
 
 
 def _env(bin_dir: Path) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k != "EXPO_PUBLIC_API_URL"}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"EXPO_PUBLIC_API_URL", "EXPO_PUBLIC_SPAWN_MOBILE_TREE"}
+    }
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["SPAWN_UPDATE_VERIFY_ATTEMPTS"] = "2"
     env["SPAWN_UPDATE_VERIFY_DELAY"] = "0"
@@ -200,6 +234,16 @@ def test_update_refuses_when_config_does_not_bake_the_url(tmp_path: Path):
         assert "eas update" not in log.read_text()
 
 
+def test_update_refuses_when_config_does_not_bake_the_mobile_tree(tmp_path: Path):
+    local = _init_repo(tmp_path)
+    bin_dir, log = _stub_tools(tmp_path, baked_mobile_tree=None)
+    result = _run([str(UPDATE_SCRIPT), "-m", "msg"], local, env=_env(bin_dir))
+    assert result.returncode != 0
+    assert "extra.mobileTree" in result.stderr
+    if log.exists():
+        assert "eas update" not in log.read_text()
+
+
 def test_update_publishes_with_the_url_baked_and_verifies_the_manifest(tmp_path: Path):
     local = _init_repo(tmp_path)
     bin_dir, log = _stub_tools(tmp_path)
@@ -208,6 +252,8 @@ def test_update_publishes_with_the_url_baked_and_verifies_the_manifest(tmp_path:
     calls = log.read_text()
     # The publish ran with the URL present in its environment, not inherited.
     assert f"EXPO_PUBLIC_API_URL={API_URL}" in calls
+    expected_tree = _git(["rev-parse", "HEAD:mobile"], local).stdout.strip()
+    assert f"EXPO_PUBLIC_SPAWN_MOBILE_TREE={expected_tree}" in calls
     assert "--branch production" in calls
     assert "verified" in result.stdout
 
@@ -215,6 +261,14 @@ def test_update_publishes_with_the_url_baked_and_verifies_the_manifest(tmp_path:
 def test_update_fails_when_served_manifest_lacks_the_url(tmp_path: Path):
     local = _init_repo(tmp_path)
     bin_dir, _ = _stub_tools(tmp_path, served_api_url=None)
+    result = _run([str(UPDATE_SCRIPT), "-m", "msg"], local, env=_env(bin_dir))
+    assert result.returncode != 0
+    assert "phones may be broken" in result.stderr
+
+
+def test_update_fails_when_served_manifest_lacks_the_mobile_tree(tmp_path: Path):
+    local = _init_repo(tmp_path)
+    bin_dir, _ = _stub_tools(tmp_path, served_mobile_tree=None)
     result = _run([str(UPDATE_SCRIPT), "-m", "msg"], local, env=_env(bin_dir))
     assert result.returncode != 0
     assert "phones may be broken" in result.stderr

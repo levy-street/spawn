@@ -8,9 +8,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from . import auth
 from .agents_builtin import seed_builtin_agents
 from .config import get_settings
+from .data_events import DataEventMiddleware
 from .db import dispose_engine, get_sessionmaker, init_engine
 from .redis import lifespan_shutdown as redis_shutdown
 from .redis import lifespan_startup as redis_startup
@@ -29,11 +33,13 @@ from .routes import hosts as hosts_routes
 from .routes import install as install_routes
 from .routes import profile as profile_routes
 from .routes import push as push_routes
+from .routes import release as release_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
+from .turn import validate_and_log_ice_config
 from .ws import alerts as alerts_ws
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
@@ -43,10 +49,41 @@ from .ws.broker import get_broker
 log = logging.getLogger("spawn.main")
 
 
+class SessionRenewalMiddleware:
+    """Attach a staged sliding cookie without changing endpoint task context.
+
+    A pure ASGI response hook matters here: ``BaseHTTPMiddleware`` moves the
+    downstream application into another task, which breaks request context
+    propagation and can buffer or otherwise interfere with streaming bodies.
+    WebSocket scopes pass straight through.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_renewal(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                state = scope.get("state")
+                token = state.get("session_renewal_token") if isinstance(state, dict) else None
+                if isinstance(token, str):
+                    MutableHeaders(scope=message).append(
+                        "set-cookie", auth.session_cookie_header(token)
+                    )
+            await send(message)
+
+        await self.app(scope, receive, send_with_renewal)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     log.info("starting spawn-server (db=%s redis=%s)", settings.database_url, settings.redis_url)
+    validate_and_log_ice_config(settings)
 
     init_engine()
     await redis_startup()
@@ -73,6 +110,8 @@ def create_app() -> FastAPI:
     app = FastAPI(title="spawn-server", version="0.1.0", lifespan=lifespan)
 
     settings = get_settings()
+    app.add_middleware(SessionRenewalMiddleware)
+    app.add_middleware(DataEventMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
@@ -95,6 +134,7 @@ def create_app() -> FastAPI:
     app.include_router(hosts_routes.router)
     app.include_router(profile_routes.router)
     app.include_router(push_routes.router)
+    app.include_router(release_routes.router)
     app.include_router(sessions_routes.router)
     app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)

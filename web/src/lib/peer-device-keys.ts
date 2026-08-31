@@ -173,8 +173,11 @@ export async function rememberPeerDeviceKey(
   await withStore(storage, "readwrite", async (store) => {
     const id = recordId(input.accountId, input.origin, input.publicKey);
     const existing = (await requestResult(store.get(id))) as StoredPeerDeviceKeyV1 | undefined;
-    const count = await requestResult(store.count());
-    if (existing === undefined && count >= PEER_DEVICE_KEY_MAX_RECORDS) {
+    const rows = (await requestResult(store.getAll())) as StoredPeerDeviceKeyV1[];
+    const activeInScope = rows.filter(
+      (row) => row.accountId === input.accountId && row.origin === input.origin,
+    ).length;
+    if (existing === undefined && activeInScope >= PEER_DEVICE_KEY_MAX_RECORDS) {
       throw new BrowserHostPinError("capacity_exceeded", "too many peer device keys");
     }
     const record: StoredPeerDeviceKeyV1 = {
@@ -224,5 +227,22 @@ export async function forgetPeerDeviceKey(
   assertInputs(input.accountId, input.origin, input.publicKey);
   await withStore(storage, "readwrite", async (store) => {
     await requestResult(store.delete(recordId(input.accountId, input.origin, input.publicKey)));
+  });
+}
+
+/** Remove every firsthand peer record for one account+origin. Other signed-in
+ * accounts in the same browser remain byte-for-byte untouched. */
+export async function forgetPeerDeviceKeys(
+  input: { accountId: string; origin: string },
+  storage: BrowserHostPinStorageOptions = {},
+): Promise<{ forgotten: number }> {
+  assertInputs(input.accountId, input.origin);
+  return withStore(storage, "readwrite", async (store) => {
+    const rows = (await requestResult(store.getAll())) as StoredPeerDeviceKeyV1[];
+    const scoped = rows.filter(
+      (row) => row.accountId === input.accountId && row.origin === input.origin,
+    );
+    for (const row of scoped) await requestResult(store.delete(row.recordId));
+    return { forgotten: scoped.length };
   });
 }

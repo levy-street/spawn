@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 import { getBaseUrl } from "@/data/api/config";
 import { getMe } from "@/data/api/endpoints/account";
 import { listAgents } from "@/data/api/endpoints/agents";
+import { listBrowserDevices } from "@/data/api/endpoints/devices";
 import {
   deleteHost,
   getHost,
@@ -10,10 +12,17 @@ import {
   listHosts,
   patchHost,
   patchHostAgentPolicy,
+  updateHost,
 } from "@/data/api/endpoints/hosts";
 import { listSessions } from "@/data/api/endpoints/sessions";
 import { listSkills } from "@/data/api/endpoints/skills";
-import type { HostAgentList, HostAgentPolicyOut, HostOut } from "@/data/api/schemas/hosts";
+import { getHostPins } from "@/data/api/endpoints/trust";
+import type {
+  HostAgentList,
+  HostAgentPolicyOut,
+  HostOut,
+  HostUpdateOut,
+} from "@/data/api/schemas/hosts";
 import { qk } from "@/data/queryKeys";
 import { openHostPinStore } from "@/data/trust/host-pins";
 
@@ -22,6 +31,8 @@ const HOST_REFRESH_MS = 30_000;
 const SESSIONS_REFRESH_MS = 5_000;
 const HOST_AGENTS_REFRESH_MS = 60_000;
 const HOST_AGENTS_STALE_MS = 30_000;
+const HOST_UPDATE_POLL_MS = 2_000;
+const HOST_UPDATE_POLL_LIMIT_MS = 3 * 60 * 1_000;
 
 export interface RenameHostInput {
   hostId: string;
@@ -105,6 +116,90 @@ export function useHostQuery(hostId: string) {
     refetchInterval: HOST_REFRESH_MS,
     enabled: hostId.length > 0,
   });
+}
+
+export function useHostPinsQuery(hostId: string) {
+  return useQuery({
+    queryKey: qk.hostPins(hostId),
+    queryFn: () => getHostPins(hostId),
+    enabled: hostId.length > 0,
+    retry: false,
+  });
+}
+
+export function useHostBrowserDevicesQuery(hostId: string) {
+  return useQuery({
+    queryKey: qk.browserDevices(),
+    queryFn: listBrowserDevices,
+    enabled: hostId.length > 0,
+  });
+}
+
+function withHostUpdate(host: HostOut, update: HostUpdateOut): HostOut {
+  return { ...host, update };
+}
+
+export function useUpdateHost(hostId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => updateHost(hostId),
+    onSuccess: ({ update }) => {
+      queryClient.setQueryData<HostOut>(qk.host(hostId), (host) =>
+        host ? withHostUpdate(host, update) : host,
+      );
+      queryClient.setQueryData<HostOut[]>(qk.hosts(), (hosts) =>
+        hosts?.map((host) => (host.id === hostId ? withHostUpdate(host, update) : host)),
+      );
+      if (update.state !== "updating") {
+        void Promise.all([
+          queryClient.invalidateQueries({ queryKey: qk.hosts() }),
+          queryClient.invalidateQueries({ queryKey: qk.host(hostId) }),
+        ]);
+      }
+    },
+  });
+}
+
+export function useHostUpdatePolling(host: HostOut, enabled: boolean) {
+  const queryClient = useQueryClient();
+  const startedAtRef = useRef<number | null>(null);
+  const sawUpdatingRef = useRef(false);
+  const pollingHostIdRef = useRef(host.id);
+  const query = useQuery({
+    queryKey: qk.host(host.id),
+    queryFn: () => getHost(host.id),
+    enabled,
+    placeholderData: host,
+    refetchInterval: ({ state }) => {
+      if (state.data?.update?.state !== "updating") return false;
+      startedAtRef.current ??= Date.now();
+      return Date.now() - startedAtRef.current < HOST_UPDATE_POLL_LIMIT_MS
+        ? HOST_UPDATE_POLL_MS
+        : false;
+    },
+  });
+
+  useEffect(() => {
+    pollingHostIdRef.current = host.id;
+    startedAtRef.current = null;
+    sawUpdatingRef.current = false;
+  }, [host.id]);
+
+  const state = query.data?.update?.state;
+  useEffect(() => {
+    if (state === "updating") {
+      sawUpdatingRef.current = true;
+      return;
+    }
+    if (!sawUpdatingRef.current) return;
+    sawUpdatingRef.current = false;
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: qk.hosts() }),
+      queryClient.invalidateQueries({ queryKey: qk.host(host.id) }),
+    ]);
+  }, [host.id, queryClient, state]);
+
+  return query;
 }
 
 export function useAllSessionsQuery() {

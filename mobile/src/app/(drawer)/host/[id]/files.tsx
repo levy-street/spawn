@@ -74,15 +74,16 @@ export default function HostFilesRoute() {
       </Screen>
     );
   }
+  // The explorer draws its own header: the folder's controls live in it.
   return (
-    <Screen header={header} padded={false}>
-      <FileExplorer
-        hostId={host.data.id}
-        hostIdentityPublicKey={host.data.host_public_key}
-        hostName={host.data.name}
-        {...(initialPath === undefined ? {} : { initialPath })}
-      />
-    </Screen>
+    <FileExplorer
+      hostId={host.data.id}
+      hostIdentityPublicKey={host.data.host_public_key}
+      hostName={host.data.name}
+      hostOS={host.data.os}
+      onBack={router.back}
+      {...(initialPath === undefined ? {} : { initialPath })}
+    />
   );
 }
 

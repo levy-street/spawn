@@ -5,8 +5,10 @@ import {
   isWithinHome,
   joinDirectory,
   listAllEntries,
+  normalizeAbsolutePath,
   normalizeCwdForHost,
   parentWithinHome,
+  pathBasename,
   visibleDirectories,
 } from "@/components/launcher/folder-picker-logic";
 import { loadLauncherRecents } from "@/data/queries/launcher";
@@ -46,6 +48,36 @@ describe("folder picker", () => {
       { label: "Home", path: "/home/ada" },
       { label: "dev", path: "/home/ada/dev" },
       { label: "spawn", path: "/home/ada/dev/spawn" },
+    ]);
+  });
+
+  test("navigates Windows drive paths without POSIX normalization", () => {
+    const home = "C:\\Users\\Ada";
+    expect(normalizeAbsolutePath("C:/Users\\Ada/Work/../src", "windows")).toBe(
+      "C:\\Users\\Ada\\src",
+    );
+    expect(joinDirectory(home, "project/src", "windows")).toBe("C:\\Users\\Ada\\project\\src");
+    expect(isWithinHome("c:\\users\\ada\\project", home, "windows")).toBe(true);
+    expect(isWithinHome("C:\\Users\\Adaptive", home, "windows")).toBe(false);
+    expect(parentWithinHome("c:\\users\\ada\\project", home, "windows")).toBe(home);
+    expect(normalizeCwdForHost("C:project", home, "windows")).toBe(home);
+    expect(pathBasename("C:\\Users\\Ada\\project", "windows")).toBe("project");
+    expect(breadcrumbParts("C:\\Users\\Ada\\project\\src", home, "windows")).toEqual([
+      { label: "Home", path: home },
+      { label: "project", path: "C:\\Users\\Ada\\project" },
+      { label: "src", path: "C:\\Users\\Ada\\project\\src" },
+    ]);
+  });
+
+  test("navigates UNC paths at the reported share ceiling", () => {
+    const home = "\\\\server\\share";
+    expect(normalizeCwdForHost("//SERVER/share/home/Ada", home, "windows")).toBe(
+      "\\\\SERVER\\share\\home\\Ada",
+    );
+    expect(parentWithinHome(home, home, "windows")).toBeNull();
+    expect(breadcrumbParts("\\\\server\\share\\home", home, "windows")).toEqual([
+      { label: home, path: home },
+      { label: "home", path: "\\\\server\\share\\home" },
     ]);
   });
 

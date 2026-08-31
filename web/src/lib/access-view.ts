@@ -69,6 +69,7 @@ export interface AccessView {
 
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
+const STALE_DEVICE_MS = 60 * 24 * HOUR;
 
 function parse(iso: string): number {
   const t = Date.parse(iso);
@@ -119,6 +120,25 @@ function deviceKind(name: string): DeviceVM["kind"] {
 
 function liveNonRoot(devices: AccessDevice[]): AccessDevice[] {
   return devices.filter((d) => d.revoked_at === null && !d.is_root);
+}
+
+/** Live roster order from the Phase D contract: most recently seen first.
+ * Missing/invalid timestamps are honest unknowns and sort last; creation time
+ * only breaks ties, it never pretends the device was seen. */
+export function sortLiveDevicesByLastSeen(devices: readonly AccessDevice[]): AccessDevice[] {
+  return liveNonRoot([...devices]).sort((a, b) => {
+    const aSeen = a.last_seen_at === null ? 0 : parse(a.last_seen_at);
+    const bSeen = b.last_seen_at === null ? 0 : parse(b.last_seen_at);
+    return bSeen - aSeen || parse(b.created_at) - parse(a.created_at) || a.id.localeCompare(b.id);
+  });
+}
+
+/** Exact stale-device badge copy, beyond (not at) the 60-day boundary. */
+export function staleDeviceLabel(lastSeenAt: string | null, now: Date): string | null {
+  if (lastSeenAt === null) return null;
+  const seenAt = Date.parse(lastSeenAt);
+  if (Number.isNaN(seenAt) || now.getTime() - seenAt <= STALE_DEVICE_MS) return null;
+  return `Not seen since ${shortDate(lastSeenAt, now)}`;
 }
 
 function rootIds(devices: AccessDevice[]): Set<string> {
@@ -193,7 +213,7 @@ export function deriveDeviceVMs(input: AccessViewInput, now: Date): DeviceVM[] {
     }
   }
 
-  const vms = liveNonRoot(input.devices).map((d): DeviceVM => {
+  return sortLiveDevicesByLastSeen(input.devices).map((d): DeviceVM => {
     const name = nameOf.get(d.id) ?? deviceDisplayName(d);
     const edge = inbound.get(d.id);
     let provenance: string;
@@ -229,16 +249,9 @@ export function deriveDeviceVMs(input: AccessViewInput, now: Date): DeviceVM[] {
       isThisDevice: d.id === input.currentDeviceId || undefined,
       provenance,
       lastSeen: seenLabel(d.last_seen_at ?? d.created_at, now),
+      staleLabel: staleDeviceLabel(d.last_seen_at, now) ?? undefined,
       waiting: waiting || undefined,
     };
-  });
-
-  // This device first, then waiting rows (they carry the screen's one call to
-  // action), then by recency of first sight.
-  return vms.sort((a, b) => {
-    if (a.isThisDevice !== b.isThisDevice) return a.isThisDevice ? -1 : 1;
-    if ((a.waiting ?? false) !== (b.waiting ?? false)) return a.waiting ? -1 : 1;
-    return 0;
   });
 }
 

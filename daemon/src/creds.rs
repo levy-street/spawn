@@ -13,7 +13,6 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -31,12 +30,14 @@ use spawnd::host_pair_approval::{self, HostPairApprovalTranscript};
 use spawnd::host_pair_possession::{
     sign_transcript, signature_to_wire, HostPairPossessionTranscript,
 };
+use spawnd::secret_file::{self, SecretFile};
 use spawnd::signed_signal::{public_key_from_wire, public_key_to_wire, SignedSignalTranscript};
 use spawnd::signed_signal_wire::{sign_rtc_signal_wire, RtcProtocol};
 
 const KEYRING_SERVICE: &str = "spawn";
 /// Pre-scoping releases used this global account. Only the canonical default
 /// config directory may probe it for a one-time, conflict-checked migration.
+#[cfg(any(not(windows), test))]
 const KEYRING_USER: &str = "daemon";
 const KEYRING_SCOPED_USER_PREFIX: &str = "daemon:";
 
@@ -53,6 +54,17 @@ const CANONICAL_UUID_BYTES: usize = 36;
 const PUBLIC_KEY_WIRE_BYTES: usize = 43;
 const FINGERPRINT_WIRE_BYTES: usize = 23;
 const CREDENTIAL_LOCK_FILE: &str = ".credentials.lock";
+
+/// How this file is handled on disk. The rules live in `spawnd::secret_file`
+/// because the macOS companion keeps its own secrets under exactly the same
+/// ones; only the vocabulary below is ours. The temporary prefix in particular
+/// is a boundary, not a name: a writer sweeping stale temporaries must be able
+/// to tell its own from another program's sharing the directory.
+const CREDENTIAL_FILE: SecretFile = SecretFile::new(
+    "credential fallback",
+    ".credentials.",
+    MAX_CREDENTIALS_FILE_BYTES,
+);
 
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +127,7 @@ pub struct BrowserPin {
 }
 
 impl BrowserPin {
+    #[allow(dead_code)] // Retained for credential/status golden tests.
     pub fn device_id(&self) -> Uuid {
         // Construction and credential loading validate this exact field.
         Uuid::parse_str(&self.browser_device_id).expect("validated browser device UUID")
@@ -158,6 +171,22 @@ impl BrowserPin {
         Ok(true)
     }
 
+    /// The account this pin's retained approval proof names, once that proof
+    /// re-verifies against this host's key. `None` for a pin with no proof
+    /// (created before proofs were retained, or by a server that supplied
+    /// none) and for one that does not verify — a verdict is re-derived from
+    /// the evidence here, never read back from a stored flag.
+    pub fn proven_account_id(&self, host_public_key: &str) -> Option<&str> {
+        match self.verify_approval(host_public_key) {
+            Ok(true) => self
+                .approval_proof
+                .as_ref()
+                .map(|proof| proof.account_id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)] // Retained for credential/status golden tests.
     pub fn key_algorithm(&self) -> &str {
         &self.browser_key_algorithm
     }
@@ -167,6 +196,7 @@ impl BrowserPin {
         &self.browser_public_key
     }
 
+    #[allow(dead_code)] // Retained for credential/status golden tests.
     pub fn fingerprint(&self) -> &str {
         &self.browser_key_fingerprint
     }
@@ -175,9 +205,17 @@ impl BrowserPin {
 const CREDENTIAL_RECORD_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // NativeKeyring is retained for non-Unix/Windows targets and policy tests.
 enum BackendPolicy {
     UnixCompleteFile,
+    WindowsCompleteFile,
     NativeKeyring,
+}
+
+impl BackendPolicy {
+    fn complete_file(self) -> bool {
+        matches!(self, Self::UnixCompleteFile | Self::WindowsCompleteFile)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +246,19 @@ impl StoredCreds {
 
     pub fn browser_pins(&self) -> &[BrowserPin] {
         &self.browser_pins
+    }
+
+    /// This host's account as its own pins prove it: the account id each
+    /// retained browser approval was signed over, re-verified against this
+    /// host's key. It is the one locally anchored answer to "whose host is
+    /// this", so the server's claim about it is checked against this rather
+    /// than taken. `None` while no pin carries a proof.
+    pub fn proven_account_id(&self) -> Option<String> {
+        let identity = host_identity(self).ok().flatten()?;
+        self.browser_pins
+            .iter()
+            .find_map(|pin| pin.proven_account_id(&identity.public_key))
+            .map(str::to_owned)
     }
 
     #[allow(dead_code)] // Consumed by the later signed-wire verification hook.
@@ -318,6 +369,23 @@ pub fn validate_login_access_token(access_token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Commit a server-rotated daemon token as a new whole credential generation.
+/// The remaining host identity, pins, server, and Host ID move atomically with
+/// it through the same conflict-checked path used by login.
+pub fn replace_access_token(access_token: &str) -> Result<()> {
+    validate_login_access_token(access_token)?;
+    let mut stored = load().context("loading credentials for daemon token rotation")?;
+    let expected = credential_revision(&stored)?;
+    if stored.access_token.as_deref() == Some(access_token) {
+        return Ok(());
+    }
+    if let Some(old) = stored.access_token.as_mut() {
+        old.zeroize();
+    }
+    stored.access_token = Some(access_token.to_owned());
+    save(&mut stored, &expected).context("persisting rotated daemon token")
+}
+
 pub fn browser_key_fingerprint(public_key: &str) -> Result<String> {
     if public_key.len() != PUBLIC_KEY_WIRE_BYTES {
         bail!("approved browser public key has the wrong encoded length")
@@ -375,14 +443,41 @@ fn retain_live_browser_pins(creds: &mut StoredCreds, live_device_ids: &[String])
 /// browser to this host no matter what it puts in the frame.
 ///
 /// Returns how many pins were adopted.
+#[allow(dead_code)] // Compatibility wrapper used by focused credential tests.
 pub fn adopt_endorsed_browser_pins(
     account_id: &str,
     proposed: &[ProposedBrowserPin],
 ) -> Result<usize> {
+    Ok(adopt_endorsed_browser_pins_report(account_id, proposed)?
+        .into_iter()
+        .filter(|outcome| outcome.newly_adopted)
+        .count())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinAdoptionOutcome {
+    pub device_id: String,
+    pub newly_adopted: bool,
+    pub reason: Option<&'static str>,
+}
+
+/// Adopt proposed pins while retaining a per-device acknowledgement result for
+/// the control plane. Invalid proposals never mutate the pin store.
+pub fn adopt_endorsed_browser_pins_report(
+    account_id: &str,
+    proposed: &[ProposedBrowserPin],
+) -> Result<Vec<PinAdoptionOutcome>> {
     let mut stored = load().context("loading credentials to adopt endorsed browser pins")?;
     let expected = credential_revision(&stored)?;
     let Some(identity) = host_identity(&stored)? else {
-        return Ok(0);
+        return Ok(proposed
+            .iter()
+            .map(|candidate| PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            })
+            .collect());
     };
     let host_key = public_key_from_wire(&identity.public_key)
         .context("decoding the stored host public key")?;
@@ -396,19 +491,30 @@ pub fn adopt_endorsed_browser_pins(
         .filter_map(|pin| public_key_from_wire(&pin.browser_public_key).ok())
         .collect();
 
-    let mut adopted = 0;
+    let mut outcomes = Vec::with_capacity(proposed.len());
+    let mut adopted = 0usize;
     for candidate in proposed {
         if stored
             .browser_pins
             .iter()
             .any(|pin| pin.browser_device_id == candidate.device_id)
         {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: None,
+            });
             continue;
         }
         let (Some(endorser), Some(signature_wire)) = (
             &candidate.endorser_public_key,
             &candidate.endorsement_signature,
         ) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         };
         let Ok(transcript) = BrowserEndorsementTranscript::from_wire(
@@ -418,32 +524,72 @@ pub fn adopt_endorsed_browser_pins(
             &candidate.public_key,
             &candidate.device_id,
         ) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         };
         let Ok(signature) = browser_endorsement::signature_from_wire(signature_wire) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         };
         if browser_endorsement::verify_endorsement(&transcript, &signature, &host_key, &trusted)
             .is_err()
         {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         }
-        let pin = browser_pin_from_approval(
+        let Ok(pin) = browser_pin_from_approval(
             &candidate.device_id,
             &candidate.key_algorithm,
             &candidate.public_key,
             &candidate.fingerprint,
-        )
-        .context("validating an endorsed browser pin")?;
-        if merge_browser_pin(&mut stored, pin)? {
+        ) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
+            continue;
+        };
+        if stored.browser_pins.len() >= MAX_BROWSER_PINS {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("pin_limit"),
+            });
+            continue;
+        }
+        if merge_browser_pin(&mut stored, pin).is_err() {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("other"),
+            });
+            continue;
+        } else {
             adopted += 1;
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: true,
+                reason: None,
+            });
         }
     }
-    if adopted == 0 {
-        return Ok(0);
+    if adopted > 0 {
+        save(&mut stored, &expected).context("persisting adopted browser pins")?;
     }
-    save(&mut stored, &expected).context("persisting adopted browser pins")?;
-    Ok(adopted)
+    Ok(outcomes)
 }
 
 /// A pin the server proposes, before any verification.
@@ -604,7 +750,11 @@ fn platform_policy() -> BackendPolicy {
     {
         BackendPolicy::UnixCompleteFile
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        BackendPolicy::WindowsCompleteFile
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         BackendPolicy::NativeKeyring
     }
@@ -612,9 +762,8 @@ fn platform_policy() -> BackendPolicy {
 
 fn keyring_scope() -> Result<KeyringScope> {
     let configured = config::config_dir()?;
-    let default = dirs::config_dir()
-        .context("cannot resolve default user config dir")?
-        .join("spawn");
+    let default =
+        crate::platform::default_config_base().context("cannot resolve default user config dir")?;
     keyring_scope_at(&configured, &default)
 }
 
@@ -671,7 +820,7 @@ fn load_without_keyring(from_file: Option<StoredCreds>) -> Result<StoredCreds> {
     let Some(mut from_file) = from_file else {
         return Ok(StoredCreds::default());
     };
-    if platform_policy() == BackendPolicy::NativeKeyring && !record_is_empty(&from_file) {
+    if !platform_policy().complete_file() && !record_is_empty(&from_file) {
         zeroize_stored_creds(&mut from_file);
         bail!("native credential metadata requires its matching OS keyring record")
     }
@@ -741,6 +890,7 @@ pub(crate) fn validate_live_record(creds: &StoredCreds) -> Result<()> {
     validate_complete_current_record(creds)
 }
 
+#[cfg(any(not(windows), test))]
 fn reconcile_backend_records(
     from_file: Option<StoredCreds>,
     from_keyring: Option<StoredCreds>,
@@ -755,7 +905,7 @@ fn reconcile_backend_records(
     match (from_file, from_keyring, file_order, keyring_order) {
         (None, None, _, _) => Ok(StoredCreds::default()),
         (Some(file), None, _, _) => match policy {
-            BackendPolicy::UnixCompleteFile => Ok(file),
+            BackendPolicy::UnixCompleteFile | BackendPolicy::WindowsCompleteFile => Ok(file),
             BackendPolicy::NativeKeyring if record_is_empty(&file) => Ok(file),
             BackendPolicy::NativeKeyring => {
                 let mut file = file;
@@ -766,7 +916,7 @@ fn reconcile_backend_records(
         (None, Some(keyring), _, _) => Ok(keyring),
         (Some(file), Some(keyring), None, None) => reconcile_legacy_records(file, keyring, policy),
         (Some(mut file), Some(keyring), Some(_), None) => match policy {
-            BackendPolicy::UnixCompleteFile => {
+            BackendPolicy::UnixCompleteFile | BackendPolicy::WindowsCompleteFile => {
                 let mut keyring = keyring;
                 zeroize_stored_creds(&mut keyring);
                 Ok(file)
@@ -779,7 +929,7 @@ fn reconcile_backend_records(
             }
         },
         (Some(mut file), Some(keyring), None, Some(_)) => match policy {
-            BackendPolicy::UnixCompleteFile
+            BackendPolicy::UnixCompleteFile | BackendPolicy::WindowsCompleteFile
                 if file.access_token.is_some() || file.host_private_key_seed.is_some() =>
             {
                 let mut keyring = keyring;
@@ -792,7 +942,7 @@ fn reconcile_backend_records(
             }
         },
         (Some(file), Some(keyring), Some(file_order), Some(keyring_order)) => match policy {
-            BackendPolicy::UnixCompleteFile => {
+            BackendPolicy::UnixCompleteFile | BackendPolicy::WindowsCompleteFile => {
                 choose_complete_record(file, keyring, file_order, keyring_order)
             }
             BackendPolicy::NativeKeyring => {
@@ -827,6 +977,7 @@ fn record_is_empty(creds: &StoredCreds) -> bool {
         && creds.browser_pins.is_empty()
 }
 
+#[cfg(any(not(windows), test))]
 fn choose_complete_record(
     mut file: StoredCreds,
     mut keyring: StoredCreds,
@@ -845,6 +996,7 @@ fn choose_complete_record(
     Ok(file)
 }
 
+#[cfg(any(not(windows), test))]
 fn reconcile_legacy_records(
     mut file: StoredCreds,
     mut keyring: StoredCreds,
@@ -854,7 +1006,7 @@ fn reconcile_legacy_records(
     // succeeded. Prefer that coherent legacy set rather than allowing a stale
     // keyring token to override it. Older metadata-only/native layouts fill
     // only absent fields and reject every conflicting value.
-    if policy == BackendPolicy::UnixCompleteFile
+    if policy.complete_file()
         && (file.access_token.is_some() || file.host_private_key_seed.is_some())
     {
         zeroize_stored_creds(&mut keyring);
@@ -891,6 +1043,7 @@ fn reconcile_legacy_records(
 /// account into the canonical default directory's scoped account. Unlike
 /// ordinary Unix reconciliation, migration never silently prefers one side:
 /// every overlapping field and pin must agree.
+#[cfg(any(not(windows), test))]
 fn legacy_migration_record(
     from_file: Option<StoredCreds>,
     mut legacy_keyring: StoredCreds,
@@ -904,7 +1057,9 @@ fn legacy_migration_record(
     match (file_order, keyring_order) {
         (Some(_), Some(_)) => {
             let matches = match policy {
-                BackendPolicy::UnixCompleteFile => file == legacy_keyring,
+                BackendPolicy::UnixCompleteFile | BackendPolicy::WindowsCompleteFile => {
+                    file == legacy_keyring
+                }
                 BackendPolicy::NativeKeyring => {
                     let mut projection = file_creds_without_private_seed(&legacy_keyring);
                     let matches = projection == file;
@@ -918,7 +1073,7 @@ fn legacy_migration_record(
                 bail!("default config file conflicts with the legacy global keyring record")
             }
             match policy {
-                BackendPolicy::UnixCompleteFile => {
+                BackendPolicy::UnixCompleteFile | BackendPolicy::WindowsCompleteFile => {
                     zeroize_stored_creds(&mut legacy_keyring);
                     Ok(file)
                 }
@@ -950,6 +1105,7 @@ fn legacy_migration_record(
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn legacy_record_is_subset(subset: &StoredCreds, complete: &StoredCreds) -> bool {
     fn field_is_subset<T: PartialEq>(subset: &Option<T>, complete: &Option<T>) -> bool {
         subset
@@ -969,6 +1125,7 @@ fn legacy_record_is_subset(subset: &StoredCreds, complete: &StoredCreds) -> bool
             .all(|pin| complete.browser_pins.contains(pin))
 }
 
+#[cfg(any(not(windows), test))]
 fn reconcile_legacy_records_strict(
     mut file: StoredCreds,
     mut keyring: StoredCreds,
@@ -1000,6 +1157,7 @@ fn reconcile_legacy_records_strict(
     Ok(file)
 }
 
+#[cfg(any(not(windows), test))]
 fn merge_legacy_field<T: PartialEq>(
     target: &mut Option<T>,
     source: &mut Option<T>,
@@ -1022,54 +1180,7 @@ fn with_credential_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
 
 fn with_credential_lock_at<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
     validate_credential_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
-    let file = open_credential_lock(path)?;
-    file.lock()
-        .with_context(|| format!("locking {}", path.display()))?;
-    let outcome = operation();
-    let unlock = file
-        .unlock()
-        .with_context(|| format!("unlocking {}", path.display()));
-    drop(file);
-    match outcome {
-        Ok(value) => {
-            unlock?;
-            Ok(value)
-        }
-        Err(error) => {
-            // Closing the file releases the OS lock even if explicit unlock
-            // itself failed; preserve the operation error as the primary cause.
-            let _ = unlock;
-            Err(error)
-        }
-    }
-}
-
-#[cfg(unix)]
-fn open_credential_lock(path: &Path) -> Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags};
-
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .with_context(|| format!("opening credential lock {}", path.display()))?;
-    let file = std::fs::File::from(fd);
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspecting credential lock {}", path.display()))?;
-    validate_unix_credentials_metadata(path, &metadata, rustix::process::geteuid().as_raw())?;
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn open_credential_lock(path: &Path) -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(path)
-        .with_context(|| format!("opening credential lock {}", path.display()))
+    CREDENTIAL_FILE.lock(path, operation)
 }
 
 /// Load one complete credential generation. Backend records are never overlaid:
@@ -1098,23 +1209,31 @@ pub(crate) fn load_for_live_reload() -> Result<StoredCreds> {
 }
 
 fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> Result<StoredCreds> {
+    #[cfg(windows)]
+    {
+        load_without_keyring(load_file_record()?)
+    }
+
     #[cfg(unix)]
     let from_file = load_file_record()?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let mut from_file = load_file_record();
 
+    #[cfg(not(windows))]
     if keyring_disabled() {
         #[cfg(unix)]
         return load_without_keyring(from_file);
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         return load_without_keyring(from_file?);
     }
 
+    #[cfg(not(windows))]
     let scope = keyring_scope()?;
     #[cfg(unix)]
     let file_for_migration = from_file.as_ref();
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let file_for_migration = from_file.as_ref().ok().and_then(Option::as_ref);
+    #[cfg(not(windows))]
     let keyring_result = read_scoped_keyring_record(&scope, file_for_migration, platform_policy());
     #[cfg(unix)]
     {
@@ -1124,7 +1243,7 @@ fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> R
             _warn_unix_keyring_unavailable,
         )
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let from_keyring = match keyring_result {
             Ok(record) => record,
@@ -1168,7 +1287,7 @@ fn resolve_unix_keyring_read_with_warning(
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 fn reconcile_native_projection<F>(
     from_file: Result<Option<StoredCreds>>,
     mut from_keyring: Option<StoredCreds>,
@@ -1209,11 +1328,10 @@ where
     }
 }
 
-/// Persist one new coherent generation. On Unix the mode-0600 file is the
-/// required complete fallback and the keyring is a redundant complete copy.
-/// On other platforms the native keyring is required because it is the only
-/// copy containing the host private seed; the metadata file is its generation-
-/// matched seed-free projection.
+/// Persist one new coherent generation. Unix uses the mode-0600 complete file
+/// as its commit point and may mirror to a keyring. Windows uses only its
+/// owner-DACL-protected complete file because Credential Manager cannot hold
+/// the accepted record size. Other platforms retain the native-keyring policy.
 pub fn save(creds: &mut StoredCreds, expected: &CredentialRevision) -> Result<()> {
     let policy = platform_policy();
     with_credential_lock(|| {
@@ -1224,8 +1342,11 @@ pub fn save(creds: &mut StoredCreds, expected: &CredentialRevision) -> Result<()
             load_unlocked,
             policy,
             |candidate| {
+                if policy == BackendPolicy::WindowsCompleteFile {
+                    return Ok(());
+                }
                 if keyring_disabled() {
-                    if policy == BackendPolicy::UnixCompleteFile {
+                    if policy.complete_file() {
                         return Ok(());
                     }
                     bail!("OS keyring is disabled")
@@ -1295,27 +1416,27 @@ where
     // bounds, before either backend can observe an update.
     validate_persistable_creds(creds)?;
     validate_complete_current_record(creds)?;
-    let keyring_result = set_keyring(creds);
     match policy {
         BackendPolicy::UnixCompleteFile => {
-            if let Err(error) = keyring_result {
+            if let Err(error) = set_keyring(creds) {
                 tracing::warn!(error = %error, "keyring write failed; committing the complete Unix file fallback");
             }
             save_file(creds)
         }
+        BackendPolicy::WindowsCompleteFile => save_file(creds),
         BackendPolicy::NativeKeyring => {
-            keyring_result.context("persisting required native-keyring credential record")?;
+            set_keyring(creds).context("persisting required native-keyring credential record")?;
             save_file(creds)
         }
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
     save_file(creds)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
     // Non-Unix platforms do not have this module's audited mode-0600 fallback.
     // Keep public metadata and the legacy token fallback, but the private seed
@@ -1326,6 +1447,7 @@ fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
     result
 }
 
+#[cfg(any(not(windows), test))]
 fn file_creds_without_private_seed(creds: &StoredCreds) -> StoredCreds {
     // Construct this field-by-field: cloning the whole value would transiently
     // copy the private seed before replacing it with None.
@@ -1451,16 +1573,7 @@ fn host_signing_key(creds: &StoredCreds) -> Result<Option<SigningKey>> {
 
 /// Wipe stored creds (file + keyring).
 pub async fn logout() -> Result<()> {
-    let outcome = with_credential_lock(|| {
-        let path = config::credentials_path()?;
-        cleanup_stale_credential_temps(&path)?;
-        clear_stored_credentials(
-            Ok(path),
-            keyring_delete,
-            |path| std::fs::remove_file(path),
-            sync_parent_directory,
-        )
-    })?;
+    let outcome = reset_local_credentials()?;
     if outcome.file_removed {
         let path = outcome
             .path
@@ -1472,7 +1585,34 @@ pub async fn logout() -> Result<()> {
     Ok(())
 }
 
-struct ClearOutcome {
+/// Clear both credential backends without presentation output. Recovery
+/// commands use this before removing the rest of the instance directory.
+pub(crate) fn reset_local_credentials() -> Result<ClearOutcome> {
+    with_credential_lock(|| {
+        let path = config::credentials_path()?;
+        cleanup_stale_credential_temps(&path)?;
+        clear_stored_credentials(
+            Ok(path),
+            keyring_delete,
+            |path| std::fs::remove_file(path),
+            sync_parent_directory,
+        )
+    })
+}
+
+/// Remove only the daemon token while retaining the host identity, server,
+/// Host ID, and browser pins for a one-approval re-attachment.
+pub fn logout_keep_identity() -> Result<()> {
+    let mut stored = load().context("loading credentials to sign out")?;
+    let expected = credential_revision(&stored)?;
+    if let Some(token) = stored.access_token.as_mut() {
+        token.zeroize();
+    }
+    stored.access_token = None;
+    save(&mut stored, &expected).context("persisting signed-out host identity")
+}
+
+pub(crate) struct ClearOutcome {
     path: Option<PathBuf>,
     file_removed: bool,
 }
@@ -1543,6 +1683,7 @@ fn keyring_disabled() -> bool {
 
 /// `spawnd status` — print what we know. The "server:" line shows the URL the
 /// other commands would actually use: explicit flag/env, else the stored one.
+#[allow(dead_code)] // Pre-TUI formatter retained for byte-equality regression tests.
 pub async fn status(server_cli: Option<String>) -> Result<()> {
     let creds = load().context("loading stored credentials")?;
     let server = config::server_url_for_instance(server_cli, creds.server_url.as_deref())?;
@@ -1550,6 +1691,7 @@ pub async fn status(server_cli: Option<String>) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn format_status(server: &str, creds: &StoredCreds) -> Result<String> {
     let mut output = String::new();
     writeln!(&mut output, "server:     {server}")?;
@@ -1606,6 +1748,7 @@ fn keyring_entry(user: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, user).context("constructing keyring entry")
 }
 
+#[cfg(not(windows))]
 fn keyring_get_for_user(user: &str) -> Result<Option<String>> {
     let entry = keyring_entry(user)?;
     match entry.get_password() {
@@ -1615,6 +1758,7 @@ fn keyring_get_for_user(user: &str) -> Result<Option<String>> {
     }
 }
 
+#[cfg(any(not(windows), test))]
 #[derive(Debug)]
 struct KeyringReadFailure {
     error: anyhow::Error,
@@ -1623,6 +1767,7 @@ struct KeyringReadFailure {
     unavailable: bool,
 }
 
+#[cfg(not(windows))]
 fn read_scoped_keyring_record(
     scope: &KeyringScope,
     from_file: Option<&StoredCreds>,
@@ -1638,6 +1783,7 @@ fn read_scoped_keyring_record(
     )
 }
 
+#[cfg(any(not(windows), test))]
 fn read_scoped_keyring_record_with<G, S, D>(
     scope: &KeyringScope,
     from_file: Option<&StoredCreds>,
@@ -1702,6 +1848,7 @@ where
     Ok(Some(migrated))
 }
 
+#[cfg(any(not(windows), test))]
 fn decode_keyring_value(value: &str) -> Result<StoredCreds> {
     if value.len() > MAX_CREDENTIALS_FILE_BYTES {
         bail!("stored keyring credential bundle is too large")
@@ -1731,6 +1878,7 @@ fn decode_keyring_value(value: &str) -> Result<StoredCreds> {
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn decode_keyring_value_and_wipe(value: &mut String) -> Result<StoredCreds> {
     let decoded = decode_keyring_value(value);
     value.zeroize();
@@ -1763,11 +1911,20 @@ fn keyring_set_for_user(user: &str, creds: &StoredCreds) -> Result<()> {
     result.map_err(Into::into)
 }
 
+#[cfg(not(windows))]
 fn keyring_delete() -> Result<()> {
     let scope = keyring_scope()?;
     delete_keyring_scope_with(&scope, keyring_delete_for_user)
 }
 
+#[cfg(windows)]
+fn keyring_delete() -> Result<()> {
+    // Windows credentials are authoritative only in the protected complete
+    // file; SPAWN D never creates a Credential Manager mirror.
+    Ok(())
+}
+
+#[cfg(any(not(windows), test))]
 fn delete_keyring_scope_with<D>(scope: &KeyringScope, mut delete: D) -> Result<()>
 where
     D: FnMut(&str) -> Result<()>,
@@ -1788,6 +1945,7 @@ where
     }
 }
 
+#[cfg(not(windows))]
 fn keyring_delete_for_user(user: &str) -> Result<()> {
     let entry = keyring_entry(user)?;
     match entry.delete_credential() {
@@ -1822,7 +1980,7 @@ fn load_file_record_at(path: &Path) -> Result<Option<StoredCreds>> {
         zeroize_stored_creds(&mut creds);
         return Err(error);
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Err(error) = validate_complete_current_record(&creds) {
         zeroize_stored_creds(&mut creds);
         return Err(error);
@@ -1976,6 +2134,13 @@ fn zeroize_stored_creds(creds: &mut StoredCreds) {
     creds.wipe_sensitive_fields();
 }
 
+#[cfg(windows)]
+fn validate_credential_directory(path: &Path) -> Result<()> {
+    crate::platform::validate_private_dir(path)
+        .with_context(|| format!("validating credential directory {}", path.display()))
+}
+
+#[cfg(not(windows))]
 fn validate_credential_directory(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspecting credential directory {}", path.display()))?;
@@ -2005,242 +2170,21 @@ fn validate_credential_directory(path: &Path) -> Result<()> {
 }
 
 fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(path)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        // The Windows replacement primitive below requests write-through. Some
-        // other platforms cannot open directories as files, so there is no
-        // additional portable directory handle to flush here.
-        let _ = path;
-        Ok(())
-    }
+    secret_file::sync_parent_directory(path)
 }
 
 fn cleanup_stale_credential_temps(credentials_path: &Path) -> Result<()> {
     let parent = credentials_path.parent().unwrap_or_else(|| Path::new("."));
     validate_credential_directory(parent)?;
-    let mut removed = false;
-    for entry in std::fs::read_dir(parent)
-        .with_context(|| format!("enumerating credential directory {}", parent.display()))?
-    {
-        let entry = entry.with_context(|| format!("reading {}", parent.display()))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(record_id) = name
-            .strip_prefix(".credentials.")
-            .and_then(|name| name.strip_suffix(".tmp"))
-        else {
-            continue;
-        };
-        let Ok(parsed) = Uuid::parse_str(record_id) else {
-            continue;
-        };
-        if parsed.to_string() != record_id {
-            continue;
-        }
-        let path = entry.path();
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspecting {}", path.display()))
-            }
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.permissions().mode() & 0o777 != 0o600
-            {
-                continue;
-            }
-        }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("removing stale credential temporary {}", path.display()))?;
-        removed = true;
-    }
-    if removed {
-        sync_parent_directory(parent)
-            .with_context(|| format!("syncing credential directory {}", parent.display()))?;
-    }
-    Ok(())
+    CREDENTIAL_FILE.cleanup_stale_temporaries(credentials_path)
 }
 
-#[cfg(unix)]
 fn read_credentials_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    use rustix::fs::{Mode, OFlags};
-
-    let fd = match rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
-    };
-    let mut file = std::fs::File::from(fd);
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspecting {}", path.display()))?;
-    validate_unix_credentials_metadata(path, &metadata, rustix::process::geteuid().as_raw())?;
-    if metadata.len() > MAX_CREDENTIALS_FILE_BYTES as u64 {
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    let mut raw = Vec::with_capacity(metadata.len() as usize);
-    let read_result = Read::by_ref(&mut file)
-        .take((MAX_CREDENTIALS_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut raw)
-        .with_context(|| format!("reading {}", path.display()));
-    if let Err(error) = read_result {
-        raw.zeroize();
-        return Err(error);
-    }
-    if raw.len() > MAX_CREDENTIALS_FILE_BYTES {
-        raw.zeroize();
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    Ok(Some(raw))
-}
-
-#[cfg(unix)]
-fn validate_unix_credentials_metadata(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-    expected_uid: u32,
-) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    if !metadata.is_file() {
-        bail!(
-            "credential fallback is not a regular file: {}",
-            path.display()
-        )
-    }
-    if metadata.uid() != expected_uid {
-        bail!(
-            "credential fallback is not owned by the current user: {}",
-            path.display()
-        )
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        bail!(
-            "credential fallback has group or other permissions: {}",
-            path.display()
-        )
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn read_credentials_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("inspecting {}", path.display())),
-    };
-    if !metadata.is_file() {
-        bail!(
-            "credential fallback is not a regular file: {}",
-            path.display()
-        )
-    }
-    if metadata.len() > MAX_CREDENTIALS_FILE_BYTES as u64 {
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    let mut raw = Vec::with_capacity(metadata.len() as usize);
-    let read_result = std::fs::File::open(path)?
-        .take((MAX_CREDENTIALS_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut raw);
-    if let Err(error) = read_result {
-        raw.zeroize();
-        return Err(error.into());
-    }
-    if raw.len() > MAX_CREDENTIALS_FILE_BYTES {
-        raw.zeroize();
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    Ok(Some(raw))
+    CREDENTIAL_FILE.read(path)
 }
 
 fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    write_secure_with_parent_sync(path, data, sync_parent_directory)
-}
-
-fn write_secure_with_parent_sync<S>(path: &Path, data: &[u8], sync_parent: S) -> std::io::Result<()>
-where
-    S: Fn(&Path) -> std::io::Result<()>,
-{
-    // Write atomically: unique temp file in the same directory, then durable replace.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = parent.to_path_buf();
-    tmp.push(format!(".credentials.{}.tmp", Uuid::new_v4()));
-    let result = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut f = options.open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        durable_replace(&tmp, path)?;
-        sync_parent(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        match std::fs::remove_file(&tmp) {
-            Ok(()) => {
-                let _ = sync_parent_directory(parent);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(std::io::Error::other(format!(
-                    "credential write failed and temporary cleanup also failed: {error}"
-                )))
-            }
-        }
-    }
-    result
-}
-
-#[cfg(not(windows))]
-fn durable_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
-}
-
-#[cfg(windows)]
-fn durable_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: both inputs are stable, NUL-terminated UTF-16 buffers for the
-    // duration of the call. Flags request atomic replacement and write-through.
-    let replaced = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    CREDENTIAL_FILE.write(path, data)
 }
 
 #[cfg(test)]
@@ -2248,6 +2192,9 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    // Only the tests hand-build files now; the module's own reads and writes go
+    // through `spawnd::secret_file`.
+    use std::io::Write;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2257,7 +2204,9 @@ mod tests {
     const LOCK_HELPER_PATH_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_PATH";
     const LOCK_HELPER_READY_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_READY";
     const LOCK_HELPER_ACQUIRED_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_ACQUIRED";
+    #[cfg(unix)]
     const FALLBACK_HELPER_PATH_ENV: &str = "SPAWN_TEST_NO_KEYRING_LOGIN_PATH";
+    #[cfg(unix)]
     const FALLBACK_HELPER_EVIDENCE_ENV: &str = "SPAWN_TEST_NO_KEYRING_LOGIN_EVIDENCE";
 
     fn fixed_creds() -> StoredCreds {
@@ -2382,6 +2331,21 @@ mod tests {
         let proven = attach_browser_approval_proof(pin, account, &nonce, &signature)
             .expect("attaching a valid proof");
         (proven, host_wire, signature)
+    }
+
+    /// The account a pin names is re-derived from its proof each time, so it
+    /// is only ever claimed for the host key the proof was signed over.
+    #[test]
+    fn a_proven_pin_names_its_account_and_a_plain_pin_names_none() {
+        let (pin, host_wire, _) = proven_browser_pin(5);
+        assert_eq!(
+            pin.proven_account_id(&host_wire),
+            Some("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f")
+        );
+        let other_host = public_key_to_wire(&SigningKey::from_bytes(&[7; 32]).verifying_key());
+        assert_eq!(pin.proven_account_id(&other_host), None);
+        let plain = browser_pin(Uuid::from_u128(99), pin.public_key());
+        assert_eq!(plain.proven_account_id(&host_wire), None);
     }
 
     #[test]
@@ -2644,7 +2608,15 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         #[cfg(not(unix))]
-        let _ = path;
+        {
+            #[cfg(windows)]
+            {
+                std::fs::remove_dir(path).unwrap();
+                crate::platform::create_private_dir_all(path).unwrap();
+            }
+            #[cfg(not(windows))]
+            let _ = path;
+        }
     }
 
     fn encoded_record(record: &StoredCreds) -> String {
@@ -4056,11 +4028,12 @@ mod tests {
         let path = temp.path().join("credentials.json");
         std::fs::write(&path, b"old-secret").unwrap();
         let sync_called = Cell::new(false);
-        let error = write_secure_with_parent_sync(&path, b"new-secret", |_| {
-            sync_called.set(true);
-            Err(std::io::Error::other("injected directory sync failure"))
-        })
-        .unwrap_err();
+        let error = CREDENTIAL_FILE
+            .write_with_parent_sync(&path, b"new-secret", |_| {
+                sync_called.set(true);
+                Err(std::io::Error::other("injected directory sync failure"))
+            })
+            .unwrap_err();
         assert!(sync_called.get());
         assert!(error
             .to_string()
@@ -4245,7 +4218,9 @@ mod tests {
         save_file_at(&path, &fixed_creds()).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let wrong_uid = metadata.uid().wrapping_add(1);
-        let error = validate_unix_credentials_metadata(&path, &metadata, wrong_uid).unwrap_err();
+        let error = CREDENTIAL_FILE
+            .validate_metadata_for_test(&path, &metadata, wrong_uid)
+            .unwrap_err();
         assert!(format!("{error:#}").contains("not owned by the current user"));
     }
 
@@ -4298,5 +4273,88 @@ mod tests {
             .err()
             .expect("corrupt seed must fail closed");
         assert!(format!("{error:#}").contains("wrong encoded length"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_complete_file_round_trips_large_records_without_keyring() {
+        let temp = tempfile::tempdir().unwrap();
+        secure_test_credential_dir(temp.path());
+        let path = temp.path().join("credentials.json");
+        let mut creds = complete_record(
+            7,
+            77,
+            &"t".repeat(MAX_ACCESS_TOKEN_BYTES),
+            10,
+            "https://server.example/",
+            7,
+        );
+        merge_browser_pin(&mut creds, browser_pin(Uuid::from_u128(1), RFC_KEY_ONE)).unwrap();
+        merge_browser_pin(&mut creds, browser_pin(Uuid::from_u128(2), RFC_KEY_TWO)).unwrap();
+
+        let keyring_called = std::cell::Cell::new(false);
+        save_with_backends(
+            &mut creds,
+            BackendPolicy::WindowsCompleteFile,
+            |_| {
+                keyring_called.set(true);
+                bail!("Credential Manager must not be used")
+            },
+            |record| save_file_at(&path, record),
+        )
+        .unwrap();
+
+        assert!(!keyring_called.get());
+        assert!(load_file_at(&path).unwrap() == creds);
+        assert_eq!(creds.browser_pins().len(), 2);
+        crate::platform::open_private_file(&path, false).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stale_temp_cleanup_removes_only_valid_private_files() {
+        let temp = tempfile::tempdir().unwrap();
+        secure_test_credential_dir(temp.path());
+        let credentials = temp.path().join("credentials.json");
+        let valid = temp
+            .path()
+            .join(format!(".credentials.{}.tmp", Uuid::from_u128(1)));
+        let inherited = temp
+            .path()
+            .join(format!(".credentials.{}.tmp", Uuid::from_u128(2)));
+        let malformed = temp.path().join(".credentials.not-a-uuid.tmp");
+        crate::platform::create_private_file_new(&valid).unwrap();
+        std::fs::write(&inherited, b"inherited").unwrap();
+        std::fs::write(&malformed, b"malformed").unwrap();
+
+        cleanup_stale_credential_temps(&credentials).unwrap();
+        assert!(!valid.exists());
+        assert!(inherited.exists());
+        assert!(malformed.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_complete_file_rejects_reparse_points_and_oversize_content() {
+        let temp = tempfile::tempdir().unwrap();
+        secure_test_credential_dir(temp.path());
+        let target = temp.path().join("target.json");
+        let link = temp.path().join("credentials.json");
+        save_file_at(&target, &fixed_creds()).unwrap();
+        match std::os::windows::fs::symlink_file(&target, &link) {
+            Ok(()) => assert!(load_file_at(&link).is_err()),
+            Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
+            Err(error) => panic!("creating credential symlink failed unexpectedly: {error}"),
+        }
+
+        let oversize = temp.path().join("oversize.json");
+        let mut file = crate::platform::create_private_file_new(&oversize).unwrap();
+        file.write_all(&vec![b' '; MAX_CREDENTIALS_FILE_BYTES + 1])
+            .unwrap();
+        file.sync_all().unwrap();
+        let error = load_file_at(&oversize)
+            .err()
+            .expect("oversize Windows credential file must fail");
+        assert!(format!("{error:#}").contains("too large"));
     }
 }

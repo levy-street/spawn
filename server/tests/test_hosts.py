@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
+from spawn_server.host_status import derived_host_status, stamp_stale_disconnect
 from spawn_server.routes import hosts as hosts_routes
 
 
@@ -130,6 +134,279 @@ async def test_host_scoping(client):
     assert r.status_code == 404
 
 
+def test_derived_host_status_requires_a_fresh_online_heartbeat():
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    fresh = type("Presence", (), {})()
+    fresh.status = "online"
+    fresh.last_seen_at = now - timedelta(seconds=90)
+    fresh.last_disconnect_at = None
+    fresh.last_disconnect_reason = None
+    assert derived_host_status(fresh, now) == "online"
+    fresh.last_seen_at = now - timedelta(seconds=91)
+    assert derived_host_status(fresh, now) == "offline"
+    assert stamp_stale_disconnect(fresh, now)
+    assert fresh.status == "online"
+    assert fresh.last_disconnect_at == now
+    assert fresh.last_disconnect_reason == "stale"
+    assert not stamp_stale_disconnect(fresh, now + timedelta(seconds=1))
+
+
+async def test_stale_host_status_and_disconnect_shape_on_all_host_routes(client):
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    token = await _signup(client, "stale-host-surfaces@example.com")
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "stale-host-surfaces@example.com")
+            )
+        ).scalar_one()
+        host = Host(
+            owner_user_id=user.id,
+            name="stale-box",
+            status="online",
+            last_seen_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    headers = {"Authorization": f"Bearer {token}"}
+    listed = await client.get("/api/hosts", headers=headers)
+    got = await client.get(f"/api/hosts/{host_id}", headers=headers)
+    patched = await client.patch(
+        f"/api/hosts/{host_id}", headers=headers, json={"name": "stale-renamed"}
+    )
+    profile = await client.get("/api/profile", headers=headers)
+    assert listed.status_code == got.status_code == patched.status_code == 200
+    list_host = next(item for item in listed.json() if item["id"] == host_id)
+    for payload in (list_host, got.json(), patched.json()):
+        assert payload["status"] == "offline"
+        assert payload["last_disconnect"]["reason"] == "stale"
+        assert payload["last_disconnect"]["at"] is not None
+    profile_host = next(item for item in profile.json()["hosts"] if item["id"] == host_id)
+    assert profile_host["status"] == "offline"
+
+    async with get_sessionmaker()() as session:
+        persisted = await session.get(Host, host_id)
+        assert persisted is not None
+        assert persisted.status == "online"
+        assert persisted.last_disconnect_reason == "stale"
+
+
+def _stage_daemon_manifest(tmp_path: Path) -> None:
+    from spawn_server import release
+
+    prebuilt = tmp_path / "daemon" / "target" / "prebuilt"
+    target = prebuilt / "linux-x86_64"
+    target.mkdir(parents=True)
+    spawnd = b"manual-spawnd"
+    worker = b"manual-worker"
+    (target / "spawnd").write_bytes(spawnd)
+    (target / "spawn-worker").write_bytes(worker)
+    (prebuilt / "manifest.json").write_text(
+        json.dumps(
+            {
+                "commit": "c" * 40,
+                "tree": "b" * 40,
+                "version": "0.2.0+gcccccccccccc",
+                "targets": {
+                    "linux-x86_64": {
+                        "spawnd_sha256": hashlib.sha256(spawnd).hexdigest(),
+                        "spawn_worker_sha256": hashlib.sha256(worker).hexdigest(),
+                    }
+                },
+            }
+        )
+    )
+    release.refresh()
+
+
+async def test_host_update_endpoint_sends_and_persists_update(client, tmp_path, monkeypatch):
+    from sqlalchemy import select
+
+    from spawn_server import release
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    _stage_daemon_manifest(tmp_path)
+    token = await _signup(client, "manual-daemon-update@example.com")
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "manual-daemon-update@example.com")
+            )
+        ).scalar_one()
+        host = Host(
+            owner_user_id=user.id,
+            name="update-box",
+            os="linux",
+            arch="x86_64",
+            version="0.1.0+gaaaaaaaaaaaa",
+            daemon_tree="a" * 40,
+            self_update=True,
+            status="online",
+        )
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+        user_id = user.id
+
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=fake_ws)  # type: ignore[arg-type]
+    await get_broker().register_daemon(daemon)
+    await _accept_daemon(daemon)
+
+    invalid = await client.post(
+        f"/api/hosts/{host_id}/update",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"allow_downgrade": "true"},
+    )
+    assert invalid.status_code == 422
+
+    response = await client.post(
+        f"/api/hosts/{host_id}/update",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"allow_downgrade": True},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["update"]["state"] == "updating"
+    sent = json.loads(fake_ws.sent_text[-1])
+    assert sent["type"] == "daemon.update"
+    assert sent["tree"] == "b" * 40
+    assert sent["allow_downgrade"] is True
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state == "updating"
+        assert host.update_tree == "b" * 40
+        assert host.update_requested_at is not None
+
+    limited = await client.post(
+        f"/api/hosts/{host_id}/update",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert limited.status_code == 429
+
+
+async def test_host_update_repairs_same_tree_worker_mismatch(client, tmp_path, monkeypatch):
+    from sqlalchemy import select
+
+    from spawn_server import release
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    _stage_daemon_manifest(tmp_path)
+    token = await _signup(client, "manual-worker-repair@example.com")
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "manual-worker-repair@example.com")
+            )
+        ).scalar_one()
+        host = Host(
+            owner_user_id=user.id,
+            name="mismatched-box",
+            os="linux",
+            arch="x86_64",
+            version="0.2.0+gcccccccccccc",
+            daemon_tree="b" * 40,
+            self_update=True,
+            worker_mismatch=True,
+            status="online",
+        )
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+        user_id = user.id
+
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=fake_ws)  # type: ignore[arg-type]
+    await get_broker().register_daemon(daemon)
+    await _accept_daemon(daemon)
+
+    before = await client.get(f"/api/hosts/{host_id}", headers={"Authorization": f"Bearer {token}"})
+    response = await client.post(
+        f"/api/hosts/{host_id}/update",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert before.status_code == 200
+    assert before.json()["update"] == {
+        "state": "current",
+        "latest_version": "0.2.0+gcccccccccccc",
+        "error": "worker_mismatch",
+        "requested_at": None,
+    }
+    assert response.status_code == 202, response.text
+    sent = json.loads(fake_ws.sent_text[-1])
+    assert sent["type"] == "daemon.update"
+    assert sent["tree"] == "b" * 40
+    assert "allow_downgrade" not in sent
+
+
+async def test_host_update_endpoint_current_is_noop_and_offline_conflicts(
+    client, tmp_path, monkeypatch
+):
+    from sqlalchemy import select
+
+    from spawn_server import release
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    _stage_daemon_manifest(tmp_path)
+    token = await _signup(client, "daemon-update-codes@example.com")
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "daemon-update-codes@example.com")
+            )
+        ).scalar_one()
+        current = Host(
+            owner_user_id=user.id,
+            name="current-box",
+            os="linux",
+            arch="x86_64",
+            daemon_tree="b" * 40,
+            self_update=True,
+            status="offline",
+        )
+        old = Host(
+            owner_user_id=user.id,
+            name="offline-box",
+            os="linux",
+            arch="x86_64",
+            daemon_tree="a" * 40,
+            self_update=True,
+            status="offline",
+        )
+        session.add_all([current, old])
+        await session.commit()
+        current_id = current.id
+        old_id = old.id
+    headers = {"Authorization": f"Bearer {token}"}
+
+    current_response = await client.post(f"/api/hosts/{current_id}/update", headers=headers)
+    offline_response = await client.post(f"/api/hosts/{old_id}/update", headers=headers)
+
+    assert current_response.status_code == 200
+    assert current_response.json()["update"]["state"] == "current"
+    assert offline_response.status_code == 409
+    assert offline_response.json() == {"detail": "host daemon is offline"}
+
+
 async def test_host_revocation_closes_daemon_only_after_database_commit(client):
     token = await _signup(client, "post-commit-revocation@example.com")
     auth = {"Authorization": f"Bearer {token}"}
@@ -195,9 +472,7 @@ async def test_host_agent_check_roundtrip(client):
         ).scalar_one()
         host = Host(owner_user_id=user.id, name="tool-box", status="online")
         session.add(host)
-        agent = (
-            await session.execute(select(Agent).where(Agent.name == "codex"))
-        ).scalar_one()
+        agent = (await session.execute(select(Agent).where(Agent.name == "codex"))).scalar_one()
         await session.commit()
         host_id = host.id
         agent_id = agent.id
@@ -223,10 +498,14 @@ async def test_host_agent_check_roundtrip(client):
         from spawn_server.models import HostAgentPolicy
 
         policy_count = (
-            await session.execute(
-                select(HostAgentPolicy).where(HostAgentPolicy.host_id == host_id)
+            (
+                await session.execute(
+                    select(HostAgentPolicy).where(HostAgentPolicy.host_id == host_id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert policy_count
 
     await broker.resolve_agent_check(
@@ -310,7 +589,9 @@ async def test_host_tools_require_online_daemon(client):
     sm = get_sessionmaker()
     async with sm() as session:
         user = (
-            await session.execute(select(User).where(User.email == "host-tools-offline@example.com"))
+            await session.execute(
+                select(User).where(User.email == "host-tools-offline@example.com")
+            )
         ).scalar_one()
         host = Host(owner_user_id=user.id, name="offline-box", status="offline")
         session.add(host)
@@ -410,7 +691,9 @@ async def test_host_file_rest_surfaces_are_retired_without_content_forwarding(cl
 
     sm = get_sessionmaker()
     async with sm() as session:
-        user = (await session.execute(select(User).where(User.email == "host-dirs-a@example.com"))).scalar_one()
+        user = (
+            await session.execute(select(User).where(User.email == "host-dirs-a@example.com"))
+        ).scalar_one()
         host = Host(owner_user_id=user.id, name="dir-box", status="online")
         session.add(host)
         await session.commit()
@@ -434,7 +717,14 @@ async def test_host_file_rest_surfaces_are_retired_without_content_forwarding(cl
         f"/api/hosts/{host_id}/files/transfer",
     ]
     for path in paths:
-        response = await client.request("POST" if path.rsplit("/", 1)[-1] in {"upload", "mkdir", "rename", "delete", "transfer"} else "GET", path, headers=auth, json={"path": secret})
+        response = await client.request(
+            "POST"
+            if path.rsplit("/", 1)[-1] in {"upload", "mkdir", "rename", "delete", "transfer"}
+            else "GET",
+            path,
+            headers=auth,
+            json={"path": secret},
+        )
         assert response.status_code == 404
     assert fake_ws.sent_text == []
     openapi = (await client.get("/openapi.json")).text
@@ -462,9 +752,7 @@ async def test_host_agent_policy_auto_update_schedules_install(client):
         ).scalar_one()
         host = Host(owner_user_id=user.id, name="auto-box", status="online")
         session.add(host)
-        agent = (
-            await session.execute(select(Agent).where(Agent.name == "codex"))
-        ).scalar_one()
+        agent = (await session.execute(select(Agent).where(Agent.name == "codex"))).scalar_one()
         await session.commit()
         host_id = host.id
         agent_id = agent.id
@@ -573,9 +861,7 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
             )
         ).scalar_one()
         host = Host(owner_user_id=user.id, name="background-auto-box", status="online")
-        agent = (
-            await session.execute(select(Agent).where(Agent.name == "codex"))
-        ).scalar_one()
+        agent = (await session.execute(select(Agent).where(Agent.name == "codex"))).scalar_one()
         session.add(host)
         await session.flush()
         policy = HostAgentPolicy(
@@ -760,9 +1046,7 @@ async def test_auto_update_shutdown_drains_owned_tasks(client, monkeypatch):
     assert not hosts_routes._AUTO_UPDATE_TASKS
 
 
-async def test_auto_update_shutdown_cancels_after_drain_and_clears_inflight(
-    client, monkeypatch
-):
+async def test_auto_update_shutdown_cancels_after_drain_and_clears_inflight(client, monkeypatch):
     started = asyncio.Event()
     cancelled = asyncio.Event()
 
@@ -817,9 +1101,7 @@ async def test_daemon_deregisters_its_own_host(client):
     assert r.status_code == 204, r.text
 
     async with sm() as session:
-        gone = (
-            await session.execute(select(Host).where(Host.id == host_id))
-        ).scalar_one_or_none()
+        gone = (await session.execute(select(Host).where(Host.id == host_id))).scalar_one_or_none()
     assert gone is None
 
     # The token now resolves to no host — a second call is unauthorized.
@@ -857,9 +1139,7 @@ async def test_host_deletion_cascades_over_its_sessions(client):
         host_id, user_id = host.id, user.id
 
     daemon_token = auth.issue_daemon_token(host_id, user_id)
-    r = await client.delete(
-        "/api/hosts/self", headers={"Authorization": f"Bearer {daemon_token}"}
-    )
+    r = await client.delete("/api/hosts/self", headers={"Authorization": f"Bearer {daemon_token}"})
     assert r.status_code == 204, r.text
 
     async with sm() as session:

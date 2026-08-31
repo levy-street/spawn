@@ -23,7 +23,7 @@ import Animated, {
   withSpring,
   withTiming,
 } from "react-native-reanimated";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { initialWindowMetrics, useSafeAreaInsets } from "react-native-safe-area-context";
 import { FullWindowOverlay } from "react-native-screens";
 
 import {
@@ -166,7 +166,13 @@ export function Sheet({
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
-  const availableHeight = windowHeight - insets.top - chrome.sheetTopClearance;
+  // The window's own top inset, not the one in context. A dialog hands its
+  // children a zeroed `top` — its header already clears the status bar — but a
+  // sheet raised from inside one does not live inside it: on iOS it is a
+  // window-level overlay. Inheriting that zero is what let a tall sheet climb
+  // under the clock. Taking the larger of the two only ever adds clearance.
+  const topInset = Math.max(insets.top, initialWindowMetrics?.insets.top ?? 0);
+  const availableHeight = windowHeight - topInset - chrome.sheetTopClearance;
   const isTall = size === "tall";
   const [mounted, setMounted] = useState(visible);
   const [panelHeight, setPanelHeight] = useState(0);

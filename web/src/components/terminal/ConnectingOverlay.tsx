@@ -19,7 +19,15 @@ const SECURED_HOLD_MS = 420;
 /** A connect that has not landed by here is not "about to" — say so. */
 const SLOW_AFTER_MS = 8_000;
 
-type Stage = "blocked" | "host-offline" | "dropped" | "reaching" | "securing" | "secured";
+type Stage =
+  | "blocked"
+  | "disabled"
+  | "host-offline"
+  | "dropped"
+  | "reaching"
+  | "securing"
+  | "secured"
+  | "unauthorized";
 
 /** How one half of the drawn channel reads: carrying (dashes drifting toward
  *  the padlock), not up yet (a still dashed gap), or settled (a solid line). */
@@ -45,6 +53,8 @@ function stageFor(
   hostOffline: boolean,
 ): Stage {
   if (refusal) return "blocked";
+  if (socketState === "unauthorized") return "unauthorized";
+  if (socketState === "disabled") return "disabled";
   if (socketState === "open") return !v3 || dcOpen ? "secured" : "securing";
   if (hostOffline) return "host-offline";
   if (socketState === "closed" || socketState === "error") return "dropped";
@@ -59,6 +69,24 @@ function viewFor(
 ): StageView {
   const where = host ? ` to ${host}` : "";
   switch (stage) {
+    case "unauthorized":
+      return {
+        title: "You've been signed out.",
+        body: "Sign in to reconnect to this session.",
+        icon: ShieldAlert,
+        tone: "text-destructive",
+        ring: "ring-destructive/40",
+        lines: ["waiting", "waiting"],
+      };
+    case "disabled":
+      return {
+        title: "Transport disabled by this server",
+        body: "This server is not offering the encrypted terminal transport.",
+        icon: Unplug,
+        tone: "text-muted-foreground",
+        ring: "ring-border",
+        lines: ["waiting", "waiting"],
+      };
     case "blocked":
       return {
         title: "Connection blocked",

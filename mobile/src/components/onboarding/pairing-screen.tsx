@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
 
 import { AppHeader } from "@/components/layout/app-header";
@@ -17,6 +17,18 @@ import { chrome, spacing, useTheme } from "@/theme";
 export function PairingScreen(): React.JSX.Element {
   const theme = useTheme();
   const router = useRouter();
+  const params = useLocalSearchParams<{
+    approvalRef?: string | string[];
+    hostKey?: string | string[];
+    fragmentMalformed?: string | string[];
+  }>();
+  const approvalRef = Array.isArray(params.approvalRef)
+    ? params.approvalRef[0]
+    : params.approvalRef;
+  const hostKey = Array.isArray(params.hostKey) ? params.hostKey[0] : params.hostKey;
+  const fragmentMalformed = Array.isArray(params.fragmentMalformed)
+    ? params.fragmentMalformed[0]
+    : params.fragmentMalformed;
   const meQuery = useQuery({ queryKey: qk.me(), queryFn: getMe });
 
   let content: React.ReactNode;
@@ -37,7 +49,15 @@ export function PairingScreen(): React.JSX.Element {
       />
     );
   } else {
-    content = <HostPairingStep accountId={meQuery.data.user.id} />;
+    content = (
+      <HostPairingStep
+        accountId={meQuery.data.user.id}
+        {...(approvalRef === undefined ? {} : { initialApprovalRef: approvalRef })}
+        {...(hostKey === undefined ? {} : { initialHostKey: hostKey })}
+        initialLinkMalformed={fragmentMalformed === "true"}
+        onExit={() => leaveOnboarding(router)}
+      />
+    );
   }
 
   return (

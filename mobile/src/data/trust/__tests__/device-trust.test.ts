@@ -3,6 +3,7 @@ import {
   type DeviceTrustProbeApi,
   invalidateDeviceHostTrust,
   probeDeviceHostTrust,
+  probeDeviceHostTrustResult,
 } from "@/data/trust/device-trust";
 
 const HOST_ID = "b3ae000c-1da3-4c6c-aeda-23a37ecb01ac";
@@ -64,6 +65,18 @@ describe("probeDeviceHostTrust", () => {
 
   it("trusts a registered device the host has pinned", async () => {
     await expect(probeDeviceHostTrust(HOST_ID, probeApi())).resolves.toBe("trusted");
+  });
+
+  it("distinguishes a direct pin from chain admission", async () => {
+    await expect(probeDeviceHostTrustResult(HOST_ID, probeApi())).resolves.toEqual({
+      status: "trusted",
+      directlyPinned: true,
+    });
+    invalidateDeviceHostTrust();
+    await expect(probeDeviceHostTrustResult(HOST_ID, chainApi())).resolves.toEqual({
+      status: "trusted",
+      directlyPinned: false,
+    });
   });
 
   it("distrusts a registered device the host has not pinned", async () => {

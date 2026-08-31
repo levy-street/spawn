@@ -4,11 +4,42 @@ import {
   capacityPresentation,
   formatBytes,
   formatDuration,
+  formatHostArch,
+  formatHostOS,
+  formatHostPlatform,
   hostConnectionLabel,
   parseHostMetrics,
 } from "@/components/hosts/host-model";
 
 describe("host presentation model", () => {
+  test.each([
+    ["darwin", "macOS"],
+    ["macos", "macOS"],
+    [" MACOS ", "macOS"],
+    ["linux", "Linux"],
+    ["windows", "Windows"],
+    ["futureOS", "futureOS"],
+    [" ", "Unknown OS"],
+    [null, "Unknown OS"],
+  ])("formats host OS %p as %s", (value, expected) => {
+    expect(formatHostOS(value)).toBe(expected);
+  });
+
+  test.each([
+    ["aarch64", "ARM64"],
+    ["arm64", "ARM64"],
+    ["x86_64", "x64"],
+    ["AMD64", "x64"],
+    ["riscv64", "riscv64"],
+    [null, "Unknown architecture"],
+  ])("formats host architecture %p as %s", (value, expected) => {
+    expect(formatHostArch(value)).toBe(expected);
+  });
+
+  test("formats a Windows host consistently", () => {
+    expect(formatHostPlatform({ os: "windows", arch: "x86_64" })).toBe("Windows · x64");
+  });
+
   test("uses coarse server buckets until an exact direct sample exists", () => {
     expect(capacityPresentation(onlineHost, null)).toEqual({
       source: "bucketed",

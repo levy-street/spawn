@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import delete, func, select
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -139,6 +139,48 @@ async def me(user: User = Depends(auth.current_user)) -> schemas.MeResponse:
     return schemas.MeResponse(user=schemas.UserOut.model_validate(user))
 
 
+def _fresh_session(response: Response, user_id: str, epoch: int) -> tuple[str, datetime]:
+    token = auth.issue_session_token(user_id, epoch)
+    expires_at = datetime.fromtimestamp(auth.decode_token(token)["exp"], UTC)
+    _set_session_cookie(response, token)
+    return token, expires_at
+
+
+@router.post("/auth/session/renew", response_model=schemas.SessionRenewResponse)
+async def renew_session(
+    request: Request,
+    response: Response,
+    _body: schemas.EmptyRequest | None = None,
+    user: User = Depends(auth.current_user),
+) -> schemas.SessionRenewResponse:
+    token, expires_at = _fresh_session(response, user.id, user.session_epoch)
+    request.state.session_renewal_token = None
+    return schemas.SessionRenewResponse(access_token=token, expires_at=expires_at)
+
+
+@router.post("/auth/sign-out-everywhere", response_model=schemas.SessionTokenResponse)
+async def sign_out_everywhere(
+    request: Request,
+    response: Response,
+    _body: schemas.EmptyRequest | None = None,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.SessionTokenResponse:
+    epoch = (
+        await session.execute(
+            update(User)
+            .where(User.id == user.id)
+            .values(session_epoch=User.session_epoch + 1)
+            .returning(User.session_epoch)
+            .execution_options(synchronize_session=False)
+        )
+    ).scalar_one()
+    await session.commit()
+    token, _expires_at = _fresh_session(response, user.id, int(epoch))
+    request.state.session_renewal_token = None
+    return schemas.SessionTokenResponse(access_token=token)
+
+
 @router.post("/account/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_account(
     body: schemas.AccountDeleteRequest,
@@ -174,9 +216,9 @@ async def delete_account(
     if not password_ok:
         has_identity = (
             await session.execute(
-                select(func.count()).select_from(AuthIdentity).where(
-                    AuthIdentity.user_id == user.id
-                )
+                select(func.count())
+                .select_from(AuthIdentity)
+                .where(AuthIdentity.user_id == user.id)
             )
         ).scalar_one() > 0
         if not has_identity or body.password is not None:

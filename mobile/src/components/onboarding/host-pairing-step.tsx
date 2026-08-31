@@ -1,15 +1,16 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import {
+  DEFAULT_INSTALL_ORIGIN,
+  installTargetsForBaseUrl,
+  nativeWindowsAvailableFromRelease,
+} from "@/components/longtail/public-content";
 import { EndorsementOption } from "@/components/onboarding/endorsement-option";
 import { FingerprintReview } from "@/components/onboarding/fingerprint-review";
-import {
-  DEFAULT_INSTALL_COMMAND,
-  InstallInstructions,
-  installCommandForBaseUrl,
-} from "@/components/onboarding/install-instructions";
+import { InstallInstructions } from "@/components/onboarding/install-instructions";
+import { MachineWait } from "@/components/onboarding/machine-wait";
 import { setHostSkipped } from "@/components/onboarding/onboarding-state";
-import { PairingCodeEntry } from "@/components/onboarding/pairing-code-entry";
 import { PairingSuccess } from "@/components/onboarding/pairing-success";
 import { TrustFailureState } from "@/components/onboarding/trust-failure-state";
 import { Button } from "@/components/ui/button";
@@ -18,6 +19,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { getBaseUrl } from "@/data/api/config";
 import type { BrowserEndorsementRecord } from "@/data/api/schemas/trust";
+import { useHostsQuery } from "@/data/queries/hosts";
 import {
   acceptPairingEndorsement,
   approvePendingPairing,
@@ -31,26 +33,42 @@ import {
   usePendingEndorsements,
   useRegisteredPhone,
 } from "@/data/queries/pairing";
+import { useRelease } from "@/data/queries/release";
 import { qk } from "@/data/queryKeys";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
 import { spacing } from "@/theme";
 
-type HostStage = "instructions" | "code" | "review" | "failure" | "success";
+type HostStage = "instructions" | "review" | "failure" | "success";
+type PairingLookupRequest = { approvalRef: string; linkHostKey?: string };
 
 export interface HostPairingStepProps {
   accountId: string;
+  initialApprovalRef?: string;
+  initialHostKey?: string;
+  initialLinkMalformed?: boolean;
+  onExit?: () => void;
   onSkip?: () => void;
 }
 
-export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
+export function HostPairingStep({
+  accountId,
+  initialApprovalRef,
+  initialHostKey,
+  initialLinkMalformed = false,
+  onExit,
+  onSkip,
+}: HostPairingStepProps) {
   const queryClient = useQueryClient();
   const phoneQuery = useRegisteredPhone(accountId);
   const devicesQuery = useAccountDevices(phoneQuery.isSuccess);
   const endorsementsQuery = usePendingEndorsements(accountId, phoneQuery.data?.id ?? null);
+  const hostsQuery = useHostsQuery();
+  const releaseQuery = useRelease();
   const [stage, setStage] = useState<HostStage>("instructions");
+  const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [serverOrigin, setServerOrigin] = useState<string | null>(null);
-  const [installCommand, setInstallCommand] = useState(DEFAULT_INSTALL_COMMAND);
+  const [commandCopied, setCommandCopied] = useState(false);
   const [ceremony, setCeremony] = useState<PendingPairingCeremony | null>(null);
   const [failure, setFailure] = useState<PairingFailure | null>(null);
   const [allowRevokedPin, setAllowRevokedPin] = useState(false);
@@ -58,14 +76,20 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
     result: PairingApprovalResult;
     requiresPhoneComparison: boolean;
   } | null>(null);
+  const initialLookupStarted = useRef(false);
+  const waitingHostIds = useRef<Set<string> | null>(null);
+  const installTargets = installTargetsForBaseUrl(
+    baseUrl ?? DEFAULT_INSTALL_ORIGIN,
+    nativeWindowsAvailableFromRelease(releaseQuery.data),
+  );
 
   useEffect(() => {
     let active = true;
     void getBaseUrl()
       .then((baseUrl) => {
         if (!active) return;
+        setBaseUrl(baseUrl);
         setServerOrigin(serverOriginFromBaseUrl(baseUrl));
-        setInstallCommand(installCommandForBaseUrl(baseUrl));
       })
       .catch((error: unknown) => {
         if (!active) return;
@@ -78,9 +102,14 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
   }, []);
 
   const lookupMutation = useMutation({
-    mutationFn: (code: string) => {
+    mutationFn: (request: PairingLookupRequest) => {
       if (serverOrigin === null) throw new Error("Server address is not ready");
-      return lookupPendingPairing({ userCode: code, accountId, serverOrigin });
+      return lookupPendingPairing({
+        accountId,
+        serverOrigin,
+        approvalRef: request.approvalRef,
+        ...(request.linkHostKey === undefined ? {} : { linkHostKey: request.linkHostKey }),
+      });
     },
     onSuccess: (nextCeremony) => {
       setCeremony(nextCeremony);
@@ -97,6 +126,23 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
       setStage("failure");
     },
   });
+  const lookupMutate = lookupMutation.mutate;
+
+  useEffect(() => {
+    if (initialLookupStarted.current || serverOrigin === null) return;
+    if (initialLinkMalformed) {
+      initialLookupStarted.current = true;
+      setFailure({ kind: "link-identity-malformed" });
+      setStage("failure");
+      return;
+    }
+    if (initialApprovalRef === undefined) return;
+    initialLookupStarted.current = true;
+    lookupMutate({
+      approvalRef: initialApprovalRef,
+      ...(initialHostKey === undefined ? {} : { linkHostKey: initialHostKey }),
+    });
+  }, [initialApprovalRef, initialHostKey, initialLinkMalformed, lookupMutate, serverOrigin]);
 
   const approveMutation = useMutation({
     mutationFn: () => {
@@ -110,7 +156,10 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
       });
     },
     onSuccess: (result) => {
-      setSuccess({ result, requiresPhoneComparison: true });
+      setSuccess({
+        result,
+        requiresPhoneComparison: ceremony?.linkVerifiedHostKey === null,
+      });
       setStage("success");
       void setHostSkipped(false);
       void queryClient.invalidateQueries({ queryKey: qk.hosts() });
@@ -189,15 +238,47 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
   const acceptingKey = endorsementMutation.variables
     ? `${endorsementMutation.variables.record.host_id}:${endorsementMutation.variables.record.endorser_device_id}`
     : null;
+  const newHost =
+    commandCopied && waitingHostIds.current !== null
+      ? (hostsQuery.data?.find((host) => !waitingHostIds.current?.has(host.id)) ?? null)
+      : null;
+  const machineWait = commandCopied ? <MachineWait host={newHost} /> : null;
+  const pairAnother = () => {
+    waitingHostIds.current = null;
+    setCommandCopied(false);
+    setCeremony(null);
+    setSuccess(null);
+    setStage("instructions");
+  };
 
   if (stage === "instructions") {
+    if (newHost !== null && onExit !== undefined) {
+      return (
+        <View style={styles.hostStep}>
+          <EmptyState
+            action={
+              <Button onPress={pairAnother} variant="outline">
+                Connect another host
+              </Button>
+            }
+            description={`${newHost.name} is connected. It will appear as soon as its daemon comes online.`}
+            icon="ShieldCheck"
+            title="Host approved"
+          />
+        </View>
+      );
+    }
     return (
       <View style={styles.hostStep}>
         <InstallInstructions
-          command={installCommand}
-          onContinue={() => setStage("code")}
+          onCommandCopied={() => {
+            waitingHostIds.current ??= new Set(hostsQuery.data?.map((host) => host.id) ?? []);
+            setCommandCopied(true);
+          }}
+          targets={installTargets}
           {...(onSkip === undefined ? {} : { onSkip })}
         />
+        {machineWait}
         <EndorsementOption
           acceptingKey={acceptingKey}
           onAccept={(record, endorserFingerprint) =>
@@ -213,73 +294,64 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
     );
   }
 
-  if (stage === "code") {
-    return (
-      <PairingCodeEntry
-        busy={lookupMutation.isPending || serverOrigin === null}
-        error={
-          lookupMutation.isError ? (toPairingFailure(lookupMutation.error).detail ?? null) : null
-        }
-        onBack={() => setStage("instructions")}
-        onSubmit={(code) => lookupMutation.mutate(code)}
-      />
-    );
-  }
-
   if (stage === "review" && ceremony !== null) {
     return (
-      <FingerprintReview
-        approving={approveMutation.isPending}
-        ceremony={ceremony}
-        onApprove={() => approveMutation.mutate()}
-        onBack={() => setStage("code")}
-        onExpired={() => {
-          setFailure({ kind: "pairing-expired" });
-          setStage("failure");
-        }}
-        onMismatch={() => {
-          haptics.error();
-          setFailure({ kind: "fingerprint-mismatch" });
-          setStage("failure");
-        }}
-        phoneFingerprint={formatHostFingerprint(phoneQuery.data.public_key)}
-        reapprovingRevokedPin={allowRevokedPin}
-      />
-    );
-  }
-
-  if (stage === "success" && success !== null) {
-    const pairAnother = () => {
-      setCeremony(null);
-      setSuccess(null);
-      setStage("instructions");
-    };
-    if (success.requiresPhoneComparison) {
-      return (
-        <PairingSuccess
-          hostName={success.result.hostName}
-          onConfirmed={() => haptics.success()}
+      <View style={styles.hostStep}>
+        {machineWait}
+        <FingerprintReview
+          approving={approveMutation.isPending}
+          ceremony={ceremony}
+          onApprove={() => approveMutation.mutate()}
+          onBack={() => setStage("instructions")}
+          onExpired={() => {
+            setFailure({ kind: "pairing-expired" });
+            setStage("failure");
+          }}
           onMismatch={() => {
             haptics.error();
             setFailure({ kind: "fingerprint-mismatch" });
             setStage("failure");
           }}
-          onPairAnother={pairAnother}
           phoneFingerprint={formatHostFingerprint(phoneQuery.data.public_key)}
+          reapprovingRevokedPin={allowRevokedPin}
         />
+      </View>
+    );
+  }
+
+  if (stage === "success" && success !== null) {
+    if (success.requiresPhoneComparison) {
+      return (
+        <View style={styles.hostStep}>
+          {machineWait}
+          <PairingSuccess
+            hostName={success.result.hostName}
+            onConfirmed={() => haptics.success()}
+            onMismatch={() => {
+              haptics.error();
+              setFailure({ kind: "fingerprint-mismatch" });
+              setStage("failure");
+            }}
+            onPairAnother={pairAnother}
+            phoneFingerprint={formatHostFingerprint(phoneQuery.data.public_key)}
+          />
+        </View>
       );
     }
     return (
-      <EmptyState
-        action={
-          <Button onPress={pairAnother} variant="outline">
-            Connect another host
-          </Button>
-        }
-        description={`${success.result.hostName} is connected. It will appear as soon as its daemon comes online.`}
-        icon="ShieldCheck"
-        title="Host approved"
-      />
+      <View style={styles.hostStep}>
+        {machineWait}
+        <EmptyState
+          action={
+            <Button onPress={pairAnother} variant="outline">
+              Connect another host
+            </Button>
+          }
+          description={`${success.result.hostName} is connected. It will appear as soon as its daemon comes online.`}
+          icon="ShieldCheck"
+          title="Host approved"
+        />
+      </View>
     );
   }
 
@@ -303,9 +375,9 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
           setStage("instructions");
           return;
         }
-        setStage("code");
+        setStage("instructions");
       }}
-      {...(ceremony === null ? {} : { onRestart: () => setStage("code") })}
+      {...(ceremony === null ? {} : { onRestart: () => setStage("instructions") })}
     />
   );
 }

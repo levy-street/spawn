@@ -12,6 +12,8 @@ export const onlineHost: HostOut = {
   os: "macOS",
   arch: "arm64",
   version: "1.4.2",
+  daemon_tree: null,
+  update: null,
   host_key_algorithm: "ed25519",
   // A real curve point: HostFacts derives the fingerprint from it locally.
   host_public_key: "XOCTsSKj9-Z7qRynE70szG_DNBeHiLzEBOCG1clQbz8",
@@ -36,6 +38,14 @@ export const offlineHost: HostOut = {
   status: "offline",
   cpu_bucket: null,
   mem_bucket: null,
+};
+
+export const windowsHost: HostOut = {
+  ...onlineHost,
+  id: "77777777-7777-4777-8777-777777777777",
+  name: "studio-pc",
+  os: "windows",
+  arch: "x86_64",
 };
 
 export const codexAgent: AgentOut = {

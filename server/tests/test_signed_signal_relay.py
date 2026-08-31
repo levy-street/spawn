@@ -212,6 +212,23 @@ def test_absent_signed_field_remains_legacy_at_server_container_boundary():
     validate_signed_relay_container(frame)
 
 
+def test_signed_restart_allows_additive_outer_ice_restart_flag():
+    envelope = _vector()
+    frame = {
+        "type": "rtc.offer",
+        "session_id": envelope["session_id"],
+        "scope_type": envelope["scope_type"],
+        "scope_id": envelope["scope_id"],
+        "protocol": envelope["protocol"],
+        "protocol_version": envelope["protocol_version"],
+        "binding_nonce": "b" * 32,
+        "binding_generation": 7,
+        "ice_restart": True,
+        "signed_envelope": _wire(envelope),
+    }
+    validate_signed_relay_container(frame)
+
+
 def test_redis_offer_and_answer_wrappers_preserve_exact_unicode_and_escapes():
     envelope = _vector()
     envelope["sdp"] = "v=0\r\na=x-unicode:\u0080\\quoted\"\r\n"

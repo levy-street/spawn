@@ -70,8 +70,8 @@ interface ChipView {
 }
 
 const KIND_LABEL: Record<NonNullable<ConnInfo["kind"]>, string> = {
-  direct: "direct",
-  stun: "p2p",
+  direct: "direct (LAN)",
+  stun: "direct (NAT)",
   relay: "relay",
 };
 
@@ -89,25 +89,35 @@ function viewFor(info: SessionConnectionInfo): ChipView {
       detail: REFUSAL_DETAIL[info.signedRtcRefusal],
     };
   }
+  if (info.socketState === "unauthorized") {
+    return { dot: "bg-destructive", label: "signed out", detail: "You've been signed out." };
+  }
+  if (info.socketState === "disabled") {
+    return {
+      dot: "bg-destructive",
+      label: "disabled",
+      detail: "Transport disabled by this server",
+    };
+  }
+  if (info.dcOpen) {
+    const kind = info.kind ?? "direct";
+    return {
+      dot: kind === "relay" ? "bg-warning" : kind === "stun" ? "bg-info" : "bg-success",
+      label: info.rttMs != null ? `${KIND_LABEL[kind]} · ${info.rttMs} ms` : KIND_LABEL[kind],
+      detail: KIND_DETAIL[kind],
+    };
+  }
   if (info.socketState === "closed" || info.socketState === "error") {
     return { dot: "bg-destructive", label: "offline", detail: "Control connection lost" };
   }
   if (info.socketState !== "open") {
     return { dot: "bg-muted-foreground", label: "connecting", pulse: true, detail: "Connecting…" };
   }
-  if (!info.dcOpen) {
-    return {
-      dot: "bg-warning",
-      label: "channel…",
-      pulse: true,
-      detail: "Negotiating the mandatory encrypted terminal channels",
-    };
-  }
-  const kind = info.kind ?? "direct";
   return {
-    dot: kind === "relay" ? "bg-warning" : kind === "stun" ? "bg-info" : "bg-success",
-    label: info.rttMs != null ? `${KIND_LABEL[kind]} · ${info.rttMs} ms` : KIND_LABEL[kind],
-    detail: KIND_DETAIL[kind],
+    dot: "bg-warning",
+    label: "channel…",
+    pulse: true,
+    detail: "Negotiating the mandatory encrypted terminal channels",
   };
 }
 

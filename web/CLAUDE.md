@@ -12,11 +12,12 @@ ceremony, a download page) says so in the commit message.
 ```
 src/
   app/            one directory per route (App Router)
-                  admin/ app/ device/ download/ forgot-password/ hosts/
-                  legion/ login/ onboarding/ reset-password/ security/
-                  sessions/ signup/ trust-ux-demo/ verify-email/ w/
+                  admin/ app/ desktop-build/ device/ download/
+                  forgot-password/ hosts/ legion/ login/ onboarding/
+                  reset-password/ security/ sessions/ signup/ trust-ux-demo/
+                  verify-email/ w/
   components/     UI grouped by product area
-                  access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/
+                  access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/ release/
                   onboarding/ profile/ session/ settings/ terminal/ trust/
                   ui/ workspace/
   hooks/          React hooks shared across areas (useHostControl, …)
@@ -39,6 +40,20 @@ public/           static assets
 - Logic that does not touch React: `src/lib/`, with a `*.test.ts` next to it.
   Unit tests colocate with the code they test; there is no parallel test tree.
 - A hook used by more than one area: `src/hooks/`.
+- A keyboard chord: `src/lib/keyboard-chords.ts` decides who owns one, the
+  app or the shell inside the terminal, and the answer differs by platform —
+  on a Mac ⌥ is the terminal's word key, so the grid asks for ⌃⌥ or ⌘⌥
+  wherever a terminal is listening, while on Windows and Linux Alt is the
+  app's and Ctrl is the shell's. Read it before binding anything with a
+  modifier: a document-level capture listener quietly taking ⌥+Arrow from a
+  focused terminal is the exact bug that module exists to prevent, and the
+  same file states the arrow sequences the terminal sends for itself, because
+  xterm.js's own platform detection is wrong inside this bundle.
+- A websocket change: the subprotocol names in `src/lib/ws.ts` and
+  `src/lib/alerts.ts` (`spawn.v3`, `spawn.alerts.v1`) are the compatibility
+  contract with the server, not a version — a server that requires a different
+  one refuses the socket, and the refusal is what raises the hard reload
+  prompt. Read "The wire protocols" in `docs/RELEASE.md` before changing one.
 
 ## Conventions
 
@@ -50,6 +65,18 @@ public/           static assets
   `SPAWN_API_PROXY_TARGET`. `scripts/next-with-proxy-target.mjs` wraps
   build/start and refuses a silent default outside `dev`. Never call the API
   cross-origin.
+- This app is also the macOS desktop app's product face, loaded into its
+  window. `useDesktopShell()` (`src/hooks/`) says so, read from the webview's
+  user agent in an effect — never during render, or the first client render
+  will not match the HTML it hydrates. Inside that window there is no address
+  bar and no way back, so anything that leads to the marketing site is a dead
+  end: a link to `/`, the masthead, the colophon, a brand mark that goes home.
+  New chrome that leaves the product has to answer for itself there. That
+  window is also the app's own device: on the way in the app leaves its
+  Ed25519 identity in `sessionStorage` and `src/lib/desktop-device-handover.ts`
+  takes it (once, only under that user agent) before the page registers as
+  anything, so the product runs as "SPAWN D on Mac" — the device that
+  possessed the computer — and never as a second device of its own.
 
 ## Before calling a change done
 

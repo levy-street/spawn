@@ -1,0 +1,30 @@
+# Current SPAWN D production shape: TURN on UDP and TCP 3478, REST-style
+# ephemeral credentials, the spawnd.dev realm, and no TLS listener. Keep
+# static-auth-secret identical to SPAWN_TURN_SECRET in the server environment.
+#
+# The public/private mapping below is the verified production mapping. Replace
+# both addresses together when installing this example on another host.
+listening-ip=10.0.0.127
+relay-ip=10.0.0.127
+external-ip=98.83.222.112/10.0.0.127
+listening-port=3478
+
+realm=spawnd.dev
+server-name=spawnd.dev
+fingerprint
+use-auth-secret
+static-auth-secret=CHANGE_ME_TO_MATCH_SPAWN_TURN_SECRET
+stale-nonce=600
+
+# UDP turn: is mandatory for spawnd. TCP remains enabled for browser/mobile
+# compatibility, but webrtc-rs 0.17 cannot use TURN over TCP or TLS.
+# Production does not currently claim turns: support; see docs/NETWORK.md for
+# the separate-IP or SNI-routing options required before enabling it on 443.
+no-tls
+
+# Run under systemd, keep secrets out of process listings, and disable the
+# unauthenticated administrative CLI listener.
+syslog
+no-cli
+no-multicast-peers
+no-loopback-peers

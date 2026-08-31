@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import { validateLeafName } from "@/components/files/paths";
+import { type PathFlavor, validateLeafName } from "@/components/files/paths";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -13,6 +13,7 @@ export interface NameDialogProps {
   confirmLabel: string;
   initialValue?: string;
   pending?: boolean;
+  pathFlavor?: PathFlavor;
   onDismiss: () => void;
   onConfirm: (name: string) => void;
 }
@@ -23,11 +24,13 @@ export function NameDialog({
   confirmLabel,
   initialValue = "",
   pending = false,
+  pathFlavor = "posix",
   onDismiss,
   onConfirm,
 }: NameDialogProps) {
   const [value, setValue] = useState(initialValue);
-  const error = validateLeafName(value);
+  const error = validateLeafName(value, pathFlavor);
+  const confirmedValue = pathFlavor === "windows" ? value : value.trim();
   useEffect(() => {
     if (visible) setValue(initialValue);
   }, [initialValue, visible]);
@@ -41,7 +44,7 @@ export function NameDialog({
           <Button
             disabled={error !== null}
             loading={pending}
-            onPress={() => onConfirm(value.trim())}
+            onPress={() => onConfirm(confirmedValue)}
             size="sm"
           >
             {confirmLabel}
@@ -61,7 +64,7 @@ export function NameDialog({
           autoFocus
           onChangeText={setValue}
           onSubmitEditing={() => {
-            if (!error && !pending) onConfirm(value.trim());
+            if (!error && !pending) onConfirm(confirmedValue);
           }}
           placeholder="Name"
           returnKeyType="done"

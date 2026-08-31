@@ -56,6 +56,7 @@ import { haptics } from "@/lib/haptics";
 import { encodeKey } from "@/terminal/key-encoder";
 import { TerminalSurface, type TerminalSurfaceHandle } from "@/terminal/TerminalSurface";
 import type {
+  ConnectionInfo,
   DisplayControlState,
   KeySpec,
   SessionTransport,
@@ -129,6 +130,7 @@ export function TerminalOverlay({
   const [connectionState, setConnectionState] = useState<TransportState>("idle");
   const [connectionError, setConnectionError] = useState<TransportError | null>(null);
   const [diagnostic, setDiagnostic] = useState<WorkerDiagnostic | null>(null);
+  const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
   const [hasEverBeenReady, setHasEverBeenReady] = useState(false);
   const [followState, setFollowState] = useState<FollowState>(INITIAL_FOLLOW_STATE);
   const [searchVisible, setSearchVisible] = useState(false);
@@ -212,18 +214,24 @@ export function TerminalOverlay({
     };
   }, []);
 
-  const updateFollow = useCallback(
-    (event: Parameters<typeof reduceFollowState>[1]): void => {
-      setFollowState((current) => {
-        const next = reduceFollowState(current, event);
-        const follow = next.mode === "following";
-        surfaceRef.current?.setFollow(follow);
-        setStoredFollow(session.id, follow);
-        return next;
-      });
-    },
-    [session.id, setStoredFollow],
-  );
+  const updateFollow = useCallback((event: Parameters<typeof reduceFollowState>[1]): void => {
+    setFollowState((current) => reduceFollowState(current, event));
+  }, []);
+
+  // The surface and the store follow the state; they are not driven from
+  // inside the updater above.
+  //
+  // A state updater has to be pure — React is free to call it during a render,
+  // and twice in development — so writing to a store from in there updates one
+  // component while another is rendering. That is the
+  // "Cannot update a component (`%s`) while rendering a different component"
+  // warning, and it showed up as soon as anyone tapped through the approval
+  // sheet quickly enough to re-render mid-update.
+  useEffect(() => {
+    const follow = followState.mode === "following";
+    surfaceRef.current?.setFollow(follow);
+    setStoredFollow(session.id, follow);
+  }, [followState.mode, session.id, setStoredFollow]);
 
   const transfers = useTerminalTransfers({
     transport: () => transportRef.current,
@@ -290,23 +298,39 @@ export function TerminalOverlay({
   // Approval is granted somewhere else entirely, so the phone watches for it
   // and reconnects itself. Making the operator walk back here and press Retry
   // is the part of this that used to feel broken.
-  const awaitingApproval =
+  //
+  // The watch latches, because the trust code is not the last word the
+  // transport says: a refused connection goes on to fail plainly ("transport is
+  // in a failed state"), and reading only the newest error called the watch off
+  // mid-approval — the ceremony finished, and the terminal sat on a Retry
+  // button nobody should have had to press.
+  const trustRefusal =
     connectionState === "failed" && connectionError?.code === DEVICE_NOT_TRUSTED_CODE;
+  const [awaitingApproval, setAwaitingApproval] = useState(false);
+  useEffect(() => {
+    if (trustRefusal) setAwaitingApproval(true);
+  }, [trustRefusal]);
+  useEffect(() => {
+    // Connected: whatever the refusal was, it is over.
+    if (connectionState === "ready") setAwaitingApproval(false);
+  }, [connectionState]);
   const hostApproval = useHostApprovalWatch(host.id, awaitingApproval);
   useEffect(() => {
-    if (awaitingApproval && hostApproval === "trusted") {
-      setApprovalVisible(false);
-      retry();
-    }
+    if (!awaitingApproval || hostApproval !== "trusted") return;
+    // Handled: drop the latch first so the watch stops and this cannot loop on
+    // a connection that fails again for some other reason.
+    setAwaitingApproval(false);
+    retry();
   }, [awaitingApproval, hostApproval, retry]);
 
   // The ceremony presents itself: a trust failure is not something Retry can
   // fix, so waiting for the operator to find the right button is a dead end.
-  // Dismissing it keeps it closed for this failure; the error screen's
-  // "Approve this device" reopens it.
+  // It closes itself a beat after the approval lands (the sheet's own dwell) —
+  // dismissing it early keeps it closed for this failure, and the error
+  // screen's "Approve this device" reopens it.
   useEffect(() => {
-    if (awaitingApproval) setApprovalVisible(true);
-  }, [awaitingApproval]);
+    if (trustRefusal) setApprovalVisible(true);
+  }, [trustRefusal]);
 
   const sendAccessoryKey = (sequence: string, _spec: KeySpec): void => {
     surfaceRef.current?.sendKey(sequence);
@@ -406,6 +430,7 @@ export function TerminalOverlay({
       testID="terminal-overlay-route-scene"
     >
       <TerminalHeader
+        connectionInfo={connectionInfo}
         cwd={session.cwd}
         foregroundCommand={session.foreground_command}
         hostName={session.host_name ?? host.name}
@@ -459,6 +484,7 @@ export function TerminalOverlay({
               initialSize={INITIAL_TERMINAL_GRID}
               key={`${session.id}-${surfaceGeneration}`}
               onDiagnostic={setDiagnostic}
+              onConnectionInfo={setConnectionInfo}
               onDisplayChange={setDisplay}
               onError={(error) => {
                 setConnectionError(error);
@@ -486,6 +512,7 @@ export function TerminalOverlay({
         )}
         <UploadProgressBar ratio={transfers.progressRatio} />
         <ConnectionStateOverlay
+          awaitingApproval={awaitingApproval}
           error={connectionError}
           hasEverBeenReady={hasEverBeenReady}
           onDeviceTrust={() => setApprovalVisible(true)}
@@ -542,6 +569,7 @@ export function TerminalOverlay({
         visible={fontSheetVisible}
       />
       <DiagnosticsSheet
+        connectionInfo={connectionInfo}
         diagnostic={diagnostic}
         error={connectionError}
         onDismiss={() => setDiagnosticsVisible(false)}

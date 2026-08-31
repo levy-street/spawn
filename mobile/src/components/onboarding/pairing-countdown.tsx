@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-
 import { Text } from "@/components/ui/text";
 import { spacing } from "@/theme";
 

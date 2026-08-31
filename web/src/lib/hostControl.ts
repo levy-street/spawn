@@ -2,7 +2,17 @@ import { parseCapabilities } from "@/lib/preview/capabilities";
 import { hashStream, Sha256 } from "@/lib/sha256";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
 import type { SignedRtcRefusalReason, SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
-import { buildHostWsUrl } from "@/lib/ws";
+import {
+  backoffDelay,
+  buildHostWsUrl,
+  iceServersNeedRefresh,
+  notifySocketUnauthorized,
+  RTC_LATCH_TIMEOUT_MS,
+  SIGNAL_SILENCE_SUSPECT_MS,
+  sanitizeIceServers,
+  socketCloseAction,
+  watchSuspendResume,
+} from "@/lib/ws";
 
 export const HOST_CONTROL_PROTOCOL = "spawn.host.ctl";
 export const HOST_CONTROL_VERSION = 1;
@@ -13,6 +23,11 @@ const MAX_PENDING_REQUESTS = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 500;
+const SIGNAL_WATCHDOG_MS = 80_000;
+const RTC_DISCONNECTED_GRACE_MS = 5_000;
+const RTC_CONFIG_REFRESH_TIMEOUT_MS = 2_000;
+const RTC_RESUME_TIMEOUT_MS = 3_000;
+const RTC_ICE_RESTART_TIMEOUT_MS = 10_000;
 const STREAM_CHUNK_BYTES = 8 * 1024;
 const STREAM_WINDOW_CHUNKS = 8;
 const STREAM_BUFFERED_HIGH_WATER = 256 * 1024;
@@ -161,7 +176,15 @@ async function collectStream(stream: ReadableStream<Uint8Array>): Promise<Uint8A
   return out;
 }
 
-export type HostControlState = "idle" | "connecting" | "open" | "ready" | "closed" | "error";
+export type HostControlState =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "ready"
+  | "closed"
+  | "error"
+  | "unauthorized";
+export type HostControlTerminalReason = "protocol_required" | "client_bug";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -208,6 +231,11 @@ interface SignalMetadata {
   protocol_version: typeof HOST_CONTROL_VERSION;
 }
 
+interface HostBindingMetadata {
+  binding_nonce?: string;
+  binding_generation?: number;
+}
+
 type SignalMessage =
   | ({
       type: "rtc.config";
@@ -220,9 +248,16 @@ type SignalMessage =
       session_id: string;
       signed_envelope?: string;
       sdp?: string;
-    } & SignalMetadata)
-  | ({ type: "rtc.candidate"; session_id: string; candidate: RTCIceCandidateInit } & SignalMetadata)
-  | ({ type: "rtc.status"; session_id?: string; status: string } & SignalMetadata);
+    } & SignalMetadata &
+      HostBindingMetadata)
+  | ({
+      type: "rtc.candidate";
+      session_id: string;
+      candidate: RTCIceCandidateInit;
+    } & SignalMetadata &
+      HostBindingMetadata)
+  | ({ type: "rtc.status"; session_id?: string; status: string } & SignalMetadata &
+      HostBindingMetadata);
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -248,6 +283,13 @@ export interface HostControlClientOptions {
   requestTimeoutMs?: number;
   maxPendingRequests?: number;
   reconnectBaseDelayMs?: number;
+  reconnectRandom?: () => number;
+  watchdogMs?: number;
+  resumeTimeoutMs?: number;
+  iceRestartTimeoutMs?: number;
+  /** How long a claimed-OPEN socket may be silent before wake() presumes it a
+   * corpse and redials. Deterministic tests shorten it. */
+  silenceSuspectMs?: number;
   /** Primarily useful for bounded clients and deterministic timeout tests. */
   streamTimeoutMs?: number;
   /** Resolve, per RTC generation, whether this host requires signed signaling,
@@ -264,10 +306,27 @@ export class HostControlClient {
   private pc: RTCPeerConnection | null = null;
   private channel: RTCDataChannel | null = null;
   private sessionId: string | null = null;
+  private bindingNonce: string | null = null;
+  private bindingGeneration: number | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private connectionAttempt = 0;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
+  private signalWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
+  private rtcResumeTimer: ReturnType<typeof setTimeout> | null = null;
+  private rtcIceRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  private rtcConfigRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private rtcConfigRefreshResolve: (() => void) | null = null;
+  private iceRestartInFlight = false;
+  private iceRestartLatchedAt = 0;
+  private resumeInFlight = false;
+  /** When the server was last heard on the current socket; see wake(). */
+  private lastSignalFrameAt = 0;
+  private stopSuspendWatch: (() => void) | null = null;
+  private latestIceServers: RTCIceServer[] | null = null;
+  private latestIceTransportPolicy: RTCIceTransportPolicy = "all";
+  private localCandidateGate: { block: () => void; release: () => void } | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
   private signedRtcSession: SignedRtcLiveSession | null = null;
   // True once the current generation has decided it will negotiate a signed
@@ -275,6 +334,8 @@ export class HostControlClient {
   // unreachable during the window before signedRtcSession is armed. Reset on
   // every teardown so a fresh generation starts unpinned until it decides.
   private signedRtcRequired = false;
+  private signedRtcDecisionForBinding: SignedRtcTrustDecision | null = null;
+  private prefetchedTrustDecision: Promise<SignedRtcTrustDecision> | null = null;
   // What this generation's daemon said it can do, from its `hello`. Reset on
   // teardown so a reconnect onto a downgraded daemon cannot inherit a stale
   // capability set and keep offering actions that daemon no longer supports.
@@ -282,12 +343,20 @@ export class HostControlClient {
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. Terminal: blocks auto-reconnect.
   private signedRtcRefusal: SignedRtcRefusalReason | null = null;
+  // A wire-version refusal is terminal too, but it is not a trust refusal and
+  // must never be surfaced as one. The release watcher owns its recovery UI.
+  private terminalReason: HostControlTerminalReason | null = null;
   private stopped = true;
   private pending = new Map<string, PendingRequest>();
   private incomingStreams = new Map<string, IncomingStream>();
   private cancelledIncomingStreams = new Map<string, CancelledIncomingStream>();
   private outgoingStreams = new Map<string, OutgoingStream>();
   private listeners = new Set<(state: HostControlState) => void>();
+  private globalListenersInstalled = false;
+  private readonly onVisibilityChange = () => {
+    if (document.visibilityState === "visible") this.wake();
+  };
+  private readonly onWake = () => this.wake();
 
   constructor(
     readonly hostId: string,
@@ -308,6 +377,9 @@ export class HostControlClient {
     if (!this.stopped) return;
     this.stopped = false;
     this.signedRtcRefusal = null;
+    this.terminalReason = null;
+    this.installGlobalListeners();
+    this.prefetchTrustDecision();
     this.openWebSocket();
   }
 
@@ -315,6 +387,10 @@ export class HostControlClient {
    * null. A refusal is terminal until an explicit reconnect. */
   getSignedRtcRefusal(): SignedRtcRefusalReason | null {
     return this.signedRtcRefusal;
+  }
+
+  getTerminalReason(): HostControlTerminalReason | null {
+    return this.terminalReason;
   }
 
   waitUntilReady(timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS): Promise<void> {
@@ -343,10 +419,14 @@ export class HostControlClient {
 
   close(): void {
     this.stopped = true;
+    this.uninstallGlobalListeners();
     this.connectionAttempt += 1;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.clearConnectDeadline();
+    this.clearSignalWatchdog();
+    this.clearRtcRecoveryTimers();
+    this.finishRtcConfigRefresh();
     this.cleanupRtc(true);
     const ws = this.ws;
     this.ws = null;
@@ -998,23 +1078,28 @@ export class HostControlClient {
 
   private openWebSocket(): void {
     if (this.stopped) return;
+    this.prefetchTrustDecision();
     const attempt = ++this.connectionAttempt;
+    const preserveHealthyRtc = this.hasHealthyRtc();
+    let resumeNeeded = preserveHealthyRtc;
     const previous = this.ws;
     this.ws = null;
     if (previous) {
       this.detachWebSocket(previous);
       previous.close();
     }
-    this.setState("connecting");
+    if (!preserveHealthyRtc) this.setState("connecting");
     this.clearConnectDeadline();
-    this.connectTimer = setTimeout(
-      () => {
-        if (attempt !== this.connectionAttempt || this.stopped) return;
-        this.connectTimer = null;
-        this.failRtc();
-      },
-      Math.max(1, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS),
-    );
+    if (!preserveHealthyRtc) {
+      this.connectTimer = setTimeout(
+        () => {
+          if (attempt !== this.connectionAttempt || this.stopped) return;
+          this.connectTimer = null;
+          this.failRtc();
+        },
+        Math.max(1, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS),
+      );
+    }
     let ws: WebSocket;
     try {
       ws = new WebSocket(buildHostWsUrl(this.hostId), HOST_SIGNAL_SUBPROTOCOL);
@@ -1024,12 +1109,25 @@ export class HostControlClient {
       return;
     }
     this.ws = ws;
+    let pingSeen = false;
+    const armWatchdog = () => {
+      if (!pingSeen || !this.isCurrentWebSocket(ws, attempt)) return;
+      this.clearSignalWatchdog();
+      this.signalWatchdogTimer = setTimeout(
+        () => {
+          if (this.isCurrentWebSocket(ws, attempt)) ws.close(4008, "keepalive timeout");
+        },
+        Math.max(1, this.options.watchdogMs ?? SIGNAL_WATCHDOG_MS),
+      );
+    };
     ws.onopen = () => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
-      this.setState("open");
+      this.lastSignalFrameAt = Date.now();
+      if (!this.hasHealthyRtc()) this.setState("open");
     };
     ws.onmessage = (event) => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
+      this.lastSignalFrameAt = Date.now();
       if (typeof event.data !== "string") {
         if (this.signedRtcSession !== null) this.failRtc();
         return;
@@ -1045,19 +1143,47 @@ export class HostControlClient {
         this.failRtc();
         return;
       }
+      if (pingSeen) armWatchdog();
+      if (parsed.type === "ping") {
+        pingSeen = true;
+        this.reconnectAttempt = 0;
+        armWatchdog();
+        if (typeof parsed.ts === "number" && Number.isFinite(parsed.ts)) {
+          ws.send(JSON.stringify({ type: "pong", ts: parsed.ts }));
+        }
+        return;
+      }
+      if (parsed.type === "error") {
+        this.reconnectAttempt = 0;
+        if (this.resumeInFlight) this.fallBackFromResume();
+        return;
+      }
       const message = parsed as unknown as SignalMessage;
       if (!this.matchesMetadata(message)) {
         if (message.type === "rtc.answer" && this.signedRtcSession !== null) this.failRtc();
         return;
       }
+      this.reconnectAttempt = 0;
       if (message.type === "rtc.config" && message.enabled) {
-        void this.startRtc(
-          message.ice_servers ?? [],
-          message.ice_transport_policy === "relay" ? "relay" : "all",
-          ws,
-          attempt,
-        );
+        if (!this.hasHealthyRtc()) this.setState("open");
+        this.latestIceServers = sanitizeIceServers(message.ice_servers ?? []);
+        this.latestIceTransportPolicy = message.ice_transport_policy === "relay" ? "relay" : "all";
+        this.finishRtcConfigRefresh();
+        if (resumeNeeded && this.hasHealthyRtc()) {
+          resumeNeeded = false;
+          this.resumeHealthyRtc(ws, attempt);
+        } else if (!this.pc) {
+          void this.startRtc(this.latestIceServers, this.latestIceTransportPolicy, ws, attempt);
+        } else if (this.pc.connectionState !== "connected") {
+          void this.restartIce("wake");
+        }
+      } else if (message.type === "rtc.config") {
+        this.latestIceServers = null;
+        this.finishRtcConfigRefresh();
+        this.cleanupRtc(true);
+        this.setState("error");
       } else if (message.type === "rtc.answer" && this.signedRtcSession !== null) {
+        this.captureBindingMetadata(message);
         const pc = this.pc;
         const session = this.signedRtcSession;
         const expectedSessionId = this.sessionId ?? undefined;
@@ -1069,6 +1195,7 @@ export class HostControlClient {
           .verifyAndApplyAnswer(pc, message)
           .then(() => {
             if (!this.isCurrentWebSocket(ws, attempt) || this.pc !== pc) return;
+            if (pc.connectionState === "connected") this.clearRtcIceRestartTimer();
             for (const candidate of this.pendingRemoteCandidates.splice(0)) {
               void pc.addIceCandidate(candidate).catch(() => {});
             }
@@ -1081,6 +1208,7 @@ export class HostControlClient {
         !this.signedRtcRequired &&
         message.session_id === this.sessionId
       ) {
+        this.captureBindingMetadata(message);
         // Legacy unpinned (TOFU) path only. Once this generation has selected
         // signed mode, signedRtcRequired stays true for its whole lifetime, so
         // a raw answer can never reach the peer's remote-description setter here
@@ -1095,6 +1223,7 @@ export class HostControlClient {
           .setRemoteDescription({ type: "answer", sdp: message.sdp })
           .then(() => {
             if (!this.isCurrentWebSocket(ws, attempt) || this.pc !== pc) return;
+            if (pc.connectionState === "connected") this.clearRtcIceRestartTimer();
             for (const candidate of this.pendingRemoteCandidates.splice(0)) {
               void pc.addIceCandidate(candidate).catch(() => {});
             }
@@ -1103,29 +1232,79 @@ export class HostControlClient {
             if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(message.session_id);
           });
       } else if (message.type === "rtc.candidate" && message.session_id === this.sessionId) {
+        this.captureBindingMetadata(message);
         if (this.pc?.remoteDescription) {
           void this.pc.addIceCandidate(message.candidate).catch(() => {});
         } else {
           this.pendingRemoteCandidates.push(message.candidate);
         }
-      } else if (
-        message.type === "rtc.status" &&
-        message.session_id === this.sessionId &&
-        ["failed", "disabled", "unavailable"].includes(message.status)
-      ) {
-        this.failRtc(message.session_id);
+      } else if (message.type === "rtc.status" && message.session_id === this.sessionId) {
+        this.captureBindingMetadata(message);
+        if (["resumed", "rebound", "signalling_lost", "connected"].includes(message.status)) {
+          if (message.status === "resumed") this.clearRtcResumeTimer();
+          return;
+        }
+        if (this.resumeInFlight && message.status === "unavailable") {
+          this.fallBackFromResume();
+          return;
+        }
+        if (["failed", "disabled", "unavailable"].includes(message.status)) {
+          if (this.iceRestartInFlight && message.status === "unavailable") {
+            this.fallBackToFreshRtc(this.sessionId);
+          } else {
+            this.failRtc(message.session_id);
+          }
+        }
       }
     };
     ws.onerror = () => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
       this.setState("error");
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
       this.detachWebSocket(ws);
       this.ws = null;
+      this.clearSignalWatchdog();
       this.clearConnectDeadline();
-      this.cleanupRtc(false);
+      this.finishRtcConfigRefresh();
+      this.clearRtcResumeTimer();
+      const action = socketCloseAction(event?.code ?? 1006);
+      if (
+        !this.hasHealthyRtc() ||
+        action === "unauthorized" ||
+        action === "client_bug" ||
+        action === "client_stale"
+      ) {
+        this.cleanupRtc(false);
+      }
+      if (action === "client_stale") {
+        this.terminalReason = "protocol_required";
+        this.setState("error");
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("spawn:client-stale", { detail: { hard: true } }));
+        }
+        return;
+      }
+      if (action === "unauthorized") {
+        this.stopped = true;
+        this.setState("unauthorized");
+        notifySocketUnauthorized();
+        return;
+      }
+      if (action === "client_bug") {
+        this.terminalReason = "client_bug";
+        this.setState("error");
+        console.error("SPAWN D host signalling stopped after a client protocol error.");
+        return;
+      }
+      if (action === "reconnect_immediately") {
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          this.openWebSocket();
+        }, 0);
+        return;
+      }
       if (!this.stopped) this.scheduleReconnect();
     };
   }
@@ -1140,11 +1319,24 @@ export class HostControlClient {
     this.cleanupRtc(true);
     if (!this.isCurrentWebSocket(ws, attempt) || ws.readyState !== WebSocket.OPEN) return;
     const sessionId = crypto.randomUUID();
-    const pc = new RTCPeerConnection({ iceServers, iceTransportPolicy });
-    const channel = pc.createDataChannel(HOST_CONTROL_PROTOCOL, { ordered: true });
+    let pc: RTCPeerConnection;
+    let channel: RTCDataChannel;
+    try {
+      pc = new RTCPeerConnection({
+        iceServers: sanitizeIceServers(iceServers),
+        iceTransportPolicy,
+        iceCandidatePoolSize: 1,
+      });
+      channel = pc.createDataChannel(HOST_CONTROL_PROTOCOL, { ordered: true });
+    } catch {
+      this.failRtc();
+      return;
+    }
     this.pc = pc;
     this.channel = channel;
     this.sessionId = sessionId;
+    this.bindingNonce = null;
+    this.bindingGeneration = null;
     this.pendingRemoteCandidates = [];
     // Locally-gathered ICE candidates carry the session_id. Emitting them
     // before the (possibly signed) offer is armed and sent would disclose the
@@ -1160,25 +1352,72 @@ export class HostControlClient {
         pendingLocalCandidates.push(candidate);
         return;
       }
-      this.sendSignal({ type: "rtc.candidate", session_id: sessionId, candidate }, ws, attempt);
+      this.sendSignal(
+        {
+          type: "rtc.candidate",
+          session_id: sessionId,
+          candidate,
+          ...(this.bindingNonce ? { binding_nonce: this.bindingNonce } : {}),
+          ...(this.bindingGeneration !== null
+            ? { binding_generation: this.bindingGeneration }
+            : {}),
+        },
+        ws,
+        attempt,
+      );
+    };
+    this.localCandidateGate = {
+      block: () => {
+        offerSent = false;
+      },
+      release: () => {
+        offerSent = true;
+        for (const candidate of pendingLocalCandidates.splice(0)) {
+          this.sendSignal(
+            {
+              type: "rtc.candidate",
+              session_id: sessionId,
+              candidate,
+              ...(this.bindingNonce ? { binding_nonce: this.bindingNonce } : {}),
+              ...(this.bindingGeneration !== null
+                ? { binding_generation: this.bindingGeneration }
+                : {}),
+            },
+            ws,
+            attempt,
+          );
+        }
+      },
     };
     pc.onconnectionstatechange = () => {
-      if (
-        this.isCurrentWebSocket(ws, attempt) &&
-        ["failed", "closed"].includes(pc.connectionState)
-      ) {
+      if (this.sessionId !== sessionId || this.pc !== pc) return;
+      if (pc.connectionState === "connected") {
+        this.clearRtcDisconnectedTimer();
+        this.clearRtcIceRestartTimer();
+      } else if (pc.connectionState === "disconnected") {
+        if (!this.rtcDisconnectedTimer) {
+          this.rtcDisconnectedTimer = setTimeout(() => {
+            this.rtcDisconnectedTimer = null;
+            if (this.sessionId === sessionId && pc.connectionState === "disconnected") {
+              void this.restartIce("disconnected");
+            }
+          }, RTC_DISCONNECTED_GRACE_MS);
+        }
+      } else if (pc.connectionState === "failed") {
+        void this.restartIce("failed");
+      } else if (pc.connectionState === "closed") {
         this.failRtc(sessionId);
       }
     };
     channel.onmessage = (event) => {
-      if (!this.isCurrentWebSocket(ws, attempt)) return;
+      if (this.sessionId !== sessionId || this.channel !== channel) return;
       this.handleControlMessage(event.data, sessionId);
     };
     channel.onclose = () => {
-      if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(sessionId);
+      if (this.sessionId === sessionId && this.channel === channel) this.failRtc(sessionId);
     };
     channel.onerror = () => {
-      if (!this.isCurrentWebSocket(ws, attempt) || this.sessionId !== sessionId) return;
+      if (this.sessionId !== sessionId || this.channel !== channel) return;
       this.setState("error");
       this.failRtc(sessionId);
     };
@@ -1189,9 +1428,9 @@ export class HostControlClient {
       // emits candidates ahead of the offer and biases ICE toward a relay pair.
       let decision: SignedRtcTrustDecision = { mode: "unpinned" };
       if (this.options.resolveSignedRtcTrust) {
-        decision = await this.options
-          .resolveSignedRtcTrust()
-          .catch(() => ({ mode: "refuse", reason: "pin_storage_error" }) as const);
+        const decisionPromise = this.prefetchedTrustDecision ?? this.resolveTrustDecision();
+        this.prefetchedTrustDecision = null;
+        decision = await decisionPromise;
         if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
       }
       if (decision.mode === "refuse") {
@@ -1207,6 +1446,7 @@ export class HostControlClient {
       // the legacy raw-answer branch is gated off for the entire lifetime of a
       // signed generation, not only once signedRtcSession is assigned below.
       this.signedRtcRequired = decision.mode === "signed";
+      this.signedRtcDecisionForBinding = decision;
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -1251,12 +1491,203 @@ export class HostControlClient {
       // The offer (signed envelope when signed) is now the first frame that can
       // disclose this session to the server. Only now release the buffered
       // local candidates, and let later ones flow directly.
-      offerSent = true;
-      for (const candidate of pendingLocalCandidates.splice(0)) {
-        this.sendSignal({ type: "rtc.candidate", session_id: sessionId, candidate }, ws, attempt);
-      }
+      this.localCandidateGate?.release();
     } catch {
       if (this.isCurrentWebSocket(ws, attempt)) this.failRtc(sessionId);
+    }
+  }
+
+  private async resolveTrustDecision(): Promise<SignedRtcTrustDecision> {
+    if (!this.options.resolveSignedRtcTrust) return { mode: "unpinned" };
+    return this.options
+      .resolveSignedRtcTrust()
+      .catch(() => ({ mode: "refuse", reason: "pin_storage_error" }) as const);
+  }
+
+  private prefetchTrustDecision(): void {
+    if (this.options.resolveSignedRtcTrust) {
+      this.prefetchedTrustDecision ??= this.resolveTrustDecision();
+    }
+  }
+
+  private captureBindingMetadata(message: HostBindingMetadata): void {
+    if (typeof message.binding_nonce === "string" && /^[0-9a-f]{32}$/.test(message.binding_nonce)) {
+      this.bindingNonce = message.binding_nonce;
+    }
+    if (
+      typeof message.binding_generation === "number" &&
+      Number.isSafeInteger(message.binding_generation) &&
+      message.binding_generation > 0
+    ) {
+      this.bindingGeneration = message.binding_generation;
+    }
+  }
+
+  private async refreshRtcConfigIfStale(): Promise<void> {
+    if (!this.latestIceServers || !iceServersNeedRefresh(this.latestIceServers)) return;
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (this.rtcConfigRefreshResolve) {
+      await new Promise<void>((resolve) => {
+        const previous = this.rtcConfigRefreshResolve;
+        this.rtcConfigRefreshResolve = () => {
+          previous?.();
+          resolve();
+        };
+      });
+      return;
+    }
+    ws.send(JSON.stringify({ type: "rtc.config.request" }));
+    await new Promise<void>((resolve) => {
+      this.rtcConfigRefreshResolve = resolve;
+      this.rtcConfigRefreshTimer = setTimeout(
+        () => this.finishRtcConfigRefresh(),
+        RTC_CONFIG_REFRESH_TIMEOUT_MS,
+      );
+    });
+  }
+
+  private async startRtcWithLatest(): Promise<void> {
+    await this.refreshRtcConfigIfStale();
+    const ws = this.ws;
+    if (
+      this.stopped ||
+      this.pc ||
+      !this.latestIceServers ||
+      !ws ||
+      ws.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    await this.startRtc(
+      this.latestIceServers,
+      this.latestIceTransportPolicy,
+      ws,
+      this.connectionAttempt,
+    );
+  }
+
+  private async restartIce(_reason: "disconnected" | "failed" | "wake"): Promise<void> {
+    const pc = this.pc;
+    const sessionId = this.sessionId;
+    // A restart still "in flight" past its deadline is frozen mid-await, not
+    // slow — honouring the latch would make every later retry a no-op.
+    if (this.iceRestartInFlight && Date.now() - this.iceRestartLatchedAt < RTC_LATCH_TIMEOUT_MS) {
+      return;
+    }
+    if (!pc || !sessionId) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (!this.bindingNonce || this.bindingGeneration === null) {
+      this.fallBackToFreshRtc(sessionId);
+      return;
+    }
+    this.iceRestartInFlight = true;
+    this.iceRestartLatchedAt = Date.now();
+    await this.refreshRtcConfigIfStale();
+    if (this.pc !== pc || this.sessionId !== sessionId || !this.latestIceServers) {
+      this.clearRtcIceRestartTimer();
+      return;
+    }
+    try {
+      pc.setConfiguration({
+        iceServers: this.latestIceServers,
+        iceTransportPolicy: this.latestIceTransportPolicy,
+      });
+      this.pendingRemoteCandidates = [];
+      this.localCandidateGate?.block();
+      pc.restartIce();
+      const offer = await pc.createOffer({ iceRestart: true });
+      await pc.setLocalDescription(offer);
+      if (this.pc !== pc || this.sessionId !== sessionId) {
+        this.clearRtcIceRestartTimer();
+        return;
+      }
+      let carrier: { signed_envelope: string } | { sdp: string };
+      if (this.signedRtcDecisionForBinding?.mode === "signed") {
+        const nextSignedSession = new SignedRtcLiveSession(
+          {
+            scopeType: "host",
+            scopeId: this.hostId,
+            protocol: HOST_CONTROL_PROTOCOL,
+            protocolVersion: HOST_CONTROL_VERSION,
+          },
+          sessionId,
+          this.signedRtcDecisionForBinding.capability,
+        );
+        carrier = await nextSignedSession.createOffer(offer.sdp ?? "");
+        this.signedRtcSession?.abort();
+        this.signedRtcSession = nextSignedSession;
+      } else {
+        carrier = { sdp: offer.sdp ?? "" };
+      }
+      this.sendSignal({
+        type: "rtc.offer",
+        session_id: sessionId,
+        binding_nonce: this.bindingNonce,
+        binding_generation: this.bindingGeneration,
+        ice_restart: true,
+        ...carrier,
+      });
+      this.localCandidateGate?.release();
+      this.rtcIceRestartTimer = setTimeout(
+        () => this.fallBackToFreshRtc(sessionId),
+        Math.max(1, this.options.iceRestartTimeoutMs ?? RTC_ICE_RESTART_TIMEOUT_MS),
+      );
+    } catch {
+      this.clearRtcIceRestartTimer();
+      this.fallBackToFreshRtc(sessionId);
+    }
+  }
+
+  private fallBackToFreshRtc(expectedSessionId: string | null): void {
+    if (!expectedSessionId || this.sessionId !== expectedSessionId) return;
+    this.clearRtcIceRestartTimer();
+    this.cleanupRtc(true);
+    this.prefetchTrustDecision();
+    if (this.ws?.readyState === WebSocket.OPEN && this.latestIceServers) {
+      void this.startRtcWithLatest();
+    } else {
+      this.scheduleReconnect();
+    }
+  }
+
+  private hasHealthyRtc(): boolean {
+    return this.pc?.connectionState === "connected" && this.channel?.readyState === "open";
+  }
+
+  private resumeHealthyRtc(ws: WebSocket, attempt: number): boolean {
+    if (!this.hasHealthyRtc()) return false;
+    if (!this.sessionId || !this.bindingNonce || this.bindingGeneration === null) {
+      this.fallBackFromResume();
+      return false;
+    }
+    if (this.resumeInFlight) return true;
+    this.resumeInFlight = true;
+    this.sendSignal(
+      {
+        type: "rtc.resume",
+        session_id: this.sessionId,
+        binding_nonce: this.bindingNonce,
+        binding_generation: this.bindingGeneration,
+      },
+      ws,
+      attempt,
+    );
+    this.rtcResumeTimer = setTimeout(
+      () => this.fallBackFromResume(),
+      Math.max(1, this.options.resumeTimeoutMs ?? RTC_RESUME_TIMEOUT_MS),
+    );
+    return true;
+  }
+
+  private fallBackFromResume(): void {
+    this.clearRtcResumeTimer();
+    this.cleanupRtc(false);
+    this.prefetchTrustDecision();
+    if (this.ws?.readyState === WebSocket.OPEN && this.latestIceServers) {
+      void this.startRtcWithLatest();
+    } else {
+      this.scheduleReconnect();
     }
   }
 
@@ -1675,17 +2106,31 @@ export class HostControlClient {
 
   private cleanupRtc(notifyServer: boolean): void {
     const sessionId = this.sessionId;
+    const bindingNonce = this.bindingNonce;
+    const bindingGeneration = this.bindingGeneration;
     this.sessionId = null;
+    this.bindingNonce = null;
+    this.bindingGeneration = null;
+    this.clearRtcRecoveryTimers();
     this.signedRtcSession?.abort();
     this.signedRtcSession = null;
     this.signedRtcRequired = false;
+    this.signedRtcDecisionForBinding = null;
     this.capabilities = new Set();
-    if (notifyServer && sessionId) this.sendSignal({ type: "rtc.close", session_id: sessionId });
+    if (notifyServer && sessionId) {
+      this.sendSignal({
+        type: "rtc.close",
+        session_id: sessionId,
+        ...(bindingNonce ? { binding_nonce: bindingNonce } : {}),
+        ...(bindingGeneration !== null ? { binding_generation: bindingGeneration } : {}),
+      });
+    }
     const channel = this.channel;
     const pc = this.pc;
     this.channel = null;
     this.pc = null;
     this.pendingRemoteCandidates = [];
+    this.localCandidateGate = null;
     if (channel) {
       channel.onopen = null;
       channel.onmessage = null;
@@ -1715,15 +2160,24 @@ export class HostControlClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.stopped || this.signedRtcRefusal !== null || this.reconnectTimer) return;
+    if (
+      this.stopped ||
+      this.signedRtcRefusal !== null ||
+      this.terminalReason !== null ||
+      this.reconnectTimer
+    )
+      return;
     this.clearConnectDeadline();
-    this.reconnectAttempt += 1;
     const attempt = this.connectionAttempt;
-    const delay = Math.min(
-      10_000,
-      Math.max(1, this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS) *
-        this.reconnectAttempt,
+    const delay = backoffDelay(
+      this.reconnectAttempt,
+      {
+        base: Math.max(1, this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS),
+        cap: 30_000,
+      },
+      this.options.reconnectRandom,
     );
+    this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 30);
     const timer = setTimeout(() => {
       if (this.reconnectTimer !== timer) return;
       this.reconnectTimer = null;
@@ -1734,7 +2188,7 @@ export class HostControlClient {
         this.detachWebSocket(ws);
         ws.close();
       }
-      this.cleanupRtc(false);
+      if (!this.hasHealthyRtc()) this.cleanupRtc(false);
       this.openWebSocket();
     }, delay);
     this.reconnectTimer = timer;
@@ -1750,6 +2204,104 @@ export class HostControlClient {
   private clearConnectDeadline(): void {
     if (this.connectTimer) clearTimeout(this.connectTimer);
     this.connectTimer = null;
+  }
+
+  private clearSignalWatchdog(): void {
+    if (this.signalWatchdogTimer) clearTimeout(this.signalWatchdogTimer);
+    this.signalWatchdogTimer = null;
+  }
+
+  private clearRtcDisconnectedTimer(): void {
+    if (this.rtcDisconnectedTimer) clearTimeout(this.rtcDisconnectedTimer);
+    this.rtcDisconnectedTimer = null;
+  }
+
+  private clearRtcResumeTimer(): void {
+    if (this.rtcResumeTimer) clearTimeout(this.rtcResumeTimer);
+    this.rtcResumeTimer = null;
+    this.resumeInFlight = false;
+  }
+
+  private clearRtcIceRestartTimer(): void {
+    if (this.rtcIceRestartTimer) clearTimeout(this.rtcIceRestartTimer);
+    this.rtcIceRestartTimer = null;
+    this.iceRestartInFlight = false;
+  }
+
+  private clearRtcRecoveryTimers(): void {
+    this.clearRtcDisconnectedTimer();
+    this.clearRtcResumeTimer();
+    this.clearRtcIceRestartTimer();
+  }
+
+  private finishRtcConfigRefresh(): void {
+    if (this.rtcConfigRefreshTimer) clearTimeout(this.rtcConfigRefreshTimer);
+    this.rtcConfigRefreshTimer = null;
+    const resolve = this.rtcConfigRefreshResolve;
+    this.rtcConfigRefreshResolve = null;
+    resolve?.();
+  }
+
+  private redialNow(): void {
+    const ws = this.ws;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    if (ws) {
+      this.ws = null;
+      this.detachWebSocket(ws);
+      try {
+        ws.close();
+      } catch {
+        // A replacement socket is opened below either way.
+      }
+    }
+    this.openWebSocket();
+  }
+
+  private wake(): void {
+    if (this.stopped || this.terminalReason !== null || this.signedRtcRefusal !== null) return;
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      this.redialNow();
+      return;
+    }
+    if (this.pc?.connectionState === "connected") return;
+    const silenceSuspectMs = this.options.silenceSuspectMs ?? SIGNAL_SILENCE_SUSPECT_MS;
+    if (Date.now() - this.lastSignalFrameAt > silenceSuspectMs) {
+      // OPEN is the socket's claim, not the network's: a sleep leaves
+      // half-open sockets that never fire onclose, and the server pings
+      // every 25 s, so a live one is never this quiet. Redial — the fresh
+      // socket also carries fresh TURN credentials in on its rtc.config.
+      this.redialNow();
+      return;
+    }
+    if (this.pc) {
+      void this.restartIce("wake");
+    } else if (this.latestIceServers) {
+      void this.startRtcWithLatest();
+    }
+  }
+
+  private installGlobalListeners(): void {
+    if (this.globalListenersInstalled || typeof window === "undefined") return;
+    this.globalListenersInstalled = true;
+    document.addEventListener("visibilitychange", this.onVisibilityChange);
+    window.addEventListener("online", this.onWake);
+    window.addEventListener("pageshow", this.onWake);
+    // The desktop shell's webview sleeps and wakes with the machine without
+    // firing any of the three events above; the clock jump always arrives.
+    this.stopSuspendWatch = watchSuspendResume(this.onWake);
+  }
+
+  private uninstallGlobalListeners(): void {
+    if (!this.globalListenersInstalled || typeof window === "undefined") return;
+    this.globalListenersInstalled = false;
+    document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    window.removeEventListener("online", this.onWake);
+    window.removeEventListener("pageshow", this.onWake);
+    this.stopSuspendWatch?.();
+    this.stopSuspendWatch = null;
   }
 
   private isCurrentWebSocket(ws: WebSocket, attempt: number): boolean {

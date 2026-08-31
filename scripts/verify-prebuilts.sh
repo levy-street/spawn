@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Verify that the daemon binaries a spawn server hands out are byte-identical to
-# the ones GitHub CI built and published to the rolling `prebuilt-latest`
-# release. For every supported target this downloads what the server serves at
-# /api/install/{spawnd,spawn-worker}/<target>, hashes it, and compares against
-# CI's SHA256SUMS. No trust in the server required — the release SHA256SUMS is
-# the reference, the served bytes are the subject.
+# Verify the server's daemon manifest signature, then prove the handed-out
+# binaries are byte-identical to the rolling `prebuilt-latest` release. For
+# every supported target this downloads /api/install/{spawnd,spawn-worker},
+# hashes it, and compares against CI's SHA256SUMS.
 #
 # Usage: scripts/verify-prebuilts.sh [server-url]
 #   server-url  Base URL of the spawn server. Default: https://spawnd.dev
@@ -16,6 +14,9 @@ set -euo pipefail
 SERVER="${1:-https://spawnd.dev}"
 SERVER="${SERVER%/}"
 REPO="${SPAWN_REPO:-levy-street/spawn}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=release-lib.sh
+source "$script_dir/release-lib.sh"
 
 die() {
   printf 'verify-prebuilts: %s\n' "$*" >&2
@@ -24,18 +25,64 @@ die() {
 
 command -v gh >/dev/null 2>&1 || die "gh is required to fetch the reference SHA256SUMS"
 command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v git >/dev/null 2>&1 || die "git is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
-
-# install.py's friendly target name -> release-asset triple.
-TARGETS=(
-  "darwin-aarch64:aarch64-apple-darwin"
-  "darwin-x86_64:x86_64-apple-darwin"
-  "linux-x86_64:x86_64-unknown-linux-gnu"
-  "linux-aarch64:aarch64-unknown-linux-gnu"
-)
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v uv >/dev/null 2>&1 || die "uv is required"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
+  die "run from inside the spawn repo"
+
+manifest="$tmp/manifest.json"
+signature="$tmp/manifest.json.sig"
+manifest_signature_ok=0
+manifest_key_id=""
+release_public_keys=()
+release_key_source="$repo_root/daemon/src/release_key.rs"
+if [[ -f "$release_key_source" ]]; then
+  while IFS= read -r public_key; do
+    [[ -n "$public_key" ]] && release_public_keys+=("$public_key")
+  done < <(release_public_keys_from_rust_file "$release_key_source" 2>/dev/null || true)
+else
+  release_key_source="SPAWN_RELEASE_PUBLIC_KEY fallback"
+  if [[ -n "${SPAWN_RELEASE_PUBLIC_KEY:-}" ]]; then
+    IFS=, read -r -a release_public_keys <<< "$SPAWN_RELEASE_PUBLIC_KEY"
+  fi
+fi
+
+if curl -fsSL "$SERVER/api/install/manifest.json" -o "$manifest" &&
+  curl -fsSL "$SERVER/api/install/manifest.json.sig" -o "$signature"; then
+  manifest_key_id="$(python3 - "$manifest" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8")).get("signing_key_id")
+if isinstance(value, str):
+    print(value)
+PY
+)"
+  for public_key in "${release_public_keys[@]}"; do
+    if verify_prebuilt_manifest_signature \
+      "$manifest" "$signature" "$public_key" 2>/dev/null; then
+      verified_key_id="$(release_signing_key_id "$public_key" 2>/dev/null || true)"
+      if [[ -n "$verified_key_id" && "$verified_key_id" == "$manifest_key_id" ]]; then
+        manifest_signature_ok=1
+        break
+      fi
+    fi
+  done
+fi
+
+if [[ "$manifest_signature_ok" == "1" ]]; then
+  printf 'verify-prebuilts: manifest signature OK (key %s; %s)\n' \
+    "$manifest_key_id" "$release_key_source"
+else
+  printf 'verify-prebuilts: manifest signature FAIL (key %s; %s)\n' \
+    "${manifest_key_id:-unknown}" "$release_key_source" >&2
+fi
 
 printf 'verify-prebuilts: fetching reference SHA256SUMS from %s (%s)\n' "$REPO" prebuilt-latest
 gh release download prebuilt-latest --repo "$REPO" --pattern SHA256SUMS --dir "$tmp" --clobber \
@@ -46,25 +93,65 @@ ref_hash() {
   awk -v f="$1" '$2 == f || $2 == "*"f { print $1; exit }' "$tmp/SHA256SUMS"
 }
 
+manifest_hash() {
+  python3 - "$manifest" "$1" "$2" <<'PY'
+import json
+import sys
+
+path, target, kind = sys.argv[1:]
+field = "spawnd_sha256" if kind == "spawnd" else "spawn_worker_sha256"
+try:
+    value = json.load(open(path, encoding="utf-8"))["targets"][target][field]
+except (KeyError, OSError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(value, str):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
 printf '\n%-22s %-14s %s\n' TARGET BINARY RESULT
 printf -- '---------------------------------------------------------------\n'
 
 fail=0
+[[ "$manifest_signature_ok" == "1" ]] || fail=1
 checked=0
-for pair in "${TARGETS[@]}"; do
+for pair in "${PREBUILT_TARGETS[@]}"; do
   target="${pair%%:*}"
   triple="${pair##*:}"
   for kind in spawnd spawn-worker; do
-    asset="$kind-$triple"
+    asset="$(prebuilt_asset_name "$target" "$triple" "$kind")"
     want="$(ref_hash "$asset" || true)"
     if [[ -z "$want" ]]; then
-      printf '%-22s %-14s %s\n' "$target" "$kind" "SKIP (not in release)"
+      if prebuilt_target_is_required "$target"; then
+        printf '%-22s %-14s %s\n' "$target" "$kind" \
+          "FAIL (required asset $asset is not in SHA256SUMS)"
+        fail=1
+      else
+        printf '%-22s %-14s %s\n' "$target" "$kind" "SKIP (not in release)"
+      fi
+      continue
+    fi
+    advertised="$(manifest_hash "$target" "$kind" 2>/dev/null || true)"
+    if [[ "$advertised" != "$want" ]]; then
+      printf '%-22s %-14s %s\n' "$target" "$kind" \
+        "FAIL (signed manifest hash does not match $asset)"
+      fail=1
       continue
     fi
     url="$SERVER/api/install/$kind/$target"
     out="$tmp/$asset.served"
-    if ! curl -fsSL "$url" -o "$out"; then
+    headers="$tmp/$asset.headers"
+    if ! curl -fsSL -D "$headers" "$url" -o "$out"; then
       printf '%-22s %-14s %s\n' "$target" "$kind" "FAIL (server 404/again: $url)"
+      fail=1
+      continue
+    fi
+    installed_name="$(prebuilt_installed_name "$target" "$kind")"
+    if ! tr -d '\r' < "$headers" |
+      grep -Eiq "^content-disposition:.*filename=\"?${installed_name//./\\.}\"?([;[:space:]]|$)"; then
+      printf '%-22s %-14s %s\n' "$target" "$kind" \
+        "FAIL (response filename is not $installed_name)"
       fail=1
       continue
     fi
@@ -82,7 +169,7 @@ done
 
 printf -- '---------------------------------------------------------------\n'
 if [[ "$fail" != 0 ]]; then
-  die "one or more served binaries do not match CI — see above"
+  die "the manifest signature or one or more served binaries failed verification — see above"
 fi
 [[ "$checked" -gt 0 ]] || die "nothing verified (no matching assets served)"
 printf 'verify-prebuilts: all %d served binaries match CI (%s)\n' "$checked" "$SERVER"

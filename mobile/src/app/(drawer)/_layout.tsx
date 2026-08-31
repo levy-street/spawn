@@ -35,7 +35,6 @@ export const APP_ROUTE_MAP = {
   "/settings/account": "settings/account",
   "/settings/appearance": "settings/appearance",
   "/settings/notifications": "settings/notifications",
-  "/settings/hosts": "settings/hosts",
   "/settings/agents": "settings/agents",
   "/settings/skills": "settings/skills",
   "/settings/templates": "settings/templates",

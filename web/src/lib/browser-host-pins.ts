@@ -4,7 +4,10 @@ import { ed25519PublicKeyFingerprint } from "./signed-signal";
 export const BROWSER_HOST_PIN_DATABASE_NAME = "spawn-browser-host-pins";
 export const BROWSER_HOST_PIN_STORE_NAME = "host-pins";
 export const BROWSER_HOST_PIN_STORAGE_VERSION = 1;
+/** Active approvals and permanent removal records have independent budgets:
+ * accumulated history can never consume the space needed for a live host. */
 export const BROWSER_HOST_PIN_MAX_RECORDS = 256;
+export const BROWSER_HOST_PIN_MAX_TOMBSTONES = 256;
 export const BROWSER_HOST_PIN_MAX_HOST_IDS = 8;
 export const BROWSER_HOST_PIN_MAX_ORIGIN_CHARS = 512;
 
@@ -517,11 +520,12 @@ async function readRawRecords(database: IDBDatabase): Promise<unknown[]> {
   try {
     const store = transaction.objectStore(BROWSER_HOST_PIN_STORE_NAME);
     const count = await requestResult(store.count());
-    if (count > BROWSER_HOST_PIN_MAX_RECORDS) {
+    const maxStoredRecords = BROWSER_HOST_PIN_MAX_RECORDS + BROWSER_HOST_PIN_MAX_TOMBSTONES;
+    if (count > maxStoredRecords) {
       await completion;
       throw new BrowserHostPinError(
         "capacity_exceeded",
-        `local host-pin storage exceeds its ${BROWSER_HOST_PIN_MAX_RECORDS}-record limit`,
+        `local host-pin storage exceeds its separate active and tombstone limits`,
       );
     }
     const values = await requestResult(store.getAll());
@@ -537,6 +541,20 @@ async function readRawRecords(database: IDBDatabase): Promise<unknown[]> {
 async function readValidatedRecords(database: IDBDatabase): Promise<StoredBrowserHostPinV1[]> {
   const raw = await readRawRecords(database);
   const records = await Promise.all(raw.map(validateStoredRecord));
+  if (records.filter((record) => record.state === "active").length > BROWSER_HOST_PIN_MAX_RECORDS) {
+    throw new BrowserHostPinError(
+      "capacity_exceeded",
+      `local host-pin storage exceeds its ${BROWSER_HOST_PIN_MAX_RECORDS}-active-record limit`,
+    );
+  }
+  if (
+    records.filter((record) => record.state === "revoked").length > BROWSER_HOST_PIN_MAX_TOMBSTONES
+  ) {
+    throw new BrowserHostPinError(
+      "capacity_exceeded",
+      `local host-pin storage exceeds its ${BROWSER_HOST_PIN_MAX_TOMBSTONES}-tombstone limit`,
+    );
+  }
   assertNoConflicts(records);
   return records;
 }
@@ -575,10 +593,10 @@ async function compareAndWrite<T>(
     try {
       const store = transaction.objectStore(BROWSER_HOST_PIN_STORE_NAME);
       const currentCount = await requestResult(store.count());
-      if (currentCount > BROWSER_HOST_PIN_MAX_RECORDS) {
+      if (currentCount > BROWSER_HOST_PIN_MAX_RECORDS + BROWSER_HOST_PIN_MAX_TOMBSTONES) {
         const error = new BrowserHostPinError(
           "capacity_exceeded",
-          `local host-pin storage exceeds its ${BROWSER_HOST_PIN_MAX_RECORDS}-record limit`,
+          "local host-pin storage exceeds its separate active and tombstone limits",
         );
         await abortTransaction(transaction, completion);
         throw error;
@@ -675,6 +693,44 @@ function mergeHostIds(existing: readonly string[], seed: readonly string[]): str
  * This is the only operation allowed to reactivate an exact revoked key, and
  * callers must invoke it only from a fresh explicit user-confirmed ceremony.
  */
+/**
+ * A monotonic counter that moves whenever this page changes local host trust.
+ *
+ * Trust lives in IndexedDB, which announces nothing. A surface that refused to
+ * connect because no pin matched has no way to learn that the operator has
+ * since re-possessed the host — so it stays dead while the copy on screen tells
+ * the reader that re-possessing will bring it back. Callers subscribe to this
+ * and re-run their trust decision when it moves.
+ *
+ * Deliberately page-local: it reports what *this* page did, which is the case
+ * the warm terminal pool keeps mounted across navigation. Another tab's
+ * approval is not observed here, and reloading still picks it up.
+ */
+let hostPinRevision = 0;
+const hostPinListeners = new Set<() => void>();
+
+export function getBrowserHostPinRevision(): number {
+  return hostPinRevision;
+}
+
+export function subscribeToBrowserHostPinChanges(listener: () => void): () => void {
+  hostPinListeners.add(listener);
+  return () => {
+    hostPinListeners.delete(listener);
+  };
+}
+
+function announceBrowserHostPinChange(): void {
+  hostPinRevision += 1;
+  for (const listener of [...hostPinListeners]) {
+    try {
+      listener();
+    } catch {
+      // A bad subscriber must not stop the others from hearing about it.
+    }
+  }
+}
+
 export async function approveBrowserHostPin(
   input: ApproveBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
@@ -685,7 +741,7 @@ export async function approveBrowserHostPin(
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
+    const approved = await compareAndWrite(database, (records) => {
       const existing = recordsInScope(records, input.accountId, input.origin).find(
         (record) => record.hostPublicKey === identity.hostPublicKey,
       );
@@ -704,6 +760,15 @@ export async function approveBrowserHostPin(
             "this host key was removed on this device; only a fresh explicit ceremony reactivates it",
           );
         }
+        if (
+          records.filter((record) => record.state === "active").length >=
+          BROWSER_HOST_PIN_MAX_RECORDS
+        ) {
+          throw new BrowserHostPinError(
+            "capacity_exceeded",
+            `local host-pin storage is limited to ${BROWSER_HOST_PIN_MAX_RECORDS} active records`,
+          );
+        }
         const reactivated: StoredBrowserHostPinV1 = {
           ...existing,
           approvedAtMs: Math.max(now, existing.approvedAtMs, existing.revokedAtMs ?? 0),
@@ -713,10 +778,12 @@ export async function approveBrowserHostPin(
         };
         return { nextRecord: reactivated, result: publicPin(reactivated) };
       }
-      if (records.length >= BROWSER_HOST_PIN_MAX_RECORDS) {
+      if (
+        records.filter((record) => record.state === "active").length >= BROWSER_HOST_PIN_MAX_RECORDS
+      ) {
         throw new BrowserHostPinError(
           "capacity_exceeded",
-          `local host-pin storage is limited to ${BROWSER_HOST_PIN_MAX_RECORDS} records including tombstones`,
+          `local host-pin storage is limited to ${BROWSER_HOST_PIN_MAX_RECORDS} active records`,
         );
       }
       const created: StoredBrowserHostPinV1 = {
@@ -734,6 +801,8 @@ export async function approveBrowserHostPin(
       };
       return { nextRecord: created, result: publicPin(created) };
     });
+    announceBrowserHostPinChange();
+    return approved;
   } finally {
     database.close();
   }
@@ -852,7 +921,7 @@ export async function revokeBrowserHostPin(
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
+    const revokedPin = await compareAndWrite(database, (records) => {
       const scoped = recordsInScope(records, input.accountId, input.origin);
       const bound = scoped.find((record) => record.hostIds.includes(input.targetHostId));
       if (bound === undefined) {
@@ -866,6 +935,15 @@ export async function revokeBrowserHostPin(
       // otherwise be unremovable from this browser forever. The bound record
       // (the key this device actually approved for this Host ID) is what dies.
       if (bound.state === "revoked") return { result: publicPin(bound) };
+      if (
+        records.filter((record) => record.state === "revoked").length >=
+        BROWSER_HOST_PIN_MAX_TOMBSTONES
+      ) {
+        throw new BrowserHostPinError(
+          "capacity_exceeded",
+          `local host-pin storage is limited to ${BROWSER_HOST_PIN_MAX_TOMBSTONES} tombstones`,
+        );
+      }
       const now = checkedNow(options);
       const revoked: StoredBrowserHostPinV1 = {
         ...bound,
@@ -874,6 +952,8 @@ export async function revokeBrowserHostPin(
       };
       return { nextRecord: revoked, result: publicPin(revoked) };
     });
+    announceBrowserHostPinChange();
+    return revokedPin;
   } finally {
     database.close();
   }
@@ -902,7 +982,7 @@ export async function forgetActiveBrowserHostPins(
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
+    const outcome = await compareAndWrite(database, (records) => {
       const active = recordsInScope(records, input.accountId, input.origin).filter(
         (record) => record.state === "active",
       );
@@ -911,6 +991,8 @@ export async function forgetActiveBrowserHostPins(
         result: { forgotten: active.length },
       };
     });
+    if (outcome.forgotten > 0) announceBrowserHostPinChange();
+    return outcome;
   } finally {
     database.close();
   }

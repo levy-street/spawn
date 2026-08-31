@@ -6,7 +6,15 @@ import {
   test,
   type WebSocketRoute,
 } from "@playwright/test";
-import { mockApp, SESSION_B_ID, SESSION_ID, session, WORKSPACE_ID, workspace } from "./app-mocks";
+import {
+  mockApp,
+  pinKeyboard,
+  SESSION_B_ID,
+  SESSION_ID,
+  session,
+  WORKSPACE_ID,
+  workspace,
+} from "./app-mocks";
 import {
   handleSessionRtcSignal,
   installSessionRtcMock,
@@ -305,6 +313,25 @@ test("shift+enter sends ESC CR exactly once (no trailing plain CR)", async ({ pa
   await expect.poll(() => binaryText(messages)).toContain("x");
   const bytes = binaryText(messages);
   expect(bytes.replace("\x1b\r", "")).not.toContain("\r");
+});
+
+test("on a Mac, ⌥ and ⌘ arrows are the shell's word and line keys", async ({ page }) => {
+  // The two halves of Mac text navigation, which xterm.js only half provides:
+  // it turns ⌥←/⌥→ into backward-word and forward-word itself, and drops every
+  // ⌘ chord unread, so the ends of the line had to be put back by hand.
+  await pinKeyboard(page, "apple");
+  const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n" });
+
+  await page.getByLabel("Session terminal").click();
+  await page.keyboard.press("Alt+ArrowLeft");
+  await page.keyboard.press("Alt+ArrowRight");
+  await expect.poll(() => binaryText(messages)).toContain("\x1bb");
+  expect(binaryText(messages)).toContain("\x1bf");
+
+  await page.keyboard.press("Meta+ArrowLeft");
+  await page.keyboard.press("Meta+ArrowRight");
+  await expect.poll(() => binaryText(messages)).toContain("\x01");
+  expect(binaryText(messages)).toContain("\x05");
 });
 
 test("terminal sends control keys without waiting for a refresh", async ({ page }) => {
@@ -789,6 +816,24 @@ test("multi-chunk upload waits for real bufferedAmount drain", async ({ page }) 
   });
   await expect.poll(() => uploads.at(-1)?.bytes.length).toBe(bytes.length);
   expect(uploads.at(-1)?.bytes.equals(bytes)).toBe(true);
+});
+
+test("a file dragged over the terminal raises the drop hint", async ({ page }) => {
+  // The sign that the terminal will take what someone is holding, which is
+  // the whole of the gesture until they let go. What a drag says about itself
+  // mid-flight differs by engine — `files` is empty until the drop in Chrome,
+  // and WebKit can hand back an `items` list nothing may be read from — so
+  // `hasFileTransfer` asks all three, `types` included.
+  await openTerminalWithMockSocket(page);
+  const terminal = page.getByLabel("Session terminal");
+  await terminal.evaluate((node) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array([1, 2, 3])], "shot.png", { type: "image/png" }));
+    node.dispatchEvent(
+      new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+  await expect(terminal.getByText("Drop images into the prompt")).toBeVisible();
 });
 
 test("removing an uploading attachment aborts it and sends upload_cancel", async ({ page }) => {
@@ -1391,7 +1436,7 @@ test("emoji occupy two cells (Unicode 11 width tables)", async ({ page }) => {
   expect(widths.emoji / widths.x).toBeCloseTo(2, 1);
 });
 
-test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page }) => {
+test("OSC 8 hyperlinks render and open without a JavaScript warning", async ({ page }) => {
   await openTerminalWithMockSocket(page, {
     history: "\x1b]8;;https://example.com\x1b\\LINKTEXT\x1b]8;;\x1b\\ plain\r\n",
   });
@@ -1411,6 +1456,36 @@ test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page
     .first()
     .evaluate((node) => getComputedStyle(node).textDecorationLine);
   expect(plainDecoration).not.toContain("underline");
+
+  await page.evaluate(() => {
+    const openedUrls: string[] = [];
+    Object.assign(globalThis, { __terminalOpenedUrls: openedUrls });
+    window.open = (() => {
+      const openedWindow = { opener: window, location: {} };
+      Object.defineProperty(openedWindow.location, "href", {
+        set: (url: string) => openedUrls.push(url),
+      });
+      return openedWindow as unknown as Window;
+    }) as typeof window.open;
+  });
+  const dialogs: string[] = [];
+  page.on("dialog", (dialog) => {
+    dialogs.push(dialog.message());
+    void dialog.dismiss();
+  });
+
+  await linkSpan.click();
+
+  expect(dialogs).toEqual([]);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as typeof globalThis & { __terminalOpenedUrls?: string[] })
+            .__terminalOpenedUrls ?? [],
+      ),
+    )
+    .toEqual(["https://example.com"]);
 });
 
 test("DECSCUSR switches the rendered cursor shape", async ({ page }) => {

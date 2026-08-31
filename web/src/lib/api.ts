@@ -1,5 +1,7 @@
 import { z } from "zod";
+import { CLIENT_INSTANCE_ID } from "@/lib/client-instance";
 import type { GridLayout, Tile, TileWidget } from "@/lib/grid";
+import { type ReleaseInfo, ReleaseSchema } from "@/lib/release";
 import type { LayoutV3, WorkspaceTab } from "@/lib/tabs";
 
 /**
@@ -33,10 +35,17 @@ export async function api<T>(
 ): Promise<T> {
   const { schema, headers, ...rest } = init;
   const res = await fetch(`${API_URL}${path}`, {
+    // The browser owns Set-Cookie processing before this promise resolves.
+    // Keeping the native response path and always including credentials lets
+    // an ordinary authenticated response transparently renew spawn_session;
+    // there is deliberately no client-side token or renewal timer here.
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
+      // Echoed as `origin` on the data-changed frames a mutation fans out,
+      // so this tab can tell its own echo from another client's change.
+      "X-Spawn-Client": CLIENT_INSTANCE_ID,
       ...headers,
     },
     ...rest,
@@ -76,18 +85,68 @@ export const UserSchema = z.object({
 });
 export type User = z.infer<typeof UserSchema>;
 
+export const HostUpdateSchema = z.preprocess(
+  (value) => value ?? {},
+  z.object({
+    state: z
+      .enum(["current", "available", "updating", "failed", "unsupported", "unknown"])
+      .catch("unknown"),
+    latest_version: z
+      .string()
+      .nullish()
+      .transform((value) => value ?? null),
+    error: z
+      .string()
+      .nullish()
+      .transform((value) => value ?? null),
+    requested_at: z
+      .string()
+      .nullish()
+      .transform((value) => value ?? null),
+  }),
+);
+export type HostUpdate = z.infer<typeof HostUpdateSchema>;
+
+export const HostUpdateResponseSchema = z.object({ update: HostUpdateSchema });
+export type HostUpdateResponse = z.infer<typeof HostUpdateResponseSchema>;
+
+export const HostLastDisconnectSchema = z
+  .object({
+    at: z.string().nullable(),
+    reason: z
+      .enum([
+        "socket_closed",
+        "superseded",
+        "keepalive_timeout",
+        "auth_rejected",
+        "server_restart",
+        "stale",
+      ])
+      .nullable(),
+  })
+  .nullable()
+  .optional();
+
 export const HostSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
   os: z.string().nullable().optional(),
   arch: z.string().nullable().optional(),
   version: z.string().nullable().optional(),
+  daemon_tree: z
+    .string()
+    .nullish()
+    .transform((value) => value ?? null),
+  update: HostUpdateSchema,
   host_key_algorithm: z.literal("ed25519").nullable().optional(),
   // The key travels alone (mesh B5): any fingerprint shown or compared is
   // derived locally from it, never read off a server response.
   host_public_key: z.string().nullable().optional(),
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
+  // Additive Phase C field. Older servers omit it; absence is deliberately
+  // indistinguishable from an ordinary offline disconnect in the UI.
+  last_disconnect: HostLastDisconnectSchema,
   session_count: z.number().int(),
   /** Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path. */
   supports_account_chains: z.boolean().default(false),
@@ -476,6 +535,65 @@ export const BrowserDeviceSchema = z.object({
 });
 export type BrowserDevice = z.infer<typeof BrowserDeviceSchema>;
 
+export const HostPinUndeliveredReasonSchema = z.enum(["pin_limit", "invalid_chain", "other"]);
+export type HostPinUndeliveredReason = z.infer<typeof HostPinUndeliveredReasonSchema>;
+
+const HostPinRecordSchema = z
+  .object({
+    browser_device_id: z.string().uuid().optional(),
+    // Accept the display endpoint's older device_id spelling while the server
+    // half rolls out; all consumers see browser_device_id after normalization.
+    device_id: z.string().uuid().optional(),
+    delivered: z.boolean().default(true),
+    undelivered_reason: HostPinUndeliveredReasonSchema.nullable().default(null),
+  })
+  .transform((pin, context) => {
+    const browserDeviceId = pin.browser_device_id ?? pin.device_id;
+    if (browserDeviceId === undefined) {
+      context.addIssue({ code: "custom", message: "host pin has no browser device id" });
+      return z.NEVER;
+    }
+    return {
+      browser_device_id: browserDeviceId,
+      delivered: pin.delivered,
+      undelivered_reason: pin.undelivered_reason,
+    };
+  });
+
+export const HostPinsResponseSchema = z
+  .union([
+    // Pre-Phase-D servers returned only live browser-device ids.
+    z.array(z.string().uuid()),
+    z.object({
+      pins: z.array(z.union([z.string().uuid(), HostPinRecordSchema])),
+      capacity: z.object({
+        used: z.number().int().nonnegative(),
+        max: z.number().int().positive(),
+      }),
+    }),
+  ])
+  .transform((response) => {
+    if (Array.isArray(response)) {
+      return {
+        pins: response.map((browserDeviceId) => ({
+          browser_device_id: browserDeviceId,
+          delivered: true,
+          undelivered_reason: null,
+        })),
+        capacity: null,
+      };
+    }
+    return {
+      pins: response.pins.map((pin) =>
+        typeof pin === "string"
+          ? { browser_device_id: pin, delivered: true, undelivered_reason: null }
+          : pin,
+      ),
+      capacity: response.capacity,
+    };
+  });
+export type HostPinsResponse = z.infer<typeof HostPinsResponseSchema>;
+
 export const DeviceApprovalRequestSchema = z.object({
   id: z.string().uuid(),
   browser_device_id: z.string().uuid(),
@@ -520,6 +638,12 @@ export const auth = {
       schema: AuthResponseSchema,
     }),
   logout: () => api<void>("/api/auth/logout", { method: "POST" }),
+  signOutEverywhere: () =>
+    api("/api/auth/sign-out-everywhere", {
+      method: "POST",
+      body: JSON.stringify({}),
+      schema: z.object({ access_token: z.string() }),
+    }),
   /** Always succeeds, whether or not the address has an account. */
   requestPasswordReset: (email: string) =>
     api<void>("/api/auth/password-reset/request", {
@@ -549,28 +673,33 @@ export const auth = {
       method: "GET",
       schema: AuthConfigSchema,
     }),
-  approveDevice: (body: {
-    user_code?: string;
-    approval_ref?: string;
-    approval_nonce: string;
-    host_key_algorithm: "ed25519";
-    host_public_key: string;
-    host_key_fingerprint: string;
-    browser_device_id: string;
-    browser_key_algorithm: "ed25519";
-    browser_public_key: string;
-    browser_key_fingerprint: string;
-    signature: string;
-  }) =>
+  approveDevice: (
+    body: {
+      user_code?: string;
+      approval_ref?: string;
+      approval_nonce: string;
+      host_key_algorithm: "ed25519";
+      host_public_key: string;
+      host_key_fingerprint: string;
+      browser_device_id: string;
+      browser_key_algorithm: "ed25519";
+      browser_public_key: string;
+      browser_key_fingerprint: string;
+      signature: string;
+    },
+    signal?: AbortSignal,
+  ) =>
     api("/api/auth/device/approve", {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
       schema: DeviceApproveResponseSchema,
     }),
-  pendingDevice: (body: { user_code?: string; approval_ref?: string }) =>
+  pendingDevice: (body: { user_code?: string; approval_ref?: string }, signal?: AbortSignal) =>
     api("/api/auth/device/pending", {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
       schema: DevicePendingResponseSchema,
     }),
 };
@@ -591,6 +720,11 @@ export const hosts = {
       method: "PATCH",
       body: JSON.stringify({ name }),
       schema: HostSchema,
+    }),
+  update: (id: string) =>
+    api(`/api/hosts/${id}/update`, {
+      method: "POST",
+      schema: HostUpdateResponseSchema,
     }),
   remove: (id: string) => api<void>(`/api/hosts/${id}`, { method: "DELETE" }),
   /** Availability of every agent definition on this host. */
@@ -755,6 +889,15 @@ export const profile = {
   get: () => api("/api/profile", { method: "GET", schema: ProfileSchema }),
 };
 
+export const release = {
+  get: (): Promise<ReleaseInfo> =>
+    api("/api/release", {
+      method: "GET",
+      cache: "no-store",
+      schema: ReleaseSchema,
+    }),
+};
+
 export const account = {
   /** Permanently deletes the signed-in account and everything it owns. */
   remove: (body: { confirm_email: string; password?: string }) =>
@@ -864,9 +1007,21 @@ export const trust = {
     }),
   removePasskey: (id: string) =>
     api(`/api/trust/passkeys/${id}`, { method: "DELETE", schema: z.unknown() }),
-  /** Browser device IDs a host already trusts. */
-  hostPins: (hostId: string) =>
-    api(`/api/trust/hosts/${hostId}/pins`, { method: "GET", schema: z.array(z.string()) }),
+  /** Delivery and capacity state for every browser approval held by a host. */
+  hostPinStatus: (hostId: string) =>
+    api(`/api/trust/hosts/${hostId}/pins`, {
+      method: "GET",
+      schema: HostPinsResponseSchema,
+    }),
+  /** Browser device IDs the host can actually admit. An undelivered approval
+   * is displayable in hostPinStatus but must not count as trust here. */
+  hostPins: async (hostId: string) => {
+    const response = await api(`/api/trust/hosts/${hostId}/pins`, {
+      method: "GET",
+      schema: HostPinsResponseSchema,
+    });
+    return response.pins.filter((pin) => pin.delivered).map((pin) => pin.browser_device_id);
+  },
   /**
    * Pin records with provenance for the Access screen's host rows: `direct`
    * means the pin came from the possess ceremony itself. Display only —
