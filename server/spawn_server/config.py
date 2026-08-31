@@ -246,6 +246,88 @@ class Settings(BaseSettings):
     turn_ttl_seconds: int = Field(default=24 * 3600)
     daemon_registration_concurrency: int = Field(default=32, ge=1, le=256)
 
+    # Subscriptions, on the hosted instance only. Absent is the supported
+    # configuration and not an error: a self-hoster sets none of this, gets
+    # unlimited hosts, and has no billing surface anywhere — no limit, no UI,
+    # no Stripe calls, and none of the new columns consulted. See docs/BILLING.md.
+    #
+    # `is_local_deployment()` looks like the right switch for that and is not:
+    # it answers "is this a laptop or a LAN address", so a self-hoster on a
+    # real domain would read as hosted and start being billed. The flag below
+    # is the only thing that turns billing on.
+    billing_enabled: bool = False
+    stripe_secret_key: str | None = None
+    # Stripe signs every webhook with this. Without it the endpoint cannot
+    # tell Stripe from anybody else — see the validator below.
+    stripe_webhook_secret: str | None = None
+    # One monthly USD price per paid tier. These ids are the authority for
+    # what an account is entitled to; Stripe's own price metadata is editable
+    # by anyone with a dashboard login and is never read.
+    stripe_price_coven: str | None = None
+    stripe_price_legion: str | None = None
+    stripe_price_pandemonium: str | None = None
+    # Where Checkout and the Customer Portal return the browser. Falls back to
+    # `web_url`, then `public_url`, like every other link the server builds.
+    billing_return_url: str | None = None
+
+    @model_validator(mode="after")
+    def _refuse_billing_without_its_secrets(self) -> Settings:
+        """Billing on with no webhook secret is an unauthenticated grant API.
+
+        A webhook endpoint that cannot verify a signature will accept anybody's
+        POST claiming anybody's subscription. Refusing to boot is the only safe
+        reading of that configuration; the alternative is a warning in a log
+        nobody reads and a paid tier anyone can mint.
+
+        The price ids are here for a duller reason with the same shape. A
+        half-configured catalogue means a tier that cannot be bought and a
+        button that answers 500, which is a broken product rather than a hole
+        — but it is broken in a way that only shows up when a customer tries
+        to pay, which is the worst moment to find out.
+
+        Unlike `_refuse_development_defaults_off_a_laptop` this applies
+        everywhere, laptops included. That guard exists to stop a *default*
+        surviving into production, and defaults are exactly what make local
+        development work. Nothing here has a working default: switching
+        billing on is a deliberate act, and a deliberate act done halfway is
+        as wrong on a laptop as it is on the internet.
+        """
+        if not self.billing_enabled:
+            return self
+
+        problems: list[str] = []
+        if not self.stripe_webhook_secret:
+            problems.append(
+                "SPAWN_STRIPE_WEBHOOK_SECRET is empty, so the webhook endpoint cannot "
+                "verify that an event came from Stripe. Anyone who can reach it could "
+                "grant themselves any plan. Copy the signing secret from the webhook "
+                "endpoint in the Stripe dashboard."
+            )
+        if not self.stripe_secret_key:
+            problems.append(
+                "SPAWN_STRIPE_SECRET_KEY is empty, so no Stripe call the server makes "
+                "can be authenticated and no subscription can be read or created."
+            )
+        for name, value in (
+            ("SPAWN_STRIPE_PRICE_COVEN", self.stripe_price_coven),
+            ("SPAWN_STRIPE_PRICE_LEGION", self.stripe_price_legion),
+            ("SPAWN_STRIPE_PRICE_PANDEMONIUM", self.stripe_price_pandemonium),
+        ):
+            if not value:
+                problems.append(
+                    f"{name} is empty, so that tier has no price to attach a subscription "
+                    "to and the server cannot map a subscription back to it."
+                )
+        if not problems:
+            return self
+
+        raise InsecureConfigurationError(
+            "SPAWN D refuses to start. SPAWN_BILLING_ENABLED is true, but the "
+            "configuration it depends on is incomplete:\n"
+            + "\n".join(f"  - {problem}" for problem in problems)
+            + "\nLeave SPAWN_BILLING_ENABLED unset for a deployment that does not bill."
+        )
+
     @model_validator(mode="after")
     def _refuse_development_defaults_off_a_laptop(self) -> Settings:
         """Refuse to start a public deployment that is still holding defaults.
@@ -290,6 +372,17 @@ class Settings(BaseSettings):
             "not a local address, but development defaults are still in place:\n"
             + "\n".join(f"  - {problem}" for problem in problems)
         )
+
+    @property
+    def billing_return_base(self) -> str:
+        """Origin Checkout and the Portal send the browser back to, no trailing slash.
+
+        Three levels because the API and the web app are different origins in
+        this deployment: an explicit override first, then the web app, then
+        whatever the server itself answers on. The last is a poor landing page
+        but always exists, so a return link is never empty.
+        """
+        return (self.billing_return_url or self.web_url or self.public_url).rstrip("/")
 
     @property
     def oauth_native_redirect_uri_list(self) -> list[str]:
