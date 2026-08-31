@@ -456,8 +456,19 @@ same moment.
 existing transaction:
 
 ```sql
-SELECT id FROM users WHERE id = :user_id FOR UPDATE
+SELECT id FROM users WHERE id = :user_id FOR NO KEY UPDATE
 ```
+
+> **`FOR UPDATE` here deadlocks, and the race test is what found it.** By the
+> time this runs, the same transaction has already inserted into
+> `host_key_claims`, whose foreign key makes PostgreSQL hold `FOR KEY SHARE` on
+> that very `users` row. `FOR UPDATE` conflicts with `FOR KEY SHARE`, so two
+> daemons pairing at once each wait on the other's key share and both come out
+> of `/device/poll` as a 500. `FOR NO KEY UPDATE` does not conflict with
+> `FOR KEY SHARE` and still conflicts with itself, which is the mutual
+> exclusion this lock exists for — and it is the honest lock, since nothing
+> here modifies the row's key. Invisible on SQLite, which emits no locking
+> clause at all and has one connection.
 
 Proven by a test pair following the existing convention — a shared
 `_assert_…(client)` body called from `test_file_sqlite_…(file_sqlite_client)`
