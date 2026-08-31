@@ -20,6 +20,7 @@ import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { WorkspaceCarryOverlay } from "@/components/nav/workspace-carry";
 import { ProfileDialog } from "@/components/profile/ProfileDialog";
+import { HostUpdateNotifier } from "@/components/release/HostUpdateNotifier";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { DeviceApprovalPrompt } from "@/components/trust/DeviceApprovalPrompt";
 import { Button } from "@/components/ui/button";
@@ -297,6 +298,7 @@ export function AppShell({
       <WorkspaceCarryOverlay />
       <ConfirmHost />
       <ToastHost />
+      <HostUpdateNotifier />
       <SettingsDialog />
       <ProfileDialog />
       <AccessCeremonyHost />

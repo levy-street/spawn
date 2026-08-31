@@ -99,10 +99,40 @@ What a bump then does is already built, end to end — do not re-derive it:
   unwritable install directory, self-update disabled) logs the exact reinstall
   command hourly and retries every five minutes.
 - **the browser reloads.** The refusal raises `spawn:client-stale` with
-  `hard: true`, which is the release watcher's hard prompt: a short countdown,
-  then a reload.
+  `hard: true`, which is the release watcher's hard prompt: a full-screen
+  overlay with a bar spending the countdown, then a reload.
 - **the phone** handles `protocol.required` on its sockets the same way and
   routes it into the update path.
+
+### The forced update, and when you are choosing it
+
+A protocol bump is the *only* thing that forces an update, and you do not
+switch it on separately — bumping the name is switching it on. There is no
+"mandatory release" flag to remember, deliberately: a flag someone forgets is
+a fleet stuck on a build the server refuses, and a flag someone sets by habit
+is a person locked out of their work over a release that would have been fine.
+The question is always the same one the bump already asks. Would a peer
+speaking the old name be *wrong*, not merely behind?
+
+What the bump then buys the person, on top of the machinery above:
+
+- **the browser and the phone take the whole screen.** Not a dialog: a dialog
+  implies something behind it you could go back to, and after a refusal there
+  isn't — every socket in the app has just been closed. Both show a progress
+  bar while the new version is fetched, and neither offers Later, because
+  there is no version of "later" in which the app works.
+- **the bar is indeterminate on the phone**, because `expo-updates` reports no
+  progress; in the browser it spends the reload countdown, which is a real
+  quantity. Neither invents a percentage. If you are tempted to add one, the
+  number would have to come from somewhere that measures it.
+- **an update the app cannot take strands the person gently.** A phone whose
+  *native runtime* is too old cannot fix itself with an OTA, so it is sent to
+  the store — and while there is no listing, it is told plainly and let out of
+  the dialog rather than held in one with no button that works.
+
+So before bumping, check the order below is possible at all; and after
+deploying, watch that daemons actually land on the new build rather than
+looping. A bump you cannot complete is worse than the drift it was fixing.
 
 So the order of operations for a bump is forced: the daemon prebuilts that
 speak the new protocol must be published **before or with** the server that

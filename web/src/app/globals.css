@@ -750,3 +750,20 @@ body {
     margin-right: 0.4em;
   }
 }
+
+/* The indeterminate stripe on an update notice. The daemon reports update
+ * state and never byte counts, so there is no position to draw — a stripe
+ * crossing the track says "still going" without claiming one. It leaves and
+ * re-enters the track cleanly each cycle, so the global reduced-motion rule
+ * freezes it as an ordinary part-filled bar rather than mid-flight. */
+@keyframes toast-progress {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+.animate-toast-progress {
+  animation: toast-progress 1.4s ease-in-out infinite;
+}
