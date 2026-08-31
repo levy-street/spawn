@@ -147,12 +147,12 @@ export const DEVICES: DeviceEntry[] = [
       ],
     },
     grid: {
-      src: "/product/phone/grid.png",
+      src: "/product/phone/codex-grid.png",
       width: 1170,
       height: 2532,
-      alt: "The spawnd app on a phone: a workspace with named tabs and live terminal tiles above the mobile modifier bar",
+      alt: "The spawnd app on a phone, server tab active: a live Codex session reporting ruff and pytest both passing, above the mobile modifier bar",
       caption:
-        "The workspace, phone-sized — Codex holds the server tab beside the rest of the fleet.",
+        "The workspace, phone-sized: the server tab is Codex's — one tap away from the rest of the fleet.",
     },
     moments: {
       heading: "Dispatch, watch, read the verdict.",
