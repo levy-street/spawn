@@ -201,7 +201,7 @@ pub fn start_listener(
 
 #[cfg(windows)]
 pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Read, Write};
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
@@ -244,9 +244,16 @@ pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
     pipe.write_all(&request)?;
     pipe.flush()?;
     let mut response = Vec::with_capacity(256);
-    pipe.take(4097).read_to_end(&mut response)?;
+    // A successful named-pipe server disconnect is surfaced as BrokenPipe on
+    // Windows, not as Unix-style EOF. The reply is already newline framed, so
+    // stop at that boundary instead of waiting for the server to disconnect.
+    let mut reader = std::io::BufReader::new(pipe.take((MAX_REQUEST_BYTES + 1) as u64));
+    reader.read_until(b'\n', &mut response)?;
     if response.len() > MAX_REQUEST_BYTES {
         bail!("control reply is oversized");
+    }
+    if !response.ends_with(b"\n") {
+        bail!("control reply is not newline terminated");
     }
     let reply: ControlReply =
         serde_json::from_slice(&response).context("decoding control reply")?;
@@ -455,5 +462,20 @@ mod tests {
         assert!(decode_request(b"{\"v\":1,\"command\":\"unknown\"}\n").is_err());
         assert!(decode_request(br#"{"v":1,"command":"ping"}"#).is_err());
         assert!(decode_request(&vec![b'x'; MAX_REQUEST_BYTES + 1]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_control_pipe_ping_reads_the_framed_reply_before_disconnect() {
+        let config = tempfile::tempdir().unwrap();
+        let reconnect = Box::leak(Box::new(tokio::sync::Notify::new()));
+        let shutdown = Box::leak(Box::new(tokio::sync::Notify::new()));
+        start_listener(config.path(), reconnect, shutdown).unwrap();
+        let path = config.path().to_path_buf();
+        let pid = tokio::task::spawn_blocking(move || send(&path, ControlCommand::Ping))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pid, std::process::id());
     }
 }

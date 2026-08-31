@@ -151,6 +151,17 @@ impl PossessionManager {
             .arg("possess")
             .arg("--no-browser")
             .arg("--no-qr");
+        #[cfg(target_os = "windows")]
+        command
+            // The desktop app has no console to inherit. Without this flag,
+            // spawning the console-subsystem daemon opens a visible terminal
+            // window for the whole possession flow.
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            // The Run watchdog starts both itself and spawnd detached. Task
+            // Scheduler's interactive-token jobs may surface a console and on
+            // some hosts also prevent session workers from breaking away.
+            .arg("--service-mode")
+            .arg("run");
         if new_account {
             command.arg("--new-account");
         }
