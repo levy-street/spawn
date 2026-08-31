@@ -574,7 +574,7 @@ describe("addBackupPasskey", () => {
     harness.listCredential("cred-a");
     await addBackupPasskey(harness.io());
     const put = harness.log.lastIndexOf("putBundle:1");
-    const add = harness.log.findIndex((entry) => entry === "addPasskey:cred-1");
+    const add = harness.log.indexOf("addPasskey:cred-1");
     expect(put).toBeGreaterThanOrEqual(0);
     expect(add).toBeGreaterThan(put);
     for (const credentialId of ["cred-a", "cred-1"]) {

@@ -1100,6 +1100,13 @@ fn ascii_lower_u16(value: u16) -> u16 {
 }
 
 #[cfg(test)]
+pub fn symlink_fixture_unavailable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        || error.raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1236,7 +1243,7 @@ mod tests {
                 open_private_file(&file_link, false).unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied
             ),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) if symlink_fixture_unavailable(&error) => {}
             Err(error) => panic!("creating file symlink failed unexpectedly: {error}"),
         }
 
@@ -1248,7 +1255,7 @@ mod tests {
                 open_private_dir(&dir_link).unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied
             ),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) if symlink_fixture_unavailable(&error) => {}
             Err(error) => panic!("creating directory symlink failed unexpectedly: {error}"),
         }
     }

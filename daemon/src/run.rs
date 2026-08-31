@@ -63,6 +63,12 @@ const CREDENTIAL_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
 /// filesystem, or a native keyring. Keep that work off Tokio and stop trusting
 /// the active generation if one complete load has not replied by this bound.
 const CREDENTIAL_LOAD_DEADLINE: Duration = Duration::from_secs(2);
+/// Once a credential reload stops inbound work, give the write half one short
+/// bounded chance to put a close frame on the wire. Dropping both split halves
+/// is not reliably observed by a Windows peer under socket load; this keeps the
+/// explicit close inside the existing fail-stop budget and still aborts on any
+/// stalled write.
+const CREDENTIAL_WS_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 const CREDENTIAL_LOADER_THREAD_NAME: &str = "spawnd-credential-loader";
 const CREDENTIAL_LOADER_PANIC_DIAGNOSTIC: &[u8] =
     b"spawnd: credential loader failed; trust disabled\n";
@@ -1046,26 +1052,37 @@ async fn serve_one_connection_with_loader(
         }
     };
 
-    // Tear down this session. A trust reload drops and joins the WebSocket I/O
-    // tasks before peer/sink cleanup so a hard loader failure cannot retain a
-    // stale control transport. Ordinary socket endings clear per-session sinks
-    // first; forwarders keep draining bounded worker output into direct
-    // viewers and reconnect catches up from worker replay. We abort rather
-    // than attempting a graceful WebSocket close because the final TCP write
-    // can hang. Only the reload branch re-awaits the aborted handles: no I/O
-    // handle was the winning `select!` branch there.
+    // Tear down this session. A trust reload stops and joins inbound WebSocket
+    // work before peer/sink cleanup so a hard loader failure cannot retain a
+    // stale control transport. It then gives the write half one bounded close
+    // attempt: dropping both split halves alone is not reliably observed by a
+    // Windows peer under socket load, while an unbounded graceful close can
+    // hang. Ordinary socket endings clear per-session sinks first; forwarders
+    // keep draining bounded worker output into direct viewers and reconnect
+    // catches up from worker replay.
     let credential_reload = matches!(&dispatch_result, ActiveSessionEvent::CredentialReload(_));
     if credential_reload {
-        // A hard loader failure is fatal. Drop the transport tasks before any
-        // potentially slow sink/peer cleanup so the stale control socket can
-        // no longer deliver work after the reply deadline fires.
+        // A hard loader failure is fatal. Stop inbound transport work before
+        // any potentially slow sink/peer cleanup so the stale control socket
+        // can no longer deliver work after the reply deadline fires.
         heartbeat_task.abort();
         reader_task.abort();
-        sender_task.abort();
-        let _ = tokio::join!(&mut heartbeat_task, &mut reader_task, &mut sender_task);
+        let _ = tokio::join!(&mut heartbeat_task, &mut reader_task);
         rtc_sessions.clear_ws_sender();
-        rtc_sessions.invalidate_trust_and_close_all().await;
         clear_session_sinks(registry).await;
+        let close_flushed = tokio::time::timeout(CREDENTIAL_WS_CLOSE_TIMEOUT, async {
+            let (close, flushed) = WsOutbound::tracked_close();
+            out_tx.send(close).await.map_err(|_| ())?;
+            flushed.notified().await;
+            Ok::<(), ()>(())
+        })
+        .await;
+        if !matches!(close_flushed, Ok(Ok(()))) {
+            tracing::warn!("credential reload websocket close exceeded its bounded window");
+        }
+        sender_task.abort();
+        let _ = (&mut sender_task).await;
+        rtc_sessions.invalidate_trust_and_close_all().await;
     } else {
         rtc_sessions.clear_ws_sender();
         clear_session_sinks(registry).await;
@@ -5889,7 +5906,12 @@ mod tests {
             assert!(message.contains("hard deadline"));
             assert!(!message.contains("live-stall-secret-token"));
             assert!(rtc_sessions.trust_epoch_for_test() > epoch_before);
-            let closed_at = tokio::time::timeout(Duration::from_millis(200), closed_rx)
+            // Receiving this observation is test-harness liveness, not the
+            // fail-stop bound: the timestamp below records when the peer
+            // actually closed and preserves the 250 ms production assertion.
+            // Give a saturated parallel Windows test run time to schedule the
+            // receiver without turning scheduler delay into a product failure.
+            let closed_at = tokio::time::timeout(HANDSHAKE_LIVENESS, closed_rx)
                 .await
                 .expect("stale websocket was not closed after loader deadline")
                 .expect("websocket close observation");
@@ -5913,7 +5935,7 @@ mod tests {
         );
         release_tx.send(()).expect("release stalled live loader");
         receive_std_signal(&exit_rx, Duration::from_secs(1), "live loader exit").await;
-        tokio::time::timeout(Duration::from_secs(1), server)
+        tokio::time::timeout(HANDSHAKE_LIVENESS, server)
             .await
             .expect("local websocket server timeout")
             .expect("local websocket server task");
@@ -6082,7 +6104,7 @@ mod tests {
             calls_at_failure
         );
         receive_std_signal(&exit_rx, Duration::from_secs(1), "cleanup-race loader exit").await;
-        tokio::time::timeout(Duration::from_secs(1), server)
+        tokio::time::timeout(HANDSHAKE_LIVENESS, server)
             .await
             .expect("local websocket server timeout")
             .expect("local websocket server task");

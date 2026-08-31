@@ -2781,7 +2781,7 @@ mod tests {
                     service.list("directory-symlink", 0).await.unwrap_err().code,
                     "symlink_rejected"
                 ),
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
                 Err(error) => panic!("creating directory symlink failed unexpectedly: {error}"),
             }
         }
