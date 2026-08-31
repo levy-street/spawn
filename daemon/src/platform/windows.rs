@@ -691,6 +691,13 @@ pub fn durable_replace(from: &Path, to: &Path) -> io::Result<()> {
     move_file(from, to, true)
 }
 
+/// No-op: Windows has no directory fsync, and `move_file` already passes
+/// `MOVEFILE_WRITE_THROUGH`, so the rename is committed before it returns.
+/// Present so callers can stay platform-agnostic.
+pub fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 pub fn rename_noreplace_at(parent: &Dir, from: &Path, to: &Path) -> io::Result<()> {
     move_file_at_verified(parent, from, to, false)
 }

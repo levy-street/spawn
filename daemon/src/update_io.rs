@@ -237,6 +237,14 @@ pub(super) fn swap_binaries(
         rollback_swapped(daemon, daemon_temporary);
         return Err(UpdateFailure::new(UpdateStage::Swap, "swap_failed"));
     }
+    // Both renames are atomic but not yet durable. Commit the directory
+    // entries so a power loss here cannot leave the pair torn — one binary
+    // swapped and the other's `.prev` half-published — which is the exact
+    // state that later refuses a repair with `swap_failed`.
+    let _ = crate::platform::sync_parent_dir(daemon);
+    if worker.parent() != daemon.parent() {
+        let _ = crate::platform::sync_parent_dir(worker);
+    }
     Ok(())
 }
 
