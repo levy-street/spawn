@@ -16,6 +16,7 @@ import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { LegionStrip } from "@/components/legion/LegionStrip";
+import { DownloadMenu } from "@/components/nav/download-menu";
 import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
 import { SidebarWorkspacePair, SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
 import {
@@ -802,58 +803,63 @@ export function Sidebar({
           </Button>
         </RailTooltip>
 
-        <DropdownMenu
-          side="top"
-          align="start"
-          className="block w-full"
-          renderTrigger={(props) => (
-            <RailTooltip label={user?.email ?? "Account"} disabled={!collapsed}>
-              <Button
-                {...props}
-                type="button"
-                variant="ghost"
-                size="sm"
-                aria-label="Account menu"
-                className={cn(sidebarRowClass(false), "h-11 justify-start px-0")}
-              >
-                <SidebarIconSlot>
-                  <span className="grid size-6 place-items-center rounded-full bg-secondary text-[11px] font-semibold uppercase text-secondary-foreground">
-                    {(user?.email ?? "?").slice(0, 1)}
-                  </span>
-                </SidebarIconSlot>
-                <SidebarRowLabel collapsed={collapsed} className="text-xs">
-                  {user?.email ?? "—"}
-                </SidebarRowLabel>
-              </Button>
-            </RailTooltip>
-          )}
-        >
-          <DropdownMenuItem
-            onSelect={() => {
-              onNavigate?.();
-              openProfile();
-            }}
+        <div className="flex items-center">
+          <DropdownMenu
+            side="top"
+            align="start"
+            className="block min-w-0 flex-1"
+            renderTrigger={(props) => (
+              <RailTooltip label={user?.email ?? "Account"} disabled={!collapsed}>
+                <Button
+                  {...props}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Account menu"
+                  className={cn(sidebarRowClass(false), "h-11 justify-start px-0")}
+                >
+                  <SidebarIconSlot>
+                    <span className="grid size-6 place-items-center rounded-full bg-secondary text-[11px] font-semibold uppercase text-secondary-foreground">
+                      {(user?.email ?? "?").slice(0, 1)}
+                    </span>
+                  </SidebarIconSlot>
+                  {/* No size override: the address reads at the same size as
+                      the Settings row above it — footer rows are one rhythm. */}
+                  <SidebarRowLabel collapsed={collapsed}>{user?.email ?? "—"}</SidebarRowLabel>
+                </Button>
+              </RailTooltip>
+            )}
           >
-            <UserRound className="size-4" aria-hidden />
-            Profile
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          {/* Settings has its own rail row above; Access keeps the one-click
-              reach the v5 Access UX asks for (docs/TRUST_UX.md). */}
-          <DropdownMenuItem onSelect={() => openSettings("access")}>
-            <ShieldCheck className="size-4" aria-hidden />
-            Access
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            destructive
-            onSelect={() => {
-              void logout();
-            }}
-          >
-            <LogOut className="size-4" aria-hidden />
-            Log out
-          </DropdownMenuItem>
-        </DropdownMenu>
+            <DropdownMenuItem
+              onSelect={() => {
+                onNavigate?.();
+                openProfile();
+              }}
+            >
+              <UserRound className="size-4" aria-hidden />
+              Profile
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            {/* Settings has its own rail row above; Access keeps the one-click
+                reach the v5 Access UX asks for (docs/TRUST_UX.md). */}
+            <DropdownMenuItem onSelect={() => openSettings("access")}>
+              <ShieldCheck className="size-4" aria-hidden />
+              Access
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              destructive
+              onSelect={() => {
+                void logout();
+              }}
+            >
+              <LogOut className="size-4" aria-hidden />
+              Log out
+            </DropdownMenuItem>
+          </DropdownMenu>
+          {/* On the rail the row is an avatar alone; the extra control waits
+              for the panel where it has room to explain itself on hover. */}
+          {!collapsed && <DownloadMenu />}
+        </div>
       </div>
     </div>
   );
