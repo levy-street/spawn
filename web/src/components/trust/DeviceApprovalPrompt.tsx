@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 
 import { requestApproval } from "@/components/access/ceremony-store";
 import { Trident } from "@/components/icons/BrandMark";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import {
   useAccountEndorsementEdges,
   useDeviceTrustMap,
@@ -33,12 +34,12 @@ import { hostsTrustingDevice } from "@/lib/trust-roster";
  * already open interrupts it, and one that knocked earlier is still waiting
  * when the tab opens.
  *
- * It renders nothing unless this browser can actually help: approving means
- * signing an endorsement, and only a browser some host already trusts, either
- * directly or through an account chain, can sign one that any host will
- * honour. Prompting a browser that would only fail is worse than staying
- * quiet. The hosts the approval reaches are named in the dialog, so "approve"
- * never promises more than the hosts anchored on this browser.
+ * The approval dialog renders only when this browser can actually help:
+ * approving means signing an endorsement, and only a browser some host already
+ * trusts can sign one that any host will honour. When it cannot help, the
+ * request remains visible as a small explanatory notice instead of failing
+ * silently. The hosts the approval reaches are named in the dialog, so
+ * "approve" never promises more than the hosts anchored on this browser.
  *
  * Approving is the number check (mesh §4 add-device, Appendix A), the same
  * ceremony a browser gets: "Enter its number" starts the committed SAS
@@ -131,14 +132,34 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
     onError: (error) => setFailure(error instanceof Error ? error.message : String(error)),
   });
 
-  if (
-    accountId === null ||
-    request === undefined ||
-    target === undefined ||
-    !canHelp ||
-    ceremonyLive
-  ) {
+  if (accountId === null || request === undefined || ceremonyLive) {
     return null;
+  }
+
+  if (target === undefined || !canHelp) {
+    const label = target?.label ?? "A device";
+    return (
+      <aside
+        className="fixed bottom-4 right-4 z-40 w-[min(24rem,calc(100vw-2rem))] rounded-lg border border-border bg-card p-4 shadow-lg"
+        data-testid="device-approval-unavailable"
+        aria-label="Pending device approval"
+      >
+        <p className="text-sm font-medium text-foreground">{label} is waiting for approval</p>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          {target === undefined
+            ? "Its device record is not available here yet. Open Access to refresh the roster and review the request."
+            : "This browser is not trusted by any host, so it cannot grant the request. Use a trusted device, or use your passkey from Access."}
+        </p>
+        <div className="mt-3 flex justify-end gap-2">
+          <Button type="button" size="sm" variant="ghost" onClick={() => dismiss(request.id)}>
+            Dismiss
+          </Button>
+          <Button type="button" size="sm" variant="outline" onClick={() => openSettings("access")}>
+            Open Access
+          </Button>
+        </div>
+      </aside>
+    );
   }
 
   const busy = deny.isPending;

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { newRtcBindingNonce } from "./useSessionSocket";
+import { describeRtcIceFailure, newRtcBindingNonce } from "./useSessionSocket";
 
 describe("newRtcBindingNonce", () => {
   test("fails closed when cryptographic randomness is unavailable", () => {
@@ -21,5 +21,13 @@ describe("newRtcBindingNonce", () => {
     });
 
     expect(nonce).toBe("000102030405060708090a0b0c0d0e0f");
+  });
+});
+
+describe("describeRtcIceFailure", () => {
+  test("separates relay gathering failure from relay connection failure", () => {
+    expect(describeRtcIceFailure(false)).toContain("no relay candidate was gathered");
+    expect(describeRtcIceFailure(true)).toContain("relay candidates were gathered");
+    expect(describeRtcIceFailure(true)).toContain("no candidate pair connected");
   });
 });

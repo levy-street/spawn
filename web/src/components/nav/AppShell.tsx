@@ -274,7 +274,7 @@ export function AppShell({
               mainClassName,
             )}
           >
-            {children}
+            <SessionApprovalGate>{children}</SessionApprovalGate>
           </main>
         </div>
       </div>
@@ -306,7 +306,6 @@ export function AppShell({
       <SettingsDialog />
       <ProfileDialog />
       <AccessCeremonyHost />
-      <SessionApprovalGate />
       <HostGossipSync />
       <DeviceApprovalPrompt accountId={user?.id ?? null} />
       <HostPinUndeliveredAlerts enabled={user !== null} />

@@ -2,6 +2,10 @@
 
 import { Lock, LockOpen, PlugZap, ShieldAlert, Unplug } from "lucide-react";
 import { useEffect, useState } from "react";
+import {
+  SessionApprovalGateCard,
+  useSessionApprovalGate,
+} from "@/components/access/session-approval-gate";
 import { REFUSAL_DETAIL } from "@/components/terminal/ConnectionChip";
 import type { SocketState } from "@/components/terminal/useSessionSocket";
 import type { SignedRtcRefusalReason } from "@/lib/signed-rtc-trust";
@@ -181,8 +185,9 @@ export function ConnectingOverlay({
   hostName?: string | null;
   hostOffline?: boolean;
 }) {
+  const approvalGate = useSessionApprovalGate();
   const stage = stageFor(socketState, v3, dcOpen, refusal, hostOffline);
-  const secured = stage === "secured";
+  const secured = approvalGate === null && stage === "secured";
 
   // The secured beat is deliberately held: the padlock closing is the one
   // moment in this overlay worth watching, and without the hold it would last
@@ -204,7 +209,7 @@ export function ConnectingOverlay({
     return () => clearTimeout(timer);
   }, [secured]);
 
-  const done = painted || held;
+  const done = approvalGate === null && (painted || held);
 
   // Arm, then leave. The entry timer is cancelled by `done`, so a connection
   // that lands inside the entry delay never mounts the card at all.
@@ -217,6 +222,10 @@ export function ConnectingOverlay({
 
   const [gone, setGone] = useState(false);
   useEffect(() => {
+    if (!done) {
+      setGone(false);
+      return;
+    }
     if (!done || !entered) return;
     const timer = setTimeout(() => setGone(true), LEAVE_MS);
     return () => clearTimeout(timer);
@@ -230,9 +239,9 @@ export function ConnectingOverlay({
   // same transitions twice is worse than not announcing them here at all.
   return (
     <div
-      aria-hidden
+      aria-hidden={approvalGate === null ? true : undefined}
       data-testid="terminal-connecting"
-      data-stage={stage}
+      data-stage={approvalGate === null ? stage : "approval"}
       className={cn(
         "pointer-events-none absolute inset-0 z-[6] grid place-items-center p-4 duration-300",
         done
@@ -240,34 +249,38 @@ export function ConnectingOverlay({
           : "animate-in fade-in-0 zoom-in-95",
       )}
     >
-      <div className="flex max-w-full flex-col items-center gap-4 text-center">
-        {/* The channel, literally: two endpoints, the padlock that has to close
+      {approvalGate !== null ? (
+        <SessionApprovalGateCard state={approvalGate} />
+      ) : (
+        <div className="flex max-w-full flex-col items-center gap-4 text-center">
+          {/* The channel, literally: two endpoints, the padlock that has to close
             between them, and dashes drifting inward for as long as it is still
             being negotiated. A pane too narrow to hold the drawing drops it and
             keeps the copy, which carries the same state in words. */}
-        <div className="flex items-center gap-2.5 @max-[16rem]/term:hidden">
-          <Endpoint />
-          <ChannelLine tone={view.tone} state={view.lines[0]} />
-          <span
-            className={cn(
-              "grid size-9 shrink-0 place-items-center rounded-xl bg-card/60 ring-1 transition-colors duration-300",
-              view.ring,
-              view.tone,
-              secured && "shadow-[0_0_20px_-8px_var(--color-success)]",
-            )}
-          >
-            <Icon className="size-4" aria-hidden />
-          </span>
-          <ChannelLine tone={view.tone} state={view.lines[1]} reverse />
-          <Endpoint />
+          <div className="flex items-center gap-2.5 @max-[16rem]/term:hidden">
+            <Endpoint />
+            <ChannelLine tone={view.tone} state={view.lines[0]} />
+            <span
+              className={cn(
+                "grid size-9 shrink-0 place-items-center rounded-xl bg-card/60 ring-1 transition-colors duration-300",
+                view.ring,
+                view.tone,
+                secured && "shadow-[0_0_20px_-8px_var(--color-success)]",
+              )}
+            >
+              <Icon className="size-4" aria-hidden />
+            </span>
+            <ChannelLine tone={view.tone} state={view.lines[1]} reverse />
+            <Endpoint />
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium text-foreground">{view.title}</p>
+            <p className="mx-auto max-w-[42ch] text-xs leading-5 text-muted-foreground">
+              {view.body}
+            </p>
+          </div>
         </div>
-        <div className="space-y-1.5">
-          <p className="text-sm font-medium text-foreground">{view.title}</p>
-          <p className="mx-auto max-w-[42ch] text-xs leading-5 text-muted-foreground">
-            {view.body}
-          </p>
-        </div>
-      </div>
+      )}
     </div>
   );
 }

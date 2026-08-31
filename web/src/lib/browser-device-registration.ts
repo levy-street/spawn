@@ -2,7 +2,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { ApiError, type BrowserDevice, browserDevices } from "./api";
+import { ApiError, type BrowserDevice, browserDevices, trust } from "./api";
 import {
   adoptBrowserDeviceIdentity,
   BrowserDeviceIdentityError,
@@ -17,7 +17,13 @@ import { CryptoUnavailableError } from "./signed-signal";
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
 
 export type BrowserDeviceRegistrationState =
-  | { status: "ready"; device: BrowserDevice; publicKey: string }
+  | {
+      status: "ready";
+      device: BrowserDevice;
+      publicKey: string;
+      /** A removed identity was replaced during this registration pass. */
+      recoveredFromRevocation?: boolean;
+    }
   | { status: "cleanup_pending"; publicKey: string }
   | { status: "revoked"; publicKey: string };
 
@@ -181,12 +187,7 @@ async function registerBrowserDevice(
       label: defaultDeviceLabel(),
     });
   } catch (error) {
-    if (
-      error instanceof ApiError &&
-      error.status === 409 &&
-      /revoked/iu.test(error.message) &&
-      !replacedRevokedKey
-    ) {
+    if (isRevokedDeviceKeyRefusal(error) && !replacedRevokedKey) {
       // The server refused this key as revoked: this device was removed FROM
       // ANOTHER device (R1), and this is the moment it finds out. Clean up the
       // dead key and register a fresh one in the same pass — seamlessly, the
@@ -217,7 +218,41 @@ async function registerBrowserDevice(
   if (adopted?.replacedPublicKeyWire) {
     void retireSupersededDevice(adopted.replacedPublicKeyWire, device.id);
   }
-  return { status: "ready", device, publicKey: identity.publicKeyWire };
+  if (replacedRevokedKey) {
+    // Registration restored presence, not trust. Raise the approval request
+    // immediately even when the browser healed on a safe route; the shell's
+    // pending badge and registration banner then make the next step visible.
+    try {
+      await Promise.all([
+        browserDevices.requestApproval(device.id, device.public_key),
+        trust.requestDeviceApproval(device.id),
+      ]);
+    } catch (cause) {
+      console.warn(
+        "SPAWN D replaced a revoked browser identity, but could not request approval:",
+        cause instanceof Error ? cause.message : cause,
+      );
+    }
+  }
+  return {
+    status: "ready",
+    device,
+    publicKey: identity.publicKeyWire,
+    recoveredFromRevocation: replacedRevokedKey || undefined,
+  };
+}
+
+/**
+ * New servers name the permanent refusal. The message fallback is restricted
+ * to old servers whose generic `http_409` is the only discriminator they had.
+ */
+export function isRevokedDeviceKeyRefusal(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    (error.code === "device_key_revoked" ||
+      (error.code === "http_409" && /revoked/iu.test(error.message)))
+  );
 }
 
 /**
@@ -317,6 +352,38 @@ export function describeBrowserDeviceRegistrationFailure(
     }
   }
   if (error instanceof ApiError) {
+    switch (error.code) {
+      case "device_key_revoked":
+        return {
+          reason: "The server permanently refused this device key because it was removed.",
+          remedy: "SPAWN D must create a fresh identity before this device can be approved again.",
+          canRetry: false,
+        };
+      case "device_key_owned_by_other_account":
+        return {
+          reason: "This device key already belongs to another account.",
+          remedy: "Clear this site's data before signing in to this account again.",
+          canRetry: false,
+        };
+      case "root_designation_mismatch":
+        return {
+          reason: "The server refused a different root designation for this device key.",
+          remedy: "Open Access and use the account recovery flow instead of registering again.",
+          canRetry: false,
+        };
+      case "root_already_exists":
+        return {
+          reason: "This account already has a different passkey root.",
+          remedy: "Open Access and use that passkey to recover this device.",
+          canRetry: false,
+        };
+      case "registration_proof_invalid":
+        return {
+          reason: "The server could not verify this browser's registration proof.",
+          remedy: null,
+          canRetry: false,
+        };
+    }
     return {
       reason: `The server refused this browser's identity: ${error.message}`,
       remedy: null,

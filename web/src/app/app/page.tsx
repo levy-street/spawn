@@ -6,12 +6,15 @@ import { useRouter } from "next/navigation";
 import { useEffect, useMemo } from "react";
 import { Trident } from "@/components/icons/BrandMark";
 import { AppShell } from "@/components/nav/AppShell";
+import { useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
-import { hosts, workspaces } from "@/lib/api";
+import { browserDevices, hosts, trust, workspaces } from "@/lib/api";
 import { useAuth, useAuthConfig } from "@/lib/auth";
+import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import { computeTrustRoster } from "@/lib/trust-roster";
 
 /**
  * The door into the product: every route that means "take me to my work" —
@@ -37,6 +40,18 @@ export default function AppEntryPage() {
     queryFn: () => workspaces.list(),
     enabled: Boolean(user),
   });
+  const registration = useBrowserDeviceRegistration(user?.id);
+  const devicesQ = useQuery({
+    queryKey: ["browser-devices"],
+    queryFn: browserDevices.list,
+    enabled: Boolean(user),
+  });
+  const edgesQ = useQuery({
+    queryKey: ["account-endorsements"],
+    queryFn: trust.accountEndorsements,
+    enabled: Boolean(user),
+  });
+  const trustMap = useDeviceTrustMap(Boolean(user));
 
   const listedHosts = useMemo(() => hostsQ.data ?? [], [hostsQ.data]);
   const orderedWorkspaces = useMemo(
@@ -47,6 +62,36 @@ export default function AppEntryPage() {
   const verificationIncomplete = Boolean(
     user && config?.email_verification_required && !user.email_verified_at,
   );
+  const currentPublicKey = registration.data?.publicKey ?? null;
+  const currentDevice =
+    (devicesQ.data ?? []).find((device) => device.public_key === currentPublicKey) ??
+    (registration.data?.status === "ready" ? registration.data.device : undefined);
+  const roster = computeTrustRoster(
+    devicesQ.data ?? [],
+    edgesQ.data ?? [],
+    trustMap.pinnedDeviceIds,
+  );
+  const approvalCheckReady =
+    registration.isError ||
+    registration.data?.status === "cleanup_pending" ||
+    registration.data?.status === "revoked" ||
+    devicesQ.isError ||
+    edgesQ.isError ||
+    (registration.data?.status === "ready" &&
+      devicesQ.data !== undefined &&
+      edgesQ.data !== undefined &&
+      trustMap.ready);
+  const currentDeviceTrusted =
+    currentDevice !== undefined &&
+    ((roster.get(currentDevice.id)?.chainTrusted ?? false) ||
+      trustMap.trustedHostIdsFor(currentDevice.id).length > 0);
+  const currentDeviceBlocked =
+    registration.isError ||
+    registration.data?.status === "cleanup_pending" ||
+    registration.data?.status === "revoked" ||
+    devicesQ.isError ||
+    edgesQ.isError ||
+    (trustMap.keyedHosts.length > 0 && currentDevice !== undefined && !currentDeviceTrusted);
 
   useEffect(() => {
     if (!authLoading && !authError && !user) {
@@ -61,7 +106,8 @@ export default function AppEntryPage() {
       hostsQ.isLoading ||
       workspacesQ.isLoading ||
       hostsQ.error ||
-      workspacesQ.error
+      workspacesQ.error ||
+      !approvalCheckReady
     ) {
       return;
     }
@@ -73,6 +119,13 @@ export default function AppEntryPage() {
       // Connecting a host is not optional: the product does nothing without
       // one, and there is no longer a way to say "later".
       router.replace("/onboarding?step=host");
+      return;
+    }
+    if (currentDeviceBlocked) {
+      // `/app` must remain a safe door: an unapproved device can manage its
+      // machines and open Access from the shell, instead of being bounced
+      // straight into a terminal pane the daemon will refuse.
+      router.replace("/legion");
       return;
     }
     if (orderedWorkspaces.length > 0) {
@@ -87,6 +140,8 @@ export default function AppEntryPage() {
     }
   }, [
     config,
+    approvalCheckReady,
+    currentDeviceBlocked,
     hostsQ.error,
     hostsQ.isLoading,
     listedHosts,
@@ -109,12 +164,19 @@ export default function AppEntryPage() {
 
   if (!user) return <AppEntrySpinner />;
 
-  if (configLoading || hostsQ.isLoading || workspacesQ.isLoading || verificationIncomplete) {
+  if (
+    configLoading ||
+    hostsQ.isLoading ||
+    workspacesQ.isLoading ||
+    !approvalCheckReady ||
+    verificationIncomplete
+  ) {
     return <AppEntrySpinner />;
   }
 
-  if (configError || hostsQ.error || workspacesQ.error) {
-    const error = configError ?? hostsQ.error ?? workspacesQ.error;
+  if (configError || hostsQ.error || workspacesQ.error || devicesQ.error || edgesQ.error) {
+    const error =
+      configError ?? hostsQ.error ?? workspacesQ.error ?? devicesQ.error ?? edgesQ.error;
     return (
       <EmptyState
         title="Could not load your workspace"
@@ -124,6 +186,8 @@ export default function AppEntryPage() {
             onClick={() => {
               void hostsQ.refetch();
               void workspacesQ.refetch();
+              void devicesQ.refetch();
+              void edgesQ.refetch();
             }}
           >
             Try again

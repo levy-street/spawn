@@ -12,7 +12,25 @@ export function BrowserDeviceRegistrationStatus() {
   const { user } = useAuth();
   const registration = useBrowserDeviceRegistration(user?.id);
 
-  if (!user || registration.isLoading || registration.data?.status === "ready") return null;
+  if (!user || registration.isLoading) return null;
+
+  if (registration.data?.status === "ready" && registration.data.recoveredFromRevocation === true) {
+    return (
+      <div className="border-warning/40 border-b bg-warning-soft px-4 py-3" role="status">
+        <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3">
+          <p className="text-sm">
+            This device was removed, so SPAWN D created a fresh identity and asked your trusted
+            devices for approval. Approve its 4-digit number before opening a host.
+          </p>
+          <Button size="sm" variant="outline" onClick={() => openSettings("access")}>
+            Open Access
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (registration.data?.status === "ready") return null;
 
   if (registration.isError) {
     // The same failure line for every cause taught readers to ignore it, and

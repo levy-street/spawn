@@ -208,6 +208,12 @@ export function newRtcBindingNonce(fillRandomBytes?: FillRandomBytes | null): st
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
+export function describeRtcIceFailure(gatheredRelayCandidate: boolean): string {
+  return gatheredRelayCandidate
+    ? "relay candidates were gathered, but no candidate pair connected"
+    : "no relay candidate was gathered; TURN may be unreachable from this network";
+}
+
 export function useSessionSocket({
   sessionId,
   enabled = true,
@@ -614,6 +620,16 @@ export function useSessionSocket({
         return;
       }
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
+      let gatheredRelayCandidate = false;
+      let iceFailureLogged = false;
+      const logIceFailure = (reason: "connection failed" | "connection timed out") => {
+        if (iceFailureLogged) return;
+        iceFailureLogged = true;
+        console.warn(
+          `SPAWN D terminal ICE ${reason}: ${describeRtcIceFailure(gatheredRelayCandidate)}.`,
+          { session_id: sessionId, rtc_session_id: rtcSessionId },
+        );
+      };
       const pendingControlTexts: string[] = [];
       const requests = new SessionCtlRequestTracker();
       type UploadMessage = NonNullable<ReturnType<typeof parseSessionCtlUploadResponse>>;
@@ -1244,6 +1260,12 @@ export function useSessionSocket({
 
       pc.onicecandidate = (event) => {
         if (!event.candidate || !isCurrentRtcGeneration()) return;
+        if (
+          event.candidate.type === "relay" ||
+          /(?:^|\s)typ\s+relay(?:\s|$)/u.test(event.candidate.candidate)
+        ) {
+          gatheredRelayCandidate = true;
+        }
         const candidate = event.candidate.toJSON();
         if (offerSent) sendRtcCandidate(candidate);
         else pendingLocalCandidates.push(candidate);
@@ -1251,6 +1273,7 @@ export function useSessionSocket({
       pc.onconnectionstatechange = () => {
         if (!isCurrentRtcGeneration()) return;
         if (pc.connectionState === "connected") {
+          iceFailureLogged = false;
           clearRtcDisconnectedTimer();
           clearRtcIceRestartTimer();
           return;
@@ -1268,8 +1291,10 @@ export function useSessionSocket({
           }
           return;
         }
-        if (pc.connectionState === "failed") void restartIce("failed");
-        else if (pc.connectionState === "closed") cleanupRtc(false, true, rtcGeneration);
+        if (pc.connectionState === "failed") {
+          logIceFailure("connection failed");
+          void restartIce("failed");
+        } else if (pc.connectionState === "closed") cleanupRtc(false, true, rtcGeneration);
       };
 
       ptyDc.onopen = () => {
@@ -1481,6 +1506,7 @@ export function useSessionSocket({
         releaseCurrentLocalCandidates?.();
         rtcConnectTimer = setTimeout(() => {
           if (isCurrentRtcGeneration() && !rtcRef.current.open) {
+            logIceFailure("connection timed out");
             cleanupRtc(true, true, rtcGeneration);
           }
         }, RTC_CONNECT_TIMEOUT_MS);

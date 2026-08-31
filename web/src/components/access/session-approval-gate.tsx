@@ -1,41 +1,52 @@
 "use client";
 
-import * as Dialog from "@radix-ui/react-dialog";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Loader2 } from "lucide-react";
+import { KeyRound, MonitorCog, RefreshCw, ShieldAlert } from "lucide-react";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef } from "react";
+import { usePathname } from "next/navigation";
+import { createContext, type ReactNode, useContext, useEffect, useMemo, useState } from "react";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { browserDevices, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
 import { isAgentSessionPath } from "@/lib/session-approval";
-import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
-import { computeTrustRoster } from "@/lib/trust-roster";
+import { computeTrustRoster, hostsTrustingDevice } from "@/lib/trust-roster";
+
+const WAIT_GUIDANCE_AFTER_MS = 2 * 60_000;
+const APPROVAL_REKNOCK_MS = 10 * 60_000;
+
+interface SessionApprovalGateState {
+  readonly deviceName: string;
+  readonly hasApprover: boolean;
+  readonly waitingTooLong: boolean;
+  readonly requesting: boolean;
+  readonly requestFailed: boolean;
+  readonly hostNames: readonly string[];
+  readonly inDesktopShell: boolean;
+  readonly passkey: ReturnType<typeof usePasskeyTrust>;
+  readonly askAgain: () => void;
+}
+
+const SessionApprovalGateContext = createContext<SessionApprovalGateState | null>(null);
 
 /**
- * The approval card over a dead terminal (docs/TRUST_UX.md §3, §7).
+ * Advisory approval state for terminal panes.
  *
- * An unapproved device that opens an agent session cannot connect — the daemon
- * refuses its offer (no chain to an anchor) and nothing here changes that.
- * What this gate does is turn the refusal into the flow: it covers the session
- * with the "one step left" card, stamps the device's approval request so every
- * other device's toast surfaces (or re-surfaces) right now, and offers the two
- * escapes that need no other device — the passkey and possessing a host from
- * its terminal.
- *
- * The number itself is NOT shown here: when an approver starts the ceremony,
- * the app-level ceremony host's dialog (which sits above this card) takes over
- * on both sides, exactly as it does from the Access roster. This card yields
- * while any pairing involving this device is live.
+ * The daemon remains the admission boundary. This provider only decides when
+ * ConnectingOverlay should replace its ordinary blocked state with recovery
+ * guidance. Keeping the state here makes one knock serve every pane in a
+ * workspace, while the card itself stays inside each blocked pane and leaves
+ * the sidebar, Settings, and the rest of the shell usable.
  */
-export function SessionApprovalGate() {
+export function SessionApprovalGate({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const router = useRouter();
   const { user } = useAuth();
+  const inDesktopShell = useDesktopShell();
   const sessionOpen = isAgentSessionPath(pathname);
   const enabled = user !== null && sessionOpen;
 
@@ -44,8 +55,6 @@ export function SessionApprovalGate() {
     queryKey: ["browser-devices"],
     queryFn: browserDevices.list,
     enabled,
-    // While a blocked session is on screen the flip to "approved" should feel
-    // immediate; this matches the Access panel's open-state cadence.
     refetchInterval: 4000,
   });
   const edges = useQuery({
@@ -61,7 +70,8 @@ export function SessionApprovalGate() {
   const currentDevice =
     (devices.data ?? []).find((device) => device.public_key === currentPublicKey) ??
     (registration.data?.status === "ready" ? registration.data.device : undefined);
-
+  const currentDeviceId = currentDevice?.id;
+  const currentDevicePublicKey = currentDevice?.public_key;
   const roster = computeTrustRoster(devices.data ?? [], edges.data ?? [], trustMap.pinnedDeviceIds);
   const ready =
     registration.data?.status === "ready" &&
@@ -72,8 +82,6 @@ export function SessionApprovalGate() {
     currentDevice !== undefined &&
     ((roster.get(currentDevice.id)?.chainTrusted ?? false) ||
       trustMap.trustedHostIdsFor(currentDevice.id).length > 0);
-  // Same condition as the Access panel's waiting callout: only hosts with an
-  // identity key refuse an unapproved device, so only they make this gate real.
   const show =
     sessionOpen &&
     ready &&
@@ -81,8 +89,6 @@ export function SessionApprovalGate() {
     currentDevice !== undefined &&
     !currentTrusted;
 
-  // Yield to the ceremony dialog the moment a pairing involving this device is
-  // live — the number check renders above and replaces this card's guidance.
   const pairings = useQuery({
     queryKey: ["device-pairings", currentDevice?.id ?? null],
     queryFn: () => trust.listPairings(currentDevice?.id ?? ""),
@@ -91,108 +97,217 @@ export function SessionApprovalGate() {
   });
   const ceremonyLive = (pairings.data ?? []).length > 0;
 
-  // Ask out loud, once per blocked sitting. The roster stamp marks this device
-  // as asking; the knock raises the approval prompt on every trusted screen
-  // and pushes to the account's phones (docs/TRUST_UX.md §3).
   const request = useMutation({
     mutationFn: async (device: { id: string; public_key: string }) => {
-      await browserDevices.requestApproval(device.id, device.public_key);
-      await trust.requestDeviceApproval(device.id);
+      await Promise.all([
+        browserDevices.requestApproval(device.id, device.public_key),
+        trust.requestDeviceApproval(device.id),
+      ]);
     },
   });
-  // What the approver compares against: derived here from this browser's own
-  // key, never served (mesh B5).
-  const fingerprint = useQuery({
-    queryKey: ["browser-device-fingerprint", currentDevice?.public_key ?? null],
-    queryFn: () => ed25519PublicKeyFingerprint(currentDevice?.public_key ?? ""),
-    enabled: show && currentDevice !== undefined,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
-  const askedForRef = useRef<string | null>(null);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: fires once per device per sitting; reads live state
+  const [waitCycle, setWaitCycle] = useState(0);
+  const [waitingTooLong, setWaitingTooLong] = useState(false);
+
+  // Knock immediately, then refresh the request well inside the server's
+  // 30-minute TTL for as long as somebody is actively waiting on this pane.
   useEffect(() => {
-    if (!show || currentDevice === undefined) return;
-    if (askedForRef.current === currentDevice.id) return;
-    askedForRef.current = currentDevice.id;
-    request.mutate({ id: currentDevice.id, public_key: currentDevice.public_key });
-  }, [show, currentDevice?.id]);
+    if (!show || currentDeviceId === undefined || currentDevicePublicKey === undefined) return;
+    const knock = () => request.mutate({ id: currentDeviceId, public_key: currentDevicePublicKey });
+    knock();
+    const interval = window.setInterval(knock, APPROVAL_REKNOCK_MS);
+    return () => window.clearInterval(interval);
+  }, [currentDeviceId, currentDevicePublicKey, request.mutate, show]);
 
-  if (!show || ceremonyLive) return null;
+  useEffect(() => {
+    // Both values restart the guidance clock without changing its duration.
+    void currentDeviceId;
+    void waitCycle;
+    if (!show) {
+      setWaitingTooLong(false);
+      return;
+    }
+    setWaitingTooLong(false);
+    const timer = window.setTimeout(() => setWaitingTooLong(true), WAIT_GUIDANCE_AFTER_MS);
+    return () => window.clearTimeout(timer);
+  }, [currentDeviceId, show, waitCycle]);
 
-  const deviceName = currentDevice.label ?? "This device";
+  const hasApprover = useMemo(() => {
+    if (!show || currentDevice === undefined) return false;
+    return (devices.data ?? []).some(
+      (device) =>
+        device.id !== currentDevice.id &&
+        device.revoked_at === null &&
+        hostsTrustingDevice(
+          device.id,
+          trustMap.keyedHosts,
+          trustMap.pinsByHost,
+          devices.data ?? [],
+          edges.data ?? [],
+        ).length > 0,
+    );
+  }, [currentDevice, devices.data, edges.data, show, trustMap.keyedHosts, trustMap.pinsByHost]);
+
+  const state = useMemo<SessionApprovalGateState | null>(() => {
+    if (!show || ceremonyLive || currentDevice === undefined) return null;
+    return {
+      deviceName: currentDevice.label ?? "This device",
+      hasApprover,
+      waitingTooLong,
+      requesting: request.isPending,
+      requestFailed: request.isError,
+      hostNames: trustMap.keyedHosts.map((host) => host.name),
+      inDesktopShell,
+      passkey,
+      askAgain: () => {
+        setWaitCycle((cycle) => cycle + 1);
+        request.mutate({ id: currentDevice.id, public_key: currentDevice.public_key });
+      },
+    };
+  }, [
+    ceremonyLive,
+    currentDevice,
+    hasApprover,
+    inDesktopShell,
+    passkey,
+    request,
+    show,
+    trustMap.keyedHosts,
+    waitingTooLong,
+  ]);
+
   return (
-    <Dialog.Root open>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px]" />
-        <Dialog.Content
-          data-testid="session-approval-gate"
-          className="fixed left-1/2 top-1/2 z-50 w-[min(100vw-2rem,420px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-background p-6 shadow-2xl focus:outline-none"
-          onEscapeKeyDown={(event) => event.preventDefault()}
-          onPointerDownOutside={(event) => event.preventDefault()}
-          onInteractOutside={(event) => event.preventDefault()}
-        >
-          <Dialog.Title className="text-center text-base font-semibold">One step left</Dialog.Title>
-          <Dialog.Description className="mt-2 text-center text-sm leading-relaxed text-muted-foreground">
-            Approve {deviceName === "This device" ? "this device" : `“${deviceName}”`} from a device
-            you already use{passkey.hasBundle ? ", or sign in here with your passkey" : ""}.
-          </Dialog.Description>
+    <SessionApprovalGateContext.Provider value={state}>
+      {children}
+    </SessionApprovalGateContext.Provider>
+  );
+}
 
-          {fingerprint.data !== undefined && (
-            <div className="mt-4 space-y-1.5" data-testid="session-gate-fingerprint">
-              <p className="text-center text-xs text-muted-foreground">
-                This device&apos;s fingerprint. The approving screen must show exactly this.
-              </p>
-              <p className="select-all break-all rounded-lg border border-border bg-muted/60 px-3 py-2 text-center font-mono text-sm font-semibold tracking-wide">
-                {fingerprint.data}
-              </p>
-            </div>
+export function useSessionApprovalGate(): SessionApprovalGateState | null {
+  return useContext(SessionApprovalGateContext);
+}
+
+/** The actionable blocked state rendered by ConnectingOverlay. */
+export function SessionApprovalGateCard({ state }: { state: SessionApprovalGateState }) {
+  const deviceLabel = state.deviceName === "This device" ? "this device" : `“${state.deviceName}”`;
+  const recovery = !state.hasApprover || state.waitingTooLong || state.requestFailed;
+  const hostLabel =
+    state.hostNames.length === 1
+      ? state.hostNames[0]
+      : state.hostNames.length > 1
+        ? `${state.hostNames[0]} or another host`
+        : "your host";
+
+  return (
+    <section
+      data-testid="session-approval-gate"
+      aria-label="Device approval required"
+      className="pointer-events-auto max-h-full w-full max-w-md overflow-y-auto rounded-xl border border-border bg-card p-5 text-left shadow-lg"
+    >
+      <div className="flex items-start gap-3">
+        <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-warning-soft text-warning">
+          {state.hasApprover ? (
+            <KeyRound className="size-4" aria-hidden />
+          ) : (
+            <ShieldAlert className="size-4" aria-hidden />
           )}
+        </span>
+        <div className="min-w-0 space-y-1">
+          <h2 className="text-sm font-semibold text-foreground">
+            {state.hasApprover ? "Approve this device" : "No trusted device can approve this one"}
+          </h2>
+          <p className="text-xs leading-5 text-muted-foreground">
+            {state.hasApprover
+              ? `Approve ${deviceLabel} from another device signed in to SPAWN D.`
+              : `${deviceLabel[0]?.toUpperCase()}${deviceLabel.slice(1)} is signed in, but none of your other devices can grant host access.`}
+          </p>
+        </div>
+      </div>
 
+      {state.hasApprover && !state.waitingTooLong && !state.requestFailed ? (
+        <div className="mt-4 space-y-3">
           <div
-            className="mt-4 flex items-center justify-center gap-2 text-sm text-muted-foreground"
+            className="flex items-start gap-2.5 text-xs leading-5 text-muted-foreground"
             role="status"
           >
-            <Loader2 className="size-4 animate-spin" aria-hidden />
-            <span>
-              {request.isSuccess
-                ? "Your other devices have been asked. This closes on its own once one approves."
-                : "Waiting for approval…"}
-            </span>
+            <Spinner size={16} label="Waiting for device approval" className="mt-0.5 shrink-0" />
+            <p>
+              On the trusted device, choose{" "}
+              <span className="font-medium text-foreground">Enter its number</span>. A 4-digit
+              number will appear here; type it there to finish the check.
+            </p>
           </div>
-
-          {passkey.status !== null && (
-            <p className="mt-3 text-center text-sm font-medium" role="status">
-              {passkey.status}
+        </div>
+      ) : (
+        <div className="mt-4 space-y-3 rounded-lg border border-border bg-muted/30 p-3">
+          {state.requestFailed && (
+            <p className="text-xs leading-5 text-destructive" role="alert">
+              SPAWN D could not reach your other devices. Ask again, or use a recovery option below.
             </p>
           )}
-          {/* A failed or partial passkey attempt must be visible here — the
-              card otherwise keeps saying "waiting" over a silent failure. */}
-          {passkey.error !== null && (
-            <p className="mt-3 text-center text-sm text-destructive" role="alert">
-              {passkey.error}
+          {state.waitingTooLong && state.hasApprover && (
+            <p className="text-xs leading-5 text-foreground">
+              No approval has arrived yet. You can ask again or recover access without waiting.
             </p>
           )}
-
-          <div className="mt-5 flex flex-col items-center gap-3">
-            {passkey.hasBundle && (
-              <Button
-                className="w-full"
-                disabled={!passkey.supported || passkey.busy}
-                onClick={() => passkey.unlock.mutate()}
-                data-testid="session-gate-passkey"
-              >
-                {passkey.unlock.isPending ? "Checking…" : "Use passkey"}
-              </Button>
-            )}
-            <Button variant="ghost" className="w-full" onClick={() => router.push("/app")}>
-              Go back
-            </Button>
-            <Link href="/device" className="text-xs text-muted-foreground underline">
-              No other device? Possess a host directly
-            </Link>
+          <div className="flex gap-2 text-xs leading-5 text-muted-foreground">
+            <MonitorCog className="mt-0.5 size-4 shrink-0" aria-hidden />
+            <p>
+              On {hostLabel}, run <code className="font-mono text-foreground">spawnd</code>, open{" "}
+              <span className="font-medium text-foreground">Manage this machine</span>, then choose{" "}
+              <span className="font-medium text-foreground">Approve</span>.
+            </p>
           </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+          {state.inDesktopShell && (
+            <p className="text-xs leading-5 text-muted-foreground">
+              In the desktop app, open the SPAWN D tray menu and choose{" "}
+              <span className="font-medium text-foreground">Repair…</span> to repair this
+              machine&apos;s setup.
+            </p>
+          )}
+        </div>
+      )}
+
+      {state.passkey.status !== null && (
+        <p className="mt-3 text-xs font-medium text-foreground" role="status">
+          {state.passkey.status}
+        </p>
+      )}
+      {state.passkey.error !== null && (
+        <p className="mt-3 text-xs leading-5 text-destructive" role="alert">
+          {state.passkey.error}
+        </p>
+      )}
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        {state.passkey.hasBundle && (
+          <Button
+            size="sm"
+            disabled={!state.passkey.supported || state.passkey.busy}
+            onClick={() => state.passkey.unlock.mutate()}
+            data-testid="session-gate-passkey"
+          >
+            {state.passkey.unlock.isPending ? "Checking…" : "Use passkey"}
+          </Button>
+        )}
+        {recovery && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={state.requesting}
+            onClick={state.askAgain}
+          >
+            <RefreshCw className="size-3.5" aria-hidden />
+            Ask again
+          </Button>
+        )}
+        <Button type="button" size="sm" variant="outline" onClick={() => openSettings("access")}>
+          Open Access
+        </Button>
+        <Button asChild size="sm" variant="ghost">
+          <Link href="/legion">View machines</Link>
+        </Button>
+      </div>
+    </section>
   );
 }

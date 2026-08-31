@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { ApiError } from "./api";
 import { BrowserDeviceIdentityError } from "./browser-device-identity";
-import { describeBrowserDeviceRegistrationFailure } from "./browser-device-registration";
+import {
+  describeBrowserDeviceRegistrationFailure,
+  isRevokedDeviceKeyRefusal,
+} from "./browser-device-registration";
 import { CryptoUnavailableError } from "./signed-signal";
 
 describe("describing a failed browser device registration", () => {
@@ -49,6 +52,39 @@ describe("describing a failed browser device registration", () => {
       describeBrowserDeviceRegistrationFailure(new ApiError(503, "http_503", "Service Unavailable"))
         .canRetry,
     ).toBe(true);
+  });
+
+  test("machine-readable refusal codes drive registration guidance", () => {
+    const revoked = describeBrowserDeviceRegistrationFailure(
+      new ApiError(409, "device_key_revoked", "legacy wording can change"),
+    );
+    expect(revoked.reason).toContain("permanently refused");
+    expect(revoked.canRetry).toBe(false);
+
+    const owned = describeBrowserDeviceRegistrationFailure(
+      new ApiError(409, "device_key_owned_by_other_account", "conflict"),
+    );
+    expect(owned.reason).toContain("another account");
+
+    const proof = describeBrowserDeviceRegistrationFailure(
+      new ApiError(422, "registration_proof_invalid", "bad proof"),
+    );
+    expect(proof.reason).toContain("registration proof");
+    expect(proof.canRetry).toBe(false);
+  });
+
+  test("revoked-key self-heal prefers the code and limits the old-server heuristic", () => {
+    expect(
+      isRevokedDeviceKeyRefusal(new ApiError(409, "device_key_revoked", "not message keyed")),
+    ).toBe(true);
+    expect(
+      isRevokedDeviceKeyRefusal(
+        new ApiError(409, "http_409", "revoked browser public keys cannot be registered again"),
+      ),
+    ).toBe(true);
+    expect(
+      isRevokedDeviceKeyRefusal(new ApiError(409, "root_already_exists", "key was revoked")),
+    ).toBe(false);
   });
 
   test("an unrecognised failure keeps the plain line and the retry", () => {

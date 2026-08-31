@@ -47,7 +47,7 @@ import { toast } from "@/components/ui/toast";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
 import { useDesktopShell } from "@/hooks/useDesktopShell";
-import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
+import { hosts, sessions, trust, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { memberSide, splitStore, useSplit } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
@@ -101,6 +101,13 @@ export function Sidebar({
     queryFn: hosts.list,
     refetchInterval: 30_000,
   });
+  const pendingApprovalsQ = useQuery({
+    queryKey: ["trust", "device-approvals"],
+    queryFn: () => trust.listDeviceApprovals(),
+    enabled: user !== null,
+    refetchInterval: 60_000,
+  });
+  const pendingApprovalCount = pendingApprovalsQ.data?.length ?? 0;
 
   const orderedWorkspaces = useMemo(
     () => [...(workspacesQ.data ?? [])].sort((a, b) => a.position - b.position),
@@ -784,19 +791,41 @@ export function Sidebar({
       />
 
       <div className="border-y border-border px-2.5 py-2">
-        <RailTooltip label="Settings" disabled={!collapsed}>
+        <RailTooltip
+          label={
+            pendingApprovalCount > 0
+              ? `Settings · ${pendingApprovalCount} pending approval${pendingApprovalCount === 1 ? "" : "s"}`
+              : "Settings"
+          }
+          disabled={!collapsed}
+        >
           <Button
             type="button"
             variant="ghost"
             size="sm"
+            aria-label={
+              pendingApprovalCount > 0
+                ? `Settings, ${pendingApprovalCount} pending device approval${pendingApprovalCount === 1 ? "" : "s"}`
+                : "Settings"
+            }
             onClick={() => {
               onNavigate?.();
-              openSettings("account");
+              openSettings(pendingApprovalCount > 0 ? "access" : "account");
             }}
             className={cn(sidebarRowClass(false), "justify-start px-0")}
           >
             <SidebarIconSlot>
-              <Settings className="size-4" aria-hidden />
+              <span className="relative">
+                <Settings className="size-4" aria-hidden />
+                {pendingApprovalCount > 0 && (
+                  <span
+                    aria-hidden
+                    className="absolute -right-2 -top-2 grid min-w-4 place-items-center rounded-full bg-warning px-1 text-[9px] font-semibold leading-4 text-background"
+                  >
+                    {pendingApprovalCount > 9 ? "9+" : pendingApprovalCount}
+                  </span>
+                )}
+              </span>
             </SidebarIconSlot>
             <SidebarRowLabel collapsed={collapsed}>Settings</SidebarRowLabel>
           </Button>
