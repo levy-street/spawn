@@ -1,6 +1,10 @@
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use reqwest::Method;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use url::Url;
 
 use crate::api::ApiClient;
@@ -57,14 +61,44 @@ pub async fn password_signup(
     finish_auth(origin, response).await
 }
 
+/// The PKCE verifier for the sign-in this app is currently running.
+///
+/// A `spawn://auth/oauth?code=…` link arrives from the operating system, and
+/// the OS does not say who sent it. Without this, any such link would be
+/// exchanged: an attacker could complete OAuth with their own account and lure
+/// someone into opening the resulting link, at which point this app would sign
+/// itself into the attacker's account — and then, because the host gate
+/// possesses on arrival, register that person's computer as a host under it.
+/// The verifier never leaves this process until redemption, so a code minted
+/// for a flow that started somewhere else cannot be spent here.
+static PENDING_OAUTH: Mutex<Option<String>> = Mutex::new(None);
+
+fn begin_pkce() -> Result<String> {
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let verifier = URL_SAFE_NO_PAD.encode(raw);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    *PENDING_OAUTH.lock().expect("pending OAuth lock") = Some(verifier);
+    Ok(challenge)
+}
+
+/// Take the pending verifier, so a code can be redeemed at most once and only
+/// by the flow that is actually outstanding.
+fn take_pkce_verifier() -> Option<String> {
+    PENDING_OAUTH.lock().expect("pending OAuth lock").take()
+}
+
 pub fn oauth_start_url(origin: &str, provider: &str, invite: Option<&str>) -> Result<String> {
     if !OAUTH_PROVIDERS.contains(&provider) {
         bail!("unsupported OAuth provider")
     }
+    let challenge = begin_pkce()?;
     let mut url = Url::parse(origin)?.join(&format!("/api/auth/oauth/{provider}/start"))?;
     url.query_pairs_mut()
         .append_pair("return_to", "/")
-        .append_pair("redirect_uri", OAUTH_REDIRECT_URI);
+        .append_pair("redirect_uri", OAUTH_REDIRECT_URI)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
     if let Some(invite) = invite.filter(|value| !value.trim().is_empty()) {
         url.query_pairs_mut().append_pair("invite", invite.trim());
     }
@@ -72,12 +106,15 @@ pub fn oauth_start_url(origin: &str, provider: &str, invite: Option<&str>) -> Re
 }
 
 pub async fn exchange_oauth_code(origin: &str, code: &str) -> Result<AuthOutcome> {
+    let Some(verifier) = take_pkce_verifier() else {
+        bail!("This sign-in did not start in SPAWN D. Open SPAWN D and sign in from there.")
+    };
     let api = ApiClient::new(origin)?;
     let response: TokenResponse = api
         .anonymous_json(
             Method::POST,
             "/api/auth/oauth/exchange",
-            &json!({ "code": code }),
+            &json!({ "code": code, "code_verifier": verifier }),
         )
         .await?;
     finish_auth(origin, response).await
@@ -254,8 +291,20 @@ mod tests {
         assert!(!endpoint_exists(reqwest::StatusCode::METHOD_NOT_ALLOWED));
     }
 
+    /// `PENDING_OAUTH` is process-wide on purpose: the app has one window and
+    /// one sign-in at a time, and a newly started flow should invalidate an
+    /// abandoned one. Tests that drive it therefore have to take turns.
+    static OAUTH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn oauth_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = OAUTH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        take_pkce_verifier();
+        guard
+    }
+
     #[test]
     fn oauth_hands_back_to_the_redirect_every_server_release_allows() {
+        let _guard = oauth_test_guard();
         let value = oauth_start_url("https://spawnd.dev", "google", None).unwrap();
         let parsed = Url::parse(&value).unwrap();
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
@@ -269,7 +318,46 @@ mod tests {
     }
 
     #[test]
+    fn oauth_start_commits_to_a_pkce_challenge_the_verifier_opens() {
+        let _guard = oauth_test_guard();
+        let value = oauth_start_url("https://spawnd.dev", "google", None).unwrap();
+        let parsed = Url::parse(&value).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        let challenge = params.get("code_challenge").expect("a challenge is sent");
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        let verifier = take_pkce_verifier().expect("a verifier is held");
+        assert!(verifier.len() >= 43, "{verifier}");
+        assert_ne!(&verifier, challenge, "the challenge is not the verifier");
+        assert_eq!(
+            &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+            challenge
+        );
+        // Taken exactly once: a second callback has nothing to spend.
+        assert!(take_pkce_verifier().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_code_for_a_flow_that_started_elsewhere_is_never_exchanged() {
+        let _guard = oauth_test_guard();
+        // Nothing is pending — no `oauth_start_url` ran for this flow. The
+        // deep link an attacker lured onto this machine dies here, before any
+        // request is made.
+        assert!(take_pkce_verifier().is_none());
+        let error = exchange_oauth_code("https://spawnd.dev", &"a".repeat(32))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("did not start in SPAWN D"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn oauth_carries_an_invite_only_when_one_was_typed() {
+        let _guard = oauth_test_guard();
         let value = oauth_start_url("https://spawnd.dev", "apple", Some("  ")).unwrap();
         assert!(!value.contains("invite="));
         let value = oauth_start_url("https://spawnd.dev", "apple", Some(" ABC-123 ")).unwrap();

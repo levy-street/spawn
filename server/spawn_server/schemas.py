@@ -271,6 +271,10 @@ class OAuthExchangeRequest(BaseModel):
     """The one-time code a native app carries back from the provider callback."""
 
     code: str = Field(min_length=16, max_length=256)
+    # The PKCE verifier for the flow this client started. Optional on the wire
+    # so app builds that predate PKCE keep working; required by the server
+    # whenever the code was minted from a challenge.
+    code_verifier: str | None = Field(default=None, min_length=43, max_length=128)
 
 
 class AppleNativeSignInRequest(BaseModel):
