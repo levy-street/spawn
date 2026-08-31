@@ -22,8 +22,8 @@ src/
   components/     UI grouped by product area
                   admin/ alerts/ auth/ brand/ files/ gestures/ hosts/
                   launcher/ layout/ longtail/ media/ nav/ onboarding/
-                  settings/ terminal-ui/ trust/ ui/ workspace-detail/
-                  workspaces/
+                  release/ settings/ terminal-ui/ trust/ ui/
+                  workspace-detail/ workspaces/
   data/           everything that talks to the server or holds client state
     api/          HTTP client and endpoints
     queries/      TanStack Query hooks; keys live in queryKeys.ts

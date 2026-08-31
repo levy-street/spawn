@@ -359,6 +359,57 @@ privileged steps without the explicit environment gate. Toxiproxy and
 mitmproxy remain useful optional manual comparators, but neither is a test
 dependency: the committed fault proxy uses Python's standard library.
 
+## What a release needs, and what does it
+
+Work out what a release owes before doing any of it. Every rule below is a
+question about **which tree changed**, because that is what the identities at
+`/api/release` are derived from — not what the change felt like.
+
+| changed | the release owes | who does it |
+| --- | --- | --- |
+| `daemon/` | signed prebuilts for every target | `prebuilt.yml` builds on a master push; **you** sign the manifest, via `deploy-prod.sh` |
+| `desktop/` | a signed, notarized app per platform | `desktop.yml` builds on a master push; **you** sign the payloads and write `latest.json` |
+| `mobile/` | an EAS OTA on the matching channel | `deploy-prod.sh`, during the deploy |
+| `server/`, `web/` | a deploy | `deploy-prod.sh` |
+| a protocol name | all of the above, in the order below | see "The wire protocols" |
+
+Three of those rows say "you", and that is not an omission to be automated
+away later. **The offline keys never enter CI** — the Ed25519 daemon release
+key and the Tauri updater key both live on the operator Mac, and CI holds only
+platform code-signing credentials (Apple notarization, Azure Authenticode).
+That split is what stops one compromised CI run from shipping a daemon or an
+app to every machine in the fleet. So the automation stops exactly where a
+signature starts: CI produces artifacts and evidence, a person with the key
+promotes them.
+
+The mobile OTA is the one piece with no offline key, and it is still not a
+workflow. It runs inside `deploy-prod.sh` because that is the only place the
+*order* can be promised: the server is already up when the bundle is
+published, so phones never fetch JavaScript newer than the API it talks to. A
+workflow firing on a push to master could not make that promise. It used to be
+a printed reminder, which is a step that gets skipped on exactly the release
+where it mattered, and fails silently — the two frontends drift while
+everything looks fine.
+
+### Things that will bite you off master
+
+`workflow_dispatch` only sees workflows that exist on the **default branch**.
+`windows.yml` and `desktop.yml` are not on master yet, so from a feature branch
+they cannot be dispatched at all; `[package]` in a commit subject is the only
+trigger that reaches `windows-package` from a branch. Merging is what fixes
+this, and it fixes it for good.
+
+Windows signing is restricted to `master` by the `windows-code-signing`
+environment's branch policy, so **a branch build can never be Authenticode
+signed**. Anything built from a branch is a rehearsal artifact: fine for a dev
+deployment, never a release. `publish-desktop.sh` enforces this independently
+by refusing a Windows setup EXE with no certificate table.
+
+`prebuilt.yml` will build on a dispatch from any ref, but its publish job is
+master-only on purpose — the rolling `prebuilt-latest` release is the
+production install channel. Branch binaries come out as run artifacts, which is
+the supported way to stage a dev host.
+
 ## The server and the web app go out together
 
 Deployment is over SSH, from a coding agent, using the script in this repo:
