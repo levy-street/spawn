@@ -9,6 +9,7 @@ import {
   sessionActivityLabel,
   sessionActivityTone,
   sessionAtShell,
+  sessionHref,
   sessionNeedsAttention,
   sessionTitle,
   sessionTitleDetail,
@@ -175,5 +176,28 @@ describe("runningAgent", () => {
     expect(runningAgent(makeSession({ foreground_command: "claude.exe" }), agents)?.id).toBe("a1");
     expect(runningAgent(makeSession({ foreground_command: "CODEX.EXE" }), agents)?.id).toBe("a2");
     expect(runningAgent(makeSession({ foreground_command: "powershell.exe" }), agents)).toBeNull();
+  });
+});
+
+describe("sessionHref", () => {
+  const layout = {
+    version: 3 as const,
+    active_tab: "t1",
+    tabs: [
+      {
+        id: "t1",
+        name: "Build",
+        layout: { version: 3 as const, tiles: [{ session_id: "s1", x: 0, y: 0, w: 12, h: 8 }] },
+      },
+    ],
+  };
+
+  test("lands on the workspace tab holding the session, focused on it", () => {
+    expect(sessionHref("s1", [{ id: "w1", layout }])).toBe("/w/w1?tab=t1&focus=s1");
+  });
+
+  test("falls back to the standalone page for an unreferenced session", () => {
+    expect(sessionHref("s2", [{ id: "w1", layout }])).toBe("/sessions/s2");
+    expect(sessionHref("s2", [])).toBe("/sessions/s2");
   });
 });
