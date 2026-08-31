@@ -43,8 +43,11 @@ import {
 import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
 import { runningAgent, sessionTitle } from "@/lib/sessions";
 import {
+  addTab,
   type LayoutV3,
+  MAX_TABS,
   moveSessionToTab,
+  nextTabName,
   tabOfSession,
   tabTiles,
   withActiveTab,
@@ -193,6 +196,24 @@ function ownTabAt(under: Element | null | undefined, workspaceId: string): strin
   const tab = under?.closest?.("[data-workspace-tab]");
   if (!tab || tab.getAttribute("data-workspace-tab-owner") !== workspaceId) return null;
   return tab.getAttribute("data-workspace-tab");
+}
+
+/**
+ * True when the pointer rests on this workspace's tab strip itself — the open
+ * ground after the tabs, not a tab or a control in it. Same ownership rule as
+ * `ownTabAt`: in a split, a foreign strip reads as no strip at all. The
+ * ground is where a tab that does not exist yet would go, which is why a
+ * dragged pane is offered "new tab" there and nowhere else.
+ */
+function ownStripGroundAt(under: Element | null | undefined, workspaceId: string): boolean {
+  const strip = under?.closest?.("[data-workspace-tab-strip]");
+  if (!strip || strip.getAttribute("data-workspace-tab-strip-owner") !== workspaceId) return false;
+  // A tab is its own target — the drop moves the pane into it — and a rename
+  // in flight keeps its input. Everything else in the band counts as ground,
+  // buttons included: they are inert to a drag anyway, and excluding the "+"
+  // would let the chip's own arrival shove it under the pointer and steal
+  // the drop it just promised.
+  return !under?.closest?.("[data-workspace-tab], form, input");
 }
 
 /** The tile a gesture is actually dragging — the copy, when ⌘ is down. */
@@ -761,6 +782,9 @@ export function WorkspaceGrid({
       dividerElementRef.current = null;
     }
     queryInPane(paneRootRef.current, "[data-launcher-fab]")?.removeAttribute("data-trash-hover");
+    queryInPane(paneRootRef.current, "[data-workspace-newtab-ghost]")?.removeAttribute(
+      "data-newtab-hover",
+    );
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
   }, [paneRootRef]);
@@ -1076,6 +1100,22 @@ export function WorkspaceGrid({
         } else {
           hoveredTabRef.current = null;
         }
+        // The strip's open ground is the one tab that does not exist yet:
+        // resting there lights a "New tab" chip at the end of the strip, and
+        // the drop makes that tab and carries the pane into it. A duplicating
+        // drag stays home for the same reason it ignores the tabs themselves,
+        // and a full envelope has no chip to offer. Stamped on the chip
+        // directly, the same wiring as the launcher's bin morph above, so a
+        // live gesture never re-renders React.
+        const overStripGround =
+          !gesture.clone &&
+          !overBin &&
+          latestLayoutRef.current.tabs.length < MAX_TABS &&
+          ownStripGroundAt(under, workspaceIdRef.current);
+        queryInPane(paneRootRef.current, "[data-workspace-newtab-ghost]")?.toggleAttribute(
+          "data-newtab-hover",
+          overStripGround,
+        );
         setCloneMode(gesture, wantsDuplicate(event));
         applyMovePointer(gesture, event.clientX, event.clientY);
         return;
@@ -1140,10 +1180,8 @@ export function WorkspaceGrid({
         if (!clone) void discardPane(sessionId);
         return;
       }
-      const overTab = ownTabAt(
-        document.elementFromPoint(event.clientX, event.clientY),
-        workspaceIdRef.current,
-      );
+      const under = document.elementFromPoint(event.clientX, event.clientY);
+      const overTab = ownTabAt(under, workspaceIdRef.current);
       if (gesture?.kind === "move" && !gesture.clone && overTab && overTab !== tabIdRef.current) {
         // Dropped on the strip before the dwell switch fired: move the pane
         // into that tab directly, auto-placed, and follow it.
@@ -1152,6 +1190,26 @@ export function WorkspaceGrid({
         if (moved) {
           flushSync(() => commitEnvelope(moved));
           onSwitchTabRef.current?.(overTab);
+        }
+        return;
+      }
+      if (
+        gesture?.kind === "move" &&
+        !gesture.clone &&
+        latestLayoutRef.current.tabs.length < MAX_TABS &&
+        ownStripGroundAt(under, workspaceIdRef.current)
+      ) {
+        // Dropped on the strip's open ground — the chip's promise: one
+        // envelope write makes a fresh tab and moves the pane into it, then
+        // the view follows, the same shape as dropping on an existing tab.
+        const layout = latestLayoutRef.current;
+        const newTabId = crypto.randomUUID();
+        const added = addTab(layout, newTabId, nextTabName(layout));
+        const moved = added ? moveSessionToTab(added, gesture.sessionId, newTabId) : null;
+        finishGesture(false);
+        if (moved) {
+          flushSync(() => commitEnvelope(moved));
+          onSwitchTabRef.current?.(newTabId);
         }
         return;
       }
