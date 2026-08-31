@@ -216,10 +216,23 @@ export const FileExplorer = forwardRef<
   }, []);
   const hover = useHoverIntent<{ path: string }>({ enabled: fineHover });
 
+  /**
+   * The tree keeps itself true to the disk without being asked: every visible
+   * directory re-lists on this cadence (paused with the tab in background),
+   * so a file an agent just wrote appears without anyone pressing Refresh.
+   * Held off whenever a shifting list would tear something out from under the
+   * pointer — an inline rename or new-folder input, a context menu, a drag.
+   * Structural sharing keeps an unchanged answer from re-rendering anything.
+   */
+  const POLL_MS = 3_000;
+  const polling =
+    controlReady && renaming === null && creatingIn === null && menu === null && dropDir === null;
+
   const rootQ = useQuery({
     queryKey: ["host-files", hostId, rootPath ?? ""],
     queryFn: () => hostControl!.listPage(rootPath),
     enabled: controlReady,
+    refetchInterval: polling ? POLL_MS : false,
     gcTime: 0,
   });
   const resolvedRoot = rootQ.data?.path ?? rootPath ?? null;
@@ -229,6 +242,7 @@ export const FileExplorer = forwardRef<
       queryKey: ["host-files", hostId, path],
       queryFn: () => hostControl!.listPage(path),
       enabled: controlReady,
+      refetchInterval: polling ? POLL_MS : false,
       gcTime: 0,
     })),
   });

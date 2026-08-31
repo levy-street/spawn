@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, useRef, useState } from "react";
 import { FileExplorer, type FileExplorerHandle } from "@/components/files/FileExplorer";
@@ -170,6 +171,18 @@ export function WidgetPane({
             Close
           </DropdownMenuItem>
         </DropdownMenu>
+        {/* Closing has its own control, at the far right where a window's
+            close has always been — the same cluster a shell pane ends its
+            header with. A widget is pure layout with no process to kill, so
+            the X needs no ceremony and just takes the pane out. */}
+        <button
+          type="button"
+          aria-label={`Close ${title}`}
+          onClick={() => onRemove(id)}
+          className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+        >
+          <X className="size-3.5" aria-hidden />
+        </button>
       </header>
 
       {onChangePath && (
