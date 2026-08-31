@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -11,7 +12,7 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, billing, rate_limit, schemas
+from .. import auth, billing, billing_email, rate_limit, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..host_identity import host_key_fingerprint
@@ -20,6 +21,8 @@ from ..host_pair_approval import verify_host_pair_approval_proof
 from ..host_pair_possession import verify_host_pair_possession_proof
 from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
 from ..pin_liveness import live_browser_device_id_set
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth/device", tags=["device"])
 
@@ -42,6 +45,52 @@ def _aware(dt: datetime | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt
+
+
+async def _mail_host_limit(
+    session: AsyncSession, owner: User, decision: billing.Decision
+) -> None:
+    """Tell the account what the refusal it just received actually means.
+
+    The refusal itself is machine codes and numbers, and the copy a client
+    builds from them may carry no price, no link and no verb — the mobile app
+    renders server strings verbatim inside a binary that shipped through App
+    Review. This message is outside the app, which is the case Apple's 3.1.3
+    preamble expressly permits, so it carries the tiers, the prices and the
+    link the app cannot (docs/BILLING.md §6.3).
+
+    Two conditions on calling it, both about not making a refusal worse:
+
+    - only after the surrounding code has committed or rolled back. The
+      delivery log writes on its own session, so a caller still holding a
+      write lock would be waiting on itself.
+    - nothing it does may reach the client. `billing_email` already promises
+      never to raise; a pairing refusal is not where anyone should discover
+      that promise was broken, so the promise is kept twice.
+    """
+
+    limit = decision.host_limit
+    if limit is None:
+        # Unreachable: an account with no limit is never refused, and there
+        # would be no number to write about if it were.
+        return
+    if decision.entitlement.reason == "comped":
+        # A comped account never sees billing at all (docs/BILLING.md §4.8).
+        # Its ceiling is an operator's decision about our own product, so the
+        # answer to hitting it is a conversation with that operator — not a
+        # price list from us.
+        return
+    tier = billing.TIERS.get(decision.tier, billing.TIERS[billing.TIER_FREE])
+    try:
+        await billing_email.send_host_limit_reached(
+            session,
+            owner,
+            tier_name=tier.name,
+            host_limit=limit,
+            host_count=decision.host_count,
+        )
+    except Exception as exc:  # pragma: no cover - the sender swallows its own
+        log.warning("could not send the host-limit email: %s", exc)
 
 
 def _gen_user_code() -> str:
@@ -541,6 +590,9 @@ async def device_poll(
                     .execution_options(synchronize_session=False)
                 )
                 await session.commit()
+                # After the commit, never before: the delivery log writes on
+                # its own session and must not wait on this one's write lock.
+                await _mail_host_limit(session, owner, decision)
                 return {"error": "host_limit"}
         candidate = Host(
             owner_user_id=user_id,
@@ -948,6 +1000,11 @@ async def device_approve(
             # on reporting authorization_pending, and the user can free a slot
             # and approve the very same code.
             await session.rollback()
+            # That rollback expired every instance again, `user` among them,
+            # and the sender reads the address off it. Re-read before handing
+            # it over rather than letting a lazy load fire from sync context.
+            await session.refresh(user)
+            await _mail_host_limit(session, user, decision)
             raise HTTPException(status_code=402, detail=billing.limit_error_detail(decision))
 
     approved = await session.execute(

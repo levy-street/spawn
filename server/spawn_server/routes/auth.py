@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -9,13 +10,15 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, rate_limit, schemas
+from .. import auth, billing_stripe, rate_limit, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..invites import is_first_account, redeem_invite, signup_is_open
-from ..models import AuthIdentity, Host, HostKeyClaim, User
+from ..models import AuthIdentity, Host, HostKeyClaim, Subscription, User
 from ..ws.broker import get_broker
 from .account_recovery import send_verification_email
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
@@ -206,6 +209,10 @@ async def delete_account(
     deleted explicitly here before the user row cascades everything else.
     Live daemon sockets for the account's hosts are closed best-effort — their
     tokens are already dead (every request re-resolves the user row).
+
+    A Stripe subscription is cancelled first, for the mirror image of that
+    reason: its row is ``ondelete=CASCADE``, so leaving it to the cascade
+    would stop the record without stopping the charge.
     """
 
     if body.confirm_email.strip().lower() != user.email.lower():
@@ -231,6 +238,39 @@ async def delete_account(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="password confirmation failed",
             )
+
+    # Billing goes first, by hand, and deliberately not via the cascade.
+    # `Subscription` is `ondelete="CASCADE"`, so deleting the user row would
+    # drop our only local record of a live Stripe subscription while Stripe
+    # went on charging the card every month — a money bug that erases its own
+    # evidence. The host key claims below are the same class of work for the
+    # opposite reason (their FK is RESTRICT); both are here because a cascade
+    # cannot reach outside this database.
+    if get_settings().billing_enabled:
+        subscription = (
+            await session.execute(select(Subscription).where(Subscription.user_id == user.id))
+        ).scalar_one_or_none()
+        if subscription is not None:
+            # Captured before the call: after a failure these ids are the only
+            # way anyone finds the subscription again.
+            customer_id = subscription.stripe_customer_id
+            subscription_id = subscription.stripe_subscription_id
+            try:
+                await billing_stripe.cancel_subscription_for_user(session, user)
+            except Exception as exc:
+                # The deletion proceeds anyway. Somebody's right to delete
+                # their account cannot be held up by our payment processor
+                # being unreachable — but it now needs a human, so this is an
+                # error an operator can act on without reading any code.
+                log.error(
+                    "ACCOUNT DELETED WITH A LIVE STRIPE SUBSCRIPTION - cancel it by hand "
+                    "in the Stripe dashboard: user_id=%s stripe_customer_id=%s "
+                    "stripe_subscription_id=%s error=%s",
+                    user.id,
+                    customer_id,
+                    subscription_id,
+                    exc,
+                )
 
     host_ids = (
         (await session.execute(select(Host.id).where(Host.owner_user_id == user.id)))
