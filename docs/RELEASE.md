@@ -194,9 +194,29 @@ the workflows above assume it has been made:
 | `macos-code-signing` | Custom branch policy naming `master` (not `protected_branches` — see the Windows note above, `master` carries no protection rule). Holds `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_PRIVATE_KEY`. |
 | `unsigned-builds` | No protection rules, no secrets. Exists only so `prebuilt.yml` has somewhere to run off master. |
 
-`desktop.yml`'s macOS job is `master`-only outright: it exists to produce signed,
-notarized artifacts, and there is nothing useful it can do from a branch. Build
-the app locally instead.
+`desktop.yml` gates both platform jobs identically — protected environment plus
+`if: master` — because both exist only to produce signed artifacts and neither
+can do anything useful from a branch. Build the app locally instead. The `if` is
+not redundant with the environment: without it a branch dispatch fails at the
+environment gate, which reads as a broken pipeline rather than a job with
+nothing to do.
+
+The two daemon signing paths in `prebuilt.yml` are deliberately *not* symmetric,
+and it is worth knowing which way:
+
+- **macOS daemon binaries publish ad-hoc signed.** The Developer ID path is
+  dormant behind the `SIGN_DAEMON_WITH_DEVELOPER_ID` variable, because turning
+  it on changes what every existing host is asked, once — read "The macOS
+  consent dialogs" before you do. Ad-hoc is not a failure: the binary runs, it
+  just re-asks for folder access after each self-update, because TCC keys the
+  grant on the signing identity and an ad-hoc identity is the binary's own hash.
+- **Windows daemon binaries do not publish at all unless Authenticode-signed**,
+  on master. An unsigned PE is not merely unpolished — it trips SmartScreen and
+  makes no publisher claim at all.
+
+So the Mac daemon ships today without a Developer ID and the Windows one refuses
+to ship without a certificate. That asymmetry is a choice about consent prompts,
+not an oversight.
 
 `prebuilt.yml`'s macOS job still runs on any ref, because it also builds the
 daemon binaries a dev host pulls. It picks its environment by ref, so off master
