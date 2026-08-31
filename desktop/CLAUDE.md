@@ -60,10 +60,11 @@ not a cousin of it:
 - Sign-in options come from `GET /api/auth/config` at sign-in time, never from
   a list in the app: providers in the server's order, the invite field only on
   an invite-only server, the verify gate only when the server will enforce it.
-- OAuth goes out to the system browser and comes back on `spawn://auth/oauth`,
-  the one native redirect every server release admits (the phone uses the same
-  one). A native `error=invite_required` shows the invite field, as the browser
-  does.
+- On macOS, OAuth uses the compact, self-dismissing system web-authentication
+  session (`ASWebAuthenticationSession`). On Windows it goes out to the system
+  browser and comes back on `spawn://auth/oauth`, the one native redirect every
+  server release admits (the phone uses the same one). A native
+  `error=invite_required` shows the invite field, as the browser does.
 - `src/styles.css` is `web/src/components/onboarding/auth-shell.tsx` and the
   `.pressroom` rules in `web/src/app/globals.css` in plain CSS — the altar
   plate under the same scrim, the stacked column for sign-in, the split

@@ -119,6 +119,9 @@ type UpdateCheck = "idle" | "checking" | "done" | "failed";
 let HOSTED_ORIGIN = "https://spawnd.dev";
 /** The native redirect the server hands a finished sign-in back to. */
 const OAUTH_CALLBACK = { host: "auth", path: "/oauth" } as const;
+const OAUTH_CANCELLED = "cancelled";
+const OAUTH_UNSUPPORTED = "unsupported";
+const OAUTH_START_FAILED = "start_failed:";
 const VERIFY_POLL_MS = 5_000;
 const CEREMONY_POLL_MS = 1_500;
 const POSSESSION_POLL_MS = 1_500;
@@ -171,8 +174,9 @@ let configOrigin: string | null = null;
 /** The provider that got as far as the callback on an invite-only server. */
 let inviteRequiredFor: string | null = null;
 let lastProvider: string | null = null;
-/** The provider whose sign-in is out in the system browser right now. */
+/** The provider whose sign-in is waiting on a native or browser callback. */
 let pendingProvider: string | null = null;
+let pendingOAuthSurface: "native" | "browser" | null = null;
 let serverChoice: "hosted" | "self" = "hosted";
 let error: string | null = null;
 let notice: string | null = null;
@@ -543,10 +547,11 @@ function providerButtons(): string {
 }
 
 function authView(): string {
-  // A sign-in that went out to the system browser: without this, the idle form
-  // sat there as if the press had done nothing at all.
+  // A sign-in waiting outside this window: without this, the idle form sat
+  // there as if the press had done nothing at all.
   if (pendingProvider) {
     const name = providerName(pendingProvider);
+    const native = pendingOAuthSurface === "native";
     const body = `
       <div class="stack">
         <div class="inset">
@@ -558,8 +563,10 @@ function authView(): string {
     return sheet(
       hatchServer(),
       stacked(
-        "Finish in your browser",
-        `${escapeHtml(name)} sign-in continues in the browser SPAWN D just opened.`,
+        native ? "Finish signing in" : "Finish in your browser",
+        native
+          ? `${escapeHtml(name)} sign-in continues in the secure window SPAWN D just opened.`
+          : `${escapeHtml(name)} sign-in continues in the browser SPAWN D just opened.`,
         body,
       ),
     );
@@ -1128,10 +1135,11 @@ async function act(action: string): Promise<void> {
     case "back-to-auth":
       setScreen("auth");
       break;
-    // The browser flow may still land; abandoning the wait only means the form
+    // The OAuth flow may still land; abandoning the wait only means the form
     // comes back, and a late callback is handled as it always was.
     case "cancel-oauth":
       pendingProvider = null;
+      pendingOAuthSurface = null;
       render();
       break;
     case "retry-config":
@@ -1232,6 +1240,7 @@ function setScreen(next: Screen): void {
   error = null;
   notice = null;
   pendingProvider = null;
+  pendingOAuthSurface = null;
   render();
 }
 
@@ -1305,31 +1314,86 @@ async function beginOAuth(provider: string): Promise<void> {
   lastProvider = provider;
   const inviteInput = document.querySelector<HTMLInputElement>('input[name="invite"]');
   const invite = inviteInput?.value.trim() || null;
-  const url = await guarded(() =>
-    invoke<string>("oauth_start_url", { origin: preferences.server_origin, provider, invite }),
-  );
-  if (!url) return;
+  pendingProvider = provider;
+  pendingOAuthSurface = WINDOWS ? "browser" : "native";
+  error = null;
+  render();
+
   try {
+    const callback = await invoke<string>("oauth_authenticate", {
+      origin: preferences.server_origin,
+      provider,
+      invite,
+    });
+    const url = parseOAuthCallback(callback);
+    if (!url) {
+      pendingProvider = null;
+      pendingOAuthSurface = null;
+      error = "The sign-in window returned an invalid callback.";
+      render();
+      return;
+    }
+    await completeOAuth(url);
+  } catch (cause) {
+    const message = describe(cause);
+    if (message === OAUTH_CANCELLED) {
+      pendingProvider = null;
+      pendingOAuthSurface = null;
+      render();
+      return;
+    }
+    if (message === OAUTH_UNSUPPORTED || message.startsWith(OAUTH_START_FAILED)) {
+      await beginBrowserOAuth(provider, invite);
+      return;
+    }
+    pendingProvider = null;
+    pendingOAuthSurface = null;
+    error = message;
+    render();
+  }
+}
+
+async function beginBrowserOAuth(provider: string, invite: string | null): Promise<void> {
+  pendingOAuthSurface = "browser";
+  render();
+  try {
+    const url = await invoke<string>("oauth_start_url", {
+      origin: preferences.server_origin,
+      provider,
+      invite,
+    });
     await openUrl(url);
   } catch (cause) {
+    pendingProvider = null;
+    pendingOAuthSurface = null;
     error = describe(cause);
     render();
-    return;
   }
-  pendingProvider = provider;
-  render();
+}
+
+function parseOAuthCallback(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === "spawn:" &&
+      url.hostname === OAUTH_CALLBACK.host &&
+      url.pathname === OAUTH_CALLBACK.path
+      ? url
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 async function handleDeepLink(value: string): Promise<void> {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return;
-  }
-  if (url.protocol !== "spawn:" || url.hostname !== OAUTH_CALLBACK.host || url.pathname !== OAUTH_CALLBACK.path) return;
-  // Whatever the browser answered, the wait for it is over.
+  const url = parseOAuthCallback(value);
+  if (!url) return;
+  await completeOAuth(url);
+}
+
+async function completeOAuth(url: URL): Promise<void> {
+  // Whatever the native session or browser answered, the wait is over.
   pendingProvider = null;
+  pendingOAuthSurface = null;
   render();
   const oauthError = url.searchParams.get("error");
   if (oauthError === "invite_required") {

@@ -147,6 +147,18 @@ fn oauth_start_url(origin: &str, provider: &str, invite: Option<&str>) -> Result
 }
 
 #[tauri::command]
+async fn oauth_authenticate(
+    app: tauri::AppHandle,
+    origin: String,
+    provider: String,
+    invite: Option<String>,
+) -> Result<String, String> {
+    auth::oauth_authenticate(app, &origin, &provider, invite.as_deref())
+        .await
+        .map_err(command_error)
+}
+
+#[tauri::command]
 async fn exchange_oauth_code(origin: &str, code: &str) -> Result<AuthOutcome, String> {
     auth::exchange_oauth_code(origin, code)
         .await
@@ -393,6 +405,7 @@ pub fn run() {
             password_login,
             password_signup,
             oauth_start_url,
+            oauth_authenticate,
             exchange_oauth_code,
             renew_session,
             poll_device_approval,

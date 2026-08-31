@@ -20,6 +20,13 @@ use crate::storage;
 /// phone already accepts this app; the installed desktop companion claims the
 /// `spawn://` scheme, so nothing else should receive what comes back.
 pub const OAUTH_REDIRECT_URI: &str = "spawn://auth/oauth";
+#[cfg(not(target_os = "macos"))]
+pub const OAUTH_UNSUPPORTED: &str = "unsupported";
+#[cfg(target_os = "macos")]
+pub const OAUTH_CANCELLED: &str = "cancelled";
+
+#[cfg(target_os = "macos")]
+const OAUTH_START_FAILED: &str = "start_failed:";
 
 /// The providers a server can enable. Which of them actually appear comes from
 /// `GET /api/auth/config` at sign-in time, never from this list.
@@ -103,6 +110,273 @@ pub fn oauth_start_url(origin: &str, provider: &str, invite: Option<&str>) -> Re
         url.query_pairs_mut().append_pair("invite", invite.trim());
     }
     Ok(url.to_string())
+}
+
+/// Present the provider with the platform OAuth primitive and return the full
+/// native callback URL. The PKCE state comes from [`oauth_start_url`] exactly
+/// as it does for the browser flow, so [`exchange_oauth_code`] consumes the
+/// same process-held verifier whichever surface completed the sign-in.
+#[cfg(target_os = "macos")]
+pub async fn oauth_authenticate(
+    app: tauri::AppHandle,
+    origin: &str,
+    provider: &str,
+    invite: Option<&str>,
+) -> Result<String> {
+    let start_url = oauth_start_url(origin, provider, invite)
+        .map_err(|error| anyhow::anyhow!("{OAUTH_START_FAILED}{error:#}"))?;
+    macos_oauth::authenticate(app, start_url)
+        .await
+        .map_err(anyhow::Error::msg)
+}
+
+/// Other platforms keep the browser plus deep-link route. The sentinel lets
+/// the wizard select it without relying on user-agent detection for behavior.
+#[cfg(not(target_os = "macos"))]
+pub async fn oauth_authenticate(
+    _app: tauri::AppHandle,
+    _origin: &str,
+    _provider: &str,
+    _invite: Option<&str>,
+) -> Result<String> {
+    bail!(OAUTH_UNSUPPORTED)
+}
+
+#[cfg(target_os = "macos")]
+mod macos_oauth {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use block2::RcBlock;
+    use objc2::rc::Retained;
+    use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+    use objc2::{
+        define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+    };
+    use objc2_authentication_services::{
+        ASPresentationAnchor, ASWebAuthenticationPresentationContextProviding,
+        ASWebAuthenticationSession, ASWebAuthenticationSessionErrorCode,
+    };
+    use objc2_foundation::{NSError, NSString, NSURL};
+    use tauri::{AppHandle, Manager};
+    use tokio::sync::oneshot;
+
+    use super::{OAUTH_CANCELLED, OAUTH_START_FAILED};
+    use crate::window;
+
+    type OAuthResult = std::result::Result<String, String>;
+    type Delivery = Arc<Mutex<Option<oneshot::Sender<OAuthResult>>>>;
+
+    struct PresentationContextIvars {
+        anchor: Retained<ASPresentationAnchor>,
+    }
+
+    define_class!(
+        // SAFETY:
+        // - NSObject has no subclassing requirements.
+        // - The stored anchor is retained and only accessed on the main thread.
+        // - PresentationContextProvider does not implement Drop.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = PresentationContextIvars]
+        #[name = "SpawnOAuthPresentationContextProvider"]
+        struct PresentationContextProvider;
+
+        unsafe impl NSObjectProtocol for PresentationContextProvider {}
+
+        unsafe impl ASWebAuthenticationPresentationContextProviding for PresentationContextProvider {
+            #[unsafe(method_id(presentationAnchorForWebAuthenticationSession:))]
+            fn presentation_anchor(
+                &self,
+                _session: &ASWebAuthenticationSession,
+            ) -> Retained<ASPresentationAnchor> {
+                self.ivars().anchor.clone()
+            }
+        }
+    );
+
+    impl PresentationContextProvider {
+        fn new(mtm: MainThreadMarker, anchor: Retained<ASPresentationAnchor>) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(PresentationContextIvars { anchor });
+            // SAFETY: `this` is an allocated instance of our NSObject subclass,
+            // and its Rust ivars have been initialized immediately above.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    /// ASWebAuthenticationSession keeps its completion block, while its
+    /// presentation provider property is weak. This holder keeps both alive;
+    /// the completion block removes it on the main thread as soon as
+    /// AuthenticationServices has finished with them.
+    struct SessionLifetime {
+        _session: Retained<ASWebAuthenticationSession>,
+        _provider: Retained<PresentationContextProvider>,
+    }
+
+    static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+    thread_local! {
+        /// AuthenticationServices' completion queue is not part of its public
+        /// contract. Keeping main-thread-only objects here means the block can
+        /// carry only Send data back to Tauri's main-thread dispatcher before
+        /// the session and its presentation provider are released.
+        static ACTIVE_SESSIONS: RefCell<HashMap<u64, SessionLifetime>> =
+            RefCell::new(HashMap::new());
+    }
+
+    pub async fn authenticate(app: AppHandle, start_url: String) -> OAuthResult {
+        let (sender, receiver) = oneshot::channel();
+        let delivery = Arc::new(Mutex::new(Some(sender)));
+        let main_delivery = Arc::clone(&delivery);
+        let main_app = app.clone();
+        app.run_on_main_thread(move || {
+            if let Err(error) = start(&main_app, &start_url, Arc::clone(&main_delivery)) {
+                deliver(&main_delivery, Err(error));
+            }
+        })
+        .map_err(|error| format!("{OAUTH_START_FAILED}{error}"))?;
+
+        receiver.await.map_err(|_| {
+            format!("{OAUTH_START_FAILED}the web authentication session ended without an answer")
+        })?
+    }
+
+    #[allow(deprecated)]
+    fn start(app: &AppHandle, start_url: &str, delivery: Delivery) -> Result<(), String> {
+        let mtm = MainThreadMarker::new()
+            .ok_or_else(|| format!("{OAUTH_START_FAILED}OAuth must start on the main thread"))?;
+        let window = app
+            .get_webview_window(window::LABEL)
+            .ok_or_else(|| format!("{OAUTH_START_FAILED}the SPAWN D window is gone"))?;
+        let ns_window = window
+            .ns_window()
+            .map_err(|error| format!("{OAUTH_START_FAILED}{error}"))?;
+        // SAFETY: Tauri returns the live NSWindow backing `window`. NSWindow
+        // is an NSObject subclass, which is exactly the concrete macOS type
+        // represented by AuthenticationServices' ASPresentationAnchor alias.
+        let anchor = unsafe { Retained::retain(ns_window.cast::<ASPresentationAnchor>()) }
+            .ok_or_else(|| {
+                format!("{OAUTH_START_FAILED}the SPAWN D window has no native handle")
+            })?;
+        let provider = PresentationContextProvider::new(mtm, anchor);
+
+        let url_string = NSString::from_str(start_url);
+        let url = NSURL::URLWithString(&url_string)
+            .ok_or_else(|| format!("{OAUTH_START_FAILED}the OAuth URL is invalid"))?;
+        let callback_scheme = NSString::from_str("spawn");
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let completion_app = app.clone();
+        let completion_delivery = Arc::clone(&delivery);
+        let completion: RcBlock<dyn Fn(*mut NSURL, *mut NSError)> = RcBlock::new(
+            move |callback_url: *mut NSURL, callback_error: *mut NSError| {
+                // Clone everything the callback still needs before main-thread
+                // cleanup releases the session and this retained block.
+                let app = completion_app.clone();
+                let delivery = Arc::clone(&completion_delivery);
+                let result = completion_result(callback_url, callback_error);
+                let main_delivery = Arc::clone(&delivery);
+                if let Err(error) = app.run_on_main_thread(move || {
+                    ACTIVE_SESSIONS.with(|sessions| {
+                        sessions.borrow_mut().remove(&session_id);
+                    });
+                    deliver(&main_delivery, result);
+                }) {
+                    deliver(
+                        &delivery,
+                        Err(format!("could not finish the OAuth session: {error}")),
+                    );
+                }
+            },
+        );
+
+        // This callback-scheme initializer is the compatible API on every
+        // macOS version SPAWN D supports. The newer callback-object overload
+        // cannot be deployed to those older systems.
+        // SAFETY: URL and scheme are valid Objective-C objects, and the heap
+        // block remains valid for the call; ASWebAuthenticationSession copies
+        // and retains it for the asynchronous operation.
+        let session = unsafe {
+            ASWebAuthenticationSession::initWithURL_callbackURLScheme_completionHandler(
+                ASWebAuthenticationSession::alloc(),
+                &url,
+                Some(&callback_scheme),
+                RcBlock::as_ptr(&completion),
+            )
+        };
+        let provider_object = ProtocolObject::from_ref(&*provider);
+        // SAFETY: All session configuration and presentation happen on the
+        // main thread, and `provider_object` implements the required protocol.
+        unsafe {
+            session.setPresentationContextProvider(Some(provider_object));
+            session.setPrefersEphemeralWebBrowserSession(false);
+        }
+        let retained_session = session.clone();
+        ACTIVE_SESSIONS.with(|sessions| {
+            sessions.borrow_mut().insert(
+                session_id,
+                SessionLifetime {
+                    _session: session,
+                    _provider: provider,
+                },
+            );
+        });
+        // SAFETY: The session is fully configured, retained in
+        // `ACTIVE_SESSIONS`, and
+        // this function is executing on the main thread.
+        let started = unsafe { retained_session.start() };
+        if !started {
+            ACTIVE_SESSIONS.with(|sessions| {
+                sessions.borrow_mut().remove(&session_id);
+            });
+            return Err(format!(
+                "{OAUTH_START_FAILED}macOS could not present the web authentication session"
+            ));
+        }
+        Ok(())
+    }
+
+    fn completion_result(callback_url: *mut NSURL, callback_error: *mut NSError) -> OAuthResult {
+        // SAFETY: AuthenticationServices owns both nullable arguments for the
+        // duration of this completion-block invocation.
+        let callback_url = unsafe { callback_url.as_ref() };
+        // SAFETY: Same callback lifetime as `callback_url` above.
+        let callback_error = unsafe { callback_error.as_ref() };
+        if let Some(url) = callback_url {
+            return url
+                .absoluteString()
+                .map(|value| value.to_string())
+                .ok_or_else(|| "macOS returned an OAuth callback without a URL".to_owned());
+        }
+        if let Some(error) = callback_error {
+            if error.code() == ASWebAuthenticationSessionErrorCode::CanceledLogin.0 {
+                return Err(OAUTH_CANCELLED.to_owned());
+            }
+            if matches!(
+                error.code(),
+                code if code == ASWebAuthenticationSessionErrorCode::PresentationContextNotProvided.0
+                    || code == ASWebAuthenticationSessionErrorCode::PresentationContextInvalid.0
+            ) {
+                return Err(format!(
+                    "{OAUTH_START_FAILED}{}",
+                    error.localizedDescription()
+                ));
+            }
+            return Err(error.localizedDescription().to_string());
+        }
+        Err("macOS returned no OAuth callback".to_owned())
+    }
+
+    fn deliver(delivery: &Delivery, result: OAuthResult) {
+        let sender = delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+        }
+    }
 }
 
 pub async fn exchange_oauth_code(origin: &str, code: &str) -> Result<AuthOutcome> {
