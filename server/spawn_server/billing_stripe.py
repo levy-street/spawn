@@ -30,10 +30,16 @@ Two rules govern everything here and are worth stating once:
   the same thing and is editable by anyone with a dashboard login, so it is
   never read. `billing.tier_for_price_id` is the authority.
 
-Stripe being unreachable is not an entitlement change. Every failure here
-raises `StripeUnavailable`, and every caller is expected to carry on: the limit
-that is actually enforced is read from our own tables, which do not depend on
-Stripe answering.
+Stripe being unreachable is not an entitlement change. A transport failure or a
+refusal raises `StripeUnavailable`, and every caller is expected to carry on:
+the limit that is actually enforced is read from our own tables, which do not
+depend on Stripe answering.
+
+An object Stripe says is *gone* raises `StripeResourceMissing` instead, and the
+split is load-bearing rather than tidy. Stripe retries a 500 for three days; a
+subscription this key cannot see will still be missing at the end of them, so
+the two get different answers — a retry for the outage, a loud log and a 200
+for the one that is never going to clear.
 """
 
 from __future__ import annotations
@@ -81,6 +87,22 @@ class StripeUnavailable(RuntimeError):
     authority at enforcement time. A caller that was doing something else —
     deleting an account, reconciling a fleet — must carry on regardless. Only
     the Stripe-shaped part of the request has failed.
+    """
+
+
+class StripeResourceMissing(LookupError):
+    """Stripe answered, and said the object is not there.
+
+    Deliberately NOT a `StripeUnavailable`. An outage is worth retrying and
+    this is not: an event naming a subscription our key cannot see will name
+    the same one in three days' time. Stripe retries a 500 for three days, so
+    classing this as an outage buys nothing and costs a log full of a failure
+    that was never going to clear. The webhook handler answers 200 to it and
+    says so loudly instead.
+
+    Reachable without anyone doing anything wrong: an event delivered after the
+    object was deleted from a sandbox, or a key rotated to a different account
+    while an endpoint kept its backlog.
     """
 
 
@@ -187,7 +209,11 @@ async def _call(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
     stalls every websocket in the process for the duration of an HTTP
     round-trip to Stripe.
 
-    Only Stripe's own errors and transport failures become `StripeUnavailable`.
+    Stripe's transport failures become `StripeUnavailable`, which is retried.
+    An object Stripe says does not exist becomes `StripeResourceMissing`, which
+    is not — the distinction matters because Stripe retries a 500 for three
+    days and a missing object will still be missing at the end of them.
+
     Anything else — a `TypeError` from a call built wrong, a `KeyError` from a
     payload shape we misread — is our bug and propagates, because the webhook
     handler answers 200 to those on purpose. Three days of Stripe retries
@@ -195,6 +221,10 @@ async def _call(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
     """
     try:
         return await asyncio.to_thread(fn, *args, **kwargs)
+    except stripe.InvalidRequestError as exc:
+        if getattr(exc, "code", None) == "resource_missing" or getattr(exc, "http_status", None) == 404:
+            raise StripeResourceMissing(str(exc)) from exc
+        raise StripeUnavailable(str(exc)) from exc
     except stripe.StripeError as exc:
         raise StripeUnavailable(str(exc)) from exc
     except (OSError, TimeoutError) as exc:
@@ -801,6 +831,16 @@ async def reconcile_all(session: AsyncSession, *, client: Any = None) -> int:
             applied = await fetch_and_apply_subscription(
                 session, subscription_id=subscription_id, client=api
             )
+        except StripeResourceMissing as exc:
+            # Stripe answered and said it is gone. Louder than an outage,
+            # because a paid row pointing at a subscription that does not exist
+            # is drift a sweep cannot fix by trying again — somebody has to
+            # look. It still does not abandon the rest of the sweep, and it
+            # still changes nothing: the limit in our row stands until a human
+            # or a real event moves it.
+            await session.rollback()
+            log.error("reconciliation found %s missing at Stripe: %s", subscription_id, exc)
+            continue
         except StripeUnavailable as exc:
             # One unreadable subscription is not a reason to abandon the rest,
             # and it changes nothing: the limit in our row still stands.

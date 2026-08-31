@@ -476,10 +476,10 @@ async def stripe_webhook(
 
     - **400** — the signature did not verify. It is not from Stripe, or a
       rotation went wrong, and either deserves an alarm rather than a retry.
-    - **200** — applied, already applied, an event type we do not handle, or a
-      deterministic bug of our own. Three days of retries against a `KeyError`
-      delays nothing but our own fix, so that last one is logged loudly and
-      answered cheerfully.
+    - **200** — applied, already applied, an event type we do not handle, an
+      object Stripe says does not exist, or a deterministic bug of our own.
+      Three days of retries against a `KeyError` delays nothing but our own
+      fix, so the last two are logged loudly and answered cheerfully.
     - **500** — the database or the Stripe API would not answer. This is the
       one we want retried, so nothing is committed on the way out and the
       dedupe row goes back with it.
@@ -522,6 +522,20 @@ async def stripe_webhook(
 
     try:
         await _handle(session, event_type=event_type, obj=event["data"]["object"])
+    except billing_stripe.StripeResourceMissing as exc:
+        # Not an outage, so not a retry. The object this event names is not
+        # there and will not be there in three days either — an event delivered
+        # after a sandbox object was deleted, or a key rotated to another
+        # account while an endpoint kept its backlog. Answer 200 so Stripe
+        # stops, and say so where somebody will see it.
+        await session.rollback()
+        log.error(
+            "billing webhook %s (%s) names a Stripe object that does not exist: %s",
+            event_id,
+            event_type,
+            exc,
+        )
+        return Response(status_code=status.HTTP_200_OK)
     except billing_stripe.StripeUnavailable as exc:
         await session.rollback()
         log.warning("billing webhook %s (%s) could not reach Stripe: %s", event_id, event_type, exc)
