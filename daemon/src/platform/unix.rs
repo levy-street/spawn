@@ -198,6 +198,21 @@ pub fn durable_replace(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
 }
 
+/// fsync the directory that holds `path`.
+///
+/// `rename` is atomic but not durable: after a power loss the kernel may have
+/// the file's contents and not the directory entry that names it. Callers that
+/// publish by rename — the self-update binary swap and its probation marker —
+/// need the entry itself on stable storage, or a crash can persist a swapped
+/// binary with no marker to revert it.
+pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::File::open(parent)?.sync_all()
+}
+
 pub fn rename_noreplace_at(parent: &Dir, from: &Path, to: &Path) -> io::Result<()> {
     let parent = parent.try_clone()?.into_std_file();
     rustix::fs::renameat_with(

@@ -29,6 +29,9 @@ use update_io::*;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBATION_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// How long a touched `allow-downgrade` file authorizes a rollback for.
+const DOWNGRADE_CONSENT_WINDOW: Duration = Duration::from_secs(30 * 60);
+const DOWNGRADE_CONSENT_FILE: &str = "allow-downgrade";
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -284,6 +287,9 @@ async fn verify_release_manifest(
         )
     };
     let keys: Vec<&str> = crate::release_key::effective_release_signing_public_keys().collect();
+    // docs/TRUST.md treats the control plane as hostile, so the server's
+    // `allow_downgrade` only *asks*. Consent is proven here, on the host.
+    let downgrade_authorized = request.allow_downgrade && local_downgrade_consent();
     verify_manifest_bytes(
         &manifest,
         signature.as_deref(),
@@ -292,7 +298,43 @@ async fn verify_release_manifest(
         allow_unsigned,
         &keys,
         crate::version::build_counter(),
+        downgrade_authorized,
     )
+}
+
+/// A downgrade needs consent from someone with a shell on this machine.
+///
+/// The monotonic release counter exists to stop a rollback to a known-
+/// vulnerable build. Letting a boolean in the server's `daemon.update` frame
+/// switch it off degrades that guarantee from cryptographic to
+/// server-permission: a compromised control plane could replay an older,
+/// validly-signed manifest and roll the fleet back. The signature root of
+/// trust still holds — nothing unsigned can be pushed — but rollback
+/// protection is exactly the property the counter is for, so it is not the
+/// server's to waive.
+///
+/// The operator arms a downgrade by touching a file in this instance's config
+/// directory. It expires on its own so a forgotten arming does not become a
+/// standing permission.
+fn local_downgrade_consent() -> bool {
+    let Ok(path) = crate::config::config_dir().map(|dir| dir.join(DOWNGRADE_CONSENT_FILE)) else {
+        return false;
+    };
+    let armed = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| {
+            modified
+                .elapsed()
+                .is_ok_and(|age| age <= DOWNGRADE_CONSENT_WINDOW)
+        });
+    if !armed && path.exists() {
+        tracing::warn!(
+            stage = "precondition",
+            path = %path.display(),
+            "downgrade consent has expired; touch the file again to re-arm it"
+        );
+    }
+    armed
 }
 
 fn verify_manifest_bytes(
@@ -303,6 +345,7 @@ fn verify_manifest_bytes(
     allow_unsigned: bool,
     public_keys: &[&str],
     build_counter: Option<u64>,
+    downgrade_authorized: bool,
 ) -> Result<(), UpdateFailure> {
     let manifest: SignedReleaseManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"))?;
@@ -362,7 +405,7 @@ fn verify_manifest_bytes(
         return Err(UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"));
     }
     if !allow_unsigned
-        && !request.allow_downgrade
+        && !downgrade_authorized
         && build_counter.is_some_and(|counter| manifest.release_counter < counter)
     {
         return Err(UpdateFailure::new(UpdateStage::Precondition, "downgrade"));
@@ -666,14 +709,54 @@ pub async fn run_cli(server_cli: Option<String>) -> Result<()> {
         }
         Ok(HttpUpdateOutcome::Applied(applied)) => {
             spinner.finish(true, "update verified; restarting");
-            let failure = exec(applied);
-            anyhow::bail!("SPAWN D daemon update failed: {failure}")
+            finish_cli_update(applied, &server)
         }
         Err(failure) => {
             spinner.finish(false, "update not applied");
             anyhow::bail!("SPAWN D daemon update failed: {failure}")
         }
     }
+}
+
+/// Hand the swapped-in binaries to whatever is actually running the daemon.
+///
+/// `exec` is right when the *service* applies its own update: the running
+/// process is the daemon, so replacing its image in place keeps the same PID
+/// and its manager none the wiser. It is wrong here. `spawnd update` is a
+/// short-lived CLI, and exec'ing its own argv just re-runs `spawnd update` on
+/// the new binary, which reports "current" and exits — while the service goes
+/// on running the old code. From there every consequence is silent: new
+/// sessions fail `worker_mismatch` (whose remedy is the command that just
+/// claimed it had nothing to do), the leftover `.prev` blocks the next
+/// server-pushed repair with `swap_failed`, and at the next restart the
+/// probation deadline has expired, so the update is reverted and reported as a
+/// health failure. Windows already avoids all of this by handing off to the
+/// service manager; this is the Unix equivalent.
+#[cfg(unix)]
+fn finish_cli_update(applied: AppliedUpdate, server: &Url) -> Result<()> {
+    // The swap is already on disk; the permit only guards concurrent updates.
+    drop(applied);
+    let config_dir = crate::config::config_dir().context("resolving the SPAWN D config dir")?;
+    let status = crate::service::status(&config_dir);
+    if !status.installed {
+        println!(
+            "SPAWN D daemon updated. Restart the daemon to run it — an update that never \
+             registers is rolled back after five minutes."
+        );
+        return Ok(());
+    }
+    crate::service::reconnect(&config_dir, server.as_str())
+        .context("restarting the SPAWN D daemon service onto the updated build")?;
+    println!("SPAWN D daemon updated; {} is restarting.", status.name);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn finish_cli_update(applied: AppliedUpdate, _server: &Url) -> Result<()> {
+    // Windows hands off to a detached helper that waits for this process to
+    // exit and then asks the service manager to start the new binary.
+    let failure = exec(applied);
+    anyhow::bail!("SPAWN D daemon update failed: {failure}")
 }
 
 fn cli_no_update_line(reason: &str) -> String {
@@ -758,6 +841,10 @@ fn write_marker(path: &Path, marker: &ProbationMarker) -> std::io::Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         crate::platform::durable_replace(&temporary, path)?;
+        // The marker must reach stable storage before the swap it guards, or a
+        // power loss between the two persists new binaries with nothing to
+        // revert them.
+        crate::platform::sync_parent_dir(path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -805,11 +892,14 @@ pub fn prepare_probation() -> Result<()> {
                     worker_path,
                     reverted: false,
                 };
-                return revert_and_exec(ProbationRuntime {
+                if let Err(error) = revert_and_exec(ProbationRuntime {
                     marker_path,
                     marker: recovered,
                     daemon_path,
-                });
+                }) {
+                    tracing::error!(stage = "health", %error, "SPAWN D daemon health revert failed");
+                }
+                return Ok(());
             }
             if let Err(remove_error) = fs::remove_file(&marker_path) {
                 if remove_error.kind() != std::io::ErrorKind::NotFound {
@@ -842,11 +932,20 @@ pub fn prepare_probation() -> Result<()> {
             });
             Ok(())
         }
-        ProbationDecision::Revert => revert_and_exec(ProbationRuntime {
-            marker_path,
-            marker,
-            daemon_path,
-        }),
+        ProbationDecision::Revert => {
+            // A revert that fails is reported, not fatal: propagating here
+            // exits the daemon on every start, which is a crash loop rather
+            // than a recovery. `revert_binaries` rolls back its own partial
+            // steps, so the tree on disk stays coherent either way.
+            if let Err(error) = revert_and_exec(ProbationRuntime {
+                marker_path,
+                marker,
+                daemon_path,
+            }) {
+                tracing::error!(stage = "health", %error, "SPAWN D daemon health revert failed");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -901,6 +1000,26 @@ pub fn arm_probation_deadline() {
 }
 
 fn revert_and_exec(mut runtime: ProbationRuntime) -> Result<()> {
+    // Nothing to revert to. Failing here would exit the daemon, the service
+    // manager would restart it, and it would arrive at this same conclusion
+    // three seconds later — a crash loop that takes the host offline until a
+    // human deletes the marker by hand, and that still does not restore the
+    // previous build. Clear the marker, stay loud, and keep running: that is
+    // already what the unreadable-marker path decides, and this makes the
+    // readable one agree with it.
+    if !complete_previous_pair(&runtime.daemon_path, &runtime.marker.worker_path) {
+        tracing::error!(
+            stage = "health",
+            "self-update probation wanted to revert, but the previous daemon pair is \
+             incomplete; continuing on the current build"
+        );
+        if let Err(error) = fs::remove_file(&runtime.marker_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(stage = "health", %error, "could not clear the probation marker");
+            }
+        }
+        return Ok(());
+    }
     revert_binaries(&runtime.daemon_path, &runtime.marker.worker_path)
         .context("restoring previous daemon binaries")?;
     runtime.marker.reverted = true;

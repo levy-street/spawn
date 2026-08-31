@@ -312,7 +312,14 @@ registers.
 Every self-update first downloads the origin-pinned
 `/api/install/manifest.json{,.sig}`, verifies the exact manifest bytes against
 the rotation list in `release_key.rs`, matches its tree and both artifact
-hashes, and enforces the build.rs-stamped monotonic release counter. Development
+hashes, and enforces the build.rs-stamped monotonic release counter. Nothing the
+server sends can waive that counter: `daemon.update` carries an
+`allow_downgrade` flag, but it only *asks*, and the daemon proceeds only when a
+downgrade has also been consented to on this machine — a `allow-downgrade` file
+touched in the config dir within the last 30 minutes. The server is untrusted
+(`docs/TRUST.md`), and rollback to a known-vulnerable release is precisely what
+the counter exists to prevent, so it is not the server's to switch off.
+Development
 harness builds may set `SPAWND_DAEMON_TREE_OVERRIDE`,
 `SPAWND_BUILD_COUNTER_OVERRIDE`, and
 `SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE`. `SPAWND_ALLOW_UNSIGNED_UPDATE=1` is a
