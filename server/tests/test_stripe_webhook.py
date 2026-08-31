@@ -93,8 +93,16 @@ class _Subscriptions(_Resource):
         self._api.record("subscriptions.retrieve", subscription_id)
         obj = self._api.subscriptions.get(subscription_id)
         if obj is None:
+            # Built the way Stripe actually builds it. The `code` and the 404
+            # are the whole difference between "retry this for three days" and
+            # "this object is never coming back" — a fixture that omitted them
+            # would let the handler classify a permanent miss as an outage and
+            # no test would notice.
             raise stripe.InvalidRequestError(
-                f"No such subscription: {subscription_id}", "subscription"
+                f"No such subscription: {subscription_id}",
+                "subscription",
+                code="resource_missing",
+                http_status=404,
             )
         return obj
 
@@ -591,6 +599,34 @@ class TestTheStatusCodeAsksStripeForTheRightThing:
         )
         assert response.status_code == 200, response.text
         assert fake_stripe.named("subscriptions.retrieve") == []
+
+    async def test_an_object_stripe_says_is_missing_is_200_not_a_retry(
+        self, client, billing_on, fake_stripe, caplog
+    ):
+        """A permanent miss must not be dressed up as an outage.
+
+        Stripe retries a 500 for three days. An event naming a subscription
+        this key cannot see will name the same one at the end of them, so a
+        retry buys nothing and costs three days of a failure that was never
+        going to clear. Reachable without anyone doing anything wrong: an
+        event delivered after a sandbox object was deleted, or a key rotated
+        to another account while an endpoint kept its backlog.
+        """
+        user_id, _ = await _signup(client, "vanished@example.com")
+        await _seed_customer(user_id)
+        # Deliberately NOT registered with the fake, so the retrieve 404s.
+        subscription = _subscription_object(spawn_user_id=user_id)
+
+        with caplog.at_level("ERROR"):
+            response = await _post(
+                client, _event_bytes("customer.subscription.updated", subscription)
+            )
+
+        assert response.status_code == 200, response.text
+        # Loud, because nobody is going to be told by Stripe retrying.
+        assert any("does not exist" in record.message for record in caplog.records)
+        # And it granted nothing on the way past.
+        assert (await _entitlement(user_id)).tier == billing.TIER_FREE
 
     async def test_a_stripe_outage_is_500_so_stripe_retries(
         self, client, billing_on, fake_stripe
