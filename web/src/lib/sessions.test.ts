@@ -120,6 +120,13 @@ describe("isShellCommand", () => {
     }
   });
 
+  test("matches the Windows shells, extension and all", () => {
+    for (const shell of ["powershell", "pwsh", "cmd"]) {
+      expect(isShellCommand(shell)).toBe(true);
+      expect(isShellCommand(`${shell}.exe`)).toBe(true);
+    }
+  });
+
   test("rejects agents, null, and lookalikes", () => {
     expect(isShellCommand(null)).toBe(false);
     expect(isShellCommand(undefined)).toBe(false);
@@ -159,5 +166,14 @@ describe("runningAgent", () => {
 
   test("an unclaimed foreground process is not an agent either", () => {
     expect(runningAgent(makeSession({ foreground_command: "vim" }), agents)).toBeNull();
+  });
+
+  test("a Windows host's .exe suffix does not hide the agent", () => {
+    // The kernel-reported name carries the extension there; the registry's
+    // command does not. Both spellings must land on the same agent, or a
+    // duplicated Claude pane comes back as an empty shell.
+    expect(runningAgent(makeSession({ foreground_command: "claude.exe" }), agents)?.id).toBe("a1");
+    expect(runningAgent(makeSession({ foreground_command: "CODEX.EXE" }), agents)?.id).toBe("a2");
+    expect(runningAgent(makeSession({ foreground_command: "powershell.exe" }), agents)).toBeNull();
   });
 });
