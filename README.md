@@ -127,8 +127,7 @@ in both, in the same commit — see [CLAUDE.md](CLAUDE.md).
 
 Further reading: [INTERFACE_MATRIX.md](docs/INTERFACE_MATRIX.md) and [proto/README.md](proto/README.md)
 for interfaces, [DESIGN.md](docs/DESIGN.md) for UI standards, [SESSIOND.md](docs/SESSIOND.md)
-for the worker model, [TRUST.md](docs/TRUST.md) for the trust architecture, and
-[RELEASE_NOTES_OVERHAUL.md](docs/RELEASE_NOTES_OVERHAUL.md) for the UI overhaul upgrade.
+for the worker model, and [TRUST.md](docs/TRUST.md) for the trust architecture.
 
 ---
 
@@ -303,9 +302,6 @@ SPAWN_DEPLOY_BUILD=0 scripts/deploy-prod.sh spawnd-prod
 SPAWN_DEPLOY_SUDO="" scripts/deploy-prod.sh spawnd-prod
 ```
 
-For the overhaul rollout order and the daemon protocol break, follow
-[RELEASE_NOTES_OVERHAUL.md](docs/RELEASE_NOTES_OVERHAUL.md).
-
 </details>
 
 ---
@@ -333,8 +329,8 @@ destination. Image paste attachments stay separate, under `<cwd>/.spawn/attachme
 
 ## Project status
 
-Pre-alpha, with the workspace/session/agent overhaul implemented and the shipped design record in
-[OVERHAUL.md](docs/OVERHAUL.md).
+Pre-alpha. The workspace/session/agent model is implemented; its interfaces are described in
+[proto/README.md](proto/README.md) and [INTERFACE_MATRIX.md](docs/INTERFACE_MATRIX.md).
 
 Not yet proven: the native Windows daemon and desktop build compile in CI, but that lane is still
 a migration scaffold rather than a required check, and nothing has been validated on real Windows

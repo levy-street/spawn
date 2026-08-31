@@ -1132,7 +1132,7 @@ class Workspace(Base):
     )
     cwd: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # Layout schema v3 (tabs over grid-schema-v3 grids), validated on every write by
-    # spawn_server.grid + routes/workspaces (docs/OVERHAUL.md §4.4).
+    # spawn_server.grid + routes/workspaces (proto/README.md, "Layout schema v3").
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # Sidebar ordering, contiguous from 0 per owner. Archived rows leave that
     # space entirely — they order by `archived_at` and their `position` is

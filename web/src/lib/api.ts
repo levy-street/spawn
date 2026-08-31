@@ -377,7 +377,7 @@ export const SessionAccessSchema = z.object({
 });
 export type SessionAccess = z.infer<typeof SessionAccessSchema>;
 
-/** Grid layout v2 (§4.4): a 12×12 canvas of non-overlapping session tiles. */
+/** Grid layout v2: a 12×12 canvas of non-overlapping session tiles. */
 export const TileWidgetSchema: z.ZodType<TileWidget> = z.object({
   kind: z.literal("files"),
   host_id: z.string().uuid(),
@@ -398,7 +398,7 @@ export const GridLayoutSchema: z.ZodType<GridLayout> = z.object({
   tiles: z.array(TileSchema),
 });
 
-/** Layout v3 (§4.4-tabs): ordered named tabs, each wrapping one tile grid. */
+/** Layout v3: ordered named tabs, each wrapping one tile grid. */
 export const WorkspaceTabSchema: z.ZodType<WorkspaceTab> = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -1237,7 +1237,7 @@ export const sessions = {
   /**
    * The daemon always spawns the login shell in `cwd` — no argv/env here.
    * `workspace_id` transactionally appends a tile to that workspace; omit
-   * `tile` to let the server auto-place (§4.4).
+   * `tile` to let the server auto-place.
    */
   create: (body: {
     host_id: string;

@@ -3,8 +3,7 @@
 The living design-system reference for `spawn-web`. Every visual decision
 flows through the tokens in `web/src/app/globals.css` and the primitives in
 `web/src/components/ui/` — this document is the inventory of both and the
-rules for extending them. The shipped product/feature decision record lives in
-`docs/OVERHAUL.md`; system architecture lives in `README.md`,
+rules for extending them. System architecture lives in `README.md`,
 `docs/TRUST.md`, and `proto/README.md`.
 
 The endpoint-local protected-data proposal in
@@ -15,8 +14,8 @@ add UI for that store until a current shell-session design is accepted.
 
 1. **No Tailwind palette literals.** `emerald-500`, `amber-400`, `sky-300`,
    `zinc-600`, `red-500`, … must not appear anywhere in `web/src/` outside
-   `globals.css`. Use the semantic tokens below. The Phase C grep gate
-   (`docs/OVERHAUL.md` §9) enforces this; Biome cannot.
+   `globals.css`. Use the semantic tokens below. Nothing enforces this
+   mechanically — Biome cannot see it — so it is a review rule.
    - The sanctioned exceptions are fixed brand constants: the grimoire
      marketing palette (`bg-void`, `text-hellfire`, …), and third-party brand
      marks in `components/icons/` whose plate colors are arbitrary-value hex
