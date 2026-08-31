@@ -427,6 +427,15 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         tracing::warn!("VirtualLock failed for scrollback key; key may be swappable");
     }
     let setup = LogSetup {
+        // On Windows `open_worker_log` creates the diagnostics directory with
+        // an explicit owner-only ACL whose ACE does not inherit. Scrollback's
+        // private-path contract intentionally requires an inheritable
+        // owner-only directory, so give encrypted segments their own child
+        // rather than asking one directory to satisfy two incompatible ACL
+        // shapes. The child is created with ScrollbackLog's canonical ACL.
+        #[cfg(windows)]
+        dir: args.log_dir.join("history"),
+        #[cfg(not(windows))]
         dir: args.log_dir.clone(),
         segment_bytes: args.segment_bytes,
         max_log_bytes: args.max_log_bytes,
