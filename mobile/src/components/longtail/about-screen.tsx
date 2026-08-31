@@ -7,8 +7,10 @@ import { BrandMark } from "@/components/brand/brand-mark";
 import {
   installCommandsForBaseUrl,
   nativeWindowsAvailableFromRelease,
+  PRIVACY_URL,
   SECURITY_URL,
   SOURCE_URL,
+  TERMS_URL,
 } from "@/components/longtail/public-content";
 import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsLinkRow } from "@/components/settings/settings-row";
@@ -341,19 +343,29 @@ export function AboutScreen({
       </SettingsSection>
 
       {/*
-       * There is no "Download & install" row here, and that is deliberate.
+       * Two rules meet in this section, and they pull in opposite directions.
        *
-       * Every install command it used to lead to is already on this screen,
-       * above, with copy and share — so the link only ever offered a longer
-       * road to the same text. Meanwhile spawnd.dev now sells subscriptions,
-       * and an in-app tappable link into a site that sells them is exactly the
-       * shape a reviewer reads as steering under App Store guideline 3.1.1.
-       * The mobile apps never sell anything (docs/BILLING.md §6.1); this keeps
-       * that true of the links as well as of the copy.
+       * Privacy MUST be here. Apple 5.1.1(i) requires the policy to be
+       * reachable from inside the app, not only from the store listing, and
+       * Google requires it on the listing; without it the app is not
+       * submittable to either store. Terms rides along because a subscription
+       * a person bought on the web is governed by them.
        *
-       * Do not re-add it. If a download page must be reachable from here, it
-       * has to be a URL with no route to pricing — which the shared marketing
-       * chrome does not currently give us.
+       * And no row here may lead to a page that sells or prices anything —
+       * that is the shape App Store guideline 3.1.1 calls steering, and the
+       * mobile apps never sell anything (docs/BILLING.md §6.1).
+       *
+       * The reconciliation is that the rule is about a link's DESTINATION, not
+       * about the site it lands on. A privacy policy the app is required to
+       * link cannot simultaneously be a violation to link, and every company's
+       * site carries pricing in its own nav. So: legal and informational pages
+       * stay, and nothing points at /pricing or a checkout.
+       *
+       * There is deliberately no "Download & install" row. It fails the
+       * destination test least of all of these, but it also earned its removal
+       * on its own: every install command it led to is already on this screen,
+       * above, with copy and share, so it only ever offered a longer road to
+       * the same text.
        */}
       <SettingsSection title="Links">
         <SettingsLinkRow
@@ -361,6 +373,18 @@ export function AboutScreen({
           icon="ShieldCheck"
           label="Security"
           onPress={() => void openExternal("Security", SECURITY_URL)}
+        />
+        <SettingsLinkRow
+          accessibilityHint="Opens the SPAWN D privacy policy in your browser"
+          icon="Lock"
+          label="Privacy policy"
+          onPress={() => void openExternal("Privacy policy", PRIVACY_URL)}
+        />
+        <SettingsLinkRow
+          accessibilityHint="Opens the SPAWN D terms of service in your browser"
+          icon="FileText"
+          label="Terms of service"
+          onPress={() => void openExternal("Terms of service", TERMS_URL)}
         />
         <SettingsLinkRow
           accessibilityHint="Opens the source repository in your browser"

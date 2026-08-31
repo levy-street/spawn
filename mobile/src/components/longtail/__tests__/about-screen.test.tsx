@@ -1,7 +1,7 @@
 import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import * as Clipboard from "expo-clipboard";
-
 import { AboutScreen } from "@/components/longtail/about-screen";
+import * as publicContent from "@/components/longtail/public-content";
 import {
   installCommandsForBaseUrl,
   installTargetsForBaseUrl,
@@ -126,10 +126,37 @@ describe("about and public content", () => {
 
     expect(screen.queryByText("Download & install")).toBeNull();
     expect(screen.getByText("curl -fsSL https://spawn.example/install.sh | sh")).toBeOnTheScreen();
-    // The Links section survives; it is the one row into a page that sells
-    // something that does not.
     expect(screen.getByText("Open source")).toBeOnTheScreen();
     await screen.unmount();
+  });
+
+  // Apple 5.1.1(i) requires the privacy policy to be reachable from inside the
+  // app, not only from the store listing. Without this the app is not
+  // submittable to either store — which was true before billing and is simply
+  // overdue. docs/BILLING.md §5.2.
+  test("links the privacy policy and terms from inside the app", async () => {
+    const screen = await render(
+      <ThemeProvider>
+        <AboutScreen baseUrl="https://spawn.example" nativeWindowsAvailable version="2.4.0" />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Privacy policy")).toBeOnTheScreen();
+    expect(screen.getByText("Terms of service")).toBeOnTheScreen();
+    await screen.unmount();
+  });
+
+  // The rule is about a link's destination, never about the site it lands on:
+  // legal pages are required, and a page that prices something is refused.
+  test("no link in About leads to a page that sells or prices anything", () => {
+    const urls = Object.entries(publicContent)
+      .filter(([, value]) => typeof value === "string" && value.startsWith("http"))
+      .map(([, value]) => value as string);
+
+    expect(urls.length).toBeGreaterThan(0);
+    for (const url of urls) {
+      expect(url).not.toMatch(/\/pricing|checkout|\/upgrade|\/subscribe|\/billing/i);
+    }
   });
 
   test("keeps the WSL-only About state truthful before native availability", async () => {
