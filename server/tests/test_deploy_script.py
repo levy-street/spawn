@@ -98,10 +98,11 @@ if [[ "{name}" == "bun" && "${{1:-}}" == "run" && "${{2:-}}" == "build" ]]; then
   # A real build freezes the proxy target into the routes manifest; the deploy
   # verifies that bake before restarting anything. SPAWN_TEST_BAKED_TARGET lets
   # a test simulate a build that baked something other than what was asked for.
-  mkdir -p .next
+  dist_dir="${{SPAWN_NEXT_DIST_DIR:-.next}}"
+  mkdir -p "$dist_dir"
   baked="${{SPAWN_TEST_BAKED_TARGET:-$SPAWN_API_PROXY_TARGET}}"
   printf '{{"rewrites":{{"afterFiles":[{{"source":"/api/:path*","destination":"%s/api/:path*"}}]}}}}\\n' \\
-    "$baked" > .next/routes-manifest.json
+    "$baked" > "$dist_dir/routes-manifest.json"
 fi
 if [[ "{name}" == "curl" ]]; then
   url="${{@: -1}}"
@@ -138,6 +139,9 @@ def _fake_ssh(tmp_path: Path, remote_home: Path) -> Path:
         fakebin / "ssh",
         f"""#!/usr/bin/env bash
 set -euo pipefail
+# The deploy pins keepalive -o options on every connection; consume them the
+# way real ssh does so $1 is the host and $2 the command.
+while [[ "${{1:-}}" == "-o" ]]; do shift 2; done
 printf '%s\\n' "$1" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-host.log"
 printf '%s\\n' "$2" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-command.log"
 script="$SPAWN_DEPLOY_TEST_LOG_DIR/remote-script.sh"

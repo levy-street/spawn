@@ -33,6 +33,11 @@ function buildId(): string {
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // The deploy builds into a staging directory and swaps it in at the restart,
+  // so a build never deletes the assets the running server is still handing
+  // out. Unset at runtime, so a started server always reads .next — the swap
+  // renames the staged build into place.
+  distDir: process.env.SPAWN_NEXT_DIST_DIR || ".next",
   // Keep Next rooted in this workspace even when a parent directory contains
   // an unrelated npm lockfile.
   outputFileTracingRoot: path.resolve(process.cwd()),
