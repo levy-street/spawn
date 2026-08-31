@@ -33,11 +33,34 @@ export interface FlatProse {
 /** @deprecated alias kept while comparisons predate the generic name. */
 export type ComparisonProse = FlatProse;
 
-/** One phone-frame capture: a real session moment from the live app. */
+/** One device-frame capture: a real session moment from the live app. */
 export interface DeviceVignette {
   src: string;
+  width: number;
+  height: number;
   alt: string;
   caption: string;
+}
+
+/**
+ * One hub page (the hub template): an essay that teaches the category,
+ * then the rack of spokes. Hubs carry the site-level schema
+ * (Organization + SoftwareApplication) per docs/SEO_TREE.md.
+ */
+export interface HubEntry {
+  slug: string;
+  title: string;
+  description: string;
+  datePublished: string;
+  dateModified: string;
+  hero: { plain: string; accent: string; sub: string };
+  essay: FlatProse[];
+  /** The spoke rack: the pages this hub exists to route. */
+  spokes: FlatRelatedLink[];
+  faq: FlatFaq[];
+  related: FlatRelatedLink[];
+  cardTitle: string;
+  cardBlurb: string;
 }
 
 /**
@@ -114,4 +137,5 @@ export interface ComparisonEntry {
 
 export type FlatPage =
   | { template: "comparison"; slug: string; comparison: ComparisonEntry }
-  | { template: "device"; slug: string; device: DeviceEntry };
+  | { template: "device"; slug: string; device: DeviceEntry }
+  | { template: "hub"; slug: string; hub: HubEntry };

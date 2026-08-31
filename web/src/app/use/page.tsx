@@ -21,6 +21,12 @@ export default function UseIndexPage() {
             "The routes that work today, and the one where the phone becomes a console for sessions on your own machines.",
           href: "/claude-code-on-your-phone",
         },
+        {
+          title: "Coding agents on your phone",
+          blurb:
+            "The hub for the device row: every agent, every honest route, and the console pattern that ties them together.",
+          href: "/coding-agents-on-your-phone",
+        },
       ]}
     />
   );

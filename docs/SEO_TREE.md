@@ -240,8 +240,8 @@ shared rail and hairline borders. Reference implementation:
 
 | template | serves | signature section | schema | status |
 |---|---|---|---|---|
-| hub | 4 hubs | intro essay + spoke rack | Organization, SoftwareApplication, Breadcrumb | exists as bare card rack; needs content upgrade |
-| device | phone pages, iPad, Chromebook | phone-frame terminal vignette (an agent moment: permission prompt, diff) | Breadcrumb, FAQ, Article (honest dates) | template built; `/claude-code-on-your-phone` live, rest of row pending |
+| hub | 4 hubs | intro essay + spoke rack | Organization, SoftwareApplication, Breadcrumb | template built; `/coding-agents-on-your-phone` live (legacy /use /for hubs still card racks) |
+| device | phone pages, iPad, Chromebook | phone-frame terminal vignette (an agent moment: permission prompt, diff) | Breadcrumb, FAQ, Article (honest dates) | 4 live: claude/codex phone, iPad, Chromebook (android folded into iPad; aider/opencode await provider auth for real captures) |
 | vibe | vibe row | device template base, softer chrome; jargon-free register enforced editorially | Breadcrumb, FAQ | new (variant) |
 | machine | machine row | outbound-only network diagram | Breadcrumb, FAQ | new |
 | job | job pages | workspace-grid vignette (the parallel fleet, live) | Breadcrumb, FAQ, Article (honest dates) | flagship built (`/run-agents-in-parallel`) |
