@@ -92,7 +92,7 @@ async def signup(
     access_token = auth.issue_access_token(user.id, user.session_epoch)
     _set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
-        access_token=access_token, user=schemas.UserOut.model_validate(user)
+        access_token=access_token, user=await schemas.user_out(session, user)
     )
 
 
@@ -121,7 +121,7 @@ async def login(
     access_token = auth.issue_access_token(row.id, row.session_epoch)
     _set_session_cookie(response, auth.issue_session_token(row.id, row.session_epoch))
     return schemas.TokenResponse(
-        access_token=access_token, user=schemas.UserOut.model_validate(row)
+        access_token=access_token, user=await schemas.user_out(session, row)
     )
 
 
@@ -135,8 +135,11 @@ async def logout(response: Response) -> None:
 
 
 @router.get("/me", response_model=schemas.MeResponse)
-async def me(user: User = Depends(auth.current_user)) -> schemas.MeResponse:
-    return schemas.MeResponse(user=schemas.UserOut.model_validate(user))
+async def me(
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.MeResponse:
+    return schemas.MeResponse(user=await schemas.user_out(session, user))
 
 
 def _fresh_session(response: Response, user_id: str, epoch: int) -> tuple[str, datetime]:

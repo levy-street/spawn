@@ -751,7 +751,7 @@ async def provider_exchange(
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
         access_token=auth.issue_access_token(user.id, user.session_epoch),
-        user=schemas.UserOut.model_validate(user),
+        user=await schemas.user_out(session, user),
     )
 
 
@@ -793,5 +793,5 @@ async def apple_native_sign_in(
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
         access_token=auth.issue_access_token(user.id, user.session_epoch),
-        user=schemas.UserOut.model_validate(user),
+        user=await schemas.user_out(session, user),
     )
