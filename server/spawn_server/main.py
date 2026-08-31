@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import auth
+from . import auth, billing_stripe
 from .agents_builtin import seed_builtin_agents
 from .config import get_settings
 from .db import dispose_engine, get_sessionmaker, init_engine
@@ -23,6 +23,7 @@ from .routes import agents as agents_routes
 from .routes import auth as auth_routes
 from .routes import auth_config as auth_config_routes
 from .routes import auth_providers as auth_providers_routes
+from .routes import billing as billing_routes
 from .routes import browser_devices as browser_devices_routes
 from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
@@ -95,10 +96,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as e:  # noqa: BLE001
             log.warning("builtin agent seed skipped: %s", e)
     hosts_routes.start_auto_update_checker()
+    # No-op with billing off: a self-hosted process holds no timer and
+    # opens no session on a schedule.
+    billing_stripe.start_reconciliation_loop()
 
     try:
         yield
     finally:
+        await billing_stripe.stop_reconciliation_loop()
         await hosts_routes.stop_auto_update_checker()
         await get_broker().shutdown()
         await redis_shutdown()
@@ -123,6 +128,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_routes.router)
     app.include_router(auth_config_routes.router)
     app.include_router(auth_providers_routes.router)
+    app.include_router(billing_routes.router)
     app.include_router(browser_devices_routes.router)
     app.include_router(capabilities_routes.router)
     app.include_router(device_routes.router)
