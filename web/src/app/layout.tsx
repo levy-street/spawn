@@ -16,24 +16,24 @@ export const metadata: Metadata = {
   applicationName: "SPAWN D",
   manifest: "/manifest.webmanifest",
   openGraph: {
-    title: "spawnd — a daemon on every host you own",
+    title: "SPAWN D — a daemon on every host you own",
     description:
       "A daemon on every host you own. Summon coding agents, reach them from any browser — the server that connects you never hears a word.",
     url: "https://spawnd.dev",
-    siteName: "spawnd",
+    siteName: "SPAWN D",
     images: [{ url: "/og.jpg", width: 1200, height: 630 }],
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "spawnd — a daemon on every host you own",
+    title: "SPAWN D — a daemon on every host you own",
     description:
       "A daemon on every host you own. The server that connects you can't read your terminal.",
     images: ["/og.jpg"],
   },
   appleWebApp: {
     capable: true,
-    title: "spawnd",
+    title: "SPAWN D",
     statusBarStyle: "black-translucent",
   },
   icons: {
