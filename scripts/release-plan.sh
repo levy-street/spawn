@@ -79,8 +79,13 @@ if [[ "$mobile_changed" == true ]]; then
     mobile_native="unknown"
     mobile_native_reason="the fingerprint check was skipped"
   else
+    # eas-cli is not one of mobile's devDependencies, so a bare runner (the
+    # release pipeline's plan job) must fetch it; same resolution as
+    # update-mobile-prod.sh.
+    eas_bin=(eas)
+    command -v eas >/dev/null 2>&1 || eas_bin=(npx --yes eas-cli)
     build_id="$(
-      cd mobile && npx --no-install eas build:list \
+      cd mobile && "${eas_bin[@]}" build:list \
         --platform ios --buildProfile production --status finished \
         --limit 1 --non-interactive --json 2>/dev/null |
         python3 -c 'import json,sys
@@ -95,7 +100,7 @@ print(builds[0]["id"] if builds else "")' 2>/dev/null || true
       mobile_native_reason="no finished production build to compare against"
     else
       verdict="$(
-        cd mobile && npx --no-install eas fingerprint:compare \
+        cd mobile && "${eas_bin[@]}" fingerprint:compare \
           --build-id "$build_id" --json --non-interactive 2>/dev/null |
           python3 -c 'import json,sys
 try:

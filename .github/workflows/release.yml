@@ -202,6 +202,9 @@ jobs:
       - name: Deploy server, web, the signed daemon manifest and the OTA
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          # release-lib.sh pulls prebuilt-latest with gh, which needs a token
+          # on a runner (and this repository is private).
+          GH_TOKEN: ${{ github.token }}
           # Inherited values are refused by the script, so name it explicitly.
           SPAWN_DEPLOY_MOBILE_CHANNEL: production
         run: |
