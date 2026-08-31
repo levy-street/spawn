@@ -12,11 +12,13 @@ import {
 } from "@/components/alerts/alert-delivery";
 import { useToast } from "@/components/ui/toast";
 import { AgentIcon } from "@/components/workspace-detail/agent-icon";
+import type { HostOut } from "@/data/api/schemas/hosts";
 import { getAlertQueryContext, refreshAlertSession } from "@/data/queries/alerts";
 import { useRegisteredPhone } from "@/data/queries/pairing";
 import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
-import type { AlertEvent } from "@/data/realtime/alert-socket";
+import type { AlertEvent, HostPinUndeliveredTrustEvent } from "@/data/realtime/alert-socket";
+import { subscribePinUndeliveredEvents } from "@/data/realtime/pin-undelivered-events";
 import { identifyAgent } from "@/data/selectors/agent";
 import { alertEventKey, useAlertStore } from "@/data/stores/alerts";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
@@ -40,6 +42,19 @@ export interface AlertPresenterProps {
 
 function fireAlertHaptic(feedback: AlertHaptic): void {
   haptics[feedback]();
+}
+
+export function pinUndeliveredToast(
+  event: HostPinUndeliveredTrustEvent,
+  hostName: string,
+): { message: string; detail: string } {
+  const detail =
+    event.reason === "pin_limit"
+      ? "This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again."
+      : event.reason === "invalid_chain"
+        ? `${hostName} could not verify the approval. Approve the device again from a device ${hostName} already trusts.`
+        : `Try approving again; if it keeps failing, run spawnd doctor on ${hostName}.`;
+  return { message: `The approval didn't reach ${hostName}.`, detail };
 }
 
 export function AlertPresenter({
@@ -66,6 +81,21 @@ export function AlertPresenter({
   const me = useMeSettingsQuery();
   const phone = useRegisteredPhone(accountId === null ? undefined : me.data?.user.id);
   const browserDeviceId = phone.data?.id ?? null;
+
+  useEffect(
+    () =>
+      subscribePinUndeliveredEvents((event) => {
+        const host =
+          queryClient.getQueryData<HostOut>(qk.host(event.host_id)) ??
+          queryClient
+            .getQueryData<HostOut[]>(qk.hosts())
+            ?.find((item) => item.id === event.host_id);
+        const presentation = pinUndeliveredToast(event, host?.name ?? "the host");
+        toast.error(presentation.message, { detail: presentation.detail });
+        void queryClient.invalidateQueries({ queryKey: qk.hostPins(event.host_id) });
+      }),
+    [queryClient, toast],
+  );
 
   const openSession = useCallback(
     (sessionId: string) => {

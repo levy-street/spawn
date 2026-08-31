@@ -22,8 +22,9 @@ export default function WorkspacePage() {
 
 /**
  * The search params, read once for the window. They describe the workspace the
- * URL is about, so they reach the primary half only; `WorkspaceSplit` is what
- * decides how many halves there are.
+ * URL is about, so they reach that workspace's half and no other —
+ * `WorkspaceSplit` is what decides how many halves there are and which of
+ * them the address bar is currently about.
  *
  * Its own component so the read stays under the Suspense boundary above —
  * `useSearchParams` opts everything above it out of static rendering, and that

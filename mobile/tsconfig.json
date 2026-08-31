@@ -7,7 +7,7 @@
     "paths": {
       "@/*": ["src/*"]
     },
-    "types": ["jest", "react-native"],
+    "types": ["jest", "node", "react-native"],
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "useUnknownInCatchVariables": true,

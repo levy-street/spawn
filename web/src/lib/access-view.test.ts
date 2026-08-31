@@ -7,6 +7,8 @@ import {
   deriveTrustEvents,
   seenLabel,
   shortDate,
+  sortLiveDevicesByLastSeen,
+  staleDeviceLabel,
 } from "./access-view";
 
 const NOW = new Date("2026-08-20T12:00:00Z");
@@ -114,14 +116,43 @@ describe("device rows", () => {
     expect(waiting?.waiting).toBe(true);
     expect(waiting?.provenance).toBe("Signed in 1 minute ago");
     expect(vms.find((v) => v.id === "old")?.provenance).toBe("Trusted since Jun 11");
-    // Waiting rows sort ahead of settled ones (after this-device).
+    // It is also the most recently seen row, so it sorts first.
     expect(vms[0]?.id).toBe("fresh");
   });
 
-  test("this device sorts first and is flagged", () => {
+  test("the most recently seen device sorts first and this device is still flagged", () => {
     const vms = deriveDeviceVMs(input({ devices: [mac, phone], currentDeviceId: "phone" }), NOW);
     expect(vms[0]?.id).toBe("phone");
     expect(vms[0]?.isThisDevice).toBe(true);
+  });
+
+  test("sorts live devices by last seen and badges only those beyond 60 days", () => {
+    const recent = device({
+      id: "recent",
+      last_seen_at: "2026-08-19T12:00:00Z",
+      created_at: "2026-01-01T00:00:00Z",
+    });
+    const boundary = device({ id: "boundary", last_seen_at: "2026-06-21T12:00:00Z" });
+    const stale = device({ id: "stale", last_seen_at: "2026-06-20T11:59:59Z" });
+    const unknown = device({ id: "unknown", last_seen_at: null });
+    const removed = device({
+      id: "removed",
+      last_seen_at: "2026-08-20T11:59:00Z",
+      revoked_at: "2026-08-20T12:00:00Z",
+    });
+
+    expect(
+      sortLiveDevicesByLastSeen([unknown, stale, removed, recent, boundary]).map((d) => d.id),
+    ).toEqual(["recent", "boundary", "stale", "unknown"]);
+    expect(staleDeviceLabel(boundary.last_seen_at, NOW)).toBeNull();
+    expect(staleDeviceLabel(stale.last_seen_at, NOW)).toBe("Not seen since Jun 20");
+    expect(staleDeviceLabel(null, NOW)).toBeNull();
+
+    const rows = deriveDeviceVMs(
+      input({ devices: [unknown, stale, removed, recent, boundary] }),
+      NOW,
+    );
+    expect(rows.find((row) => row.id === "stale")?.staleLabel).toBe("Not seen since Jun 20");
   });
 
   test("duplicate names get a creation-order suffix; the earliest keeps its bare name", () => {

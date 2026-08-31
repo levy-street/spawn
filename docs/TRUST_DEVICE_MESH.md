@@ -67,6 +67,15 @@ catastrophic; removing it wrongly is only a denial of service.**
 account has a **root** `R = (sk_R, pk_R)` whose `sk_R` is sealed under the user's
 passkey (the same passkey that seals the trust bundle in TRUST.md).
 
+*One computer is one device.* The desktop companion and the web app it loads
+into its own window are the **same** `d`: the companion hands its `sk` to that
+webview in-process, never through the server (`desktop/CLAUDE.md`, "the page is
+this app's device"; `web/src/lib/desktop-device-handover.ts`). The key the page
+then signs with is the key in `A(h)` from `possess`, so no second device is ever
+minted for the computer that was possessed, and the companion's own signed host
+introductions are firsthand to the page (§4, R7) — they verify under a key it
+holds, not one it was told about.
+
 **Endorsement.** A signed statement
 `e = Sign_{sk_a}(⟨"SPAWN-ENDORSE", account_id, pk_b⟩)`
 meaning *issuer `a` vouches for key `pk_b` for this account*. The issuer `a` is a

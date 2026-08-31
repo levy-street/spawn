@@ -38,6 +38,7 @@ import {
 import { FileIcon } from "@/components/files/file-icon";
 import { FilePreviewCard } from "@/components/files/file-preview-card";
 import { FileViewerDialog } from "@/components/files/file-viewer-dialog";
+import { type PreviewPlacement, previewPlacement } from "@/components/files/preview-placement";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -47,7 +48,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useHoverIntent } from "@/components/ui/hover-intent";
 import {
-  type MenuAnchor,
   type MenuPlacement,
   measureMenu,
   placeMenu,
@@ -58,6 +58,16 @@ import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/hostControl";
+import {
+  isPathWithin,
+  isValidPathLeafName,
+  joinPath,
+  normalizeAbsolutePath,
+  type PathFlavor,
+  basename as pathBasename,
+  pathFlavorForHostOS,
+  pathsEqual,
+} from "@/lib/paths";
 import { deriveFileCapabilities } from "@/lib/preview/capabilities";
 import { classifyFile } from "@/lib/preview/file-kinds";
 import { previewCache } from "@/lib/preview/preview-cache";
@@ -106,8 +116,8 @@ interface MenuState {
   parentDir: string;
 }
 
-function baseName(path: string): string {
-  return path.split("/").filter(Boolean).at(-1) ?? path;
+function baseName(path: string, flavor: PathFlavor): string {
+  return pathBasename(path, flavor) || path;
 }
 
 function errorMessage(err: unknown): string {
@@ -186,6 +196,7 @@ export const FileExplorer = forwardRef<
     os: hostOs,
     signedRtcRefusal,
   } = useHostControl(hostId);
+  const pathFlavor = pathFlavorForHostOS(hostOs);
   const controlReady = hostControlState === "ready" && hostControl !== null;
   // Actions are gated on what the daemon advertised, never on the platform it
   // reports: an old agent on a Mac must not be offered what it cannot do, and a
@@ -343,30 +354,28 @@ export const FileExplorer = forwardRef<
     return entryRows.find((row) => row.entry.path === path)?.entry ?? null;
   }, [hover.value, entryRows]);
 
-  // The anchor deliberately mixes two rects: the row supplies the vertical
-  // extent so the card tracks what it describes, and the panel supplies the
-  // horizontal edges so it does not slide sideways as the pointer moves down.
-  const [hoverAnchor, setHoverAnchor] = useState<MenuAnchor | null>(null);
+  // Where the card hangs from, and whether it is lying over the panel to get
+  // there — `previewPlacement` owns both, from the row's box and the panel's.
+  const [hoverPlacement, setHoverPlacement] = useState<PreviewPlacement | null>(null);
   useLayoutEffect(() => {
     const path = hover.value?.path;
     const container = containerRef.current;
     if (!path || !container) {
-      setHoverAnchor(null);
+      setHoverPlacement(null);
       return;
     }
     const row = container.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
     if (!row) {
-      setHoverAnchor(null);
+      setHoverPlacement(null);
       return;
     }
-    const rowRect = row.getBoundingClientRect();
-    const panel = container.getBoundingClientRect();
-    setHoverAnchor({
-      top: rowRect.top,
-      bottom: rowRect.bottom,
-      left: panel.left,
-      right: panel.right,
-    });
+    setHoverPlacement(
+      previewPlacement(
+        row.getBoundingClientRect(),
+        container.getBoundingClientRect(),
+        window.innerWidth,
+      ),
+    );
   }, [hover.value]);
 
   /**
@@ -457,15 +466,21 @@ export const FileExplorer = forwardRef<
   // Deep link: expand every ancestor between the root and initialPath.
   useEffect(() => {
     if (initialAppliedRef.current || !initialPath || !resolvedRoot) return;
-    if (initialPath === resolvedRoot || !initialPath.startsWith(`${resolvedRoot}/`)) {
+    if (
+      pathsEqual(initialPath, resolvedRoot, pathFlavor) ||
+      !isPathWithin(initialPath, resolvedRoot, pathFlavor)
+    ) {
       initialAppliedRef.current = true;
       return;
     }
-    const rest = initialPath.slice(resolvedRoot.length).split("/").filter(Boolean);
+    const rest = initialPath
+      .slice(resolvedRoot.length)
+      .split(pathFlavor === "windows" ? /[\\/]/u : "/")
+      .filter(Boolean);
     const ancestors: string[] = [];
     let acc = resolvedRoot;
     for (const part of rest) {
-      acc = `${acc}/${part}`;
+      acc = normalizeAbsolutePath(joinPath(acc, part, pathFlavor), pathFlavor);
       ancestors.push(acc);
     }
     const available = Math.max(0, FILE_EXPLORER_RETAINED_PAGE_LIMIT - 1);
@@ -475,7 +490,7 @@ export const FileExplorer = forwardRef<
     }
     setSelected(initialPath);
     initialAppliedRef.current = true;
-  }, [initialPath, resolvedRoot]);
+  }, [initialPath, pathFlavor, resolvedRoot]);
 
   const refreshDir = useCallback(
     (dir: string | null) => {
@@ -528,13 +543,11 @@ export const FileExplorer = forwardRef<
     (path: string) => {
       if (expanded.includes(path)) {
         setExpanded((current) =>
-          current.filter((entryPath) => entryPath !== path && !entryPath.startsWith(`${path}/`)),
+          current.filter((entryPath) => !isPathWithin(entryPath, path, pathFlavor)),
         );
         setPageCursors((pages) =>
           Object.fromEntries(
-            Object.entries(pages).filter(
-              ([pagePath]) => pagePath !== path && !pagePath.startsWith(`${path}/`),
-            ),
+            Object.entries(pages).filter(([pagePath]) => !isPathWithin(pagePath, path, pathFlavor)),
           ),
         );
         return;
@@ -545,7 +558,7 @@ export const FileExplorer = forwardRef<
       }
       setExpanded((current) => [...current, path]);
     },
-    [expanded, retainedPageCount],
+    [expanded, pathFlavor, retainedPageCount],
   );
 
   const loadNextPage = useCallback(
@@ -585,7 +598,8 @@ export const FileExplorer = forwardRef<
 
   const mkdirM = useMutation({
     mutationFn: ({ dir, name }: { dir: string; name: string }) =>
-      hostControl?.mkdir(`${dir}/${name}`) ?? Promise.reject(new Error("Host is not connected")),
+      hostControl?.mkdir(normalizeAbsolutePath(joinPath(dir, name, pathFlavor), pathFlavor)) ??
+      Promise.reject(new Error("Host is not connected")),
     onSuccess: (_, { dir }) => {
       setCreatingIn(null);
       setFolderDraft("");
@@ -603,12 +617,11 @@ export const FileExplorer = forwardRef<
       if (result.path) {
         setSelected(result.path);
         if (entry.is_dir) {
-          const oldPrefix = `${entry.path}/`;
           setExpanded((cur) =>
             cur.map((p) =>
-              p === entry.path
+              pathsEqual(p, entry.path, pathFlavor)
                 ? (result.path as string)
-                : p.startsWith(oldPrefix)
+                : isPathWithin(p, entry.path, pathFlavor)
                   ? `${result.path}${p.slice(entry.path.length)}`
                   : p,
             ),
@@ -616,9 +629,9 @@ export const FileExplorer = forwardRef<
           setPageCursors((current) =>
             Object.fromEntries(
               Object.entries(current).map(([path, cursors]) => [
-                path === entry.path
+                pathsEqual(path, entry.path, pathFlavor)
                   ? (result.path as string)
-                  : path.startsWith(oldPrefix)
+                  : isPathWithin(path, entry.path, pathFlavor)
                     ? `${result.path}${path.slice(entry.path.length)}`
                     : path,
                 cursors,
@@ -639,15 +652,13 @@ export const FileExplorer = forwardRef<
       Promise.reject(new Error("Host is not connected")),
     onSuccess: (_, { entry, parentDir }) => {
       setStatus(`Deleted ${entry.name}`);
-      setExpanded((cur) => cur.filter((p) => p !== entry.path && !p.startsWith(`${entry.path}/`)));
+      setExpanded((cur) => cur.filter((path) => !isPathWithin(path, entry.path, pathFlavor)));
       setPageCursors((current) =>
         Object.fromEntries(
-          Object.entries(current).filter(
-            ([path]) => path !== entry.path && !path.startsWith(`${entry.path}/`),
-          ),
+          Object.entries(current).filter(([path]) => !isPathWithin(path, entry.path, pathFlavor)),
         ),
       );
-      if (selected === entry.path) setSelected(null);
+      if (selected && pathsEqual(selected, entry.path, pathFlavor)) setSelected(null);
       refreshDir(parentDir);
     },
     onError: (err) => setStatus(errorMessage(err)),
@@ -715,11 +726,13 @@ export const FileExplorer = forwardRef<
   const relativePath = useCallback(
     (path: string) => {
       if (!resolvedRoot) return path;
-      if (path === resolvedRoot) return ".";
-      if (path.startsWith(`${resolvedRoot}/`)) return path.slice(resolvedRoot.length + 1);
+      if (pathsEqual(path, resolvedRoot, pathFlavor)) return ".";
+      if (isPathWithin(path, resolvedRoot, pathFlavor)) {
+        return path.slice(resolvedRoot.length).replace(/^[\\/]/u, "");
+      }
       return path;
     },
-    [resolvedRoot],
+    [pathFlavor, resolvedRoot],
   );
 
   const copyText = useCallback(async (text: string, label: string) => {
@@ -965,7 +978,7 @@ export const FileExplorer = forwardRef<
   // disabled, so it is pending but not fetching — and the panel would claim the
   // directory is empty for the whole of a multi-second connect.
   const rootBusy = hostControlState !== "error" && (!controlReady || rootQ.isPending);
-  const label = rootLabel ?? (resolvedRoot ? baseName(resolvedRoot) : "files");
+  const label = rootLabel ?? (resolvedRoot ? baseName(resolvedRoot, pathFlavor) : "files");
 
   return (
     <div className={cn("flex min-h-0 flex-col", className)}>
@@ -1115,6 +1128,7 @@ export const FileExplorer = forwardRef<
           <NewFolderRow
             depth={0}
             draft={folderDraft}
+            pathFlavor={pathFlavor}
             setDraft={setFolderDraft}
             pending={mkdirM.isPending}
             onSubmit={(name) => mkdirM.mutate({ dir: resolvedRoot, name })}
@@ -1241,8 +1255,8 @@ export const FileExplorer = forwardRef<
                     onKeyDown={(e) => {
                       e.stopPropagation();
                       if (e.key === "Enter") {
-                        const name = renameDraft.trim();
-                        if (name && name !== entry.name) {
+                        const name = pathFlavor === "windows" ? renameDraft : renameDraft.trim();
+                        if (isValidPathLeafName(name, pathFlavor) && name !== entry.name) {
                           renameM.mutate({ entry, name, parentDir });
                         } else {
                           setRenaming(null);
@@ -1303,6 +1317,7 @@ export const FileExplorer = forwardRef<
                 <NewFolderRow
                   depth={depth + 1}
                   draft={folderDraft}
+                  pathFlavor={pathFlavor}
                   setDraft={setFolderDraft}
                   pending={mkdirM.isPending}
                   onSubmit={(name) => mkdirM.mutate({ dir: entry.path, name })}
@@ -1316,12 +1331,14 @@ export const FileExplorer = forwardRef<
 
       {/* Hover preview. Anchored to the panel's edges but the row's vertical
           extent, so it tracks the row without sliding sideways as the pointer
-          runs down the list. */}
+          runs down the list — and pinned to the right when it is lying over
+          the panel, where a flip would carry it onto the sidebar. */}
       <Popover
         open={hoverEntry !== null}
-        anchor={hoverAnchor}
+        anchor={hoverPlacement?.anchor ?? null}
         side="right"
         align="start"
+        flip={!hoverPlacement?.overlay}
         interactive
         id="file-preview-card"
         ariaLabel={hoverEntry ? `${hoverEntry.name} preview` : undefined}
@@ -1395,6 +1412,7 @@ export const FileExplorer = forwardRef<
 function NewFolderRow({
   depth,
   draft,
+  pathFlavor,
   setDraft,
   pending,
   onSubmit,
@@ -1402,6 +1420,7 @@ function NewFolderRow({
 }: {
   depth: number;
   draft: string;
+  pathFlavor: PathFlavor;
   setDraft: (value: string) => void;
   pending: boolean;
   onSubmit: (name: string) => void;
@@ -1419,7 +1438,8 @@ function NewFolderRow({
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && draft.trim()) onSubmit(draft.trim());
+          const name = pathFlavor === "windows" ? draft : draft.trim();
+          if (e.key === "Enter" && isValidPathLeafName(name, pathFlavor)) onSubmit(name);
           if (e.key === "Escape") onCancel();
         }}
         onBlur={onCancel}

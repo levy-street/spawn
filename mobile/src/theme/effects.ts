@@ -30,6 +30,29 @@ export const opacity = {
   opaque: 1,
 } as const;
 
+/**
+ * A theme colour at a given alpha.
+ *
+ * Gradient stops need the fade in the channel rather than on the view: an
+ * `opacity` here would take the whole ramp down with it, and a stop written as
+ * `"transparent"` fades through black on the way, which shows as a bruise on a
+ * light ground. Hex and `rgb()`/`rgba()` tokens are understood; anything else
+ * comes back untouched rather than mangled.
+ */
+export function withAlpha(color: string, value: number): string {
+  const hex = /^#([0-9a-fA-F]{6})$/.exec(color);
+  if (hex) {
+    const channels = Number.parseInt(hex[1] as string, 16);
+    return `rgba(${(channels >> 16) & 255},${(channels >> 8) & 255},${channels & 255},${value})`;
+  }
+  const rgb = /^rgba?\(([^)]*)\)$/.exec(color);
+  if (rgb) {
+    const [red = "0", green = "0", blue = "0"] = (rgb[1] as string).split(",");
+    return `rgba(${red.trim()},${green.trim()},${blue.trim()},${value})`;
+  }
+  return color;
+}
+
 /** Apply these to a color channel rather than to an entire subtree. */
 export const alpha = {
   a05: 0.05,

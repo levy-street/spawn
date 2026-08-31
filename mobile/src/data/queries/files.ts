@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { validateDirectoryPage } from "@/components/files/pagination";
-import { joinDirectory } from "@/components/files/paths";
+import { joinDirectory, type PathFlavor } from "@/components/files/paths";
 import type { HostDirList, HostHome } from "@/components/files/types";
 import { getHost, listHosts } from "@/data/api/endpoints/hosts";
 import { qk } from "@/data/queryKeys";
@@ -26,8 +26,9 @@ export function createHostFolder(
   transport: HostTransport,
   parentPath: string,
   name: string,
+  pathFlavor: PathFlavor = "posix",
 ): Promise<{ path: string }> {
-  return transport.request("fs.mkdir", { path: joinDirectory(parentPath, name) });
+  return transport.request("fs.mkdir", { path: joinDirectory(parentPath, name, pathFlavor) });
 }
 
 export function renameHostEntry(

@@ -60,6 +60,13 @@ jest.mock("@/components/ui/toast", () => ({
   ToastProvider: mockOrderedProvider("ToastProvider"),
 }));
 
+jest.mock("@/lib/release-watcher", () => ({
+  ReleaseWatcher: () => {
+    mockProviderOrder.push("ReleaseWatcher");
+    return null;
+  },
+}));
+
 jest.mock("@/components/ui/confirm", () => ({
   ConfirmHost: mockOrderedProvider("ConfirmHost"),
 }));

@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
 
 // The /device approval page on its no-fragment paths: every test here opens
-// the page WITHOUT a `#k=` host-key fragment, which is the fallback lane
-// (older daemons, retyped URLs) — the human compares the full fingerprint
-// against the host's terminal. The fragment lane, and the refusal of a
-// server-substituted host key, live in possess-key-check.spec.ts.
+// the page WITHOUT a `#k=` host-key fragment, including older-server `?code=`
+// links — the human compares the full fingerprint against the host's terminal.
+// The fragment lane, and the refusal of a server-substituted host key, live in
+// possess-key-check.spec.ts.
 
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
@@ -147,6 +147,10 @@ test("device approval shows the locally derived fingerprint before confirmation"
 
   await page.getByRole("button", { name: "They match" }).click();
   await expect(page.getByTestId("ceremony-done")).toContainText("build-host is possessed");
+  // One screen, one answer. The waiting pill used to sit above this card still
+  // pulsing "Waiting for your machine…" — contradicting the card that had just
+  // said the machine was possessed and reachable.
+  await expect(page.getByText("Waiting for your machine…")).toHaveCount(0);
   expect(approved).toBe(true);
   expect(localPinAtServerApproval).toMatchObject([
     {
@@ -182,7 +186,11 @@ test("device approval shows the locally derived fingerprint before confirmation"
   );
 });
 
-test("the bare page instructs — one command, no code to type", async ({ page }) => {
+test("the bare page keeps installation instructions and has no code entry", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Linux x86_64" });
+  });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/me") {
@@ -212,16 +220,72 @@ test("the bare page instructs — one command, no code to type", async ({ page }
   });
   await page.goto("/device");
 
-  const instructions = page.getByTestId("possess-instructions");
-  await expect(instructions).toBeVisible();
-  await expect(instructions).toContainText("spawnd possess");
-  await expect(instructions).toContainText("single click");
-  // The terminal's link is still the intended entry, but /device is the shared
-  // connect surface after the workspaces overhaul, so code entry stays on the
-  // page as the stated fallback for a host whose link you cannot open. Typing a
-  // code is not a weaker path: it runs the same fingerprint-compare ceremony.
-  await expect(instructions).toContainText("fallback");
-  await expect(page.getByLabel("Code from the terminal")).toBeVisible();
+  // The install command is the instruction; it leads, unfolded.
+  await expect(page.getByText(/curl -fsSL .*install\.sh \| sh$/)).toBeVisible();
+  await expect(page.getByText("After installation, run")).toContainText("spawnd possess");
+  await expect(page.getByText("Already running SPAWN D for another account")).toContainText(
+    "--new-account",
+  );
+
+  // Approval starts only from a terminal link; the bare route has no ceremony
+  // to load and exposes no manual-entry controls or waiting state.
+  await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
+  await expect(page.getByTestId("possess-instructions")).toHaveCount(0);
+  await expect(page.getByTestId("reveal-pairing-code")).toHaveCount(0);
+  await expect(page.getByText("Waiting for your machine…")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Copy install command" }).click();
+  await expect(page.getByText("Waiting for your machine…")).toBeVisible();
+});
+
+test("the bare Windows page copies the explicit WSL install command", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Win32" });
+  });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/me") {
+      await route.fulfill({
+        status: 200,
+        json: {
+          user: { id: USER_ID, email: "owner@example.com", created_at: "2026-07-17T00:00:00Z" },
+        },
+      });
+      return;
+    }
+    if (path === "/api/release") {
+      await route.fulfill({ status: 200, json: {} });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = route.request().postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+  });
+
+  await page.goto("/device");
+  const origin = new URL(page.url()).origin;
+  const expected = `wsl -- bash -c "curl -fsSL ${origin}/install.sh | sh"`;
+  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await page.getByRole("button", { name: "Copy install command" }).click();
+  await expect
+    .poll(() => page.evaluate(() => window.navigator.clipboard.readText()))
+    .toBe(expected);
 });
 
 test("blocks first contact when the server fingerprint disagrees with the host key", async ({

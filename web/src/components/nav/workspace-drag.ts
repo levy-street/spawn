@@ -126,80 +126,58 @@ export function zoneAt(x: number, y: number, zones: readonly DropZone[]): DropZo
   return zones.find((zone) => pointInRect(x, y, zone.rect)) ?? null;
 }
 
-/**
- * What a drop actually changes: the workspace to route to, and the one to set
- * beside it. Either may be null — null `routeTo` stays on the workspace the
- * URL is already about, null `setSecondary` leaves the other half as it is.
- *
- * Applied as `splitStore.open(setSecondary, routeTo ?? routedId)` and then the
- * route. That argument order is the store's, not this plan's: `open` names the
- * workspace going on the right first, and takes the one that will be routed
- * only to refuse the arrangement where they are the same. Setting the pair
- * before navigating is what lets the reconcile that follows see the
- * arrangement this drop asked for rather than the one it replaced.
- */
-export interface SplitDropPlan {
-  routeTo: string | null;
-  setSecondary: string | null;
-}
-
-/**
- * What dropping `draggedId` on `side` should do. Null means the drop asks for
- * the arrangement already on screen and the gesture should simply end.
- *
- * The rule the drop obeys is "it goes where I dropped it", which for the left
- * half means the workspace that was there has to go somewhere: it moves
- * across to the right rather than being closed. Dropping a workspace onto the
- * half it is not already in, when it is in the other one, therefore reads as
- * the two swapping sides — the alternative, taking the store's word that a
- * workspace cannot sit beside itself, would silently collapse the split and
- * lose a workspace the user never asked to close.
- */
-export function splitDropPlan(
-  side: SplitSide,
-  draggedId: string,
-  routedId: string | null,
-  secondaryId: string | null,
-): SplitDropPlan | null {
-  if (!routedId || !draggedId) return null;
-  if (side === "primary") {
-    if (draggedId === routedId) return null;
-    if (secondaryId === null || draggedId === secondaryId) {
-      return { routeTo: draggedId, setSecondary: routedId };
-    }
-    return { routeTo: draggedId, setSecondary: null };
-  }
-  if (draggedId === secondaryId) return null;
-  if (draggedId === routedId) {
-    if (secondaryId === null) return null;
-    return { routeTo: secondaryId, setSecondary: routedId };
-  }
-  return { routeTo: null, setSecondary: draggedId };
-}
-
-/** Which workspace sits in each half of the window. */
+/** Which workspace sits in each half of the window. `secondary` null is one. */
 export interface Arrangement {
   primary: string | null;
   secondary: string | null;
 }
 
 /**
- * The arrangement a drop would leave behind.
+ * The window a release on `side` would leave behind, or null when the drop
+ * asks for the arrangement already on screen and the gesture should simply
+ * end.
  *
- * Derived from the same plan the release applies, and deliberately not
- * recomputed from the drop rules a second time: a preview that can disagree
- * with its own drop is worse than no preview at all, because it is believed.
+ * `shown` is what is on the canvas right now, left and right — not what the
+ * URL says. Those two part company as soon as a split is parked: the pair
+ * keeps its own order, the address bar may be about either half of it, and a
+ * drop lands where the user aimed regardless.
+ *
+ * The rule a drop obeys is "it goes where I dropped it", which for a half
+ * that is already occupied means its occupant has to go somewhere: it moves
+ * across rather than being closed, if there is room. Dropping a workspace
+ * onto the half it is not already in therefore reads as the two swapping
+ * sides — the alternative, refusing the arrangement where a workspace would
+ * sit beside itself, would silently collapse the split and lose a workspace
+ * nobody asked to close.
+ *
+ * One function rather than a plan plus a preview of it: a preview that can
+ * disagree with its own drop is worse than no preview at all, because it is
+ * believed. The overlay draws this, and the release applies it.
  */
-export function arrangementAfter(
-  plan: SplitDropPlan | null,
-  routedId: string | null,
-  secondaryId: string | null,
-): Arrangement {
-  if (!plan) return { primary: routedId, secondary: secondaryId };
-  return {
-    primary: plan.routeTo ?? routedId,
-    secondary: plan.setSecondary ?? secondaryId,
-  };
+export function splitDrop(
+  side: SplitSide,
+  draggedId: string,
+  shown: Arrangement,
+): Arrangement | null {
+  const { primary, secondary } = shown;
+  if (!draggedId || !primary) return null;
+  if (side === "primary") {
+    if (draggedId === primary) return null;
+    // The left half's occupant moves across, unless a third workspace is
+    // already holding the right — then it is the one displaced.
+    if (secondary === null || draggedId === secondary) {
+      return { primary: draggedId, secondary: primary };
+    }
+    return { primary: draggedId, secondary };
+  }
+  if (draggedId === secondary) return null;
+  // The one workspace on screen, dropped onto its own right half: there is no
+  // second workspace for it to trade places with, so nothing happens.
+  if (draggedId === primary) {
+    if (secondary === null) return null;
+    return { primary: secondary, secondary: primary };
+  }
+  return { primary, secondary: draggedId };
 }
 
 /**

@@ -1,0 +1,8 @@
+{
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://spawnd.dev/desktop/beta/latest.json"]
+    }
+  }
+}
+

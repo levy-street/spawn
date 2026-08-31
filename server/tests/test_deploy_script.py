@@ -7,6 +7,12 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="production deploy scripts require POSIX shell semantics"
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy-prod.sh"
 
@@ -30,7 +36,7 @@ def _git(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _write_executable(path: Path, body: str) -> None:
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -98,7 +104,22 @@ if [[ "{name}" == "bun" && "${{1:-}}" == "run" && "${{2:-}}" == "build" ]]; then
     "$baked" > .next/routes-manifest.json
 fi
 if [[ "{name}" == "curl" ]]; then
-  printf '%s' "${{SPAWN_TEST_CURL_CODE:-200}}"
+  url="${{@: -1}}"
+  if [[ "$url" == */api/release ]]; then
+    commit="$(git rev-parse HEAD)"
+    manifest="daemon/target/prebuilt/manifest.json"
+    tree=""
+    if [[ -f "$manifest" ]]; then
+      tree="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tree", ""))' "$manifest" 2>/dev/null || true)"
+    fi
+    if [[ -n "$tree" ]]; then
+      printf '{{"server":{{"commit":"%s"}},"daemon":{{"tree":"%s"}}}}' "$commit" "$tree"
+    else
+      printf '{{"server":{{"commit":"%s"}},"daemon":null}}' "$commit"
+    fi
+  else
+    printf '%s' "${{SPAWN_TEST_CURL_CODE:-200}}"
+  fi
 fi
 exit 0
 """,
@@ -121,7 +142,7 @@ printf '%s\\n' "$1" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-host.log"
 printf '%s\\n' "$2" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-command.log"
 script="$SPAWN_DEPLOY_TEST_LOG_DIR/remote-script.sh"
 cat > "$script"
-HOME={str(remote_home)!r} bash -lc "$2" < "$script"
+HOME={str(remote_home)!r} bash -lc "export PATH={str(remote_home / '.local' / 'bin')!r}:\\$PATH; $2" < "$script"
 """,
     )
     # Tripwires: the deploy script must never reach the real network or a real
@@ -177,6 +198,18 @@ def _log(tmp_path: Path, name: str) -> str:
     return path.read_text() if path.exists() else ""
 
 
+def _stage_current_remote_manifest(remote: Path) -> None:
+    """Give production the daemon identity it already runs, outside git."""
+
+    daemon_tree = _git(["rev-parse", "HEAD:daemon"], remote).stdout.strip()
+    exclude = remote / ".git" / "info" / "exclude"
+    with exclude.open("a") as handle:
+        handle.write("\ndaemon/target/prebuilt/\n")
+    prebuilt = remote / "daemon" / "target" / "prebuilt"
+    prebuilt.mkdir(parents=True)
+    (prebuilt / "manifest.json").write_text(f'{{"tree":"{daemon_tree}"}}\n')
+
+
 def test_deploy_refuses_dirty_checkout(tmp_path: Path):
     _origin, local, remote = _init_repo(tmp_path)
     remote_home = _fake_remote_home(tmp_path)
@@ -213,7 +246,7 @@ def test_deploy_runs_remote_build_and_restarts_services(tmp_path: Path):
     result = _deploy(local, _deploy_env(tmp_path, fakebin, remote))
 
     assert result.returncode == 0, result.stderr
-    assert _log(tmp_path, "ssh-host.log").strip() == "prod"
+    assert set(_log(tmp_path, "ssh-host.log").splitlines()) == {"prod"}
     assert "SPAWN_DEPLOY_BRANCH=master" in _log(tmp_path, "ssh-command.log")
     assert "uv sync --frozen" in _log(tmp_path, "uv.log")
     assert "uv run alembic upgrade head" in _log(tmp_path, "uv.log")
@@ -225,7 +258,7 @@ def test_deploy_runs_remote_build_and_restarts_services(tmp_path: Path):
     assert "restart spawn-web" in systemctl_log
     assert "--no-pager --full status spawn-server" in systemctl_log
     assert "--no-pager --full status spawn-web" in systemctl_log
-    assert "remote deploy: complete" in result.stdout
+    assert "deploy-prod: complete" in result.stdout
 
 
 def test_deploy_honors_no_build_custom_services_and_no_sudo(tmp_path: Path):
@@ -244,7 +277,7 @@ def test_deploy_honors_no_build_custom_services_and_no_sudo(tmp_path: Path):
     result = _deploy(local, env, host="spawnd-prod")
 
     assert result.returncode == 0, result.stderr
-    assert _log(tmp_path, "ssh-host.log").strip() == "spawnd-prod"
+    assert set(_log(tmp_path, "ssh-host.log").splitlines()) == {"spawnd-prod"}
     assert _log(tmp_path, "uv.log") == ""
     assert _log(tmp_path, "bun.log") == ""
     assert _log(tmp_path, "cargo.log") == ""
@@ -272,7 +305,7 @@ def test_deploy_handles_remote_path_with_spaces(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     assert f"to prod:{remote_with_spaces}" in result.stdout
     assert "restart spawn-server" in _log(tmp_path, "systemctl.log")
-    assert "remote deploy: complete" in result.stdout
+    assert "deploy-prod: complete" in result.stdout
 
 
 def test_deploy_prebuilt_publish_skips_cleanly_without_a_release(tmp_path: Path):
@@ -283,15 +316,17 @@ def test_deploy_prebuilt_publish_skips_cleanly_without_a_release(tmp_path: Path)
     _origin, local, remote = _init_repo(tmp_path)
     remote_home = _fake_remote_home(tmp_path)
     fakebin = _fake_ssh(tmp_path, remote_home)
+    _stage_current_remote_manifest(remote)
     env = _deploy_env(tmp_path, fakebin, remote, SPAWN_DEPLOY_PREBUILTS="1")
 
     result = _deploy(local, env)
 
     assert result.returncode == 0, result.stderr
-    assert "no prebuilt-latest release; skipping prebuilt publish" in result.stdout
+    assert "prebuilt publish skipped (prebuilt-latest could not be downloaded)" in result.stdout
+    assert "daemon tree is unchanged, continuing" in result.stderr
     assert "release download prebuilt-latest" in _log(tmp_path, "gh.log")
     assert _log(tmp_path, "scp.log") == ""
-    assert "remote deploy: complete" in result.stdout
+    assert "deploy-prod: complete" in result.stdout
 
 
 def test_deploy_refuses_stale_prebuilt_before_touching_production(tmp_path: Path):
@@ -328,8 +363,8 @@ printf '%s\\n' {prebuilt_commit!r} > "$out/COMMIT"
     result = _deploy(local, env)
 
     assert result.returncode != 0
-    assert "prebuilt-latest was built from a different daemon tree" in result.stderr
-    assert _log(tmp_path, "ssh-host.log") == ""
+    assert "prebuilt-latest COMMIT/TREE is stale or invalid" in result.stderr
+    assert _log(tmp_path, "systemctl.log") == ""
 
 
 def test_deploy_refuses_dirty_remote_checkout_before_build_or_restart(tmp_path: Path):

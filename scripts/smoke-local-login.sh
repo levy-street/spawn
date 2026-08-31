@@ -317,7 +317,7 @@ wait_for_login() {
 wait_for_login
 
 grep -F "/device?ref=" "$login_out" >/dev/null
-grep -F "logged in. host_id =" "$login_out" >/dev/null
+grep -F "browser approval proof verified" "$login_out" >/dev/null
 
 printf '%s\n' "smoke-local-login: re-running login in the same scoped keyring namespace"
 env \
@@ -364,7 +364,7 @@ printf '%s\n' "smoke-local-login: approving second device code"
 approve_device_code "$user_code_2" "$approved_browser_2"
 wait_for_login
 grep -F "/device?ref=" "$login_out_2" >/dev/null
-grep -F "logged in. host_id =" "$login_out_2" >/dev/null
+grep -F "browser approval proof verified" "$login_out_2" >/dev/null
 
 printf '%s\n' "smoke-local-login: verifying stored credentials and host"
 env \
@@ -376,10 +376,14 @@ env \
   -u XDG_CONFIG_HOME \
   HOME="$home" \
   SPAWN_CONFIG_DIR="$config_dir" \
-  daemon/target/debug/spawnd --server "$base_url" status \
+  daemon/target/debug/spawnd --server "$base_url" status --json \
   >"$status_out" 2>"$status_err"
-grep -F "logged in:  yes" "$status_out" >/dev/null
-grep -F "configured: $base_url/" "$status_out" >/dev/null
+python3 - "$status_out" "$base_url" <<'PY_STATUS'
+import json, sys
+instance = json.load(open(sys.argv[1]))["instances"][0]
+assert instance["signed_in"] is True, instance
+assert instance["server"] == sys.argv[2].rstrip("/") + "/", instance["server"]
+PY_STATUS
 
 python3 - "$config_dir" "$base_url" "$user_token" "$approved_browser" "$approved_browser_2" \
   "$login_out" "$login_err" "$login_out_2" "$login_err_2" "$status_out" "$status_err" <<'PY'

@@ -383,7 +383,9 @@ export function subscribeToLocalNotificationResponses(
       return;
     }
     const approval = parseNotificationApprovalTarget(response.notification.request.content.data);
-    if (approval && onApproval) onApproval(approval);
+    if (approval && onApproval) {
+      onApproval(approval);
+    }
   });
   return () => subscription.remove();
 }

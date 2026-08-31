@@ -37,6 +37,7 @@ describe("transport readiness state machine", () => {
   });
 
   test("uses capped exponential reconnect delays and resets gates", () => {
+    jest.spyOn(Math, "random").mockReturnValue(0.5);
     let state: ConnectionMachineState = { ...INITIAL_CONNECTION_STATE, phase: "ready" };
     const observed: number[] = [];
     for (let attempt = 0; attempt < 7; attempt += 1) {
@@ -45,8 +46,21 @@ describe("transport readiness state machine", () => {
       state = reduceConnection(state, { type: "retry" });
       state = { ...state, phase: "ready" };
     }
-    expect(observed).toEqual([5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000]);
-    expect(reconnectDelay(99)).toBe(60_000);
+    expect(observed).toEqual([500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
+    expect(reconnectDelay(99, 0.5)).toBe(30_000);
+    jest.restoreAllMocks();
+  });
+
+  test("accepts a fresh signal from ready and resets the ladder when gates reopen", () => {
+    let state: ConnectionMachineState = {
+      ...INITIAL_CONNECTION_STATE,
+      phase: "ready",
+      reconnectAttempt: 4,
+    };
+    state = reduceConnection(state, { type: "signal-open" });
+    expect(state).toMatchObject({ phase: "connecting", reconnectAttempt: 4 });
+    for (const gate of gates) state = reduceConnection(state, { type: "gate", gate });
+    expect(state).toMatchObject({ phase: "ready", reconnectAttempt: 0 });
   });
 
   test("retires on background and can resume with a clean generation", () => {

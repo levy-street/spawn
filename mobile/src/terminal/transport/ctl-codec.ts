@@ -6,6 +6,7 @@ export const SESSION_CTL_CHUNK_PAYLOAD_BYTES = 48 * 1024;
 export const SESSION_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 export const SESSION_CTL_MAX_OUTSTANDING_REQUESTS = 128;
 export const PTY_INPUT_MAX_BYTES = 64 * 1024;
+export const PTY_INPUT_CHUNK_BYTES = 16 * 1024;
 export const SPCT_HEADER_BYTES = 28;
 
 const SPCT_MAGIC = new Uint8Array([0x53, 0x50, 0x43, 0x54]);
@@ -65,10 +66,11 @@ export interface SessionCtlDisplayEvent {
 export interface SessionCtlHistoryEvent {
   version: 1;
   kind: "event";
-  event: "history_delta" | "history_wipe" | "history_gap";
+  event: "history_delta" | "history_wipe" | "history_gap" | "pty_gap";
   history_epoch?: string;
   history_offset?: number;
   data?: string;
+  offset?: number;
 }
 
 export type SessionCtlTextMessage =
@@ -332,8 +334,8 @@ function validGrid(value: unknown, min: number, max: number): boolean {
 
 export function chunkPtyInput(bytes: Uint8Array): Uint8Array[] {
   const chunks: Uint8Array[] = [];
-  for (let offset = 0; offset < bytes.byteLength; offset += PTY_INPUT_MAX_BYTES) {
-    chunks.push(bytes.slice(offset, offset + PTY_INPUT_MAX_BYTES));
+  for (let offset = 0; offset < bytes.byteLength; offset += PTY_INPUT_CHUNK_BYTES) {
+    chunks.push(bytes.slice(offset, offset + PTY_INPUT_CHUNK_BYTES));
   }
   return chunks;
 }

@@ -18,6 +18,9 @@ if [[ -n "$non_executable_scripts" ]]; then
   exit 1
 fi
 
+printf '%s\n' "== production release script self-test =="
+scripts/deploy-prod.sh --self-test
+
 printf '%s\n' "== worker-only daemon guard =="
 scripts/check-worker-only-daemon.sh --self-test
 scripts/check-worker-only-daemon.sh
@@ -28,6 +31,15 @@ scripts/check-durable-data-decision.sh
 
 printf '%s\n' "== local daemon smoke cleanup guard =="
 scripts/smoke-local-daemon.sh --self-test
+
+printf '%s\n' "== daemon updater harness guards =="
+scripts/update-test-lib.sh --self-test
+scripts/fault-proxy.py --self-test
+scripts/test-update-e2e.sh --self-test
+scripts/test-update-faults.sh --self-test
+scripts/test-update-probation.sh --self-test
+scripts/test-version-skew.sh --self-test
+scripts/chaos-drills.sh --self-test
 
 printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh
@@ -53,6 +65,29 @@ scripts/check-claude-md.sh
 
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
+
+printf '%s\n' "== daemon updater end-to-end =="
+scripts/test-update-e2e.sh
+
+printf '%s\n' "== daemon updater fault injection =="
+scripts/test-update-faults.sh
+
+printf '%s\n' "== daemon updater probation =="
+scripts/test-update-probation.sh
+
+printf '%s\n' "== pre-release version skew ritual (optional) =="
+if [[ -n "${SPAWN_OLD_REF:-}" ]]; then
+  scripts/test-version-skew.sh
+else
+  printf '%s\n' "set SPAWN_OLD_REF to the last deployed commit to run the four-cell skew matrix"
+fi
+
+printf '%s\n' "== connection chaos ritual (optional) =="
+if [[ "${SPAWN_ALLOW_SUDO:-0}" == "1" ]]; then
+  scripts/chaos-drills.sh
+else
+  printf '%s\n' "set SPAWN_ALLOW_SUDO=1 to run the local connection chaos ritual (sudo remains non-interactive)"
+fi
 
 printf '%s\n' "== prebuilt installer smoke =="
 scripts/smoke-install-prebuilt.sh
@@ -116,8 +151,9 @@ printf '%s\n' "== public HTTP surface smoke (optional) =="
 http_smoke_url="${SPAWN_HTTP_SMOKE_URL:-${SPAWN_PROD_URL:-}}"
 if [[ -n "$http_smoke_url" ]]; then
   scripts/smoke-http-surface.sh "$http_smoke_url"
+  scripts/verify-release.sh "$http_smoke_url"
 else
-  printf '%s\n' "set SPAWN_HTTP_SMOKE_URL=https://host to verify landing, download, installer, health, and hosted daemon binary"
+  printf '%s\n' "set SPAWN_HTTP_SMOKE_URL=https://host to verify the HTTP surface and release identities"
 fi
 
 printf '%s\n' "== web lint + browser tests + build =="
@@ -128,6 +164,30 @@ printf '%s\n' "== web lint + browser tests + build =="
   bun run test:e2e
   SPAWN_API_PROXY_TARGET="${SPAWN_API_PROXY_TARGET:-http://127.0.0.1:8001}" bun run build
 )
+
+printf '%s\n' "== mobile typecheck + lint + tests =="
+# The other frontend of the same product. Its own `npm run ci` is the contract
+# (typecheck, lint, jest); running it here is what makes the root CLAUDE.md's
+# claim about this script true, and what stops a change shipping to one
+# frontend and not the other.
+(cd mobile && npm run ci)
+
+printf '%s\n' "== desktop typecheck + lint + tests =="
+# This local lane exercises the macOS Tauri bundle and daemon linkage. Native
+# Windows daemon, desktop, and PowerShell installer checks run on
+# `windows-latest` in `.github/workflows/windows.yml`.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  (
+    cd desktop
+    npx tsc --noEmit
+    cd src-tauri
+    cargo fmt --check
+    cargo clippy --locked -- -D warnings
+    cargo test --locked
+  )
+else
+  printf '%s\n' "not macOS — native Windows checks run in .github/workflows/windows.yml"
+fi
 
 printf '%s\n' "== diff hygiene =="
 git diff --check

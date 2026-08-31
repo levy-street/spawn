@@ -1,0 +1,299 @@
+name: Desktop artifacts
+
+# Builds, signs and notarizes the app. It does NOT publish: the offline Tauri
+# updater key is deliberately absent from CI (see the note at the foot of this
+# file), so an operator signs the promoted archives and assembles latest.json
+# locally. What this automates is everything up to that signature.
+#
+# Gated to `desktop/**` on master for the same reason `prebuilt.yml` is gated to
+# `daemon/**`: these are billed macOS and doubled Windows minutes, and a release
+# that did not touch the app does not need a new app.
+#
+# Both platform jobs are master-only, because both carry a release signing
+# identity: a dispatch on another ref skips macOS and is refused by the Windows
+# environment. To build the app from a branch, build it locally — CI's job here
+# is to produce signed artifacts, and signing a branch is what we are
+# preventing.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  macos:
+    name: macOS · ${{ matrix.target }}
+    runs-on: macos-14
+    # This job holds the whole Apple release identity — the exportable
+    # Developer ID .p12, its password, and the App Store Connect key. Both
+    # gates are load-bearing: `environment` scopes those secrets to a
+    # deployment branch policy that permits only `master` (so a modified
+    # workflow on a pushed branch cannot reach them), and the `if` skips the
+    # job cleanly off master rather than failing at the environment gate.
+    # Same shape as the Windows job below.
+    environment: macos-code-signing
+    if: github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          - target: x86_64-apple-darwin
+            platform: darwin-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Prepare App Store Connect key
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          printf 'APPLE_API_KEY_PATH=%s\n' "$key_path" >> "$GITHUB_ENV"
+
+      - name: Build, sign and notarize SPAWN D
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+        with:
+          projectPath: desktop
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.ci.conf.json
+
+      # tauri-action notarizes and staples the .app; the disk image around it is
+      # only signed. Gatekeeper judges the DMG first, so it needs its own ticket.
+      - name: Notarize and staple the disk image
+        working-directory: desktop
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          dmg="$(ls src-tauri/target/$TARGET/release/bundle/dmg/*.dmg)"
+          xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+      - name: Assemble unsigned updater payload and release evidence
+        working-directory: desktop
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          # No AppleDouble ._ entries: the updater unpacks this archive as-is,
+          # and a stray file inside the bundle breaks its signature.
+          COPYFILE_DISABLE: "1"
+        run: |
+          version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          bundle="src-tauri/target/$TARGET/release/bundle"
+          output="desktop-artifacts"
+          mkdir -p "$output"
+          tar -czf "$output/SPAWN-D_${version}_${PLATFORM}.app.tar.gz" -C "$bundle/macos" "SPAWN D.app"
+          cp "$bundle/dmg/"*.dmg "$output/SPAWN-D_${version}_${PLATFORM}.dmg"
+          shasum -a 256 "$output/"* > "$output/SHA256SUMS"
+
+      - name: Upload notarized desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPAWN-D-${{ matrix.target }}
+          path: desktop/desktop-artifacts/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows · x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    # The Key Vault federated credential is scoped to this environment; without
+    # it the OIDC subject does not match and azure/login is refused. The
+    # environment permits only `master`, so this job cannot sign from a branch.
+    # The `if` is not redundant with that: without it a branch dispatch *fails*
+    # here rather than skipping, which reads as a broken pipeline instead of a
+    # job that had nothing to do. The macOS job above says the same thing the
+    # same way.
+    environment: windows-code-signing
+    if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Check generated icons and build the wizard
+        working-directory: desktop
+        run: |
+          npm run icons:check
+          npm run build
+
+      - name: Test the Windows desktop crate
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+
+      # Build once without bundling, then sign that exact inner executable.
+      # `tauri bundle` below consumes the existing release output and does not
+      # rebuild it, so NSIS contains these already Authenticode-signed bytes.
+      - name: Build the unbundled Windows application
+        working-directory: desktop
+        run: npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
+
+      - name: Authenticate to Azure Key Vault
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install AzureSignTool
+        run: dotnet tool install --global AzureSignTool --version 7.0.1
+
+      - name: Sign SPAWN D executable
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
+        run: |
+          $path = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
+          azuresigntool sign `
+            -kvu $env:AZURE_KEY_VAULT_URL `
+            -kvm `
+            -kvc $env:AZURE_KEY_VAULT_CERTIFICATE `
+            -fd sha256 `
+            -tr $env:CODE_SIGN_TIMESTAMP_URL `
+            -td sha256 `
+            $path
+          if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $path" }
+
+      - name: Verify the signed inner executable
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: |
+          $path = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
+          $expectedSubject = $env:WINDOWS_SIGNING_SUBJECT
+          if (-not $expectedSubject) { throw 'WINDOWS_SIGNING_SUBJECT is empty' }
+          $signature = Get-AuthenticodeSignature $path
+          if ($signature.Status -ne 'Valid') { throw "Inner SPAWN D signature is $($signature.Status): $($signature.StatusMessage)" }
+          if ($null -eq $signature.TimeStamperCertificate) { throw 'Inner SPAWN D signature has no RFC 3161 timestamp' }
+          if ($signature.SignerCertificate.Subject -ne $expectedSubject) {
+            throw "Inner SPAWN D publisher is '$($signature.SignerCertificate.Subject)', expected '$expectedSubject'"
+          }
+
+      - name: Bundle the signed executable with NSIS
+        working-directory: desktop
+        run: npm run tauri -- bundle --bundles nsis --target x86_64-pc-windows-msvc
+
+      - name: Locate NSIS installer
+        id: nsis
+        shell: pwsh
+        run: |
+          $bundle = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis'
+          $files = @(Get-ChildItem $bundle -Filter '*-setup.exe')
+          if ($files.Count -ne 1) { throw "Expected one NSIS installer, found $($files.Count)" }
+          "installer=$($files[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Sign NSIS installer
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
+        run: |
+          $path = '${{ steps.nsis.outputs.installer }}'
+          azuresigntool sign `
+            -kvu $env:AZURE_KEY_VAULT_URL `
+            -kvm `
+            -kvc $env:AZURE_KEY_VAULT_CERTIFICATE `
+            -fd sha256 `
+            -tr $env:CODE_SIGN_TIMESTAMP_URL `
+            -td sha256 `
+            $path
+          if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $path" }
+
+      - name: Verify, canonically name and checksum Windows artifacts
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: |
+          $inner = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
+          $installer = '${{ steps.nsis.outputs.installer }}'
+          $expectedSubject = $env:WINDOWS_SIGNING_SUBJECT
+          if (-not $expectedSubject) { throw 'WINDOWS_SIGNING_SUBJECT is empty' }
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter signtool.exe -File -Recurse |
+            Where-Object FullName -Match '\\x64\\' |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw 'Windows SDK signtool.exe was not found' }
+          foreach ($path in @($inner, $installer)) {
+            $signature = Get-AuthenticodeSignature $path
+            if ($signature.Status -ne 'Valid') { throw "$path signature is $($signature.Status): $($signature.StatusMessage)" }
+            if ($null -eq $signature.TimeStamperCertificate) { throw "$path has no RFC 3161 timestamp" }
+            if ($signature.SignerCertificate.Subject -ne $expectedSubject) {
+              throw "$path publisher is '$($signature.SignerCertificate.Subject)', expected '$expectedSubject'"
+            }
+            & $signTool.FullName verify /pa /all /v $path
+            if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $path" }
+          }
+          $version = (Get-Content '${{ github.workspace }}\desktop\src-tauri\tauri.conf.json' | ConvertFrom-Json).version
+          $output = '${{ github.workspace }}\desktop\desktop-artifacts'
+          New-Item -ItemType Directory -Force $output | Out-Null
+          $name = "SPAWN-D_${version}_windows-x86_64-setup.exe"
+          $canonical = Join-Path $output $name
+          Move-Item $installer $canonical
+          $hash = (Get-FileHash -Algorithm SHA256 $canonical).Hash.ToLowerInvariant()
+          Set-Content -Encoding utf8NoBOM (Join-Path $output 'SHA256SUMS') "$hash  $name"
+
+      - name: Upload Authenticode-signed Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPAWN-D-x86_64-pc-windows-msvc
+          path: desktop/desktop-artifacts/*
+          if-no-files-found: error
+
+# CI receives platform code-signing credentials only. The offline Tauri updater
+# key is deliberately absent: release operators sign the promoted app archives
+# and Windows setup EXE, then assemble latest.json locally after inspecting the
+# Authenticode/notarization evidence.

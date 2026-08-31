@@ -40,7 +40,7 @@ export async function verifyCommitWire(
   );
 }
 
-/** The device↔device ceremony number both devices display, `"NN NN"`. Four
+/** The device↔device ceremony number both devices display, `"NNNN"`. Four
  * digits (not the host flow's six): each wrong guess is an online, one-shot,
  * committed attempt, so 1-in-10⁴ bounds a substituting server's success while
  * keeping the entry light. Initiator in the host position, joiner in the

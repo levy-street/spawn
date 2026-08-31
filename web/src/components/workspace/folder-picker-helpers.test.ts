@@ -7,6 +7,7 @@ import {
   joinDirectory,
   listAllEntries,
   parentWithinHome,
+  placePickerPanel,
   visibleDirectories,
 } from "./folder-picker-helpers";
 
@@ -49,6 +50,29 @@ describe("folder picker path helpers", () => {
       { label: "data", path: "/srv/data" },
     ]);
   });
+
+  test("builds Windows drive breadcrumbs with canonical request paths", () => {
+    expect(breadcrumbParts("C:/Users\\Ada/Work/spawn", "C:\\Users\\Ada", "windows")).toEqual([
+      { label: "Home", path: "C:\\Users\\Ada" },
+      { label: "Work", path: "C:\\Users\\Ada\\Work" },
+      { label: "spawn", path: "C:\\Users\\Ada\\Work\\spawn" },
+    ]);
+    expect(breadcrumbParts("C:\\Projects", "C:\\", "windows")).toEqual([
+      { label: "C:\\", path: "C:\\" },
+      { label: "Projects", path: "C:\\Projects" },
+    ]);
+  });
+
+  test("keeps a UNC share root intact", () => {
+    expect(
+      breadcrumbParts("\\\\server\\share\\home\\Ada\\Work", "\\\\server\\share", "windows"),
+    ).toEqual([
+      { label: "\\\\server\\share", path: "\\\\server\\share" },
+      { label: "home", path: "\\\\server\\share\\home" },
+      { label: "Ada", path: "\\\\server\\share\\home\\Ada" },
+      { label: "Work", path: "\\\\server\\share\\home\\Ada\\Work" },
+    ]);
+  });
 });
 
 describe("folder picker home boundary", () => {
@@ -68,6 +92,19 @@ describe("folder picker home boundary", () => {
     expect(parentWithinHome("/Users/alice/project", "/Users/alice")).toBe("/Users/alice");
     expect(parentWithinHome("/Users/alice", "/Users/alice")).toBeNull();
     expect(parentWithinHome("/Users", "/Users/alice")).toBeNull();
+  });
+
+  test("Windows containment is case-insensitive and respects drive/share boundaries", () => {
+    expect(isWithinHome("c:\\users\\ada\\Work", "C:\\Users\\Ada", "windows")).toBe(true);
+    expect(isWithinHome("C:\\Users\\Adam", "C:\\Users\\Ada", "windows")).toBe(false);
+    expect(isWithinHome("D:\\Users\\Ada", "C:\\Users\\Ada", "windows")).toBe(false);
+    expect(isWithinHome("\\\\SERVER\\SHARE\\home\\Ada", "\\\\server\\share\\home", "windows")).toBe(
+      true,
+    );
+    expect(parentWithinHome("C:\\Users\\Ada\\Work", "c:\\users\\ada", "windows")).toBe(
+      "C:\\Users\\Ada",
+    );
+    expect(parentWithinHome("C:\\Users\\Ada", "c:\\users\\ada", "windows")).toBeNull();
   });
 });
 
@@ -113,6 +150,16 @@ describe("folderColumns", () => {
       // The trailing column lists the selection's own contents.
       { path: "/home/ada/dev/spawn", selectedChild: null },
     ]);
+  });
+
+  test("builds a Windows column trail without POSIX normalization", () => {
+    expect(folderColumns("C:\\Users\\Ada\\dev", "C:\\Users\\Ada", "windows")).toEqual([
+      { path: "C:\\Users\\Ada", selectedChild: "C:\\Users\\Ada\\dev" },
+      { path: "C:\\Users\\Ada\\dev", selectedChild: null },
+    ]);
+    expect(joinDirectory("C:\\Users\\Ada", "Work/sub", "windows")).toBe(
+      "C:\\Users\\Ada\\Work\\sub",
+    );
   });
 
   test("a path above home collapses to the home column alone", () => {
@@ -173,5 +220,55 @@ describe("listAllEntries", () => {
     }, 3);
     expect(calls).toBe(3);
     expect(result.truncated).toBe(true);
+  });
+});
+
+describe("placePickerPanel", () => {
+  const viewport = { viewportWidth: 1512, viewportHeight: 900 };
+  const size = { width: 474, height: 440, preferredHeight: 440 };
+
+  test("hangs off a control-sized anchor like a menu", () => {
+    // A folder chip near the top left: plenty of room below it.
+    const placed = placePickerPanel({
+      ...size,
+      ...viewport,
+      anchor: { top: 40, bottom: 68, left: 120, right: 280 },
+    });
+    expect(placed.top).toBe(72); // anchor bottom + the menu offset
+    expect(placed.left).toBe(120);
+    expect(placed.maxHeight).toBeGreaterThanOrEqual(size.height);
+  });
+
+  test("centres without an anchor", () => {
+    const placed = placePickerPanel({ ...size, ...viewport, anchor: null });
+    expect(placed.left).toBe((1512 - 474) / 2);
+    expect(placed.top).toBe((900 - 440) / 2);
+    expect(placed.transformOrigin).toBe("center");
+  });
+
+  test("centres over an area anchor that leaves it no usable side", () => {
+    // The grid's "add a window" opening spans most of the canvas: the only
+    // room placeMenu can find is the sliver above it, which squashed the
+    // panel to its header row. Centring over the area beats that.
+    const placed = placePickerPanel({
+      ...size,
+      ...viewport,
+      anchor: { top: 48, bottom: 892, left: 780, right: 1500 },
+    });
+    expect(placed.transformOrigin).toBe("center");
+    expect(placed.maxHeight).toBe(900 - 16);
+    expect(placed.top).toBe((900 - 440) / 2);
+  });
+
+  test("keeps the anchored placement while at least half the panel fits", () => {
+    // Room below is tight but real (~446px): stay anchored and let the cap
+    // turn the shortfall into an internal scroll.
+    const placed = placePickerPanel({
+      ...size,
+      ...viewport,
+      anchor: { top: 400, bottom: 446, left: 120, right: 280 },
+    });
+    expect(placed.transformOrigin).not.toBe("center");
+    expect(placed.maxHeight).toBeGreaterThanOrEqual(size.preferredHeight / 2);
   });
 });

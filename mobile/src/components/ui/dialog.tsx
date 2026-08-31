@@ -12,6 +12,7 @@ import {
   useState,
 } from "react";
 import {
+  Keyboard,
   Modal,
   type StyleProp,
   StyleSheet,
@@ -72,6 +73,16 @@ const SWIPE_DISMISS_RATIO = 0.25;
 const SWIPE_PROJECTION_SECONDS = 0.15;
 /** Settling back after a drag that did not go far enough to dismiss. */
 const SETTLE_SPRING = { damping: 26, mass: 0.7, stiffness: 260 } as const;
+
+/**
+ * The keyboard goes down the moment the surface starts to leave — carried off
+ * by a swipe, or backed out of — rather than vanishing when the window does.
+ * A keyboard still standing over a form that is sliding away reads as the
+ * form having left it behind.
+ */
+function dismissKeyboard(): void {
+  Keyboard.dismiss();
+}
 
 export interface DialogProps {
   visible: boolean;
@@ -224,6 +235,7 @@ export function Dialog({
     (manner: "rise" | "slide") => {
       if (closingRef.current) return;
       closingRef.current = true;
+      dismissKeyboard();
       if (entryRef.current) markOverlayClosing(entryRef.current);
       const settled = (finished?: boolean) => {
         "worklet";
@@ -334,6 +346,12 @@ export function Dialog({
         // scrolling form and a text cursor keep their own touches.
         .activeOffsetX(SWIPE_ACTIVATION)
         .failOffsetY([-SWIPE_AXIS_SLOP, SWIPE_AXIS_SLOP])
+        .onStart(() => {
+          "worklet";
+          // The keyboard follows the surface out from the first committed
+          // movement, so a swipe that lets go of the form lets go of it whole.
+          runOnJS(dismissKeyboard)();
+        })
         .onUpdate((event) => {
           "worklet";
           // Leftward has nowhere to go, so it is resisted rather than followed.
@@ -351,15 +369,21 @@ export function Dialog({
     [requestClose, slide, windowWidth],
   );
 
+  // The surface itself only fades in and out; a swipe carries the whole of it
+  // aside. It is what sits on the surface that rises on the way in and sinks
+  // on the way out, so the page reads as lighting up with the form arriving
+  // on it rather than as a sheet being lifted into place.
   const surfaceStyle = useAnimatedStyle(() => ({
     opacity: presence.value,
+    transform: [{ translateX: slide.value }],
+  }));
+  const riseStyle = useAnimatedStyle(() => ({
     transform: [
       {
         translateY: reducedMotion
           ? 0
           : interpolate(presence.value, [0, 1], [sizing.dialog.riseDistance, 0]),
       },
-      { translateX: slide.value },
     ],
   }));
   // The page underneath dims as the surface arrives, and a swipe that carries
@@ -411,92 +435,94 @@ export function Dialog({
             ]}
             testID={testID ?? "dialog-content"}
           >
-            <OverlaySurfaceContext.Provider value="background">
-              {hasHeader ? (
-                <View
-                  style={[
-                    styles.header,
-                    {
-                      gap: theme.space(1),
-                      paddingBottom: theme.space(4),
-                      paddingHorizontal: theme.space(4),
-                      // The title row stands as tall as its close control now, which
-                      // carries part of the clearance the padding used to owe on its own.
-                      paddingTop: insets.top + theme.space(3),
-                    },
-                  ]}
-                  testID="dialog-header"
-                >
-                  {/* The close control shares a row with the title alone, so it centres
+            <Animated.View style={[styles.rise, riseStyle]} testID="dialog-rise">
+              <OverlaySurfaceContext.Provider value="background">
+                {hasHeader ? (
+                  <View
+                    style={[
+                      styles.header,
+                      {
+                        gap: theme.space(1),
+                        paddingBottom: theme.space(4),
+                        paddingHorizontal: theme.space(4),
+                        // The title row stands as tall as its close control now, which
+                        // carries part of the clearance the padding used to owe on its own.
+                        paddingTop: insets.top + theme.space(3),
+                      },
+                    ]}
+                    testID="dialog-header"
+                  >
+                    {/* The close control shares a row with the title alone, so it centres
                     on that line rather than on a copy block a description may extend. */}
-                  <View style={[styles.titleRow, { gap: theme.space(3) }]}>
-                    <View style={styles.titleCopy}>
-                      {title !== undefined ? (
-                        <Text accessibilityRole="header" variant="uiLg" weight="semibold">
-                          {title}
-                        </Text>
+                    <View style={[styles.titleRow, { gap: theme.space(3) }]}>
+                      <View style={styles.titleCopy}>
+                        {title !== undefined ? (
+                          <Text accessibilityRole="header" variant="uiLg" weight="semibold">
+                            {title}
+                          </Text>
+                        ) : null}
+                      </View>
+                      {showCloseButton ? (
+                        // The same way out as the headerless X and the swipe: through
+                        // the dialog's own close, so it reads as backed out of rather
+                        // than closed from outside — which is what decides whether the
+                        // drawer it was raised from comes back.
+                        <IconButton
+                          accessibilityLabel={closeAccessibilityLabel}
+                          icon="X"
+                          onPress={() => requestClose("rise")}
+                          size="lg"
+                        />
                       ) : null}
                     </View>
-                    {showCloseButton ? (
-                      // The same way out as the headerless X and the swipe: through
-                      // the dialog's own close, so it reads as backed out of rather
-                      // than closed from outside — which is what decides whether the
-                      // drawer it was raised from comes back.
-                      <IconButton
-                        accessibilityLabel={closeAccessibilityLabel}
-                        icon="X"
-                        onPress={() => requestClose("rise")}
-                        size="lg"
-                      />
+                    {description !== undefined ? (
+                      typeof description === "string" ? (
+                        <Text color="mutedForeground" variant="body">
+                          {description}
+                        </Text>
+                      ) : (
+                        description
+                      )
                     ) : null}
                   </View>
-                  {description !== undefined ? (
-                    typeof description === "string" ? (
-                      <Text color="mutedForeground" variant="body">
-                        {description}
-                      </Text>
-                    ) : (
-                      description
-                    )
-                  ) : null}
-                </View>
-              ) : null}
+                ) : null}
 
-              {ChildInsetsProvider === undefined ? (
-                <View style={styles.body} testID="dialog-body">
-                  {children}
-                </View>
-              ) : (
-                <ChildInsetsProvider value={childInsets}>
+                {ChildInsetsProvider === undefined ? (
                   <View style={styles.body} testID="dialog-body">
                     {children}
                   </View>
-                </ChildInsetsProvider>
-              )}
+                ) : (
+                  <ChildInsetsProvider value={childInsets}>
+                    <View style={styles.body} testID="dialog-body">
+                      {children}
+                    </View>
+                  </ChildInsetsProvider>
+                )}
 
-              {footerActions.length > 0 ? (
-                <DialogFooter reservedBottomChrome={reservedBottomChrome}>
-                  {footerActions}
-                </DialogFooter>
-              ) : null}
+                {footerActions.length > 0 ? (
+                  <DialogFooter reservedBottomChrome={reservedBottomChrome}>
+                    {footerActions}
+                  </DialogFooter>
+                ) : null}
 
-              {!hasHeader && showCloseButton ? (
-                <View
-                  pointerEvents="box-none"
-                  style={[
-                    styles.close,
-                    { right: theme.space(3), top: insets.top + theme.space(2) },
-                  ]}
-                >
-                  <IconButton
-                    accessibilityLabel={closeAccessibilityLabel}
-                    icon="X"
-                    onPress={() => requestClose("rise")}
-                    size="sm"
-                  />
-                </View>
-              ) : null}
-            </OverlaySurfaceContext.Provider>
+                {!hasHeader && showCloseButton ? (
+                  <View
+                    pointerEvents="box-none"
+                    style={[
+                      styles.close,
+                      { right: theme.space(3), top: insets.top + theme.space(2) },
+                    ]}
+                  >
+                    <IconButton
+                      accessibilityLabel={closeAccessibilityLabel}
+                      icon="X"
+                      onPress={() => requestClose("rise")}
+                      size="sm"
+                    />
+                  </View>
+                ) : null}
+              </OverlaySurfaceContext.Provider>
+            </Animated.View>
           </Animated.View>
         </GestureDetector>
       </View>
@@ -513,6 +539,9 @@ const styles = StyleSheet.create({
   },
   header: {
     alignItems: "stretch",
+  },
+  rise: {
+    flex: 1,
   },
   scrim: {
     ...StyleSheet.absoluteFillObject,

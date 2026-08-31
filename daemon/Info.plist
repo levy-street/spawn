@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The sentences macOS reads out on SPAWN D's behalf.
+
+  `spawnd` is a bare Mach-O, not an app bundle, so it has nowhere to keep an
+  Info.plist unless one is linked into it: build.rs stamps this file into the
+  `__TEXT,__info_plist` section of both binaries. Without it every consent
+  dialog on the machine is a lower-case path — "spawnd" would like to access
+  your Desktop folder — with no icon, no product, and no reason given, which is
+  precisely the dialog nobody should ever grant.
+
+  Every `NS*UsageDescription` below is the second line of a real dialog. macOS
+  shows them verbatim and truncates long ones, so they are one sentence, say
+  who is asking and what for, and are true of what the daemon actually does.
+  There is no key for `kTCCServiceSystemPolicyAppData` — Apple ships none — so
+  that one dialog stays wordless whatever we write here.
+
+  CFBundleIdentifier is load-bearing twice over: codesign adopts it as the
+  signing identifier, so the daemon stops identifying itself as a per-build
+  hash like `spawnd-fc29710558bd7071`, and TCC keys a Developer ID grant on it,
+  so a grant given once survives the next self-update instead of asking again.
+  Both binaries deliberately carry the *same* identifier: `spawn-worker` can end
+  up its own responsible process, and the person allowed SPAWN D once — not a
+  supervisor and a worker separately.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>SPAWN D</string>
+	<key>CFBundleDisplayName</key>
+	<string>SPAWN D</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.spawnd.daemon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__SPAWND_VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__SPAWND_VERSION__</string>
+
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>SPAWN D reads and writes files on your Desktop when you open them from SPAWN D, or when an agent you started works there.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>SPAWN D reads and writes files in Documents when you open them from SPAWN D, or when an agent you started works there.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>SPAWN D reads and writes files in Downloads when you open them from SPAWN D, or when an agent you started works there.</string>
+	<key>NSFileProviderDomainUsageDescription</key>
+	<string>SPAWN D reads files kept in iCloud Drive and other file providers when you open them from SPAWN D, or an agent you started works there.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>SPAWN D reads files on network volumes when you open them from SPAWN D, or an agent you started works there.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>SPAWN D reads files on drives you connect when you open them from SPAWN D, or an agent you started works there.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>SPAWN D can open one file inside your photo library if you browse to it. It never reads the library otherwise, and SPAWN D never asks for this on its own.</string>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>SPAWN D can open one file inside your music library if you browse to it. It never reads the library otherwise, and SPAWN D never asks for this on its own.</string>
+</dict>
+</plist>

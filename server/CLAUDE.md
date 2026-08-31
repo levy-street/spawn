@@ -14,17 +14,19 @@ spawn_server/
   routes/       one module per HTTP surface: auth, auth_config,
                 auth_providers, account_recovery, admin, agents,
                 browser_devices, capabilities, device, device_pairing,
-                host_introductions, hosts, install, profile, push,
+                host_introductions, hosts, install, profile, push, release,
                 root_introductions, sessions, trust_bundle,
                 workspace_templates, workspaces
   ws/           websocket handlers: browser.py, daemon.py, host.py,
                 broker.py, alerts.py, activity.py, host_signal.py,
-                owner_dispatch.py, signed_signal_relay.py
+                owner_dispatch.py, signed_signal_relay.py, reliability.py,
+                close_codes.py
   models.py     SQLAlchemy models — the schema of record
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
   <concern>.py  one module per concern: auth, config, db, redis, mail, push,
-                invites, limits, rate_limit, trust_events, …
+                web_push, release, invites, limits, rate_limit, trust_events,
+                data_events, host_status, …
 alembic/        migrations
 tests/          pytest; test_<module>.py mirrors the module it covers
 ```
@@ -33,9 +35,17 @@ tests/          pytest; test_<module>.py mirrors the module it covers
 
 - A new endpoint: the matching `routes/<area>.py` (or a new one), request and
   response shapes in `schemas.py`, tests in `tests/test_<area>.py`.
+- Hosted daemon installers are rendered by `routes/install.py` at `/install.sh`
+  and `/install.ps1`. Prebuilt API paths stay extensionless; canonical Windows
+  files and download filenames keep `.exe` (`spawnd.exe`,
+  `spawn-worker.exe`).
 - A new websocket frame: the matching `ws/` module — daemon frames in
   `ws/daemon.py`, browser frames in `ws/browser.py`. The daemon side of the
-  wire lives in `daemon/src/`; change both sides in the same commit.
+  wire lives in `daemon/src/`; change both sides in the same commit. The
+  subprotocol names each module enforces (`spawn.control.v3`, `spawn.v3`,
+  `spawn.alerts.v1`) are the compatibility contract every deployed peer is held
+  to — adding a frame never touches them, and changing one is a fleet-wide
+  cutover: read "The wire protocols" in `docs/RELEASE.md` before you do.
 - A schema change: `models.py` plus an Alembic revision. Keep a single head —
   check `alembic heads` after any merge. Migrations run before the new server
   starts, so old code must tolerate the new schema (`docs/RELEASE.md`).

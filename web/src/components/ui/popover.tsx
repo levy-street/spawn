@@ -31,6 +31,7 @@ export function Popover({
   anchor,
   side = "right",
   align = "start",
+  flip = true,
   interactive = false,
   id,
   ariaLabel,
@@ -43,6 +44,8 @@ export function Popover({
   anchor: MenuAnchor | null;
   side?: MenuSide;
   align?: MenuAlign;
+  /** False pins the box to `side`, narrowing it rather than crossing over. */
+  flip?: boolean;
   interactive?: boolean;
   id?: string;
   ariaLabel?: string;
@@ -75,6 +78,7 @@ export function Popover({
           menuHeight: height,
           align,
           side,
+          flip,
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
         }),
@@ -93,7 +97,7 @@ export function Popover({
       window.removeEventListener("scroll", place, true);
       window.removeEventListener("resize", place);
     };
-  }, [open, anchor, side, align]);
+  }, [open, anchor, side, align, flip]);
 
   if (!mounted || !open || !anchor) return null;
 

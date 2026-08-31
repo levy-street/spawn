@@ -67,14 +67,16 @@ function resolveMainAxis(
   roomPositive: number,
   roomNegative: number,
   preferPositive: boolean,
+  flip: boolean,
 ): { positive: boolean; room: number } {
   const fitsPreferred = size <= (preferPositive ? roomPositive : roomNegative);
   const fitsOther = size <= (preferPositive ? roomNegative : roomPositive);
-  const positive = fitsPreferred
-    ? preferPositive
-    : fitsOther
-      ? !preferPositive
-      : roomPositive >= roomNegative;
+  const positive =
+    !flip || fitsPreferred
+      ? preferPositive
+      : fitsOther
+        ? !preferPositive
+        : roomPositive >= roomNegative;
   return { positive, room: Math.max(0, positive ? roomPositive : roomNegative) };
 }
 
@@ -84,6 +86,7 @@ export function placeMenu({
   menuHeight,
   align,
   side = "bottom",
+  flip = true,
   viewportWidth,
   viewportHeight,
 }: {
@@ -94,6 +97,16 @@ export function placeMenu({
   menuHeight: number;
   align: MenuAlign;
   side?: MenuSide;
+  /**
+   * Whether the box may take the other side when the preferred one is short.
+   *
+   * True for a menu, whose only job is to be readable: the side it lands on
+   * says nothing. False when the caller has a reason the other side is wrong
+   * — the file preview lies over its own panel deliberately, and flipping
+   * would carry it across the whole window onto the sidebar. With it off the
+   * box stays put and the cap turns the shortfall into a narrower box.
+   */
+  flip?: boolean;
   viewportWidth: number;
   viewportHeight: number;
 }): MenuPlacement {
@@ -105,6 +118,7 @@ export function placeMenu({
       roomRight,
       roomLeft,
       side === "right",
+      flip,
     );
     const width = Math.min(menuWidth, maxWidth);
     const left = toRight ? anchor.right + OFFSET : anchor.left - OFFSET - width;
@@ -142,6 +156,7 @@ export function placeMenu({
     roomBelow,
     roomAbove,
     side !== "top",
+    flip,
   );
   const height = Math.min(menuHeight, maxHeight);
   const top = below ? anchor.bottom + OFFSET : anchor.top - OFFSET - height;

@@ -10,3 +10,9 @@ dist/
 .env.production.local
 .env.test.local
 next-env.d.ts
+
+# Locally built SPAWN D installers, so `npm run dev` serves /desktop/ the way
+# nginx does in production and the download page's Mac link works end to end.
+# Real installers are published by scripts/publish-desktop.sh and never live
+# in the repo.
+/public/desktop/

@@ -3,7 +3,12 @@ import { StyleSheet, View } from "react-native";
 import { Sheet, SheetHeader } from "@/components/ui/sheet";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
-import type { TransportError, TransportState, WorkerDiagnostic } from "@/terminal/transport/types";
+import type {
+  ConnectionInfo,
+  TransportError,
+  TransportState,
+  WorkerDiagnostic,
+} from "@/terminal/transport/types";
 import { borderWidth, useTheme } from "@/theme";
 
 export interface DiagnosticsSheetProps {
@@ -11,6 +16,7 @@ export interface DiagnosticsSheetProps {
   state: TransportState;
   diagnostic: WorkerDiagnostic | null;
   error: TransportError | null;
+  connectionInfo?: ConnectionInfo | null;
   onDismiss: () => void;
 }
 
@@ -47,6 +53,7 @@ export function DiagnosticsSheet({
   state,
   diagnostic,
   error,
+  connectionInfo,
   onDismiss,
 }: DiagnosticsSheetProps): React.JSX.Element {
   const theme = useTheme();
@@ -64,6 +71,15 @@ export function DiagnosticsSheet({
         <DiagnosticRow
           label="Secure context"
           value={diagnostic ? yesNo(diagnostic.isSecureContext) : "Pending"}
+        />
+        <DiagnosticRow label="Connection path" value={connectionInfo?.kind ?? "Pending"} />
+        <DiagnosticRow
+          label="Round-trip time"
+          value={
+            connectionInfo?.rttMs === null || !connectionInfo
+              ? "Pending"
+              : `${connectionInfo.rttMs} ms`
+          }
         />
         <DiagnosticRow
           label="Peer connection"

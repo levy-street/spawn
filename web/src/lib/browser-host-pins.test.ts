@@ -9,10 +9,12 @@ import {
   BROWSER_HOST_PIN_STORE_NAME,
   BrowserHostPinError,
   forgetActiveBrowserHostPins,
+  getBrowserHostPinRevision,
   loadBrowserHostPin,
   loadBrowserHostPinByHostId,
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
+  subscribeToBrowserHostPinChanges,
 } from "./browser-host-pins";
 import { ed25519PublicKeyFingerprint, encodeBase64Url } from "./signed-signal";
 
@@ -278,7 +280,7 @@ describe("browser-local host pins", () => {
     }
   });
 
-  test("fails cap+1 without evicting active pins or tombstones", async () => {
+  test("counts active records separately so 256 tombstones never starve live capacity", async () => {
     const factory = new IDBFactory();
     await approveBrowserHostPin(approvalInput(), options(factory));
     const template = (await rawRecords(factory))[0];
@@ -286,27 +288,52 @@ describe("browser-local host pins", () => {
     const transaction = database.transaction(BROWSER_HOST_PIN_STORE_NAME, "readwrite");
     const completion = transactionResult(transaction);
     const store = transaction.objectStore(BROWSER_HOST_PIN_STORE_NAME);
-    for (let index = 1; index < BROWSER_HOST_PIN_MAX_RECORDS; index += 1) {
+    for (let index = 0; index < BROWSER_HOST_PIN_MAX_RECORDS; index += 1) {
       const accountId = `00000000-0000-4000-8001-${index.toString().padStart(12, "0")}`;
-      store.add({
+      store.put({
         ...template,
         accountId,
         recordId: JSON.stringify([accountId, ORIGIN, HOST_KEY]),
-        revokedAtMs: index % 2 === 0 ? null : 2_000,
-        state: index % 2 === 0 ? "active" : "revoked",
+        revokedAtMs: 2_000,
+        state: "revoked",
       });
     }
+    store.delete(template.recordId);
     await completion;
     database.close();
 
+    // A full tombstone budget leaves the entire active budget available.
+    const firstActiveAccount = "00000000-0000-4000-8002-000000000000";
+    await expect(
+      approveBrowserHostPin(approvalInput({ accountId: firstActiveAccount }), options(factory)),
+    ).resolves.toMatchObject({ state: "active" });
+
+    const activeTemplate = (await rawRecords(factory)).find(
+      (record) => record.accountId === firstActiveAccount,
+    )!;
+    const activeDatabase = await requestResult(factory.open(BROWSER_HOST_PIN_DATABASE_NAME));
+    const activeTransaction = activeDatabase.transaction(BROWSER_HOST_PIN_STORE_NAME, "readwrite");
+    const activeCompletion = transactionResult(activeTransaction);
+    const activeStore = activeTransaction.objectStore(BROWSER_HOST_PIN_STORE_NAME);
+    for (let index = 1; index < BROWSER_HOST_PIN_MAX_RECORDS; index += 1) {
+      const accountId = `00000000-0000-4000-8003-${index.toString().padStart(12, "0")}`;
+      activeStore.put({
+        ...activeTemplate,
+        accountId,
+        recordId: JSON.stringify([accountId, ORIGIN, HOST_KEY]),
+      });
+    }
+    await activeCompletion;
+    activeDatabase.close();
+
     await expectPinError(
       approveBrowserHostPin(
-        approvalInput({ accountId: "00000000-0000-4000-8002-000000000000" }),
+        approvalInput({ accountId: "00000000-0000-4000-8004-000000000000" }),
         options(factory),
       ),
       "capacity_exceeded",
     );
-    expect(await rawRecords(factory)).toHaveLength(BROWSER_HOST_PIN_MAX_RECORDS);
+    expect(await rawRecords(factory)).toHaveLength(BROWSER_HOST_PIN_MAX_RECORDS * 2);
   });
 
   test("fails closed on unknown fields, record version, fingerprint corruption, and identity mismatch", async () => {
@@ -751,6 +778,34 @@ describe("approveBrowserHostPin Host ID seeding", () => {
     );
     expect(bound?.hostPublicKey).toBe(HOST_KEY);
     expect(bound?.hostIds).toEqual([HOST_ID]);
+  });
+
+  test("announces a revision when trust changes, so a refused pane can retry", async () => {
+    const factory = new IDBFactory();
+    const seen: number[] = [];
+    const unsubscribe = subscribeToBrowserHostPinChanges(() =>
+      seen.push(getBrowserHostPinRevision()),
+    );
+    try {
+      const before = getBrowserHostPinRevision();
+      await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+      expect(seen.length).toBe(1);
+      expect(getBrowserHostPinRevision()).toBeGreaterThan(before);
+
+      await revokeBrowserHostPin(revokeInput(), options(factory));
+      expect(seen.length).toBe(2);
+
+      // Forgetting nothing changed nothing, so it says nothing.
+      await forgetActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, options(factory));
+      expect(seen.length).toBe(2);
+    } finally {
+      unsubscribe();
+    }
+
+    // And a listener that has unsubscribed stops hearing.
+    const quiet = seen.length;
+    await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+    expect(seen.length).toBe(quiet);
   });
 
   test("re-approving unions new Host IDs without dropping existing ones", async () => {

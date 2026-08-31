@@ -22,6 +22,10 @@ import {
   type PasswordResetRequest,
   PasswordResetRequestSchema,
   type ProviderId,
+  type SessionRenewResponse,
+  SessionRenewResponseSchema,
+  type SignOutEverywhereResponse,
+  SignOutEverywhereResponseSchema,
   type SignupRequest,
   SignupRequestSchema,
   type TokenResponse,
@@ -43,7 +47,6 @@ export function signUp(body: SignupRequest): Promise<TokenResponse> {
     auth: false,
     body: jsonBody(SignupRequestSchema.parse(body)),
     schema: TokenResponseSchema,
-    onResponse: authToken.captureFromResponse,
   });
 }
 
@@ -53,7 +56,6 @@ export function logIn(body: LoginRequest): Promise<TokenResponse> {
     auth: false,
     body: jsonBody(LoginRequestSchema.parse(body)),
     schema: TokenResponseSchema,
-    onResponse: authToken.captureFromResponse,
   });
 }
 
@@ -67,6 +69,23 @@ export async function logOut(): Promise<void> {
   } finally {
     await authToken.clear();
   }
+}
+
+export function renewSession(): Promise<SessionRenewResponse> {
+  return api("/api/auth/session/renew", {
+    method: "POST",
+    schema: SessionRenewResponseSchema,
+  });
+}
+
+export async function signOutEverywhere(): Promise<SignOutEverywhereResponse> {
+  const result = await api("/api/auth/sign-out-everywhere", {
+    method: "POST",
+    schema: SignOutEverywhereResponseSchema,
+  });
+  // The body is authoritative even if an intermediary hides Set-Cookie.
+  await authToken.set(result.access_token);
+  return result;
 }
 
 export function requestPasswordReset(body: PasswordResetRequest): Promise<void> {
@@ -83,7 +102,6 @@ export function confirmPasswordReset(body: PasswordResetConfirm): Promise<TokenR
     auth: false,
     body: jsonBody(PasswordResetConfirmSchema.parse(body)),
     schema: TokenResponseSchema,
-    onResponse: authToken.captureFromResponse,
   });
 }
 
@@ -110,7 +128,12 @@ export function confirmEmailVerification(body: EmailVerifyConfirm): Promise<MeRe
  */
 export async function getOAuthStartUrl(
   provider: ProviderId,
-  options: { returnTo?: string; redirectUri?: string; invite?: string | null } = {},
+  options: {
+    returnTo?: string;
+    redirectUri?: string;
+    invite?: string | null;
+    codeChallenge?: string;
+  } = {},
 ): Promise<string> {
   return `${await getBaseUrl()}/api/auth/oauth/${pathPart(provider)}/start${queryString({
     return_to: options.returnTo ?? "/",
@@ -119,6 +142,10 @@ export async function getOAuthStartUrl(
     // needs it to admit a new account, and it is the only chance to supply one
     // — there is no form between the button and the account being created.
     invite: options.invite ?? undefined,
+    // PKCE. Only the challenge travels; the verifier stays in this process
+    // until redemption, so a code that reaches any other app is unspendable.
+    code_challenge: options.codeChallenge,
+    code_challenge_method: options.codeChallenge ? "S256" : undefined,
   })}`;
 }
 
@@ -129,7 +156,6 @@ export function exchangeOAuthCode(body: OAuthExchangeRequest): Promise<TokenResp
     auth: false,
     body: jsonBody(OAuthExchangeRequestSchema.parse(body)),
     schema: TokenResponseSchema,
-    onResponse: authToken.captureFromResponse,
   });
 }
 
@@ -140,6 +166,5 @@ export function signInWithApple(body: AppleNativeSignIn): Promise<TokenResponse>
     auth: false,
     body: jsonBody(AppleNativeSignInSchema.parse(body)),
     schema: TokenResponseSchema,
-    onResponse: authToken.captureFromResponse,
   });
 }

@@ -1,7 +1,15 @@
 import { useIsFocused } from "@react-navigation/native";
 import { useRouter } from "expo-router";
-import { useMemo, useState } from "react";
-import { RefreshControl, ScrollView, StyleSheet, View } from "react-native";
+import { useCallback, useMemo, useRef, useState } from "react";
+import {
+  type LayoutChangeEvent,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  View,
+} from "react-native";
 import { errorMessage } from "@/components/hosts/host-model";
 import { LegionHostCard } from "@/components/hosts/legion-host-card";
 import { AppHeader } from "@/components/layout/app-header";
@@ -37,6 +45,9 @@ export function LegionScreen() {
   const sessionsQuery = useAllSessionsQuery();
   const agentsQuery = useAgentsQuery();
   const [live, setLive] = useState(false);
+  const viewport = useRef({ height: 0, scrollY: 0, hostListY: 0 });
+  const hostFrames = useRef(new Map<string, { y: number; height: number }>());
+  const [visibleHostIds, setVisibleHostIds] = useState<ReadonlySet<string>>(() => new Set());
   const hosts = useMemo(() => sortHosts(hostsQuery.data ?? []), [hostsQuery.data]);
   const rollup = useMemo(
     () => fleetRollup(hosts, sessionsQuery.data ?? [], agentsQuery.data ?? []),
@@ -47,6 +58,35 @@ export function LegionScreen() {
   const refresh = () => {
     void Promise.all([hostsQuery.refetch(), sessionsQuery.refetch(), agentsQuery.refetch()]);
   };
+  const recalculateVisibleHosts = useCallback(() => {
+    const { height, hostListY, scrollY } = viewport.current;
+    if (height <= 0) return;
+    const next = new Set<string>();
+    for (const [hostId, frame] of hostFrames.current) {
+      const top = hostListY + frame.y;
+      if (top + frame.height > scrollY && top < scrollY + height) next.add(hostId);
+    }
+    setVisibleHostIds((current) => {
+      if (current.size === next.size && [...current].every((hostId) => next.has(hostId))) {
+        return current;
+      }
+      return next;
+    });
+  }, []);
+  const handleScroll = useCallback(
+    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      viewport.current.scrollY = event.nativeEvent.contentOffset.y;
+      recalculateVisibleHosts();
+    },
+    [recalculateVisibleHosts],
+  );
+  const handleViewportLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      viewport.current.height = event.nativeEvent.layout.height;
+      recalculateVisibleHosts();
+    },
+    [recalculateVisibleHosts],
+  );
 
   return (
     <Screen
@@ -90,6 +130,8 @@ export function LegionScreen() {
         ) : (
           <ScrollView
             contentContainerStyle={styles.content}
+            onLayout={handleViewportLayout}
+            onScroll={handleScroll}
             refreshControl={
               <RefreshControl
                 onRefresh={refresh}
@@ -97,6 +139,7 @@ export function LegionScreen() {
                 tintColor={theme.colors.mutedForeground}
               />
             }
+            scrollEventThrottle={100}
           >
             <View style={styles.stats}>
               <Stat label="hosts" value={`${rollup.onlineHosts}/${rollup.hosts}`} />
@@ -121,16 +164,31 @@ export function LegionScreen() {
                 </Text>
               </View>
             ) : null}
-            <View style={styles.hosts}>
+            <View
+              onLayout={(event) => {
+                viewport.current.hostListY = event.nativeEvent.layout.y;
+                recalculateVisibleHosts();
+              }}
+              style={styles.hosts}
+            >
               {hosts.map((host) => (
-                <LegionHostCard
-                  agents={agentsQuery.data ?? []}
-                  host={host}
+                <View
                   key={host.id}
-                  liveEnabled={live && focused}
-                  onOpen={() => router.push({ pathname: "/host/[id]", params: { id: host.id } })}
-                  sessions={sessionsForHost(sessionsQuery.data ?? [], host.id)}
-                />
+                  onLayout={(event) => {
+                    const { height, y } = event.nativeEvent.layout;
+                    hostFrames.current.set(host.id, { y, height });
+                    recalculateVisibleHosts();
+                  }}
+                >
+                  <LegionHostCard
+                    agents={agentsQuery.data ?? []}
+                    host={host}
+                    liveEnabled={live && focused}
+                    onOpen={() => router.push({ pathname: "/host/[id]", params: { id: host.id } })}
+                    probeEnabled={visibleHostIds.has(host.id)}
+                    sessions={sessionsForHost(sessionsQuery.data ?? [], host.id)}
+                  />
+                </View>
               ))}
             </View>
             <Button onPress={() => router.push("/onboarding/host")} variant="outline">

@@ -16,7 +16,9 @@ use zeroize::Zeroize;
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 pub const MAX_REPLAY_BYTES: usize = 12 * 1024 * 1024;
-pub const CHUNK_PAYLOAD_BYTES: usize = 48 * 1024;
+/// Keep the complete SCTP user message (header plus payload) at or below the
+/// portable 16 KiB data-channel ceiling.
+pub const CHUNK_PAYLOAD_BYTES: usize = 16 * 1024 - CHUNK_HEADER_LEN;
 pub const OUTBOUND_QUEUE_DEPTH: usize = 64;
 pub const OUTBOUND_ENQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub const MAX_HISTORY_LINES: u16 = 10_000;
@@ -403,6 +405,11 @@ pub enum HistoryEvent<'a> {
     Gap,
 }
 
+pub async fn send_pty_gap(sender: &ControlSender, offset: u64) -> Result<(), ProtocolError> {
+    let text = serde_json::json!({"type": "pty_gap", "offset": offset}).to_string();
+    enqueue(sender, ControlOutbound::Text(text), None).await
+}
+
 #[derive(Serialize)]
 struct ReadyEvent {
     version: u8,
@@ -755,7 +762,8 @@ impl SessionControlHub {
             let _guard = transaction.lock().await;
             self.unregister_in_transaction(session_id, viewer_id).await;
         }
-        self.evict_transaction_if_idle(session_id, &transaction).await;
+        self.evict_transaction_if_idle(session_id, &transaction)
+            .await;
     }
 
     async fn unregister_in_transaction(&self, session_id: Uuid, viewer_id: &str) {
@@ -788,7 +796,8 @@ impl SessionControlHub {
             let _guard = transaction.lock().await;
             self.inner.lock().await.remove(&session_id);
         }
-        self.evict_transaction_if_idle(session_id, &transaction).await;
+        self.evict_transaction_if_idle(session_id, &transaction)
+            .await;
     }
 
     async fn evict_transaction_if_idle(&self, session_id: Uuid, transaction: &Arc<Mutex<()>>) {
@@ -1086,6 +1095,7 @@ mod tests {
                 sequence
             );
             assert_eq!(frame.len() - CHUNK_HEADER_LEN, expected_len);
+            assert!(frame.len() <= 16 * 1024);
         }
 
         let oversized = crate::pty::WorkerReplay::new(0, vec![0; MAX_REPLAY_BYTES + 1]);
@@ -1095,6 +1105,20 @@ mod tests {
                 .unwrap_err()
                 .code,
             "response_too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_gap_uses_the_cross_client_wire_shape() {
+        let (tx, mut rx) = mpsc::channel(1);
+        send_pty_gap(&tx, 42).await.unwrap();
+        let message = rx.recv().await.unwrap();
+        let ControlOutbound::Text(frame) = &message else {
+            panic!("expected text gap event")
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(frame).unwrap(),
+            serde_json::json!({"type": "pty_gap", "offset": 42})
         );
     }
 
@@ -1178,7 +1202,9 @@ mod tests {
             // Represents the awaited backend resize. Ownership is not exposed
             // until the same transaction commits its geometry.
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            transfer_hub.take_control(session_id, "second", 140, 44).await;
+            transfer_hub
+                .take_control(session_id, "second", 140, 44)
+                .await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1214,7 +1240,8 @@ mod tests {
         assert_eq!(hub.retained_counts().await, (0, 0));
 
         let (display, _events) = watch::channel(None);
-        hub.register(session_id, "replacement".into(), display).await;
+        hub.register(session_id, "replacement".into(), display)
+            .await;
         hub.remove_session(session_id).await;
         assert_eq!(hub.retained_counts().await, (0, 0));
     }

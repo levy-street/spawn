@@ -45,6 +45,8 @@ jest.mock("@/components/ui/toast", () => ({
   ToastProvider: ({ children }: PropsWithChildren) => children,
 }));
 
+jest.mock("@/lib/release-watcher", () => ({ ReleaseWatcher: () => null }));
+
 import { confirm } from "@/components/ui/confirm";
 import { AppProviders } from "@/lib/providers";
 

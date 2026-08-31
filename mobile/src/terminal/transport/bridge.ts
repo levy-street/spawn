@@ -1,5 +1,6 @@
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type {
+  ConnectionInfo,
   ScrollState,
   TransportState,
   UploadState,
@@ -36,13 +37,18 @@ export type NativeToWorkerMessage =
       rows: number;
       theme: TerminalTheme;
       fontSize: number;
+      cachedLoopback?: boolean;
+      skipLoopbackProbe?: boolean;
     })
   | (NativeMessage & {
       type: "connect";
       rtcSessionId: string;
       bindingNonce: string;
       iceServers: readonly unknown[];
+      /** The server's `ice_transport_policy`: "relay" when it offers no direct path. */
+      iceTransportPolicy: "all" | "relay";
       forceRelay: boolean;
+      forceRebuild?: boolean;
     })
   | (NativeMessage & { type: "signal-frame"; frame: unknown })
   | (NativeMessage & {
@@ -71,6 +77,11 @@ export type NativeToWorkerMessage =
   | (NativeMessage & { type: "focus" })
   | (NativeMessage & { type: "blur" })
   | (NativeMessage & { type: "request-replay"; fromOffset?: number })
+  | (NativeMessage & {
+      type: "network-changed";
+      iceServers?: readonly unknown[];
+      iceTransportPolicy?: "all" | "relay";
+    })
   | (NativeMessage & {
       type: "upload-start";
       uploadId: string;
@@ -124,6 +135,7 @@ export type WorkerToNativeMessage =
   | (WorkerMessage & { type: "clipboard-read"; requestId: string })
   | (WorkerMessage & { type: "clipboard-write"; requestId: string; text: string })
   | (WorkerMessage & { type: "diagnostic"; diagnostic: WorkerDiagnostic })
+  | (WorkerMessage & { type: "connection-info"; info: ConnectionInfo })
   | (WorkerMessage & {
       type: "upload-progress";
       uploadId: string;
@@ -232,6 +244,7 @@ const NATIVE_MESSAGE_TYPES = new Set([
   "focus",
   "blur",
   "request-replay",
+  "network-changed",
   "upload-start",
   "upload-chunk",
   "upload-cancel",
@@ -255,6 +268,7 @@ const WORKER_MESSAGE_TYPES = new Set([
   "clipboard-read",
   "clipboard-write",
   "diagnostic",
+  "connection-info",
   "upload-progress",
   "host-response",
   "error",

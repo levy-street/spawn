@@ -15,9 +15,12 @@ import { AccessCeremonyHost } from "@/components/access/ceremony-host";
 import { HostGossipSync } from "@/components/access/host-gossip-sync";
 import { SessionApprovalGate } from "@/components/access/session-approval-gate";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
+import { HostPinUndeliveredAlerts } from "@/components/hosts/host-pin-undelivered-alerts";
 import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
+import { WorkspaceCarryOverlay } from "@/components/nav/workspace-carry";
 import { ProfileDialog } from "@/components/profile/ProfileDialog";
+import { HostUpdateNotifier } from "@/components/release/HostUpdateNotifier";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { DeviceApprovalPrompt } from "@/components/trust/DeviceApprovalPrompt";
 import { Button } from "@/components/ui/button";
@@ -25,6 +28,7 @@ import { ConfirmHost } from "@/components/ui/confirm";
 import { Drawer } from "@/components/ui/drawer";
 import { ToastHost } from "@/components/ui/toast";
 import { NewSessionMenu } from "@/components/workspace/new-session-menu";
+import { useLiveData } from "@/hooks/useLiveData";
 import { useSessionAlerts } from "@/hooks/useSessionAlerts";
 import { workspaces } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -84,6 +88,9 @@ export function AppShell({
    * would drop the events it exists to deliver.
    */
   useSessionAlerts();
+  // The same socket also carries data-changed frames; this turns them into
+  // cache invalidations so every open client shows the same account.
+  useLiveData();
   const { user } = useAuth();
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
   const currentWorkspaceName = useMemo(
@@ -288,14 +295,21 @@ export function AppShell({
           />
         </Drawer>
       )}
+      {/* One overlay for the whole app, not one per surface that can start a
+          carry: a workspace can be picked up from the rail, from the drawer's
+          copy of it, or off its own name in a split's tab strip, and all three
+          draw the same ghost over the same canvas. */}
+      <WorkspaceCarryOverlay />
       <ConfirmHost />
       <ToastHost />
+      <HostUpdateNotifier />
       <SettingsDialog />
       <ProfileDialog />
       <AccessCeremonyHost />
       <SessionApprovalGate />
       <HostGossipSync />
       <DeviceApprovalPrompt accountId={user?.id ?? null} />
+      <HostPinUndeliveredAlerts enabled={user !== null} />
     </div>
   );
 }

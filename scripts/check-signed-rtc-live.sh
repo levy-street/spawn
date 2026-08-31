@@ -130,8 +130,11 @@ check_tree() {
   require_count "$root" "$adapter" 'const verified = await verifyRtcSignalWire(' 2 || return 1
   require_count "$root" "$session" '.verifyAndApplyAnswer(' 1 || return 1
   require_count "$root" "$host" '.verifyAndApplyAnswer(' 1 || return 1
-  require_count "$root" "$session" 'new SignedRtcLiveSession(' 1 || return 1
-  require_count "$root" "$host" 'new SignedRtcLiveSession(' 1 || return 1
+  # Two signed construction sites since the connection stream (8d2c960): the
+  # initial offer and the ICE-restart offer, both inside the signed-mode branch
+  # with the same binding tuple; the restart aborts the previous session first.
+  require_count "$root" "$session" 'new SignedRtcLiveSession(' 2 || return 1
+  require_count "$root" "$host" 'new SignedRtcLiveSession(' 2 || return 1
 
   if grep -Fq 'sdp: frame.sdp' "$root/$adapter"; then
     fail 'untrusted outer SDP reached the signed live adapter consumer'

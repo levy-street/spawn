@@ -2,8 +2,10 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
+import { ReleaseWatcher } from "@/components/release/ReleaseWatcher";
 import { LiveTerminalProvider } from "@/components/terminal/LiveTerminalProvider";
 import { useViewportInset } from "@/lib/viewport";
+import { SOCKET_UNAUTHORIZED_EVENT } from "@/lib/ws";
 
 /**
  * Top-level providers that need to live inside the client tree.
@@ -42,8 +44,17 @@ export function AppProviders({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("load", onLoad);
   }, []);
 
+  useEffect(() => {
+    const onUnauthorized = () => {
+      void client.invalidateQueries({ queryKey: ["me"] });
+    };
+    window.addEventListener(SOCKET_UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(SOCKET_UNAUTHORIZED_EVENT, onUnauthorized);
+  }, [client]);
+
   return (
     <QueryClientProvider client={client}>
+      <ReleaseWatcher />
       <LiveTerminalProvider>{children}</LiveTerminalProvider>
     </QueryClientProvider>
   );

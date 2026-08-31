@@ -5,6 +5,7 @@ import { useCallback, useMemo, useState } from "react";
 import { View } from "react-native";
 
 import { Screen } from "@/components/layout/screen";
+import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { confirm } from "@/components/ui/confirm";
 import { ListSeparator } from "@/components/ui/list-row";
 import { useToast } from "@/components/ui/toast";
@@ -37,6 +38,7 @@ import {
 } from "@/components/workspaces/workspace-operations";
 import { WorkspaceRow } from "@/components/workspaces/workspace-row";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
+import { useDeviceHostApprovals } from "@/data/queries/device-trust";
 import {
   useArchiveWorkspaceMutation,
   useChangeWorkspaceIconMutation,
@@ -81,7 +83,23 @@ export function WorkspaceListScreen() {
   const [renameTarget, setRenameTarget] = useState<WorkspaceOut | null>(null);
   const [iconTarget, setIconTarget] = useState<WorkspaceOut | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
-  const openCreate = useCallback(() => setCreateVisible(true), []);
+  // Everything this flow ends in — a folder listed, a terminal opened in it —
+  // needs a machine that has approved this phone. When none has, the approval
+  // is the first step rather than the wall halfway down.
+  const approvals = useDeviceHostApprovals();
+  const gate = useDeviceApprovalGate();
+  const blockedHostId =
+    approvals.resolved && approvals.approved.length === 0
+      ? (approvals.awaiting.find((entry) => entry.host.status === "online")?.host.id ?? null)
+      : null;
+  const guard = gate.guard;
+  const openCreate = useCallback(() => {
+    if (blockedHostId === null) {
+      setCreateVisible(true);
+      return;
+    }
+    guard(blockedHostId, () => setCreateVisible(true));
+  }, [blockedHostId, guard]);
   const canCreate = !workspacesQuery.isLoading && workspacesQuery.error === null;
   const header = <WorkspaceListHeader canCreate={canCreate} onCreate={openCreate} />;
 
@@ -323,6 +341,9 @@ export function WorkspaceListScreen() {
             createMutation.mutate(
               {
                 name: draft.name,
+                // A folder is where the workspace opens: its terminals start
+                // there, exactly as a workspace made on the desktop does.
+                ...(draft.folder ? { host_id: draft.folder.hostId, cwd: draft.folder.path } : {}),
                 ...(draft.iconChoice
                   ? {
                       icon: draft.iconChoice.icon,
@@ -350,6 +371,7 @@ export function WorkspaceListScreen() {
           templates={templatesQuery.data ?? []}
           visible={createVisible}
         />
+        {gate.overlay}
         <RenameWorkspaceDialog
           busy={renameMutation.isPending}
           onDismiss={() => setRenameTarget(null)}

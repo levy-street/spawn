@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
 
 from spawn_server import auth
 from spawn_server.db import get_sessionmaker
-from spawn_server.models import Host, Session
+from spawn_server.models import Host, Session, User
 from spawn_server.redis import get_backend, user_alert_channel
 from spawn_server.ws.alerts import (
     ALERTS_WS_PROTOCOL,
@@ -71,6 +72,9 @@ class FakeAlertWebSocket:
 
     def queue_disconnect(self) -> None:
         self._incoming.put_nowait({"type": "websocket.disconnect"})
+
+    def queue_text(self, payload: dict[str, Any]) -> None:
+        self._incoming.put_nowait({"type": "websocket.receive", "text": json.dumps(payload)})
 
     def frames(self) -> list[dict[str, Any]]:
         return [json.loads(item) for item in self.sent_text]
@@ -143,7 +147,13 @@ async def _create_session_row(user_id: str, host_id: str, *, status: str = "runn
 
 
 class _AlertCollector:
-    """Subscribes to an owner's alert channel for the length of a `with`."""
+    """Subscribes to an owner's alert channel for the length of a `with`.
+
+    `events` holds only the `alert` family. The channel also carries trust
+    and data-changed frames now, and this file asserts alert *semantics* —
+    counting a data frame here would fail every "exactly one alert" claim
+    for the wrong reason.
+    """
 
     def __init__(self, user_id: str) -> None:
         self._user_id = user_id
@@ -170,7 +180,9 @@ class _AlertCollector:
         async with get_backend().subscribe_channel(user_alert_channel(self._user_id)) as stream:
             self._ready.set()
             async for raw in stream:
-                self.events.append(json.loads(raw))
+                event = json.loads(raw)
+                if event.get("type") == "alert":
+                    self.events.append(event)
 
 
 async def _run_daemon(token: str, frames: list[dict[str, Any]]) -> FakeDaemonWebSocket:
@@ -388,9 +400,7 @@ async def test_alerts_do_not_cross_owners(client):
 
 async def test_alerts_ws_requires_its_subprotocol(client):
     user_id, access_token = await _signup(client, "alert-proto@example.com")
-    ws = FakeAlertWebSocket(
-        authorization=f"Bearer {access_token}", subprotocols=["spawn.v3"]
-    )
+    ws = FakeAlertWebSocket(authorization=f"Bearer {access_token}", subprotocols=["spawn.v3"])
     await alerts_ws(ws, token=None)  # type: ignore[arg-type]
     assert ws.closed == (4003, "protocol upgrade required")
     assert ws.frames()[0]["type"] == "protocol.required"
@@ -402,6 +412,54 @@ async def test_alerts_ws_rejects_unauthenticated(client):
     await alerts_ws(ws, token=None)  # type: ignore[arg-type]
     assert ws.accepted_subprotocol == ALERTS_WS_PROTOCOL
     assert ws.closed == (1008, "not authenticated")
+
+
+async def test_alerts_ws_rejects_revoked_epoch_and_reports_unknown_frame(client):
+    user_id, token = await _signup(client, "alert-revoked-epoch@example.com")
+    async with get_sessionmaker()() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.session_epoch += 1
+        await session.commit()
+    revoked = FakeAlertWebSocket(authorization=f"Bearer {token}")
+    await alerts_ws(revoked, token=None)  # type: ignore[arg-type]
+    assert revoked.closed == (1008, "not authenticated")
+
+    fresh = auth.issue_access_token(user_id, session_epoch=1)
+    ws = FakeAlertWebSocket(authorization=f"Bearer {fresh}")
+    task = asyncio.create_task(alerts_ws(ws, token=None))  # type: ignore[arg-type]
+    await asyncio.sleep(0.02)
+    ws.queue_text({"type": "future.alert.frame"})
+    for _ in range(100):
+        if any(frame.get("type") == "error" for frame in ws.frames()):
+            break
+        await asyncio.sleep(0.01)
+    assert [frame for frame in ws.frames() if frame.get("type") == "error"] == [
+        {
+            "type": "error",
+            "code": "unknown_frame",
+            "frame_type": "future.alert.frame",
+        }
+    ]
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_alerts_ws_closes_4010_when_subscription_is_not_ready(client, monkeypatch):
+    _user_id, token = await _signup(client, "alert-subscription-lost@example.com")
+
+    @asynccontextmanager
+    async def ended_subscription(_channel):
+        async def empty():
+            if False:
+                yield b""
+
+        yield empty()
+
+    monkeypatch.setattr(get_backend(), "subscribe_channel", ended_subscription)
+    ws = FakeAlertWebSocket(authorization=f"Bearer {token}")
+    await alerts_ws(ws, token=None)  # type: ignore[arg-type]
+    assert ws.closed == (4010, "subscription lost")
 
 
 async def test_alerts_ws_forwards_owner_events_only(client):
@@ -422,12 +480,8 @@ async def test_alerts_ws_forwards_owner_events_only(client):
         "at": "2026-08-21T00:00:00+00:00",
     }
     theirs = {**mine, "session_id": "s-2"}
-    await backend.publish_channel(
-        user_alert_channel(user_id), json.dumps(mine).encode()
-    )
-    await backend.publish_channel(
-        user_alert_channel(other_id), json.dumps(theirs).encode()
-    )
+    await backend.publish_channel(user_alert_channel(user_id), json.dumps(mine).encode())
+    await backend.publish_channel(user_alert_channel(other_id), json.dumps(theirs).encode())
     # Junk on the owner's own channel is dropped rather than forwarded.
     await backend.publish_channel(
         user_alert_channel(user_id),

@@ -1,0 +1,68 @@
+# Public spawnd.dev vhost. nginx terminates the Let's Encrypt certificate and
+# forwards both HTTP and WebSocket traffic to the Next service on port 3001.
+#
+# Install after replacing the certificate/server names if this is not prod:
+#   sudo cp infra/nginx-spawnd.conf.example /etc/nginx/sites-available/spawnd.dev
+#   sudo ln -s /etc/nginx/sites-available/spawnd.dev /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+
+# This belongs in nginx's http context, outside the server blocks.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name spawnd.dev;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name spawnd.dev;
+
+    ssl_certificate     /etc/letsencrypt/live/spawnd.dev/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/spawnd.dev/privkey.pem;
+
+    # Application pings every 25 seconds make nginx's 60-second default
+    # survivable. Five minutes is the intended margin for socket scheduling,
+    # deploys, and transient stalls; keep this dedicated location above `/`.
+    location /ws/ {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_buffering off;
+    }
+
+    # Static desktop release origin: the notarized DMGs, Mac updater payloads,
+    # signed Windows setup EXE, and latest.json that publish-desktop.sh uploads
+    # (docs/RELEASE.md, The desktop app). Kept above `/` so the app updater and
+    # the download page never reach Next for these files. Create the directory once:
+    #   sudo mkdir -p /var/www/spawnd/desktop && sudo chown -R <deploy-user> /var/www/spawnd
+    location /desktop/ {
+        alias /var/www/spawnd/desktop/;
+        autoindex off;
+        expires -1;
+    }
+
+    location / {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}

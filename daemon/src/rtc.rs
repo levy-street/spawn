@@ -3,12 +3,15 @@
 //! The central websocket remains the authenticated, content-free control and
 //! signaling plane. Raw PTY input/output and replay are endpoint-only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 #[cfg(test)]
 use serde_json::json;
@@ -16,11 +19,13 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::setting_engine::SettingEngine;
+use webrtc::api::setting_engine::{SctpMaxMessageSize, SettingEngine};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -29,15 +34,15 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use crate::session_ctl::{
-    self, SessionControlHub, ControlOperation, ControlOutbound, ControlRequest, ControlSender,
-    ProtocolError,
-};
-use crate::sessions::{SessionBinding, SessionRegistry};
 use crate::host_files::HostFileService;
 use crate::host_signal::HostConnectedSignal;
-use crate::proto::{Outbound, RtcIceServerConfig};
+use crate::proto::{LiveRtcBinding, Outbound, RtcIceServerConfig};
 use crate::pty::{ForwarderControl, WsOutbound};
+use crate::session_ctl::{
+    self, ControlOperation, ControlOutbound, ControlRequest, ControlSender, ProtocolError,
+    SessionControlHub,
+};
+use crate::sessions::{SessionBinding, SessionRegistry};
 use crate::upload::{
     UploadChunkOutcome, UploadChunkRequest, UploadHub, UploadManifest, UploadStartOutcome,
     UPLOAD_CLOSE_TIMEOUT,
@@ -84,7 +89,24 @@ const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(3);
-const DATA_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the daemon waits for one obfuscated `<name>.local` candidate to
+/// resolve.
+///
+/// A hit is immediate once the responder has answered once, but the first
+/// query of a connection is a multicast round trip and was measured taking
+/// over a second and a half on a quiet LAN — a shorter bound than this threw
+/// away the first candidate of every connection and left ICE waiting for the
+/// client to try again. macOS gives up on a name nobody answers for after
+/// five seconds, so the cost of a miss is bounded either way, and the peer
+/// connection has [`RTC_CONNECT_TIMEOUT`] to spare.
+const MDNS_CANDIDATE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
+const DATA_CHANNEL_MESSAGE_BYTES: usize = 16 * 1024;
+const DATA_CHANNEL_BUFFER_LOW: usize = 64 * 1024;
+const DATA_CHANNEL_BUFFER_HIGH: usize = 512 * 1024;
+const RTC_UDP_PORT_MIN: u16 = 50_000;
+const RTC_UDP_PORT_MAX: u16 = 50_100;
+static RTC_NETWORK_POLICY_LOGGED: AtomicBool = AtomicBool::new(false);
+static TURN_UDP_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 type SessionCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
 #[cfg(test)]
@@ -107,6 +129,9 @@ pub struct RtcSessions {
     peer_cleanup_tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
     closing_peers: Arc<Mutex<HashMap<(String, String), RtcPeer>>>,
     peer_admission: RtcPeerAdmission,
+    api: Arc<OnceLock<webrtc::api::API>>,
+    signaling: RtcWsSender,
+    deferred_statuses: Arc<Mutex<HashMap<String, Outbound>>>,
     #[cfg(test)]
     peer_insert_attempted: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -117,6 +142,39 @@ pub struct RtcSessions {
     slow_close_all_gate: Arc<Mutex<Option<Arc<TestEffectGate>>>>,
     #[cfg(test)]
     sender_close_gates: Arc<Mutex<TestSenderCloseGateMap>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RtcWsSender {
+    current: Arc<ArcSwapOption<mpsc::Sender<WsOutbound>>>,
+}
+
+impl RtcWsSender {
+    fn install(&self, sender: mpsc::Sender<WsOutbound>) {
+        self.current.store(Some(Arc::new(sender)));
+    }
+
+    fn clear(&self) {
+        self.current.store(None);
+    }
+
+    fn load(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
+        self.current.load_full()
+    }
+
+    pub(crate) fn try_send(&self, frame: Outbound) -> bool {
+        let Ok(text) = serde_json::to_string(&frame) else {
+            return false;
+        };
+        let Some(sender) = self.load() else {
+            return true;
+        };
+        match sender.try_send(WsOutbound::json(text)) {
+            Ok(())
+            | Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -240,6 +298,10 @@ struct HostRtcPeer {
 pub(crate) struct HostRtcBinding {
     pub(crate) host_id: Uuid,
     pub(crate) binding_nonce: String,
+    /// Zero only for a legacy server that did not include the daemon-owner
+    /// generation on host-scope frames. New servers provide the exact value so
+    /// the binding can be reconciled across control-WebSocket reconnects.
+    pub(crate) binding_generation: u64,
     pub(crate) protocol: String,
     pub(crate) protocol_version: u16,
 }
@@ -249,6 +311,7 @@ pub(crate) struct HostRtcBinding {
 pub struct HostRtcSignal {
     pub signal_id: String,
     pub binding_nonce: Option<String>,
+    pub binding_generation: Option<u64>,
     pub scope_type: Option<String>,
     pub scope_id: Option<Uuid>,
     pub protocol: Option<String>,
@@ -258,6 +321,7 @@ pub struct HostRtcSignal {
 impl HostRtcSignal {
     fn binding(&self) -> Option<HostRtcBinding> {
         let nonce = self.binding_nonce.as_ref()?;
+        let generation = self.binding_generation.unwrap_or(0);
         if nonce.len() != 32
             || !nonce
                 .bytes()
@@ -265,12 +329,14 @@ impl HostRtcSignal {
             || self.scope_type.as_deref() != Some("host")
             || self.protocol.as_deref() != Some(HOST_CONTROL_LABEL)
             || self.protocol_version != Some(RTC_PROTOCOL_VERSION)
+            || generation > MAX_SAFE_SIGNAL_GENERATION
         {
             return None;
         }
         Some(HostRtcBinding {
             host_id: self.scope_id?,
             binding_nonce: nonce.clone(),
+            binding_generation: generation,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         })
@@ -286,6 +352,9 @@ struct RtcPeer {
     control: ForwarderControl,
     channels: Arc<RequiredSessionChannels>,
     close: Arc<PeerCloseCoordinator>,
+    offer_key: Option<[u8; 32]>,
+    remote_ufrags: Arc<Mutex<HashSet<String>>>,
+    restart_lock: Arc<Mutex<()>>,
     _admission_permit: Arc<RtcPeerAdmissionPermit>,
     /// Replacement sets `active` false, closes the PC, then takes this write
     /// lock. Every callback holds a read lock while touching its backend, so
@@ -307,6 +376,10 @@ pub struct RtcSignalBinding {
 }
 
 impl RtcSignalBinding {
+    pub(crate) fn signal_id(&self) -> &str {
+        &self.signal_id
+    }
+
     #[cfg(test)]
     pub fn new(signal_id: String, generation: String, session_id: Uuid) -> Self {
         Self {
@@ -394,6 +467,7 @@ struct RequiredSessionChannels {
     ready: AtomicBool,
     failed: AtomicBool,
     effects: Arc<tokio::sync::RwLock<()>>,
+    control_sender: std::sync::Mutex<Option<ControlSender>>,
 }
 
 struct SessionEffectPermit {
@@ -420,6 +494,17 @@ impl RequiredSessionChannels {
         self.failed.store(true, Ordering::SeqCst);
         self.ready.store(false, Ordering::SeqCst);
         self.changed.notify_waiters();
+    }
+
+    fn set_control_sender(&self, sender: ControlSender) {
+        *self.control_sender.lock().expect("control sender lock") = Some(sender);
+    }
+
+    fn control_sender(&self) -> Option<ControlSender> {
+        self.control_sender
+            .lock()
+            .expect("control sender lock")
+            .clone()
     }
 
     async fn permit(self: &Arc<Self>) -> Option<SessionEffectPermit> {
@@ -505,7 +590,113 @@ fn viewer_id(signal_id: &str, generation: &str) -> String {
 
 impl RtcSessions {
     pub fn new() -> Self {
-        Self::default()
+        let sessions = Self::default();
+        sessions
+            .api
+            .set(build_api().expect("static WebRTC API configuration"))
+            .ok();
+        sessions
+    }
+
+    pub fn install_ws_sender(&self, sender: mpsc::Sender<WsOutbound>) {
+        self.signaling.install(sender);
+    }
+
+    pub fn clear_ws_sender(&self) {
+        self.signaling.clear();
+    }
+
+    pub async fn live_bindings(&self) -> Vec<LiveRtcBinding> {
+        let sessions = self.peers.lock().await;
+        let mut live = sessions
+            .iter()
+            .map(|(signal_id, peer)| LiveRtcBinding {
+                session_id: signal_id.clone(),
+                binding_nonce: peer
+                    .generation
+                    .split_once(':')
+                    .map_or_else(String::new, |(_, nonce)| nonce.to_string()),
+                binding_generation: peer
+                    .generation
+                    .split_once(':')
+                    .and_then(|(generation, _)| generation.parse().ok())
+                    .unwrap_or(0),
+                scope_type: "session".to_string(),
+                scope_id: peer.session.session_id(),
+                protocol: PTY_DATA_CHANNEL_LABEL.to_string(),
+                protocol_version: SESSION_RTC_PROTOCOL_VERSION,
+            })
+            .collect::<Vec<_>>();
+        drop(sessions);
+        live.extend(
+            self.host_peers
+                .lock()
+                .await
+                .iter()
+                .map(|(signal_id, peer)| LiveRtcBinding {
+                    session_id: signal_id.clone(),
+                    binding_nonce: peer.binding.binding_nonce.clone(),
+                    binding_generation: peer.binding.binding_generation,
+                    scope_type: "host".to_string(),
+                    scope_id: peer.binding.host_id,
+                    protocol: peer.binding.protocol.clone(),
+                    protocol_version: peer.binding.protocol_version,
+                }),
+        );
+        live
+    }
+
+    pub async fn reannounce_live_statuses(&self) {
+        let pending = std::mem::take(&mut *self.deferred_statuses.lock().await);
+        for (_, frame) in pending {
+            self.send_or_defer_status(frame).await;
+        }
+        let peers = self.peers.lock().await.clone();
+        for (signal_id, peer) in peers {
+            if peer.channels.ready() {
+                let nonce = peer
+                    .generation
+                    .split_once(':')
+                    .map_or("", |(_, nonce)| nonce);
+                self.send_or_defer_status(session_status_frame(
+                    &signal_id,
+                    nonce,
+                    peer.session.session_id(),
+                    "connected",
+                    None,
+                ))
+                .await;
+            }
+        }
+        let hosts = self.host_peers.lock().await.clone();
+        for (signal_id, peer) in hosts {
+            if peer.pc.connection_state() == RTCPeerConnectionState::Connected {
+                self.send_or_defer_status(host_status_frame(signal_id, &peer.binding, "connected"))
+                    .await;
+            }
+        }
+    }
+
+    async fn send_or_defer_status(&self, frame: Outbound) -> bool {
+        let key = match &frame {
+            Outbound::RtcStatus { session_id, .. } => session_id.clone(),
+            _ => return false,
+        };
+        let Some(sender) = self.signaling.load() else {
+            self.deferred_statuses.lock().await.insert(key, frame);
+            return true;
+        };
+        let Ok(text) = serde_json::to_string(&frame) else {
+            return false;
+        };
+        match sender.try_send(WsOutbound::json(text)) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.deferred_statuses.lock().await.insert(key, frame);
+                true
+            }
+        }
     }
 
     fn capture_trust_epoch(&self) -> u64 {
@@ -569,15 +760,20 @@ impl RtcSessions {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_offer(
         &self,
         binding: RtcSignalBinding,
         sdp: String,
         ice_servers: Vec<RtcIceServerConfig>,
+        ice_transport_policy: Option<String>,
+        ice_restart: bool,
+        offer_key: Option<[u8; 32]>,
         registry: SessionRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) {
+        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(session) = registry.binding_for(binding.session_id) else {
             send_status(
@@ -615,6 +811,9 @@ impl RtcSessions {
                 bound.clone(),
                 sdp,
                 ice_servers,
+                ice_transport_policy,
+                ice_restart,
+                offer_key,
                 registry,
                 out_tx.clone(),
                 answer_signer,
@@ -624,8 +823,14 @@ impl RtcSessions {
             tracing::warn!(
                 session_id = %bound.signaling.session_id,
                 signal_id = %bound.signaling.signal_id,
-                error = %e,
+                class = "negotiation",
                 "rtc offer failed"
+            );
+            tracing::debug!(
+                session_id = %bound.signaling.session_id,
+                signal_id = %bound.signaling.signal_id,
+                error = %e,
+                "rtc offer failure detail"
             );
             send_status(
                 &out_tx,
@@ -633,53 +838,80 @@ impl RtcSessions {
                 bound.signaling.binding_nonce,
                 bound.signaling.session_id,
                 "failed",
-                Some(&format!("{e:#}")),
+                Some("RTC negotiation failed"),
             )
             .await;
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_answer(
         &self,
         binding: BoundRtcSession,
         sdp: String,
         ice_servers: Vec<RtcIceServerConfig>,
+        ice_transport_policy: Option<String>,
+        ice_restart: bool,
+        offer_key: Option<[u8; 32]>,
         registry: SessionRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) -> Result<()> {
+        let remote_ufrag = ice_ufrag(&sdp).context("offer SDP has no ICE ufrag")?;
+        if let Some(existing) = self
+            .peers
+            .lock()
+            .await
+            .get(&binding.signaling.signal_id)
+            .cloned()
+        {
+            let _restart = existing.restart_lock.lock().await;
+            let ufrags = existing.remote_ufrags.lock().await;
+            if !restart_offer_is_acceptable(
+                ice_restart,
+                existing.generation == binding.signaling.generation,
+                existing.session == binding.session,
+                existing.offer_key,
+                offer_key,
+                restart_ufrag_is_fresh(&ufrags, &remote_ufrag),
+            ) {
+                anyhow::bail!("rtc restart offer was rejected");
+            }
+            drop(ufrags);
+            let local_sdp = negotiate(&existing.pc, sdp).await?;
+            existing.remote_ufrags.lock().await.insert(remote_ufrag);
+            let (answer_sdp, answer_signed_envelope) = sign_answer(&local_sdp, &answer_signer)
+                .context("signing restarted session RTC answer")?;
+            send_json(
+                &out_tx,
+                Outbound::RtcAnswer {
+                    session_id: binding.signaling.signal_id,
+                    binding_nonce: Some(binding.signaling.binding_nonce),
+                    scope_type: Some("session".to_string()),
+                    scope_id: Some(binding.signaling.session_id),
+                    protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
+                    protocol_version: Some(SESSION_RTC_PROTOCOL_VERSION),
+                    sdp: answer_sdp,
+                    signed_envelope: answer_signed_envelope,
+                },
+            )
+            .await;
+            return Ok(());
+        }
+        if ice_restart {
+            anyhow::bail!("rtc restart refers to an unknown binding");
+        }
+
         let admission_permit = self
             .peer_admission
             .try_acquire()
             .context("rtc session admission capacity exhausted")?;
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .context("registering WebRTC codecs")?;
-        let mut setting_engine = SettingEngine::default();
-        // webrtc-rs 0.17 leaks one mDNS socket plus an immortal resolver task
-        // per peer connection in the default QueryOnly mode (its close signal
-        // for .local resolution is an unwired TODO upstream), so every browser
-        // visit pinned ~12 fds until the daemon hit its fd limit and the host
-        // dropped offline. Browser .local candidates never resolve across
-        // networks anyway — direct connects use our real host candidates or
-        // srflx/TURN.
-        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
-        // ICE also gathers candidate sockets per interface; virtual bridges
-        // multiply the socket count ~7x for candidates nothing can reach.
-        setting_engine.set_interface_filter(Box::new(|name: &str| {
-            !(name.starts_with("docker")
-                || name.starts_with("br-")
-                || name.starts_with("veth")
-                || name == "lo")
-        }));
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_setting_engine(setting_engine)
-            .build();
+        warn_if_no_udp_turn(&ice_servers);
+        let api = self.api.get().context("WebRTC API was not initialized")?;
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers: ice_servers.into_iter().map(to_webrtc_ice_server).collect(),
+                ice_transport_policy: parse_ice_transport_policy(ice_transport_policy.as_deref())?,
                 ..Default::default()
             })
             .await
@@ -739,6 +971,9 @@ impl RtcSessions {
                         control: binding.control.clone(),
                         channels: Arc::clone(&channels),
                         close: Arc::clone(&close),
+                        offer_key,
+                        remote_ufrags: Arc::new(Mutex::new(HashSet::from([remote_ufrag]))),
+                        restart_lock: Arc::new(Mutex::new(())),
                         _admission_permit: admission_permit,
                         fence: Arc::clone(&fence),
                     },
@@ -753,7 +988,7 @@ impl RtcSessions {
         }
         drop(_admission);
 
-        install_ice_handler(&pc, binding.signaling.clone(), out_tx.clone());
+        install_ice_handler(&pc, binding.signaling.clone(), self.signaling.clone());
         #[cfg(test)]
         let pty_send_gate = self
             .pty_send_gates
@@ -852,6 +1087,7 @@ impl RtcSessions {
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) {
+        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
             tracing::warn!(signal_id = %signal.signal_id, "rejecting invalid host rtc offer binding");
@@ -876,11 +1112,13 @@ impl RtcSessions {
             )
             .await
         {
-            tracing::warn!(signal_id = %signal.signal_id, %error, "host rtc offer failed");
+            tracing::warn!(signal_id = %signal.signal_id, class = "negotiation", "host rtc offer failed");
+            tracing::debug!(signal_id = %signal.signal_id, %error, "host rtc offer failure detail");
             send_host_status(&out_tx, signal.signal_id, &binding, "failed").await;
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_host_answer(
         &self,
         signal_id: String,
@@ -895,22 +1133,8 @@ impl RtcSessions {
             .peer_admission
             .try_acquire()
             .context("rtc session admission capacity exhausted")?;
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .context("registering WebRTC codecs")?;
-        let mut setting_engine = SettingEngine::default();
-        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
-        setting_engine.set_interface_filter(Box::new(|name: &str| {
-            !(name.starts_with("docker")
-                || name.starts_with("br-")
-                || name.starts_with("veth")
-                || name == "lo")
-        }));
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_setting_engine(setting_engine)
-            .build();
+        warn_if_no_udp_turn(&ice_servers);
+        let api = self.api.get().context("WebRTC API was not initialized")?;
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers: ice_servers.into_iter().map(to_webrtc_ice_server).collect(),
@@ -955,13 +1179,13 @@ impl RtcSessions {
             &pc,
             signal_id.clone(),
             binding.clone(),
-            admission.out_tx.clone(),
+            self.signaling.clone(),
         );
         install_host_data_channel_handler(
             &pc,
             signal_id.clone(),
             binding.clone(),
-            admission.out_tx.clone(),
+            self.signaling.clone(),
             None,
         );
         self.install_host_reaper(&pc, signal_id.clone());
@@ -1022,6 +1246,11 @@ impl RtcSessions {
             let signal_id = signal_id.clone();
             let weak = weak.clone();
             Box::pin(async move {
+                if state == RTCPeerConnectionState::Connected {
+                    if let Some(pc) = weak.upgrade() {
+                        log_selected_candidate_pair(&pc, "host", &signal_id).await;
+                    }
+                }
                 let delay = match state {
                     RTCPeerConnectionState::Failed => Some(Duration::ZERO),
                     RTCPeerConnectionState::Disconnected => Some(RTC_DISCONNECTED_GRACE),
@@ -1064,13 +1293,7 @@ impl RtcSessions {
         let Some(binding) = signal.binding() else {
             return;
         };
-        let Some(peer) = self
-            .host_peers
-            .lock()
-            .await
-            .get(&signal.signal_id)
-            .cloned()
-        else {
+        let Some(peer) = self.host_peers.lock().await.get(&signal.signal_id).cloned() else {
             return;
         };
         if peer.binding != binding {
@@ -1078,6 +1301,7 @@ impl RtcSessions {
             return;
         }
         if let Ok(candidate) = serde_json::from_value::<RTCIceCandidateInit>(candidate) {
+            let candidate = resolve_mdns_candidate(candidate).await;
             if let Err(error) = peer.pc.add_ice_candidate(candidate).await {
                 tracing::debug!(signal_id = %signal.signal_id, %error, "adding host rtc candidate failed");
             }
@@ -1132,12 +1356,7 @@ impl RtcSessions {
                     );
                     let deadline = close.initiate();
                     sessions
-                        .close_if_same_until(
-                            &binding.signal_id,
-                            &binding.generation,
-                            &pc,
-                            deadline,
-                        )
+                        .close_if_same_until(&binding.signal_id, &binding.generation, &pc, deadline)
                         .await;
                 }
             });
@@ -1152,6 +1371,11 @@ impl RtcSessions {
             let initiating_deadline =
                 (state == RTCPeerConnectionState::Failed).then(|| close.initiate());
             Box::pin(async move {
+                if state == RTCPeerConnectionState::Connected {
+                    if let Some(pc) = weak.upgrade() {
+                        log_selected_candidate_pair(&pc, "session", &binding.signal_id).await;
+                    }
+                }
                 match state {
                     RTCPeerConnectionState::Failed => {
                         let Some(pc) = weak.upgrade() else { return };
@@ -1272,7 +1496,8 @@ impl RtcSessions {
         } else {
             None
         };
-        let Some(session) = active_session.or_else(|| closing_peer.as_ref().map(|peer| peer.session))
+        let Some(session) =
+            active_session.or_else(|| closing_peer.as_ref().map(|peer| peer.session))
         else {
             let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
             return;
@@ -1321,7 +1546,7 @@ impl RtcSessions {
         status: &str,
         message: Option<&str>,
     ) -> bool {
-        let (sent, close) = {
+        let (current, close) = {
             let peers = self.peers.lock().await;
             let current = peers.get(signal_id).filter(|current| {
                 current.generation == generation
@@ -1329,19 +1554,11 @@ impl RtcSessions {
                     && current.session.session_id() == session_id
             });
             (
-                current.is_some()
-                    && try_send_status(
-                        out_tx,
-                        signal_id,
-                        binding_nonce,
-                        session_id,
-                        status,
-                        message,
-                    ),
+                current.is_some(),
                 current.map(|peer| Arc::clone(&peer.close)),
             )
         };
-        if !sent {
+        if !current {
             channels.stop();
             active.store(false, Ordering::Release);
             if let Some(close) = close {
@@ -1349,8 +1566,17 @@ impl RtcSessions {
             } else {
                 let _ = pc.close().await;
             }
+            return false;
         }
-        sent
+        let _ = out_tx;
+        self.send_or_defer_status(session_status_frame(
+            signal_id,
+            binding_nonce,
+            session_id,
+            status,
+            message,
+        ))
+        .await
     }
 
     pub async fn handle_candidate(
@@ -1371,6 +1597,7 @@ impl RtcSessions {
         let pc = peer.pc;
         match serde_json::from_value::<RTCIceCandidateInit>(candidate) {
             Ok(candidate) => {
+                let candidate = resolve_mdns_candidate(candidate).await;
                 if let Err(e) = pc.add_ice_candidate(candidate).await {
                     tracing::debug!(%signal_id, error = %e, "adding rtc candidate failed");
                 }
@@ -1386,7 +1613,9 @@ impl RtcSessions {
             let peers = self.peers.lock().await;
             peers
                 .get(signal_id)
-                .filter(|peer| peer.session.session_id() == session_id && peer.generation == generation)
+                .filter(|peer| {
+                    peer.session.session_id() == session_id && peer.generation == generation
+                })
                 .cloned()
         };
         let closing = if active.is_none() {
@@ -1416,7 +1645,9 @@ impl RtcSessions {
             let peers = self.peers.lock().await;
             peers
                 .get(signal_id)
-                .filter(|peer| peer.session.session_id() == session_id && peer.generation == generation)
+                .filter(|peer| {
+                    peer.session.session_id() == session_id && peer.generation == generation
+                })
                 .cloned()
         };
         if let Some(peer) = peer {
@@ -1482,7 +1713,10 @@ impl RtcSessions {
         // state so a new generation either prevents cleanup or registers only
         // after cleanup has completed.
         let peers = self.peers.lock().await;
-        if !peers.values().any(|peer| peer.session.session_id() == session_id) {
+        if !peers
+            .values()
+            .any(|peer| peer.session.session_id() == session_id)
+        {
             self.controls.remove_session(session_id).await;
         }
         drop(peers);
@@ -1706,29 +1940,157 @@ async fn negotiate(pc: &Arc<RTCPeerConnection>, sdp: String) -> Result<String> {
     Ok(local.sdp)
 }
 
+fn ice_ufrag(sdp: &str) -> Option<String> {
+    sdp.lines()
+        .find_map(|line| line.strip_prefix("a=ice-ufrag:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .map(str::to_string)
+}
+
+fn restart_ufrag_is_fresh(seen: &HashSet<String>, candidate: &str) -> bool {
+    !seen.contains(candidate)
+}
+
+fn restart_offer_is_acceptable(
+    restart_requested: bool,
+    same_generation: bool,
+    same_session: bool,
+    pinned_key: Option<[u8; 32]>,
+    offered_key: Option<[u8; 32]>,
+    fresh_ufrag: bool,
+) -> bool {
+    restart_requested
+        && same_generation
+        && same_session
+        && offered_key.is_some()
+        && offered_key == pinned_key
+        && fresh_ufrag
+}
+
+fn sign_answer(
+    local_sdp: &str,
+    answer_signer: &Option<RtcAnswerSigner>,
+) -> Result<(Option<String>, Option<String>)> {
+    match answer_signer {
+        Some(sign) => Ok((None, Some(sign(local_sdp)?))),
+        None => Ok((Some(local_sdp.to_string()), None)),
+    }
+}
+
+async fn configure_data_channel_pacing(dc: &Arc<RTCDataChannel>) -> Arc<Notify> {
+    let buffered_low = Arc::new(Notify::new());
+    dc.set_buffered_amount_low_threshold(DATA_CHANNEL_BUFFER_LOW)
+        .await;
+    let notify = Arc::clone(&buffered_low);
+    dc.on_buffered_amount_low(Box::new(move || {
+        notify.notify_waiters();
+        Box::pin(async {})
+    }))
+    .await;
+    buffered_low
+}
+
+async fn wait_for_data_channel_capacity(
+    dc: &Arc<RTCDataChannel>,
+    buffered_low: &Arc<Notify>,
+) -> bool {
+    let ready_dc = Arc::clone(dc);
+    let amount_dc = Arc::clone(dc);
+    let wait_notify = Arc::clone(buffered_low);
+    wait_for_pacing_capacity(
+        move || ready_dc.ready_state() == RTCDataChannelState::Open,
+        move || {
+            let dc = Arc::clone(&amount_dc);
+            async move { dc.buffered_amount().await }
+        },
+        move || {
+            let notify = Arc::clone(&wait_notify);
+            async move {
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        },
+    )
+    .await
+}
+
+async fn wait_for_pacing_capacity<Ready, Amount, AmountFuture, Wait, WaitFuture>(
+    mut is_open: Ready,
+    mut buffered_amount: Amount,
+    mut wait_for_low: Wait,
+) -> bool
+where
+    Ready: FnMut() -> bool,
+    Amount: FnMut() -> AmountFuture,
+    AmountFuture: Future<Output = usize>,
+    Wait: FnMut() -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    loop {
+        if !is_open() {
+            return false;
+        }
+        if buffered_amount().await < DATA_CHANNEL_BUFFER_HIGH {
+            return true;
+        }
+        wait_for_low().await;
+    }
+}
+
+async fn log_selected_candidate_pair(
+    pc: &Arc<RTCPeerConnection>,
+    scope: &'static str,
+    signal_id: &str,
+) {
+    let Some(pair) = pc
+        .sctp()
+        .transport()
+        .ice_transport()
+        .get_selected_candidate_pair()
+        .await
+    else {
+        return;
+    };
+    tracing::info!(
+        scope,
+        signal_id,
+        local_type = %pair.local.typ,
+        local_protocol = %pair.local.protocol,
+        remote_type = %pair.remote.typ,
+        remote_protocol = %pair.remote.protocol,
+        "selected RTC ICE candidate pair"
+    );
+}
+
 fn install_ice_handler(
     pc: &Arc<RTCPeerConnection>,
     binding: RtcSignalBinding,
-    out_tx: mpsc::Sender<WsOutbound>,
+    signaling: RtcWsSender,
 ) {
     pc.on_ice_candidate(Box::new(move |candidate| {
-        let out_tx = out_tx.clone();
+        let signaling = signaling.clone();
         let binding = binding.clone();
         Box::pin(async move {
-            let Some(candidate) = candidate else {
-                return;
-            };
-            let candidate = match candidate.to_json() {
-                Ok(candidate) => candidate,
-                Err(e) => {
-                    tracing::debug!(session_id = %binding.session_id, error = %e, "encoding rtc candidate failed");
-                    return;
-                }
+            let candidate = match candidate {
+                Some(candidate) => match candidate.to_json() {
+                    Ok(candidate) => candidate,
+                    Err(e) => {
+                        tracing::debug!(session_id = %binding.session_id, error = %e, "encoding rtc candidate failed");
+                        return;
+                    }
+                },
+                None => RTCIceCandidateInit {
+                    candidate: String::new(),
+                    ..Default::default()
+                },
             };
             match serde_json::to_value(candidate) {
                 Ok(candidate) => {
-                    send_json(
-                        &out_tx,
+                    send_json_dynamic(
+                        &signaling,
                         Outbound::RtcCandidate {
                             session_id: binding.signal_id,
                             binding_nonce: Some(binding.binding_nonce),
@@ -2035,7 +2397,7 @@ fn install_data_channel_handler(
                         return;
                     };
                     let Ok(Ok(Ok(replay))) =
-                        tokio::time::timeout(Duration::from_secs(3), replay_rx).await
+                        tokio::time::timeout(Duration::from_secs(10), replay_rx).await
                     else {
                         let _ = sessions
                             .send_session_peer_status(
@@ -2070,7 +2432,7 @@ fn install_data_channel_handler(
                         return;
                     }
                     if tokio::time::timeout(
-                        Duration::from_secs(3),
+                        Duration::from_secs(10),
                         control.wait_source_offset(watermark),
                     )
                     .await
@@ -2161,9 +2523,12 @@ fn install_data_channel_handler(
                     let output_pc = Arc::clone(&pc);
                     let output_signal_id = signal_id.clone();
                     let output_generation = generation.clone();
+                    let output_control = control.clone();
+                    let output_viewer_id = viewer_id.clone();
                     drop(_callback);
                     drop(effect);
                     tokio::spawn(async move {
+                        let buffered_low = configure_data_channel_pacing(&dc).await;
                         #[cfg(test)]
                         let mut pty_send_gate = pty_send_gate;
                         #[cfg(test)]
@@ -2174,12 +2539,41 @@ fn install_data_channel_handler(
                         loop {
                             let chunk = tokio::select! {
                                 changed = direct.disconnected.changed() => {
-                                    let _ = changed;
+                                    if changed.is_ok()
+                                        && direct.gap_offset.load(Ordering::Acquire) > 0
+                                        && output_active.load(Ordering::Acquire)
+                                        && rtc_output_allowed(&output_registry, session)
+                                    {
+                                        let gap_offset = direct.gap_offset.load(Ordering::Acquire);
+                                        if let Some(sender) = output_channels.control_sender() {
+                                            let _ = session_ctl::send_pty_gap(&sender, gap_offset).await;
+                                        }
+                                        let origin = direct.source_origin;
+                                        direct = output_control
+                                            .add_direct_sink_from(output_viewer_id.clone(), origin)
+                                            .await;
+                                        continue;
+                                    }
                                     None
                                 }
                                 chunk = direct.receiver.recv() => chunk,
                                 _ = &mut sender_exit => None,
                             };
+                            if chunk.is_none()
+                                && direct.gap_offset.load(Ordering::Acquire) > 0
+                                && output_active.load(Ordering::Acquire)
+                                && rtc_output_allowed(&output_registry, session)
+                            {
+                                let gap_offset = direct.gap_offset.load(Ordering::Acquire);
+                                if let Some(sender) = output_channels.control_sender() {
+                                    let _ = session_ctl::send_pty_gap(&sender, gap_offset).await;
+                                }
+                                let origin = direct.source_origin;
+                                direct = output_control
+                                    .add_direct_sink_from(output_viewer_id.clone(), origin)
+                                    .await;
+                                continue;
+                            }
                             let Some(chunk) = chunk else { break };
                             #[cfg(test)]
                             if let Some(gate) = pty_send_gate.take() {
@@ -2195,21 +2589,12 @@ fn install_data_channel_handler(
                             {
                                 break;
                             }
-                            match tokio::time::timeout(
-                                DATA_CHANNEL_SEND_TIMEOUT,
-                                dc.send(&Bytes::copy_from_slice(&chunk)),
-                            )
-                            .await
-                            {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(error)) => {
-                                    tracing::debug!(%session_id, %error, "rtc data channel send failed");
-                                    break;
-                                }
-                                Err(_) => {
-                                    tracing::debug!(%session_id, "rtc data channel send timed out");
-                                    break;
-                                }
+                            if !wait_for_data_channel_capacity(&dc, &buffered_low).await {
+                                break;
+                            }
+                            if let Err(error) = dc.send(&Bytes::copy_from_slice(&chunk)).await {
+                                tracing::debug!(%session_id, %error, "rtc data channel send failed");
+                                break;
                             }
                         }
                         output_channels.stop();
@@ -2275,6 +2660,7 @@ fn install_control_data_channel(
     let upload_capability = Uuid::new_v4();
     let uploads = sessions.uploads.clone();
     let (sender, mut receiver) = mpsc::channel(session_ctl::OUTBOUND_QUEUE_DEPTH);
+    channels.set_control_sender(sender.clone());
     let (display_sender, mut display_receiver) = tokio::sync::watch::channel(None::<String>);
     let (close_tx, mut close_rx) = oneshot::channel();
     let close_tx = Arc::new(Mutex::new(Some(close_tx)));
@@ -2289,6 +2675,7 @@ fn install_control_data_channel(
     let send_close = Arc::clone(&close);
     let send_generation = generation.clone();
     tokio::spawn(async move {
+        let buffered_low = configure_data_channel_pacing(&send_dc).await;
         #[cfg(test)]
         let sender_exit = wait_test_sender_exit(&sender_close_gate);
         #[cfg(not(test))]
@@ -2323,6 +2710,17 @@ fn install_control_data_channel(
             {
                 break;
             }
+            let message_len = match &message {
+                ControlOutbound::Text(text) => text.len(),
+                ControlOutbound::Binary(bytes) => bytes.len(),
+            };
+            if message_len > DATA_CHANNEL_MESSAGE_BYTES {
+                tracing::warn!(%session_id, %send_viewer_id, "dropping oversized spawn.ctl outbound message");
+                continue;
+            }
+            if !wait_for_data_channel_capacity(&send_dc, &buffered_low).await {
+                break;
+            }
             let send = async {
                 match &mut message {
                     ControlOutbound::Text(text) => send_dc.send_text(std::mem::take(text)).await,
@@ -2331,14 +2729,10 @@ fn install_control_data_channel(
                     }
                 }
             };
-            match tokio::time::timeout(DATA_CHANNEL_SEND_TIMEOUT, send).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
+            match send.await {
+                Ok(_) => {}
+                Err(error) => {
                     tracing::debug!(%session_id, %send_viewer_id, %error, "spawn.ctl send failed");
-                    break;
-                }
-                Err(_) => {
-                    tracing::debug!(%session_id, %send_viewer_id, "spawn.ctl send timed out");
                     break;
                 }
             }
@@ -2587,8 +2981,16 @@ fn install_control_data_channel(
         let close = Arc::clone(&close);
         let uploads = uploads.clone();
         let viewer_id = viewer_id.clone();
+        // webrtc-rs close delivery differs by platform. Establish the Unix
+        // deadline synchronously at callback invocation, before returning the
+        // future whose polling may be independently scheduled.
+        #[cfg(not(windows))]
         let upload_deadline = close.initiate();
         Box::pin(async move {
+            // Windows serializes this path differently; preserve its observed
+            // first-poll ordering.
+            #[cfg(windows)]
+            let upload_deadline = close.initiate();
             uploads.cancel_viewer_now(session, &viewer_id);
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
@@ -2676,7 +3078,9 @@ async fn execute_control_request(
                     if !effect.valid() {
                         return Ok(());
                     }
-                    let _ = controls.update_size(session_id, viewer_id, cols, rows).await;
+                    let _ = controls
+                        .update_size(session_id, viewer_id, cols, rows)
+                        .await;
                 }
             }
             if !effect.valid() {
@@ -2743,7 +3147,9 @@ async fn execute_control_request(
             if !effect.valid() {
                 return Ok(());
             }
-            let _ = controls.update_size(session_id, viewer_id, cols, rows).await;
+            let _ = controls
+                .update_size(session_id, viewer_id, cols, rows)
+                .await;
             if !effect.valid() {
                 return Ok(());
             }
@@ -2860,8 +3266,13 @@ async fn execute_control_request(
                     next_sequence,
                     received_bytes,
                 } => {
-                    session_ctl::send_upload_ready(sender, request_id, next_sequence, received_bytes)
-                        .await
+                    session_ctl::send_upload_ready(
+                        sender,
+                        request_id,
+                        next_sequence,
+                        received_bytes,
+                    )
+                    .await
                 }
                 UploadStartOutcome::Complete(result) => {
                     session_ctl::send_upload_complete(sender, request_id, &result).await
@@ -3197,6 +3608,176 @@ fn to_webrtc_ice_server(config: RtcIceServerConfig) -> RTCIceServer {
     }
 }
 
+fn build_api() -> Result<webrtc::api::API> {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_default_codecs()
+        .context("registering WebRTC codecs")?;
+    Ok(APIBuilder::new()
+        .with_media_engine(media_engine)
+        .with_setting_engine(setting_engine()?)
+        .build())
+}
+
+/// The connection-address of an RFC 8828 obfuscated host candidate, if this
+/// is one.
+///
+/// Every browser hides the local IP of its host candidates behind an ephemeral
+/// `<uuid>.local` name and expects the peer to resolve it over mDNS. Only host
+/// candidates are ever obfuscated, and the name is always a single label, so
+/// anything else is left exactly as it arrived.
+fn mdns_candidate_host(candidate: &str) -> Option<&str> {
+    let line = candidate
+        .strip_prefix("a=")
+        .unwrap_or(candidate)
+        .strip_prefix("candidate:")?;
+    let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+    // foundation component transport priority address port typ type
+    if fields.len() < 8 || fields[6] != "typ" || fields[7] != "host" {
+        return None;
+    }
+    let address = fields[4];
+    let name = address.strip_suffix(".local")?;
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    Some(address)
+}
+
+/// The same candidate with its obfuscated name replaced by the address it
+/// stands for. `None` when the line is not shaped the way it was measured.
+fn rewrite_candidate_host(candidate: &str, address: IpAddr) -> Option<String> {
+    let (prefix, line) = match candidate.strip_prefix("a=") {
+        Some(rest) => ("a=", rest),
+        None => ("", candidate),
+    };
+    let body = line.strip_prefix("candidate:")?;
+    let mut fields: Vec<&str> = body.split_ascii_whitespace().collect();
+    if fields.len() < 8 {
+        return None;
+    }
+    let resolved = address.to_string();
+    fields[4] = resolved.as_str();
+    Some(format!("{prefix}candidate:{}", fields.join(" ")))
+}
+
+/// Resolve an obfuscated candidate to an ordinary host candidate.
+///
+/// webrtc-rs can do this itself, but only in a multicast-DNS mode whose
+/// resolver task outlives the connection and spins forever on a name that
+/// never answers — which is most of them, since a browser's name only resolves
+/// on its own network. So mDNS stays off in the [`setting_engine`] and the
+/// lookup happens here instead, where it is bounded and ends with the
+/// connection: the OS resolver answers `.local` on macOS, and on Linux
+/// wherever nss-mdns or systemd-resolved is installed.
+///
+/// A name that does not resolve is passed through untouched, which is exactly
+/// what arrived before this existed — webrtc-rs logs it and ignores it.
+async fn resolve_mdns_candidate(init: RTCIceCandidateInit) -> RTCIceCandidateInit {
+    let Some(name) = mdns_candidate_host(&init.candidate) else {
+        return init;
+    };
+    let name = name.to_owned();
+    let lookup = tokio::time::timeout(
+        MDNS_CANDIDATE_RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((name.as_str(), 0)),
+    )
+    .await;
+    let addresses = match lookup {
+        Ok(Ok(addresses)) => addresses,
+        Ok(Err(error)) => {
+            tracing::debug!(%name, %error, "resolving an mDNS ICE candidate failed");
+            return init;
+        }
+        Err(_) => {
+            tracing::debug!(%name, "resolving an mDNS ICE candidate timed out");
+            return init;
+        }
+    };
+    // IPv4 first: this daemon gathers no IPv6 candidate on a host without
+    // routable IPv6, and a pair needs both halves in the same family.
+    let mut fallback = None;
+    let mut chosen = None;
+    for address in addresses {
+        match address.ip() {
+            IpAddr::V4(ip) => {
+                chosen = Some(IpAddr::V4(ip));
+                break;
+            }
+            IpAddr::V6(ip) => fallback = fallback.or(Some(IpAddr::V6(ip))),
+        }
+    }
+    let Some(address) = chosen.or(fallback) else {
+        tracing::debug!(%name, "an mDNS ICE candidate resolved to no address");
+        return init;
+    };
+    let Some(candidate) = rewrite_candidate_host(&init.candidate, address) else {
+        return init;
+    };
+    tracing::debug!(%name, "resolved an mDNS ICE candidate");
+    RTCIceCandidateInit { candidate, ..init }
+}
+
+fn setting_engine() -> Result<SettingEngine> {
+    let mut settings = SettingEngine::default();
+    // QueryOnly leaks a resolver task/socket per peer in webrtc-rs 0.17: the
+    // query loops forever on a name that never answers, and closing the agent
+    // does not end it. Remote `.local` candidates are resolved in
+    // [`resolve_mdns_candidate`] instead, bounded and before they get here.
+    settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+    settings.set_interface_filter(Box::new(interface_is_allowed));
+    settings.set_ip_filter(Box::new(ip_is_allowed));
+    settings.set_udp_network(UDPNetwork::Ephemeral(
+        EphemeralUDP::new(RTC_UDP_PORT_MIN, RTC_UDP_PORT_MAX)
+            .context("configuring the RTC UDP port range")?,
+    ));
+    settings.set_sctp_max_message_size_can_send(SctpMaxMessageSize::Bounded(
+        DATA_CHANNEL_MESSAGE_BYTES as u32,
+    ));
+    if !RTC_NETWORK_POLICY_LOGGED.swap(true, Ordering::AcqRel) {
+        tracing::info!(
+            udp_port_min = RTC_UDP_PORT_MIN,
+            udp_port_max = RTC_UDP_PORT_MAX,
+            "LAN-direct WebRTC requires this inbound UDP firewall range; remote mDNS candidates are resolved by the OS resolver"
+        );
+    }
+    Ok(settings)
+}
+
+fn interface_is_allowed(name: &str) -> bool {
+    ![
+        "docker", "br-", "veth", "awdl", "llw", "anpi", "bridge", "vmnet", "virbr", "zt",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+        && name != "lo"
+}
+
+fn ip_is_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(octets[0] == 169 && octets[1] == 254)
+        }
+        IpAddr::V6(ip) => ip.segments()[0] & 0xffc0 != 0xfe80,
+    }
+}
+
+fn warn_if_no_udp_turn(servers: &[RtcIceServerConfig]) {
+    if !has_udp_turn(servers) && !TURN_UDP_WARNING_LOGGED.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            "offered ICE configuration has no UDP turn: URL; webrtc-ice 0.17 cannot use TURN over TCP/TLS"
+        );
+    }
+}
+
+fn has_udp_turn(servers: &[RtcIceServerConfig]) -> bool {
+    servers.iter().flat_map(|server| &server.urls).any(|url| {
+        let lower = url.to_ascii_lowercase();
+        lower.starts_with("turn:") && !lower.contains("transport=tcp")
+    })
+}
+
 fn parse_ice_transport_policy(value: Option<&str>) -> Result<RTCIceTransportPolicy> {
     match value {
         Some("relay") => Ok(RTCIceTransportPolicy::Relay),
@@ -3209,22 +3790,30 @@ fn install_host_ice_handler(
     pc: &Arc<RTCPeerConnection>,
     signal_id: String,
     binding: HostRtcBinding,
-    out_tx: mpsc::Sender<WsOutbound>,
+    signaling: RtcWsSender,
 ) {
     pc.on_ice_candidate(Box::new(move |candidate| {
         let signal_id = signal_id.clone();
         let binding = binding.clone();
-        let out_tx = out_tx.clone();
+        let signaling = signaling.clone();
         Box::pin(async move {
-            let Some(candidate) = candidate else { return };
-            let Ok(candidate) = candidate.to_json() else {
-                return;
+            let candidate = match candidate {
+                Some(candidate) => {
+                    let Ok(candidate) = candidate.to_json() else {
+                        return;
+                    };
+                    candidate
+                }
+                None => RTCIceCandidateInit {
+                    candidate: String::new(),
+                    ..Default::default()
+                },
             };
             let Ok(candidate) = serde_json::to_value(candidate) else {
                 return;
             };
-            send_json(
-                &out_tx,
+            send_json_dynamic(
+                &signaling,
                 Outbound::RtcCandidate {
                     session_id: signal_id,
                     binding_nonce: Some(binding.binding_nonce),
@@ -3244,7 +3833,7 @@ fn install_host_data_channel_handler(
     pc: &Arc<RTCPeerConnection>,
     signal_id: String,
     binding: HostRtcBinding,
-    out_tx: mpsc::Sender<WsOutbound>,
+    signaling: RtcWsSender,
     files_override: Option<Arc<HostFileService>>,
 ) {
     let accepted = Arc::new(AtomicBool::new(false));
@@ -3254,7 +3843,7 @@ fn install_host_data_channel_handler(
         let pc = Arc::clone(&handler_pc);
         let signal_id = signal_id.clone();
         let binding = binding.clone();
-        let out_tx = out_tx.clone();
+        let signaling = signaling.clone();
         let files = files_override.clone();
         Box::pin(async move {
             let reliable = dc.ordered()
@@ -3269,7 +3858,7 @@ fn install_host_data_channel_handler(
                 let _ = dc.close().await;
                 return;
             }
-            install_host_control_channel(dc, signal_id, binding, out_tx, files);
+            install_host_control_channel(dc, signal_id, binding, signaling, files);
         })
     }));
 }
@@ -3333,10 +3922,10 @@ fn install_host_control_channel(
     dc: Arc<RTCDataChannel>,
     signal_id: String,
     binding: HostRtcBinding,
-    out_tx: mpsc::Sender<WsOutbound>,
+    signaling: RtcWsSender,
     files_override: Option<Arc<HostFileService>>,
 ) {
-    let connected_signal = HostConnectedSignal::new(out_tx, signal_id, binding);
+    let connected_signal = HostConnectedSignal::new(signaling, signal_id, binding);
     crate::host_control::install(dc, connected_signal, files_override);
 }
 
@@ -3346,29 +3935,20 @@ pub(crate) async fn send_host_status(
     binding: &HostRtcBinding,
     status: &str,
 ) {
-    send_json(
-        out_tx,
-        Outbound::RtcStatus {
-            session_id: signal_id,
-            binding_nonce: Some(binding.binding_nonce.clone()),
-            scope_type: Some("host".to_string()),
-            scope_id: Some(binding.host_id),
-            protocol: Some(binding.protocol.clone()),
-            protocol_version: Some(binding.protocol_version),
-            status: status.to_string(),
-            message: None,
-        },
-    )
-    .await;
+    send_json(out_tx, host_status_frame(signal_id, binding, status)).await;
 }
 
 pub(crate) fn try_send_host_status(
-    out_tx: &mpsc::Sender<WsOutbound>,
+    signaling: &RtcWsSender,
     signal_id: String,
     binding: &HostRtcBinding,
     status: &str,
 ) -> bool {
-    let frame = Outbound::RtcStatus {
+    signaling.try_send(host_status_frame(signal_id, binding, status))
+}
+
+fn host_status_frame(signal_id: String, binding: &HostRtcBinding, status: &str) -> Outbound {
+    Outbound::RtcStatus {
         session_id: signal_id,
         binding_nonce: Some(binding.binding_nonce.clone()),
         scope_type: Some("host".to_string()),
@@ -3377,22 +3957,17 @@ pub(crate) fn try_send_host_status(
         protocol_version: Some(binding.protocol_version),
         status: status.to_string(),
         message: None,
-    };
-    let Ok(text) = serde_json::to_string(&frame) else {
-        return false;
-    };
-    out_tx.try_send(WsOutbound::json(text)).is_ok()
+    }
 }
 
-fn try_send_status(
-    out_tx: &mpsc::Sender<WsOutbound>,
+fn session_status_frame(
     signal_id: &str,
     binding_nonce: &str,
     session_id: Uuid,
     status: &str,
     message: Option<&str>,
-) -> bool {
-    let frame = Outbound::RtcStatus {
+) -> Outbound {
+    Outbound::RtcStatus {
         session_id: signal_id.to_string(),
         binding_nonce: Some(binding_nonce.to_string()),
         scope_type: Some("session".to_string()),
@@ -3401,11 +3976,7 @@ fn try_send_status(
         protocol_version: Some(SESSION_RTC_PROTOCOL_VERSION),
         status: status.to_string(),
         message: message.map(str::to_string),
-    };
-    let Ok(text) = serde_json::to_string(&frame) else {
-        return false;
-    };
-    out_tx.try_send(WsOutbound::json(text)).is_ok()
+    }
 }
 
 async fn send_status(
@@ -3438,15 +4009,127 @@ async fn send_json(out_tx: &mpsc::Sender<WsOutbound>, frame: Outbound) {
     }
 }
 
+async fn send_json_dynamic(signaling: &RtcWsSender, frame: Outbound) {
+    let Some(sender) = signaling.load() else {
+        return;
+    };
+    if let Ok(serialized) = serde_json::to_string(&frame) {
+        let _ = sender.send(WsOutbound::json(serialized)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BROWSER_MDNS_CANDIDATE: &str =
+        "candidate:842163049 1 udp 1677729535 33cde59c-1be0-47b5-9ae5-786881bd0089.local 50123 typ host generation 0 ufrag Xk4b network-cost 999";
+
+    #[test]
+    fn an_obfuscated_browser_candidate_is_recognised_and_rewritten() {
+        // What every browser actually sends: the local IP replaced by an
+        // ephemeral name only its own network can answer for.
+        assert_eq!(
+            mdns_candidate_host(BROWSER_MDNS_CANDIDATE),
+            Some("33cde59c-1be0-47b5-9ae5-786881bd0089.local")
+        );
+        let rewritten =
+            rewrite_candidate_host(BROWSER_MDNS_CANDIDATE, "192.168.1.24".parse().unwrap())
+                .unwrap();
+        assert_eq!(
+            rewritten,
+            "candidate:842163049 1 udp 1677729535 192.168.1.24 50123 typ host generation 0 ufrag Xk4b network-cost 999"
+        );
+        // Only the address moved; everything ICE authenticates with is intact.
+        assert!(rewritten.contains("ufrag Xk4b"));
+        assert!(rewritten.contains("typ host"));
+        assert!(!rewritten.contains(".local"));
+        // The `a=` form some clients send keeps its prefix.
+        let prefixed = format!("a={BROWSER_MDNS_CANDIDATE}");
+        assert_eq!(
+            mdns_candidate_host(&prefixed),
+            Some("33cde59c-1be0-47b5-9ae5-786881bd0089.local")
+        );
+        assert!(
+            rewrite_candidate_host(&prefixed, "10.0.0.2".parse().unwrap())
+                .unwrap()
+                .starts_with("a=candidate:")
+        );
+    }
+
+    #[test]
+    fn nothing_else_is_touched() {
+        for candidate in [
+            // An ordinary host candidate.
+            "candidate:1 1 udp 2130706431 192.168.1.24 50123 typ host",
+            // Reflexive and relay candidates are never obfuscated, and their
+            // `raddr` must never be mistaken for the connection-address.
+            "candidate:2 1 udp 1694498815 203.0.113.7 50124 typ srflx raddr 192.168.1.24 rport 50123",
+            "candidate:3 1 udp 16777215 198.51.100.9 3478 typ relay raddr 0.0.0.0 rport 0",
+            // A multi-label name is not the RFC 8828 form: resolving it would
+            // send the daemon looking up whatever a peer asked it to.
+            "candidate:4 1 udp 1677729535 sneaky.internal.local 50123 typ host",
+            "candidate:5 1 udp 1677729535 .local 50123 typ host",
+            // Not a candidate line at all, and a truncated one.
+            "candidate:6 1 udp 1677729535 33cde59c.local 50123",
+            "v=0",
+            "",
+        ] {
+            assert_eq!(mdns_candidate_host(candidate), None, "{candidate}");
+        }
+        assert_eq!(
+            rewrite_candidate_host("v=0", "10.0.0.2".parse().unwrap()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_never_resolves_arrives_exactly_as_it_was_sent() {
+        // The failure path is the old behaviour: webrtc-rs receives the
+        // obfuscated candidate, says so, and ignores it. Nothing is dropped
+        // here and nothing waits longer than the bound.
+        let init = RTCIceCandidateInit {
+            candidate: BROWSER_MDNS_CANDIDATE.to_owned(),
+            sdp_mid: Some("0".to_owned()),
+            sdp_mline_index: Some(0),
+            username_fragment: None,
+        };
+        let started = tokio::time::Instant::now();
+        let resolved = resolve_mdns_candidate(init.clone()).await;
+        assert_eq!(resolved.candidate, init.candidate);
+        assert_eq!(resolved.sdp_mid, init.sdp_mid);
+        assert!(started.elapsed() < MDNS_CANDIDATE_RESOLVE_TIMEOUT + Duration::from_millis(750));
+
+        // A candidate that was never obfuscated is not delayed at all.
+        let plain = RTCIceCandidateInit {
+            candidate: "candidate:1 1 udp 2130706431 192.168.1.24 50123 typ host".to_owned(),
+            ..init
+        };
+        let started = tokio::time::Instant::now();
+        let untouched = resolve_mdns_candidate(plain.clone()).await;
+        assert_eq!(untouched.candidate, plain.candidate);
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
     use crate::host_files::{HostOperationKind, STREAM_CHUNK_BYTES};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use sha2::{Digest, Sha256};
     use std::path::Path;
 
     const DIRECT_ENDPOINT_BYTES_FIELD: &str = concat!("bytes", "_b64");
+
+    #[cfg(windows)]
+    fn test_runner_denied_worker_breakaway(error: &anyhow::Error) -> bool {
+        let breakaway_denied = error
+            .chain()
+            .any(|cause| cause.to_string() == "worker breakaway launch was denied");
+        let access_denied = error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+            })
+        });
+        breakaway_denied && access_denied
+    }
 
     #[tokio::test]
     async fn trust_reload_invalidates_every_pre_reload_admission_capture() {
@@ -3471,7 +4154,9 @@ mod tests {
         let registry = SessionRegistry::new();
         let session_id = Uuid::new_v4();
         let (session, _commands) = insert_test_worker(&registry, session_id);
-        let control = registry.control_for_binding(session).expect("worker control");
+        let control = registry
+            .control_for_binding(session)
+            .expect("worker control");
         let pc = Arc::new(
             APIBuilder::new()
                 .build()
@@ -3492,6 +4177,9 @@ mod tests {
                 control,
                 channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::new(PeerCloseCoordinator::default()),
+                offer_key: None,
+                remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+                restart_lock: Arc::new(Mutex::new(())),
                 _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
             },
@@ -3510,6 +4198,7 @@ mod tests {
                 binding: HostRtcBinding {
                     host_id: Uuid::new_v4(),
                     binding_nonce: "0".repeat(32),
+                    binding_generation: 1,
                     protocol: HOST_CONTROL_LABEL.to_owned(),
                     protocol_version: RTC_PROTOCOL_VERSION,
                 },
@@ -3613,11 +4302,13 @@ mod tests {
             })
         }));
         let (out_tx, out_rx) = mpsc::channel(4);
+        let signaling = RtcWsSender::default();
+        signaling.install(out_tx);
         install_host_data_channel_handler(
             &daemon_pc,
             signal_id.to_string(),
             binding,
-            out_tx,
+            signaling,
             Some(files),
         );
 
@@ -3728,6 +4419,34 @@ mod tests {
         agent_generation: Option<u64>,
     }
 
+    struct UploadCleanupPauseGuard {
+        uploads: crate::upload::UploadHub,
+        armed: bool,
+    }
+
+    impl UploadCleanupPauseGuard {
+        fn arm(uploads: crate::upload::UploadHub) -> Self {
+            uploads.arm_cleanup_pause_for_test();
+            Self {
+                uploads,
+                armed: true,
+            }
+        }
+
+        fn release(&mut self) {
+            if self.armed {
+                self.uploads.release_cleanup_pause_for_test();
+                self.armed = false;
+            }
+        }
+    }
+
+    impl Drop for UploadCleanupPauseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct TestSessionChannel {
         label: &'static str,
@@ -3836,6 +4555,9 @@ mod tests {
                 RtcSignalBinding::new(signal_id.to_string(), generation.to_string(), session_id),
                 offer_sdp,
                 Vec::new(),
+                None,
+                false,
+                None,
                 registry.clone(),
                 out_tx,
                 None,
@@ -3979,7 +4701,9 @@ mod tests {
         let viewer = viewer_id(&signal_id, generation);
         let registry = SessionRegistry::new();
         let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
-        let control = registry.control_for_binding(session).expect("worker control");
+        let control = registry
+            .control_for_binding(session)
+            .expect("worker control");
         let sessions = RtcSessions::new();
 
         let mut media_engine = MediaEngine::default();
@@ -4086,6 +4810,9 @@ mod tests {
                 RtcSignalBinding::new(signal_id.clone(), generation.to_string(), session_id),
                 offer_sdp,
                 Vec::new(),
+                None,
+                false,
+                None,
                 registry,
                 out_tx,
                 None,
@@ -4333,7 +5060,7 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe");
         exe.parent()
             .and_then(|deps| deps.parent())
-            .map(|debug| debug.join("spawn-worker"))
+            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
             .expect("worker bin path")
     }
 
@@ -4347,8 +5074,27 @@ mod tests {
         fn install() -> Self {
             let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
             let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
+            #[cfg(unix)]
+            let dir = tempfile::Builder::new()
+                .prefix("spawn-rtc-")
+                .tempdir_in("/tmp")
+                .expect("short worker tempdir");
+            #[cfg(windows)]
             let dir = tempfile::tempdir().expect("worker tempdir");
-            std::env::set_var("SPAWND_WORKER_DIR", dir.path());
+            #[cfg(windows)]
+            let worker_dir = {
+                // The runner owns its TEMP root policy. Exercise the worker
+                // contract with a child carrying the exact owner-only DACL
+                // SPAWN D creates rather than weakening validation for the
+                // inherited runner directory.
+                let worker_dir = dir.path().join("workers");
+                crate::platform::create_private_dir_all(&worker_dir)
+                    .expect("protected worker tempdir");
+                worker_dir
+            };
+            #[cfg(not(windows))]
+            let worker_dir = dir.path();
+            std::env::set_var("SPAWND_WORKER_DIR", worker_dir);
             std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
             Self {
                 old_dir,
@@ -4357,6 +5103,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn path(&self) -> &std::path::Path {
             self._dir.path()
         }
@@ -4454,6 +5201,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn saturate_test_lifecycle_endpoint(
         dir: &std::path::Path,
         lifecycle_path: &std::path::Path,
@@ -4482,7 +5230,10 @@ mod tests {
         for _ in 0..1024 {
             match flood.send(&payload) {
                 Ok(size) => assert_eq!(size, payload.len()),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(nix::libc::ENOBUFS) =>
+                {
                     saturated = true;
                     break;
                 }
@@ -4496,6 +5247,7 @@ mod tests {
         (server, flood, identity)
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_cleanup_guard_drop_is_bounded_on_a_nonwritable_endpoint() {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
@@ -4508,7 +5260,7 @@ mod tests {
             .expect("bind persistent fake worker endpoint");
         let ordinary_identity = spawnd::sessiond::endpoint::secure_bound_socket(&ordinary_path)
             .expect("secure persistent fake worker endpoint");
-        let lifecycle_path = spawnd::sessiond::wire::lifecycle_socket_path(&ordinary_path);
+        let lifecycle_path = ordinary_path.with_extension("lifecycle.sock");
         let (_lifecycle, _flood, _lifecycle_identity) =
             saturate_test_lifecycle_endpoint(env.path(), &lifecycle_path);
         let mut unrelated = TestChildCleanup(
@@ -4549,6 +5301,114 @@ mod tests {
         );
         drop(ordinary_identity);
         drop(ordinary);
+    }
+
+    #[cfg(windows)]
+    async fn open_silent_lifecycle_client(
+        name: &std::ffi::OsStr,
+    ) -> tokio::net::windows::named_pipe::NamedPipeClient {
+        use tokio::net::windows::named_pipe::{ClientOptions, PipeMode};
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match ClientOptions::new().pipe_mode(PipeMode::Message).open(name) {
+                Ok(client) => return client,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("opening silent lifecycle client failed: {error}"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_cleanup_guard_drop_is_bounded_when_all_pipe_handlers_are_silent() {
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("SPAWND_WORKER_DIR", value),
+                    None => std::env::remove_var("SPAWND_WORKER_DIR"),
+                }
+            }
+        }
+
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("guard pipe tempdir");
+        let dir = temp.path().join("workers");
+        spawnd::sessiond::endpoint::ensure_private_dir(&dir).expect("secure guard pipe directory");
+        let _env = EnvRestore(std::env::var_os("SPAWND_WORKER_DIR"));
+        std::env::set_var("SPAWND_WORKER_DIR", &dir);
+
+        let session_id = Uuid::new_v4();
+        let endpoint = spawnd::sessiond::endpoint::endpoint_for(
+            &dir,
+            &spawnd::sessiond::endpoint::config_root_tag(),
+            session_id,
+        )
+        .expect("guard endpoint");
+        let reservation = match spawnd::sessiond::endpoint::try_reserve(&endpoint).unwrap() {
+            spawnd::sessiond::endpoint::LockAttempt::Acquired(reservation) => reservation,
+            spawnd::sessiond::endpoint::LockAttempt::Busy => {
+                panic!("new guard endpoint reservation was busy")
+            }
+        };
+        let spawnd::sessiond::endpoint::BoundWorkerEndpoints {
+            main: _main,
+            lifecycle: _lifecycle,
+            identity: _identity,
+        } = spawnd::sessiond::endpoint::bind_worker(&endpoint, &reservation, Uuid::new_v4())
+            .expect("bind guard pipe endpoints");
+        let mut silent = Vec::new();
+        for _ in 0..7 {
+            silent.push(open_silent_lifecycle_client(endpoint.lifecycle_arg()).await);
+            tokio::task::yield_now().await;
+        }
+
+        let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+        let mut unrelated = TestChildCleanup(
+            std::process::Command::new(comspec)
+                .args(["/d", "/c", "ping -n 30 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn guard sentinel process"),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        let handle = crate::pty::SessionHandle::new_worker(crate::pty::WorkerHandleParts {
+            session_id,
+            cwd: "C:\\".into(),
+            cmd_tx,
+            lifecycle: crate::pty::SessionLifecycle::new(endpoint.clone(), Uuid::new_v4()),
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: crate::pty::ForwarderControl::new(),
+        });
+        let guard = WorkerCleanupGuard::new(session_id, &handle);
+        drop(handle);
+
+        let started = std::time::Instant::now();
+        drop(guard);
+        assert!(
+            started.elapsed() <= WORKER_TEST_CLEANUP_TIMEOUT + Duration::from_millis(500),
+            "worker cleanup guard exceeded its advertised bound"
+        );
+        assert!(
+            spawnd::sessiond::endpoint::endpoint_exists(&endpoint),
+            "test did not retain the deliberately stuck worker endpoint"
+        );
+        assert!(
+            unrelated.0.try_wait().unwrap().is_none(),
+            "worker cleanup guard touched an unrelated process"
+        );
+        drop(silent);
     }
 
     async fn request_history(client: &mut RtcTestClient) -> Vec<u8> {
@@ -4803,6 +5663,9 @@ mod tests {
                 control,
                 channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::clone(&close),
+                offer_key: None,
+                remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+                restart_lock: Arc::new(Mutex::new(())),
                 _admission_permit: admission_permit,
                 fence: Arc::clone(&fence),
             },
@@ -4904,6 +5767,15 @@ mod tests {
             let gate = sessions.stall_sender_close(&signal_id, channel).await;
             let client =
                 connect_rtc_session(&sessions, &registry, session_id, &signal_id, generation).await;
+            let close = {
+                let peers = sessions.peers.lock().await;
+                Arc::clone(&peers.get(&signal_id).expect("active real peer").close)
+            };
+            assert_eq!(
+                close.initiated_deadline(),
+                None,
+                "installing real DataChannel handlers started the close deadline"
+            );
             tokio::time::timeout(Duration::from_secs(10), async {
                 while control.direct_sink_offset(&viewer).await.is_none() {
                     tokio::task::yield_now().await;
@@ -5040,7 +5912,9 @@ mod tests {
         let session_id = Uuid::new_v4();
         let registry = SessionRegistry::new();
         let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
-        let control = registry.control_for_binding(session).expect("worker control");
+        let control = registry
+            .control_for_binding(session)
+            .expect("worker control");
         let worker_control = control.clone();
         let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
         let worker = tokio::spawn(async move {
@@ -5066,7 +5940,8 @@ mod tests {
         ] {
             let viewer = viewer_id(signal_id, "generation");
             let client =
-                connect_rtc_session(&sessions, &registry, session_id, signal_id, "generation").await;
+                connect_rtc_session(&sessions, &registry, session_id, signal_id, "generation")
+                    .await;
             let gate = sessions.stall_effect(signal_id, point).await;
             match point {
                 TestEffectPoint::ControlRequest => {
@@ -5114,7 +5989,9 @@ mod tests {
         let session_id = Uuid::new_v4();
         let registry = SessionRegistry::new();
         let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
-        let control = registry.control_for_binding(session).expect("worker control");
+        let control = registry
+            .control_for_binding(session)
+            .expect("worker control");
         let worker_control = control.clone();
         let worker = tokio::spawn(async move {
             while let Some(command) = worker_commands.recv().await {
@@ -5174,11 +6051,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_signaling_outbox_cannot_hold_teardown_or_leak_stale_status() {
+    async fn full_signaling_outbox_defers_status_without_closing_the_peer() {
         let registry = SessionRegistry::new();
         let session_id = Uuid::new_v4();
         let (session, _commands) = insert_test_worker(&registry, session_id);
-        let control = registry.control_for_binding(session).expect("worker control");
+        let control = registry
+            .control_for_binding(session)
+            .expect("worker control");
         let api = APIBuilder::new().build();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration::default())
@@ -5194,35 +6073,41 @@ mod tests {
         let fence = Arc::new(tokio::sync::RwLock::new(()));
         let sessions = RtcSessions::new();
         let signal_id = "full-status-outbox";
-        let generation = "old-generation";
+        let old_nonce = "b".repeat(32);
+        let generation = format!("7:{old_nonce}");
         sessions.peers.lock().await.insert(
             signal_id.to_string(),
             RtcPeer {
                 pc: Arc::clone(&pc),
                 session,
-                generation: generation.to_string(),
+                generation: generation.clone(),
                 active: Arc::clone(&active),
                 control: control.clone(),
                 channels: Arc::clone(&channels),
                 close: Arc::new(PeerCloseCoordinator::default()),
+                offer_key: None,
+                remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+                restart_lock: Arc::new(Mutex::new(())),
                 _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::clone(&fence),
             },
         );
 
         let (out_tx, mut out_rx) = mpsc::channel(1);
+        sessions.install_ws_sender(out_tx.clone());
         out_tx
             .try_send(WsOutbound::json(r#"{"type":"sentinel"}"#.to_string()))
             .expect("fill signaling outbox");
-        let effect = channels.permit().await.expect("admitted PTY callback");
-        let callback = fence.read().await;
-        let old_nonce = "b".repeat(32);
+        let live = sessions.live_bindings().await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].binding_generation, 7);
+        assert_eq!(live[0].binding_nonce, old_nonce);
         let sent = tokio::time::timeout(
             Duration::from_millis(100),
             sessions.send_session_peer_status(
                 &out_tx,
                 signal_id,
-                generation,
+                &generation,
                 &pc,
                 &active,
                 &channels,
@@ -5234,73 +6119,17 @@ mod tests {
         )
         .await
         .expect("full signaling outbox blocked the lifecycle callback");
-        assert!(!sent);
-        assert!(channels.failed.load(Ordering::SeqCst));
-        assert!(!active.load(Ordering::Acquire));
+        assert!(sent);
+        assert!(!channels.failed.load(Ordering::SeqCst));
+        assert!(active.load(Ordering::Acquire));
 
-        let closing_sessions = sessions.clone();
-        let close = tokio::spawn(async move {
-            closing_sessions.close_all().await;
-        });
-        tokio::task::yield_now().await;
-        drop(callback);
-        drop(effect);
-        tokio::time::timeout(Duration::from_secs(3), close)
-            .await
-            .expect("full signaling outbox wedged teardown")
-            .unwrap();
-        assert_eq!(sessions.resident_session_count().await, 0);
         let sentinel = out_rx.recv().await.expect("sentinel frame");
         assert_eq!(sentinel.as_str(), r#"{"type":"sentinel"}"#);
-        assert!(matches!(
-            out_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-
-        let replacement_pc = Arc::new(
-            api.new_peer_connection(RTCConfiguration::default())
-                .await
-                .unwrap(),
-        );
-        let replacement_active = Arc::new(AtomicBool::new(true));
-        let replacement_channels = Arc::new(RequiredSessionChannels::default());
-        let replacement_fence = Arc::new(tokio::sync::RwLock::new(()));
-        sessions.peers.lock().await.insert(
-            signal_id.to_string(),
-            RtcPeer {
-                pc: Arc::clone(&replacement_pc),
-                session,
-                generation: "replacement-generation".to_string(),
-                active: Arc::clone(&replacement_active),
-                control,
-                channels: Arc::clone(&replacement_channels),
-                close: Arc::new(PeerCloseCoordinator::default()),
-                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
-                fence: replacement_fence,
-            },
-        );
-        let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
-        let replacement_nonce = "c".repeat(32);
-        assert!(
-            sessions
-                .send_session_peer_status(
-                    &replacement_tx,
-                    signal_id,
-                    "replacement-generation",
-                    &replacement_pc,
-                    &replacement_active,
-                    &replacement_channels,
-                    &replacement_nonce,
-                    session_id,
-                    "connected",
-                    None,
-                )
-                .await
-        );
-        let replacement_status = replacement_rx.recv().await.expect("replacement status");
-        let replacement_status: serde_json::Value =
-            serde_json::from_str(replacement_status.as_str()).unwrap();
-        assert_eq!(replacement_status["binding_nonce"], replacement_nonce);
+        sessions.reannounce_live_statuses().await;
+        let deferred = out_rx.recv().await.expect("deferred status");
+        let deferred: serde_json::Value = serde_json::from_str(deferred.as_str()).unwrap();
+        assert_eq!(deferred["binding_nonce"], old_nonce);
+        assert!(active.load(Ordering::Acquire));
         sessions.close_all().await;
     }
 
@@ -5332,6 +6161,9 @@ mod tests {
                 control: old_control,
                 channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::new(PeerCloseCoordinator::default()),
+                offer_key: None,
+                remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+                restart_lock: Arc::new(Mutex::new(())),
                 _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
             },
@@ -5379,6 +6211,9 @@ mod tests {
                 control: replacement_control,
                 channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::new(PeerCloseCoordinator::default()),
+                offer_key: None,
+                remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+                restart_lock: Arc::new(Mutex::new(())),
                 _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
             },
@@ -5440,94 +6275,150 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_control_close_uses_one_upload_deadline_and_isolates_replacement() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session_id = Uuid::new_v4();
-        let registry = SessionRegistry::new();
-        let (old_session, _old_worker_commands) =
-            insert_test_worker_at(&registry, session_id, tmp.path());
-        let sessions = RtcSessions::new();
-        let mut client =
-            connect_rtc_session(&sessions, &registry, session_id, "rtc-close-stall", "old").await;
-        let abandoned_id = Uuid::new_v4();
-        let abandoned = b"must-not-publish";
-        let ready = start_real_upload(&mut client, abandoned_id, "abandoned.bin", abandoned).await;
-        assert_eq!(ready["state"], "ready");
-        sessions.uploads.arm_cleanup_pause_for_test();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let session_id = Uuid::new_v4();
+            let registry = SessionRegistry::new();
+            let (old_session, _old_worker_commands) =
+                insert_test_worker_at(&registry, session_id, tmp.path());
+            let sessions = RtcSessions::new();
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(10),
+                connect_rtc_session(&sessions, &registry, session_id, "rtc-close-stall", "old"),
+            )
+            .await
+            .expect("initial RTC session did not connect within 10 seconds");
+            let abandoned_id = Uuid::new_v4();
+            let abandoned = b"must-not-publish";
+            let ready = tokio::time::timeout(
+                Duration::from_secs(10),
+                start_real_upload(&mut client, abandoned_id, "abandoned.bin", abandoned),
+            )
+            .await
+            .expect("abandoned upload did not become ready within 10 seconds");
+            assert_eq!(ready["state"], "ready");
+            let mut cleanup_pause = UploadCleanupPauseGuard::arm(sessions.uploads.clone());
 
-        client.ctl.close().await.expect("close real spawn.ctl");
-        sessions.uploads.wait_cleanup_pause_for_test().await;
-        assert_eq!(sessions.uploads.retained_counts().await, (1, 0));
-        assert!(sessions.uploads.operation_count() >= 1);
-        let closed = tokio::time::timeout(Duration::from_millis(150), async {
-            while sessions.resident_session_count().await != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        if closed.is_err() {
-            sessions.uploads.release_cleanup_pause_for_test();
-            panic!("control close consumed more than one upload teardown deadline");
-        }
-        assert!(!tmp.path().join("abandoned.bin").exists());
-
-        let (replacement, _replacement_worker_commands) =
-            insert_test_worker_at(&registry, session_id, tmp.path());
-        assert_ne!(old_session, replacement);
-        let mut replacement_client = connect_rtc_session(
-            &sessions,
-            &registry,
-            session_id,
-            "rtc-close-stall",
-            "replacement",
-        )
-        .await;
-        let replacement_id = Uuid::new_v4();
-        let replacement_bytes = b"replacement-only";
-        let replacement_ready = start_real_upload(
-            &mut replacement_client,
-            replacement_id,
-            "replacement.bin",
-            replacement_bytes,
-        )
-        .await;
-        assert_eq!(replacement_ready["state"], "ready");
-        send_real_upload_chunks(&replacement_client, replacement_id, replacement_bytes).await;
-        let replacement_complete =
-            next_ctl_json_for(&mut replacement_client.ctl_messages, replacement_id).await;
-        assert_eq!(replacement_complete["state"], "complete");
-        assert_eq!(
-            std::fs::read(tmp.path().join("replacement.bin")).unwrap(),
-            replacement_bytes
-        );
-        assert_eq!(sessions.uploads.retained_counts().await, (1, 1));
-
-        sessions.uploads.release_cleanup_pause_for_test();
-        assert!(
-            sessions
-                .uploads
-                .wait_for_operations(tokio::time::Instant::now() + Duration::from_secs(5))
+            tokio::time::timeout(Duration::from_secs(10), client.ctl.close())
                 .await
-        );
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while sessions.peer_cleanup_task_count().await != 0 {
-                tokio::task::yield_now().await;
+                .expect("closing the original spawn.ctl exceeded 10 seconds")
+                .expect("close real spawn.ctl");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                sessions.uploads.wait_cleanup_pause_for_test(),
+            )
+            .await
+            .expect("control close did not reach the upload cleanup pause within 10 seconds");
+            assert_eq!(sessions.uploads.retained_counts().await, (1, 0));
+            assert!(sessions.uploads.operation_count() >= 1);
+            let closed = tokio::time::timeout(Duration::from_millis(150), async {
+                while sessions.resident_session_count().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if closed.is_err() {
+                cleanup_pause.release();
+                panic!("control close consumed more than one upload teardown deadline");
             }
+            assert!(!tmp.path().join("abandoned.bin").exists());
+
+            let (replacement, _replacement_worker_commands) =
+                insert_test_worker_at(&registry, session_id, tmp.path());
+            assert_ne!(old_session, replacement);
+            let mut replacement_client = tokio::time::timeout(
+                Duration::from_secs(10),
+                connect_rtc_session(
+                    &sessions,
+                    &registry,
+                    session_id,
+                    "rtc-close-stall",
+                    "replacement",
+                ),
+            )
+            .await
+            .expect("replacement RTC session did not connect within 10 seconds");
+            let replacement_id = Uuid::new_v4();
+            let replacement_bytes = b"replacement-only";
+            let replacement_ready = tokio::time::timeout(
+                Duration::from_secs(10),
+                start_real_upload(
+                    &mut replacement_client,
+                    replacement_id,
+                    "replacement.bin",
+                    replacement_bytes,
+                ),
+            )
+            .await
+            .expect("replacement upload did not become ready within 10 seconds");
+            assert_eq!(replacement_ready["state"], "ready");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                send_real_upload_chunks(&replacement_client, replacement_id, replacement_bytes),
+            )
+            .await
+            .expect("replacement upload chunks did not send within 10 seconds");
+            let replacement_complete = tokio::time::timeout(
+                Duration::from_secs(10),
+                next_ctl_json_for(&mut replacement_client.ctl_messages, replacement_id),
+            )
+            .await
+            .expect("replacement upload did not complete within 10 seconds");
+            assert_eq!(replacement_complete["state"], "complete");
+            assert_eq!(
+                std::fs::read(tmp.path().join("replacement.bin")).unwrap(),
+                replacement_bytes
+            );
+            assert_eq!(sessions.uploads.retained_counts().await, (1, 1));
+
+            cleanup_pause.release();
+            assert!(
+                sessions
+                    .uploads
+                    .wait_for_operations(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await,
+                "original upload operations did not drain within 5 seconds"
+            );
+            // webrtc-rs may retain the server's graceful SCTP close until the
+            // remote peer settles. The stale browser fixture has finished all
+            // assertions, so let transport cleanup complete before counting tasks.
+            tokio::time::timeout(Duration::from_secs(10), close_test_peer(&client.pc))
+                .await
+                .expect("original RTC peer did not close within 10 seconds");
+            let cleanup_timeout = Duration::from_secs(15);
+            tokio::time::timeout(cleanup_timeout, async {
+                while sessions.peer_cleanup_task_count().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("tracked peer cleanup task did not drain");
+            assert_eq!(sessions.uploads.retained_counts().await, (0, 1));
+            assert!(!tmp.path().join("abandoned.bin").exists());
+            assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("spawn-upload")));
+
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                sessions.close("rtc-close-stall", "replacement", session_id),
+            )
+            .await
+            .expect("replacement server peer did not close within 10 seconds");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                close_test_peer(&replacement_client.pc),
+            )
+            .await
+            .expect("replacement client peer did not close within 10 seconds");
+            tokio::time::timeout(Duration::from_secs(10), close_test_peer(&client.pc))
+                .await
+                .expect("original client peer did not close within 10 seconds");
         })
         .await
-        .expect("tracked peer cleanup task did not drain");
-        assert_eq!(sessions.uploads.retained_counts().await, (0, 1));
-        assert!(!tmp.path().join("abandoned.bin").exists());
-        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("spawn-upload")));
-
-        sessions
-            .close("rtc-close-stall", "replacement", session_id)
-            .await;
-        close_test_peer(&replacement_client.pc).await;
-        close_test_peer(&client.pc).await;
+        .expect("real control-close fixture exceeded its 45-second overall deadline");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5549,6 +6440,16 @@ mod tests {
         assert!(!tmp.path().join("once.bin").exists());
 
         stale.ctl.close().await.expect("close stale real spawn.ctl");
+        let stale_peer_close = {
+            // webrtc-rs can serialize the remote DataChannel close callback
+            // behind the deliberately paused message callback.
+            // Closing the peer supplies the independent endpoint-loss signal
+            // while retaining the test's paused final-commit race.
+            let pc = Arc::clone(&stale.pc);
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), pc.close()).await;
+            })
+        };
         let stale_disabled = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let active = sessions
@@ -5566,6 +6467,7 @@ mod tests {
         .await;
         sessions.uploads.release_commit_pause_for_test();
         stale_disabled.expect("stale control close did not disable endpoint effects");
+        stale_peer_close.await.expect("close stale RTC peer");
         wait_for_resident_sessions(&sessions, 0).await;
         assert!(
             sessions
@@ -5812,8 +6714,14 @@ mod tests {
         .expect("RTC viewer cleanup timed out");
 
         let stall_gate = sessions.stall_first_pty_send("rtc-stalled").await;
-        let stalled =
-            connect_rtc_session(&sessions, &registry, session_id, "rtc-stalled", "generation").await;
+        let stalled = connect_rtc_session(
+            &sessions,
+            &registry,
+            session_id,
+            "rtc-stalled",
+            "generation",
+        )
+        .await;
         let stalled_viewer = viewer_id("rtc-stalled", "generation");
         assert!(
             control
@@ -5831,7 +6739,9 @@ mod tests {
         .await
         .expect("stalled RTC PTY viewer was not disconnected");
         stall_gate.notify_one();
-        sessions.close("rtc-stalled", "generation", session_id).await;
+        sessions
+            .close("rtc-stalled", "generation", session_id)
+            .await;
         close_test_peer(&stalled.pc).await;
         assert_eq!(sessions.resident_session_count().await, 0);
         worker.abort();
@@ -5842,12 +6752,29 @@ mod tests {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
         let session_id = Uuid::new_v4();
+        #[cfg(unix)]
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             "exec cat".to_string(),
         ];
+        #[cfg(windows)]
+        let argv = vec![
+            std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/d".to_string(),
+        ];
+        #[cfg(unix)]
+        let cwd = "/".to_string();
+        #[cfg(windows)]
+        let cwd = std::env::current_dir()
+            .expect("current worker test directory")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(unix)]
         let mut env = std::collections::BTreeMap::new();
+        #[cfg(windows)]
+        let mut env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+        #[cfg(unix)]
         env.insert(
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
@@ -5856,14 +6783,26 @@ mod tests {
 
         let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
             session_id,
-            cwd: "/",
+            cwd: &cwd,
             cols: 80,
             rows: 24,
             argv: &argv,
             env: &env,
         })
-        .await
-        .expect("launch cleanup-guard worker");
+        .await;
+        #[cfg(windows)]
+        let launched = match launched {
+            Ok(launched) => launched,
+            Err(error) if test_runner_denied_worker_breakaway(&error) => {
+                eprintln!(
+                    "skipping real worker cleanup-guard case: the test runner job denies worker breakaway"
+                );
+                return;
+            }
+            Err(error) => panic!("launch cleanup-guard worker: {error:#}"),
+        };
+        #[cfg(not(windows))]
+        let launched = launched.expect("launch cleanup-guard worker");
         let crate::pty::Launched {
             handle, exit_rx, ..
         } = launched;
@@ -5891,12 +6830,31 @@ mod tests {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
         let session_id = Uuid::new_v4();
+        #[cfg(unix)]
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             "printf 'rtc-worker-ready\\n'; exec cat".to_string(),
         ];
+        #[cfg(windows)]
+        let argv = vec![
+            std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/d".to_string(),
+            "/k".to_string(),
+            "echo rtc-worker-ready".to_string(),
+        ];
+        #[cfg(unix)]
+        let cwd = "/".to_string();
+        #[cfg(windows)]
+        let cwd = std::env::current_dir()
+            .expect("current worker test directory")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(unix)]
         let mut env = std::collections::BTreeMap::new();
+        #[cfg(windows)]
+        let mut env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+        #[cfg(unix)]
         env.insert(
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
@@ -5905,14 +6863,26 @@ mod tests {
 
         let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
             session_id,
-            cwd: "/",
+            cwd: &cwd,
             cols: 80,
             rows: 24,
             argv: &argv,
             env: &env,
         })
-        .await
-        .expect("launch real worker");
+        .await;
+        #[cfg(windows)]
+        let launched = match launched {
+            Ok(launched) => launched,
+            Err(error) if test_runner_denied_worker_breakaway(&error) => {
+                eprintln!(
+                    "skipping real worker RTC case: the test runner job denies worker breakaway"
+                );
+                return;
+            }
+            Err(error) => panic!("launch real worker: {error:#}"),
+        };
+        #[cfg(not(windows))]
+        let launched = launched.expect("launch real worker");
         let crate::pty::Launched {
             handle,
             exit_rx: initial_exit_rx,
@@ -5989,7 +6959,9 @@ mod tests {
         let old_handle = registry
             .remove_if_generation(session_id, old.generation())
             .expect("remove launch binding");
-        sessions.close_for_session(session_id, old.generation()).await;
+        sessions
+            .close_for_session(session_id, old.generation())
+            .await;
         drop(transition);
         drop(old_handle);
         drop(initial_exit_rx);
@@ -6140,6 +7112,9 @@ mod tests {
                 ),
                 String::new(),
                 Vec::new(),
+                None,
+                false,
+                None,
                 registry.clone(),
                 status_tx,
                 None,
@@ -6294,6 +7269,9 @@ mod tests {
                     ),
                     offer_sdp,
                     Vec::new(),
+                    None,
+                    false,
+                    None,
                     offer_registry,
                     out_tx,
                     None,
@@ -6307,7 +7285,9 @@ mod tests {
         assert!(registry
             .remove_if_generation(session_id, old.generation())
             .is_some());
-        sessions.close_for_session(session_id, old.generation()).await;
+        sessions
+            .close_for_session(session_id, old.generation())
+            .await;
         let (current, _current_commands) = insert_test_worker(&registry, session_id);
         drop(transition);
         offer_task.await.unwrap();
@@ -6371,6 +7351,9 @@ mod tests {
                 ),
                 offer_sdp,
                 Vec::new(),
+                None,
+                false,
+                None,
                 registry.clone(),
                 out_tx,
                 None,
@@ -6382,7 +7365,9 @@ mod tests {
         assert!(registry
             .remove_if_generation(session_id, old.generation())
             .is_some());
-        sessions.close_for_session(session_id, old.generation()).await;
+        sessions
+            .close_for_session(session_id, old.generation())
+            .await;
         let (current, _current_commands) = insert_test_worker(&registry, session_id);
         drop(transition);
 
@@ -6434,6 +7419,9 @@ mod tests {
                     control: old_control,
                     channels: old_channels,
                     close: Arc::new(PeerCloseCoordinator::default()),
+                    offer_key: None,
+                    remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+                    restart_lock: Arc::new(Mutex::new(())),
                     _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                     fence: Arc::clone(&old_fence),
                 },
@@ -6448,6 +7436,9 @@ mod tests {
                     control: current_control,
                     channels: current_channels,
                     close: Arc::new(PeerCloseCoordinator::default()),
+                    offer_key: None,
+                    remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+                    restart_lock: Arc::new(Mutex::new(())),
                     _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                     fence: current_fence,
                 },
@@ -6628,10 +7619,13 @@ mod tests {
             session_id,
         )
         .is_none());
-        assert!(
-            RtcSignalBinding::from_server("session".to_string(), "b".repeat(32), 0, session_id,)
-                .is_none()
-        );
+        assert!(RtcSignalBinding::from_server(
+            "session".to_string(),
+            "b".repeat(32),
+            0,
+            session_id,
+        )
+        .is_none());
         assert!(RtcSignalBinding::from_server(
             "session".to_string(),
             "b".repeat(32),
@@ -6647,12 +7641,22 @@ mod tests {
         let valid = HostRtcSignal {
             signal_id: "host-session".to_string(),
             binding_nonce: Some("c".repeat(32)),
+            binding_generation: Some(9),
             scope_type: Some("host".to_string()),
             scope_id: Some(host_id),
             protocol: Some(HOST_CONTROL_LABEL.to_string()),
             protocol_version: Some(RTC_PROTOCOL_VERSION),
         };
         assert_eq!(valid.binding().unwrap().host_id, host_id);
+        assert_eq!(valid.binding().unwrap().binding_generation, 9);
+
+        let mut legacy = valid.clone();
+        legacy.binding_generation = None;
+        assert_eq!(legacy.binding().unwrap().binding_generation, 0);
+
+        let mut invalid_generation = valid.clone();
+        invalid_generation.binding_generation = Some(MAX_SAFE_SIGNAL_GENERATION + 1);
+        assert!(invalid_generation.binding().is_none());
 
         let mut invalid = valid.clone();
         invalid.scope_type = Some("session".to_string());
@@ -6718,6 +7722,105 @@ mod tests {
         assert!(parse_ice_transport_policy(Some("unknown")).is_err());
     }
 
+    #[test]
+    fn network_policy_drops_link_local_and_virtual_noise_but_keeps_vpns() {
+        for interface in [
+            "docker0", "br-123", "veth4", "awdl0", "llw0", "anpi1", "bridge0", "vmnet8", "virbr0",
+            "ztabc", "lo",
+        ] {
+            assert!(!interface_is_allowed(interface), "{interface}");
+        }
+        for interface in ["en0", "eth0", "utun4", "wg0", "tailscale0"] {
+            assert!(interface_is_allowed(interface), "{interface}");
+        }
+
+        assert!(!ip_is_allowed("169.254.10.20".parse().unwrap()));
+        assert!(ip_is_allowed("169.255.10.20".parse().unwrap()));
+        assert!(!ip_is_allowed("fe80::1".parse().unwrap()));
+        assert!(!ip_is_allowed("febf::1".parse().unwrap()));
+        assert!(ip_is_allowed("fec0::1".parse().unwrap()));
+
+        let config = |urls: &[&str]| RtcIceServerConfig {
+            urls: urls.iter().map(|url| (*url).to_string()).collect(),
+            username: None,
+            credential: None,
+        };
+        assert!(has_udp_turn(&[config(&[
+            "turn:relay.test:3478?transport=udp"
+        ])]));
+        assert!(has_udp_turn(&[config(&["turn:relay.test:3478"])]));
+        assert!(!has_udp_turn(&[config(&[
+            "turn:relay.test:3478?transport=tcp"
+        ])]));
+        assert!(!has_udp_turn(&[config(&["turns:relay.test:5349"])]));
+    }
+
+    #[test]
+    fn ice_restart_ufrag_parser_rejects_replays_and_accepts_new_generations() {
+        let initial = ice_ufrag("v=0\r\na=ice-ufrag:first\r\n").unwrap();
+        assert_eq!(initial, "first");
+        assert!(ice_ufrag("v=0\r\n").is_none());
+
+        let seen = HashSet::from([initial]);
+        assert!(!restart_ufrag_is_fresh(&seen, "first"));
+        assert!(restart_ufrag_is_fresh(&seen, "second"));
+
+        let key = Some([7; 32]);
+        assert!(restart_offer_is_acceptable(
+            true, true, true, key, key, true
+        ));
+        for rejected in [
+            restart_offer_is_acceptable(false, true, true, key, key, true),
+            restart_offer_is_acceptable(true, false, true, key, key, true),
+            restart_offer_is_acceptable(true, true, false, key, key, true),
+            restart_offer_is_acceptable(true, true, true, key, None, true),
+            restart_offer_is_acceptable(true, true, true, key, Some([8; 32]), true),
+            restart_offer_is_acceptable(true, true, true, key, key, false),
+        ] {
+            assert!(!rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn pacing_loop_waits_for_a_fake_channel_to_drain_and_stops_if_closed() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex as StdMutex;
+
+        let amounts = Arc::new(StdMutex::new(VecDeque::from([
+            DATA_CHANNEL_BUFFER_HIGH + 1,
+            DATA_CHANNEL_BUFFER_HIGH,
+            DATA_CHANNEL_BUFFER_HIGH - 1,
+        ])));
+        let waits = Arc::new(AtomicUsize::new(0));
+        let drained = wait_for_pacing_capacity(
+            || true,
+            {
+                let amounts = Arc::clone(&amounts);
+                move || std::future::ready(amounts.lock().unwrap().pop_front().unwrap_or_default())
+            },
+            {
+                let waits = Arc::clone(&waits);
+                move || {
+                    waits.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(())
+                }
+            },
+        )
+        .await;
+        assert!(drained);
+        assert_eq!(waits.load(Ordering::Relaxed), 2);
+
+        assert!(
+            !wait_for_pacing_capacity(
+                || false,
+                || std::future::ready(0),
+                || std::future::ready(())
+            )
+            .await
+        );
+    }
+
     #[tokio::test]
     async fn daemon_host_identity_binds_without_a_session_and_cannot_be_rebound() {
         let sessions = RtcSessions::new();
@@ -6754,12 +7857,14 @@ mod tests {
         let source_binding = HostRtcBinding {
             host_id: source_host_id,
             binding_nonce: "a".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
         let destination_binding = HostRtcBinding {
             host_id: destination_host_id,
             binding_nonce: "b".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -6936,6 +8041,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "d".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -6971,6 +8077,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "e".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -7007,6 +8114,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "9".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -7079,6 +8187,7 @@ mod tests {
             let binding = HostRtcBinding {
                 host_id: Uuid::new_v4(),
                 binding_nonce: "4".repeat(32),
+                binding_generation: 1,
                 protocol: HOST_CONTROL_LABEL.to_string(),
                 protocol_version: RTC_PROTOCOL_VERSION,
             };
@@ -7109,6 +8218,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "e".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -7172,6 +8282,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "f".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -7253,6 +8364,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "0".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -7381,6 +8493,7 @@ mod tests {
             let binding = HostRtcBinding {
                 host_id: Uuid::new_v4(),
                 binding_nonce: "1".repeat(32),
+                binding_generation: 1,
                 protocol: HOST_CONTROL_LABEL.to_string(),
                 protocol_version: RTC_PROTOCOL_VERSION,
             };
@@ -7480,6 +8593,7 @@ mod tests {
             let binding = HostRtcBinding {
                 host_id: Uuid::new_v4(),
                 binding_nonce: "2".repeat(32),
+                binding_generation: 1,
                 protocol: HOST_CONTROL_LABEL.to_string(),
                 protocol_version: RTC_PROTOCOL_VERSION,
             };
@@ -7555,6 +8669,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "3".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -7636,6 +8751,7 @@ mod tests {
             let binding = HostRtcBinding {
                 host_id: Uuid::new_v4(),
                 binding_nonce: "c".repeat(32),
+                binding_generation: 1,
                 protocol: HOST_CONTROL_LABEL.to_string(),
                 protocol_version: RTC_PROTOCOL_VERSION,
             };
@@ -7756,14 +8872,36 @@ mod tests {
             .await
             .unwrap();
         let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let write_hooks = files.write_lifecycle_test_hooks();
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "d".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
         let (browser_pc, daemon_pc, channel, mut messages) =
             paired_host_endpoint(files, binding, "stalled-write-control-paths").await;
+
+        // Establish the write stream before either read can publish chunks.
+        // This request is setup, not part of the fast-path ordering under test.
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "stalled-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "stalled-write.bin",
+                "length": 1,
+                "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let write_stream_id = write["result"]["stream_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("write setup did not return a stream id: {write}"));
 
         let ack_read = request_host_control(
             &channel,
@@ -7795,21 +8933,6 @@ mod tests {
             assert_eq!(chunk["sequence"], sequence);
         }
 
-        let write = request_host_control(
-            &channel,
-            &mut messages,
-            "stalled-write",
-            "fs.write.begin",
-            json!({
-                "dir": "~",
-                "name": "stalled-write.bin",
-                "length": 1,
-                "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
-                "overwrite": false,
-            }),
-        )
-        .await;
-        let write_stream_id = write["result"]["stream_id"].as_str().unwrap();
         channel
             .send_text(
                 json!({
@@ -7824,7 +8947,12 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            write_hooks.wait_write_delay_entered(),
+        )
+        .await
+        .expect("stalled write chunk did not enter its delayed normal path");
 
         for frame in [
             json!({
@@ -7942,6 +9070,7 @@ mod tests {
         let binding = HostRtcBinding {
             host_id,
             binding_nonce: "d".repeat(32),
+            binding_generation: 1,
             protocol: HOST_CONTROL_LABEL.to_string(),
             protocol_version: RTC_PROTOCOL_VERSION,
         };
@@ -7957,11 +9086,13 @@ mod tests {
         .await
         .unwrap();
         let files = Arc::new(HostFileService::rooted_at(file_root.path()).await.unwrap());
+        let signaling = RtcWsSender::default();
+        signaling.install(out_tx);
         install_host_data_channel_handler(
             &daemon_pc,
             "host-e2e".to_string(),
             binding,
-            out_tx,
+            signaling,
             Some(Arc::clone(&files)),
         );
 

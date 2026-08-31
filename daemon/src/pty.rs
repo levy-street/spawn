@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use spawnd::sessiond::wire;
+#[cfg(unix)]
 use tokio::net::UnixDatagram;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
@@ -26,24 +27,157 @@ use crate::activity;
 use crate::proto::Outbound;
 
 #[derive(Clone, Debug)]
-pub struct WsOutbound(String);
+enum WsOutboundKind {
+    Text(String),
+    Ping,
+    Close,
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, PipeMode};
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+    async fn open_silent_client(name: &std::ffi::OsStr) -> NamedPipeClient {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match ClientOptions::new().pipe_mode(PipeMode::Message).open(name) {
+                Ok(client) => return client,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("opening silent lifecycle client failed: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_survives_all_silent_handler_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("workers");
+        spawnd::sessiond::endpoint::ensure_private_dir(&dir).unwrap();
+        let endpoint = spawnd::sessiond::endpoint::endpoint_for(&dir, "", Uuid::new_v4()).unwrap();
+        let reservation = match spawnd::sessiond::endpoint::try_reserve(&endpoint).unwrap() {
+            spawnd::sessiond::endpoint::LockAttempt::Acquired(reservation) => reservation,
+            spawnd::sessiond::endpoint::LockAttempt::Busy => {
+                panic!("new lifecycle reservation was busy")
+            }
+        };
+        let spawnd::sessiond::endpoint::BoundWorkerEndpoints {
+            main: _main,
+            mut lifecycle,
+            identity: _identity,
+        } = spawnd::sessiond::endpoint::bind_worker(&endpoint, &reservation, Uuid::new_v4())
+            .unwrap();
+        let mut silent = Vec::new();
+        for _ in 0..7 {
+            silent.push(open_silent_client(endpoint.lifecycle_arg()).await);
+            tokio::task::yield_now().await;
+        }
+
+        let instance = Uuid::new_v4();
+        let responder = tokio::spawn(async move {
+            let exchange = spawnd::sessiond::endpoint::receive_lifecycle(&mut lifecycle)
+                .await
+                .unwrap();
+            let (request, len) = exchange.request();
+            assert_eq!(len, spawnd::sessiond::wire::LIFECYCLE_REQUEST_LEN);
+            let request: &[u8; spawnd::sessiond::wire::LIFECYCLE_REQUEST_LEN] =
+                request.try_into().unwrap();
+            let (received_instance, signal) =
+                spawnd::sessiond::wire::decode_lifecycle_request(request).unwrap();
+            assert_eq!(received_instance, instance);
+            assert_eq!(signal, spawnd::sessiond::wire::LifecycleSignal::Term);
+            spawnd::sessiond::endpoint::acknowledge_lifecycle(
+                &mut lifecycle,
+                exchange,
+                spawnd::sessiond::wire::LIFECYCLE_ACK_DELIVERED,
+            )
+            .await
+            .unwrap();
+        });
+        let started = tokio::time::Instant::now();
+        SessionLifecycle::new(endpoint, instance)
+            .shutdown(spawnd::sessiond::wire::LifecycleSignal::Term)
+            .await
+            .unwrap();
+        assert!(started.elapsed() <= LIFECYCLE_DELIVERY_TIMEOUT + Duration::from_millis(500));
+        responder.await.unwrap();
+        drop(silent);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WsOutbound {
+    kind: WsOutboundKind,
+    flushed: Option<Arc<Notify>>,
+}
 
 impl WsOutbound {
     pub(crate) fn json(text: String) -> Self {
-        Self(text)
+        Self {
+            kind: WsOutboundKind::Text(text),
+            flushed: None,
+        }
     }
 
-    pub(crate) fn into_text(mut self) -> String {
-        std::mem::take(&mut self.0)
+    pub(crate) fn tracked_json(text: String) -> (Self, Arc<Notify>) {
+        let flushed = Arc::new(Notify::new());
+        (
+            Self {
+                kind: WsOutboundKind::Text(text),
+                flushed: Some(Arc::clone(&flushed)),
+            },
+            flushed,
+        )
+    }
+
+    pub(crate) fn tracked_close() -> (Self, Arc<Notify>) {
+        let flushed = Arc::new(Notify::new());
+        (
+            Self {
+                kind: WsOutboundKind::Close,
+                flushed: Some(Arc::clone(&flushed)),
+            },
+            flushed,
+        )
+    }
+
+    pub(crate) fn ping() -> Self {
+        Self {
+            kind: WsOutboundKind::Ping,
+            flushed: None,
+        }
+    }
+
+    pub(crate) fn into_parts(mut self) -> (Option<String>, bool, bool, Option<Arc<Notify>>) {
+        let kind = std::mem::replace(&mut self.kind, WsOutboundKind::Close);
+        let flushed = self.flushed.take();
+        match kind {
+            WsOutboundKind::Text(text) => (Some(text), false, false, flushed),
+            WsOutboundKind::Ping => (None, true, false, flushed),
+            WsOutboundKind::Close => (None, false, true, flushed),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        match &self.kind {
+            WsOutboundKind::Text(text) => text,
+            WsOutboundKind::Ping => "",
+            WsOutboundKind::Close => "",
+        }
     }
 
     pub(crate) fn wipe(&mut self) {
-        self.0.zeroize();
+        if let WsOutboundKind::Text(text) = &mut self.kind {
+            text.zeroize();
+        }
     }
 }
 
@@ -57,14 +191,14 @@ impl Drop for WsOutbound {
 /// route to the current connection.
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type DirectWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Plaintext owned by a bounded direct-viewer queue. It wipes itself whether
 /// consumed normally, rejected by a full queue, or drained during teardown.
 pub struct DirectPayload {
     bytes: Vec<u8>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wipe_probe: Option<DirectWipeProbe>,
 }
 
@@ -72,12 +206,12 @@ impl DirectPayload {
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wipe_probe: None,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_wipe_probe(bytes: Vec<u8>, wipe_probe: DirectWipeProbe) -> Self {
         Self {
             bytes,
@@ -112,7 +246,7 @@ impl<const N: usize> PartialEq<&[u8; N]> for DirectPayload {
 impl Drop for DirectPayload {
     fn drop(&mut self) {
         self.bytes.as_mut_slice().zeroize();
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe(&self.bytes);
         }
@@ -124,6 +258,8 @@ impl Drop for DirectPayload {
 pub struct DirectSinkReceiver {
     pub receiver: mpsc::Receiver<DirectPayload>,
     pub disconnected: watch::Receiver<bool>,
+    pub gap_offset: Arc<AtomicU64>,
+    pub source_origin: u64,
 }
 
 /// One committed-history event fanned out to a viewer: either a batch of
@@ -270,7 +406,11 @@ fn activity_message(session_id: Uuid, kind: ActivityKind) -> Option<WsOutbound> 
 
 /// Best-effort emission used by the WebRTC input callback. The sink accepts
 /// serialized control-plane JSON only; it has no terminal-byte variant.
-pub(crate) fn try_emit_activity(out_tx: &SessionSink, session_id: Uuid, kind: ActivityKind) -> bool {
+pub(crate) fn try_emit_activity(
+    out_tx: &SessionSink,
+    session_id: Uuid,
+    kind: ActivityKind,
+) -> bool {
     let Some(message) = activity_message(session_id, kind) else {
         return false;
     };
@@ -286,6 +426,7 @@ struct DirectSinkEntry {
     disconnected: watch::Sender<bool>,
     source_origin: u64,
     bytes_sent: Arc<AtomicU64>,
+    gap_offset: Arc<AtomicU64>,
 }
 
 /// Shared between a session's forwarder task and the WS connection lifecycle.
@@ -370,7 +511,9 @@ impl ForwarderControl {
             let now = Instant::now();
             let wait = state
                 .last_emit_at
-                .map(|last| FOREGROUND_MIN_INTERVAL.saturating_sub(now.saturating_duration_since(last)))
+                .map(|last| {
+                    FOREGROUND_MIN_INTERVAL.saturating_sub(now.saturating_duration_since(last))
+                })
                 .unwrap_or(Duration::ZERO);
             if wait.is_zero() {
                 if state.emitted.as_deref() == Some(command.as_str()) {
@@ -478,7 +621,7 @@ impl ForwarderControl {
     /// outside the throttle window, not suppressed, and carrying meaningful
     /// content. Records the emit time on success. Mirrors the former
     /// server-side classifier, now content-free on the wire.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn note_output_at(&self, now: Instant, chunk: &[u8]) -> bool {
         self.classify_output_at(now, chunk).activity
     }
@@ -594,10 +737,15 @@ impl ForwarderControl {
     /// DataChannel. These sinks receive raw PTY output bytes without the
     /// daemon->server->browser relay hop.
     pub async fn add_direct_sink(&self, id: String) -> DirectSinkReceiver {
+        let source_origin = self.source_offset.load(Ordering::Acquire);
+        self.add_direct_sink_from(id, source_origin).await
+    }
+
+    pub async fn add_direct_sink_from(&self, id: String, source_origin: u64) -> DirectSinkReceiver {
         let (sink, receiver) = mpsc::channel(DIRECT_SINK_QUEUE_DEPTH);
         let (disconnected, disconnected_rx) = watch::channel(false);
+        let gap_offset = Arc::new(AtomicU64::new(0));
         let mut sinks = self.direct_sinks.lock().await;
-        let source_origin = self.source_offset.load(Ordering::Acquire);
         let previous = sinks.insert(
             id,
             DirectSinkEntry {
@@ -605,6 +753,7 @@ impl ForwarderControl {
                 disconnected,
                 source_origin,
                 bytes_sent: Arc::new(AtomicU64::new(0)),
+                gap_offset: Arc::clone(&gap_offset),
             },
         );
         if let Some(previous) = previous {
@@ -615,6 +764,8 @@ impl ForwarderControl {
         DirectSinkReceiver {
             receiver,
             disconnected: disconnected_rx,
+            gap_offset,
+            source_origin,
         }
     }
 
@@ -711,6 +862,10 @@ impl ForwarderControl {
             // safely reconcile this live stream. Disconnect every current
             // sink; reconnect performs a bounded replay from a new origin.
             for entry in sinks.values() {
+                entry.gap_offset.store(
+                    source_end.saturating_sub(entry.source_origin),
+                    Ordering::Release,
+                );
                 let _ = entry.disconnected.send(true);
             }
             sinks.clear();
@@ -726,6 +881,10 @@ impl ForwarderControl {
                     .try_send(DirectPayload::new(part.to_vec()))
                     .is_err()
                 {
+                    entry.gap_offset.store(
+                        source_end.saturating_sub(entry.source_origin),
+                        Ordering::Release,
+                    );
                     let _ = entry.disconnected.send(true);
                     return false;
                 }
@@ -743,7 +902,7 @@ impl ForwarderControl {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type ReplayWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Decrypted replay owned by spawnd. The bytes wipe on every drop path,
@@ -755,7 +914,7 @@ pub struct WorkerReplay {
     /// worker streams history deltas. The offset ends on a batch boundary, so
     /// a delta with exactly this start offset appends seamlessly.
     history_anchor: Option<(u64, u64)>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wipe_probe: Option<ReplayWipeProbe>,
 }
 
@@ -765,7 +924,7 @@ impl WorkerReplay {
             watermark,
             bytes,
             history_anchor: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wipe_probe: None,
         }
     }
@@ -775,7 +934,7 @@ impl WorkerReplay {
             watermark,
             bytes,
             history_anchor: Some(anchor),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wipe_probe: None,
         }
     }
@@ -792,7 +951,7 @@ impl WorkerReplay {
         &self.bytes
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_wipe_probe(
         watermark: u64,
         bytes: Vec<u8>,
@@ -820,7 +979,7 @@ impl std::fmt::Debug for WorkerReplay {
 impl Drop for WorkerReplay {
     fn drop(&mut self) {
         self.bytes.as_mut_slice().zeroize();
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe(&self.bytes);
         }
@@ -849,14 +1008,34 @@ pub enum WorkerCmd {
 
 #[derive(Clone)]
 pub struct SessionLifecycle {
-    socket: PathBuf,
+    target: SessionLifecycleTarget,
     instance_id: Uuid,
 }
 
+#[derive(Clone)]
+pub(crate) enum SessionLifecycleTarget {
+    Endpoint(spawnd::sessiond::endpoint::Endpoint),
+    // Compatibility for test fixtures outside the endpoint module. Production
+    // connections always carry the complete deterministic Endpoint.
+    LegacyPath(PathBuf),
+}
+
+impl From<spawnd::sessiond::endpoint::Endpoint> for SessionLifecycleTarget {
+    fn from(endpoint: spawnd::sessiond::endpoint::Endpoint) -> Self {
+        Self::Endpoint(endpoint)
+    }
+}
+
+impl From<PathBuf> for SessionLifecycleTarget {
+    fn from(path: PathBuf) -> Self {
+        Self::LegacyPath(path)
+    }
+}
+
 impl SessionLifecycle {
-    pub(crate) fn new(socket: PathBuf, instance_id: Uuid) -> Self {
+    pub(crate) fn new(target: impl Into<SessionLifecycleTarget>, instance_id: Uuid) -> Self {
         Self {
-            socket,
+            target: target.into(),
             instance_id,
         }
     }
@@ -864,70 +1043,95 @@ impl SessionLifecycle {
     pub async fn shutdown(&self, signal: wire::LifecycleSignal) -> Result<()> {
         let deadline = tokio::time::Instant::now() + LIFECYCLE_DELIVERY_TIMEOUT;
         let request = wire::encode_lifecycle_request(self.instance_id, signal);
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("worker lifecycle delivery deadline exceeded");
+        let ack = match &self.target {
+            SessionLifecycleTarget::Endpoint(endpoint) => {
+                spawnd::sessiond::endpoint::send_lifecycle(endpoint, &request, deadline).await?
             }
-            if spawnd::sessiond::endpoint::validate_private_socket(&self.socket).is_err() {
-                anyhow::bail!("worker lifecycle endpoint validation failed");
+            SessionLifecycleTarget::LegacyPath(socket) => {
+                send_lifecycle_legacy(socket, &request, deadline).await?
             }
-            let parent = self
-                .socket
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("worker lifecycle endpoint validation failed"))?;
-            let client_path = parent.join(format!(
-                ".lifecycle-client-{}-{}.sock",
-                std::process::id(),
-                Uuid::new_v4()
-            ));
-            let socket = UnixDatagram::bind(&client_path)
-                .map_err(|_| anyhow::anyhow!("worker lifecycle client unavailable"))?;
-            let _client_identity = spawnd::sessiond::endpoint::secure_bound_socket(&client_path)
-                .map_err(|_| anyhow::anyhow!("worker lifecycle client validation failed"))?;
-            if socket.connect(&self.socket).is_err() {
-                tokio::time::sleep_until(std::cmp::min(
-                    deadline,
-                    tokio::time::Instant::now() + Duration::from_millis(10),
-                ))
-                .await;
-                continue;
+        };
+        match ack {
+            wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
+            wire::LIFECYCLE_ACK_GONE => anyhow::bail!("session process already exited"),
+            wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
+                anyhow::bail!("worker lifecycle instance changed")
             }
-            match tokio::time::timeout_at(deadline, socket.send(&request)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {
-                    tokio::time::sleep_until(std::cmp::min(
-                        deadline,
-                        tokio::time::Instant::now() + Duration::from_millis(10),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(_) => anyhow::bail!("worker lifecycle delivery deadline exceeded"),
-            }
-            let mut ack = [0u8; 2];
-            let attempt_deadline = std::cmp::min(
-                deadline,
-                tokio::time::Instant::now() + Duration::from_millis(100),
-            );
-            let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
-            let Ok(Ok(1)) = received else {
-                tokio::time::sleep_until(std::cmp::min(
-                    deadline,
-                    tokio::time::Instant::now() + Duration::from_millis(10),
-                ))
-                .await;
-                continue;
-            };
-            return match ack[0] {
-                wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
-                wire::LIFECYCLE_ACK_GONE => anyhow::bail!("session process already exited"),
-                wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
-                    anyhow::bail!("worker lifecycle instance changed")
-                }
-                _ => anyhow::bail!("worker lifecycle delivery failed"),
-            };
+            _ => anyhow::bail!("worker lifecycle delivery failed"),
         }
     }
+}
+
+#[cfg(unix)]
+async fn send_lifecycle_legacy(
+    socket_path: &std::path::Path,
+    request: &[u8; wire::LIFECYCLE_REQUEST_LEN],
+    deadline: tokio::time::Instant,
+) -> Result<u8> {
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("worker lifecycle delivery deadline exceeded");
+        }
+        if spawnd::sessiond::endpoint::validate_private_socket(socket_path).is_err() {
+            anyhow::bail!("worker lifecycle endpoint validation failed");
+        }
+        let parent = socket_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("worker lifecycle endpoint validation failed"))?;
+        let client_path = parent.join(format!(
+            ".lifecycle-client-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let socket = UnixDatagram::bind(&client_path)
+            .map_err(|_| anyhow::anyhow!("worker lifecycle client unavailable"))?;
+        let _client_identity = spawnd::sessiond::endpoint::secure_bound_socket(&client_path)
+            .map_err(|_| anyhow::anyhow!("worker lifecycle client validation failed"))?;
+        if socket.connect(socket_path).is_err() {
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(10),
+            ))
+            .await;
+            continue;
+        }
+        match tokio::time::timeout_at(deadline, socket.send(request)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                ))
+                .await;
+                continue;
+            }
+            Err(_) => anyhow::bail!("worker lifecycle delivery deadline exceeded"),
+        }
+        let mut ack = [0u8; 2];
+        let attempt_deadline = std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        );
+        let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
+        let Ok(Ok(1)) = received else {
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(10),
+            ))
+            .await;
+            continue;
+        };
+        return Ok(ack[0]);
+    }
+}
+
+#[cfg(windows)]
+async fn send_lifecycle_legacy(
+    _socket_path: &std::path::Path,
+    _request: &[u8; wire::LIFECYCLE_REQUEST_LEN],
+    _deadline: tokio::time::Instant,
+) -> Result<u8> {
+    anyhow::bail!("legacy lifecycle paths are unavailable on Windows")
 }
 
 /// Per-session runtime handle.
@@ -1180,7 +1384,7 @@ async fn wait_for_idle(idle_timer: &mut Option<IdleResolutionTimer>) -> u64 {
     timer.generation
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram as StdUnixDatagram;
@@ -1221,7 +1425,10 @@ mod tests {
         for _ in 0..1024 {
             match flood.send(&payload) {
                 Ok(size) => assert_eq!(size, payload.len()),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(nix::libc::ENOBUFS) =>
+                {
                     saturated = true;
                     break;
                 }
@@ -1234,7 +1441,10 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_shutdown_send_obeys_the_absolute_deadline() {
-        let dir = tempfile::tempdir().expect("lifecycle timeout tempdir");
+        let dir = tempfile::Builder::new()
+            .prefix("spawn-lc-")
+            .tempdir_in("/tmp")
+            .expect("short lifecycle timeout tempdir");
         let server_path = dir.path().join("lifecycle.sock");
         let (_server, _flood, _identity) = saturate_lifecycle_endpoint(dir.path(), &server_path);
         let mut unrelated = ChildCleanup(
@@ -1577,7 +1787,9 @@ mod tests {
         let long = "x".repeat(100);
         control.note_foreground(session_id, &long).await;
         let third = rx.recv().await.unwrap();
-        assert!(third.as_str().contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS)));
+        assert!(third
+            .as_str()
+            .contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS)));
         assert!(!third
             .as_str()
             .contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS + 1)));
@@ -1810,8 +2022,21 @@ mod tests {
             .expect("stalled viewer was not disconnected")
             .expect("disconnect watch closed");
         assert!(*direct.disconnected.borrow());
+        let gap_offset = direct.gap_offset.load(Ordering::Acquire);
+        assert!(gap_offset > 0);
+        assert!(gap_offset <= control.source_offset());
         assert!(direct.receiver.len() <= DIRECT_SINK_QUEUE_DEPTH);
         assert_eq!(control.direct_sink_offset("stalled").await, None);
+
+        let origin = direct.source_origin;
+        let healed = control.add_direct_sink_from("stalled".into(), origin).await;
+        assert_eq!(healed.source_origin, origin);
+        assert_eq!(
+            control
+                .direct_sink_anchor("stalled", control.source_offset())
+                .await,
+            Some(control.source_offset().saturating_sub(origin))
+        );
 
         drop(outbox_tx);
         forwarder.await.unwrap();

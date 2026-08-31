@@ -100,6 +100,12 @@ async def send_verification_email(session: AsyncSession, user: User) -> None:
     """Best-effort verification mail; never fails the caller's request."""
 
     token = await issue_email_token(session, user, PURPOSE_EMAIL_VERIFY, VERIFY_TTL)
+    # The delivery audit deliberately uses its own transaction. Make the token
+    # durable before entering the mailer so SQLite does not leave this session
+    # holding the write lock while the audit session waits for that same lock.
+    # PostgreSQL benefits from the same ordering: never advertise a token before
+    # the database state that accepts it has committed.
+    await session.commit()
     link = f"{_web_base()}/verify-email?token={token}"
     rendered = email_templates.verify_email(link=link, site_url=_web_base())
     try:

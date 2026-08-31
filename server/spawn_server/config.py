@@ -4,10 +4,74 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from ipaddress import ip_address
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: The default below, and every stand-in this repository ships beside it. All
+#: three are readable by anyone who can read the repository, so a server that
+#: signs session tokens with one is letting them mint a token for any account.
+#: `.env.example` and `scripts/dev.sh` carry their own — copying either file
+#: into production and editing everything except this line is the likeliest
+#: way to end up here, so they are named too.
+DEVELOPMENT_JWT_SECRET = "change-me-in-prod"
+PUBLISHED_JWT_SECRETS = frozenset(
+    {
+        DEVELOPMENT_JWT_SECRET,
+        "change-me-in-prod-please-this-is-only-for-local",
+        "spawn-local-dev-only-secret-change-before-production",
+    }
+)
+
+#: Hostnames that mean "somebody's own machine" no matter what resolves them.
+_LOCAL_HOSTNAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
+
+#: Suffixes with the same meaning. `.local` is mDNS — a Mac on its own LAN.
+_LOCAL_SUFFIXES = (".localhost", ".local")
+
+
+class InsecureConfigurationError(RuntimeError):
+    """A deployment that is evidently not local is still holding a development
+    default. Raised while the settings are being built, so the process refuses
+    to start rather than serving with a secret that is published in this
+    repository."""
+
+
+def is_local_deployment(public_url: str) -> bool:
+    """Whether `public_url` describes a machine only its owner can reach.
+
+    Deliberately generous. Loopback is obvious, but a developer testing the
+    phone app points `SPAWN_PUBLIC_URL` at their LAN address — that is still
+    somebody's laptop, and a guard that refused to start there would be the
+    most hated line in the repository. Private, loopback and link-local
+    ranges, `.local`, `.localhost` and a bare `localhost` all pass; a name
+    that resolves on the public internet does not.
+    """
+    value = public_url.strip()
+    host = (urlsplit(value).hostname or "").strip().lower()
+    if not host and value:
+        # A value with no scheme: `urlsplit` puts the whole thing in `path`
+        # and reports no host. Such a URL is already broken elsewhere, but
+        # reading it as "no host, therefore local" would let the one shape
+        # this guard exists for slip past it.
+        host = (urlsplit(f"//{value}").hostname or "").strip().lower()
+    if not host:
+        # Nothing configured at all is not evidence of a production
+        # deployment. Say nothing rather than guess.
+        return True
+    if host in _LOCAL_HOSTNAMES or host.endswith(_LOCAL_SUFFIXES):
+        return True
+    try:
+        address = ip_address(host)
+    except ValueError:
+        # A hostname, not an address. Anything that is not one of the names
+        # above is treated as reachable from outside.
+        return False
+    return address.is_loopback or address.is_private or address.is_link_local
 
 
 class Settings(BaseSettings):
@@ -35,7 +99,7 @@ class Settings(BaseSettings):
     # a prefix or host rule here would let anything claiming the scheme collect
     # codes on the real app's behalf.
     oauth_native_redirect_uris: str = Field(
-        default="spawn://auth/oauth",
+        default="spawn://auth/oauth,spawn://oauth/callback",
         description="Comma-separated exact redirect URIs the native app may hand back to.",
     )
     # Long enough to survive a slow provider handoff, short enough that a code
@@ -75,7 +139,44 @@ class Settings(BaseSettings):
     # Only required when the Expo project enables enhanced push security.
     expo_access_token: str | None = None
 
+    # Browsers do not go through Expo. A browser subscribes with the push
+    # service its own vendor runs (Mozilla's, Google's, Apple's) and the server
+    # authenticates to that service with a P-256 key pair it holds — VAPID,
+    # RFC 8292. The key is server configuration, never committed: see
+    # `docs/PUSH.md` for how to generate and set it.
+    #
+    # Absent is a supported configuration, not an error. A server with no key
+    # simply has no browser channel; `/api/notifications/web-push/key` says so
+    # and phones are unaffected.
+    #
+    # A PKCS#8 PEM, or the base64url raw private scalar the JavaScript tools
+    # emit. Newlines may arrive escaped; `web_push.py` normalizes either form.
+    vapid_private_key: str | None = None
+    # The contact a push service can reach if this server misbehaves — RFC 8292
+    # requires a `mailto:` or `https:` URI. Empty falls back to `public_url`,
+    # which is valid but tells an operator nothing; set a real mailbox.
+    vapid_subject: str = ""
+
     public_url: str = Field(default="http://localhost:8000")
+
+    # Release identity overrides are stamped by production deploys. Empty
+    # values fall back to the checkout when git is available.
+    release_commit: str | None = None
+    mobile_tree: str | None = None
+    desktop_version: str | None = None
+    desktop_tree: str | None = None
+    daemon_auto_update: bool = True
+    prebuilt_dir: Path = Field(
+        default=Path(__file__).resolve().parents[2] / "daemon" / "target" / "prebuilt"
+    )
+    # Where the published desktop artifacts actually live: notarized Mac disk
+    # images and the signed Windows setup EXE. Not derivable from the checkout:
+    # `/desktop/` is nginx's alias over a static root
+    # (`infra/nginx-spawnd.conf.example`), and the server has to look in the
+    # same place to know whether the version it advertises was ever published.
+    # The name matches `scripts/publish-desktop.sh`'s own SPAWN_DESKTOP_DIR on
+    # purpose — the publisher and the server mean one directory.
+    desktop_dir: Path = Field(default=Path("/var/www/spawnd/desktop"))
 
     # Where password-reset and verification links point. Falls back to
     # public_url; set when the web app is served from a different origin than
@@ -143,6 +244,52 @@ class Settings(BaseSettings):
     )
     turn_secret: str | None = Field(default=None)
     turn_ttl_seconds: int = Field(default=24 * 3600)
+    daemon_registration_concurrency: int = Field(default=32, ge=1, le=256)
+
+    @model_validator(mode="after")
+    def _refuse_development_defaults_off_a_laptop(self) -> Settings:
+        """Refuse to start a public deployment that is still holding defaults.
+
+        Every value here has a default that makes `git clone && uv run` work,
+        and nothing until now noticed when one of those survived into
+        production. A truncated env file or a misspelled variable name would
+        boot happily and sign session tokens with a secret published in this
+        repository, silently.
+
+        `public_url` is the tell: it is the one setting a deployment cannot
+        avoid getting right, because the daemon and the browser are handed it.
+        When it names something the internet can reach, a default that is
+        merely convenient locally becomes a hole, and this stops the process
+        instead of logging a warning nobody reads.
+
+        Local development is untouched — see `is_local_deployment`.
+        """
+        if is_local_deployment(self.public_url):
+            return self
+
+        problems: list[str] = []
+        if self.jwt_secret in PUBLISHED_JWT_SECRETS:
+            problems.append(
+                "SPAWN_JWT_SECRET is still one of the placeholders that ship in this "
+                "repository, so anyone who can read it can mint a session token for any "
+                "account. Set it to something random: "
+                "python -c 'import secrets; print(secrets.token_urlsafe(64))'"
+            )
+        if self.email_backend == "console":
+            problems.append(
+                "SPAWN_EMAIL_BACKEND is 'console', which records every message and sends "
+                "none. Signup asks for a verified address, so nobody could finish creating "
+                "an account. Set it to 'smtp' and configure delivery (docs/EMAIL.md), or to "
+                "'disabled' if this deployment genuinely sends no mail."
+            )
+        if not problems:
+            return self
+
+        raise InsecureConfigurationError(
+            f"SPAWN D refuses to start. SPAWN_PUBLIC_URL is {self.public_url!r}, which is "
+            "not a local address, but development defaults are still in place:\n"
+            + "\n".join(f"  - {problem}" for problem in problems)
+        )
 
     @property
     def oauth_native_redirect_uri_list(self) -> list[str]:

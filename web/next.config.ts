@@ -44,6 +44,7 @@ const nextConfig: NextConfig = {
     middlewareClientMaxBodySize: 64 * 1024 * 1024,
   },
   env: {
+    NEXT_PUBLIC_SPAWN_BUILD_ID: buildId(),
     NEXT_PUBLIC_SPAWN_WS_URL: defaultPublicWsUrl(),
   },
   async headers() {
@@ -63,6 +64,11 @@ const nextConfig: NextConfig = {
       { source: "/ws/:path*", destination: `${API_PROXY_TARGET}/ws/:path*` },
       { source: "/healthz", destination: `${API_PROXY_TARGET}/healthz` },
       { source: "/install.sh", destination: `${API_PROXY_TARGET}/install.sh` },
+      // Its Windows twin. The server renders this one too — hash-pinned, and a
+      // 503 when there is no Windows release yet — but without the rewrite Next
+      // answers first with its own 404, so the `irm .../install.ps1 | iex` line
+      // printed on /download and by the daemon reaches nothing at all.
+      { source: "/install.ps1", destination: `${API_PROXY_TARGET}/install.ps1` },
     ];
   },
   // The overhaul collapsed five nav destinations into one workspace page plus a

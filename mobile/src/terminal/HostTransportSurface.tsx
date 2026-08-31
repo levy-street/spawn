@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState, Image, StyleSheet } from "react-native";
 import WebView, { type WebViewMessageEvent } from "react-native-webview";
-import { WorkerBridge } from "@/terminal/transport/bridge";
+import { subscribeRetirementReason } from "@/data/realtime/lifecycle";
 import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
-import { createHostTransport } from "@/terminal/transport/host-transport";
+import { retainHostTransport } from "@/terminal/transport/host-transport-registry";
 import type {
   HostTransport,
   HostTransportOptions,
@@ -35,26 +35,30 @@ export function HostTransportSurface({
   onStateChange,
   onError,
   onDiagnostic,
-}: HostTransportSurfaceProps): React.JSX.Element {
+}: HostTransportSurfaceProps): React.JSX.Element | null {
   const webViewRef = useRef<WebView>(null);
   const workerLoaded = useRef(false);
   const retiredForBackground = useRef(false);
-  const bridge = useMemo(() => new WorkerBridge(), []);
   const callbacks = useRef({ onTransport, onStateChange, onError, onDiagnostic });
   callbacks.current = { onTransport, onStateChange, onError, onDiagnostic };
-  const transport = useMemo(
+  const lease = useMemo(
     () =>
-      createHostTransport({
+      retainHostTransport({
         hostId,
         hostIdentityPublicKey,
-        bridge,
         ...(forceRelay === undefined ? {} : { forceRelay }),
         ...(openSignal === undefined ? {} : { openSignal }),
       }),
-    [bridge, forceRelay, hostId, hostIdentityPublicKey, openSignal],
+    [forceRelay, hostId, hostIdentityPublicKey, openSignal],
   );
+  const { bridge, transport } = lease.shared;
+  const [ownsWorker, setOwnsWorker] = useState(lease.shared.owner === lease.ownerId);
 
-  useEffect(() => bridge.attach((raw) => webViewRef.current?.postMessage(raw)), [bridge]);
+  useEffect(() => lease.subscribeOwnership(setOwnsWorker), [lease]);
+  useEffect(() => {
+    if (!ownsWorker) return;
+    return bridge.attach((raw) => webViewRef.current?.postMessage(raw));
+  }, [bridge, ownsWorker]);
 
   useEffect(() => {
     callbacks.current.onTransport(transport);
@@ -65,8 +69,15 @@ export function HostTransportSurface({
     ];
     return () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
-      transport.close();
+      lease.release();
     };
+  }, [lease, transport]);
+
+  useEffect(() => {
+    transport.prepare?.();
+    return subscribeRetirementReason((reason) => {
+      if (reason === "interface-change") transport.networkChanged?.();
+    });
   }, [transport]);
 
   const openTransport = useCallback((): void => {
@@ -82,19 +93,30 @@ export function HostTransportSurface({
   }, [transport]);
 
   useEffect(() => {
+    let backgroundTimer: ReturnType<typeof setTimeout> | null = null;
     const subscription = AppState.addEventListener("change", (nextState) => {
-      if (nextState !== "active") {
-        if (workerLoaded.current) {
+      if (nextState === "inactive") return;
+      if (nextState === "background") {
+        if (!workerLoaded.current || backgroundTimer !== null) return;
+        backgroundTimer = setTimeout(() => {
+          backgroundTimer = null;
           retiredForBackground.current = true;
           transport.close();
-        }
+        }, 3_000);
         return;
+      }
+      if (backgroundTimer !== null) {
+        clearTimeout(backgroundTimer);
+        backgroundTimer = null;
       }
       if (!retiredForBackground.current || !workerLoaded.current) return;
       retiredForBackground.current = false;
       openTransport();
     });
-    return () => subscription.remove();
+    return () => {
+      if (backgroundTimer !== null) clearTimeout(backgroundTimer);
+      subscription.remove();
+    };
   }, [openTransport, transport]);
 
   const handleMessage = (event: WebViewMessageEvent): void => {
@@ -109,6 +131,8 @@ export function HostTransportSurface({
     }
   };
 
+  if (!ownsWorker) return null;
+
   const fileWorkerUrl = USE_FILE_WORKER_FALLBACK
     ? Image.resolveAssetSource(terminalWorkerAsset).uri
     : null;
@@ -121,6 +145,10 @@ export function HostTransportSurface({
       ref={webViewRef}
       source={source}
       style={styles.hiddenWorker}
+      // The library wraps the web view in a container of its own that grows to
+      // fill its column; positioned like the worker itself, it takes no room
+      // from whatever screen hosts the transport.
+      containerStyle={styles.hiddenWorker}
       accessible={false}
       pointerEvents="none"
       originWhitelist={["*"]}

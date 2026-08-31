@@ -188,6 +188,14 @@ describe("TerminalHeader", () => {
     expect(input.onBack).toHaveBeenCalledTimes(1);
   });
 
+  test("adds the selected path and RTT to the terminal metadata", async () => {
+    await renderHeader(props({ connectionInfo: { kind: "relay", rttMs: 42 } }));
+
+    expect(mockAppHeaderProps).toMatchObject({
+      subtitle: "Codex · studio · relay · 42 ms",
+    });
+  });
+
   test("presents every action as a drawer row and marks kill destructive", async () => {
     const input = props();
     await renderHeader(input);

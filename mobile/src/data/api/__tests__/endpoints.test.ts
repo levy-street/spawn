@@ -20,11 +20,17 @@ import { api } from "@/data/api/client";
 import { deleteAccount } from "@/data/api/endpoints/account";
 import { listAdminEmails } from "@/data/api/endpoints/admin";
 import { patchAgentPreferences } from "@/data/api/endpoints/agents";
-import { getOAuthStartUrl, logIn } from "@/data/api/endpoints/auth";
+import {
+  getOAuthStartUrl,
+  logIn,
+  renewSession,
+  signOutEverywhere,
+} from "@/data/api/endpoints/auth";
 import { getPendingDevice } from "@/data/api/endpoints/devices";
-import { patchHost } from "@/data/api/endpoints/hosts";
+import { patchHost, updateHost } from "@/data/api/endpoints/hosts";
 import { downloadSpawnWorker } from "@/data/api/endpoints/install";
 import { getProfile } from "@/data/api/endpoints/legion";
+import { getRelease } from "@/data/api/endpoints/release";
 import { createSession, patchSessionAccess } from "@/data/api/endpoints/sessions";
 import { createSkill } from "@/data/api/endpoints/skills";
 import { deleteWorkspaceTemplate } from "@/data/api/endpoints/templates";
@@ -38,7 +44,7 @@ beforeEach(() => {
   jest.mocked(authToken.clear).mockClear();
 });
 
-it("serializes the auth domain request and captures the durable cookie", async () => {
+it("serializes the auth domain request through the shared response-capturing client", async () => {
   await logIn({ email: "owner@example.com", password: "password" });
   expect(api).toHaveBeenCalledWith(
     "/api/auth/login",
@@ -46,10 +52,29 @@ it("serializes the auth domain request and captures the durable cookie", async (
       method: "POST",
       auth: false,
       body: '{"email":"owner@example.com","password":"password"}',
-      onResponse: authToken.captureFromResponse,
       schema: expect.any(Object),
     }),
   );
+});
+
+it("renews the current session and keeps the caller signed in after signing out elsewhere", async () => {
+  jest.mocked(api).mockResolvedValueOnce({
+    access_token: "renewed-session",
+    expires_at: "2026-09-24T00:00:00Z",
+  });
+  await renewSession();
+  expect(api).toHaveBeenLastCalledWith(
+    "/api/auth/session/renew",
+    expect.objectContaining({ method: "POST" }),
+  );
+
+  jest.mocked(api).mockResolvedValueOnce({ access_token: "caller-session" });
+  await signOutEverywhere();
+  expect(api).toHaveBeenLastCalledWith(
+    "/api/auth/sign-out-everywhere",
+    expect.objectContaining({ method: "POST" }),
+  );
+  expect(authToken.set).toHaveBeenCalledWith("caller-session");
 });
 
 it("constructs the OAuth route with an encoded return path", async () => {
@@ -75,10 +100,10 @@ it("serializes the account domain and clears auth after deletion", async () => {
 });
 
 it("serializes the device-pairing domain", async () => {
-  await getPendingDevice({ user_code: "ABCD1234" });
+  await getPendingDevice({ approval_ref: "approval-ref-123" });
   expect(api).toHaveBeenCalledWith(
     "/api/auth/device/pending",
-    expect.objectContaining({ method: "POST", body: '{"user_code":"ABCD1234"}' }),
+    expect.objectContaining({ method: "POST", body: '{"approval_ref":"approval-ref-123"}' }),
   );
 });
 
@@ -87,6 +112,22 @@ it("encodes host identifiers and serializes host patches", async () => {
   expect(api).toHaveBeenCalledWith(
     "/api/hosts/host%2Fone",
     expect.objectContaining({ method: "PATCH", body: '{"name":"Laptop"}' }),
+  );
+});
+
+it("requests a daemon update for an encoded host identifier", async () => {
+  await updateHost("host/one");
+  expect(api).toHaveBeenCalledWith(
+    "/api/hosts/host%2Fone/update",
+    expect.objectContaining({ method: "POST", schema: expect.any(Object) }),
+  );
+});
+
+it("fetches the public release contract without auth", async () => {
+  await getRelease();
+  expect(api).toHaveBeenCalledWith(
+    "/api/release",
+    expect.objectContaining({ auth: false, schema: expect.any(Object) }),
   );
 });
 

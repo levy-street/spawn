@@ -1,22 +1,54 @@
 import { z } from "zod";
 import { IsoDateTimeSchema, UUIDSchema } from "@/data/api/schemas/common";
 
+export const HostUpdateStateSchema = z.enum([
+  "current",
+  "available",
+  "updating",
+  "failed",
+  "unsupported",
+  "unknown",
+]);
+export const HostUpdateOutSchema = z.object({
+  state: HostUpdateStateSchema,
+  latest_version: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+  requested_at: IsoDateTimeSchema.nullable().default(null),
+});
+export const HostUpdateResponseSchema = z.object({ update: HostUpdateOutSchema });
+export const HostDisconnectSchema = z.object({
+  at: IsoDateTimeSchema.nullable(),
+  reason: z
+    .enum([
+      "socket_closed",
+      "superseded",
+      "keepalive_timeout",
+      "auth_rejected",
+      "server_restart",
+      "stale",
+    ])
+    .nullable(),
+});
+
 export const HostOutSchema = z.object({
   id: UUIDSchema,
   name: z.string(),
   os: z.string().nullable(),
   arch: z.string().nullable(),
   version: z.string().nullable(),
+  daemon_tree: z.string().nullable().default(null),
+  update: HostUpdateOutSchema.nullable().default(null),
   host_key_algorithm: z.literal("ed25519").nullable(),
   // The key travels alone (mesh B5): any fingerprint shown or compared is
   // derived locally from it, never read off a server response.
   host_public_key: z.string().nullable(),
   status: z.string(),
   last_seen_at: IsoDateTimeSchema.nullable(),
+  last_disconnect: HostDisconnectSchema.optional(),
   session_count: z.number().int().nonnegative(),
   // Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path,
   // and this app cannot join an account chain yet — so for these hosts the
-  // pairing code is the only admission, and the UI must say so.
+  // possessing the host from this phone is the only admission, and the UI must say so.
   supports_account_chains: z.boolean().default(false),
   cpu_cores: z.number().int().nullable(),
   cpu_physical_cores: z.number().int().nullable(),
@@ -72,6 +104,8 @@ export const RecentDirOutSchema = z.object({
 export const RecentDirListSchema = z.object({ dirs: z.array(RecentDirOutSchema) });
 
 export type HostOut = z.infer<typeof HostOutSchema>;
+export type HostUpdateOut = z.infer<typeof HostUpdateOutSchema>;
+export type HostUpdateResponse = z.infer<typeof HostUpdateResponseSchema>;
 export type HostPatch = z.infer<typeof HostPatchSchema>;
 export type HostAgentTarget = z.infer<typeof HostAgentTargetSchema>;
 export type HostAgentStatus = z.infer<typeof HostAgentStatusSchema>;

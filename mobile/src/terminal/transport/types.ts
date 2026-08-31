@@ -1,5 +1,5 @@
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
-import type { DeviceHostTrust } from "@/data/trust/device-trust";
+import type { DeviceHostTrust, DeviceHostTrustResult } from "@/data/trust/device-trust";
 import type { TerminalTheme } from "@/theme";
 
 export type TransportState =
@@ -45,6 +45,11 @@ export interface WorkerDiagnostic {
   loopback: boolean;
   renderer: "webgl" | "dom" | null;
   detail?: string;
+}
+
+export interface ConnectionInfo {
+  kind: "direct" | "stun" | "relay" | "unknown";
+  rttMs: number | null;
 }
 
 export interface UploadSource {
@@ -106,8 +111,10 @@ export interface WorkerEndpoint {
 
 export interface SignalChannelLike {
   readonly state: string;
+  readonly closeInfo?: { code: number; reason: string } | null;
   send(frame: unknown): void;
   onFrame(fn: (frame: unknown) => void): () => void;
+  onState?(fn: (state: string) => void): () => void;
   close(): void;
 }
 
@@ -124,6 +131,7 @@ export interface SessionTransportOptions {
   /** Enables the trust preflight; without it an unapproved device only learns from the watchdog. */
   hostId?: string;
   probeTrust?: (hostId: string) => Promise<DeviceHostTrust>;
+  probeTrustResult?: (hostId: string) => Promise<DeviceHostTrustResult>;
   /** Defaults to {@link CONNECT_TIMEOUT_MS}; lower values support deterministic tests. */
   connectTimeoutMs?: number;
 }
@@ -131,6 +139,9 @@ export interface SessionTransportOptions {
 export interface SessionTransport {
   readonly sessionId: string;
   readonly state: TransportState;
+  /** Starts identity, trust, endorsements and signalling before WKWebView finishes loading. */
+  prepare?(): void;
+  networkChanged?(): void;
   open(): Promise<void>;
   close(): void;
   write(bytes: Uint8Array): void;
@@ -145,6 +156,7 @@ export interface SessionTransport {
   on(ev: "bell", fn: () => void): () => void;
   on(ev: "scroll", fn: (s: ScrollState) => void): () => void;
   on(ev: "diagnostic", fn: (d: WorkerDiagnostic) => void): () => void;
+  on(ev: "connection-info", fn: (info: ConnectionInfo) => void): () => void;
   on(ev: "display", fn: (d: DisplayControlState) => void): () => void;
 }
 
@@ -266,6 +278,7 @@ export interface HostTransportOptions {
   /** Defaults to the protocol maximum of 60 seconds; lower values support deterministic tests. */
   streamTimeoutMs?: number;
   probeTrust?: (hostId: string) => Promise<DeviceHostTrust>;
+  probeTrustResult?: (hostId: string) => Promise<DeviceHostTrustResult>;
   /** Defaults to {@link CONNECT_TIMEOUT_MS}; lower values support deterministic tests. */
   connectTimeoutMs?: number;
 }
@@ -275,6 +288,8 @@ export interface HostTransport {
   readonly state: TransportState;
   /** Null until this RTC generation's hello frame is decoded. */
   readonly capabilities?: HostCapabilities | null;
+  prepare?(): void;
+  networkChanged?(): void;
   open(): Promise<void>;
   close(): void;
   request<T>(operation: string, payload?: unknown, options?: HostRequestOptions): Promise<T>;
@@ -397,3 +412,75 @@ export interface KeyModifiers {
 export type KeySpec =
   | { kind: "named"; key: NamedTerminalKey; modifiers?: KeyModifiers; applicationCursor?: boolean }
   | { kind: "text"; text: string; modifiers?: KeyModifiers };
+
+/**
+ * The server's `ice_transport_policy`, read defensively.
+ *
+ * Anything but an explicit "relay" means the deployment still offers direct
+ * paths: an older server that does not send the field at all must not be read
+ * as forbidding them.
+ */
+export function readTransportPolicy(value: unknown): "all" | "relay" {
+  if (value !== undefined && value !== "all" && value !== "relay") {
+    console.warn(`Ignoring unrecognised ice_transport_policy: ${String(value)}`);
+  }
+  return value === "relay" ? "relay" : "all";
+}
+
+const ICE_URL = /^(?:stun|stuns|turn|turns):/i;
+const TURN_URL = /^turns?:/i;
+const MAX_ICE_SERVER_ENTRIES = 8;
+
+/** Keep only browser-safe ICE schemes and require credentials for TURN. */
+export function sanitizeIceServers(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  const sanitized: Array<Record<string, unknown>> = [];
+  for (const candidate of value) {
+    if (sanitized.length >= MAX_ICE_SERVER_ENTRIES) break;
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) continue;
+    const record = candidate as Record<string, unknown>;
+    const rawUrls = typeof record["urls"] === "string" ? [record["urls"]] : record["urls"];
+    if (!Array.isArray(rawUrls) || rawUrls.length === 0) continue;
+    if (!rawUrls.every((url) => typeof url === "string" && ICE_URL.test(url))) continue;
+    const hasTurn = rawUrls.some((url) => TURN_URL.test(url as string));
+    if (
+      hasTurn &&
+      (typeof record["username"] !== "string" ||
+        record["username"].length === 0 ||
+        typeof record["credential"] !== "string" ||
+        record["credential"].length === 0)
+    ) {
+      continue;
+    }
+    sanitized.push({
+      urls: typeof record["urls"] === "string" ? rawUrls[0] : rawUrls,
+      ...(hasTurn ? { username: record["username"], credential: record["credential"] } : {}),
+    });
+  }
+  return sanitized;
+}
+
+/** Coturn REST usernames start with their Unix expiry. Refresh one hour early. */
+export function iceServersNeedRefresh(
+  iceServers: readonly Record<string, unknown>[],
+  nowMs = Date.now(),
+): boolean {
+  const refreshBeforeSeconds = Math.floor(nowMs / 1_000) + 60 * 60;
+  for (const server of iceServers) {
+    const rawUrls = server["urls"];
+    const urls = typeof rawUrls === "string" ? [rawUrls] : rawUrls;
+    if (
+      !Array.isArray(urls) ||
+      !urls.some((url) => typeof url === "string" && TURN_URL.test(url))
+    ) {
+      continue;
+    }
+    const username = server["username"];
+    const expiry = Number.parseInt(
+      typeof username === "string" ? (username.split(":", 1)[0] ?? "") : "",
+      10,
+    );
+    if (Number.isSafeInteger(expiry) && expiry <= refreshBeforeSeconds) return true;
+  }
+  return false;
+}

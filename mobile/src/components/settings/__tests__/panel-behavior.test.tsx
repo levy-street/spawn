@@ -16,6 +16,8 @@ const mockPush = jest.fn();
 const mockBack = jest.fn();
 const mockToastShow = jest.fn();
 const mockToastError = jest.fn();
+const mockToastSuccess = jest.fn();
+const mockSignOutEverywhere = jest.fn(async () => ({ access_token: "caller-session" }));
 
 jest.mock("expo-router", () => ({
   router: { push: mockPush },
@@ -23,7 +25,7 @@ jest.mock("expo-router", () => ({
 }));
 
 jest.mock("@/components/ui/toast", () => ({
-  useToast: () => ({ show: mockToastShow, error: mockToastError }),
+  useToast: () => ({ show: mockToastShow, error: mockToastError, success: mockToastSuccess }),
 }));
 
 jest.mock("expo-notifications", () => ({
@@ -41,7 +43,22 @@ jest.mock("@/data/api/auth-token", () => ({
 
 jest.mock("@/data/api/client", () => ({
   api: jest.fn(async () => undefined),
-  ApiError: class ApiError extends Error {},
+  ApiError: class ApiError extends Error {
+    status: number;
+
+    constructor(status: number, _code: string, message: string) {
+      super(message);
+      this.status = status;
+    }
+  },
+}));
+
+jest.mock("@/data/queries/auth", () => ({
+  useSignOutEverywhereMutation: () => ({
+    isPending: false,
+    mutateAsync: mockSignOutEverywhere,
+    reset: jest.fn(),
+  }),
 }));
 
 const mockUser = {
@@ -124,7 +141,9 @@ describe("settings panel behavior", () => {
   test("settings root renders the documented panels plus connectivity", async () => {
     const screen = await render(<SettingsRoot />, { wrapper });
 
-    expect(SETTINGS_PANELS).toHaveLength(9);
+    expect(SETTINGS_PANELS).toHaveLength(8);
+    // Machines belong to the Legion tab, so Settings never lists a Hosts panel.
+    expect(screen.queryByTestId("settings-panel-hosts")).toBeNull();
     for (const panel of SETTINGS_PANELS) {
       expect(screen.getByTestId(`settings-panel-${panel.key}`)).toBeOnTheScreen();
     }
@@ -188,6 +207,45 @@ describe("settings panel behavior", () => {
       expect(authToken.clear).toHaveBeenCalledTimes(1);
       expect(mockReplace).toHaveBeenCalledWith("/login");
     });
+  });
+
+  test("sign out everywhere confirms, preserves this session, and reports success", async () => {
+    const screen = await render(<AccountPanel />, { wrapper });
+    await fireEvent.press(screen.getByRole("button", { name: "Sign out everywhere" }));
+
+    expect(screen.getByText("Sign out everywhere?")).toBeOnTheScreen();
+    expect(
+      screen.getByText(
+        "Every other browser and phone signed in to this account will be signed out. This one stays signed in.",
+      ),
+    ).toBeOnTheScreen();
+    const confirms = screen.getAllByRole("button", { name: "Sign out everywhere" });
+    const confirm = confirms.at(-1);
+    if (!confirm) throw new Error("Sign-out-everywhere confirmation is missing");
+    await fireEvent.press(confirm);
+
+    await waitFor(() => expect(mockSignOutEverywhere).toHaveBeenCalledTimes(1));
+    expect(mockToastSuccess).toHaveBeenCalledWith("Signed out everywhere else.");
+    expect(mockReplace).not.toHaveBeenCalledWith("/login");
+  });
+
+  test("sign out everywhere becomes unavailable after an old-server 404", async () => {
+    const { ApiError } = jest.requireMock("@/data/api/client") as {
+      ApiError: new (status: number, code: string, message: string) => Error;
+    };
+    mockSignOutEverywhere.mockRejectedValueOnce(new ApiError(404, "http_404", "not found"));
+    const screen = await render(<AccountPanel />, { wrapper });
+    await fireEvent.press(screen.getByRole("button", { name: "Sign out everywhere" }));
+    const confirms = screen.getAllByRole("button", { name: "Sign out everywhere" });
+    const confirm = confirms.at(-1);
+    if (!confirm) throw new Error("Sign-out-everywhere confirmation is missing");
+    await fireEvent.press(confirm);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Not available on this server yet." }),
+      ).toBeDisabled(),
+    );
   });
 
   test("account confirmation input stays unmounted until deletion is expanded", async () => {

@@ -73,6 +73,15 @@ jest.mock("@/components/ui/select", () => ({
   })(),
 }));
 
+// The folder step opens a live connection to a machine; this file is about the
+// footer's geometry, and mounting that would drag a transport into it.
+jest.mock("@/components/workspaces/workspace-folder-sheet", () => ({
+  ...(() => {
+    const { View: MockView } = require("react-native") as typeof import("react-native");
+    return { WorkspaceFolderSheet: () => <MockView testID="workspace-folder-sheet" /> };
+  })(),
+}));
+
 jest.mock("@/components/workspaces/workspace-icon-picker", () => ({
   ...(() => {
     const { View: MockView } = require("react-native") as typeof import("react-native");
@@ -176,6 +185,7 @@ describe("new workspace form layout", () => {
     await fireEvent.changeText(screen.getByPlaceholderText("Workspace name"), "  Mobile build  ");
     await fireEvent.press(screen.getByTestId("create-workspace-submit"));
     expect(onCreate).toHaveBeenCalledWith({
+      folder: null,
       iconChoice: null,
       name: "Mobile build",
       templateId: null,

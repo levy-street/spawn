@@ -72,3 +72,44 @@ describe("toastQueueReducer", () => {
     expect(toastQueueReducer(initial, { type: "clear" })).toEqual([]);
   });
 });
+
+describe("toastQueueReducer, persistent notices", () => {
+  test("keeps a persistent notice when a burst of transient ones arrives", () => {
+    // An update waiting to be taken is the one notice on screen asking a
+    // question. Losing it to five routine notices would drop the question.
+    let state = toastQueueReducer([], {
+      type: "enqueue",
+      toast: toast("update", { persistent: true, message: "mac has an update" }),
+    });
+    for (let index = 0; index < 6; index++) {
+      state = toastQueueReducer(state, {
+        type: "enqueue",
+        toast: toast(`noise-${index}`, { message: `Noise ${index}` }),
+      });
+    }
+    expect(state.map((item) => item.id)).toContain("update");
+    expect(state.filter((item) => !item.leaving)).toHaveLength(5);
+  });
+
+  test("updates a notice in place rather than adding a second row", () => {
+    const initial = toast("update", { persistent: true, message: "mac has an update" });
+    const next = toastQueueReducer([initial], {
+      type: "update",
+      id: "update",
+      patch: { message: "Updating SPAWN D on mac", progress: "indeterminate" },
+    });
+    expect(next).toHaveLength(1);
+    expect(next[0]?.message).toBe("Updating SPAWN D on mac");
+    expect(next[0]?.progress).toBe("indeterminate");
+  });
+
+  test("ignores an update for a notice already dismissed by hand", () => {
+    const leaving = toast("update", { leaving: true, message: "mac has an update" });
+    const next = toastQueueReducer([leaving], {
+      type: "update",
+      id: "update",
+      patch: { message: "Updating SPAWN D on mac" },
+    });
+    expect(next[0]?.message).toBe("mac has an update");
+  });
+});

@@ -37,7 +37,7 @@ export function FileViewerBody({ state, type, entry, onLoad, onCancel }: FileVie
       <MetadataState
         detail={
           entry.kind === "symlink"
-            ? "Spawn does not follow symbolic links."
+            ? "SPAWN D does not follow symbolic links."
             : "Inline preview is unavailable for this file type."
         }
         title={type.label}

@@ -29,10 +29,25 @@ export const host = {
   os: "macos",
   arch: "aarch64",
   version: "0.1.0",
+  daemon_tree: "1111111111111111111111111111111111111111",
+  update: {
+    state: "current",
+    latest_version: "0.1.0",
+    error: null,
+    requested_at: null,
+  },
   status: "online",
   last_seen_at: CREATED_AT,
   session_count: 1,
   home_dir: "/Users/tester",
+};
+
+export const windowsHost = {
+  ...host,
+  name: "Windows PC",
+  os: "windows",
+  arch: "x86_64",
+  home_dir: "C:\\Users\\tester",
 };
 
 export const agentDefinition = {
@@ -47,6 +62,37 @@ export const agentDefinition = {
   yolo_env: {},
   yolo: false,
 };
+
+/**
+ * Which keyboard the page believes is in front of it.
+ *
+ * The terminal and the app split the modifiers differently per platform — ⌥ is
+ * the shell's word key on a Mac and the app's pane key everywhere else — so a
+ * spec about chords has to state the keyboard rather than inherit whichever
+ * machine is running the suite. `navigator.platform` settles both halves at
+ * once: `src/lib/keyboard-chords.ts` reads it through `detectOS`, and xterm's
+ * own `isMac` reads it directly. The agent goes with it because `detectOS`
+ * falls back to the agent, and a Mac's agent says "Mac OS X" whatever the
+ * platform claims.
+ */
+export async function pinKeyboard(page: Page, keyboard: "apple" | "pc") {
+  const pinned =
+    keyboard === "apple"
+      ? {
+          platform: "MacIntel",
+          userAgent:
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        }
+      : {
+          platform: "Win32",
+          userAgent:
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        };
+  await page.addInitScript((values) => {
+    Object.defineProperty(navigator, "platform", { get: () => values.platform });
+    Object.defineProperty(navigator, "userAgent", { get: () => values.userAgent });
+  }, pinned);
+}
 
 export function session(overrides: Record<string, unknown> = {}) {
   return {
@@ -233,6 +279,10 @@ export interface AppMockOptions {
   sessions?: unknown[];
   hosts?: unknown[];
   workspaces?: unknown[];
+  devicePendingError?: { status: number; code?: string; message?: string; detail?: unknown };
+  deviceApproveError?: { status: number; code?: string; message?: string; detail?: unknown };
+  /** False models a pre-Phase-D server. */
+  signOutEverywhereAvailable?: boolean;
   agents?: unknown[];
   workspaceTemplates?: JsonRecord[];
   skills?: unknown[];
@@ -243,6 +293,10 @@ export interface AppMockOptions {
   hostAgents?: Record<string, Array<Record<string, unknown>>>;
   sessionSkills?: Record<string, string[]>;
   workspaceFull?: boolean;
+  /** Additive `/api/release.desktop` block exposed to download surfaces. */
+  releaseDesktop?: JsonRecord | null;
+  /** Verified daemon target IDs exposed by the release manifest. */
+  releaseDaemonTargets?: string[];
   updateWorkspace?: (
     id: string,
     body: unknown,
@@ -849,12 +903,25 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       await route.fulfill({ status: 204, body: "" });
       return;
     }
+    if (path === "/api/auth/sign-out-everywhere" && method === "POST") {
+      store.requests.auth.push({ path, ...(await readBody()) });
+      if (options.signOutEverywhereAvailable === false) {
+        await json(route, { detail: "not found" }, 404);
+        return;
+      }
+      await json(route, { access_token: "fresh-session-token" });
+      return;
+    }
     if (path === "/api/auth/verify-email/request" && method === "POST") {
       await route.fulfill({ status: 204, body: "" });
       return;
     }
     if (path === "/api/auth/device/pending" && method === "POST") {
       store.requests.auth.push({ path, ...(await readBody()) });
+      if (options.devicePendingError) {
+        await json(route, options.devicePendingError, options.devicePendingError.status);
+        return;
+      }
       const digest = createHash("sha256")
         .update(Buffer.from(HOST_PUBLIC_KEY, "base64url"))
         .digest()
@@ -872,6 +939,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     if (path === "/api/auth/device/approve" && method === "POST") {
       const body = await readBody();
       store.requests.auth.push({ path, ...body });
+      if (options.deviceApproveError) {
+        await json(route, options.deviceApproveError, options.deviceApproveError.status);
+        return;
+      }
       await json(route, {
         host_name: String(store.hosts[0]?.name ?? "Mac"),
         host_id: store.hosts[0]?.id ?? null,
@@ -1168,6 +1239,43 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     }
     if (path === "/api/hosts" && method === "GET") {
       await json(route, hostList);
+      return;
+    }
+    if (path === "/api/release" && method === "GET") {
+      const releaseTargets = options.releaseDaemonTargets ?? [];
+      await json(route, {
+        server: { commit: null, dirty: false },
+        web: { build_id: null },
+        daemon:
+          releaseTargets.length > 0
+            ? {
+                commit: "1".repeat(40),
+                tree: "2".repeat(40),
+                version: "0.2.0",
+                targets: Object.fromEntries(releaseTargets.map((target) => [target, {}])),
+              }
+            : null,
+        mobile: { tree: null, runtime_version: null },
+        desktop: options.releaseDesktop ?? null,
+        protocols: { daemon: null, browser: null, alerts: null },
+      });
+      return;
+    }
+    const hostUpdateMatch = path.match(/^\/api\/hosts\/([^/]+)\/update$/);
+    if (hostUpdateMatch && method === "POST") {
+      const selected = findById(store.hosts, hostUpdateMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "host not found" }, 404);
+        return;
+      }
+      const update = {
+        state: "current",
+        latest_version: selected.version ?? null,
+        error: null,
+        requested_at: new Date().toISOString(),
+      };
+      selected.update = update;
+      await json(route, { update });
       return;
     }
     const hostMatch = path.match(/^\/api\/hosts\/([^/]+)$/);
@@ -1717,7 +1825,6 @@ export async function openSettings(
     | "account"
     | "appearance"
     | "notifications"
-    | "hosts"
     | "agents"
     | "skills"
     | "templates"

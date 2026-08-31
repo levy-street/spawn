@@ -5,6 +5,7 @@ import {
   envelope,
   HOST_ID,
   mockApp,
+  pinKeyboard,
   SESSION_B_ID,
   SESSION_ID,
   session,
@@ -22,10 +23,12 @@ async function setupGrid(
   options: Omit<AppMockOptions, "sessions" | "workspaces"> & {
     sessionFixtures?: ReturnType<typeof session>[];
     extraWorkspaces?: ReturnType<typeof workspace>[];
+    /** Filled with everything the panes put on the wire, PTY bytes included. */
+    captured?: Array<string | Buffer>;
   } = {},
 ) {
   const connections: string[] = [];
-  await installSessionRtcMock(page, [], {
+  await installSessionRtcMock(page, options.captured ?? [], {
     history: "ready\r\n$ ",
     autoSnapshot: true,
   });
@@ -197,7 +200,10 @@ test("clicking the title bar without moving is not a drag", async ({ page }) => 
 test("shrinking a pane leaves empty canvas you can drop a pane into", async ({ page }) => {
   const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }];
   const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
-  const handle = page.getByRole("button", { name: "Resize palette (bottom-right corner)" });
+  // The right edge, not the bottom-right corner: the launcher is pinned into
+  // that corner of the window and covers the corner grip of whichever pane
+  // reaches it. Every edge of the pane is still its own grab surface.
+  const handle = page.getByRole("button", { name: "Resize palette (right edge)" });
   const areaBox = await page
     .locator(`[data-grid-tile="${SESSION_ID}"]`)
     .locator("..")
@@ -255,14 +261,25 @@ test("removing a tile re-packs and expands the survivor", async ({ page }) => {
   });
 });
 
+const SHORTCUT_TILES: Tile[] = [
+  { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+  { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
+];
+
+function ptyText(captured: Array<string | Buffer>) {
+  return captured
+    .filter(Buffer.isBuffer)
+    .map((message) => message.toString("utf8"))
+    .join("");
+}
+
 test("Alt+arrows follow reading order and Alt+digits switch workspace position", async ({
   page,
 }) => {
-  const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
-    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
-  ];
-  await setupGrid(page, initial, {
+  // A PC keyboard, where Alt is the app's — Windows Terminal moves between
+  // panes with the same chord, and the shell's word key there is Ctrl+Arrow.
+  await pinKeyboard(page, "pc");
+  await setupGrid(page, SHORTCUT_TILES, {
     extraWorkspaces: [workspace({ id: SECOND_WORKSPACE_ID, name: "second", position: 1 })],
   });
   const firstInput = page
@@ -272,6 +289,37 @@ test("Alt+arrows follow reading order and Alt+digits switch workspace position",
   await firstInput.focus();
   await page.keyboard.press("Alt+ArrowRight");
   await expect(secondInput).toBeFocused();
+  await page.keyboard.press("Alt+Digit2");
+  await page.waitForURL(`/w/${SECOND_WORKSPACE_ID}`);
+});
+
+test("on a Mac the terminal keeps ⌥ and the grid answers to ⌃⌥", async ({ page }) => {
+  await pinKeyboard(page, "apple");
+  const captured: Array<string | Buffer> = [];
+  await setupGrid(page, SHORTCUT_TILES, {
+    captured,
+    extraWorkspaces: [workspace({ id: SECOND_WORKSPACE_ID, name: "second", position: 1 })],
+  });
+  const firstInput = page
+    .getByRole("region", { name: "palette" })
+    .locator(".xterm-helper-textarea");
+  const secondInput = page.getByRole("region", { name: "beta" }).locator(".xterm-helper-textarea");
+  await firstInput.focus();
+
+  // ⌥← / ⌥→ are backward-word and forward-word. They go to the shell, and the
+  // focus stays exactly where the person left it.
+  await page.keyboard.press("Alt+ArrowLeft");
+  await page.keyboard.press("Alt+ArrowRight");
+  await expect.poll(() => ptyText(captured)).toContain("\u001bb");
+  expect(ptyText(captured)).toContain("\u001bf");
+  await expect(firstInput).toBeFocused();
+
+  // ⌃⌥ is the app's chord, and it reaches it from inside a terminal.
+  await page.keyboard.press("Control+Alt+ArrowRight");
+  await expect(secondInput).toBeFocused();
+
+  // ⌥+digit is the app's on every keyboard: no shell binds it, and this is
+  // how someone in a terminal reaches another workspace.
   await page.keyboard.press("Alt+Digit2");
   await page.waitForURL(`/w/${SECOND_WORKSPACE_ID}`);
 });

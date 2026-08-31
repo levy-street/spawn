@@ -15,10 +15,13 @@ import {
   SESSION_CTL_MAX_REPLAY_BYTES,
   SESSION_CTL_MAX_UPLOAD_BYTES,
   SESSION_CTL_UPLOAD_CHUNK_BYTES,
+  SESSION_PTY_INPUT_CHUNK_BYTES,
   SessionCtlRequestTracker,
   SessionGenerationInputQueue,
+  sessionPtyInputChunks,
   sha256Blob,
   slicePtyChunkAfterAnchor,
+  writeSessionPtyInput,
 } from "./session-ctl";
 
 declare function describe(name: string, callback: () => void): void;
@@ -371,5 +374,64 @@ describe("spawn.ctl browser protocol", () => {
     assert.equal(queue.enqueue(2, new Uint8Array([5])), false);
     assert.deepEqual(queue.drain(2), [new Uint8Array([3, 4])]);
     assert.deepEqual(queue.drain(1), []);
+  });
+
+  test("expires stale queued input and exposes a bounded queued count", () => {
+    const queue = new SessionGenerationInputQueue(SESSION_PTY_INPUT_CHUNK_BYTES * 2);
+    assert.equal(queue.enqueue(3, new Uint8Array([1]), 1_000), true);
+    assert.equal(queue.enqueue(3, new Uint8Array([2, 3]), 25_000), true);
+    assert.equal(queue.count(3), 2);
+    assert.equal(queue.bytes(3), 3);
+    queue.prune(3, 30_000, 32_000);
+    assert.equal(queue.count(3), 1);
+    assert.deepEqual(queue.drain(3, 30_000, 32_000), [new Uint8Array([2, 3])]);
+  });
+
+  test("chunks PTY input into ordered messages no larger than 16 KiB", () => {
+    const bytes = new Uint8Array(SESSION_PTY_INPUT_CHUNK_BYTES * 2 + 7);
+    bytes.forEach((_, index) => {
+      bytes[index] = index % 251;
+    });
+    const chunks = sessionPtyInputChunks(bytes);
+    assert.deepEqual(
+      chunks.map((chunk) => chunk.byteLength),
+      [SESSION_PTY_INPUT_CHUNK_BYTES, SESSION_PTY_INPUT_CHUNK_BYTES, 7],
+    );
+    assert.deepEqual(new Uint8Array(chunks.flatMap((chunk) => Array.from(chunk))), bytes);
+  });
+
+  test("stops PTY sends at backpressure and returns the exact remainder after a throw", () => {
+    const bytes = new Uint8Array(SESSION_PTY_INPUT_CHUNK_BYTES * 2 + 7);
+    const sent: ArrayBuffer[] = [];
+    const channel = {
+      readyState: "open",
+      bufferedAmount: 0,
+      send(value: ArrayBuffer) {
+        if (sent.length === 1) throw new TypeError("message rejected");
+        sent.push(value);
+      },
+    } as unknown as RTCDataChannel;
+    assert.equal(writeSessionPtyInput(channel, bytes), SESSION_PTY_INPUT_CHUNK_BYTES);
+    assert.deepEqual(
+      sent.map((value) => value.byteLength),
+      [SESSION_PTY_INPUT_CHUNK_BYTES],
+    );
+
+    const blocked = {
+      ...channel,
+      bufferedAmount: 256 * 1024 + 1,
+    } as RTCDataChannel;
+    assert.equal(writeSessionPtyInput(blocked, bytes), 0);
+  });
+
+  test("accepts pty_gap only with a safe non-negative offset", () => {
+    assert.deepEqual(
+      parseSessionCtlText('{"version":1,"kind":"event","event":"pty_gap","offset":42}'),
+      { version: 1, kind: "event", event: "pty_gap", offset: 42 },
+    );
+    assert.equal(
+      parseSessionCtlText('{"version":1,"kind":"event","event":"pty_gap","offset":-1}'),
+      null,
+    );
   });
 });

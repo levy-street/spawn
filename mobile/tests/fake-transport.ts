@@ -1,4 +1,5 @@
 import type {
+  ConnectionInfo,
   DisplayControlState,
   ScrollState,
   SessionTransport,
@@ -18,6 +19,7 @@ type BellListener = () => void;
 type ScrollListener = (state: ScrollState) => void;
 type DiagnosticListener = (diagnostic: WorkerDiagnostic) => void;
 type DisplayListener = (display: DisplayControlState) => void;
+type ConnectionInfoListener = (info: ConnectionInfo) => void;
 
 export class FakeUploadHandle implements UploadHandle {
   readonly result: Promise<UploadResult>;
@@ -111,6 +113,7 @@ export class FakeSessionTransport implements SessionTransport {
   private readonly scrollListeners = new Set<ScrollListener>();
   private readonly diagnosticListeners = new Set<DiagnosticListener>();
   private readonly displayListeners = new Set<DisplayListener>();
+  private readonly connectionInfoListeners = new Set<ConnectionInfoListener>();
   readonly writes: Uint8Array[] = [];
   readonly resizes: Array<{ cols: number; rows: number }> = [];
   takeControlCalls = 0;
@@ -168,8 +171,17 @@ export class FakeSessionTransport implements SessionTransport {
   on(ev: "scroll", fn: ScrollListener): () => void;
   on(ev: "diagnostic", fn: DiagnosticListener): () => void;
   on(ev: "display", fn: DisplayListener): () => void;
+  on(ev: "connection-info", fn: ConnectionInfoListener): () => void;
   on(
-    ev: "state" | "error" | "title" | "bell" | "scroll" | "diagnostic" | "display",
+    ev:
+      | "state"
+      | "error"
+      | "title"
+      | "bell"
+      | "scroll"
+      | "diagnostic"
+      | "display"
+      | "connection-info",
     fn:
       | StateListener
       | ErrorListener
@@ -177,7 +189,8 @@ export class FakeSessionTransport implements SessionTransport {
       | BellListener
       | ScrollListener
       | DiagnosticListener
-      | DisplayListener,
+      | DisplayListener
+      | ConnectionInfoListener,
   ): () => void {
     switch (ev) {
       case "state":
@@ -194,6 +207,8 @@ export class FakeSessionTransport implements SessionTransport {
         return this.subscribe(this.diagnosticListeners, fn as DiagnosticListener);
       case "display":
         return this.subscribe(this.displayListeners, fn as DisplayListener);
+      case "connection-info":
+        return this.subscribe(this.connectionInfoListeners, fn as ConnectionInfoListener);
     }
   }
 

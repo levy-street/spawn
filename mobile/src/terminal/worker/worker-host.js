@@ -42,12 +42,22 @@
   }
 
   async function waitForWritable() {
-    const deadline = Date.now() + STREAM_TIMEOUT_MS;
-    while (state.ctl?.readyState === "open" && state.ctl.bufferedAmount > BUFFERED_HIGH_WATER) {
-      if (Date.now() >= deadline) throw new Error("Host stream backpressure timed out.");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    if (state.ctl?.readyState !== "open") throw new Error("Host-control channel is not ready.");
+    const channel = state.ctl;
+    if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
+    if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
+    channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        channel.removeEventListener("bufferedamountlow", onWritable);
+        reject(new Error("Host stream backpressure timed out."));
+      }, STREAM_TIMEOUT_MS);
+      const onWritable = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      channel.addEventListener("bufferedamountlow", onWritable, { once: true });
+    });
+    if (channel.readyState !== "open") throw new Error("Host-control channel is not ready.");
   }
 
   function streamFrame(type, payload) {

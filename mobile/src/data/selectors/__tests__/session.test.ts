@@ -45,6 +45,8 @@ function host(status: string): Host {
     os: "darwin",
     arch: "arm64",
     version: "1",
+    daemon_tree: null,
+    update: null,
     host_key_algorithm: "ed25519",
     host_public_key: null,
     status,

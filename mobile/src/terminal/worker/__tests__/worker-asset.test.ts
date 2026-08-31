@@ -8,10 +8,12 @@ describe("offline terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).not.toMatch(/<link[^>]+href=/i);
   });
 
-  test("forwards xterm links through the native bridge", () => {
+  test("forwards plain-text and OSC 8 xterm links through the native bridge", () => {
     expect(TERMINAL_WORKER_HTML).toContain(
-      'new WebLinksAddon.WebLinksAddon((_event, uri) => api.post({ type: "link", url: uri }))',
+      'const forwardTerminalLink = (_event, uri) => api.post({ type: "link", url: uri })',
     );
+    expect(TERMINAL_WORKER_HTML).toContain("linkHandler: { activate: forwardTerminalLink }");
+    expect(TERMINAL_WORKER_HTML).toContain("new WebLinksAddon.WebLinksAddon(forwardTerminalLink)");
   });
 
   test("contains exact xterm parity configuration and addons", () => {
@@ -46,6 +48,11 @@ describe("offline terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).not.toContain("maxRetransmits");
   });
 
+  test("caps every native-to-worker PTY send at 16 KiB", () => {
+    expect(TERMINAL_WORKER_HTML).toContain("const MAX_INPUT_BYTES = 16 * 1024");
+    expect(TERMINAL_WORKER_HTML).toContain("offset += MAX_INPUT_BYTES");
+  });
+
   test("ships the secure-context and loopback capability probe", () => {
     expect(TERMINAL_WORKER_HTML).toContain("globalThis.isSecureContext === true");
     expect(TERMINAL_WORKER_HTML).toContain('createDataChannel("spawn.probe", { ordered: true })');
@@ -55,6 +62,24 @@ describe("offline terminal worker", () => {
   test("keeps PTY output inside the worker", () => {
     expect(TERMINAL_WORKER_HTML).toContain("state.term.write(takeWriteBatch()");
     expect(TERMINAL_WORKER_HTML).not.toContain('type: "output"');
+  });
+
+  test("uses one platform-correct native bridge listener without collapsing duplicates", () => {
+    expect(TERMINAL_WORKER_HTML).toContain(
+      "const bridgeTarget = /Android/i.test(navigator.userAgent) ? document : window",
+    );
+    expect(TERMINAL_WORKER_HTML).toContain('bridgeTarget.addEventListener("message", listener)');
+    expect(TERMINAL_WORKER_HTML).not.toContain("lastRawAt");
+  });
+
+  test("rebuilds history cleanly and recovers both history and PTY gaps", () => {
+    expect(TERMINAL_WORKER_HTML).toContain("session.bootstrapCount > 0 && alternate");
+    expect(TERMINAL_WORKER_HTML).toContain(
+      'state.term.write("\\x1b[0m\\x1b[H\\x1b[2J\\x1b[3J", writeReplay)',
+    );
+    expect(TERMINAL_WORKER_HTML).toContain('message.event === "history_gap"');
+    expect(TERMINAL_WORKER_HTML).toContain('message.event === "pty_gap"');
+    expect(TERMINAL_WORKER_HTML).toContain("recoverFromGap(message.offset)");
   });
 
   test("retries only the pre-effect upload start exchange", () => {

@@ -5,8 +5,7 @@ export type OnboardingStep = (typeof ONBOARDING_STEPS)[number];
 export interface DeriveStepInput {
   user: { email_verified_at: string | null } | null;
   config: { email_verification_required: boolean };
-  hosts: readonly unknown[];
-  skippedHost: boolean;
+  hosts: readonly { status?: string }[];
 }
 
 /**
@@ -15,10 +14,12 @@ export interface DeriveStepInput {
  * Keeping this pure is important: auth, verification, and host pairing can
  * complete in another tab, so the UI must never preserve a stale local step.
  */
-export function deriveStep({ user, config, hosts, skippedHost }: DeriveStepInput): OnboardingStep {
+export function deriveStep({ user, config, hosts }: DeriveStepInput): OnboardingStep {
   if (user === null) return "account";
   if (config.email_verification_required && user.email_verified_at === null) return "verify";
-  if (hosts.length === 0 && !skippedHost) return "host";
+  if (!hosts.some((host) => host.status === undefined || host.status === "online")) {
+    return "host";
+  }
   return "done";
 }
 

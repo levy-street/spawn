@@ -2,7 +2,10 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import { BrowserDeviceRow } from "@/components/settings/browser-device-row";
+import {
+  BrowserDeviceRow,
+  sortBrowserDevicesByLastSeen,
+} from "@/components/settings/browser-device-row";
 import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
@@ -12,6 +15,7 @@ import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
+import { logOut } from "@/data/api/endpoints/auth";
 import { listHostPins } from "@/data/api/endpoints/trust";
 import type { BrowserDeviceOut } from "@/data/api/schemas/devices";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -22,9 +26,15 @@ import {
   useMeSettingsQuery,
 } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
+import { useConnectionStore } from "@/data/stores/connection";
 import { createDeviceEndorsement } from "@/data/trust/endorsement";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
-import { ensureDeviceRegistered, revokeThisDevice } from "@/data/trust/registration";
+import { removeLocalTrustAccount } from "@/data/trust/local-account";
+import {
+  deviceRegistrationFailureLine,
+  ensureDeviceRegistered,
+  revokeThisDevice,
+} from "@/data/trust/registration";
 import { spacing, useTheme } from "@/theme";
 
 interface HostDeviceTrust {
@@ -36,7 +46,7 @@ function derivedDeviceFingerprint(device: BrowserDeviceOut): string {
   try {
     return formatHostFingerprint(device.public_key);
   } catch {
-    return "Invalid device key";
+    return "Invalid device identity";
   }
 }
 
@@ -54,11 +64,12 @@ export function BrowserDevicesPanel(): React.JSX.Element {
   const [trustMapError, setTrustMapError] = useState<string | null>(null);
   const [hostTrust, setHostTrust] = useState<HostDeviceTrust[]>([]);
   const [approveTarget, setApproveTarget] = useState<BrowserDeviceOut | null>(null);
-  const [revokeTarget, setRevokeTarget] = useState<BrowserDeviceOut | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<BrowserDeviceOut | null>(null);
   const [approvalNote, setApprovalNote] = useState<string | null>(null);
   const [revokedCurrent, setRevokedCurrent] = useState(false);
   const [showRevoked, setShowRevoked] = useState(false);
   const [confirmPrune, setConfirmPrune] = useState(false);
+  const [confirmRemoveAccount, setConfirmRemoveAccount] = useState(false);
   const [busy, setBusy] = useState(false);
   const accountId = me.data?.user.id;
 
@@ -71,9 +82,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
       setRevokedCurrent(false);
       await queryClient.invalidateQueries({ queryKey: qk.browserDevices() });
     } catch (cause) {
-      setRegistrationError(
-        cause instanceof Error ? cause.message : "This device's identity registration failed.",
-      );
+      setRegistrationError(deviceRegistrationFailureLine(cause));
     }
   }, [accountId, queryClient]);
 
@@ -105,7 +114,9 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     };
   }, [hosts.data]);
 
-  const activeDevices = (devices.data ?? []).filter((device) => device.revoked_at === null);
+  const activeDevices = sortBrowserDevicesByLastSeen(
+    (devices.data ?? []).filter((device) => device.revoked_at === null && !device.is_root),
+  );
   const revokedDevices = (devices.data ?? []).filter((device) => device.revoked_at !== null);
   const trustedCount = (deviceId: string) =>
     hostTrust.filter((record) => record.deviceIds.includes(deviceId)).length;
@@ -136,9 +147,8 @@ export function BrowserDevicesPanel(): React.JSX.Element {
           endorsedPublicKey: approveTarget.public_key,
         });
       }
-      const fingerprint = derivedDeviceFingerprint(approveTarget);
       setApprovalNote(
-        `Approved ${approveTarget.label ?? "the device"} (${fingerprint}) for ${endorsableHosts.length} ${endorsableHosts.length === 1 ? "host" : "hosts"}. It can connect within a few seconds.`,
+        `Approved ${approveTarget.label ?? "the device"} for ${endorsableHosts.length} ${endorsableHosts.length === 1 ? "host" : "hosts"}. It can connect within a few seconds.`,
       );
       setApproveTarget(null);
     } catch (cause) {
@@ -148,25 +158,47 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     }
   };
 
-  const revoke = async () => {
-    if (!revokeTarget) return;
+  const removeDevice = async () => {
+    if (!removeTarget) return;
     setBusy(true);
     setActionError(null);
     try {
-      if (revokeTarget.id === currentDevice?.id) {
-        await revokeThisDevice({ deviceId: revokeTarget.id });
+      if (removeTarget.id === currentDevice?.id) {
+        await revokeThisDevice({ deviceId: removeTarget.id });
         setCurrentDevice(null);
         setRevokedCurrent(true);
       } else {
         await mutations.revoke.mutateAsync({
-          id: revokeTarget.id,
-          publicKey: revokeTarget.public_key,
+          id: removeTarget.id,
+          publicKey: removeTarget.public_key,
         });
       }
       await queryClient.invalidateQueries({ queryKey: qk.browserDevices() });
-      setRevokeTarget(null);
+      setRemoveTarget(null);
     } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : "Device revocation failed.");
+      setActionError(cause instanceof Error ? cause.message : "The device could not be removed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeAccountFromPhone = async () => {
+    if (!accountId) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await removeLocalTrustAccount(accountId);
+      await logOut().catch(() => undefined);
+      useConnectionStore.getState().reset();
+      queryClient.clear();
+      router.replace("/login");
+    } catch (cause) {
+      setActionError(
+        cause instanceof Error
+          ? cause.message
+          : "This account could not be removed from the phone.",
+      );
+      setConfirmRemoveAccount(false);
     } finally {
       setBusy(false);
     }
@@ -232,11 +264,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
             </Text>
           </View>
           <Text color="mutedForeground" variant="body">
-            No host trusts it. Approve this fingerprint from a device that already works, or connect
-            a host directly.
-          </Text>
-          <Text selectable variant="mono">
-            {derivedDeviceFingerprint(currentDevice)}
+            Approve from a device you already use — or connect a host directly from this phone.
           </Text>
           <View style={styles.actions}>
             <Button onPress={() => router.push("/device-approval")} size="sm">
@@ -258,8 +286,8 @@ export function BrowserDevicesPanel(): React.JSX.Element {
             </Text>
           </View>
           <Text color="mutedForeground" variant="body">
-            Compare this exact fingerprint on the other device. The name is only a label — cancel if
-            the fingerprint differs.
+            Compare this exact identity value on the other device. The name is only a label — cancel
+            if the value differs.
           </Text>
           <Text selectable variant="mono">
             {derivedDeviceFingerprint(approveTarget)}
@@ -302,7 +330,6 @@ export function BrowserDevicesPanel(): React.JSX.Element {
               }
               current={device.id === currentDevice?.id}
               device={device}
-              fingerprint={derivedDeviceFingerprint(device)}
               key={device.id}
               onApprove={() => setApproveTarget(device)}
               onRename={(label) =>
@@ -311,7 +338,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
                   { onError: (cause) => setActionError(cause.message) },
                 )
               }
-              onRevoke={() => setRevokeTarget(device)}
+              onRemove={() => setRemoveTarget(device)}
               trustedHostCount={trustedCount(device.id)}
             />
           ))
@@ -320,8 +347,8 @@ export function BrowserDevicesPanel(): React.JSX.Element {
 
       {revokedDevices.length > 0 ? (
         <SettingsSection
-          description="Revoked devices keep no access. This is only a record."
-          title={`Revoked · ${revokedDevices.length}`}
+          description="Removed devices keep no access. This is only a record."
+          title={`Removed · ${revokedDevices.length}`}
         >
           <Button
             onPress={() => setShowRevoked((value) => !value)}
@@ -329,15 +356,12 @@ export function BrowserDevicesPanel(): React.JSX.Element {
             style={styles.revokedToggle}
             variant="outline"
           >
-            {showRevoked ? "Hide revoked devices" : "Show revoked devices"}
+            {showRevoked ? "Hide removed devices" : "Show removed devices"}
           </Button>
           {showRevoked
             ? revokedDevices.map((device) => (
                 <SettingsBlock key={device.id}>
-                  <Text variant="label">{device.label ?? "Unnamed browser"}</Text>
-                  <Text color="mutedForeground" selectable variant="mono">
-                    {derivedDeviceFingerprint(device)}
-                  </Text>
+                  <Text variant="label">{device.label ?? "Unnamed device"}</Text>
                 </SettingsBlock>
               ))
             : null}
@@ -354,20 +378,35 @@ export function BrowserDevicesPanel(): React.JSX.Element {
         </SettingsSection>
       ) : null}
 
+      <SettingsSection title="This phone">
+        <SettingsBlock>
+          <View style={styles.notice}>
+            <Text color="mutedForeground" variant="body">
+              Delete this account’s local identity and saved approvals from this phone.
+            </Text>
+            <Button
+              loading={busy && confirmRemoveAccount}
+              onPress={() => setConfirmRemoveAccount(true)}
+              variant="outline"
+            >
+              Remove this account from this phone
+            </Button>
+          </View>
+        </SettingsBlock>
+      </SettingsSection>
+
       <Confirm
-        confirmLabel="Revoke"
-        description={`It immediately loses terminal access on every host. Its key fingerprint is ${
-          revokeTarget ? derivedDeviceFingerprint(revokeTarget) : "—"
-        }.`}
+        confirmLabel="Remove"
+        description="It loses access to every host — instantly and permanently. To use it again, you'd approve it as a new device."
         destructive
-        onCancel={() => setRevokeTarget(null)}
-        onConfirm={() => void revoke()}
-        title={`Revoke ${revokeTarget?.label ?? "this unnamed browser"}?`}
-        visible={revokeTarget !== null}
+        onCancel={() => setRemoveTarget(null)}
+        onConfirm={() => void removeDevice()}
+        title={`Remove ${removeTarget?.label ?? "this unnamed device"}?`}
+        visible={removeTarget !== null}
       />
       <Confirm
         confirmLabel="Clear history"
-        description="Only clears revoked devices from this list."
+        description="Removal is permanent; this only clears the list."
         destructive
         onCancel={() => setConfirmPrune(false)}
         onConfirm={() =>
@@ -376,8 +415,17 @@ export function BrowserDevicesPanel(): React.JSX.Element {
             onError: (cause) => setActionError(cause.message),
           })
         }
-        title="Clear revoked device history?"
+        title="Clear removed device history?"
         visible={confirmPrune}
+      />
+      <Confirm
+        confirmLabel="Remove"
+        description={`Its device identity, host approvals, and cached keys for this account are deleted here. Removed devices stay removed everywhere.`}
+        destructive
+        onCancel={() => setConfirmRemoveAccount(false)}
+        onConfirm={() => void removeAccountFromPhone()}
+        title={`Remove ${me.data?.user.email ?? "this account"} from this phone?`}
+        visible={confirmRemoveAccount}
       />
     </SettingsScreen>
   );

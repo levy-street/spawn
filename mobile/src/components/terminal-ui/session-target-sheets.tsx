@@ -3,6 +3,7 @@ import { useCallback, useState } from "react";
 
 import { shellQuote } from "@/components/launcher/agent-command";
 import { FolderPicker } from "@/components/launcher/folder-picker";
+import { pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
 import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
 import { stillRunningMessage } from "@/components/launcher/shell-handoff";
 import { useShellHandoff } from "@/components/launcher/use-shell-handoff";
@@ -144,6 +145,9 @@ export function SessionTargetSheets({
             onDismissFolder();
             void run(`cd ${shellQuote(path)}`, "Changing this window's folder");
           }}
+          // Without this the picker defaults to POSIX and mangles every path
+          // on a Windows host — separators, the drive root, the home check.
+          pathFlavor={pathFlavorForHostOS(host.os)}
           recentDirectories={recents.data ?? []}
           recentError={recents.error?.message ?? null}
           transport={transport}

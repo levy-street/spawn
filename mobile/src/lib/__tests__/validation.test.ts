@@ -2,9 +2,7 @@ import {
   matchingConfirmation,
   maxLength,
   minLength,
-  normalizeHostPairingCode,
   validateEmail,
-  validateHostPairingCode,
   validateRequired,
   validateResetPassword,
   validateSessionName,
@@ -69,17 +67,4 @@ describe("validation", () => {
     expect(validateSessionName(` ${"a".repeat(128)} `)).toBeNull();
     expect(validateSessionName("a".repeat(129))).toBe(validationCopy.sessionNameTooLong);
   });
-
-  test("pairing code accepts the daemon alphabet with or without its display hyphen", () => {
-    expect(normalizeHostPairingCode(" qz4k-7hmt ")).toBe("QZ4K7HMT");
-    expect(validateHostPairingCode("QZ4K-7HMT")).toBeNull();
-    expect(validateHostPairingCode("qz4k7hmt")).toBeNull();
-  });
-
-  test.each(["QZ4K-7HM", "QZ4K-7HMT9", "QZ-4K-7HMT", "QZ4K-7HM0", "QZ4K-7HMI", "QZ4K-7HMO"])(
-    "pairing code rejects invalid length or excluded characters: %s",
-    (value) => {
-      expect(validateHostPairingCode(value)).toBe(validationCopy.hostPairingCode);
-    },
-  );
 });

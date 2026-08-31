@@ -44,6 +44,8 @@ export type CascadeItem = {
   label: string;
   /** Secondary line, e.g. a full path under a folder name. */
   detail?: string;
+  /** Compact state or metadata aligned after the label. */
+  trailing?: ReactNode;
   /** Render as a non-interactive section label instead of a menu item. */
   heading?: boolean;
   /** Draw the row in the danger ink, as DropdownMenuItem's `destructive` does. */
@@ -401,6 +403,7 @@ export const CascadeMenu = forwardRef<
                   </span>
                 )}
               </span>
+              {item.trailing != null && <span className="shrink-0">{item.trailing}</span>}
               {item.panel != null && (
                 <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />
               )}

@@ -54,7 +54,6 @@ jest.mock("@/components/hosts/rename-host-dialog", () => ({
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import HostPairingScreen from "@/app/onboarding/host";
 import { HostListScreen } from "@/components/hosts/host-list-screen";
-import { HostsPanel } from "@/components/settings/hosts-panel";
 import { ThemeProvider } from "@/theme";
 
 /** The shell renders a device-approval watcher that queries; give it a client. */
@@ -92,7 +91,7 @@ describe("standalone host pairing route", () => {
 
   it("is reachable from both connect controls on Hosts", async () => {
     const screen = await render(<HostListScreen />, { wrapper: Providers });
-    const connectButtons = screen.getAllByRole("button", { name: "Connect a host" });
+    const connectButtons = screen.getAllByRole("button", { name: "Add a machine" });
     expect(connectButtons).toHaveLength(2);
 
     for (const button of connectButtons) await fireEvent.press(button);
@@ -100,11 +99,5 @@ describe("standalone host pairing route", () => {
     expect(mockPush).toHaveBeenCalledTimes(2);
     expect(mockPush).toHaveBeenNthCalledWith(1, "/onboarding/host");
     expect(mockPush).toHaveBeenNthCalledWith(2, "/onboarding/host");
-  });
-
-  it("is reachable from Settings Hosts", async () => {
-    const screen = await render(<HostsPanel />, { wrapper: Providers });
-    await fireEvent.press(screen.getByRole("button", { name: "Connect a host" }));
-    expect(mockPush).toHaveBeenCalledWith("/onboarding/host");
   });
 });

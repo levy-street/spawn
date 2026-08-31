@@ -33,6 +33,7 @@ pub(crate) const PREVIEW_PIXEL_SIZES: [u32; 4] = [128, 256, 512, 1024];
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 /// Concurrent renders. Deliberately small and separate from the file-service
 /// long-task budget.
+#[cfg(target_os = "macos")]
 pub(crate) const PREVIEW_RENDER_PERMITS: usize = 2;
 
 pub(crate) struct PreviewImage {
@@ -100,6 +101,7 @@ impl PreviewService {
     /// daemon. It is safe in a way the home root is not: the client can never
     /// name this directory, never list it, and never remove anything from it,
     /// because it lives outside the capability root entirely.
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(renderer: Arc<dyn PreviewRenderer>) -> FsResult<Self> {
         let base = std::env::temp_dir().join(format!("spawn-preview-{}", uuid::Uuid::new_v4()));
         let stage_display = base.join("in");
@@ -128,10 +130,7 @@ impl PreviewService {
         operations: Arc<HostFileOperations>,
     ) -> FsResult<PreviewImage> {
         if !is_supported_size(max_pixels) {
-            return Err(FsError::new(
-                "invalid_request",
-                "unsupported preview size",
-            ));
+            return Err(FsError::new("invalid_request", "unsupported preview size"));
         }
         // Taken before any file-service permit. The other order lets queued
         // previews hold every long-task permit while waiting on this much
@@ -181,8 +180,6 @@ impl PreviewService {
     /// exactly why the result is stat'd afterwards and required to be the same
     /// regular file we opened.
     fn stage_source(&self, source: &PreviewSource) -> FsResult<StagedFile> {
-        use std::os::fd::AsFd;
-
         let extension = sanitized_extension(&source.leaf);
         let name = match extension {
             Some(ext) => format!("{}.{}", uuid::Uuid::new_v4(), ext),
@@ -195,28 +192,26 @@ impl PreviewService {
             display,
         };
 
-        let linked = rustix::fs::linkat(
-            source.parent.as_fd(),
-            source.name.as_os_str(),
-            self.stage.as_fd(),
-            name.as_str(),
-            rustix::fs::AtFlags::empty(),
+        let linked = crate::platform::hard_link_noreplace_at(
+            &source.parent,
+            Path::new(&source.name),
+            &self.stage,
+            Path::new(&name),
         );
 
         match linked {
             Ok(()) => {
-                let stat = rustix::fs::statat(
-                    self.stage.as_fd(),
-                    name.as_str(),
-                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .map_err(|_| FsError::new("io_error", "could not verify the staged file"))?;
-                let is_regular =
-                    stat.st_mode & rustix::fs::FileType::RegularFile.as_raw_mode() != 0;
-                if !is_regular
-                    || stat.st_dev as u64 != source.dev
-                    || stat.st_ino as u64 != source.ino
-                {
+                let mut options = cap_std::fs::OpenOptions::new();
+                use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+                options.read(true).follow(FollowSymlinks::No);
+                let staged_file = self
+                    .stage
+                    .open_with(&name, &options)
+                    .map(cap_std::fs::File::into_std)
+                    .map_err(|_| FsError::new("io_error", "could not verify the staged file"))?;
+                let metadata = staged_file.metadata()?;
+                let identity = crate::platform::file_identity(&staged_file)?;
+                if !metadata.is_file() || identity != source.identity {
                     // The name we just created does not refer to the inode we
                     // validated. Drop unlinks it; nothing is rendered.
                     return Err(FsError::new(
@@ -243,11 +238,7 @@ impl PreviewService {
             .try_clone()
             .map_err(|_| FsError::new("io_error", "could not stage the file"))?;
         reader.seek(SeekFrom::Start(0))?;
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut writer = self
-            .stage
-            .open_with(name, &options)
+        let mut writer = crate::platform::create_private_file_new_at(&self.stage, Path::new(name))
             .map_err(|_| FsError::new("io_error", "could not stage the file"))?;
         let mut bounded = reader.take(crate::host_files::PREVIEW_MAX_INPUT_BYTES);
         let copied = std::io::copy(&mut bounded, &mut writer)?;
@@ -386,7 +377,10 @@ impl PreviewRenderer for QlmanageRenderer {
 /// extension, so the staged name needs one — but nothing else about the
 /// client's filename may survive into a path handed to another process.
 fn sanitized_extension(name: &str) -> Option<String> {
-    let extension = Path::new(name).extension()?.to_string_lossy().to_lowercase();
+    let extension = Path::new(name)
+        .extension()?
+        .to_string_lossy()
+        .to_lowercase();
     if extension.is_empty() || extension.len() > 16 {
         return None;
     }
@@ -396,45 +390,25 @@ fn sanitized_extension(name: &str) -> Option<String> {
     Some(extension)
 }
 
+#[cfg(target_os = "macos")]
 fn create_private_dir(path: &Path) -> FsResult<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder
-        .create(path)
+    crate::platform::create_private_dir_all(path)
         .map_err(|_| FsError::new("io_error", "could not create the preview staging directory"))
 }
 
 /// Open the staging directory and prove it is ours before trusting it.
+#[cfg(target_os = "macos")]
 fn open_private_dir(path: &Path) -> FsResult<cap_std::fs::Dir> {
-    use cap_std::ambient_authority;
-    use std::os::unix::fs::MetadataExt;
-
-    let dir = cap_std::fs::Dir::open_ambient_dir(path, ambient_authority())
-        .map_err(|_| FsError::new("io_error", "could not open the preview staging directory"))?;
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|_| FsError::new("io_error", "could not stat the preview staging directory"))?;
-    // The classic /tmp defence: it must be a directory, ours, and private.
-    if !metadata.is_dir() || metadata.uid() != nix::unistd::getuid().as_raw() {
-        return Err(FsError::new(
-            "io_error",
-            "the preview staging directory is not owned by this user",
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(FsError::new(
-            "io_error",
-            "the preview staging directory is not private",
-        ));
-    }
-    Ok(dir)
+    crate::platform::open_private_dir(path)
+        .map_err(|_| FsError::new("io_error", "could not open the preview staging directory"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\x00\x00\x00\xC0";
+    const PNG_HEADER: &[u8] =
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\x00\x00\x00\xC0";
 
     #[test]
     fn png_dimensions_are_read_from_the_ihdr() {
@@ -468,9 +442,6 @@ mod tests {
         assert_eq!(sanitized_extension("evil.a/b"), None);
         assert_eq!(sanitized_extension("evil.$(id)"), None);
         assert_eq!(sanitized_extension("noext"), None);
-        assert_eq!(
-            sanitized_extension(&format!("a.{}", "x".repeat(20))),
-            None
-        );
+        assert_eq!(sanitized_extension(&format!("a.{}", "x".repeat(20))), None);
     }
 }

@@ -3,10 +3,17 @@
 import {
   ALERTS_WS_SUBPROTOCOL,
   type AlertEvent,
+  type DataEvent,
   parseAlertFrame,
   type TrustEvent,
 } from "@/lib/alerts";
-import { buildAlertsWsUrl } from "@/lib/ws";
+import {
+  backoffDelay,
+  buildAlertsWsUrl,
+  notifySocketUnauthorized,
+  socketCloseAction,
+  watchSuspendResume,
+} from "@/lib/ws";
 
 /**
  * The owner's attention stream: one socket per tab, opened once, kept alive
@@ -25,10 +32,11 @@ import { buildAlertsWsUrl } from "@/lib/ws";
  * the background.
  */
 
-export type AlertSocketState = "idle" | "connecting" | "open" | "closed";
+export type AlertSocketState = "idle" | "connecting" | "open" | "closed" | "unauthorized";
 
 type AlertListener = (event: AlertEvent) => void;
 type TrustListener = (event: TrustEvent) => void;
+type DataListener = (event: DataEvent) => void;
 
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 15_000;
@@ -42,11 +50,12 @@ const LINGER_MS = 15_000;
 
 const listeners = new Set<AlertListener>();
 const trustListeners = new Set<TrustListener>();
+const dataListeners = new Set<DataListener>();
 const stateListeners = new Set<() => void>();
 
-/** Alerts and trust events share one socket, so either family keeps it alive. */
+/** All three families share one socket, so any of them keeps it alive. */
 function hasSubscribers(): boolean {
-  return listeners.size > 0 || trustListeners.size > 0;
+  return listeners.size > 0 || trustListeners.size > 0 || dataListeners.size > 0;
 }
 
 let socket: WebSocket | null = null;
@@ -57,6 +66,7 @@ let lingerTimer: number | null = null;
 let watchdogTimer: number | null = null;
 let installed = false;
 let stopped = false;
+let protocolRequired = false;
 
 function setState(next: AlertSocketState): void {
   if (state === next) return;
@@ -85,18 +95,17 @@ function armWatchdog(): void {
 }
 
 function scheduleReconnect(): void {
-  if (stopped || !hasSubscribers()) return;
+  if (stopped || protocolRequired || !hasSubscribers()) return;
   reconnectTimer = clearTimer(reconnectTimer);
   // Exponential with a ceiling, jittered so many tabs waking together do not
   // redial in lockstep.
-  const base = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** attempt);
-  const delay = base * (0.7 + Math.random() * 0.6);
+  const delay = backoffDelay(attempt, { base: RECONNECT_MIN_MS, cap: RECONNECT_MAX_MS });
   attempt = Math.min(attempt + 1, 6);
   reconnectTimer = window.setTimeout(connect, delay);
 }
 
 function connect(): void {
-  if (stopped || !hasSubscribers()) return;
+  if (stopped || protocolRequired || !hasSubscribers()) return;
   if (
     socket &&
     (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
@@ -117,7 +126,6 @@ function connect(): void {
 
   ws.onopen = () => {
     if (socket !== ws) return;
-    attempt = 0;
     setState("open");
     armWatchdog();
   };
@@ -128,11 +136,23 @@ function connect(): void {
     if (typeof message.data !== "string") return;
     const frame = parseAlertFrame(message.data);
     if (!frame) return;
+    attempt = 0;
     if (frame.type === "trust") {
       const { type: _trustType, ...trustEvent } = frame;
       for (const listener of [...trustListeners]) {
         try {
           listener(trustEvent);
+        } catch {
+          // One bad consumer must not stop the others hearing about it.
+        }
+      }
+      return;
+    }
+    if (frame.type === "data") {
+      const { type: _dataType, ...dataEvent } = frame;
+      for (const listener of [...dataListeners]) {
+        try {
+          listener(dataEvent);
         } catch {
           // One bad consumer must not stop the others hearing about it.
         }
@@ -150,25 +170,80 @@ function connect(): void {
     }
   };
 
-  const onGone = () => {
+  const onGone = (event: Event) => {
     if (socket !== ws) return;
     socket = null;
     watchdogTimer = clearTimer(watchdogTimer);
+    const action = socketCloseAction(
+      "code" in event && typeof event.code === "number" ? event.code : 1006,
+    );
+    if (action === "client_stale") {
+      protocolRequired = true;
+      reconnectTimer = clearTimer(reconnectTimer);
+      window.dispatchEvent(new CustomEvent("spawn:client-stale", { detail: { hard: true } }));
+      return;
+    }
+    if (action === "unauthorized") {
+      stopped = true;
+      reconnectTimer = clearTimer(reconnectTimer);
+      setState("unauthorized");
+      notifySocketUnauthorized();
+      return;
+    }
+    if (action === "client_bug") {
+      stopped = true;
+      reconnectTimer = clearTimer(reconnectTimer);
+      setState("closed");
+      console.error("SPAWN D alert signalling stopped after a client protocol error.");
+      return;
+    }
     setState("closed");
+    if (action === "reconnect_immediately") {
+      reconnectTimer = window.setTimeout(connect, 0);
+      return;
+    }
     scheduleReconnect();
   };
   ws.onclose = onGone;
-  ws.onerror = onGone;
+  // The close frame carries the protocol-required code; handling an error
+  // first would throw that information away and start a reconnect too early.
+  ws.onerror = () => {
+    if (socket === ws) setState("closed");
+  };
 }
 
 function wake(): void {
   // Coming back from a hidden tab or a dropped network is the moment a
   // half-open socket gets discovered, so retry immediately rather than
   // waiting out the backoff.
-  if (!hasSubscribers() || stopped) return;
-  if (socket && socket.readyState === WebSocket.OPEN) return;
+  if (!hasSubscribers() || stopped || protocolRequired) return;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    // pagehide dropped the watchdog; without one a socket the sleep
+    // half-opened would stay a silent corpse forever. Re-armed, the missing
+    // server pings cull it within the watchdog window.
+    if (watchdogTimer === null) armWatchdog();
+    return;
+  }
   attempt = 0;
   connect();
+}
+
+function suspendResumed(): void {
+  // The machine provably slept. Whatever readyState claims, the TCP side of
+  // an idle socket rarely survives that; closing it hands recovery to the
+  // ordinary reconnect path instead of waiting out the watchdog.
+  if (!hasSubscribers() || stopped || protocolRequired) return;
+  const current = socket;
+  if (current && current.readyState === WebSocket.OPEN) {
+    attempt = 0;
+    try {
+      current.close();
+    } catch {
+      // onclose schedules the redial either way.
+    }
+    return;
+  }
+  wake();
 }
 
 function installGlobalListeners(): void {
@@ -178,6 +253,10 @@ function installGlobalListeners(): void {
     if (document.visibilityState === "visible") wake();
   });
   window.addEventListener("online", wake);
+  window.addEventListener("pageshow", wake);
+  // The desktop shell's webview sleeps and wakes with the machine without
+  // firing visibilitychange, online, or pageshow; the clock jump arrives.
+  watchSuspendResume(suspendResumed);
   window.addEventListener("pagehide", () => {
     // Bfcache: let the socket go rather than restoring a corpse.
     watchdogTimer = clearTimer(watchdogTimer);
@@ -215,6 +294,14 @@ export function subscribeToTrustEvents(listener: TrustListener): () => void {
   return subscribe(
     () => trustListeners.add(listener),
     () => trustListeners.delete(listener),
+  );
+}
+
+/** Data-changed frames, for the cache invalidation in AppShell. */
+export function subscribeToDataEvents(listener: DataListener): () => void {
+  return subscribe(
+    () => dataListeners.add(listener),
+    () => dataListeners.delete(listener),
   );
 }
 

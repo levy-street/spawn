@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -10,10 +9,9 @@ use std::time::{Duration, Instant as StdInstant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use nix::errno::Errno;
-use nix::fcntl::{open, openat, OFlag};
-use nix::sys::stat::{fchmod, mkdirat, Mode};
-use nix::unistd::{fsync, linkat, unlinkat, UnlinkatFlags};
+use cap_fs_ext::DirExt;
+use cap_std::fs::Dir;
+use cap_std::{ambient_authority, fs::Dir as CapDir};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use tokio::fs;
@@ -217,7 +215,7 @@ struct ActiveUpload {
     owner: UploadOwner,
     manifest: UploadManifest,
     root_path: PathBuf,
-    directory: Arc<OwnedFd>,
+    directory: Arc<Dir>,
     temp_name: String,
     final_name: String,
     file: Option<std::fs::File>,
@@ -1277,14 +1275,8 @@ fn prepare_upload(cwd: &str, owner: UploadOwner, manifest: UploadManifest) -> Re
         }
     };
     let temp_name = format!(".spawn-upload-{}.part", Uuid::new_v4().simple());
-    let raw = openat(
-        Some(directory.as_raw_fd()),
-        temp_name.as_str(),
-        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::from_bits_truncate(0o600),
-    )
-    .context("creating private upload temporary file")?;
-    let file = unsafe { std::fs::File::from_raw_fd(raw) };
+    let file = crate::platform::create_private_file_new_at(&directory, Path::new(&temp_name))
+        .context("creating private upload temporary file")?;
     Ok(ActiveUpload {
         owner,
         manifest,
@@ -1370,22 +1362,19 @@ fn cleanup_active_sync(active: &mut ActiveUpload, hooks: &UploadLifecycleHooks) 
     if hooks.fail_unlink() {
         anyhow::bail!("injected upload temporary unlink failure");
     }
-    match unlinkat(
-        Some(active.directory.as_raw_fd()),
-        active.temp_name.as_str(),
-        UnlinkatFlags::NoRemoveDir,
-    ) {
-        Ok(()) | Err(Errno::ENOENT) => {}
+    match active.directory.remove_file(&active.temp_name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("removing upload temporary file"),
     }
     if hooks.fail_fsync() {
         anyhow::bail!("injected upload directory fsync failure");
     }
-    fsync(active.directory.as_raw_fd()).context("syncing upload directory cleanup")?;
+    crate::platform::fsync_dir(&active.directory).context("syncing upload directory cleanup")?;
     Ok(())
 }
 
-fn link_no_clobber(directory: &OwnedFd, temp_name: &str, desired_name: &str) -> Result<String> {
+fn link_no_clobber(directory: &Dir, temp_name: &str, desired_name: &str) -> Result<String> {
     let file_path = Path::new(desired_name);
     let stem = file_path
         .file_stem()
@@ -1407,15 +1396,14 @@ fn link_no_clobber(directory: &OwnedFd, temp_name: &str, desired_name: &str) -> 
             }
         };
         validate_leaf_name(&candidate)?;
-        match linkat(
-            Some(directory.as_raw_fd()),
-            temp_name,
-            Some(directory.as_raw_fd()),
-            candidate.as_str(),
-            nix::fcntl::AtFlags::empty(),
+        match crate::platform::hard_link_noreplace_at(
+            directory,
+            Path::new(temp_name),
+            directory,
+            Path::new(&candidate),
         ) {
             Ok(()) => return Ok(candidate),
-            Err(Errno::EEXIST) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error).context("committing upload without clobber"),
         }
     }
@@ -1430,7 +1418,7 @@ fn upload_close_timeout() -> Duration {
     }
 }
 
-fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
+fn open_capability_root(cwd: &str) -> Result<(PathBuf, Dir)> {
     if cwd.is_empty() || cwd.len() > MAX_UPLOAD_PATH_BYTES {
         anyhow::bail!("session cwd is outside upload path limits");
     }
@@ -1438,25 +1426,41 @@ fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
     if !path.is_absolute() {
         anyhow::bail!("session cwd is not an absolute capability root");
     }
-    let mut current = owned_fd(open(
-        Path::new("/"),
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    )?);
-    let mut normalized = PathBuf::from("/");
+    #[cfg(unix)]
+    let (mut normalized, mut current) = (
+        PathBuf::from("/"),
+        CapDir::open_ambient_dir(Path::new("/"), ambient_authority())?,
+    );
+    #[cfg(windows)]
+    let (mut normalized, mut current) = {
+        use std::path::Prefix;
+        let mut components = path.components();
+        let Component::Prefix(prefix) = components
+            .next()
+            .context("Windows upload root has no drive prefix")?
+        else {
+            anyhow::bail!("Windows upload root has no drive prefix");
+        };
+        match prefix.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+            _ => anyhow::bail!("UNC and device upload roots are unavailable in this release"),
+        }
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            anyhow::bail!("Windows upload root is not drive-absolute");
+        }
+        let mut root = PathBuf::new();
+        root.push(prefix.as_os_str());
+        root.push("\\");
+        let current = CapDir::open_ambient_dir(&root, ambient_authority())?;
+        (root, current)
+    };
     for component in path.components() {
         match component {
-            Component::RootDir => continue,
+            Component::Prefix(_) | Component::RootDir => continue,
             Component::Normal(name) if !name.is_empty() => {
-                current = owned_fd(
-                    openat(
-                        Some(current.as_raw_fd()),
-                        name,
-                        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                        Mode::empty(),
-                    )
-                    .context("opening session cwd capability component")?,
-                );
+                current = current
+                    .open_dir_nofollow(name)
+                    .context("opening session cwd capability component")?;
                 normalized.push(name);
             }
             _ => anyhow::bail!("session cwd contains an ambiguous component"),
@@ -1465,27 +1469,10 @@ fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
     Ok((normalized, current))
 }
 
-fn open_or_create_private_dir(parent: &OwnedFd, name: &str) -> Result<OwnedFd> {
+fn open_or_create_private_dir(parent: &Dir, name: &str) -> Result<Dir> {
     validate_leaf_name(name)?;
-    match mkdirat(
-        Some(parent.as_raw_fd()),
-        name,
-        Mode::from_bits_truncate(0o700),
-    ) {
-        Ok(()) | Err(Errno::EEXIST) => {}
-        Err(error) => return Err(error).context("creating private upload directory"),
-    }
-    let directory = openat(
-        Some(parent.as_raw_fd()),
-        name,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    )
-    .context("opening private upload directory without following links")?;
-    let directory = owned_fd(directory);
-    fchmod(directory.as_raw_fd(), Mode::from_bits_truncate(0o700))
-        .context("enforcing private upload directory permissions")?;
-    Ok(directory)
+    crate::platform::open_or_create_private_dir_at(parent, Path::new(name))
+        .context("opening private upload directory without following links")
 }
 
 fn validate_leaf_name(name: &str) -> Result<()> {
@@ -1503,11 +1490,26 @@ fn validate_leaf_name(name: &str) -> Result<()> {
     {
         anyhow::bail!("upload name is not one unambiguous relative component");
     }
+    #[cfg(windows)]
+    {
+        let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+        let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || base
+                .strip_prefix("COM")
+                .or_else(|| base.strip_prefix("LPT"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
+                });
+        if name.ends_with(['.', ' '])
+            || name
+                .chars()
+                .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+            || reserved
+        {
+            anyhow::bail!("upload name is not a valid Windows file name");
+        }
+    }
     Ok(())
-}
-
-fn owned_fd(raw: std::os::fd::RawFd) -> OwnedFd {
-    unsafe { OwnedFd::from_raw_fd(raw) }
 }
 
 fn unique_file_name(name: &str, mime_type: &str) -> String {
@@ -1609,6 +1611,34 @@ fn extension_for_mime(mime_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BlockingPauseReleaseGuard<'a> {
+        pause: &'a BlockingPause,
+        released: bool,
+    }
+
+    impl<'a> BlockingPauseReleaseGuard<'a> {
+        fn arm(pause: &'a BlockingPause) -> Self {
+            pause.arm();
+            Self {
+                pause,
+                released: false,
+            }
+        }
+
+        fn release(&mut self) {
+            if !self.released {
+                self.pause.release();
+                self.released = true;
+            }
+        }
+    }
+
+    impl Drop for BlockingPauseReleaseGuard<'_> {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     fn manifest(bytes: &[u8], name: &str, destination: UploadDestination) -> UploadManifest {
         let sha256 = Sha256::digest(bytes)
@@ -1746,12 +1776,15 @@ mod tests {
         )
         .await;
         assert_eq!(std::fs::read(&result.path).unwrap(), bytes);
-        let mode = std::fs::metadata(&result.path).unwrap().permissions();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&result.path).unwrap().permissions();
             assert_eq!(mode.mode() & 0o777, 0o600);
         }
+        #[cfg(windows)]
+        crate::platform::open_private_file(Path::new(&result.path), false)
+            .expect("uploaded file has a protected owner-only DACL");
         assert!(matches!(
             hub.start(
                 session,
@@ -1999,119 +2032,141 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_different_owner_start_conflicts_without_replacing_the_inserted_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let hub = UploadHub::default();
-        let hooks = hub.lifecycle_hooks();
-        hooks.arm_admit_barrier(2);
-        hooks.prepare.arm();
-        let session = SessionBinding::new(Uuid::new_v4(), 82);
-        let capability = Uuid::new_v4();
-        let other_capability = Uuid::new_v4();
-        let upload_id = Uuid::new_v4();
-        let cwd = tmp.path().to_string_lossy().into_owned();
-        let upload_manifest = manifest(b"owner", "owner.bin", UploadDestination::Cwd);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let hub = UploadHub::default();
+            let hooks = hub.lifecycle_hooks();
+            hooks.arm_admit_barrier(2);
+            let mut prepare_pause = BlockingPauseReleaseGuard::arm(&hooks.prepare);
+            let session = SessionBinding::new(Uuid::new_v4(), 82);
+            let capability = Uuid::new_v4();
+            let other_capability = Uuid::new_v4();
+            let upload_id = Uuid::new_v4();
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let upload_manifest = manifest(b"owner", "owner.bin", UploadDestination::Cwd);
 
-        let first_hub = hub.clone();
-        let first_cwd = cwd.clone();
-        let first_manifest = upload_manifest.clone();
-        let first = tokio::spawn(async move {
-            first_hub
-                .start(
-                    session,
-                    "viewer-a",
-                    capability,
-                    upload_id,
-                    &first_cwd,
-                    first_manifest,
+            let first_hub = hub.clone();
+            let first_cwd = cwd.clone();
+            let first_manifest = upload_manifest.clone();
+            let first = tokio::spawn(async move {
+                first_hub
+                    .start(
+                        session,
+                        "viewer-a",
+                        capability,
+                        upload_id,
+                        &first_cwd,
+                        first_manifest,
+                    )
+                    .await
+            });
+            let second_hub = hub.clone();
+            let second_cwd = cwd.clone();
+            let second_manifest = upload_manifest.clone();
+            let second = tokio::spawn(async move {
+                second_hub
+                    .start(
+                        session,
+                        "viewer-b",
+                        other_capability,
+                        upload_id,
+                        &second_cwd,
+                        second_manifest,
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), hooks.prepare.wait_until_entered())
+                .await
+                .expect("winning upload start did not reach the prepare pause within 10 seconds");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !first.is_finished() && !second.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("conflicting-owner upload start did not resolve within 10 seconds");
+            assert_ne!(first.is_finished(), second.is_finished());
+            assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+            assert_eq!(hub.retained_counts().await.0, 1);
+
+            prepare_pause.release();
+            let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(first, second)
+            })
+            .await
+            .expect(
+                "competing upload starts did not finish within 10 seconds after prepare resumed",
+            );
+            let first = first.unwrap();
+            let second = second.unwrap();
+            let is_ready = |result: &UploadOpResult<UploadStartOutcome>| {
+                matches!(
+                    result,
+                    Ok(UploadStartOutcome::Ready {
+                        next_sequence: 0,
+                        received_bytes: 0
+                    })
+                )
+            };
+            assert_ne!(is_ready(&first), is_ready(&second));
+            let conflict = if is_ready(&first) {
+                second.as_ref().unwrap_err()
+            } else {
+                first.as_ref().unwrap_err()
+            };
+            assert!(conflict.detail.contains("another manifest or capability"));
+            let (winner_session, winner_capability) = if is_ready(&first) {
+                ("viewer-a", capability)
+            } else {
+                ("viewer-b", other_capability)
+            };
+            assert!(matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    hub.start(
+                        session,
+                        winner_session,
+                        winner_capability,
+                        upload_id,
+                        &cwd,
+                        upload_manifest,
+                    )
                 )
                 .await
-        });
-        let second_hub = hub.clone();
-        let second_cwd = cwd.clone();
-        let second_manifest = upload_manifest.clone();
-        let second = tokio::spawn(async move {
-            second_hub
-                .start(
-                    session,
-                    "viewer-b",
-                    other_capability,
-                    upload_id,
-                    &second_cwd,
-                    second_manifest,
-                )
-                .await
-        });
-        hooks.prepare.wait_until_entered().await;
-        for _ in 0..100 {
-            if first.is_finished() || second.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_ne!(first.is_finished(), second.is_finished());
-        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
-        assert_eq!(hub.retained_counts().await.0, 1);
-
-        hooks.prepare.release();
-        let (first, second) = tokio::join!(first, second);
-        let first = first.unwrap();
-        let second = second.unwrap();
-        let is_ready = |result: &UploadOpResult<UploadStartOutcome>| {
-            matches!(
-                result,
-                Ok(UploadStartOutcome::Ready {
+                .expect("winner retry did not finish within 10 seconds")
+                .unwrap(),
+                UploadStartOutcome::Ready {
                     next_sequence: 0,
                     received_bytes: 0
-                })
-            )
-        };
-        assert_ne!(is_ready(&first), is_ready(&second));
-        let conflict = if is_ready(&first) {
-            second.as_ref().unwrap_err()
-        } else {
-            first.as_ref().unwrap_err()
-        };
-        assert!(conflict.detail.contains("another manifest or capability"));
-        let (winner_session, winner_capability) = if is_ready(&first) {
-            ("viewer-a", capability)
-        } else {
-            ("viewer-b", other_capability)
-        };
-        assert!(matches!(
-            hub.start(
-                session,
-                winner_session,
-                winner_capability,
-                upload_id,
-                &cwd,
-                upload_manifest,
-            )
-            .await
-            .unwrap(),
-            UploadStartOutcome::Ready {
-                next_sequence: 0,
-                received_bytes: 0
-            }
-        ));
-        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
-        let private_temps = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
-            .count();
-        assert_eq!(private_temps, 1);
+                }
+            ));
+            assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+            let private_temps = std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
+                .count();
+            assert_eq!(private_temps, 1);
 
-        assert!(hub
-            .cancel(session, winner_session, winner_capability, upload_id)
+            assert!(tokio::time::timeout(
+                Duration::from_secs(10),
+                hub.cancel(session, winner_session, winner_capability, upload_id),
+            )
             .await
+            .expect("winner cancellation did not finish within 10 seconds")
             .unwrap());
-        wait_for_upload_drain(&hub).await;
-        assert_eq!(hub.retained_counts().await, (0, 0));
-        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("spawn-upload")));
+            tokio::time::timeout(Duration::from_secs(10), wait_for_upload_drain(&hub))
+                .await
+                .expect("winner cleanup did not drain within 10 seconds");
+            assert_eq!(hub.retained_counts().await, (0, 0));
+            assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("spawn-upload")));
+        })
+        .await
+        .expect("different-owner upload concurrency fixture exceeded 30 seconds");
     }
 
     #[tokio::test]
@@ -2983,5 +3038,96 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("without following links"));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_upload_roots_and_names_reject_ambiguous_native_shapes() {
+        for root in [
+            r"\\server\share\folder",
+            r"\\?\UNC\server\share\folder",
+            r"\\.\C:\folder",
+        ] {
+            let error = match open_capability_root(root) {
+                Ok(_) => panic!("UNC/device root must be unavailable"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("UNC") || error.to_string().contains("device"),
+                "unexpected error for {root:?}: {error:#}"
+            );
+        }
+        for name in [
+            "CON",
+            "con.txt",
+            "LPT9.log",
+            "trailing.",
+            "trailing ",
+            "colon:name",
+            "question?.txt",
+        ] {
+            let error = manifest(b"inside", name, UploadDestination::Cwd)
+                .validate()
+                .unwrap_err();
+            assert!(error.to_string().contains("Windows file name"), "{name:?}");
+        }
+        for name in ["", ".", "..", r"..\escape", r"C:\absolute", "a/b", r"a\b"] {
+            let error = manifest(b"inside", name, UploadDestination::Cwd)
+                .validate()
+                .unwrap_err();
+            assert!(error.to_string().contains("unambiguous"), "{name:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_upload_refuses_file_and_directory_reparse_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        let destination_link = tmp.path().join("note.txt");
+        match std::os::windows::fs::symlink_file(&outside_file, &destination_link) {
+            Ok(()) => {
+                let result = complete(
+                    &UploadHub::default(),
+                    CompleteUpload {
+                        session: SessionBinding::new(Uuid::new_v4(), 1),
+                        viewer: "viewer",
+                        capability: Uuid::new_v4(),
+                        upload_id: Uuid::new_v4(),
+                        cwd: tmp.path().to_str().unwrap(),
+                        bytes: b"inside",
+                        manifest: manifest(b"inside", "note.txt", UploadDestination::Cwd),
+                    },
+                )
+                .await;
+                assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
+                assert_ne!(Path::new(&result.path), destination_link);
+            }
+            Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
+            Err(error) => panic!("creating file symlink failed unexpectedly: {error}"),
+        }
+
+        let escape = tmp.path().join("escape");
+        match std::os::windows::fs::symlink_dir(outside.path(), &escape) {
+            Ok(()) => {
+                let error = UploadHub::default()
+                    .start(
+                        SessionBinding::new(Uuid::new_v4(), 1),
+                        "viewer",
+                        Uuid::new_v4(),
+                        Uuid::new_v4(),
+                        escape.to_str().unwrap(),
+                        manifest(b"inside", "note.txt", UploadDestination::Cwd),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("capability component"));
+                assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+            }
+            Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
+            Err(error) => panic!("creating directory symlink failed unexpectedly: {error}"),
+        }
     }
 }

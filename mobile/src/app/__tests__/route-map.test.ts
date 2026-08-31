@@ -19,7 +19,6 @@ const DOCUMENTED_URLS = [
   "/settings/account",
   "/settings/appearance",
   "/settings/notifications",
-  "/settings/hosts",
   "/settings/agents",
   "/settings/skills",
   "/settings/templates",

@@ -1,0 +1,42 @@
+<!doctype html>
+<!--
+  The disk image's window, printed on the press sheet: the ink plate, the
+  wordmark, the registration marks and one arrow between the two icons — no
+  other words, the Finder's own "Applications" label says all that needs
+  saying.
+  Rendered to background.png (660×400 points at 2×, tagged 144 dpi so the
+  Finder draws it at its logical size) by `npm run dmg:background`; the icon
+  positions match `bundle.macOS.dmg` in tauri.conf.json, which is why the
+  arrow lands where it does. Assets are the app's own, so this can never
+  drift from the app.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; background: #000; }
+  .bg {
+    position: relative; width: 660px; height: 400px; overflow: hidden;
+    background: #000 url("../../src/assets/altar-ink.png") 50% 38% / cover no-repeat;
+  }
+  .scrim { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,.95) 0%, rgba(0,0,0,.84) 40%, rgba(0,0,0,.84) 60%, rgba(0,0,0,.96) 100%); }
+  .marks span { position: absolute; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 14px; color: rgba(225,30,21,.55); }
+  .marks span:nth-child(1) { top: 10px; left: 14px; } .marks span:nth-child(2) { top: 10px; right: 14px; }
+  .marks span:nth-child(3) { bottom: 10px; left: 14px; } .marks span:nth-child(4) { bottom: 10px; right: 14px; }
+  /* The unpainted wordmark, inlined by render.mjs at print time so it takes this ink. */
+  .wordmark { position: absolute; top: 32px; left: 36px; width: 114px; height: 24px; color: #e11e15; }
+  .wordmark svg { display: block; width: 100%; height: 100%; }
+  .arrow { position: absolute; left: 258px; top: 156px; width: 144px; height: 28px; }
+</style>
+</head>
+<body>
+<div class="bg">
+  <div class="scrim"></div>
+  <div class="marks" aria-hidden="true"><span>+</span><span>+</span><span>+</span><span>+</span></div>
+  <div class="wordmark" data-art="../../src/assets/spawnd-wordmark.svg" aria-hidden="true"></div>
+  <svg class="arrow" viewBox="0 0 144 28" fill="none" stroke="#e11e15" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M4 14h124" /><path d="m118 4 12 10-12 10" />
+  </svg>
+</div>
+</body>
+</html>

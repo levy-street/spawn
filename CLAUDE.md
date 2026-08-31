@@ -8,14 +8,21 @@ there is one copy and it cannot drift.
 ```
 web/      Next.js browser app                → web/CLAUDE.md
 mobile/   Expo / React Native app            → mobile/CLAUDE.md
+desktop/  Tauri v2 macOS + Windows companion → desktop/CLAUDE.md
 server/   FastAPI API + websockets + Alembic → server/CLAUDE.md
 daemon/   Rust spawnd + spawn-worker         → daemon/CLAUDE.md
 proto/    cross-runtime golden vectors shared by daemon and web crypto
 scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot
 infra/    docker-compose and nginx examples
-docs/     design docs, and docs/RELEASE.md — the release process
+docs/     design docs; docs/RELEASE.md — the release process,
+          docs/WINDOWS_VALIDATION.md — the Windows evidence gate, and
+          docs/AZURE_SIGNING_SETUP.md — the Windows signing identity, for
+          whoever holds Azure
 tools/    development utilities
-.github/  CI workflows: tests and the rolling daemon prebuilts
+.github/  CI workflows: tests, the rolling daemon prebuilts, the Windows check
+          and its unsigned packaging rehearsal, and the signed desktop
+          artifacts; readme/ holds the README's press art, struck from
+          web/public/brand/ink
 ```
 
 Each product folder has its own `CLAUDE.md` (with an `AGENTS.md` symlink

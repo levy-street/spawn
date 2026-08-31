@@ -1993,6 +1993,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2737,7 +2743,10 @@ name = "spawnd"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "anstream",
+ "anstyle",
  "anyhow",
+ "arc-swap",
  "base64",
  "bytes",
  "cap-fs-ext",
@@ -2753,6 +2762,7 @@ dependencies = [
  "keyring",
  "nix 0.29.0",
  "portable-pty",
+ "qrcode",
  "reqwest",
  "rustix",
  "serde",
@@ -2766,6 +2776,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "tungstenite",
  "url",
@@ -3507,9 +3518,9 @@ dependencies = [
 
 [[package]]
 name = "webrtc"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ba06986c4fcfbbb4b490abe4b88887b0ac9de0d3eb0aae36f3254e38d6ecdd1"
+checksum = "baaacdf9d96224d7b6e2872ba065578f38775f7634367e3ac2cc87c7271da433"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3564,9 +3575,9 @@ dependencies = [
 
 [[package]]
 name = "webrtc-ice"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23ede72a36e5dda685814c389b2b34ac60b3ed000a81789e93626e27180eb785"
+checksum = "5b7fd30f52e6fda8664779b84b7904b2553b76fee24d9ca665e774ae32b13f53"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3615,9 +3626,7 @@ dependencies = [
 
 [[package]]
 name = "webrtc-sctp"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ea6633bf951b3fd71eba3244731c8d0814f6a80300620a4370cad2983a5a42f"
+version = "0.17.2"
 dependencies = [
  "arc-swap",
  "async-trait",

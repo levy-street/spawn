@@ -44,7 +44,9 @@ fn hex(value: impl AsRef<[u8]>) -> String {
 fn unhex(value: &str) -> Vec<u8> {
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -275,7 +277,10 @@ fn main() {
     });
 
     let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../proto");
-    write_pretty(&proto_dir.join("signed-signal-v1-vectors.json"), &transcript_file);
+    write_pretty(
+        &proto_dir.join("signed-signal-v1-vectors.json"),
+        &transcript_file,
+    );
     write_pretty(
         &proto_dir.join("signed-signal-wire-v1-vectors.json"),
         &wire_file,

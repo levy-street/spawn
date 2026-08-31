@@ -62,9 +62,7 @@ export function deriveFileCapabilities(
     openLabel: "Open in default program",
     unavailableReason: quicklook
       ? null
-      : os === "macos"
-        ? "This host is running an older agent that cannot render previews."
-        : "Rendered previews are only available on macOS hosts.",
+      : "This host cannot render previews with its current daemon.",
   };
 }
 

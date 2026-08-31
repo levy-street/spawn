@@ -276,12 +276,22 @@ impl Emulator {
                 }
                 if j - i < band_min {
                     for &offset in &offsets[i..j] {
-                        paint_history_row(&grid[Line(-(offset as i32))], &mut pen, &mut hyperlink, &mut out);
+                        paint_history_row(
+                            &grid[Line(-(offset as i32))],
+                            &mut pen,
+                            &mut hyperlink,
+                            &mut out,
+                        );
                     }
                 }
                 i = j;
             } else {
-                paint_history_row(&grid[Line(-(offsets[i] as i32))], &mut pen, &mut hyperlink, &mut out);
+                paint_history_row(
+                    &grid[Line(-(offsets[i] as i32))],
+                    &mut pen,
+                    &mut hyperlink,
+                    &mut out,
+                );
                 emitted_content = true;
                 i += 1;
             }
@@ -488,7 +498,7 @@ impl Emulator {
         // mapped glyphs, so painting above never needed these).
         for (i, charset) in self.shadow.charsets.iter().enumerate() {
             if *charset != StandardCharset::Ascii {
-                let designator = [b'(', b')', b'*', b'+'][i];
+                let designator = b"()*+"[i];
                 out.extend_from_slice(&[0x1b, designator, b'0']);
             }
         }
@@ -1074,7 +1084,10 @@ mod tests {
         // The two content rows survive; the ~26 blank padding rows do not.
         assert!(text.contains("some prompt text"), "content lost: {text:?}");
         assert!(text.contains("---footer---"), "content lost: {text:?}");
-        assert!(blank <= 2, "blank padding committed as a band: {blank} blank lines in {text:?}");
+        assert!(
+            blank <= 2,
+            "blank padding committed as a band: {blank} blank lines in {text:?}"
+        );
     }
 
     #[test]
@@ -1082,7 +1095,11 @@ mod tests {
         // Clearing an already-empty screen must add nothing to history.
         let mut e = Emulator::new(48, 29);
         let events = e.feed_output(b"\x1b[2J\x1b[H");
-        assert!(committed(&events).is_empty(), "blank clear committed: {:?}", String::from_utf8_lossy(&committed(&events)));
+        assert!(
+            committed(&events).is_empty(),
+            "blank clear committed: {:?}",
+            String::from_utf8_lossy(&committed(&events))
+        );
     }
 
     #[test]
@@ -1095,12 +1112,15 @@ mod tests {
         let mut out = Vec::new();
         out.extend(committed(&e.feed_output(b"A\r\n\r\n"))); // commits [A]; blank still on screen
         out.extend(committed(&e.feed_output(b"B\r\nC\r\nD"))); // scrolls off [blank, B]
-        // Committed history is A, blank, B (C and D remain on screen). The
-        // single blank between A and B is a leading edge run well under half a
-        // screenful, so it survives.
+                                                               // Committed history is A, blank, B (C and D remain on screen). The
+                                                               // single blank between A and B is a leading edge run well under half a
+                                                               // screenful, so it survives.
         let rows = render_lines(20, 10, &out);
         assert_eq!(rows[0], "A", "history: {rows:?}");
-        assert_eq!(rows[1], "", "authored blank between A and B was trimmed: {rows:?}");
+        assert_eq!(
+            rows[1], "",
+            "authored blank between A and B was trimmed: {rows:?}"
+        );
         assert_eq!(rows[2], "B", "history: {rows:?}");
     }
 
@@ -1112,11 +1132,14 @@ mod tests {
         // A run at least half a screenful tall is padding and must be dropped,
         // even when it is not at a batch edge.
         let mut e = Emulator::new(20, 8); // band_min = 4
-        // "top", a 6-row blank band, "bottom", then rows to scroll them all off.
+                                          // "top", a 6-row blank band, "bottom", then rows to scroll them all off.
         let feed = b"top\r\n\r\n\r\n\r\n\r\n\r\n\r\nbottom\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx";
         let text = render_lines(20, 30, &committed(&e.feed_output(feed)));
         let ti = text.iter().position(|l| l == "top").expect("top committed");
-        let bi = text.iter().position(|l| l == "bottom").expect("bottom committed");
+        let bi = text
+            .iter()
+            .position(|l| l == "bottom")
+            .expect("bottom committed");
         assert!(
             bi - ti - 1 < 4,
             "interior blank band survived: {} blanks between top and bottom: {text:?}",

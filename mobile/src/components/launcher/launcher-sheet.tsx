@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 
+import { HostUpdateDialog } from "@/components/hosts/host-update-dialog";
+import { hostNeedsUpdatePrompt } from "@/components/hosts/host-update-status";
 import { FolderPicker } from "@/components/launcher/folder-picker";
-import { pathBasename } from "@/components/launcher/folder-picker-logic";
+import { pathBasename, pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
 import { HostStep } from "@/components/launcher/host-step";
 import { type LaunchHome, resolveLaunchHome } from "@/components/launcher/launcher-selection";
+import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { Button } from "@/components/ui/button";
 import { DrawerRow, DrawerSeparator } from "@/components/ui/drawer-row";
 import { Icon } from "@/components/ui/icon";
@@ -70,7 +73,7 @@ function choiceLabel(choice: Choice): string {
 function homeDetail(home: LaunchHome | null): string | null {
   if (!home) return null;
   if (home.host.status !== "online") return `${home.host.name} is offline — pick somewhere else`;
-  return `Opens in ${pathBasename(home.cwd) || home.cwd} on ${home.host.name}`;
+  return `Opens in ${pathBasename(home.cwd, pathFlavorForHostOS(home.host.os)) || home.cwd} on ${home.host.name}`;
 }
 
 /**
@@ -94,6 +97,9 @@ export function LauncherSheet({
   const theme = useTheme();
   const data = useLauncherData(workspaceId, visible);
   const launch = useLaunchSession();
+  // Listing a machine's folders needs that machine to have approved this
+  // device, so the approval comes before the browse rather than as its error.
+  const gate = useDeviceApprovalGate();
   const addWidget = useAddFilesWidget();
   const cancelRequested = useRef(false);
   const [step, setStep] = useState<LauncherStep>("choose");
@@ -106,6 +112,11 @@ export function LauncherSheet({
   const [hostTransportState, setHostTransportState] = useState<TransportState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [recovery, setRecovery] = useState<{ session: SessionOut; message: string } | null>(null);
+  const [updatePrompt, setUpdatePrompt] = useState<{
+    host: HostOut;
+    cwd: string;
+    target: Choice;
+  } | null>(null);
   const recents = useRecentDirectories(pickerHost?.id ?? null, visible && step === "folder");
   const workspace = data.workspace;
   const busy = launch.isPending || addWidget.isPending;
@@ -125,6 +136,7 @@ export function LauncherSheet({
     setHostTransportState("idle");
     setError(null);
     setRecovery(null);
+    setUpdatePrompt(null);
     cancelRequested.current = false;
   }, [visible]);
 
@@ -139,7 +151,7 @@ export function LauncherSheet({
     setHostTransport(transport);
   }, []);
 
-  const create = async (host: HostOut, cwd: string, target: Choice) => {
+  const performCreate = async (host: HostOut, cwd: string, target: Choice) => {
     if (!tabId || busy) return;
     setError(null);
     try {
@@ -195,6 +207,20 @@ export function LauncherSheet({
     }
   };
 
+  const create = (host: HostOut, cwd: string, target: Choice) => {
+    if (hostNeedsUpdatePrompt(host)) {
+      setUpdatePrompt({ host, cwd, target });
+      return;
+    }
+    void performCreate(host, cwd, target);
+  };
+
+  const proceedPastUpdate = () => {
+    const pending = updatePrompt;
+    setUpdatePrompt(null);
+    if (pending) void performCreate(pending.host, pending.cwd, pending.target);
+  };
+
   /**
    * Ask where. The folder browser answers that on its own, so there is no menu
    * of locations to step through — one host opens it straight away, several ask
@@ -222,7 +248,7 @@ export function LauncherSheet({
   const pick = (target: Choice) => {
     if (home && home.host.status === "online") {
       haptics.selection();
-      void create(home.host, home.cwd, target);
+      create(home.host, home.cwd, target);
       return;
     }
     browse(target);
@@ -316,143 +342,160 @@ export function LauncherSheet({
   );
 
   return (
-    <Sheet
-      onDismiss={handleCancel}
-      size={scrolls ? "tall" : "content"}
-      testID="launcher-sheet"
-      visible={visible}
-    >
-      {placing ? (
-        <View style={[styles.stepBar, { borderBottomColor: theme.colors.border }]}>
-          <IconButton
-            accessibilityLabel="Go back"
-            icon="ChevronLeft"
-            onPress={() => {
+    <>
+      <Sheet
+        onDismiss={handleCancel}
+        size={scrolls ? "tall" : "content"}
+        testID="launcher-sheet"
+        visible={visible}
+      >
+        {placing ? (
+          <View style={[styles.stepBar, { borderBottomColor: theme.colors.border }]}>
+            <IconButton
+              accessibilityLabel="Go back"
+              icon="ChevronLeft"
+              onPress={() => {
+                haptics.selection();
+                setError(null);
+                setStep(back[step] ?? "choose");
+              }}
+              size="sm"
+            />
+            <Text numberOfLines={1} style={styles.stepTitle} variant="label">
+              {placing}
+            </Text>
+            <View style={styles.backPlaceholder} />
+          </View>
+        ) : null}
+
+        {error ? (
+          <View style={[styles.error, { backgroundColor: theme.colors.destructiveSoft }]}>
+            <Text accessibilityRole="alert" color="destructive">
+              {error}
+            </Text>
+          </View>
+        ) : null}
+
+        {data.error ? (
+          <View style={styles.centered}>
+            <Text color="destructive">Could not load the launcher.</Text>
+            <Button onPress={() => void data.refetch()} variant="outline">
+              Try again
+            </Button>
+          </View>
+        ) : data.isLoading || !workspace ? (
+          <View style={styles.centered}>
+            <Spinner size={spacing[6]} />
+            <Text color="mutedForeground">Loading…</Text>
+          </View>
+        ) : step === "choose" ? (
+          scrolls ? (
+            <SheetScrollView contentContainerStyle={styles.menuContent}>{menu}</SheetScrollView>
+          ) : (
+            <View>{menu}</View>
+          )
+        ) : step === "host" ? (
+          <HostStep
+            hosts={data.hosts}
+            onSelect={(host) => {
               haptics.selection();
-              setError(null);
-              setStep(back[step] ?? "choose");
+              gate.guard(host.id, () => {
+                setPickerHost(host);
+                setHostTransport(null);
+                setHostTransportState("idle");
+                setStep("folder");
+              });
             }}
-            size="sm"
+            selectedHostId={pickerHost?.id ?? null}
           />
-          <Text numberOfLines={1} style={styles.stepTitle} variant="label">
-            {placing}
-          </Text>
-          <View style={styles.backPlaceholder} />
-        </View>
-      ) : null}
-
-      {error ? (
-        <View style={[styles.error, { backgroundColor: theme.colors.destructiveSoft }]}>
-          <Text accessibilityRole="alert" color="destructive">
-            {error}
-          </Text>
-        </View>
-      ) : null}
-
-      {data.error ? (
-        <View style={styles.centered}>
-          <Text color="destructive">Could not load the launcher.</Text>
-          <Button onPress={() => void data.refetch()} variant="outline">
-            Try again
-          </Button>
-        </View>
-      ) : data.isLoading || !workspace ? (
-        <View style={styles.centered}>
-          <Spinner size={spacing[6]} />
-          <Text color="mutedForeground">Loading…</Text>
-        </View>
-      ) : step === "choose" ? (
-        scrolls ? (
-          <SheetScrollView contentContainerStyle={styles.menuContent}>{menu}</SheetScrollView>
-        ) : (
-          <View>{menu}</View>
-        )
-      ) : step === "host" ? (
-        <HostStep
-          hosts={data.hosts}
-          onSelect={(host) => {
-            haptics.selection();
-            setPickerHost(host);
-            setHostTransport(null);
-            setHostTransportState("idle");
-            setStep("folder");
-          }}
-          selectedHostId={pickerHost?.id ?? null}
-        />
-      ) : step === "folder" ? (
-        <FolderPicker
-          initialPath={pickerHost && home?.host.id === pickerHost.id ? home.cwd : null}
-          onSelect={(path) => {
-            if (!pickerHost) return;
-            if (pendingChoice) {
-              void create(pickerHost, path, pendingChoice);
-              return;
-            }
-            // "Somewhere else" only answered where; the menu asks what again,
-            // now opening here instead of at the tab's home.
-            haptics.selection();
-            setElsewhere({ host: pickerHost, cwd: path });
-            setStep("choose");
-          }}
-          recentError={recents.error?.message ?? null}
-          recentDirectories={recents.data}
-          transport={hostTransport}
-          transportState={hostTransportState}
-        />
-      ) : recovery ? (
-        <View style={styles.recovery}>
-          <Text variant="title">The shell is running</Text>
-          <Text color="mutedForeground">{recovery.message}</Text>
-          <Button
-            onPress={() => {
-              void keepLaunchedShell(recovery.session.id)
-                .then(() => {
-                  onLaunched({
-                    session: recovery.session,
-                    pendingCommand: false,
-                    warning: recovery.message,
+        ) : step === "folder" ? (
+          <FolderPicker
+            initialPath={pickerHost && home?.host.id === pickerHost.id ? home.cwd : null}
+            onSelect={(path) => {
+              if (!pickerHost) return;
+              if (pendingChoice) {
+                create(pickerHost, path, pendingChoice);
+                return;
+              }
+              // "Somewhere else" only answered where; the menu asks what again,
+              // now opening here instead of at the tab's home.
+              haptics.selection();
+              setElsewhere({ host: pickerHost, cwd: path });
+              setStep("choose");
+            }}
+            recentError={recents.error?.message ?? null}
+            recentDirectories={recents.data}
+            pathFlavor={pathFlavorForHostOS(pickerHost?.os)}
+            transport={hostTransport}
+            transportState={hostTransportState}
+          />
+        ) : recovery ? (
+          <View style={styles.recovery}>
+            <Text variant="title">The shell is running</Text>
+            <Text color="mutedForeground">{recovery.message}</Text>
+            <Button
+              onPress={() => {
+                void keepLaunchedShell(recovery.session.id)
+                  .then(() => {
+                    onLaunched({
+                      session: recovery.session,
+                      pendingCommand: false,
+                      warning: recovery.message,
+                    });
+                    onDismiss();
+                  })
+                  .catch((cause) => {
+                    const message =
+                      cause instanceof Error
+                        ? cause.message
+                        : "Could not abandon the agent launch.";
+                    setError(message);
+                    onLaunchError?.(message, recovery.session.id);
                   });
-                  onDismiss();
-                })
-                .catch((cause) => {
-                  const message =
-                    cause instanceof Error ? cause.message : "Could not abandon the agent launch.";
-                  setError(message);
-                  onLaunchError?.(message, recovery.session.id);
-                });
-            }}
-            variant="outline"
-          >
-            Keep shell
-          </Button>
-          <Button
-            onPress={() => {
-              void discardLaunchedSession(recovery.session.id)
-                .then(onDismiss)
-                .catch((cause) => {
-                  const message =
-                    cause instanceof Error ? cause.message : "Could not remove the session.";
-                  setError(message);
-                  onLaunchError?.(message, recovery.session.id);
-                });
-            }}
-            variant="destructive"
-          >
-            Remove session
-          </Button>
-        </View>
-      ) : null}
+              }}
+              variant="outline"
+            >
+              Keep shell
+            </Button>
+            <Button
+              onPress={() => {
+                void discardLaunchedSession(recovery.session.id)
+                  .then(onDismiss)
+                  .catch((cause) => {
+                    const message =
+                      cause instanceof Error ? cause.message : "Could not remove the session.";
+                    setError(message);
+                    onLaunchError?.(message, recovery.session.id);
+                  });
+              }}
+              variant="destructive"
+            >
+              Remove session
+            </Button>
+          </View>
+        ) : null}
 
-      {visible && step === "folder" && pickerHost?.host_public_key ? (
-        <HostTransportSurface
-          hostId={pickerHost.id}
-          hostIdentityPublicKey={pickerHost.host_public_key}
-          onError={(transportError) => setError(transportError.message)}
-          onStateChange={setHostTransportState}
-          onTransport={handleTransport}
+        {visible && step === "folder" && pickerHost?.host_public_key ? (
+          <HostTransportSurface
+            hostId={pickerHost.id}
+            hostIdentityPublicKey={pickerHost.host_public_key}
+            onError={(transportError) => setError(transportError.message)}
+            onStateChange={setHostTransportState}
+            onTransport={handleTransport}
+          />
+        ) : null}
+      </Sheet>
+      {gate.overlay}
+      {updatePrompt ? (
+        <HostUpdateDialog
+          host={updatePrompt.host}
+          onDismiss={() => setUpdatePrompt(null)}
+          onNotNow={proceedPastUpdate}
+          onUpdated={proceedPastUpdate}
+          visible
         />
       ) : null}
-    </Sheet>
+    </>
   );
 }
 

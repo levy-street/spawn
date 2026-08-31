@@ -1,9 +1,11 @@
 import { openHostSignal } from "@/data/realtime/host-signal";
-import { loadCarriedEndorsements } from "@/data/trust/carried-endorsements";
+import { loadMemoizedCarriedEndorsements } from "@/data/trust/carried-endorsements";
 import {
   DEVICE_NOT_TRUSTED_CODE,
   DEVICE_NOT_TRUSTED_MESSAGE,
-  probeDeviceHostTrust,
+  type DeviceHostTrustResult,
+  invalidateDeviceHostTrust,
+  probeDeviceHostTrustResult,
 } from "@/data/trust/device-trust";
 import { randomBytes } from "@/lib/crypto/bootstrap";
 import { bytesToUuid, encodeHex } from "@/lib/crypto/bytes";
@@ -28,12 +30,14 @@ import {
 import {
   CONNECT_TIMEOUT_MESSAGE,
   CONNECT_TIMEOUT_MS,
+  LOST_CONNECTION_MESSAGE,
 } from "@/terminal/transport/session-transport";
 import {
   browserIdentityWire,
   signWorkerRequest,
   verifyAnswerFrame,
 } from "@/terminal/transport/signed-signalling";
+import { reconnectDelay } from "@/terminal/transport/state-machine";
 import type {
   HostCapabilities,
   HostFileSource,
@@ -53,6 +57,11 @@ import type {
   TransportState,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
+import {
+  iceServersNeedRefresh,
+  readTransportPolicy,
+  sanitizeIceServers,
+} from "@/terminal/transport/types";
 import { terminalDark, terminalMetrics } from "@/theme";
 
 const MAX_PENDING_REQUESTS = 32;
@@ -61,6 +70,7 @@ const PREVIEW_REQUEST_TIMEOUT_MS = 35_000;
 const HOST_HELLO_BRIDGE_ID = "$host.hello";
 const HOST_STREAM_BRIDGE_PREFIX = "$host.stream:";
 const STREAM_COMMAND_PREFIX = "$host.stream.";
+const RECONNECT_BUDGET_MS = 3 * 60_000;
 const INDETERMINATE_OPERATIONS = new Set([
   "fs.mkdir",
   "fs.rename",
@@ -73,6 +83,7 @@ interface FrameRecord extends Record<string, unknown> {
   type?: unknown;
   enabled?: unknown;
   ice_servers?: unknown;
+  ice_transport_policy?: unknown;
   scope_type?: unknown;
   scope_id?: unknown;
   protocol?: unknown;
@@ -92,6 +103,11 @@ interface PendingCommand {
   resolve(): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+interface CachedRtcConfig {
+  iceServers: Array<Record<string, unknown>>;
+  iceTransportPolicy: "all" | "relay";
 }
 
 function record(value: unknown): FrameRecord | null {
@@ -126,8 +142,28 @@ class WebViewHostTransport implements StreamingHostTransport {
   #browserKey: string | null = null;
   #signal: SignalChannelLike | null = null;
   #signalUnsubscribe: (() => void) | null = null;
+  #signalStateUnsubscribe: (() => void) | null = null;
   #bridgeUnsubscribe: (() => void) | null = null;
   #opening: Promise<void> | null = null;
+  #prepared = false;
+  #preparePromise: Promise<void> | null = null;
+  #workerStarted = false;
+  #cachedConfig: CachedRtcConfig | null = null;
+  #activeRtcSessionId: string | null = null;
+  #activeBindingNonce: string | null = null;
+  #activeBindingGeneration: number | null = null;
+  #signalHasOpened = false;
+  #configWaiters = new Set<() => void>();
+  #endorsements: Promise<
+    readonly import("@/data/trust/carried-endorsements").CarriedEndorsement[]
+  > = Promise.resolve([]);
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  #resumeTimer: ReturnType<typeof setTimeout> | null = null;
+  #reconnectAttempt = 0;
+  #reconnectStartedAt: number | null = null;
+  #hasEverReady = false;
+  /** True once this host has refused an offer from this device. */
+  #refused = false;
   #connectTimer: ReturnType<typeof setTimeout> | null = null;
   #resolveOpen: (() => void) | null = null;
   #rejectOpen: ((error: Error) => void) | null = null;
@@ -158,6 +194,34 @@ class WebViewHostTransport implements StreamingHostTransport {
     return this.#capabilities;
   }
 
+  prepare(): void {
+    if (this.#prepared) return;
+    this.#prepared = true;
+    this.#setState("signalling");
+    this.#loadEndorsements(this.#preflightTrust());
+    this.#startSignal();
+    this.#preparePromise = browserIdentityWire().then((browserKey) => {
+      this.#browserKey = browserKey;
+    });
+  }
+
+  networkChanged(): void {
+    if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
+    this.#refreshConfigBefore(() => {
+      if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
+      this.options.bridge.send({
+        v: TERMINAL_BRIDGE_VERSION,
+        type: "network-changed",
+        ...(this.#cachedConfig
+          ? {
+              iceServers: this.#cachedConfig.iceServers,
+              iceTransportPolicy: this.#cachedConfig.iceTransportPolicy,
+            }
+          : {}),
+      });
+    });
+  }
+
   hasCapability(operation: string): boolean {
     return this.#capabilities?.operations.includes(operation) === true;
   }
@@ -171,8 +235,14 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#resolveOpen = resolve;
       this.#rejectOpen = reject;
     });
+    this.prepare();
+    const opening = this.#opening;
     try {
-      this.#browserKey = await browserIdentityWire();
+      await this.#preparePromise;
+      if (this.#opening !== opening || ["closed", "failed"].includes(this.#state)) {
+        return opening;
+      }
+      this.#bridgeUnsubscribe?.();
       this.#bridgeUnsubscribe = this.options.bridge.onMessage((message) => {
         void this.#handleWorkerMessage(message);
       });
@@ -181,17 +251,17 @@ class WebViewHostTransport implements StreamingHostTransport {
         type: "init",
         mode: "host",
         scopeId: this.hostId,
-        browserIdentityPublicKey: this.#browserKey,
+        browserIdentityPublicKey: this.#browserKey ?? "",
         hostIdentityPublicKey: this.options.hostIdentityPublicKey,
         cols: 80,
         rows: 24,
         theme: terminalDark,
         fontSize: terminalMetrics.fontSize,
+        skipLoopbackProbe: true,
       });
-      this.#setState("signalling");
+      this.#workerStarted = true;
       this.#armConnectWatchdog();
-      this.#preflightTrust();
-      this.#startSignal();
+      if (this.#cachedConfig && this.#state === "signalling") this.#startPeer(this.#cachedConfig);
     } catch (error) {
       this.#fail(
         "host_open",
@@ -204,6 +274,10 @@ class WebViewHostTransport implements StreamingHostTransport {
   close(): void {
     if (this.#state === "closed") return;
     this.#clearConnectWatchdog();
+    clearTimeout(this.#reconnectTimer ?? undefined);
+    this.#reconnectTimer = null;
+    clearTimeout(this.#resumeTimer ?? undefined);
+    this.#resumeTimer = null;
     try {
       this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "close" });
     } catch {
@@ -212,6 +286,9 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#retireSignal();
     this.#bridgeUnsubscribe?.();
     this.#bridgeUnsubscribe = null;
+    this.#workerStarted = false;
+    this.#prepared = false;
+    this.#preparePromise = null;
     this.#capabilities = null;
     this.#setState("closed");
     const error = new HostControlTransportError("connection_closed", "Host transport closed.");
@@ -592,11 +669,16 @@ class WebViewHostTransport implements StreamingHostTransport {
     const openSignal = this.options.openSignal ?? openHostSignal;
     this.#signal = openSignal(this.hostId);
     this.#signalUnsubscribe = this.#signal.onFrame((frame) => this.#handleSignalFrame(frame));
+    this.#signalStateUnsubscribe =
+      this.#signal.onState?.((state) => this.#handleSignalState(state)) ?? null;
+    if (this.#signal.state === "open") this.#signalHasOpened = true;
   }
 
   #retireSignal(): void {
     this.#signalUnsubscribe?.();
     this.#signalUnsubscribe = null;
+    this.#signalStateUnsubscribe?.();
+    this.#signalStateUnsubscribe = null;
     this.#signal?.close();
     this.#signal = null;
   }
@@ -618,16 +700,44 @@ class WebViewHostTransport implements StreamingHostTransport {
         this.#fail("rtc_config", "Host RTC configuration is disabled or weakly bound.");
         return;
       }
-      this.#setState("connecting");
-      this.options.bridge.send({
-        v: TERMINAL_BRIDGE_VERSION,
-        type: "connect",
-        rtcSessionId: newUuid(),
-        bindingNonce: encodeHex(randomBytes(16)),
-        iceServers: frame.ice_servers,
-        forceRelay: this.options.forceRelay ?? false,
-      });
+      const iceServers = sanitizeIceServers(frame.ice_servers);
+      if (frame.ice_servers.length > 0 && iceServers.length === 0) {
+        this.#fail("rtc_config", "Host RTC configuration did not contain a safe ICE server.");
+        return;
+      }
+      this.#cachedConfig = {
+        iceServers,
+        iceTransportPolicy: readTransportPolicy(frame.ice_transport_policy),
+      };
+      for (const waiter of this.#configWaiters) waiter();
+      this.#configWaiters.clear();
+      if (this.#workerStarted && this.#state === "signalling") this.#startPeer(this.#cachedConfig);
       return;
+    }
+    if (frame.type === "rtc.status") {
+      const matchesActiveBinding = frame["session_id"] === this.#activeRtcSessionId;
+      if (matchesActiveBinding && Number.isSafeInteger(frame["binding_generation"])) {
+        this.#activeBindingGeneration = frame["binding_generation"] as number;
+      }
+      if (
+        matchesActiveBinding &&
+        frame["status"] === "unavailable" &&
+        this.#cachedConfig &&
+        this.#workerStarted
+      ) {
+        clearTimeout(this.#resumeTimer ?? undefined);
+        this.#resumeTimer = null;
+        this.#startPeer(this.#cachedConfig, true);
+        return;
+      }
+      if (
+        matchesActiveBinding &&
+        ["resumed", "rebound", "connected", "negotiating"].includes(String(frame["status"]))
+      ) {
+        clearTimeout(this.#resumeTimer ?? undefined);
+        this.#resumeTimer = null;
+      }
+      if (matchesActiveBinding && frame["status"] === "failed") this.#handleRtcRefusal();
     }
     try {
       const verified = verifyAnswerFrame(
@@ -654,22 +764,109 @@ class WebViewHostTransport implements StreamingHostTransport {
     }
   }
 
+  #startPeer(config: CachedRtcConfig, forceRebuild = false): void {
+    this.#setState("connecting");
+    this.#activeRtcSessionId = newUuid();
+    this.#activeBindingNonce = encodeHex(randomBytes(16));
+    this.#activeBindingGeneration = null;
+    this.options.bridge.send({
+      v: TERMINAL_BRIDGE_VERSION,
+      type: "connect",
+      rtcSessionId: this.#activeRtcSessionId,
+      bindingNonce: this.#activeBindingNonce,
+      iceServers: config.iceServers,
+      iceTransportPolicy: config.iceTransportPolicy,
+      forceRelay: this.options.forceRelay ?? false,
+      ...(forceRebuild ? { forceRebuild: true } : {}),
+    });
+  }
+
+  #handleSignalState(state: string): void {
+    if (state === "open") {
+      if (
+        this.#signalHasOpened &&
+        this.#state === "ready" &&
+        this.#activeRtcSessionId &&
+        this.#activeBindingNonce &&
+        this.#activeBindingGeneration
+      ) {
+        this.#signal?.send({
+          type: "rtc.resume",
+          session_id: this.#activeRtcSessionId,
+          binding_nonce: this.#activeBindingNonce,
+          binding_generation: this.#activeBindingGeneration,
+          scope_type: "host",
+          scope_id: this.hostId,
+          protocol: HOST_CONTROL_PROTOCOL,
+          protocol_version: HOST_CONTROL_VERSION,
+        });
+        clearTimeout(this.#resumeTimer ?? undefined);
+        this.#resumeTimer = setTimeout(() => {
+          this.#resumeTimer = null;
+          if (this.#state === "ready" && this.#cachedConfig && this.#workerStarted) {
+            this.#startPeer(this.#cachedConfig, true);
+          }
+        }, 2_000);
+      }
+      this.#signalHasOpened = true;
+      return;
+    }
+    if (state !== "failed" && state !== "unauthenticated") return;
+    const close = this.#signal?.closeInfo;
+    const message =
+      close?.code === 4003
+        ? "Update SPAWN D to reconnect to this host."
+        : state === "unauthenticated" || close?.code === 1008
+          ? "You've been signed out."
+          : close?.reason || "The host signalling connection failed.";
+    this.#fail("signal_failed", message);
+  }
+
+  #refreshConfigBefore(callback: () => void): void {
+    if (
+      !this.#cachedConfig ||
+      !iceServersNeedRefresh(this.#cachedConfig.iceServers) ||
+      this.#signal?.state !== "open"
+    ) {
+      callback();
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      this.#configWaiters.delete(finish);
+      callback();
+    };
+    const timer = setTimeout(finish, 2_000);
+    this.#configWaiters.add(finish);
+    try {
+      this.#signal.send({ type: "rtc.config.request" });
+    } catch {
+      finish();
+    }
+  }
+
   async #handleWorkerMessage(message: WorkerToNativeMessage): Promise<void> {
     switch (message.type) {
       case "state":
-        this.#setState(message.state);
+        if (message.state === "reconnecting") this.#scheduleReconnect();
+        else this.#setState(message.state);
         break;
       case "signal-frame":
-        this.#signal?.send(message.frame);
+        try {
+          this.#signal?.send(message.frame);
+        } catch {
+          // The reconnecting signalling socket will either resume this binding
+          // or the worker's restart deadline will request a fresh one.
+        }
         break;
       case "sign-request":
         try {
           const [signature, carriedEndorsements] = await Promise.all([
             signWorkerRequest(message),
-            (this.options.loadCarriedEndorsements ?? loadCarriedEndorsements)().catch(() => {
-              // Endorsements are best-effort; direct pins can still admit this signed offer.
-              return [];
-            }),
+            this.#endorsements,
           ]);
           this.options.bridge.send({
             v: TERMINAL_BRIDGE_VERSION,
@@ -792,6 +989,9 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#state = state;
     for (const listener of this.#stateListeners) listener(state);
     if (state === "ready") {
+      this.#hasEverReady = true;
+      this.#reconnectAttempt = 0;
+      this.#reconnectStartedAt = null;
       this.#clearConnectWatchdog();
       if (!this.#capabilities) {
         this.#fail("host_hello", "Host became ready without a capability hello.");
@@ -807,7 +1007,17 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#connectTimer = setTimeout(() => {
       this.#connectTimer = null;
       if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
-      this.#fail("connect_timeout", CONNECT_TIMEOUT_MESSAGE);
+      if (
+        this.#hasEverReady &&
+        Date.now() - (this.#reconnectStartedAt ?? Date.now()) < RECONNECT_BUDGET_MS
+      ) {
+        this.#scheduleReconnect();
+        return;
+      }
+      this.#fail(
+        "connect_timeout",
+        this.#hasEverReady ? LOST_CONNECTION_MESSAGE : CONNECT_TIMEOUT_MESSAGE,
+      );
     }, this.options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS);
   }
 
@@ -817,15 +1027,72 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#connectTimer = null;
   }
 
+  #scheduleReconnect(): void {
+    if (this.#state === "closed" || this.#state === "failed" || this.#reconnectTimer !== null) {
+      return;
+    }
+    this.#clearConnectWatchdog();
+    this.#reconnectStartedAt ??= Date.now();
+    this.#setState("reconnecting");
+    const lost = new HostControlTransportError(
+      "connection_lost",
+      "The host connection was lost. Retry the request when it reconnects.",
+    );
+    this.#emitError({ code: lost.code, message: lost.message, retryable: true });
+    this.#rejectActive(lost);
+    const delay = reconnectDelay(this.#reconnectAttempt++);
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      if (this.#state === "closed" || this.#state === "failed") return;
+      this.#capabilities = null;
+      this.#setState("signalling");
+      this.#loadEndorsements(this.#preflightTrust());
+      this.#armConnectWatchdog();
+      this.#startSignal();
+    }, delay);
+  }
+
+  /**
+   * The endorsement edges the next offer will carry, read once per attempt.
+   * Mirrors the session transport: a set frozen when the channel opened is the
+   * set from before the refusal, and the edge that admits this device is
+   * written by the approval that follows it.
+   */
+  #loadEndorsements(trust: Promise<DeviceHostTrustResult>): void {
+    this.#endorsements = trust
+      .then((result) =>
+        result.directlyPinned && !this.#refused
+          ? []
+          : (this.options.loadCarriedEndorsements ?? loadMemoizedCarriedEndorsements)(),
+      )
+      .catch(() => []);
+  }
+
+  /** A refusal makes both memoized views of this device's admission wrong: the
+   * verdict, and the edges the next offer carries. */
+  #handleRtcRefusal(): void {
+    this.#refused = true;
+    invalidateDeviceHostTrust(this.hostId);
+  }
+
   /** Mirrors the session transport: a host that never pinned this device drops
    * its offers silently, so name that instead of waiting out the watchdog. */
-  #preflightTrust(): void {
-    const probe = this.options.probeTrust ?? probeDeviceHostTrust;
-    void probe(this.hostId).then((trust) => {
-      if (trust !== "untrusted") return;
+  #preflightTrust(): Promise<DeviceHostTrustResult> {
+    const result = (
+      this.options.probeTrustResult
+        ? this.options.probeTrustResult(this.hostId)
+        : this.options.probeTrust
+          ? this.options
+              .probeTrust(this.hostId)
+              .then((status) => ({ status, directlyPinned: false }))
+          : probeDeviceHostTrustResult(this.hostId)
+    ).catch(() => ({ status: "unknown" as const, directlyPinned: false }));
+    void result.then(({ status }) => {
+      if (status !== "untrusted") return;
       if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
       this.#fail(DEVICE_NOT_TRUSTED_CODE, DEVICE_NOT_TRUSTED_MESSAGE);
     });
+    return result;
   }
 
   #fail(code: string, message: string): void {

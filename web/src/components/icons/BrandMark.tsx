@@ -59,5 +59,5 @@ export function Wordmark({
   if (ariaHidden) {
     return <span aria-hidden className={classes} style={WORDMARK_MASK} />;
   }
-  return <span role="img" aria-label="spawnd" className={classes} style={WORDMARK_MASK} />;
+  return <span role="img" aria-label="SPAWN D" className={classes} style={WORDMARK_MASK} />;
 }

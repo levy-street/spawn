@@ -7,15 +7,18 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ConnectHostSection } from "@/components/hosts/connect-host";
 import { Button } from "@/components/ui/button";
+import { PaceBar } from "@/components/ui/pace-bar";
 import { Spinner } from "@/components/ui/spinner";
-import { ApiError, auth, type Host, hosts, type User, workspaces } from "@/lib/api";
+import { ApiError, auth, type Host, hosts, type User } from "@/lib/api";
 import { useAuth, useAuthConfig } from "@/lib/auth";
+import { restoreDeviceApproval } from "@/lib/device-approval-stash";
 import { AuthShell } from "./auth-shell";
 import { SignupForm } from "./signup-form";
 import { ONBOARDING_STEPS, type OnboardingStep, resolveStep } from "./step-machine";
 
-const SKIPPED_HOST_KEY = "spawn.onboarding.skippedHost";
 const SUCCESS_BEAT_MS = 900;
+/** Hoisted so the host step hands down one array, not a new one per render. */
+const NOTHING_ONLINE_YET: readonly string[] = [];
 
 type SuccessBeat = "verify" | "host" | null;
 type CompletionState =
@@ -35,11 +38,11 @@ const STEP_COPY: Record<OnboardingStep, { title: string; description: string }> 
   host: {
     title: "Connect your first host",
     description:
-      "Install the daemon on a Mac or Linux machine, then approve it from the link its terminal prints.",
+      "Install the daemon on a machine you control, then approve it from the link spawnd possess prints. It appears here once it’s online.",
   },
   done: {
-    title: "Your workspace is ready",
-    description: "We’re opening a shell on your connected machine.",
+    title: "Your machine is possessed",
+    description: "Pick a folder on it and summon your first wall of terminals.",
   },
 };
 
@@ -49,7 +52,39 @@ export function OnboardingFlow() {
   const queryClient = useQueryClient();
   const authState = useAuth();
   const configState = useAuthConfig();
-  const [storage, setStorage] = useState({ ready: false, skippedHost: false });
+  const [storage, setStorage] = useState({ ready: false });
+  const _userId = authState.user?.id ?? null;
+  // Whether a machine's own approval link brought this visit here — carried on
+  // the URL, or left in sessionStorage by a link that went through signup and
+  // put back on this URL below. Either way the host step finishes the approval
+  // in place rather than starting a second one.
+  const [approvalFromLink, setApprovalFromLink] = useState(false);
+  // Whether the stash has been looked for yet. The restore must happen in an
+  // effect — it writes history and consumes storage — so rendering the host
+  // step before it runs shows the install-and-type-a-code layout for a frame
+  // and then replaces it: a flash of exactly the screen this flow exists to
+  // skip. Holding the step for that tick is cheaper than showing it.
+  const [approvalChecked, setApprovalChecked] = useState(false);
+
+  useEffect(() => {
+    const restored = restoreDeviceApproval(
+      window.sessionStorage,
+      window.location.href,
+      Date.now(),
+      ["/onboarding"],
+    );
+    if (restored !== null) {
+      window.history.replaceState(window.history.state, "", restored);
+    }
+    // The stash is consumed the first time it is read, so "was there a stash"
+    // answers a different question from "is there a ceremony here": a reload,
+    // or this URL opened a second time, still carries `?ref=` and still has an
+    // approval waiting on it. Asking the URL means the host step never teaches
+    // installation to someone whose machine is already asking to be let in.
+    const params = new URLSearchParams(window.location.search);
+    setApprovalFromLink(restored !== null || Boolean(params.get("ref") ?? params.get("code")));
+    setApprovalChecked(true);
+  }, []);
   const [successBeat, setSuccessBeat] = useState<SuccessBeat>(null);
   const [completion, setCompletion] = useState<CompletionState>({ status: "working" });
   const successTimerRef = useRef<number | null>(null);
@@ -57,11 +92,10 @@ export function OnboardingFlow() {
   const mountedRef = useRef(true);
   const previousStepRef = useRef<OnboardingStep | null>(null);
 
+  // Re-read whenever the signed-in account changes: the answer belongs to the
+  // user, not the browser.
   useEffect(() => {
-    setStorage({
-      ready: true,
-      skippedHost: window.localStorage.getItem(SKIPPED_HOST_KEY) !== null,
-    });
+    setStorage({ ready: true });
   }, []);
 
   useEffect(() => {
@@ -88,6 +122,17 @@ export function OnboardingFlow() {
     enabled: verificationSatisfied,
     retry: 1,
     staleTime: 3_000,
+    // Deliberately not polled. ConnectHostSection below polls for the host and
+    // owns the moment it arrives: it paints its Online row complete,
+    // then calls `onHostOnline` a beat later, and that callback is what moves
+    // this page on. A poll here would race it — this page would learn the host
+    // was online first and swap the whole surface for the success beat while
+    // its last row still read "Connecting…", so the reader never sees the
+    // thing they were waiting for tick over.
+    //
+    // The reload case needs no poll either: this query runs on mount, so a
+    // machine that is already online when the page opens resolves straight to
+    // "done" without the host step ever rendering.
   });
 
   const canDeriveStep =
@@ -103,18 +148,10 @@ export function OnboardingFlow() {
           user,
           config,
           hosts: hostsQuery.data ?? [],
-          skippedHost: storage.skippedHost,
         },
         searchParams.get("step"),
       )
     : null;
-
-  const workspacesQuery = useQuery({
-    queryKey: ["workspaces"],
-    queryFn: () => workspaces.list(),
-    enabled: step === "done",
-    retry: 1,
-  });
 
   const playSuccessBeat = useCallback((beat: Exclude<SuccessBeat, null>) => {
     if (successTimerRef.current !== null) window.clearTimeout(successTimerRef.current);
@@ -155,14 +192,8 @@ export function OnboardingFlow() {
     [playSuccessBeat, queryClient],
   );
 
-  const skipHost = () => {
-    window.localStorage.setItem(SKIPPED_HOST_KEY, "true");
-    setStorage({ ready: true, skippedHost: true });
-  };
-
-  const workspaceDataReady = workspacesQuery.data !== undefined;
-  const workspaceCount = workspacesQuery.data?.length ?? 0;
   const onlineHost = hostsQuery.data?.find((host) => host.status === "online") ?? null;
+  const approvedOfflineHost = hostsQuery.data?.find((host) => host.status !== "online") ?? null;
   const discoveredVerification =
     previousStepRef.current === "verify" &&
     step !== "verify" &&
@@ -186,53 +217,33 @@ export function OnboardingFlow() {
     if (
       step !== "done" ||
       transitionBeat !== null ||
-      !workspaceDataReady ||
-      workspacesQuery.isError ||
       completion.status !== "working" ||
       completionStartedRef.current
     ) {
       return;
     }
 
+    // Onboarding's job ends with a machine you own. It used to also create a
+    // workspace and open a shell in the home directory — so the first thing
+    // anyone saw of the product was a terminal somebody else had chosen for
+    // them, in a folder they had not picked. `/app` refuses to do that in so
+    // many words ("the first workspace is a deliberate act"), and this doing
+    // it anyway meant the two doors into the product disagreed.
+    //
+    // So hand over. `/app` decides where "my work" is — the create-your-first
+    // -workspace state for a new account, the last workspace for a returning
+    // one — and it is the same answer however you arrived.
     completionStartedRef.current = true;
-    setCompletion({ status: "working" });
-
-    void (async () => {
-      try {
-        if (workspaceCount === 0 && onlineHost !== null) {
-          const result = await workspaces.create({
-            first_session: { host_id: onlineHost.id, cwd: "~" },
-          });
-          if (!mountedRef.current) return;
-          setCompletion({ status: "success", message: "Host connected. Shell summoned." });
-          await new Promise((resolve) => window.setTimeout(resolve, SUCCESS_BEAT_MS));
-          if (mountedRef.current) router.replace(`/w/${result.workspace.id}`);
-          return;
-        }
-
-        setCompletion({ status: "success", message: "Setup complete." });
-        await new Promise((resolve) => window.setTimeout(resolve, SUCCESS_BEAT_MS));
-        if (mountedRef.current) router.replace("/app");
-      } catch (cause) {
-        if (!mountedRef.current) return;
-        completionStartedRef.current = false;
-        setCompletion({
-          status: "failed",
-          message:
-            cause instanceof ApiError ? cause.message : "Could not create your first workspace",
-        });
-      }
-    })();
-  }, [
-    completion.status,
-    onlineHost,
-    router,
-    step,
-    transitionBeat,
-    workspaceCount,
-    workspaceDataReady,
-    workspacesQuery.isError,
-  ]);
+    setCompletion({ status: "success", message: "Your machine is connected." });
+    // Deliberately not cleaned up on re-run: setting the state above changes
+    // `completion.status`, which re-runs this effect — and a cleanup here would
+    // clear the very timer that does the handover, leaving the reader parked on
+    // a success message for ever. `completionStartedRef` makes it one-shot and
+    // `mountedRef` makes it harmless after unmount.
+    window.setTimeout(() => {
+      if (mountedRef.current) router.replace("/app");
+    }, SUCCESS_BEAT_MS);
+  }, [completion.status, router, step, transitionBeat]);
 
   if (authState.error) {
     return (
@@ -275,13 +286,10 @@ export function OnboardingFlow() {
   const visibleSteps = config.email_verification_required
     ? ONBOARDING_STEPS
     : ONBOARDING_STEPS.filter((candidate) => candidate !== "verify");
-  const copy =
-    visibleStep === "done" && onlineHost === null
-      ? {
-          title: "Setup complete",
-          description: "Connect a host whenever you’re ready to open your first shell.",
-        }
-      : STEP_COPY[visibleStep];
+  // No "setup complete, connect a host whenever you like" variant any more:
+  // reaching `done` now means a host is online, because that is the only way
+  // through the gate.
+  const copy = STEP_COPY[visibleStep];
 
   return (
     <AuthShell
@@ -306,25 +314,46 @@ export function OnboardingFlow() {
       ) : step === "host" ? (
         <div className="space-y-5">
           <div className="min-w-0 [&_button]:min-h-11 [&_button]:min-w-11 [&_input]:min-h-11">
-            <ConnectHostSection onHostOnline={onHostOnline} frameless />
+            {approvalChecked ? (
+              <ConnectHostSection
+                onHostOnline={onHostOnline}
+                frameless
+                autoLoadFromUrl={approvalFromLink}
+                onPairingApproved={() => {
+                  // The ceremony is spent. Leaving `?ref=` on the URL means any
+                  // later remount auto-loads a consumed approval, which fails
+                  // and leaves an empty code box sitting where the answer was.
+                  const url = new URL(window.location.href);
+                  url.searchParams.delete("ref");
+                  url.searchParams.delete("code");
+                  window.history.replaceState(
+                    window.history.state,
+                    "",
+                    `${url.pathname}${url.search}`,
+                  );
+                  // `approvalFromLink` deliberately stays true: it records how
+                  // this visit arrived, and the layout keyed off it must not
+                  // change under the reader mid-flow.
+                }}
+                resumeApprovedHost={approvedOfflineHost}
+                // This step is not the end of anything: the approval is
+                // followed by a wait for the machine, and then by the beat that
+                // hands the reader to /app.
+                awaitsHostArrival
+                // This gate is only ever reached with nothing online — that is
+                // what puts the reader on it — so there is no host here that
+                // could belong to some other ceremony, and any machine that
+                // arrives is the one being connected. Saying so is what keeps a
+                // surface that mounts again mid-wait from mistaking the machine
+                // it is waiting for for one that was always there.
+                priorOnlineHostIds={NOTHING_ONLINE_YET}
+              />
+            ) : (
+              <div className="flex min-h-48 items-center justify-center px-6">
+                <PaceBar className="w-full max-w-xs" label="Opening this step…" />
+              </div>
+            )}
           </div>
-          <Button
-            type="button"
-            variant="link"
-            className="h-11 w-full text-ash hover:text-bone"
-            onClick={skipHost}
-          >
-            Skip for now
-          </Button>
-        </div>
-      ) : workspacesQuery.isError ? (
-        <div className="space-y-4">
-          <p className="text-sm text-destructive" role="alert">
-            Could not check your workspaces.
-          </p>
-          <Button className="h-11 w-full" onClick={() => void workspacesQuery.refetch()}>
-            Try again
-          </Button>
         </div>
       ) : (
         <CompletionBeat
@@ -469,9 +498,8 @@ function CompletionBeat({ state, onRetry }: { state: CompletionState; onRetry: (
   if (state.status === "success") return <SuccessBeat message={state.message} />;
 
   return (
-    <div className="flex min-h-32 items-center justify-center gap-3 text-sm text-muted-foreground">
-      <Spinner label="Preparing your workspace" />
-      Preparing your workspace…
+    <div className="flex min-h-32 items-center justify-center px-6">
+      <PaceBar className="w-full max-w-xs" label="Preparing your workspace…" />
     </div>
   );
 }

@@ -87,10 +87,20 @@ export function ListBlock({
 
 export interface ListGroupProps {
   children: ReactNode;
+  /**
+   * Draws the rule a heading would have opened the group with. For a group
+   * that stands on its own under plain copy: without it the first entry has a
+   * rule below and none above, and reads as hanging off the text over it.
+   */
+  openingRule?: boolean;
   testID?: string;
 }
 
-export function ListGroup({ children, testID }: ListGroupProps): React.JSX.Element {
+export function ListGroup({
+  children,
+  openingRule = false,
+  testID,
+}: ListGroupProps): React.JSX.Element {
   const theme = useTheme();
   const items = Children.toArray(children).filter((child): child is ReactElement =>
     isValidElement(child),
@@ -98,6 +108,12 @@ export function ListGroup({ children, testID }: ListGroupProps): React.JSX.Eleme
 
   return (
     <View style={styles.group} testID={testID}>
+      {openingRule && items.length > 0 ? (
+        <View
+          style={[styles.separator, { backgroundColor: theme.colors.border }]}
+          testID="list-group-start"
+        />
+      ) : null}
       {items.map((item, index) => (
         <View key={String(item.key)}>
           {index > 0 ? (

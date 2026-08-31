@@ -15,11 +15,17 @@ import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { type MenuPlacement, measureMenu, placeMenu } from "@/components/ui/menu-position";
+import { type MenuPlacement, measureMenu } from "@/components/ui/menu-position";
 import { useHostControl } from "@/hooks/useHostControl";
 import type { Host } from "@/lib/api";
 import { HostControlError } from "@/lib/hostControl";
-import { normalizeCwdForHost } from "@/lib/paths";
+import {
+  isAbsolutePath,
+  isValidPathLeafName,
+  normalizeCwdForHost,
+  pathFlavorForHostOS,
+  pathsEqual,
+} from "@/lib/paths";
 import { cn } from "@/lib/utils";
 import { FolderColumn, type FolderColumnEmpty } from "./folder-picker-column";
 import { CrumbDrillMenu } from "./folder-picker-crumbs";
@@ -30,6 +36,7 @@ import {
   joinDirectory,
   listAllEntries,
   parentWithinHome,
+  placePickerPanel,
   visibleDirectories,
 } from "./folder-picker-helpers";
 
@@ -49,6 +56,29 @@ const PANEL_CHROME = 26;
 /** The panel's preferred size; the placement caps it to the room available. */
 const PANEL_WIDTH = COLUMN_WIDTH * VISIBLE_COLUMNS + PANEL_CHROME;
 const PANEL_HEIGHT = 440;
+
+/**
+ * Bring the trail's selected row into view *vertically*, and only vertically.
+ *
+ * `scrollIntoView` cannot do this: `inline` defaults to "nearest" whatever
+ * `block` is set to, and it walks every scrollable ancestor — so a call meant
+ * to nudge one row down its own column also scrolled the column strip
+ * sideways, instantly, cancelling the smooth horizontal scroll that had just
+ * been started a line above. The visible symptom was a picker whose reveal ran
+ * exactly one drill behind: opening a folder scrolled to where the *previous*
+ * one had wanted to be, because the row it had just highlighted was what the
+ * strip ended up chasing.
+ */
+function revealSelectedRow(row: HTMLElement | null): void {
+  const column = row?.closest<HTMLElement>('[role="listbox"]');
+  if (!row || !column) return;
+  const top = row.offsetTop;
+  const bottom = top + row.offsetHeight;
+  if (top < column.scrollTop) column.scrollTop = top;
+  else if (bottom > column.scrollTop + column.clientHeight) {
+    column.scrollTop = bottom - column.clientHeight;
+  }
+}
 
 /**
  * The folder picker: a Finder column browser in an anchored dropdown.
@@ -85,6 +115,7 @@ export function FolderPicker({
   onSelect: (path: string) => void;
 }) {
   const { client, state } = useHostControl(host?.id ?? null, open && host?.status === "online");
+  const pathFlavor = pathFlavorForHostOS(host?.os);
   const [path, setPath] = useState(initialPath || "~");
   const [filter, setFilter] = useState("");
   const [showHidden, setShowHidden] = useState(false);
@@ -98,6 +129,14 @@ export function FolderPicker({
   // False until the strip has been parked once, which separates "opened at a
   // folder" from "drilled into one" — the two want opposite scroll positions.
   const settled = useRef(false);
+  /**
+   * Bumped by every navigation, so the reveal is driven by the act rather than
+   * by the path it produced. Pressing the folder you are already in is a
+   * request to see inside it — the most natural way to ask, from the column
+   * where it sits highlighted — and that leaves the path exactly as it was, so
+   * a reveal keyed on the path alone would answer it with nothing at all.
+   */
+  const [revealNonce, setRevealNonce] = useState(0);
   const leafColumnRef = useRef<HTMLDivElement>(null);
   const [coords, setCoords] = useState<MenuPlacement | null>(null);
 
@@ -128,15 +167,21 @@ export function FolderPicker({
   // above the root the host will serve.
   useEffect(() => {
     if (!open || !homeDir) return;
-    const next = normalizeCwdForHost(path, homeDir);
-    const clamped = isWithinHome(next, homeDir) ? next : normalizeCwdForHost("~", homeDir);
+    const next = normalizeCwdForHost(path, homeDir, pathFlavor);
+    const clamped = isWithinHome(next, homeDir, pathFlavor)
+      ? next
+      : normalizeCwdForHost("~", homeDir, pathFlavor);
     if (clamped !== path) setPath(clamped);
-  }, [homeDir, open, path]);
+  }, [homeDir, open, path, pathFlavor]);
 
-  const resolvedPath = homeDir && path.startsWith("~") ? normalizeCwdForHost(path, homeDir) : path;
-  const listedPath = resolvedPath.startsWith("/") ? resolvedPath : "/";
-  const breadcrumbs = breadcrumbParts(listedPath, homeDir ?? "/");
-  const columns = folderColumns(listedPath, homeDir ?? "/");
+  const fallbackRoot = pathFlavor === "windows" ? "\\" : "/";
+  const resolvedPath =
+    homeDir && path.startsWith("~") ? normalizeCwdForHost(path, homeDir, pathFlavor) : path;
+  const listedPath = isAbsolutePath(resolvedPath, pathFlavor)
+    ? resolvedPath
+    : (homeDir ?? fallbackRoot);
+  const breadcrumbs = breadcrumbParts(listedPath, homeDir ?? fallbackRoot, pathFlavor);
+  const columns = folderColumns(listedPath, homeDir ?? fallbackRoot, pathFlavor);
   const leafIndex = columns.length - 1;
   // The column holding the current selection: one left of the trailing column,
   // and absent entirely at the home root where nothing is selected yet.
@@ -151,7 +196,7 @@ export function FolderPicker({
         state === "ready" &&
         client !== null &&
         Boolean(homeDir) &&
-        column.path.startsWith("/"),
+        isAbsolutePath(column.path, pathFlavor),
       staleTime: 5_000,
     })),
   });
@@ -174,15 +219,22 @@ export function FolderPicker({
   // an error screen with no way down.
   const navigate = (value: string) => {
     if (!homeDir) return;
-    const next = normalizeCwdForHost(value, homeDir);
-    setPath(isWithinHome(next, homeDir) ? next : normalizeCwdForHost("~", homeDir));
+    const next = normalizeCwdForHost(value, homeDir, pathFlavor);
+    setPath(
+      isWithinHome(next, homeDir, pathFlavor)
+        ? next
+        : normalizeCwdForHost("~", homeDir, pathFlavor),
+    );
     setFilter("");
+    setRevealNonce((value) => value + 1);
   };
 
   // Anchored like a menu, with the same viewport-aware placement: the panel is
   // large, so which side it opens to matters more here than anywhere else.
-  // Without an anchor — opened from a cascade that has already closed, so there
-  // is no control left to hang off — it centres instead.
+  // `placePickerPanel` centres it without an anchor — opened from a cascade
+  // that has already closed, so there is no control left to hang off — and
+  // over an anchor too big to leave it a usable side, which is what the
+  // grid's "Add a window" opening is: an area, not a control.
   useLayoutEffect(() => {
     if (!open) {
       setCoords(null);
@@ -190,25 +242,12 @@ export function FolderPicker({
     }
     const place = () => {
       const { width, height } = measureMenu(panelRef.current, PANEL_WIDTH);
-      const anchor = anchorRef?.current?.getBoundingClientRect();
-      if (!anchor) {
-        setCoords({
-          position: "fixed",
-          left: Math.max(8, (window.innerWidth - width) / 2),
-          top: Math.max(8, (window.innerHeight - height) / 2),
-          maxHeight: window.innerHeight - 16,
-          maxWidth: window.innerWidth - 16,
-          // Nothing to grow out of, so it grows from its own middle.
-          transformOrigin: "center",
-        });
-        return;
-      }
       setCoords(
-        placeMenu({
-          anchor,
-          menuWidth: width,
-          menuHeight: height,
-          align: "start",
+        placePickerPanel({
+          anchor: anchorRef?.current?.getBoundingClientRect() ?? null,
+          width,
+          height,
+          preferredHeight: PANEL_HEIGHT,
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
         }),
@@ -264,14 +303,19 @@ export function FolderPicker({
 
   // Focus the column you landed in, so the arrow keys work without a click
   // first. The filter box is one Tab away for anyone who would rather type.
+  // Not until the home directory lands: the columns are rebuilt (re-keyed)
+  // then, so an earlier focus sits on an element about to unmount and falls
+  // back to the body. preventScroll because the parking effect below owns the
+  // strip's position — a focus scroll would drag the leaf into frame when the
+  // park deliberately leaves it one scroll further right.
   useEffect(() => {
-    if (!open) return;
-    const id = requestAnimationFrame(() => leafColumnRef.current?.focus());
+    if (!open || !homeDir) return;
+    const id = requestAnimationFrame(() => leafColumnRef.current?.focus({ preventScroll: true }));
     return () => cancelAnimationFrame(id);
-  }, [open]);
+  }, [open, homeDir]);
 
   // Park the strip as the trail changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: listedPath is the change being tracked
+  // biome-ignore lint/correctness/useExhaustiveDependencies: listedPath and revealNonce are the changes being tracked
   useEffect(() => {
     if (!open) {
       settled.current = false;
@@ -297,13 +341,13 @@ export function FolderPicker({
         strip.scrollTo({ left, behavior: settled.current ? "smooth" : "auto" });
         settled.current = true;
       }
-      selectedRef.current?.scrollIntoView({ block: "nearest" });
+      revealSelectedRow(selectedRef.current);
     });
     return () => cancelAnimationFrame(id);
-  }, [open, homeDir, listedPath]);
+  }, [open, homeDir, listedPath, revealNonce]);
 
   const mkdirM = useMutation({
-    mutationFn: (name: string) => client!.mkdir(joinDirectory(listedPath, name)),
+    mutationFn: (name: string) => client!.mkdir(joinDirectory(listedPath, name, pathFlavor)),
     onSuccess: () => {
       setCreatingFolder(false);
       setFolderName("");
@@ -314,8 +358,8 @@ export function FolderPicker({
   });
 
   const submitFolder = () => {
-    const name = folderName.trim();
-    if (!name || name === "." || name === ".." || name.includes("/")) return;
+    const name = pathFlavor === "windows" ? folderName : folderName.trim();
+    if (!isValidPathLeafName(name, pathFlavor)) return;
     mkdirM.mutate(name);
   };
 
@@ -324,22 +368,26 @@ export function FolderPicker({
   // type a `cd` into a live shell, write a workspace setting — and in the shell
   // case that means an "interrupt the agent?" prompt for a move to where the
   // window already is. Closing is the whole of the right answer.
-  const startedAt = homeDir && initialPath ? normalizeCwdForHost(initialPath, homeDir) : null;
+  const startedAt =
+    homeDir && initialPath ? normalizeCwdForHost(initialPath, homeDir, pathFlavor) : null;
   const commit = () => {
-    if (startedAt !== listedPath) onSelect(listedPath);
+    if (startedAt === null || !pathsEqual(startedAt, listedPath, pathFlavor)) onSelect(listedPath);
     onOpenChange(false);
   };
 
   // Null at the home root: there is no rung above it.
-  const parentPath = homeDir === null ? null : parentWithinHome(listedPath, homeDir);
-  const selectable = homeDir !== null && isWithinHome(listedPath, homeDir);
+  const parentPath = homeDir === null ? null : parentWithinHome(listedPath, homeDir, pathFlavor);
+  const selectable = homeDir !== null && isWithinHome(listedPath, homeDir, pathFlavor);
   const chrome = state !== "ready" || homeQ.isLoading;
 
   /** Move the selection among its siblings — the column view's up/down. */
   const step = (delta: 1 | -1) => {
     const siblings = columnEntries[Math.max(0, trailIndex)] ?? [];
     if (siblings.length === 0) return;
-    const current = trailIndex < 0 ? -1 : siblings.findIndex((e) => e.path === listedPath);
+    const current =
+      trailIndex < 0
+        ? -1
+        : siblings.findIndex((entry) => pathsEqual(entry.path, listedPath, pathFlavor));
     const next =
       current < 0
         ? delta === 1
@@ -612,6 +660,7 @@ export function FolderPicker({
                 entries={entries}
                 selectedPath={column.selectedChild}
                 selectedRef={index === trailIndex ? selectedRef : undefined}
+                columnRef={index === leafIndex ? leafColumnRef : undefined}
                 pending={chrome || (query?.isPending ?? true)}
                 errorMessage={query?.isError ? listErrorMessage(query.error) : null}
                 empty={emptyState(index, hiddenCount)}
@@ -642,7 +691,15 @@ export function FolderPicker({
                 if (event.key === "Escape") setCreatingFolder(false);
               }}
             />
-            <Button type="submit" disabled={!folderName.trim() || mkdirM.isPending}>
+            <Button
+              type="submit"
+              disabled={
+                !isValidPathLeafName(
+                  pathFlavor === "windows" ? folderName : folderName.trim(),
+                  pathFlavor,
+                ) || mkdirM.isPending
+              }
+            >
               Create
             </Button>
           </form>
@@ -687,7 +744,7 @@ function listErrorMessage(error: unknown): string {
     switch (error.code) {
       case "outside_root":
       case "traversal_rejected":
-        return "That folder sits above your home folder, which is as far up as Spawn can browse.";
+        return "That folder sits above your home folder, which is as far up as SPAWN D can browse.";
       case "permission_denied":
         return "You do not have permission to open this folder.";
       case "not_found":
@@ -695,7 +752,7 @@ function listErrorMessage(error: unknown): string {
       case "not_directory":
         return "That is a file, not a folder.";
       case "symlink_rejected":
-        return "This is a symbolic link, which Spawn does not follow.";
+        return "This is a symbolic link, which SPAWN D does not follow.";
     }
   }
   return error instanceof Error ? error.message : "Could not list this folder.";

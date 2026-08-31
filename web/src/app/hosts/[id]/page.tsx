@@ -4,16 +4,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FolderOpen, MoreHorizontal, Pencil, Server, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
+import { HostApprovingDevicesPanel } from "@/components/hosts/host-approving-devices-panel";
+import { HostHealthPanel } from "@/components/hosts/host-health-panel";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
 import {
-  openSettings,
-  type SettingsTab,
-  takeSettingsReturn,
-} from "@/components/settings/settings-dialog-store";
+  HostUpdateBadge,
+  HostUpdateDialog,
+  useHostUpdate,
+} from "@/components/release/HostUpdateDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
@@ -34,6 +36,7 @@ import {
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { formatHostPlatform } from "@/lib/host-platform";
 import { relativeTime, sessionActivityDetail, sessionTitle } from "@/lib/sessions";
 import { SIGNED_RTC_REFUSAL_DETAIL, SIGNED_RTC_REFUSAL_NEXT_STEP } from "@/lib/signed-rtc-trust";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
@@ -64,11 +67,6 @@ function HostDetail() {
   const id = params?.id;
   const router = useRouter();
   const queryClient = useQueryClient();
-  // Read once, on mount, and cleared by the read: the flag describes the
-  // navigation that landed here, not a persistent property of the page.
-  const settingsReturnRef = useRef<SettingsTab | null | undefined>(undefined);
-  if (settingsReturnRef.current === undefined) settingsReturnRef.current = takeSettingsReturn();
-  const settingsReturn = settingsReturnRef.current;
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -88,6 +86,7 @@ function HostDetail() {
     refetchInterval: 5_000,
   });
   const host = hostQ.data;
+  const hostUpdate = useHostUpdate(host ?? null, { autoOpen: true });
   // Displayed fingerprint, derived LOCALLY from the served key (mesh B5): the
   // server no longer serves one, and this page would not show it if it did.
   const hostFingerprintQ = useQuery({
@@ -159,8 +158,8 @@ function HostDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
-      openSettings("hosts");
-      router.push("/app");
+      // The machine is gone; the fleet it left is the place to land.
+      router.push("/legion");
     },
     onError: (caught) => {
       if (caught instanceof HostDeletionFlowError && caught.localTombstoneWritten) {
@@ -257,18 +256,11 @@ function HostDetail() {
   };
 
   /**
-   * Back means back — always the route you came from. Arriving here from the
-   * settings dialog additionally reopens it on the way, because the dialog is
-   * not URL state and so is the one part of "where I was" that history cannot
-   * restore by itself. Opening it before the navigation is what carries it
-   * across: the store is a module singleton, so the shell that mounts on the
-   * far side finds it already open.
-   *
-   * A page opened cold in a fresh tab has nothing to pop, so it goes to the
-   * legion rather than leaving the arrow dead.
+   * Back means back — the route you came from. A page opened cold in a fresh
+   * tab has nothing to pop, so it goes to the legion rather than leaving the
+   * arrow dead.
    */
   const goBack = () => {
-    if (settingsReturn) openSettings(settingsReturn);
     if (window.history.length > 1) router.back();
     else router.push("/legion");
   };
@@ -427,8 +419,20 @@ function HostDetail() {
         {host && (
           <div className="space-y-4">
             <dl className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border p-4 text-sm @lg/shell:grid-cols-4">
-              <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
-              <Fact label="Daemon" value={host.version ?? "unknown"} />
+              <Fact label="System" value={formatHostPlatform(host)} />
+              <Fact
+                label="Daemon"
+                value={
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <span className="truncate">{host.version ?? "unknown"}</span>
+                    {(host.update.state === "available" || host.update.state === "updating") && (
+                      <button type="button" onClick={() => hostUpdate.openHostUpdate(host)}>
+                        <HostUpdateBadge host={host} />
+                      </button>
+                    )}
+                  </span>
+                }
+              />
               <Fact label="Sessions" value={String(host.session_count)} />
               <Fact
                 label="Connection"
@@ -447,7 +451,11 @@ function HostDetail() {
               />
             </dl>
 
+            <HostHealthPanel host={host} />
+
             <HostAgentsPanel host={host} />
+
+            <HostApprovingDevicesPanel hostId={host.id} />
 
             <section
               className="overflow-hidden rounded-xl border border-border"
@@ -503,17 +511,19 @@ function HostDetail() {
           </div>
         )}
       </main>
+      <HostUpdateDialog {...hostUpdate.dialogProps} />
     </div>
   );
 }
 
-function Fact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+function Fact({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
+  const title = typeof value === "string" ? value : undefined;
   return (
     <div className="min-w-0">
       <dt className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
         {label}
       </dt>
-      <dd className={`mt-0.5 truncate ${mono ? "font-mono text-xs leading-5" : ""}`} title={value}>
+      <dd className={`mt-0.5 truncate ${mono ? "font-mono text-xs leading-5" : ""}`} title={title}>
         {value}
       </dd>
     </div>

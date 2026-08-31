@@ -9,6 +9,7 @@ import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { Menu, type MenuEntry } from "@/components/ui/menu";
 import { commandBasename } from "@/data/selectors/agent";
+import type { ConnectionInfo } from "@/terminal/transport/types";
 import { useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
@@ -44,6 +45,7 @@ export interface TerminalHeaderProps {
   /** The folder this window points at; shown on the control that re-points it. */
   cwd: string;
   foregroundCommand: string | null;
+  connectionInfo?: ConnectionInfo | null;
   onBack: () => void;
   onRename: (name: string) => Promise<void>;
   /** Re-point this window: pick a folder, or pick what runs in it. */
@@ -65,6 +67,7 @@ export function TerminalHeader({
   hostName,
   cwd,
   foregroundCommand,
+  connectionInfo,
   onBack,
   onRename,
   onChangeFolder,
@@ -84,6 +87,9 @@ export function TerminalHeader({
   const [draftName, setDraftName] = useState(title);
   const [saving, setSaving] = useState(false);
   const agent = inferAgentPresentation(foregroundCommand);
+  const path = connectionInfo
+    ? `${connectionInfo.kind}${connectionInfo.rttMs === null ? "" : ` · ${connectionInfo.rttMs} ms`}`
+    : null;
 
   const showMenu = (visible: boolean): void => {
     setMenuVisible(visible);
@@ -159,7 +165,7 @@ export function TerminalHeader({
       <AppHeader
         actions={actions}
         onBack={onBack}
-        subtitle={`${agent.label} · ${hostName}`}
+        subtitle={`${agent.label} · ${hostName}${path ? ` · ${path}` : ""}`}
         testID="terminal-header"
         title={title}
       />

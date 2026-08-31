@@ -13,6 +13,7 @@ import { Icon, type IconName } from "@/components/ui/icon";
 import { dismissAllSheets } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
+import { useShareSheetOpen } from "@/lib/share";
 import { borderWidth, opacity, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
@@ -155,9 +156,11 @@ export function BottomNav(): React.JSX.Element {
  */
 export function PersistentBottomNav(): React.JSX.Element | null {
   // The window-level bar would sit across the camera's viewfinder, which is
-  // presented as a modal underneath it. It steps aside while the camera is up.
+  // presented as a modal underneath it — and across the foot of the system
+  // share sheet, presented the same way. It steps aside while either is up.
   const cameraOpen = useCameraOpen();
-  if (cameraOpen) return null;
+  const shareSheetOpen = useShareSheetOpen();
+  if (cameraOpen || shareSheetOpen) return null;
   return (
     <FullWindowOverlay unstable_accessibilityContainerViewIsModal={false}>
       <View pointerEvents="box-none" style={styles.portal}>

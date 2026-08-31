@@ -1,8 +1,73 @@
+import { type MenuAnchor, type MenuPlacement, placeMenu } from "@/components/ui/menu-position";
 import type { HostDirEntry, HostDirList } from "@/lib/hostControl";
-import { normalizeAbsolutePath, parentDir, trimTrailingSlash } from "@/lib/paths";
+import {
+  isPathWithin,
+  joinPath,
+  normalizeAbsolutePath,
+  type PathFlavor,
+  parentDir,
+  pathRoot,
+  pathsEqual,
+  trimTrailingSlash,
+} from "@/lib/paths";
 
-export function joinDirectory(parent: string, child: string): string {
-  return normalizeAbsolutePath(`${trimTrailingSlash(parent)}/${child}`);
+/** Gutter the centred panel keeps from the viewport edge — `placeMenu`'s own. */
+const PANEL_MARGIN = 8;
+
+/**
+ * Where the picker panel goes.
+ *
+ * Anchored like a menu when it has a control to hang off; centred in the
+ * viewport when it has none. The third case is the one that earns this
+ * function: an anchor that is an *area* rather than a control — the grid's
+ * "Add a window" opening can be most of the canvas — leaves `placeMenu` no
+ * side worth having, and its cap squashed the panel into the sliver above the
+ * opening: a breadcrumb row with the whole browser crushed out of it. A panel
+ * that cannot get at least half its preferred height beside its anchor is
+ * better off centred over it.
+ */
+export function placePickerPanel({
+  anchor,
+  width,
+  height,
+  preferredHeight,
+  viewportWidth,
+  viewportHeight,
+}: {
+  /** The control the panel hangs off, or null to centre. */
+  anchor: MenuAnchor | null;
+  /** The panel's current rendered size. */
+  width: number;
+  height: number;
+  /** What the panel wants to be — the yardstick squashing is measured by. */
+  preferredHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
+}): MenuPlacement {
+  if (anchor) {
+    const placed = placeMenu({
+      anchor,
+      menuWidth: width,
+      menuHeight: height,
+      align: "start",
+      viewportWidth,
+      viewportHeight,
+    });
+    if (placed.maxHeight >= preferredHeight / 2) return placed;
+  }
+  return {
+    position: "fixed",
+    left: Math.max(PANEL_MARGIN, (viewportWidth - width) / 2),
+    top: Math.max(PANEL_MARGIN, (viewportHeight - height) / 2),
+    maxHeight: viewportHeight - PANEL_MARGIN * 2,
+    maxWidth: viewportWidth - PANEL_MARGIN * 2,
+    // Nothing usable to grow out of, so it grows from its own middle.
+    transformOrigin: "center",
+  };
+}
+
+export function joinDirectory(parent: string, child: string, flavor: PathFlavor = "posix"): string {
+  return normalizeAbsolutePath(joinPath(parent, child, flavor), flavor);
 }
 
 /**
@@ -28,16 +93,16 @@ export function visibleDirectories<T extends { name: string; is_dir: boolean }>(
  * measured against home, not `/`, so the UI can never offer a step the host
  * would refuse.
  */
-export function homeRoot(homeDir: string): string {
-  return trimTrailingSlash(normalizeAbsolutePath(homeDir || "/")) || "/";
+export function homeRoot(homeDir: string, flavor: PathFlavor = "posix"): string {
+  const fallback = flavor === "windows" ? "\\" : "/";
+  return trimTrailingSlash(normalizeAbsolutePath(homeDir || fallback, flavor), flavor) || fallback;
 }
 
 /** True when `path` is the home root itself or sits beneath it. */
-export function isWithinHome(path: string, homeDir: string): boolean {
-  const home = homeRoot(homeDir);
-  const target = trimTrailingSlash(normalizeAbsolutePath(path || "/"));
-  if (home === "/") return true;
-  return target === home || target.startsWith(`${home}/`);
+export function isWithinHome(path: string, homeDir: string, flavor: PathFlavor = "posix"): boolean {
+  const home = homeRoot(homeDir, flavor);
+  const target = trimTrailingSlash(normalizeAbsolutePath(path || home, flavor), flavor);
+  return isPathWithin(target, home, flavor);
 }
 
 /**
@@ -45,12 +110,16 @@ export function isWithinHome(path: string, homeDir: string): boolean {
  * home is the ceiling, so the ".." row disappears there rather than walking
  * the user into an error.
  */
-export function parentWithinHome(path: string, homeDir: string): string | null {
-  if (!isWithinHome(path, homeDir)) return null;
-  const home = homeRoot(homeDir);
-  const target = trimTrailingSlash(normalizeAbsolutePath(path || "/"));
-  if (target === home) return null;
-  return parentDir(target);
+export function parentWithinHome(
+  path: string,
+  homeDir: string,
+  flavor: PathFlavor = "posix",
+): string | null {
+  if (!isWithinHome(path, homeDir, flavor)) return null;
+  const home = homeRoot(homeDir, flavor);
+  const target = trimTrailingSlash(normalizeAbsolutePath(path || home, flavor), flavor);
+  if (pathsEqual(target, home, flavor)) return null;
+  return parentDir(target, flavor);
 }
 
 /**
@@ -61,16 +130,17 @@ export function parentWithinHome(path: string, homeDir: string): string | null {
 export function breadcrumbParts(
   path: string,
   homeDir: string,
+  flavor: PathFlavor = "posix",
 ): Array<{ label: string; path: string }> {
-  const home = homeRoot(homeDir);
-  const breadcrumbs = [{ label: home === "/" ? "/" : "Home", path: home }];
-  if (!isWithinHome(path, home)) return breadcrumbs;
-  const relative = trimTrailingSlash(normalizeAbsolutePath(path || "/")).slice(
-    home === "/" ? 0 : home.length,
-  );
-  let current = home === "/" ? "" : home;
-  for (const part of relative.split("/").filter(Boolean)) {
-    current += `/${part}`;
+  const home = homeRoot(homeDir, flavor);
+  const root = pathRoot(home, flavor);
+  const breadcrumbs = [{ label: pathsEqual(home, root, flavor) ? root : "Home", path: home }];
+  if (!isWithinHome(path, home, flavor)) return breadcrumbs;
+  const target = trimTrailingSlash(normalizeAbsolutePath(path || home, flavor), flavor);
+  const relative = target.slice(pathsEqual(home, root, flavor) ? root.length : home.length);
+  let current = home;
+  for (const part of relative.split(flavor === "windows" ? /[\\/]/u : "/").filter(Boolean)) {
+    current = joinDirectory(current, part, flavor);
     breadcrumbs.push({ label: part, path: current });
   }
   return breadcrumbs;
@@ -93,8 +163,12 @@ export type FolderColumn = {
  * every way of moving — a crumb, the drill menu, an arrow key, a stale saved
  * cwd — rebuilds the same columns. There is no history to fall out of sync.
  */
-export function folderColumns(path: string, homeDir: string): FolderColumn[] {
-  const trail = breadcrumbParts(path, homeDir);
+export function folderColumns(
+  path: string,
+  homeDir: string,
+  flavor: PathFlavor = "posix",
+): FolderColumn[] {
+  const trail = breadcrumbParts(path, homeDir, flavor);
   return trail.map((crumb, index) => ({
     path: crumb.path,
     selectedChild: trail[index + 1]?.path ?? null,

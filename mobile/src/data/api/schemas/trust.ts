@@ -81,6 +81,52 @@ export const AccountEndorsementRecordSchema = z.object({
   created_at: IsoDateTimeSchema,
 });
 
+export const HostPinUndeliveredReasonSchema = z.enum(["pin_limit", "invalid_chain", "other"]);
+export const HostPinCapacitySchema = z.object({
+  used: z.number().int().nonnegative(),
+  max: z.number().int().positive(),
+});
+const HostPinDeliveryWireSchema = z
+  .object({
+    browser_device_id: UUIDSchema.optional(),
+    device_id: UUIDSchema.optional(),
+    delivered: z.boolean().default(true),
+    undelivered_reason: HostPinUndeliveredReasonSchema.nullable().default(null),
+  })
+  .refine((pin) => pin.browser_device_id !== undefined || pin.device_id !== undefined)
+  .transform((pin) => ({
+    browser_device_id: pin.browser_device_id ?? pin.device_id ?? "",
+    delivered: pin.delivered,
+    undelivered_reason: pin.undelivered_reason,
+  }));
+const HostPinDeliverySchema = z
+  .union([UUIDSchema, HostPinDeliveryWireSchema])
+  .transform((pin) =>
+    typeof pin === "string"
+      ? { browser_device_id: pin, delivered: true, undelivered_reason: null }
+      : pin,
+  );
+export const HostPinsOutSchema = z
+  .union([
+    z.array(UUIDSchema),
+    z.object({
+      pins: z.array(HostPinDeliverySchema),
+      capacity: HostPinCapacitySchema,
+    }),
+  ])
+  .transform((response) =>
+    Array.isArray(response)
+      ? {
+          pins: response.map((browserDeviceId) => ({
+            browser_device_id: browserDeviceId,
+            delivered: true,
+            undelivered_reason: null,
+          })),
+          capacity: null,
+        }
+      : response,
+  );
+
 export type TrustBundleOut = z.infer<typeof TrustBundleOutSchema>;
 export type TrustBundlePut = z.infer<typeof TrustBundlePutSchema>;
 export type PasskeyCredentialOut = z.infer<typeof PasskeyCredentialOutSchema>;
@@ -93,3 +139,6 @@ export type AccountEndorsementOut = z.infer<typeof AccountEndorsementOutSchema>;
 export type AccountEndorsementRecord = z.infer<typeof AccountEndorsementRecordSchema>;
 export type DeviceApprovalRequestCreate = z.infer<typeof DeviceApprovalRequestCreateSchema>;
 export type DeviceApprovalRequestOut = z.infer<typeof DeviceApprovalRequestOutSchema>;
+export type HostPinUndeliveredReason = z.infer<typeof HostPinUndeliveredReasonSchema>;
+export type HostPinCapacity = z.infer<typeof HostPinCapacitySchema>;
+export type HostPinsOut = z.infer<typeof HostPinsOutSchema>;

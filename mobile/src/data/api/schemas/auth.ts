@@ -23,6 +23,11 @@ export const TokenResponseSchema = z.object({
   access_token: z.string(),
   user: UserOutSchema,
 });
+export const SessionRenewResponseSchema = z.object({
+  access_token: z.string(),
+  expires_at: IsoDateTimeSchema,
+});
+export const SignOutEverywhereResponseSchema = z.object({ access_token: z.string() });
 export const MeResponseSchema = z.object({ user: UserOutSchema });
 export const PasswordResetRequestSchema = z.object({ email: z.string().email() });
 export const PasswordResetConfirmSchema = z.object({
@@ -35,7 +40,12 @@ export const AccountDeleteRequestSchema = z.object({
   password: z.string().nullable().optional(),
 });
 export const AuthProviderOutSchema = z.object({ id: ProviderIdSchema, name: z.string() });
-export const OAuthExchangeRequestSchema = z.object({ code: z.string().min(16).max(256) });
+export const OAuthExchangeRequestSchema = z.object({
+  code: z.string().min(16).max(256),
+  // PKCE: proves this app started the flow the code came back from. Optional
+  // on the wire so a server that predates it still accepts the request.
+  code_verifier: z.string().min(43).max(128).optional(),
+});
 // Sign in with Apple on iOS never leaves the app, so there is no callback and no
 // one-time code: the identity token Apple hands the button goes straight up.
 export const AppleNativeSignInSchema = z.object({
@@ -54,6 +64,8 @@ export type UserOut = z.infer<typeof UserOutSchema>;
 export type SignupRequest = z.infer<typeof SignupRequestSchema>;
 export type LoginRequest = z.infer<typeof LoginRequestSchema>;
 export type TokenResponse = z.infer<typeof TokenResponseSchema>;
+export type SessionRenewResponse = z.infer<typeof SessionRenewResponseSchema>;
+export type SignOutEverywhereResponse = z.infer<typeof SignOutEverywhereResponseSchema>;
 export type MeResponse = z.infer<typeof MeResponseSchema>;
 export type PasswordResetRequest = z.infer<typeof PasswordResetRequestSchema>;
 export type PasswordResetConfirm = z.infer<typeof PasswordResetConfirmSchema>;

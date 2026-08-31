@@ -5,7 +5,11 @@ import type {
   BrowserDeviceRevokeRequest,
 } from "@/data/api/schemas/devices";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
-import { deviceIdentity, setDeviceIdentityAccount } from "@/lib/crypto/identity";
+import {
+  DeviceIdentityError,
+  deviceIdentity,
+  setDeviceIdentityAccount,
+} from "@/lib/crypto/identity";
 
 export type BrowserDeviceRecord = BrowserDeviceOut;
 
@@ -78,6 +82,70 @@ export async function ensureDeviceRegistered(input: {
     );
   }
   return registered;
+}
+
+/**
+ * Why registration failed, said in a way the reader can do something about.
+ *
+ * The screens used to print whatever `Error.message` they were handed, which
+ * is internal vocabulary — "Device identity record is not an object" — and
+ * always paired with a Try again that some of those causes will never answer.
+ * The web app says the same things about a browser (see
+ * `describeBrowserDeviceRegistrationFailure`); the cause is kept apart from
+ * the remedy so each surface can put its own consequence between them.
+ */
+export interface DeviceRegistrationFailure {
+  /** What went wrong, as a complete sentence. */
+  readonly reason: string;
+  /** What would change it, where anything the reader controls would. */
+  readonly remedy: string | null;
+  /** Whether registering again could succeed without the reader doing anything. */
+  readonly canRetry: boolean;
+}
+
+export function describeDeviceRegistrationFailure(error: unknown): DeviceRegistrationFailure {
+  if (error instanceof DeviceIdentityError) {
+    switch (error.code) {
+      case "IDENTITY_STORAGE_UNAVAILABLE":
+        return {
+          reason: "This device could not save SPAWN D's key.",
+          remedy: null,
+          canRetry: true,
+        };
+      case "IDENTITY_CORRUPT":
+        return {
+          reason: "The key this device saved for SPAWN D is unreadable.",
+          remedy: null,
+          canRetry: false,
+        };
+      case "IDENTITY_ABSENT":
+        return {
+          reason: "SPAWN D's key is not ready on this device yet.",
+          remedy: null,
+          canRetry: true,
+        };
+    }
+  }
+  if (error instanceof DeviceRegistrationError) {
+    return error.code === "REGISTRATION_MISMATCH"
+      ? {
+          reason: "The server answered with a different key than this device sent.",
+          remedy: null,
+          canRetry: false,
+        }
+      : { reason: "The server refused this device's identity.", remedy: null, canRetry: true };
+  }
+  return {
+    reason: "This device's identity could not be registered.",
+    remedy: null,
+    canRetry: true,
+  };
+}
+
+/** The failure as one line, for a surface with nowhere to put a second one. */
+export function deviceRegistrationFailureLine(error: unknown): string {
+  const failure = describeDeviceRegistrationFailure(error);
+  return failure.remedy === null ? failure.reason : `${failure.reason} ${failure.remedy}`;
 }
 
 export async function revokeThisDevice(input: {

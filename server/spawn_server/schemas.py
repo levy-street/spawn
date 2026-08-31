@@ -27,6 +27,7 @@ from .host_identity import (
 )
 from .host_pair_approval import APPROVAL_NONCE_B64URL_LENGTH, decode_approval_nonce
 from .host_pair_possession import DEVICE_CODE_B64URL_LENGTH, decode_device_code
+from .web_push import valid_subscription_key
 
 # ---------- auth ----------
 
@@ -59,6 +60,19 @@ class TokenResponse(BaseModel):
 
 class MeResponse(BaseModel):
     user: UserOut
+
+
+class EmptyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRenewResponse(BaseModel):
+    access_token: str
+    expires_at: datetime
+
+
+class SessionTokenResponse(BaseModel):
+    access_token: str
 
 
 # ---------- browser devices ----------
@@ -257,6 +271,10 @@ class OAuthExchangeRequest(BaseModel):
     """The one-time code a native app carries back from the provider callback."""
 
     code: str = Field(min_length=16, max_length=256)
+    # The PKCE verifier for the flow this client started. Optional on the wire
+    # so app builds that predate PKCE keep working; required by the server
+    # whenever the code was minted from a challenge.
+    code_verifier: str | None = Field(default=None, min_length=43, max_length=128)
 
 
 class AppleNativeSignInRequest(BaseModel):
@@ -295,6 +313,77 @@ class PushDeviceOut(BaseModel):
     last_seen_at: datetime
 
 
+class WebPushKeyOut(BaseModel):
+    """What a browser needs before it can subscribe at all.
+
+    `public_key` is the VAPID application server key, base64url and unpadded,
+    ready to be decoded into the `applicationServerKey` that
+    `pushManager.subscribe` demands. A server with no VAPID key configured
+    answers `enabled: false` and a null key rather than an error: no browser
+    channel is a supported deployment, and the web app's job is then to not
+    offer the toggle.
+    """
+
+    enabled: bool
+    public_key: str | None = None
+
+
+class WebPushSubscribeRequest(BaseModel):
+    """One `PushSubscription`, as `PushSubscription.toJSON()` serializes it.
+
+    Both keys are validated here rather than at send time. A subscription the
+    server cannot encrypt to is not a delivery failure to retire in three
+    days' time; it is a malformed request, and saying so at the door is the
+    only place the browser can still do something about it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Push services are HTTPS, always. The cap is far above any endpoint any
+    # vendor issues and exists so a request body cannot be used to write an
+    # unbounded string into the table.
+    endpoint: str = Field(min_length=8, max_length=2048)
+    # The subscription's P-256 public key: 65 bytes, uncompressed point.
+    p256dh: str = Field(min_length=8, max_length=255)
+    # The subscription's auth secret: 16 bytes.
+    auth: str = Field(min_length=8, max_length=64)
+    # Recognition only, for a future signed-in-devices screen. Never trusted.
+    label: str | None = Field(default=None, max_length=64)
+    # This browser's device id, so its own knock is not pushed back to it.
+    browser_device_id: str | None = Field(default=None, min_length=36, max_length=36)
+
+    @field_validator("endpoint")
+    @classmethod
+    def _https_endpoint(cls, value: str) -> str:
+        value = value.strip()
+        if not value.startswith("https://") or len(value.split("/", 3)[2]) == 0:
+            raise ValueError("endpoint must be an absolute https URL")
+        return value
+
+    @field_validator("p256dh")
+    @classmethod
+    def _p256dh_is_a_point(cls, value: str) -> str:
+        if not valid_subscription_key(value, length=65):
+            raise ValueError("p256dh must be a base64url P-256 point of 65 bytes")
+        return value.strip()
+
+    @field_validator("auth")
+    @classmethod
+    def _auth_is_a_secret(cls, value: str) -> str:
+        if not valid_subscription_key(value, length=16):
+            raise ValueError("auth must be a base64url secret of 16 bytes")
+        return value.strip()
+
+
+class WebPushSubscriptionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    label: str | None = None
+    created_at: datetime
+    last_seen_at: datetime
+
+
 class AuthConfigOut(BaseModel):
     """Everything the login/signup/onboarding surfaces need in one request.
 
@@ -322,6 +411,8 @@ class DeviceStartRequest(BaseModel):
     # Committed-ephemeral SAS: the daemon's commitment Cd = H(domain ‖ H ‖ Nd),
     # opaque to the server. Absent from a pre-SAS daemon.
     sas_commit: str | None = Field(default=None, min_length=43, max_length=43)
+    # Accepted and ignored for compatibility with older daemons.
+    setup_token: str | None = None
 
     @field_validator("host_public_key")
     @classmethod
@@ -673,9 +764,7 @@ class DevicePairingIntroductions(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    introductions: list[DevicePairingIntroductionItem] = Field(
-        default_factory=list, max_length=64
-    )
+    introductions: list[DevicePairingIntroductionItem] = Field(default_factory=list, max_length=64)
     device_introductions: list[DevicePairingDeviceIntroductionItem] = Field(
         default_factory=list, max_length=32
     )
@@ -774,6 +863,18 @@ class RootIntroductionOut(BaseModel):
 # ---------- hosts ----------
 
 
+class HostUpdateOut(BaseModel):
+    state: Literal["current", "available", "updating", "failed", "unsupported", "unknown"]
+    latest_version: str | None = None
+    error: str | None = None
+    requested_at: datetime | None = None
+
+
+class HostDisconnectOut(BaseModel):
+    at: datetime | None = None
+    reason: str | None = None
+
+
 class HostOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -781,12 +882,15 @@ class HostOut(BaseModel):
     os: str | None = None
     arch: str | None = None
     version: str | None = None
+    daemon_tree: str | None = None
+    update: HostUpdateOut = Field(default_factory=lambda: HostUpdateOut(state="unknown"))
     host_key_algorithm: Literal["ed25519"] | None = None
     # The key travels alone (mesh B5): its display fingerprint is derived
     # locally by the client, never served next to the key it must vouch for.
     host_public_key: str | None = None
     status: str
     last_seen_at: datetime | None = None
+    last_disconnect: HostDisconnectOut = Field(default_factory=HostDisconnectOut)
     session_count: int = 0
     # Mesh R9: true once this host's daemon validates account-scoped chains;
     # the legacy per-host device-endorsement path is refused for such hosts.
@@ -804,6 +908,68 @@ class HostOut(BaseModel):
     cpu_bucket: int | None = None
     mem_bucket: int | None = None
     capacity_at: datetime | None = None
+
+
+class HostUpdateResponse(BaseModel):
+    update: HostUpdateOut
+
+
+class HostUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allow_downgrade: bool = Field(default=False, strict=True)
+
+
+# ---------- release ----------
+
+
+class ServerReleaseOut(BaseModel):
+    commit: str | None = None
+    dirty: bool
+
+
+class WebReleaseOut(BaseModel):
+    build_id: str | None = None
+
+
+class DaemonTargetOut(BaseModel):
+    spawnd_sha256: str
+    spawn_worker_sha256: str
+
+
+class DaemonReleaseOut(BaseModel):
+    version: str
+    commit: str
+    tree: str
+    release_counter: int | None = None
+    signed: bool = False
+    targets: dict[str, DaemonTargetOut]
+
+
+class MobileReleaseOut(BaseModel):
+    tree: str | None = None
+    runtime_version: str | None = None
+
+
+class ReleaseDesktop(BaseModel):
+    version: str
+    tree: str
+    platforms: list[str]
+
+
+class ReleaseProtocolsOut(BaseModel):
+    daemon: str
+    browser: str
+    alerts: str
+
+
+class ReleaseOut(BaseModel):
+    server: ServerReleaseOut
+    web: WebReleaseOut
+    daemon: DaemonReleaseOut | None = None
+    mobile: MobileReleaseOut
+    desktop: ReleaseDesktop | None = None
+    protocols: ReleaseProtocolsOut
 
 
 class LegionDayOut(BaseModel):

@@ -27,23 +27,29 @@ pub fn server_url_for_instance(cli_value: Option<String>, stored: Option<&str>) 
 }
 
 /// Returns the daemon config dir, creating it if missing. Defaults to
-/// `~/.config/spawn/`; `SPAWN_CONFIG_DIR` overrides it so multiple daemons
-/// (e.g. one per server) can coexist on a host without sharing credentials.
+/// the platform-local SPAWN D config base; `SPAWN_CONFIG_DIR` overrides it so
+/// multiple daemons (e.g. one per server) can coexist without sharing
+/// credentials.
 pub fn config_dir() -> Result<PathBuf> {
     let dir = match std::env::var_os("SPAWN_CONFIG_DIR").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
-        None => dirs::config_dir()
-            .context("cannot resolve user config dir")?
-            .join("spawn"),
+        None => crate::platform::default_config_base().context("cannot resolve user config dir")?,
     };
-    let existed = dir.exists();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(unix)]
-    if !existed {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("securing {}", dir.display()))?;
+    {
+        let existed = dir.exists();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        if !existed {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing {}", dir.display()))?;
+        }
     }
+    #[cfg(windows)]
+    crate::platform::create_private_dir_all(&dir)
+        .with_context(|| format!("creating or validating {}", dir.display()))?;
+    #[cfg(not(any(unix, windows)))]
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
 

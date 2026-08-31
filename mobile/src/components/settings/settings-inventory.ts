@@ -4,7 +4,6 @@ export type SettingsPanelKey =
   | "account"
   | "appearance"
   | "notifications"
-  | "hosts"
   | "agents"
   | "skills"
   | "templates"
@@ -61,14 +60,6 @@ export const SETTINGS_PANELS = [
       "System notification",
       "Vibration",
     ],
-  },
-  {
-    key: "hosts",
-    label: "Hosts",
-    description: "Open host settings and connect another machine",
-    icon: "Server",
-    route: "/settings/hosts",
-    controls: ["Open Hosts", "Connect a host"],
   },
   {
     key: "agents",
@@ -138,4 +129,4 @@ export const SETTINGS_PANELS = [
   },
 ] as const satisfies readonly SettingsPanelDefinition[];
 
-export const SETTINGS_PANEL_COUNT = 9;
+export const SETTINGS_PANEL_COUNT = 8;

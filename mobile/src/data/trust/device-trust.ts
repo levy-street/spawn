@@ -1,6 +1,7 @@
 import { listBrowserDevices } from "@/data/api/endpoints/devices";
 import { getHost } from "@/data/api/endpoints/hosts";
 import { listAccountEndorsements, listHostPins } from "@/data/api/endpoints/trust";
+import { invalidateCarriedEndorsements } from "@/data/trust/carried-endorsements";
 import { chainReachableFrom } from "@/data/trust/chain-reach";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
 import { deviceIdentity } from "@/lib/crypto/identity";
@@ -21,6 +22,12 @@ import { deviceIdentity } from "@/lib/crypto/identity";
  * app can say the true thing and reconnect the moment an approval lands.
  */
 export type DeviceHostTrust = "trusted" | "untrusted" | "unknown";
+
+export interface DeviceHostTrustResult {
+  status: DeviceHostTrust;
+  /** True only when this device itself appears in the host's durable pin set. */
+  directlyPinned: boolean;
+}
 
 export const DEVICE_NOT_TRUSTED_CODE = "device_not_trusted";
 export const DEVICE_NOT_TRUSTED_MESSAGE =
@@ -46,8 +53,7 @@ const defaultApi: DeviceTrustProbeApi = {
   nowMs: () => Date.now(),
 };
 
-interface CacheEntry {
-  status: DeviceHostTrust;
+interface CacheEntry extends DeviceHostTrustResult {
   atMs: number;
 }
 
@@ -74,19 +80,27 @@ function sharedRead<T>(load: () => Promise<T>, nowMs: number): Promise<T> {
   return promise;
 }
 
-/** Drop memoized verdicts so a fresh approval takes effect immediately. */
+/**
+ * Drop memoized verdicts so a fresh approval takes effect immediately.
+ *
+ * The edges an offer carries are dropped with them. Every caller here means
+ * the same thing — an approval may have just landed — and a verdict refreshed
+ * against edges still cached from before it is a device that is told it is
+ * trusted while it goes on offering the proof that was already refused.
+ */
 export function invalidateDeviceHostTrust(hostId?: string): void {
   if (hostId === undefined) cache.clear();
   else cache.delete(hostId);
+  invalidateCarriedEndorsements();
 }
 
 async function resolveTrust(
   hostId: string,
   api: DeviceTrustProbeApi,
   nowMs: number,
-): Promise<DeviceHostTrust> {
+): Promise<DeviceHostTrustResult> {
   const publicKeyBytes = await api.publicKey();
-  if (publicKeyBytes === null) return "unknown";
+  if (publicKeyBytes === null) return { status: "unknown", directlyPinned: false };
   const publicKey = encodeBase64Url(publicKeyBytes);
   publicKeyBytes.fill(0);
   const [devices, pinnedDeviceIds, host] = await Promise.all([
@@ -99,33 +113,47 @@ async function resolveTrust(
   );
   // An unregistered identity cannot be pinned, so the host will drop its
   // offers for exactly the same reason a registered-but-unapproved one does.
-  if (thisDevice === undefined) return "untrusted";
-  if (pinnedDeviceIds.includes(thisDevice.id)) return "trusted";
+  if (thisDevice === undefined) return { status: "untrusted", directlyPinned: false };
+  if (pinnedDeviceIds.includes(thisDevice.id)) {
+    return { status: "trusted", directlyPinned: true };
+  }
   // The chain path only exists on a host whose daemon validates it; toward an
   // older one a carried chain is ignored and the pin is the whole story.
-  if (!host.supports_account_chains) return "untrusted";
+  if (!host.supports_account_chains) return { status: "untrusted", directlyPinned: false };
   const edges = await sharedRead(api.listAccountEndorsements, nowMs);
-  return chainReachableFrom(pinnedDeviceIds, devices, edges).has(thisDevice.id)
-    ? "trusted"
-    : "untrusted";
+  return {
+    status: chainReachableFrom(pinnedDeviceIds, devices, edges).has(thisDevice.id)
+      ? "trusted"
+      : "untrusted",
+    directlyPinned: false,
+  };
+}
+
+export async function probeDeviceHostTrustResult(
+  hostId: string,
+  overrides?: Partial<DeviceTrustProbeApi>,
+): Promise<DeviceHostTrustResult> {
+  const api = overrides === undefined ? defaultApi : { ...defaultApi, ...overrides };
+  const cached = cache.get(hostId);
+  const now = api.nowMs();
+  if (cached !== undefined && now - cached.atMs < TRUST_TTL_MS) {
+    return { status: cached.status, directlyPinned: cached.directlyPinned };
+  }
+  let result: DeviceHostTrustResult;
+  try {
+    result = await resolveTrust(hostId, api, now);
+  } catch {
+    // A probe failure is not evidence of distrust; let the dial proceed and
+    // let the connect watchdog report whatever actually goes wrong.
+    result = { status: "unknown", directlyPinned: false };
+  }
+  if (result.status !== "unknown") cache.set(hostId, { ...result, atMs: now });
+  return result;
 }
 
 export async function probeDeviceHostTrust(
   hostId: string,
   overrides?: Partial<DeviceTrustProbeApi>,
 ): Promise<DeviceHostTrust> {
-  const api = overrides === undefined ? defaultApi : { ...defaultApi, ...overrides };
-  const cached = cache.get(hostId);
-  const now = api.nowMs();
-  if (cached !== undefined && now - cached.atMs < TRUST_TTL_MS) return cached.status;
-  let status: DeviceHostTrust;
-  try {
-    status = await resolveTrust(hostId, api, now);
-  } catch {
-    // A probe failure is not evidence of distrust; let the dial proceed and
-    // let the connect watchdog report whatever actually goes wrong.
-    status = "unknown";
-  }
-  if (status !== "unknown") cache.set(hostId, { status, atMs: now });
-  return status;
+  return (await probeDeviceHostTrustResult(hostId, overrides)).status;
 }

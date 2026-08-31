@@ -5,6 +5,9 @@ import {
   planApproverEndorsement,
   planReciprocalEndorsement,
   planVanishedCeremonyCompletion,
+  RECIPROCAL_SETTLE_MS,
+  reciprocalStillSettling,
+  vanishedCeremonyScreen,
   verifyAccountEndorsementSignature,
 } from "./approve-ceremony";
 import { encodeBase64Url, exportEd25519PublicKeyWire } from "./signed-signal";
@@ -561,5 +564,44 @@ describe("accountEndorsementEdgeVerified", () => {
     expect(await accountEndorsementEdgeVerified({ ...base, endorserPublicKey: endorsedWire })).toBe(
       false,
     );
+  });
+});
+
+// The peer signs its reciprocal edge and only THEN deletes the relay row, so
+// the edge is on the server before the row is gone — the only thing missing at
+// that instant is this side's next endorsement poll. Rendering "not finished"
+// in that window flashes a failure one second before the success that
+// contradicts it, which is exactly what a trust screen may not do.
+describe("a vanished row that is still settling", () => {
+  const RECORD = { done: false, stopped: false, halfDone: false, signedMine: true };
+
+  test("holds the waiting screen instead of blinking the dialog away", () => {
+    expect(vanishedCeremonyScreen(RECORD)).toBe("waiting");
+  });
+
+  test("shows nothing for a ceremony this side never signed", () => {
+    expect(vanishedCeremonyScreen({ ...RECORD, signedMine: false })).toBeNull();
+  });
+
+  test("every settled verdict still owns the screen", () => {
+    expect(vanishedCeremonyScreen({ ...RECORD, done: true })).toBe("done");
+    expect(vanishedCeremonyScreen({ ...RECORD, halfDone: true })).toBe("half-done");
+    expect(vanishedCeremonyScreen({ ...RECORD, stopped: true })).toBe("stopped");
+    // Stopped outranks the rest: a ceremony that was aborted never becomes a
+    // success because a later flag was set on the same record.
+    expect(vanishedCeremonyScreen({ ...RECORD, done: true, stopped: true })).toBe("stopped");
+  });
+
+  test("the reciprocal is in flight for a window, and absent after it", () => {
+    const signedAt = 10_000;
+    expect(reciprocalStillSettling(signedAt, signedAt + 500)).toBe(true);
+    expect(reciprocalStillSettling(signedAt, signedAt + RECIPROCAL_SETTLE_MS)).toBe(false);
+    // A row reaped by the 10-minute TTL long after the entry is not a race —
+    // "not finished" is the truth there and must not be held back.
+    expect(reciprocalStillSettling(signedAt, signedAt + 600_000)).toBe(false);
+  });
+
+  test("a side that never signed has no window to wait out", () => {
+    expect(reciprocalStillSettling(null, 10_000)).toBe(false);
   });
 });

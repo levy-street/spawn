@@ -8,12 +8,15 @@ import { SettingsScreen } from "@/components/settings/settings-screen";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Collapse } from "@/components/ui/collapse";
+import { Confirm } from "@/components/ui/confirm";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
+import { ApiError } from "@/data/api/client";
 import { logOut, requestEmailVerification } from "@/data/api/endpoints/auth";
+import { useSignOutEverywhereMutation } from "@/data/queries/auth";
 import { useDeleteAccountMutation, useMeSettingsQuery } from "@/data/queries/settings";
 import { useConnectionStore } from "@/data/stores/connection";
 import { deviceIdentity, setDeviceIdentityAccount } from "@/lib/crypto/identity";
@@ -28,7 +31,10 @@ export function AccountPanel(): React.JSX.Element {
   const toast = useToast();
   const me = useMeSettingsQuery();
   const remove = useDeleteAccountMutation();
+  const signOutEverywhere = useSignOutEverywhereMutation();
   const [confirming, setConfirming] = useState(false);
+  const [confirmingSignOutEverywhere, setConfirmingSignOutEverywhere] = useState(false);
+  const [signOutEverywhereUnavailable, setSignOutEverywhereUnavailable] = useState(false);
   const [confirmEmail, setConfirmEmail] = useState("");
   const [password, setPassword] = useState("");
   const [resendNote, setResendNote] = useState<string | null>(null);
@@ -42,6 +48,23 @@ export function AccountPanel(): React.JSX.Element {
     useConnectionStore.getState().reset();
     queryClient.clear();
     router.replace("/login");
+  };
+
+  const signOutOtherSessions = async () => {
+    try {
+      await signOutEverywhere.mutateAsync();
+      setConfirmingSignOutEverywhere(false);
+      toast.success("Signed out everywhere else.");
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) {
+        setSignOutEverywhereUnavailable(true);
+        setConfirmingSignOutEverywhere(false);
+        return;
+      }
+      toast.error("Could not sign out everywhere", {
+        detail: cause instanceof Error ? cause.message : "Try again.",
+      });
+    }
   };
 
   const deletePermanently = async () => {
@@ -121,6 +144,16 @@ export function AccountPanel(): React.JSX.Element {
         Log out
       </Button>
 
+      {signOutEverywhereUnavailable ? (
+        <Button disabled variant="secondary">
+          Not available on this server yet.
+        </Button>
+      ) : (
+        <Button onPress={() => setConfirmingSignOutEverywhere(true)} variant="secondary">
+          Sign out everywhere
+        </Button>
+      )}
+
       <Card
         style={{ borderColor: theme.colors.destructive }}
         testID="delete-account-section"
@@ -197,6 +230,15 @@ export function AccountPanel(): React.JSX.Element {
           </Collapse>
         </View>
       </Card>
+
+      <Confirm
+        confirmLabel="Sign out everywhere"
+        description="Every other browser and phone signed in to this account will be signed out. This one stays signed in."
+        onCancel={() => setConfirmingSignOutEverywhere(false)}
+        onConfirm={() => void signOutOtherSessions()}
+        title="Sign out everywhere?"
+        visible={confirmingSignOutEverywhere}
+      />
     </SettingsScreen>
   );
 }

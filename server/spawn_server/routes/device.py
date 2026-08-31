@@ -7,7 +7,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +19,7 @@ from ..host_key_claims import create_or_lock_host_key_claim, lock_host_key_claim
 from ..host_pair_approval import verify_host_pair_approval_proof
 from ..host_pair_possession import verify_host_pair_possession_proof
 from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
+from ..pin_liveness import live_browser_device_id_set
 
 router = APIRouter(prefix="/api/auth/device", tags=["device"])
 
@@ -183,26 +184,30 @@ async def device_possession(
         host_public_key=body.host_public_key,
     )
     verified = (
-        await session.execute(
-            update(DeviceCode)
-            .where(
-                DeviceCode.device_code == body.device_code,
-                DeviceCode.approval_nonce == body.approval_nonce,
-                DeviceCode.host_key_algorithm == body.host_key_algorithm,
-                DeviceCode.host_public_key == body.host_public_key,
-                DeviceCode.status == "pending",
-                DeviceCode.host_possession_version.is_(None),
-                DeviceCode.host_possession_verified_at.is_(None),
-                DeviceCode.expires_at > now,
+        (
+            await session.execute(
+                update(DeviceCode)
+                .where(
+                    DeviceCode.device_code == body.device_code,
+                    DeviceCode.approval_nonce == body.approval_nonce,
+                    DeviceCode.host_key_algorithm == body.host_key_algorithm,
+                    DeviceCode.host_public_key == body.host_public_key,
+                    DeviceCode.status == "pending",
+                    DeviceCode.host_possession_version.is_(None),
+                    DeviceCode.host_possession_verified_at.is_(None),
+                    DeviceCode.expires_at > now,
+                )
+                .values(
+                    host_possession_version=1,
+                    host_possession_verified_at=now,
+                )
+                .returning(DeviceCode.device_code)
+                .execution_options(synchronize_session=False)
             )
-            .values(
-                host_possession_version=1,
-                host_possession_verified_at=now,
-            )
-            .returning(DeviceCode.device_code)
-            .execution_options(synchronize_session=False)
         )
-    ).scalar_one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if verified is not None:
         await session.commit()
         return schemas.DevicePossessionResponse(verified=True, version=1)
@@ -578,13 +583,7 @@ async def device_poll(
             await session.commit()
             return {"error": "pin_conflict"}
     else:
-        pin_count = (
-            await session.execute(
-                select(func.count(HostBrowserPin.browser_device_id)).where(
-                    HostBrowserPin.host_id == host.id
-                )
-            )
-        ).scalar_one()
+        pin_count = len(await live_browser_device_id_set(session, host.id))
         if pin_count >= MAX_BROWSER_PINS_PER_HOST:
             await session.execute(
                 update(DeviceCode)
@@ -601,6 +600,7 @@ async def device_poll(
                 browser_key_algorithm=pin_values[0],
                 browser_public_key=pin_values[1],
                 browser_key_fingerprint=pin_values[2],
+                delivered_at=now,
             )
         )
 
@@ -618,6 +618,13 @@ async def device_poll(
         await session.commit()
     except IntegrityError:
         await session.rollback()
+        await session.execute(
+            update(DeviceCode)
+            .where(DeviceCode.device_code == body.device_code)
+            .values(status="denied")
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
         return {"error": "key_conflict"}
     return {
         "access_token": token,
@@ -670,6 +677,7 @@ async def _pending_device_code(
         raise HTTPException(status_code=404, detail="unknown device code")
     expires = _aware(dc.expires_at)
     if expires is not None and expires <= _utcnow():
+        await session.commit()
         raise HTTPException(status_code=400, detail="user code expired")
     if dc.status != "pending":
         raise HTTPException(status_code=400, detail=f"user code is {dc.status}")
@@ -907,9 +915,7 @@ async def device_approve(
     # minus the fingerprint (mesh B5: the response carries the keys themselves,
     # so the client derives any fingerprint it needs locally).
     return schemas.DeviceApproveResponse(
-        **reviewed.model_dump(
-            exclude={"host_key_fingerprint", "sas_commit", "sas_host_nonce"}
-        ),
+        **reviewed.model_dump(exclude={"host_key_fingerprint", "sas_commit", "sas_host_nonce"}),
         browser_device_id=body.browser_device_id,
         browser_key_algorithm=body.browser_key_algorithm,
         browser_public_key=body.browser_public_key,

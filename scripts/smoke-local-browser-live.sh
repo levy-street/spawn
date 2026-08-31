@@ -551,6 +551,12 @@ async function endorseLiveDevice(page) {
   console.log(`live browser device ${device.id} endorsed by the pinned anchor`);
 }
 
+// Deliberately a browser with its ordinary settings: every one of them hides
+// the local IP of its host candidates behind an ephemeral `<uuid>.local` name
+// (RFC 8828), and the daemon resolving that name is the whole reason a browser
+// and a daemon on one machine can reach each other at all. A harness that
+// turned the obfuscation off would prove the connection works for a browser
+// nobody runs.
 const browser = await chromium.launch();
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
