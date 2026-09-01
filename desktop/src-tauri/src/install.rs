@@ -262,6 +262,16 @@ impl PossessionManager {
                     observe_pinned_host(&hosts, Some(&identity.host_id), &identity.public_key)
                 {
                     if host.online {
+                        // Says which path finished the run. A wizard that
+                        // completes for a reason nobody can see is how this
+                        // took three rounds to find.
+                        let _ = app.emit(
+                            "possess-output",
+                            format!(
+                                "spawn: this machine is already online as {} — finishing setup.",
+                                host.name
+                            ),
+                        );
                         if let Some(run) = self.runs.lock().await.get_mut(run_id) {
                             run.host_id = Some(host.id.clone());
                             run.host_name = Some(host.name.clone());
