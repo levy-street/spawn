@@ -17,7 +17,7 @@ import type {
   WorkspaceOut,
   WorkspaceTile,
 } from "@/data/api/schemas/workspaces";
-import { agentRunCommand, runningAgent } from "@/data/selectors/agent";
+import { agentRunCommand, runningAgent, sessionAgent } from "@/data/selectors/agent";
 
 export interface WorkspaceOperationResult {
   workspace: WorkspaceOut;
@@ -159,16 +159,17 @@ export async function instantiateWorkspaceTemplate(
     workspace = await activateTab(workspaceId, targetTab.id, dependencies);
     for (const tile of templateTab.tiles ?? []) {
       if (tile.run.kind === "files") continue;
+      const storedCommand = tile.run.kind === "agent" ? tile.run.command?.trim() : undefined;
+      const templateAgent = runningAgent(storedCommand ?? null, input.agents);
       const session = await dependencies.createSession({
         host_id: template.host_id,
         cwd: template.cwd,
+        ...(templateAgent ? { agent_id: templateAgent.id } : {}),
         workspace_id: workspaceId,
         tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
       });
       if (tile.run.kind === "agent") {
-        const storedCommand = tile.run.command?.trim();
-        const currentAgent = runningAgent(storedCommand ?? null, input.agents);
-        const command = currentAgent ? agentRunCommand(currentAgent) : storedCommand;
+        const command = templateAgent ? agentRunCommand(templateAgent) : storedCommand;
         if (command) {
           try {
             await dependencies.pending.persist(session.id, command);
@@ -241,15 +242,16 @@ export async function duplicateWorkspaceDeep(
         const session = sessionsById.get(tile.session_id);
         if (!session) continue;
         const access = await dependencies.getSessionAccess(session.id);
+        const currentAgent = sessionAgent(session, input.agents);
         const createdSession = await dependencies.createSession({
           host_id: session.host_id,
           cwd: session.cwd,
           name: session.name,
+          ...(currentAgent ? { agent_id: currentAgent.id } : {}),
           skill_ids: access.skills.map((skill) => skill.id),
           workspace_id: workspaceId,
           tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
         });
-        const currentAgent = runningAgent(session.foreground_command, input.agents);
         if (currentAgent) {
           try {
             await dependencies.pending.persist(createdSession.id, agentRunCommand(currentAgent));

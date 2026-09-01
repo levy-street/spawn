@@ -41,7 +41,7 @@ import {
   validate,
 } from "@/lib/grid";
 import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
-import { runningAgent, sessionTitle } from "@/lib/sessions";
+import { sessionAgent, sessionTitle } from "@/lib/sessions";
 import {
   addTab,
   type LayoutV3,
@@ -650,18 +650,22 @@ export function WorkspaceGrid({
         // call rather than being patched on afterwards.
         const access = await sessionAccess.get(sourceId).catch(() => null);
         const skillIds = access?.skills.map((skill) => skill.id) ?? [];
-        const created = await sessionsApi.create({
-          host_id: session.host_id,
-          cwd: session.cwd,
-          ...(skillIds.length > 0 && { skill_ids: skillIds }),
-        });
         // Awaited rather than read from the hook: a duplicate fired before
         // the registry query settles would silently copy an agent pane as a
         // bare shell. Failure falls back to the empty list it used to read.
         const definitions = await queryClient
           .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
           .catch(() => []);
-        const agent = runningAgent(session, definitions);
+        // The copy is created as the same type of window, so it is one even
+        // before its agent has taken the foreground — and stays one if the
+        // agent is later quit.
+        const agent = sessionAgent(session, definitions);
+        const created = await sessionsApi.create({
+          host_id: session.host_id,
+          cwd: session.cwd,
+          ...(agent && { agent_id: agent.id }),
+          ...(skillIds.length > 0 && { skill_ids: skillIds }),
+        });
         if (agent) pendingLaunch.set(created.id, agentRunCommand(agent));
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});

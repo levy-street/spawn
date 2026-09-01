@@ -1223,6 +1223,11 @@ class SessionCreate(BaseModel):
     host_id: str
     cwd: str
     name: str | None = Field(default=None, max_length=128)
+    # The agent this window is being opened as, when it is being opened as one.
+    # The window still starts as a login shell — the client types the agent's
+    # command into it — and this is what makes the window's type outlive the
+    # process, so a duplicate can reproduce it.
+    agent_id: str | None = None
     # Omitted -> all skills marked enabled_by_default.
     skill_ids: list[str] | None = None
     # Optional: transactionally append a tile for this session to a workspace.
@@ -1233,6 +1238,9 @@ class SessionCreate(BaseModel):
 
 class SessionPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
+    # Sent when an agent is launched into a running window, and sent as null
+    # when the window is stopped back to a bare prompt. Omitted leaves it be.
+    agent_id: str | None = None
 
 
 class SessionOut(BaseModel):
@@ -1252,6 +1260,9 @@ class SessionOut(BaseModel):
     activity_state: str = "unknown"
     activity_label: str = "Unknown"
     foreground_command: str | None = None
+    # What this window was opened as; `foreground_command` is what is running
+    # in it now. See models.Session.agent_id.
+    agent_id: str | None = None
 
 
 # ---------- workspaces ----------
@@ -1397,6 +1408,7 @@ class WorkspaceFirstSession(BaseModel):
 
     host_id: str
     cwd: str
+    agent_id: str | None = None
     skill_ids: list[str] | None = None
 
 

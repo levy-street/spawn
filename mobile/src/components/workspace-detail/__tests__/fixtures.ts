@@ -20,6 +20,7 @@ export function makeSession(overrides: Partial<Session> = {}): Session {
     activity_state: "quiet",
     activity_label: "Quiet",
     foreground_command: "codex",
+    agent_id: null,
     ...overrides,
   };
 }

@@ -60,7 +60,7 @@ import {
 import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE } from "@/lib/grid";
 import { basename } from "@/lib/paths";
-import { runningAgent } from "@/lib/sessions";
+import { sessionAgent } from "@/lib/sessions";
 import {
   addTab,
   allTiles,
@@ -975,14 +975,15 @@ export function WorkspaceTabs({
           if (!source) continue; // a tile whose session is already gone
           const access = await sessionAccess.get(source.id).catch(() => null);
           const skillIds = access?.skills.map((skill) => skill.id) ?? [];
+          const agent = sessionAgent(source, definitions);
           const copy = await sessions.create({
             host_id: source.host_id,
             cwd: source.cwd,
+            ...(agent && { agent_id: agent.id }),
             ...(skillIds.length > 0 && { skill_ids: skillIds }),
           });
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
-          const agent = runningAgent(source, definitions);
           if (agent) pendingLaunch.set(copy.id, agentRunCommand(agent));
         }
         const next = duplicateTab(
