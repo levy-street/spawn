@@ -902,6 +902,48 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Console echo, suppressed for the guard's lifetime and restored on drop.
+pub struct EchoGuard {
+    handle: usize,
+    saved: u32,
+}
+
+/// Stop the console echoing what is typed, for the same reason as the Unix
+/// implementation: a live region repaints rows in place, and echoed input
+/// lands inside the frame and displaces every rewind after it.
+pub fn suppress_echo() -> Option<EchoGuard> {
+    // SAFETY: GetStdHandle returns a borrowed console handle.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut saved = 0_u32;
+    // SAFETY: saved is a valid out value and handle is borrowed, not closed.
+    if unsafe { GetConsoleMode(handle, &mut saved) } == 0 {
+        return None;
+    }
+    // ENABLE_LINE_INPUT stays on so a waiting reader still wakes on a whole
+    // line; only the echoing of it goes away.
+    // SAFETY: handle is a console input handle and saved is restored on Drop.
+    if unsafe { SetConsoleMode(handle, saved & !ENABLE_ECHO_INPUT) } == 0 {
+        return None;
+    }
+    Some(EchoGuard {
+        handle: handle as usize,
+        saved,
+    })
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: the handle is the borrowed console input handle this guard
+        // read its saved mode from; it is not closed here.
+        unsafe {
+            let _ = SetConsoleMode(self.handle as HANDLE, self.saved);
+        }
+    }
+}
+
 pub fn enable_vt_output() -> Option<VtOutputGuard> {
     // SAFETY: GetStdHandle returns a borrowed console handle.
     let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };

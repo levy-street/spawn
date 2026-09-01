@@ -76,10 +76,18 @@ fn instance_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
     let base = crate::possess::default_instance_base()?;
     let instances = crate::possess::account_dirs_with_creds(&base)?;
     if instances.is_empty() {
-        Ok(vec![crate::config::config_dir()?])
-    } else {
-        Ok(instances)
+        // Only the legacy single-instance layout — credentials in the base
+        // dir itself — earns the fallback. A bare or absent dir is zero
+        // instances; treating it as one invented a phantom account named
+        // after the folder ("account  spawn") and made `status` disagree
+        // with `instances` about whether anything is signed in at all.
+        let legacy = crate::config::config_dir()?;
+        if legacy.join("credentials.json").is_file() {
+            return Ok(vec![legacy]);
+        }
+        return Ok(Vec::new());
     }
+    Ok(instances)
 }
 
 async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<InstanceStatus> {
@@ -273,6 +281,12 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
         "Account instances on this machine: {}",
         output.instances.len()
     );
+    if output.instances.is_empty() {
+        let _ = writeln!(
+            text,
+            "\n  No account is signed in on this machine yet — `spawnd possess` links it to one."
+        );
+    }
     for (index, instance) in output.instances.iter().enumerate() {
         text.push('\n');
         if output.instances.len() > 1 {

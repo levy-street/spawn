@@ -548,12 +548,14 @@ fn waiting_status(elapsed: u64, expires_in: u64, width: usize) -> String {
 fn spawn_enter_offer(approve_url: &str, approval_done: Arc<AtomicBool>) {
     let approve_url = approve_url.to_owned();
     std::thread::spawn(move || {
+        // The wait suppresses terminal echo, so the Enter that ends it never
+        // reaches the screen and the frame stays exactly where it was drawn —
+        // no `frame_pushed_down` compensation to get right, and no way for a
+        // keystroke that opens nothing to displace the panel for ever.
         if crate::platform::wait_for_enter_until(&approval_done)
             && !approval_done.load(Ordering::Acquire)
             && open_browser(&approve_url)
         {
-            #[cfg(unix)]
-            crate::tui::frame_pushed_down(1);
             crate::tui::log_line("opened your browser; approve the login there.");
         }
     });

@@ -235,13 +235,28 @@ fn systemd_unit_path(config_dir: &Path) -> Result<PathBuf> {
     Ok(dir.join(systemd_unit_name(config_dir)))
 }
 
+/// Run a service-manager command without letting it write to the terminal.
+///
+/// These run inside the possession ceremony, while the live region is
+/// repainting rows in place. Anything a child prints to the inherited stdout
+/// lands *inside* the frame and leaves the cursor where the next rewind does
+/// not expect it — after which every repaint is off by a row and the panel
+/// grows a duplicate of its own header. `launchctl bootout` printing
+/// "Boot-out failed: 5: Input/output error" on a machine with no service yet
+/// is the ordinary case, not an exotic one. What the child says is captured
+/// and reported through the frame's own log, which queues above it.
+fn quiet(command: &mut Command) -> std::io::Result<std::process::Output> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+}
+
 fn systemctl(args: &[&str]) -> Result<bool> {
-    let status = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
+    let output = quiet(Command::new("systemctl").arg("--user").args(args))
         .context("running systemctl --user")?;
-    Ok(status.success())
+    Ok(output.status.success())
 }
 
 fn systemd_install(config_dir: &Path, server: &str) -> Result<()> {
@@ -252,7 +267,7 @@ fn systemd_install(config_dir: &Path, server: &str) -> Result<()> {
         .with_context(|| format!("writing {}", unit_path.display()))?;
 
     // Best-effort so the service survives logout; harmless if already enabled.
-    let _ = Command::new("loginctl").args(["enable-linger"]).status();
+    let _ = quiet(Command::new("loginctl").args(["enable-linger"]));
     systemctl(&["daemon-reload"])?;
     let unit = systemd_unit_name(config_dir);
     if !systemctl(&["enable", "--now", &unit])? {
@@ -402,25 +417,42 @@ fn launchd_install(config_dir: &Path, server: &str) -> Result<()> {
     let uid = effective_user_id();
     let domain = format!("gui/{uid}");
     let label = launchd_label(config_dir);
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain])
-        .arg(&plist_path)
-        .status();
-    let bootstrapped = Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&plist_path)
-        .status()
-        .context("running launchctl bootstrap")?;
-    if !bootstrapped.success() {
+    // Booting out first is how a reinstall replaces a running service; with no
+    // service loaded it fails noisily and harmlessly, so its output is dropped
+    // rather than shown.
+    let _ = quiet(
+        Command::new("launchctl")
+            .args(["bootout", &domain])
+            .arg(&plist_path),
+    );
+    let bootstrapped = quiet(
+        Command::new("launchctl")
+            .args(["bootstrap", &domain])
+            .arg(&plist_path),
+    )
+    .context("running launchctl bootstrap")?;
+    if !bootstrapped.status.success() {
         // Older macOS: fall back to the legacy loader.
-        let _ = Command::new("launchctl")
-            .arg("load")
-            .arg(&plist_path)
-            .status();
+        let loaded = quiet(Command::new("launchctl").arg("load").arg(&plist_path));
+        if !loaded.is_ok_and(|output| output.status.success()) {
+            // Both loaders refused. The daemon still runs in this window, so
+            // say what happened rather than leaving "background daemon" to
+            // look done.
+            let reason = String::from_utf8_lossy(&bootstrapped.stderr)
+                .trim()
+                .to_owned();
+            let reason = if reason.is_empty() {
+                "launchd refused the service".to_owned()
+            } else {
+                reason
+            };
+            crate::tui::log_line(&format!(
+                "could not install the background service: {reason}"
+            ));
+        }
     }
-    let _ = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("{domain}/{label}")])
-        .status();
+    let _ =
+        quiet(Command::new("launchctl").args(["kickstart", "-k", &format!("{domain}/{label}")]));
     Ok(())
 }
 
@@ -428,10 +460,11 @@ fn launchd_uninstall(config_dir: &Path) -> Result<()> {
     let uid = effective_user_id();
     let domain = format!("gui/{uid}");
     if let Ok(path) = launchd_plist_path(config_dir) {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &domain])
-            .arg(&path)
-            .status();
+        let _ = quiet(
+            Command::new("launchctl")
+                .args(["bootout", &domain])
+                .arg(&path),
+        );
         let _ = std::fs::remove_file(&path);
     }
     Ok(())

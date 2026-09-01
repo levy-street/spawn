@@ -34,6 +34,47 @@ pub struct RawModeGuard {
     saved: nix::sys::termios::Termios,
 }
 
+/// Terminal echo, suppressed for the guard's lifetime and restored on drop.
+pub struct EchoGuard {
+    saved: nix::sys::termios::Termios,
+}
+
+/// Stop the terminal echoing what is typed.
+///
+/// A live region repaints rows in place, so anything the tty echoes lands
+/// *inside* the frame and leaves the cursor where the next rewind does not
+/// expect it — after which every repaint is off by a row and the panel grows
+/// a duplicate of its own header. The region owns the terminal while it is
+/// drawing, so it owns the echo too. Returns `None` when there is no terminal
+/// or its state cannot be read.
+pub fn suppress_echo() -> Option<EchoGuard> {
+    use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
+    use std::io::IsTerminal;
+
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return None;
+    }
+    let saved = tcgetattr(&stdin).ok()?;
+    let mut quiet = saved.clone();
+    // ICANON stays on: `poll` must keep reporting readable only once a whole
+    // line is available, which is what lets the Enter listener wait without
+    // blocking. Only the echoing of what was typed goes away.
+    quiet
+        .local_flags
+        .remove(LocalFlags::ECHO | LocalFlags::ECHOE | LocalFlags::ECHOK | LocalFlags::ECHONL);
+    tcsetattr(&stdin, SetArg::TCSANOW, &quiet).ok()?;
+    Some(EchoGuard { saved })
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        use nix::sys::termios::{tcsetattr, SetArg};
+
+        let _ = tcsetattr(std::io::stdin(), SetArg::TCSANOW, &self.saved);
+    }
+}
+
 pub struct VtOutputGuard;
 
 impl Drop for VtOutputGuard {
@@ -319,6 +360,10 @@ pub fn wait_for_enter_until(done: &AtomicBool) -> bool {
     if !std::io::stdin().is_terminal() {
         return false;
     }
+    // Echo is suppressed for the whole ceremony by the live region that owns
+    // the terminal (`tui::Ui`), so the newline ending this Enter never reaches
+    // the screen. Suppressing it here as well would only cover the wait, and
+    // the keystrokes that corrupt a frame mostly arrive after it.
     let mut descriptor = nix::libc::pollfd {
         fd: nix::libc::STDIN_FILENO,
         events: nix::libc::POLLIN,

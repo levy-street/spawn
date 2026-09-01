@@ -514,6 +514,10 @@ struct UiState {
     /// Height of the region as last drawn, so the next frame knows how far up
     /// to move. Zero means nothing is on screen yet.
     drawn: usize,
+    /// The frame on screen no longer matches the state (or the cursor moved
+    /// under us), so the next tick must repaint in full rather than touch
+    /// only the status line.
+    dirty: bool,
     width: usize,
     finished: bool,
 }
@@ -637,6 +641,10 @@ pub struct Ui {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
     _vt: Option<crate::platform::VtOutputGuard>,
+    /// The region owns the terminal while it draws, so it owns the echo too:
+    /// anything the tty echoes would land inside the frame and displace every
+    /// rewind after it.
+    _echo: Option<crate::platform::EchoGuard>,
 }
 
 impl Ui {
@@ -651,6 +659,7 @@ impl Ui {
                 stop: Arc::new(AtomicBool::new(true)),
                 thread: None,
                 _vt: None,
+                _echo: None,
             };
         }
         let Some(vt) = crate::platform::enable_vt_output() else {
@@ -659,6 +668,7 @@ impl Ui {
                 stop: Arc::new(AtomicBool::new(true)),
                 thread: None,
                 _vt: None,
+                _echo: None,
             };
         };
         let state = Arc::new(Mutex::new(UiState {
@@ -667,8 +677,11 @@ impl Ui {
             steps: steps
                 .iter()
                 .map(|label| Step {
+                    // A step that has not happened yet says nothing: a row of
+                    // quiet labels reads as a plan, while four bracketed
+                    // placeholders read as four alarms.
                     label: (*label).to_owned(),
-                    detail: "[ PENDING ]".to_owned(),
+                    detail: String::new(),
                     state: StepState::Pending,
                 })
                 .collect(),
@@ -677,6 +690,7 @@ impl Ui {
             frame: 0,
             pending: Vec::new(),
             drawn: 0,
+            dirty: true,
             width: terminal_width(),
             finished: false,
         }));
@@ -696,7 +710,11 @@ impl Ui {
                         // frame ten times a second is pure terminal churn.
                         if state.status.is_some() {
                             state.frame = state.frame.wrapping_add(1);
-                            draw(&mut state);
+                            if state.dirty || !state.pending.is_empty() || state.drawn == 0 {
+                                draw(&mut state);
+                            } else {
+                                tick_status_line(&mut state);
+                            }
                         }
                     }
                     thread::sleep(Duration::from_millis(90));
@@ -711,6 +729,7 @@ impl Ui {
             stop,
             thread: Some(thread),
             _vt: Some(vt),
+            _echo: crate::platform::suppress_echo(),
         }
     }
 
@@ -845,22 +864,75 @@ impl Drop for Ui {
 /// Repaint the live region in place, flushing any queued scrollback above it
 /// first. Single writer, so a frame can never be split by another print.
 fn draw(state: &mut UiState) {
+    let lines = state.frame_lines();
+    let buf = compose_frame(state.drawn, &state.pending, &lines);
+    state.pending.clear();
     let mut out = anstream::stdout();
-    // Rewind over the previous frame so it is overwritten rather than repeated.
-    if state.drawn > 0 {
-        let _ = write!(out, "\r\x1b[{}A", state.drawn);
+    // One write_all for the whole frame. The old shape — a dozen separate
+    // error-swallowed write! calls — could lose the middle of a frame when a
+    // single flush failed, and a frame missing lines desynchronises every
+    // rewind after it: that is exactly how the approval panel duplicated its
+    // own header on screen.
+    if out.write_all(buf.as_bytes()).is_err() {
+        // After a failed write the cursor position is unknowable. Draw the
+        // next frame fresh below rather than rewinding into a mystery.
+        state.drawn = 0;
+        state.dirty = true;
+        return;
+    }
+    let _ = out.flush();
+    state.drawn = lines.len();
+    state.dirty = false;
+}
+
+/// The full repaint as one string: synchronized-update guards around a rewind
+/// over the previous frame, queued scrollback, then the frame itself.
+/// Terminals that understand ?2026 swap the frame in atomically, so a reader
+/// never catches it half-drawn; the rest ignore the guards.
+fn compose_frame(drawn: usize, pending: &[String], lines: &[String]) -> String {
+    let mut buf = String::from("\x1b[?2026h");
+    if drawn > 0 {
+        buf.push_str(&format!("\r\x1b[{drawn}A"));
     }
     // Clearing to end of screen before scrollback keeps a shrinking frame from
     // leaving fragments of the taller one behind.
-    let _ = write!(out, "\x1b[0J");
-    for line in state.pending.drain(..) {
-        let _ = writeln!(out, "{line}");
+    buf.push_str("\x1b[0J");
+    for line in pending {
+        buf.push_str(line);
+        buf.push('\n');
     }
+    for line in lines {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    buf.push_str("\x1b[?2026l");
+    buf
+}
+
+/// Repaint only the frame's last row (the status line). Between state changes
+/// the spinner is the only thing moving, and rewriting one line instead of
+/// fourteen keeps the terminal quiet and shrinks the window in which an
+/// interrupted write can tear the panel.
+fn tick_status_line(state: &mut UiState) {
     let lines = state.frame_lines();
-    for line in &lines {
-        let _ = writeln!(out, "{line}");
+    let Some(last) = lines.last() else {
+        return;
+    };
+    if lines.len() != state.drawn {
+        // The frame changed height under us; only a full repaint can be right.
+        draw(state);
+        return;
     }
-    state.drawn = lines.len();
+    let mut buf = String::from("\x1b[?2026h\r\x1b[1A\x1b[2K");
+    buf.push_str(last);
+    buf.push('\n');
+    buf.push_str("\x1b[?2026l");
+    let mut out = anstream::stdout();
+    if out.write_all(buf.as_bytes()).is_err() {
+        state.drawn = 0;
+        state.dirty = true;
+        return;
+    }
     let _ = out.flush();
 }
 
@@ -1012,6 +1084,9 @@ pub fn frame_pushed_down(lines: usize) {
         // send the next rewind up into output the frame does not own.
         if state.drawn > 0 {
             state.drawn += lines;
+            // The cursor is no longer one row below the status line, so the
+            // cheap status-only tick would paint into foreign output.
+            state.dirty = true;
         }
     });
 }
@@ -1248,7 +1323,12 @@ fn arrow_choice(
         }
     }
     if confirmed {
-        let confirmation = choice_confirmation(options[selected].0, terminal_width(), styled);
+        let confirmation = choice_confirmation(
+            options[selected].0,
+            options[selected].1,
+            terminal_width(),
+            styled,
+        );
         let mut out = anstream::stdout();
         let _ = write!(out, "{}", choice_confirmation_redraw(drawn, &confirmation));
         let _ = out.flush();
@@ -1258,15 +1338,26 @@ fn arrow_choice(
     selected
 }
 
-fn choice_confirmation(label: &str, width: usize, styled: bool) -> String {
+fn choice_confirmation(label: &str, detail: &str, width: usize, styled: bool) -> String {
     let g = glyphs();
     let mark_style = if styled {
         Style::new().fg_color(Some(AnsiColor::Green.into()))
     } else {
         Style::new()
     };
+    // A bare value makes a baffling record — "✓ localhost:3000" says nothing.
+    // Carrying the row's detail turns the scrollback line back into a
+    // sentence: "✓ localhost:3000 — where this command came from".
     let label = ellipsize_plain(label, width.saturating_sub(2));
-    format!("{mark_style}{}{mark_style:#} {label}", g.done)
+    let mut line = format!("{mark_style}{}{mark_style:#} {label}", g.done);
+    if !detail.is_empty() {
+        let used = 2 + display_width(&ellipsize_plain(&label, width));
+        let room = width.saturating_sub(used + 3);
+        if display_width(detail) <= room {
+            line.push_str(&format!(" {}", dim(&format!("— {detail}"), styled)));
+        }
+    }
+    line
 }
 
 fn choice_confirmation_redraw(drawn: usize, confirmation: &str) -> String {
@@ -1438,6 +1529,7 @@ mod tests {
                 frame: 0,
                 pending: Vec::new(),
                 drawn: 0,
+                dirty: true,
                 width,
                 finished: false,
             };
@@ -1463,6 +1555,7 @@ mod tests {
             frame: 0,
             pending: Vec::new(),
             drawn: 0,
+            dirty: true,
             width: 66,
             finished: false,
         };
@@ -1674,18 +1767,91 @@ mod tests {
         println!("--- confirmation ---");
         println!(
             "{}",
-            choice_confirmation("Approve a new browser or phone", 80, false)
+            choice_confirmation("Approve a new browser or phone", "", 80, false)
         );
     }
 
     #[test]
+    fn a_frame_is_one_atomic_write_that_rewinds_exactly_its_last_height() {
+        let lines = vec!["┌─ one ─┐".to_owned(), "└───────┘".to_owned()];
+        let frame = compose_frame(5, &[], &lines);
+
+        // Synchronized update, so a terminal swaps the frame in whole rather
+        // than letting a reader catch it half-drawn.
+        assert!(frame.starts_with("\x1b[?2026h"));
+        assert!(frame.ends_with("\x1b[?2026l"));
+        // Exactly one rewind, of exactly the previous height, and one clear.
+        assert_eq!(frame.matches("\x1b[").count() - 2, 2, "rewind + clear only");
+        assert!(frame.contains("\r\x1b[5A"));
+        assert_eq!(frame.matches("\x1b[0J").count(), 1);
+        assert_eq!(frame.matches('\n').count(), lines.len());
+
+        // Nothing on screen yet means nothing to rewind over.
+        let first = compose_frame(0, &[], &lines);
+        assert!(!first.contains('A'), "no cursor-up on the first frame");
+    }
+
+    #[test]
+    fn queued_scrollback_is_flushed_above_the_frame_in_the_same_write() {
+        let pending = vec!["✓ localhost:3000 — where this command came from".to_owned()];
+        let lines = vec!["┌─ panel ─┐".to_owned()];
+        let frame = compose_frame(3, &pending, &lines);
+
+        let body = frame
+            .split("\x1b[0J")
+            .nth(1)
+            .expect("a clear precedes the body");
+        let rows: Vec<&str> = body.trim_end_matches("\x1b[?2026l").lines().collect();
+        assert_eq!(rows, vec![pending[0].as_str(), lines[0].as_str()]);
+    }
+
+    #[test]
+    fn a_pending_step_says_nothing_rather_than_shouting_pending() {
+        let state = UiState {
+            title: "POSSESSING somewhere".to_owned(),
+            panel_context: None,
+            steps: vec![Step {
+                label: "Start background daemon".to_owned(),
+                detail: String::new(),
+                state: StepState::Pending,
+            }],
+            status: None,
+            hint: String::new(),
+            frame: 0,
+            pending: Vec::new(),
+            drawn: 0,
+            dirty: true,
+            width: 80,
+            finished: false,
+        };
+        let rendered = state.frame_lines().join("\n");
+        assert!(rendered.contains("Start background daemon"));
+        assert!(
+            !rendered.contains("PENDING"),
+            "a step that has not happened yet needs no badge: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_line_keeps_the_detail_that_makes_it_a_sentence() {
+        let line = choice_confirmation("localhost:3000", "where this command came from", 80, false);
+        assert_eq!(line, "✓ localhost:3000 — where this command came from");
+
+        // No room for the detail is not a reason to wrap or overflow.
+        let tight =
+            choice_confirmation("localhost:3000", "where this command came from", 24, false);
+        assert!(display_width(&tight) <= 24, "{tight}");
+        assert!(tight.starts_with("✓ localhost:3000"));
+    }
+
+    #[test]
     fn arrow_choice_confirmation_is_one_quiet_width_safe_line() {
-        let line = choice_confirmation("Approve a new browser or phone", 80, false);
+        let line = choice_confirmation("Approve a new browser or phone", "", 80, false);
         assert_eq!(line, "✓ Approve a new browser or phone");
         assert!(!line.contains("Enter"));
         assert!(display_width(&line) <= 80);
 
-        let narrow = choice_confirmation(&"account ".repeat(30), 60, false);
+        let narrow = choice_confirmation(&"account ".repeat(30), "", 60, false);
         assert_eq!(display_width(&narrow), 60);
         assert!(narrow.ends_with('…'));
 
@@ -1733,6 +1899,7 @@ mod tests {
                 frame: 0,
                 pending: Vec::new(),
                 drawn: 0,
+                dirty: true,
                 width,
                 finished: false,
             };
