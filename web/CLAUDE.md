@@ -14,7 +14,7 @@ src/
   app/            one directory per route (App Router)
                   admin/ app/ desktop-build/ device/ download/
                   forgot-password/ hosts/ legion/ login/ onboarding/
-                  reset-password/ security/ sessions/ signup/ trust-ux-demo/
+                  reset-password/ security/ sessions/ signup/
                   verify-email/ w/
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/ release/
@@ -23,12 +23,15 @@ src/
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files
-  trust-ux/       trust and identity UX flows
   middleware.ts   request middleware (+ its test beside it)
 tests/e2e/        Playwright end-to-end specs
 scripts/          build wrappers (next-with-proxy-target.mjs) and helpers
 public/           static assets
 ```
+
+The retired production mockup paths `src/trust-ux/` and
+`src/app/trust-ux-demo/` were deleted; trust UI belongs with its live product
+area and must not be reintroduced through a public demo route.
 
 ## Where things go
 
