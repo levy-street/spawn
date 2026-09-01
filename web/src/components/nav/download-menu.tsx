@@ -70,14 +70,23 @@ function DownloadMenuItems() {
   // Safe to read in the initializer: menu content never server-renders, so
   // there is no hydration pass for the detected OS to disagree with.
   const [platform] = useState(detectPlatform);
-  const desktopPlatform = desktopPlatformForOS(platform.os) ?? "darwin-aarch64";
-  const release = useDesktopRelease(platform.origin, desktopPlatform);
+  const desktopPlatform = desktopPlatformForOS(platform.os);
   const badges = storeBadges();
 
   return (
     <>
       <DropdownMenuLabel>Get SPAWN D</DropdownMenuLabel>
-      <DesktopDownloadRow platform={desktopPlatform} release={release} />
+      {desktopPlatform === null ? (
+        // No desktop build for this OS — Linux, ChromeOS, something unknown.
+        // /download says which platforms there are; a macOS disk image handed
+        // to a Linux browser would only say the menu had not looked.
+        <DropdownMenuItem href="/download">
+          <Laptop className="size-4" aria-hidden />
+          Download for desktop
+        </DropdownMenuItem>
+      ) : (
+        <DesktopDownloadRow origin={platform.origin} platform={desktopPlatform} />
+      )}
       <DropdownMenuSeparator />
       {badges.map((badge) => (
         <DropdownMenuItem
@@ -112,13 +121,8 @@ function DownloadMenuItems() {
  * something to report is the state this row exists to replace. Closing it
  * mid-download only takes the readout away; the file still lands.
  */
-function DesktopDownloadRow({
-  platform,
-  release,
-}: {
-  platform: DesktopPlatform;
-  release: DesktopReleaseState;
-}) {
+function DesktopDownloadRow({ origin, platform }: { origin: string; platform: DesktopPlatform }) {
+  const release: DesktopReleaseState = useDesktopRelease(origin, platform);
   const { phase, percent, busy, alreadyHas, press } = useDesktopDownload({
     href: release.url,
     pending: !release.settled,
