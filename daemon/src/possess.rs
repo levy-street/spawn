@@ -289,13 +289,15 @@ async fn keep_possessed(
             .map_err(|error| login::background_service_error(&error))?;
         offer_breakaway_fallback(dir, &server)
             .map_err(|error| login::background_service_error(&error))?;
-        println!("{}", resume_line(&instance_account(dir)));
+        println!("{}", resume_line(&instance_account_id(dir)));
         print_auth_note(dir);
         return Ok(());
     }
+    // Ids, not labels: the desktop app reads this line too, and matches what
+    // it finds against the account it is signed in as.
     let accounts = existing
         .iter()
-        .map(|dir| instance_account(dir))
+        .map(|dir| instance_account_id(dir))
         .collect::<Vec<_>>()
         .join(", ");
     println!("spawn: already possessed for {accounts}.");
@@ -820,8 +822,24 @@ fn relogin_hint(server: &Url, dir: &Path) -> String {
     )
 }
 
+/// The label a person reads: an email where one is known, a shortened id
+/// otherwise. For menus and status — never for a line something parses.
 fn instance_account(dir: &Path) -> String {
     crate::state::human_account_label(dir)
+}
+
+/// The account id, exactly as it names the instance directory.
+///
+/// The resume lines below are read by the desktop app to decide whether this
+/// machine is already possessed *for the account signed in there* — it compares
+/// what it finds against its own stored account id. Putting a friendly label in
+/// them told that app the machine belonged to somebody else, and its setup
+/// wizard then waited for ever for a host it had decided to ignore. Plain
+/// output is a contract; this is the half of it that machines read.
+fn instance_account_id(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn resume_line(account: &str) -> String {
@@ -1047,6 +1065,25 @@ mod tests {
             resume_line("9f1c2d3e"),
             "spawn: already possessed (9f1c2d3e); daemon running in the background."
         );
+    }
+
+    #[test]
+    fn the_resume_lines_name_the_account_id_because_the_desktop_app_reads_them() {
+        // `desktop/src-tauri/src/install.rs` splits on "already possessed ("
+        // and compares what it finds against the account id it is signed in
+        // as. A friendly label there reads as a *different* account, and its
+        // setup wizard then waits for ever for a host it decided to ignore —
+        // which is exactly what a human-readable label in this line caused.
+        let dir = std::path::Path::new("/tmp/spawn-test/9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f");
+        let id = instance_account_id(dir);
+        assert_eq!(id, "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f");
+        assert!(!id.contains('@'), "an email here is the regression: {id}");
+        let line = resume_line(&id);
+        let parsed = line
+            .split_once("already possessed (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(account, _)| account.trim().to_owned());
+        assert_eq!(parsed.as_deref(), Some(id.as_str()));
     }
 
     #[test]
