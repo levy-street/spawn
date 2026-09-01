@@ -21,6 +21,8 @@ export interface OnboardingStepInput {
 }
 
 export const HOST_SKIP_STORAGE_KEY = "spawn.onboarding.skippedHost";
+type HostSkippedListener = (skipped: boolean) => void;
+const hostSkippedListeners = new Set<HostSkippedListener>();
 
 export function resolveOnboardingStep(input: OnboardingStepInput): OnboardingStep {
   if (input.account === null) return "account";
@@ -35,10 +37,17 @@ export async function readHostSkipped(): Promise<boolean> {
   return (await AsyncStorage.getItem(HOST_SKIP_STORAGE_KEY)) === "true";
 }
 
+/** Keep AuthGate and a mounted onboarding flow in the same live state. */
+export function subscribeHostSkipped(listener: HostSkippedListener): () => void {
+  hostSkippedListeners.add(listener);
+  return () => hostSkippedListeners.delete(listener);
+}
+
 export async function setHostSkipped(skipped: boolean): Promise<void> {
   if (skipped) {
     await AsyncStorage.setItem(HOST_SKIP_STORAGE_KEY, "true");
   } else {
     await AsyncStorage.removeItem(HOST_SKIP_STORAGE_KEY);
   }
+  for (const listener of [...hostSkippedListeners]) listener(skipped);
 }

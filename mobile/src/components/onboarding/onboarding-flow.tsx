@@ -12,6 +12,7 @@ import {
   readHostSkipped,
   resolveOnboardingStep,
   setHostSkipped,
+  subscribeHostSkipped,
 } from "@/components/onboarding/onboarding-state";
 import { DeviceApprovalBody } from "@/components/trust/device-approval-screen";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,7 @@ import { getAuthConfig } from "@/data/api/endpoints/auth";
 import { listHosts } from "@/data/api/endpoints/hosts";
 import { useDeviceHostApprovals } from "@/data/queries/device-trust";
 import { qk } from "@/data/queryKeys";
+import { useSignOut } from "@/lib/use-sign-out";
 import { borderWidth, chrome, spacing, useTheme } from "@/theme";
 
 function ProgressRail({
@@ -39,7 +41,7 @@ function ProgressRail({
   const labels: Record<OnboardingStep, string> = {
     account: "Account",
     verify: "Verify",
-    host: "Host",
+    host: "Computer",
     done: "Done",
   };
   const currentIndex = steps.indexOf(current);
@@ -75,6 +77,7 @@ function ProgressRail({
 export function OnboardingFlow(): React.JSX.Element {
   const theme = useTheme();
   const router = useRouter();
+  const signOut = useSignOut();
   const meQuery = useQuery({ queryKey: qk.me(), queryFn: getMe });
   const configQuery = useQuery({ queryKey: qk.authConfig(), queryFn: getAuthConfig });
   const hostsQuery = useQuery({ queryKey: qk.hosts(), queryFn: listHosts, refetchInterval: 3000 });
@@ -85,7 +88,20 @@ export function OnboardingFlow(): React.JSX.Element {
   const [hostSkipped, setHostSkippedState] = useState<boolean | null>(null);
 
   useEffect(() => {
-    void readHostSkipped().then(setHostSkippedState);
+    let active = true;
+    let liveRevision = 0;
+    const unsubscribe = subscribeHostSkipped((skipped) => {
+      if (!active) return;
+      liveRevision += 1;
+      setHostSkippedState(skipped);
+    });
+    void readHostSkipped().then((skipped) => {
+      if (active && liveRevision === 0) setHostSkippedState(skipped);
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   const loading =
@@ -95,7 +111,7 @@ export function OnboardingFlow(): React.JSX.Element {
     : configQuery.isError
       ? "Couldn’t load sign-in options"
       : hostsQuery.isError
-        ? "Couldn’t load your hosts"
+        ? "Couldn’t load your computers"
         : null;
   const step = resolveOnboardingStep({
     account: meQuery.data ? { emailVerified: meQuery.data.user.email_verified_at !== null } : null,
@@ -147,21 +163,24 @@ export function OnboardingFlow(): React.JSX.Element {
     content = (
       <EmptyState
         action={
-          hostsQuery.data?.length === 0 ? (
-            <Button
-              onPress={() => {
-                void setHostSkipped(false).then(() => setHostSkippedState(false));
-              }}
-              variant="outline"
-            >
-              Connect a host
-            </Button>
-          ) : undefined
+          <View style={styles.doneActions}>
+            <Button onPress={() => router.replace("/workspaces")}>Go to SPAWN D</Button>
+            {hostsQuery.data?.length === 0 ? (
+              <Button
+                onPress={() => {
+                  void setHostSkipped(false);
+                }}
+                variant="outline"
+              >
+                Connect a computer
+              </Button>
+            ) : null}
+          </View>
         }
         description={
           hostsQuery.data?.length === 0
-            ? "Connect a host whenever you’re ready to open your first shell."
-            : "Your hosts are ready."
+            ? "Connect a computer whenever you’re ready to open your first terminal."
+            : "Your computers are ready."
         }
         icon="CheckCircle2"
         title="Setup complete"
@@ -175,12 +194,16 @@ export function OnboardingFlow(): React.JSX.Element {
     // account always lands on.
     content =
       hostIds.length > 0 ? (
-        <DeviceApprovalBody />
+        <DeviceApprovalBody
+          onExit={() => {
+            void setHostSkipped(true);
+          }}
+        />
       ) : (
         <HostPairingStep
           accountId={meQuery.data.user.id}
           onSkip={() => {
-            void setHostSkipped(true).then(() => setHostSkippedState(true));
+            void setHostSkipped(true);
           }}
         />
       );
@@ -200,7 +223,20 @@ export function OnboardingFlow(): React.JSX.Element {
       testID="onboarding-flow"
     >
       <Screen
-        header={<AppHeader onBack={() => leaveOnboarding(router)} title="Set up SPAWN D" />}
+        header={
+          <AppHeader
+            actions={[
+              {
+                accessibilityLabel: "Sign out",
+                busy: signOut.signingOut,
+                icon: "LogOut",
+                onPress: () => void signOut.signOut(),
+              },
+            ]}
+            onBack={() => leaveOnboarding(router)}
+            title="Set up SPAWN D"
+          />
+        }
         padded={false}
         scroll
       >
@@ -223,6 +259,10 @@ const styles = StyleSheet.create({
     maxWidth: chrome.pickerPreferredWidth,
     paddingHorizontal: spacing[5],
     paddingVertical: spacing[8],
+    width: "100%",
+  },
+  doneActions: {
+    gap: spacing[2],
     width: "100%",
   },
   loadingState: {
