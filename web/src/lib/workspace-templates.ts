@@ -1,5 +1,5 @@
 import type { Agent, Session, WorkspaceTemplateSpec } from "@/lib/api";
-import { runningAgent } from "@/lib/sessions";
+import { sessionAgent } from "@/lib/sessions";
 import type { LayoutV3 } from "@/lib/tabs";
 
 /**
@@ -37,6 +37,6 @@ function agentRun(
   session: Session | undefined,
   agents: Agent[],
 ): { kind: "agent"; command: string } | null {
-  const agent = runningAgent(session, agents);
+  const agent = sessionAgent(session, agents);
   return agent ? { kind: "agent", command: agent.command } : null;
 }

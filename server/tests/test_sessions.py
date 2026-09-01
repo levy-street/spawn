@@ -111,6 +111,94 @@ async def test_session_create_defaults_name_from_host_and_cwd(client):
     assert "preset_id" not in body
 
 
+async def _builtin_agent_id(client, auth, name: str) -> str:
+    r = await client.get("/api/agents", headers=auth)
+    assert r.status_code == 200, r.text
+    return next(a["id"] for a in r.json() if a["name"] == name)
+
+
+async def test_session_remembers_the_agent_it_was_opened_as(client):
+    """A window's type outlives the process: what the client launched into it
+    is recorded, so a duplicate can reproduce it even when the agent has been
+    quit, or reports an interpreter's name while it runs."""
+    token = await _signup(client, "session-agent@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host("session-agent@example.com", status="offline")
+    hermes = await _builtin_agent_id(client, auth, "hermes")
+
+    r = await client.post(
+        "/api/sessions",
+        json={"host_id": host_id, "cwd": "/repo", "agent_id": hermes},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    session_id = r.json()["id"]
+    assert r.json()["agent_id"] == hermes
+
+    # Still the window's type when the daemon reports the interpreter that
+    # actually holds the foreground.
+    r = await client.get(f"/api/sessions/{session_id}", headers=auth)
+    assert r.json()["agent_id"] == hermes
+
+    # Launching another agent into the same window retypes it...
+    codex = await _builtin_agent_id(client, auth, "codex")
+    r = await client.patch(f"/api/sessions/{session_id}", json={"agent_id": codex}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["agent_id"] == codex
+
+    # ...a patch that says nothing about it leaves it be...
+    r = await client.patch(f"/api/sessions/{session_id}", json={"name": "work"}, headers=auth)
+    assert r.json()["agent_id"] == codex
+
+    # ...and stopping back to a bare prompt says so with an explicit null.
+    r = await client.patch(f"/api/sessions/{session_id}", json={"agent_id": None}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["agent_id"] is None
+
+
+async def test_session_agent_must_be_one_this_user_can_launch(client):
+    token = await _signup(client, "session-agent-scope@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host("session-agent-scope@example.com", status="offline")
+
+    # Someone else's definition is not a type this user's windows may claim.
+    other = await _signup(client, "session-agent-other@example.com")
+    r = await client.post(
+        "/api/agents",
+        json={"name": "theirs", "kind": "codex", "command": "codex"},
+        headers={"Authorization": f"Bearer {other}"},
+    )
+    assert r.status_code == 201, r.text
+    theirs = r.json()["id"]
+
+    r = await client.post(
+        "/api/sessions",
+        json={"host_id": host_id, "cwd": "/repo", "agent_id": theirs},
+        headers=auth,
+    )
+    assert r.status_code == 404, r.text
+
+    r = await client.post(
+        "/api/sessions",
+        json={
+            "host_id": host_id,
+            "cwd": "/repo",
+            "agent_id": "00000000-0000-4000-8000-000000009999",
+        },
+        headers=auth,
+    )
+    assert r.status_code == 404, r.text
+
+    # A window opened as nothing in particular is a shell, and says so.
+    r = await client.post("/api/sessions", json={"host_id": host_id, "cwd": "/repo"}, headers=auth)
+    assert r.status_code == 201, r.text
+    assert r.json()["agent_id"] is None
+    session_id = r.json()["id"]
+
+    r = await client.patch(f"/api/sessions/{session_id}", json={"agent_id": theirs}, headers=auth)
+    assert r.status_code == 404, r.text
+
+
 async def test_session_create_rejects_retired_launch_fields(client):
     token = await _signup(client, "no-argv@example.com")
     auth = {"Authorization": f"Bearer {token}"}
@@ -245,10 +333,18 @@ async def test_session_create_appends_workspace_tile(client):
     layout = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()["layout"]
     by_id = {tile["session_id"]: tile for tile in layout["tabs"][0]["layout"]["tiles"]}
     assert by_id[first.json()["id"]] == {
-        "session_id": first.json()["id"], "x": 0, "y": 0, "w": 12, "h": 24
+        "session_id": first.json()["id"],
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 24,
     }
     assert by_id[second.json()["id"]] == {
-        "session_id": second.json()["id"], "x": 12, "y": 0, "w": 12, "h": 24
+        "session_id": second.json()["id"],
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 24,
     }
 
 

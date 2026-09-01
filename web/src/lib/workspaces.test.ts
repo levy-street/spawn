@@ -56,6 +56,7 @@ function makeSession(id: string, overrides: Partial<Session> = {}): Session {
     activity_state: "quiet",
     activity_label: "Quiet",
     foreground_command: null,
+    agent_id: null,
     ...overrides,
   };
 }

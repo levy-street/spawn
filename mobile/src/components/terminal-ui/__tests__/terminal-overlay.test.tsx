@@ -215,6 +215,7 @@ const session: SessionOut = {
   activity_state: "active",
   activity_label: "Active",
   foreground_command: "codex",
+  agent_id: null,
 };
 
 const host: HostOut = {

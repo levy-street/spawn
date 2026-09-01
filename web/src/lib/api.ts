@@ -314,6 +314,13 @@ export const SessionSchema = z.object({
   /** Basename of the foreground process, reported by the daemon; null until
    * the worker reports one (old workers never do). */
   foreground_command: z.string().nullable().default(null),
+  /**
+   * The agent this window was opened as — what SPAWN D typed into its shell —
+   * as opposed to `foreground_command`, which is whatever holds the terminal
+   * this second. Null for a window opened as a plain shell, or one stopped
+   * back to a prompt.
+   */
+  agent_id: z.string().uuid().nullable().default(null),
 });
 export type Session = z.infer<typeof SessionSchema>;
 
@@ -1243,6 +1250,9 @@ export const sessions = {
     host_id: string;
     cwd: string;
     name?: string;
+    /** The agent this window is being opened as, when it is being opened as
+     *  one: the type a duplicate of it reproduces. */
+    agent_id?: string | null;
     skill_ids?: string[];
     workspace_id?: string;
     tile?: { x: number; y: number; w: number; h: number };
@@ -1252,7 +1262,7 @@ export const sessions = {
       body: JSON.stringify(body),
       schema: SessionSchema,
     }),
-  update: (id: string, body: { name?: string | null }) =>
+  update: (id: string, body: { name?: string | null; agent_id?: string | null }) =>
     api(`/api/sessions/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
@@ -1350,7 +1360,12 @@ export const workspaces = {
    */
   create: (body?: {
     name?: string;
-    first_session?: { host_id: string; cwd: string; skill_ids?: string[] };
+    first_session?: {
+      host_id: string;
+      cwd: string;
+      agent_id?: string | null;
+      skill_ids?: string[];
+    };
     host_id?: string;
     cwd?: string;
     icon?: string | null;
