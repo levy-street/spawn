@@ -975,6 +975,17 @@ class Session(Base):
     # documented content-free exception: a process name, nothing else, so the
     # UI can label panes. See docs/TRUST.md.
     foreground_command: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The agent this window was opened as — what SPAWN D typed into its shell —
+    # and not what happens to hold the foreground this second. The two answer
+    # different questions: `foreground_command` says what is running now, which
+    # is a shell whenever the agent has been quit or is between runs, and which
+    # names an interpreter rather than a tool for any CLI that ships as a
+    # script (Hermes reports "python3"). Duplicating a window reproduces its
+    # type from this. NULL for a window opened as a plain shell, or one whose
+    # agent was stopped back to a prompt.
+    agent_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
+    )
 
     owner: Mapped[User] = relationship(back_populates="sessions")
     host: Mapped[Host] = relationship(back_populates="sessions")

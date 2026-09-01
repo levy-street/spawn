@@ -32,6 +32,7 @@ export interface LaunchDependencies {
     host_id: string;
     cwd: string;
     name?: string;
+    agent_id?: string;
     workspace_id: string;
     tile: { x: number; y: number; w: number; h: number };
   }): Promise<SessionOut>;
@@ -114,6 +115,10 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
       const session = await dependencies.createSession({
         host_id: request.hostId,
         cwd: request.cwd,
+        // The window is a shell an agent is about to be typed into; recording
+        // which one is what makes it that kind of window, so a duplicate of it
+        // opens as one too.
+        ...(request.agent ? { agent_id: request.agent.id } : {}),
         workspace_id: request.workspaceId,
         tile: placement.tile,
         ...(trimmedName ? { name: trimmedName } : {}),

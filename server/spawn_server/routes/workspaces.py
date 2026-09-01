@@ -371,6 +371,7 @@ async def create_workspace(
             cwd=body.first_session.cwd,
             name=None,
             skill_ids=body.first_session.skill_ids,
+            agent_id=body.first_session.agent_id,
         )
         workspace.layout = _single_tab_layout(
             [{"session_id": session_row.id, **FIRST_SESSION_TILE}]

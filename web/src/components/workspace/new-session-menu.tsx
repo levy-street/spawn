@@ -217,13 +217,23 @@ function useNewSessionChoices(
         const session = await sessions.create({
           host_id: host.id,
           cwd,
+          // The window is a shell that an agent is about to be typed into;
+          // recording which one is what makes it that kind of window, so a
+          // duplicate of it opens as one too.
+          ...(choice.kind === "agent" && { agent_id: choice.agent.id }),
           workspace_id: workspaceId,
           tile,
         });
         if (choice.kind === "agent") pendingLaunch.set(session.id, agentRunCommand(choice.agent));
         return { workspaceId, sessionId: session.id };
       }
-      const result = await workspaces.create({ first_session: { host_id: host.id, cwd } });
+      const result = await workspaces.create({
+        first_session: {
+          host_id: host.id,
+          cwd,
+          ...(choice.kind === "agent" && { agent_id: choice.agent.id }),
+        },
+      });
       if (!result.session) throw new Error("The workspace was created without its first session.");
       if (choice.kind === "agent")
         pendingLaunch.set(result.session.id, agentRunCommand(choice.agent));

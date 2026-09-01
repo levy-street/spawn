@@ -57,6 +57,29 @@ export function runningAgent(
   return agents.find((agent) => normalizedBasename(agent.command) === reported) ?? null;
 }
 
+/**
+ * What kind of window this is: the agent it was opened as, else whatever its
+ * foreground process says is running in it.
+ *
+ * The recorded type comes first because it is the durable answer. The
+ * foreground is a snapshot of one process: it says "shell" for a window whose
+ * agent has been quit or is between runs, and it names the interpreter rather
+ * than the tool for any CLI that ships as a script — a Hermes window reports
+ * "python3", which matches no agent's command and used to duplicate as a bare
+ * shell. A window someone typed an agent into by hand has nothing recorded, so
+ * the foreground is still asked.
+ */
+export function sessionAgent(
+  session: Pick<Session, "foreground_command" | "agent_id"> | undefined,
+  agents: readonly AgentDef[],
+): AgentDef | null {
+  const recorded = session?.agent_id;
+  const known = recorded ? agents.find((agent) => agent.id === recorded) : undefined;
+  // A recorded id no agent claims — a custom definition deleted since — is a
+  // type nothing can launch any more, so the live process answers instead.
+  return known ?? runningAgent(session?.foreground_command ?? null, agents);
+}
+
 function brandFor(value: string | null | undefined): Brand | null {
   const normalized = value?.toLowerCase() ?? "";
   return BRANDS.find(({ needle }) => normalized.includes(needle))?.brand ?? null;

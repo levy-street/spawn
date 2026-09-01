@@ -832,7 +832,12 @@ export function Sidebar({
           </Button>
         </RailTooltip>
 
-        <div className="flex items-center">
+        {/* One row, two controls: the account menu, and the apps beside it.
+            The lit ground belongs to the row rather than to either control, so
+            the download button sits inside the same pill instead of floating
+            off its right edge — and whichever half the pointer is on brightens
+            its own contents. */}
+        <div className="flex items-center rounded-lg transition-colors hover:bg-accent/50">
           <DropdownMenu
             side="top"
             align="start"
@@ -845,7 +850,13 @@ export function Sidebar({
                   variant="ghost"
                   size="sm"
                   aria-label="Account menu"
-                  className={cn(sidebarRowClass(false), "h-11 justify-start px-0")}
+                  className={cn(
+                    sidebarRowClass(false),
+                    "h-11 justify-start px-0",
+                    // The row's own ground is the pill around both controls;
+                    // a second one here would double the tint.
+                    "hover:bg-transparent",
+                  )}
                 >
                   <SidebarIconSlot>
                     <span className="grid size-6 place-items-center rounded-full bg-secondary text-[11px] font-semibold uppercase text-secondary-foreground">
