@@ -1,4 +1,9 @@
-import { agentDisplayName, commandBasename, stripExecutableSuffix } from "@/lib/agent-identity";
+import {
+  agentDisplayName,
+  commandBasename,
+  SHELL_COMMANDS,
+  stripExecutableSuffix,
+} from "@/lib/agent-identity";
 import type { Agent, Session, Workspace } from "@/lib/api";
 import { tabOfSession } from "@/lib/tabs";
 
@@ -90,8 +95,6 @@ export function sessionNeedsAttention(session: Session): "waiting" | "dead" | nu
   if (session.activity_state === "waiting") return "waiting";
   return null;
 }
-
-const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash", "powershell", "pwsh", "cmd"]);
 
 /**
  * True when a reported foreground command is a shell. The daemon reports the

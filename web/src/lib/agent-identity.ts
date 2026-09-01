@@ -3,7 +3,21 @@
  * to draw, and what to call the thing in prose. Lives in `lib` so both the
  * icon component and the session-title helpers can read it.
  */
-const SHELL_RE = /^(bash|zsh|fish|sh|dash|powershell|pwsh|cmd)$/;
+/**
+ * The one list of shells, read here for the icon and by `lib/sessions` for
+ * the prompt test — a second copy drifted once already. Names are lower case
+ * with any Windows executable suffix already stripped.
+ */
+export const SHELL_COMMANDS: ReadonlySet<string> = new Set([
+  "bash",
+  "zsh",
+  "fish",
+  "sh",
+  "dash",
+  "powershell",
+  "pwsh",
+  "cmd",
+]);
 
 /**
  * The daemon reports the kernel's own name for the foreground process, and on
@@ -39,7 +53,7 @@ function matchName(name: string): ResolvedAgentIcon | null {
   if (lower.includes("opencode")) return { icon: "opencode", label: "OpenCode" };
   if (lower.includes("aider")) return { icon: "aider", label: "Aider" };
   if (lower.includes("hermes")) return { icon: "hermes", label: "Hermes Agent" };
-  if (SHELL_RE.test(lower)) return { icon: "shell", label: lower };
+  if (SHELL_COMMANDS.has(lower)) return { icon: "shell", label: lower };
   return null;
 }
 

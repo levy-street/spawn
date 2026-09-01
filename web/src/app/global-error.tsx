@@ -1,5 +1,10 @@
 "use client";
 
+// A root error boundary replaces the root layout wholesale and inherits none
+// of its styles, so the sheet the layout imports has to be imported here too —
+// without it the production build renders this page with no CSS at all and
+// the altar ink paints over the copy.
+import "./globals.css";
 import { ERROR_ACTION_CLASS, ErrorSurface } from "@/components/brand/error-surface";
 import { grimoire } from "@/lib/fonts";
 
