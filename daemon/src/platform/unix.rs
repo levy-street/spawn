@@ -354,50 +354,72 @@ pub fn enable_raw_mode() -> Option<RawModeGuard> {
 /// eventual `read_line` cannot remain blocked. Checking `done` between short
 /// polls lets an approval completed on another device retire this listener
 /// before a later prompt needs stdin.
-pub fn wait_for_enter_until(done: &AtomicBool) -> bool {
+pub fn wait_for_enter_until(done: &AtomicBool) -> super::EnterWait {
     use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() {
-        return false;
+        return super::EnterWait::Unavailable;
     }
     // Echo is suppressed for the whole ceremony by the live region that owns
     // the terminal (`tui::Ui`), so the newline ending this Enter never reaches
     // the screen. Suppressing it here as well would only cover the wait, and
     // the keystrokes that corrupt a frame mostly arrive after it.
-    let mut descriptor = nix::libc::pollfd {
-        fd: nix::libc::STDIN_FILENO,
-        events: nix::libc::POLLIN,
-        revents: 0,
-    };
+    //
+    // `select`, not `poll`. On macOS `poll` reports POLLNVAL for a descriptor
+    // opened on the `/dev/tty` *device* even though the descriptor is entirely
+    // valid — `fcntl` and `isatty` both agree it is a live terminal. That is
+    // precisely the descriptor every real install has, because `install.sh`
+    // reattaches the terminal with `exec spawnd … < /dev/tty` when the script
+    // itself arrived down a pipe from curl. So the offer worked when spawnd was
+    // run by hand and did nothing whatsoever for the people it was written for.
+    // `select` has no such quirk on any platform here.
     while !done.load(Ordering::Acquire) {
-        // SAFETY: descriptor points to one live pollfd for the duration of the
-        // call; poll neither retains nor takes ownership of it.
-        let ready = unsafe { nix::libc::poll(&mut descriptor, 1, 100) };
+        let mut readable: nix::libc::fd_set = unsafe { std::mem::zeroed() };
+        // SAFETY: `readable` is a live, zeroed fd_set and 0 is below FD_SETSIZE.
+        unsafe {
+            nix::libc::FD_ZERO(&mut readable);
+            nix::libc::FD_SET(nix::libc::STDIN_FILENO, &mut readable);
+        }
+        let mut timeout = nix::libc::timeval {
+            tv_sec: 0,
+            tv_usec: 100_000,
+        };
+        // SAFETY: the fd_set and timeval outlive the call; the write/error sets
+        // are explicitly absent.
+        let ready = unsafe {
+            nix::libc::select(
+                nix::libc::STDIN_FILENO + 1,
+                &mut readable,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut timeout,
+            )
+        };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return false;
+            return super::EnterWait::Unavailable;
         }
         if ready == 0 {
             continue;
         }
-        if descriptor.revents & nix::libc::POLLIN == 0 {
-            if descriptor.revents & (nix::libc::POLLERR | nix::libc::POLLHUP | nix::libc::POLLNVAL)
-                != 0
-            {
-                return false;
-            }
+        // SAFETY: `readable` was populated by the successful select above.
+        if !unsafe { nix::libc::FD_ISSET(nix::libc::STDIN_FILENO, &readable) } {
             continue;
         }
         if done.load(Ordering::Acquire) {
-            return false;
+            return super::EnterWait::Retired;
         }
         let mut line = String::new();
-        return matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0);
+        return match std::io::stdin().read_line(&mut line) {
+            Ok(read) if read > 0 => super::EnterWait::Pressed,
+            // EOF or a read error: nobody is going to press anything here.
+            _ => super::EnterWait::Unavailable,
+        };
     }
-    false
+    super::EnterWait::Retired
 }
 
 impl Drop for RawModeGuard {

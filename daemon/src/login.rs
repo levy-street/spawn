@@ -11,6 +11,8 @@
 
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::platform::EnterWait;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -574,11 +576,34 @@ fn spawn_enter_offer(approve_url: &str, approval_done: Arc<AtomicBool>) {
         // reaches the screen and the frame stays exactly where it was drawn —
         // no `frame_pushed_down` compensation to get right, and no way for a
         // keystroke that opens nothing to displace the panel for ever.
-        if crate::platform::wait_for_enter_until(&approval_done)
-            && !approval_done.load(Ordering::Acquire)
-            && open_browser(&approve_url)
-        {
-            crate::tui::log_line("opened your browser; approve the login there.");
+        match crate::platform::wait_for_enter_until(&approval_done) {
+            EnterWait::Pressed => {
+                if approval_done.load(Ordering::Acquire) {
+                    return;
+                }
+                if open_browser(&approve_url) {
+                    crate::tui::log_line("opened your browser; approve the login there.");
+                } else {
+                    // The offer was taken and nothing happened. Saying so beats
+                    // leaving someone pressing a key that visibly does nothing.
+                    crate::tui::log_line(
+                        "could not open a browser here — use the link above on any signed-in device.",
+                    );
+                }
+            }
+            // The screen promised "Press Enter" and this process cannot watch
+            // the terminal to honour it. Withdraw the promise rather than let
+            // someone press a key for ever.
+            EnterWait::Unavailable => {
+                crate::tui::replace_panel(
+                    "APPROVE THIS LOGIN",
+                    approval_rows(false, &approve_url, crate::tui::terminal_width(), false),
+                );
+                crate::tui::log_line(
+                    "this terminal cannot take a keypress here — use the link above instead.",
+                );
+            }
+            EnterWait::Retired => {}
         }
     });
 }

@@ -629,6 +629,18 @@ pub fn log_line(text: &str) {
     }
 }
 
+/// Replace the live region's action panel from anywhere in the process.
+///
+/// Process-wide for the same reason `log_line` is: the enter listener runs on
+/// its own thread with no handle to the `Ui`. Does nothing when no live region
+/// is drawing, which is exactly right for plain mode.
+pub fn replace_panel(title: &str, rows: Vec<String>) {
+    let title = title.to_owned();
+    let _ = with_active(move |state| {
+        state.panel_context = Some(PanelContext { title, rows });
+    });
+}
+
 /// Emit pre-formatted scrollback: `rich` when a live region is drawing,
 /// `plain` otherwise.
 pub fn log_block(rich: Vec<String>, plain: &[String]) {

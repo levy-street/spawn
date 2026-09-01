@@ -844,28 +844,28 @@ pub fn enable_raw_mode() -> Option<RawModeGuard> {
 /// This uses the console event API instead of `stdin().read_line`, because a
 /// line read cannot be cancelled after another device approves the login and
 /// would retain stdin across any prompt that follows the ceremony.
-pub fn wait_for_enter_until(done: &AtomicBool) -> bool {
+pub fn wait_for_enter_until(done: &AtomicBool) -> super::EnterWait {
     // SAFETY: GetStdHandle returns a process-owned borrowed console handle.
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return false;
+        return super::EnterWait::Unavailable;
     }
     while !done.load(Ordering::Acquire) {
         // SAFETY: handle remains process-owned and valid for this wait.
         match unsafe { WaitForSingleObject(handle, 100) } {
             WAIT_TIMEOUT => continue,
             WAIT_OBJECT_0 => {}
-            _ => return false,
+            _ => return super::EnterWait::Unavailable,
         }
         if done.load(Ordering::Acquire) {
-            return false;
+            return super::EnterWait::Retired;
         }
         let mut record = INPUT_RECORD::default();
         let mut read = 0_u32;
         // SAFETY: record and read are valid out-pointers for a single event;
         // the borrowed console handle is not closed by this call.
         if unsafe { ReadConsoleInputW(handle, &mut record, 1, &mut read) } == 0 || read == 0 {
-            return false;
+            return super::EnterWait::Unavailable;
         }
         if record.EventType as u32 == KEY_EVENT {
             // SAFETY: EventType identifies the active union member.
@@ -874,12 +874,12 @@ pub fn wait_for_enter_until(done: &AtomicBool) -> bool {
                 // SAFETY: UnicodeChar is the active representation for the W API.
                 let character = unsafe { key.uChar.UnicodeChar };
                 if character == b'\r' as u16 || character == b'\n' as u16 {
-                    return true;
+                    return super::EnterWait::Pressed;
                 }
             }
         }
     }
-    false
+    super::EnterWait::Retired
 }
 
 fn raw_console_mode(saved: u32) -> u32 {

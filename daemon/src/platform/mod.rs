@@ -11,6 +11,22 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+/// What became of an offer to press Enter.
+///
+/// `Unavailable` is not the same as "nobody pressed it": it means this process
+/// cannot watch the terminal at all, so a screen that says "Press Enter" is
+/// making a promise it cannot keep and has to say so instead of waiting
+/// silently for ever.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnterWait {
+    /// Someone pressed Enter.
+    Pressed,
+    /// The wait was stood down because the thing it offered already happened.
+    Retired,
+    /// Stdin cannot be watched here.
+    Unavailable,
+}
+
 #[cfg(unix)]
 pub use unix::*;
 #[cfg(windows)]
