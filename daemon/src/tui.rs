@@ -545,6 +545,12 @@ impl UiState {
                 )
             })
             .collect();
+        // While the panel is asking the reader to do something, it is the only
+        // thing on screen. A progress list underneath the ask is what made
+        // people sit and watch a link they were supposed to open: three of its
+        // four rows are the machine's future work, and together they read as
+        // the machine already handling it. Once the ask is answered the panel
+        // stands down and the list takes over.
         let (title, mut rows) = match &self.panel_context {
             Some(context) => (
                 context.title.as_str(),
@@ -554,12 +560,11 @@ impl UiState {
                     .map(|row| truncate_visible(row, self.width.saturating_sub(4)))
                     .collect(),
             ),
-            None => (self.title.as_str(), Vec::new()),
+            None => (self.title.as_str(), step_rows),
         };
-        if !rows.is_empty() && !step_rows.is_empty() {
+        if rows.last().is_some_and(|row| !row.trim().is_empty()) {
             rows.push(String::new());
         }
-        rows.extend(step_rows);
         let mut lines = render_panel(title, &rows, self.width, true);
         let status = match &self.status {
             Some(status) => {
@@ -1862,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    fn action_context_and_progress_share_one_width_safe_panel() {
+    fn the_ask_owns_the_frame_alone_and_hands_it_back_when_answered() {
         for width in [60, 80, 100] {
             let state = UiState {
                 title: "POSSESSING Charlies-MacBook-Pro".to_owned(),
@@ -1920,6 +1925,27 @@ mod tests {
                 lines.iter().all(|line| display_width(line) <= width),
                 "live panel overflowed at {width} columns: {plain:?}"
             );
+
+            // While the panel is asking, the progress list is not on screen:
+            // rows describing the machine's future work under an instruction
+            // are what made people watch instead of act.
+            let joined = plain.join("\n");
+            assert!(!joined.contains("Register this machine"), "{joined}");
+            assert!(!joined.contains("Store credentials"), "{joined}");
+
+            // Answering the ask stands the panel down and hands the frame to
+            // the progress list.
+            let mut answered = state;
+            answered.panel_context = None;
+            let after = answered
+                .frame_lines()
+                .iter()
+                .map(|line| strip_styles(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(after.contains("POSSESSING"), "{after}");
+            assert!(after.contains("Register this machine"), "{after}");
+            assert!(!after.contains("APPROVE THIS LOGIN"), "{after}");
         }
     }
 

@@ -300,6 +300,10 @@ pub async fn run_with_ui(
 
         if poll_has_success_fields(&body) {
             approval_done.store(true, Ordering::Release);
+            // The ask is answered, so the instructions come down and the
+            // progress list takes the screen back: from here on the machine
+            // is the one working.
+            ui.restore_panel();
             ui.complete(1, "approved");
             ui.begin(2, "storing securely");
             ui.status("approval received — SPAWN D is storing credentials");
@@ -410,15 +414,31 @@ fn approval_rows(
             .map(|l| dim(l, true))
             .collect()
     };
-    let lead = if browser_opened {
-        "Your browser is open. If it did not appear, open this link on any signed-in device:"
+    // The thing to do is set apart and bright; the fallback is prose under it.
+    // One long dim sentence carrying both — "Press Enter … or open this link
+    // …" — is how the instruction disappeared into the furniture.
+    let (call, alternative) = if browser_opened {
+        (
+            "Your browser is open — approve the login there.",
+            Some("Nothing appeared? Open this link on any signed-in device:"),
+        )
     } else if interactive {
-        "Press Enter to open the approval page in your browser, or open this link on any signed-in device:"
+        (
+            "Press Enter to open the approval page in your browser.",
+            Some("Or open this link on any signed-in device:"),
+        )
     } else {
-        "Open this link on any signed-in device to approve this login:"
+        (
+            "Open this link on any signed-in device to approve this login:",
+            None,
+        )
     };
     let mut rows = vec![String::new()];
-    rows.extend(prose(lead));
+    rows.extend(wrap_words(call, inner).iter().map(|line| bold(line, true)));
+    if let Some(alternative) = alternative {
+        rows.push(String::new());
+        rows.extend(prose(alternative));
+    }
     rows.push(String::new());
     // Every wrapped segment carries the same OSC 8 target, so the whole run is
     // clickable rather than just the first line.
@@ -520,16 +540,18 @@ fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str
 /// The live status line, rebuilt each tick so elapsed and expiry stay current.
 fn waiting_status(elapsed: u64, expires_in: u64, width: usize) -> String {
     let minutes = expires_in.saturating_sub(elapsed).div_ceil(60);
+    // This line sits under an instruction the reader has to carry out, so it
+    // says who is being waited on. "moves on by itself once approved" was true
+    // and useless: read from the chair it means the machine is busy, which is
+    // exactly the impression that left people watching a link they were meant
+    // to open.
     let variants = [
         format!(
-            "waiting for you to approve — this screen moves on by itself once you do ({elapsed}s) · expires in {minutes} min"
+            "nothing happens until you approve — this screen continues on its own ({elapsed}s · {minutes} min left)"
         ),
-        format!(
-            "waiting for approval — moves on by itself once approved ({elapsed}s) · {minutes} min left"
-        ),
-        format!("waiting for approval — moves on by itself ({elapsed}s) · {minutes} min left"),
-        format!("waiting for approval ({elapsed}s) · {minutes} min left"),
-        format!("waiting for approval ({elapsed}s)"),
+        format!("nothing happens until you approve ({elapsed}s · {minutes} min left)"),
+        format!("nothing happens until you approve ({minutes} min left)"),
+        "nothing happens until you approve".to_owned(),
     ];
     let available = width.saturating_sub(4);
     variants
@@ -1762,17 +1784,31 @@ mod tests {
     fn the_waiting_status_counts_down_the_real_expiry() {
         assert_eq!(
             waiting_status(0, 1800, 100),
-            "waiting for you to approve — this screen moves on by itself once you do (0s) · expires in 30 min"
+            "nothing happens until you approve — this screen continues on its own (0s · 30 min left)"
         );
         assert_eq!(
             waiting_status(33, 1800, 80),
-            "waiting for approval — moves on by itself once approved (33s) · 30 min left"
+            "nothing happens until you approve (33s · 30 min left)"
         );
         // Past expiry must not underflow into a huge number.
         assert_eq!(
             waiting_status(9_000, 1800, 60),
-            "waiting for approval (9000s) · 0 min left"
+            "nothing happens until you approve (9000s · 0 min left)"
         );
+    }
+
+    #[test]
+    fn the_waiting_status_never_reads_as_the_machine_working() {
+        // The reader has an instruction above this line. Anything that sounds
+        // like progress invites them to sit and watch it instead.
+        for width in [60, 80, 100] {
+            let status = waiting_status(5, 1_800, width);
+            assert!(
+                status.starts_with("nothing happens until you approve"),
+                "{status:?}"
+            );
+            assert!(!status.contains("waiting for approval"), "{status:?}");
+        }
     }
 
     #[test]
