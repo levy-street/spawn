@@ -31,6 +31,14 @@ struct InstanceStatus {
     version: String,
     update: String,
     host_key: Option<String>,
+    /// The identity this machine registered under, for a local client that has
+    /// to recognise this host in a list the server sent. Neither value is a
+    /// secret — the server stores both and the approval link carries the key —
+    /// but reading them from the daemon rather than from the network is what
+    /// lets a client refuse a row that does not match the machine it is
+    /// standing on. Absent until this instance has registered.
+    host_id: Option<String>,
+    host_public_key: Option<String>,
     browser_pins: usize,
     browser_connections: Vec<BrowserConnectionStatus>,
     compatibility_notes: Vec<String>,
@@ -99,7 +107,12 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     let connection = connection_text(heartbeat.as_ref());
     let sessions = heartbeat.as_ref().map_or(0, |state| state.sessions);
     let update = release_state(&server).await;
-    let host_key = crate::creds::host_identity(&stored)?.map(|identity| identity.fingerprint);
+    let identity = crate::creds::host_identity(&stored)?;
+    let host_key = identity
+        .as_ref()
+        .map(|identity| identity.fingerprint.clone());
+    let host_public_key = identity.map(|identity| identity.public_key);
+    let host_id = stored.host_id.map(|id| id.to_string());
     let mut account_id = dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -185,6 +198,8 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         version: crate::version::build_version(),
         update,
         host_key,
+        host_id,
+        host_public_key,
         browser_pins: browser_connections.len(),
         browser_connections,
         compatibility_notes,
@@ -431,6 +446,8 @@ mod tests {
                 version: "0.4.2".into(),
                 update: "up to date".into(),
                 host_key: Some("SHA256:Yr0kQmVd12345678".into()),
+                host_id: Some("11111111-2222-3333-4444-555555555555".into()),
+                host_public_key: Some("jjR72AS1hifOv_I33o9frsYX3Ac9eCylvIxHOyYdNEc".into()),
                 browser_pins: 3,
                 browser_connections: vec![BrowserConnectionStatus {
                     pin_id: Some("pin-1".into()),

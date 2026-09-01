@@ -97,7 +97,7 @@ pub fn stop_possessing() -> Result<String> {
     Ok(text)
 }
 
-fn command_json(path: &Path, args: &[&str]) -> Result<serde_json::Value> {
+pub(crate) fn command_json(path: &Path, args: &[&str]) -> Result<serde_json::Value> {
     let output = Command::new(path)
         .args(args)
         .env("NO_COLOR", "1")

@@ -80,6 +80,10 @@ impl ApprovalIdentifier {
 
 #[derive(Clone, Default)]
 struct PossessRun {
+    /// A run that deliberately registers a *second* account beside whatever is
+    /// already here. The "this machine is already online" shortcut must never
+    /// finish such a run: the host it would find is the other account's.
+    new_account: bool,
     approval_identifier: Option<ApprovalIdentifier>,
     local_key: Option<String>,
     approved: bool,
@@ -119,10 +123,13 @@ impl PossessionManager {
         })?;
         let bin_dir = platform_install::install_pair(pair, &preferences.server_origin)?;
         let run_id = new_run_id()?;
-        self.runs
-            .lock()
-            .await
-            .insert(run_id.clone(), PossessRun::default());
+        self.runs.lock().await.insert(
+            run_id.clone(),
+            PossessRun {
+                new_account,
+                ..PossessRun::default()
+            },
+        );
         self.spawn_possess(
             app.clone(),
             run_id.clone(),
@@ -234,6 +241,42 @@ impl PossessionManager {
             self.fail_run(run_id, detail).await;
             snapshot = self.snapshot(run_id).await?;
             return Ok(possession_progress(run_id, snapshot, None));
+        }
+
+        // This computer may already be possessed and online — possessed from a
+        // terminal install, or by an earlier run of this app whose ceremony
+        // this run knows nothing about. The wizard used to be able to notice
+        // that only through a key it scraped out of its own approval link, so
+        // a run that never held a ceremony sat on "Waiting for this Mac to
+        // come online…" while the daemon was, in fact, online.
+        //
+        // The daemon knows the identity it registered under. Reading it from
+        // the daemon rather than from the network keeps the check exactly as
+        // strict as before — a row whose key is not this machine's key is
+        // still refused — while making it work however the machine was
+        // possessed.
+        if !snapshot.online && !snapshot.new_account {
+            if let Some(identity) = local_host_identity(preferences.account_id.as_deref()) {
+                let hosts: Value = api.authenticated_get("/api/hosts").await?;
+                if let Ok(Some(host)) =
+                    observe_pinned_host(&hosts, Some(&identity.host_id), &identity.public_key)
+                {
+                    if host.online {
+                        if let Some(run) = self.runs.lock().await.get_mut(run_id) {
+                            run.host_id = Some(host.id.clone());
+                            run.host_name = Some(host.name.clone());
+                            run.online = true;
+                        }
+                        emit_step(app, 3, "Online and ready");
+                        let mut updated = preferences;
+                        updated.first_run_complete = true;
+                        updated.host_name = Some(host.name);
+                        storage::save_preferences(&updated)?;
+                        snapshot = self.snapshot(run_id).await?;
+                        return Ok(possession_progress(run_id, snapshot, None));
+                    }
+                }
+            }
         }
 
         if matches!(progress_status(&snapshot), PossessionStatus::Registered) {
@@ -640,6 +683,47 @@ struct ObservedHost {
     online: bool,
 }
 
+/// The identity the local daemon registered this machine under.
+struct LocalHostIdentity {
+    host_id: String,
+    public_key: String,
+}
+
+/// Ask the daemon on this computer who it is.
+///
+/// Both values are public — the server stores them and the approval link
+/// carries the key — but they come from the daemon rather than the network,
+/// which is what makes them usable as the thing a server's answer is checked
+/// against. `None` whenever the daemon is absent, unregistered, or too old to
+/// report them, and every caller treats that as "cannot tell yet".
+fn local_host_identity(account_id: Option<&str>) -> Option<LocalHostIdentity> {
+    let spawnd = crate::supervision::daemon_path().ok()?;
+    let status = crate::supervision::command_json(&spawnd, &["status", "--json"]).ok()?;
+    read_local_host_identity(&status, account_id)
+}
+
+/// Pick this app's instance out of `spawnd status --json` and read its identity.
+///
+/// Several accounts can be possessed on one machine, each its own instance and
+/// its own host. Take the one this app is signed in as; fall back to the only
+/// instance when there is exactly one, and to nothing when there are several
+/// and none of them is ours — guessing there would finish a run against
+/// somebody else's host.
+fn read_local_host_identity(status: &Value, account_id: Option<&str>) -> Option<LocalHostIdentity> {
+    let instances = status.get("instances").and_then(Value::as_array)?;
+    let instance = account_id
+        .and_then(|wanted| {
+            instances
+                .iter()
+                .find(|instance| string_field(instance, &["account_id"]) == Some(wanted))
+        })
+        .or_else(|| (instances.len() == 1).then(|| &instances[0]))?;
+    Some(LocalHostIdentity {
+        host_id: string_field(instance, &["host_id"])?.to_owned(),
+        public_key: string_field(instance, &["host_public_key"])?.to_owned(),
+    })
+}
+
 fn observe_pinned_host(
     hosts: &Value,
     expected_id: Option<&str>,
@@ -922,6 +1006,72 @@ fn installer_command_for(origin: &str, os: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A real `spawnd status --json` shape, trimmed to what this reads.
+    fn status_json(instances: Value) -> Value {
+        json!({ "host": "Charlies-MacBook-Pro.local", "instances": instances })
+    }
+
+    #[test]
+    fn the_local_identity_is_this_apps_account_not_whichever_came_first() {
+        let status = status_json(json!([
+            { "account_id": "other", "host_id": "host-other", "host_public_key": "key-other" },
+            { "account_id": "mine", "host_id": "host-mine", "host_public_key": "key-mine" },
+        ]));
+        let identity = read_local_host_identity(&status, Some("mine")).expect("our instance");
+        assert_eq!(identity.host_id, "host-mine");
+        assert_eq!(identity.public_key, "key-mine");
+
+        // One instance and no idea which account we are: it can only be that one.
+        let single = status_json(json!([
+            { "account_id": "mine", "host_id": "host-mine", "host_public_key": "key-mine" },
+        ]));
+        assert!(read_local_host_identity(&single, None).is_some());
+
+        // Several, none of them ours: say nothing rather than adopt a stranger.
+        assert!(read_local_host_identity(&status, Some("absent")).is_none());
+        // A daemon too old to report the identity, and a machine with none.
+        let old = status_json(json!([{ "account_id": "mine" }]));
+        assert!(read_local_host_identity(&old, Some("mine")).is_none());
+        assert!(read_local_host_identity(&status_json(json!([])), None).is_none());
+    }
+
+    #[test]
+    fn a_machine_possessed_from_a_terminal_is_still_recognised_as_online() {
+        // The wizard held no ceremony, so it pinned no key; the identity comes
+        // from the daemon instead. This is the state that used to wait for ever
+        // on "Waiting for this Mac to come online…".
+        let status = status_json(json!([{
+            "account_id": "mine",
+            "host_id": "c2422e8d-a223-4be9-ac1e-a1f0bfd44fbd",
+            "host_public_key": "jjR72AS1hifOv_I33o9frsYX3Ac9eCylvIxHOyYdNEc",
+        }]));
+        let identity = read_local_host_identity(&status, Some("mine")).expect("identity");
+        let hosts = json!([{
+            "id": "c2422e8d-a223-4be9-ac1e-a1f0bfd44fbd",
+            "name": "Charlies-MacBook-Pro.local",
+            "host_public_key": "jjR72AS1hifOv_I33o9frsYX3Ac9eCylvIxHOyYdNEc",
+            "status": "online",
+        }]);
+        let observed = observe_pinned_host(&hosts, Some(&identity.host_id), &identity.public_key)
+            .expect("no refusal")
+            .expect("the host is in the list");
+        assert!(observed.online);
+        assert_eq!(observed.name, "Charlies-MacBook-Pro.local");
+    }
+
+    #[test]
+    fn a_row_wearing_another_machines_key_is_still_refused() {
+        // The check is only as good as its strictness: reading the key locally
+        // must not become a way to accept whatever the server says.
+        let hosts = json!([{
+            "id": "host-mine",
+            "name": "Someone else",
+            "host_public_key": "key-that-is-not-ours",
+            "status": "online",
+        }]);
+        assert!(observe_pinned_host(&hosts, Some("host-mine"), "key-mine").is_err());
+    }
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
