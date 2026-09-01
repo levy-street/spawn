@@ -202,6 +202,7 @@ pub fn render_panel(title: &str, rows: &[String], width: usize, styled: bool) ->
     let inner = width.saturating_sub(4);
     let mut out = Vec::with_capacity(rows.len() + 2);
 
+    let title = ellipsize_plain(title, width.saturating_sub(8));
     let head = format!("{} [ {} ] ", g.horizontal, title);
     let rule = g
         .horizontal
@@ -296,6 +297,68 @@ pub fn truncate_visible(text: &str, width: usize) -> String {
     out
 }
 
+/// Shorten an unstyled field with an explicit ellipsis. Pick-list labels and
+/// step details are often user- or server-supplied; a hard slice looks like a
+/// rendering failure and can leave a UUID or word ambiguously half-visible.
+pub fn ellipsize_plain(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    match width {
+        0 => String::new(),
+        1 => "…".to_owned(),
+        _ => format!("{}…", text.chars().take(width - 1).collect::<String>()),
+    }
+}
+
+fn ellipsize_middle_plain(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width < 3 {
+        return ellipsize_plain(text, width);
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    // Pick-list labels often end in a server origin. Preserve that whole
+    // suffix at ordinary narrow widths; the account name remains at the front.
+    let after = (width - 2).min(16);
+    let before = width - 1 - after;
+    format!(
+        "{}…{}",
+        chars[..before].iter().collect::<String>(),
+        chars[chars.len() - after..].iter().collect::<String>()
+    )
+}
+
+/// Fit prose without cutting the final word in half. Status lines use this as
+/// a last-resort guard after choosing their compact copy variant.
+fn fit_words(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let room = width.saturating_sub(1);
+    let mut fitted = String::new();
+    for word in text.split_whitespace() {
+        let next = fitted.chars().count() + usize::from(!fitted.is_empty()) + word.chars().count();
+        if next > room {
+            break;
+        }
+        if !fitted.is_empty() {
+            fitted.push(' ');
+        }
+        fitted.push_str(word);
+    }
+    if fitted.is_empty() {
+        ellipsize_plain(text, width)
+    } else {
+        fitted.push('…');
+        fitted
+    }
+}
+
 /// Word-wrap prose to `width`. Prefer this over [`wrap_plain`] for anything a
 /// person reads; `wrap_plain` is for opaque runs — URLs, codes, fingerprints —
 /// that have no spaces to break on.
@@ -372,10 +435,29 @@ pub fn render_step(
         Style::default()
     };
 
+    let lead = format!("{mark}  {number}. ");
+    let lead_width = display_width(&lead);
+    if detail.is_empty() {
+        let label = ellipsize_plain(label, width.saturating_sub(lead_width));
+        return format!("{mark_style}{mark}{mark_style:#}  {number}. {label}");
+    }
+    let content_room = width.saturating_sub(lead_width + 3);
+    let label_width = label.chars().count();
+    let detail_width = detail.chars().count();
+    let (label_room, detail_room) = if label_width + detail_width <= content_room {
+        (label_width, detail_width)
+    } else {
+        let preferred_label = label_width.min((content_room * 3 / 5).max(16).min(content_room));
+        let detail_room = detail_width.min(content_room.saturating_sub(preferred_label));
+        (content_room.saturating_sub(detail_room), detail_room)
+    };
+    let label = ellipsize_plain(label, label_room);
     let head = format!("{mark_style}{mark}{mark_style:#}  {number}. {label} ");
+    let head_width = lead_width + display_width(&label) + 1;
+    let detail = ellipsize_plain(detail, detail_room);
     let tail = format!("{detail_style}{detail}{detail_style:#}");
     let dots = width
-        .saturating_sub(display_width(&head) + display_width(&tail) + 1)
+        .saturating_sub(head_width + display_width(&detail) + 1)
         .max(1);
     format!("{head}{dim}{}{dim:#} {tail}", g.dot.repeat(dots))
 }
@@ -422,6 +504,7 @@ struct Step {
 
 struct UiState {
     title: String,
+    panel_context: Option<PanelContext>,
     steps: Vec<Step>,
     status: Option<String>,
     hint: String,
@@ -435,10 +518,15 @@ struct UiState {
     finished: bool,
 }
 
+struct PanelContext {
+    title: String,
+    rows: Vec<String>,
+}
+
 impl UiState {
     fn frame_lines(&self) -> Vec<String> {
         let g = glyphs();
-        let rows: Vec<String> = self
+        let step_rows: Vec<String> = self
             .steps
             .iter()
             .enumerate()
@@ -453,10 +541,26 @@ impl UiState {
                 )
             })
             .collect();
-        let mut lines = render_panel(&self.title, &rows, self.width, true);
+        let (title, mut rows) = match &self.panel_context {
+            Some(context) => (
+                context.title.as_str(),
+                context
+                    .rows
+                    .iter()
+                    .map(|row| truncate_visible(row, self.width.saturating_sub(4)))
+                    .collect(),
+            ),
+            None => (self.title.as_str(), Vec::new()),
+        };
+        if !rows.is_empty() && !step_rows.is_empty() {
+            rows.push(String::new());
+        }
+        rows.extend(step_rows);
+        let mut lines = render_panel(title, &rows, self.width, true);
         let status = match &self.status {
             Some(status) => {
                 let spin = g.spinner[self.frame % g.spinner.len()];
+                let status = fit_words(status, self.width.saturating_sub(4));
                 format!("  {} {status}", accent(spin, true))
             }
             None => String::new(),
@@ -559,6 +663,7 @@ impl Ui {
         };
         let state = Arc::new(Mutex::new(UiState {
             title: title.to_owned(),
+            panel_context: None,
             steps: steps
                 .iter()
                 .map(|label| Step {
@@ -645,6 +750,14 @@ impl Ui {
         });
     }
 
+    pub fn set_detail(&self, index: usize, detail: &str) {
+        self.with(|state| {
+            if let Some(step) = state.steps.get_mut(index) {
+                step.detail = detail.to_owned();
+            }
+        });
+    }
+
     pub fn fail(&self, index: usize, detail: &str) {
         self.with(|state| {
             if let Some(step) = state.steps.get_mut(index) {
@@ -661,6 +774,20 @@ impl Ui {
 
     pub fn clear_status(&self) {
         self.with(|state| state.status = None);
+    }
+
+    /// Put action instructions inside the live frame, above its progress rows.
+    /// This is intentionally state, not scrollback: while the action remains
+    /// current, its instructions and progress must repaint as one region.
+    pub fn show_panel(&self, title: &str, rows: Vec<String>) {
+        let title = title.to_owned();
+        self.with(move |state| {
+            state.panel_context = Some(PanelContext { title, rows });
+        });
+    }
+
+    pub fn restore_panel(&self) {
+        self.with(|state| state.panel_context = None);
     }
 
     /// Scrollback that is already fully formatted (a panel, a QR code). Plain
@@ -962,16 +1089,27 @@ pub fn render_choice_row(
     // either to be short.
     let lead = format!("{marker}  {number}. ");
     let lead_width = display_width(&lead);
-    // Reserve what always follows the label even with no detail at all: the
-    // space that closes it, one dot, and the space before the (empty) tail.
-    let label = truncate_visible(label, width.saturating_sub(lead_width + 3));
+    // Give the outcome enough room to remain useful, then spend the rest on
+    // the label. On the resume menu the account label can be long, but hiding
+    // "leave this machine as it is" would remove the reason for the row. A
+    // 60-column frame cannot preserve both in full, so keep roughly three
+    // fifths for identity and let both halves ellipsize honestly.
+    let content_room = width.saturating_sub(lead_width + 3);
+    let label_width = label.chars().count();
+    let detail_width = detail.chars().count();
+    let (label_room, detail_room) = if label_width + detail_width <= content_room {
+        (label_width, detail_width)
+    } else {
+        let preferred_label = label_width.min((content_room * 3 / 5).max(16).min(content_room));
+        let detail_room = detail_width.min(content_room.saturating_sub(preferred_label));
+        (content_room.saturating_sub(detail_room), detail_room)
+    };
+    let label = ellipsize_middle_plain(label, label_room);
     let head = format!(
         "{marker_style}{marker}{marker_style:#}  {label_style}{number}. {label}{label_style:#} "
     );
     let head_width = lead_width + display_width(&label) + 1;
-    // What is left after one dot and the space before the detail.
-    let detail_room = width.saturating_sub(head_width + 2);
-    let detail = truncate_visible(detail, detail_room);
+    let detail = ellipsize_plain(detail, detail_room);
     let tail = if detail.is_empty() {
         String::new()
     } else {
@@ -1011,7 +1149,17 @@ fn choice_frame(
     hint: &str,
     styled: bool,
 ) -> Vec<String> {
-    let width = terminal_width();
+    choice_frame_at_width(title, options, selected, hint, terminal_width(), styled)
+}
+
+fn choice_frame_at_width(
+    title: &str,
+    options: &[(&str, &str)],
+    selected: usize,
+    hint: &str,
+    width: usize,
+    styled: bool,
+) -> Vec<String> {
     let rows: Vec<String> = options
         .iter()
         .enumerate()
@@ -1051,6 +1199,7 @@ fn arrow_choice(
     let mut drawn = 0usize;
     let mut stdin = std::io::stdin();
     let mut buf = [0u8; 8];
+    let mut confirmed = false;
 
     loop {
         let lines = choice_frame(title, options, selected, hint, styled);
@@ -1074,7 +1223,10 @@ fn arrow_choice(
             Ok(read) => read,
         };
         match &buf[..read] {
-            b"\r" | b"\n" => break,
+            b"\r" | b"\n" => {
+                confirmed = true;
+                break;
+            }
             // Raw mode suppresses signal generation, so ^C arrives as a byte.
             b"\x03" => {
                 drop(raw);
@@ -1095,9 +1247,35 @@ fn arrow_choice(
             _ => {}
         }
     }
+    if confirmed {
+        let confirmation = choice_confirmation(options[selected].0, terminal_width(), styled);
+        let mut out = anstream::stdout();
+        let _ = write!(out, "{}", choice_confirmation_redraw(drawn, &confirmation));
+        let _ = out.flush();
+    }
     drop(raw);
     drop(vt);
     selected
+}
+
+fn choice_confirmation(label: &str, width: usize, styled: bool) -> String {
+    let g = glyphs();
+    let mark_style = if styled {
+        Style::new().fg_color(Some(AnsiColor::Green.into()))
+    } else {
+        Style::new()
+    };
+    let label = ellipsize_plain(label, width.saturating_sub(2));
+    format!("{mark_style}{}{mark_style:#} {label}", g.done)
+}
+
+fn choice_confirmation_redraw(drawn: usize, confirmation: &str) -> String {
+    let rewind = if drawn > 0 {
+        format!("\r\x1b[{drawn}A")
+    } else {
+        String::new()
+    };
+    format!("{rewind}\x1b[0J{confirmation}\r\n")
 }
 
 /// The line-based fallback: no raw mode, so type a number and press Enter.
@@ -1242,6 +1420,7 @@ mod tests {
         for width in [MIN_FRAME_COLUMNS, 66, 72, 80, MAX_FRAME_COLUMNS] {
             let state = UiState {
                 title: "POSSESSING Charlies-MacBook-Pro.local".to_owned(),
+                panel_context: None,
                 steps: vec![
                     Step {
                         label: "Register this machine".to_owned(),
@@ -1277,6 +1456,7 @@ mod tests {
         let long_status = "waiting for approval — 5s · code expires in 30 min";
         let state = UiState {
             title: "T".to_owned(),
+            panel_context: None,
             steps: Vec::new(),
             status: Some(long_status.to_owned()),
             hint: "ctrl-c to stop; nothing is registered".to_owned(),
@@ -1371,22 +1551,22 @@ mod tests {
         ui.begin(0, "[ RUNNING ]");
         thread::sleep(Duration::from_millis(600));
         ui.complete(0, "Charlies-MacBook-Pro");
-        ui.begin(1, "[ APPROVE THIS LOGIN ]");
-        ui.block(
-            render_panel(
-                "APPROVE THIS LOGIN",
-                &[
-                    String::new(),
-                    dim("Press Enter to open the approval page, or open this link on any signed-in device:", true),
-                    bold(
-                        "http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8",
-                        true,
-                    ),
-                ],
-                terminal_width(),
-                true,
-            ),
-            &[],
+        ui.begin(1, "waiting for you");
+        ui.set_detail(2, "");
+        ui.show_panel(
+            "APPROVE THIS LOGIN",
+            vec![
+                String::new(),
+                dim(
+                    "Press Enter to open the approval page, or open this link on any signed-in device:",
+                    true,
+                ),
+                String::new(),
+                bold(
+                    "http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8",
+                    true,
+                ),
+            ],
         );
         for elapsed in 0..24 {
             ui.status(&format!(
@@ -1398,7 +1578,10 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         ui.complete(1, "approved");
-        ui.complete(2, "host 9f1c2d3e");
+        ui.begin(2, "storing securely");
+        thread::sleep(Duration::from_millis(300));
+        ui.complete(2, "stored");
+        ui.restore_panel();
         ui.begin(3, "[ RUNNING ]");
         thread::sleep(Duration::from_millis(700));
         ui.complete(3, "running");
@@ -1413,8 +1596,9 @@ mod tests {
             "spawnd.dev",
             "localhost:3000",
             "spawn.a-very-long-internal-hostname.example.test:8443",
+            "Keep charlie.with.a.very.long.account.label@example.com (localhost:3000)",
         ] {
-            for width in [40usize, 60, 72, 92] {
+            for width in [40usize, 56, 76, 96] {
                 let row =
                     render_choice_row(true, 1, label, "where this command came from", width, false);
                 assert!(
@@ -1423,6 +1607,152 @@ mod tests {
                     display_width(&row)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn resume_menu_frames_fit_60_80_and_100_columns_with_a_long_account_label() {
+        let keep = "Keep charlie.with.a.very.long.account.label@example.com (localhost:3000)";
+        let options = [
+            (keep, "leave this machine as it is"),
+            ("Approve a new browser or phone", "opens an approval link"),
+            ("Add another account", "sign in alongside this one"),
+            (
+                "Manage this machine",
+                "connections, approvals, sessions, accounts",
+            ),
+            ("Check for a newer SPAWN D", "update the daemon in place"),
+        ];
+        for width in [60, 80, 100] {
+            let frame = choice_frame_at_width(
+                "THIS MACHINE IS ALREADY POSSESSED",
+                &options,
+                0,
+                "↑ ↓ to choose · Enter to confirm",
+                width,
+                false,
+            );
+            assert!(
+                frame.iter().all(|line| display_width(line) <= width),
+                "menu overflowed at {width} columns: {frame:?}"
+            );
+            let rendered = frame.join("\n");
+            assert!(rendered.contains("localhost:3000)"));
+            assert!(rendered.contains("leave this"));
+            if width >= 80 {
+                assert!(rendered.contains("leave this machine as it is"));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "report fixture; prints the exact 80-column menu and confirmation"]
+    fn render_resume_report_sample() {
+        let options = [
+            (
+                "Keep charlie@example.com (localhost:3000)",
+                "leave this machine as it is",
+            ),
+            ("Approve a new browser or phone", "opens an approval link"),
+            ("Add another account", "sign in alongside this one"),
+            (
+                "Manage this machine",
+                "connections, approvals, sessions, accounts",
+            ),
+            ("Check for a newer SPAWN D", "update the daemon in place"),
+        ];
+        for line in choice_frame_at_width(
+            "THIS MACHINE IS ALREADY POSSESSED",
+            &options,
+            1,
+            "↑ ↓ to choose · Enter to confirm",
+            80,
+            false,
+        ) {
+            println!("{line}");
+        }
+        println!("--- confirmation ---");
+        println!(
+            "{}",
+            choice_confirmation("Approve a new browser or phone", 80, false)
+        );
+    }
+
+    #[test]
+    fn arrow_choice_confirmation_is_one_quiet_width_safe_line() {
+        let line = choice_confirmation("Approve a new browser or phone", 80, false);
+        assert_eq!(line, "✓ Approve a new browser or phone");
+        assert!(!line.contains("Enter"));
+        assert!(display_width(&line) <= 80);
+
+        let narrow = choice_confirmation(&"account ".repeat(30), 60, false);
+        assert_eq!(display_width(&narrow), 60);
+        assert!(narrow.ends_with('…'));
+
+        assert_eq!(
+            choice_confirmation_redraw(8, &line),
+            "\r\x1b[8A\x1b[0J✓ Approve a new browser or phone\r\n"
+        );
+    }
+
+    #[test]
+    fn action_context_and_progress_share_one_width_safe_panel() {
+        for width in [60, 80, 100] {
+            let state = UiState {
+                title: "POSSESSING Charlies-MacBook-Pro".to_owned(),
+                panel_context: Some(PanelContext {
+                    title: "APPROVE THIS LOGIN".to_owned(),
+                    rows: vec![
+                        String::new(),
+                        "Press Enter to open the approval page in your browser,".to_owned(),
+                        "or open this link on any signed-in device:".to_owned(),
+                    ],
+                }),
+                steps: vec![
+                    Step {
+                        label: "Register this machine".to_owned(),
+                        detail: "Charlies-MacBook-Pro".to_owned(),
+                        state: StepState::Done,
+                    },
+                    Step {
+                        label: "Approve in your browser".to_owned(),
+                        detail: "waiting for you".to_owned(),
+                        state: StepState::Running,
+                    },
+                    Step {
+                        label: "Store credentials".to_owned(),
+                        detail: String::new(),
+                        state: StepState::Pending,
+                    },
+                ],
+                status: Some(
+                    "waiting for approval — moves on by itself once approved (12s) · 29 min left"
+                        .to_owned(),
+                ),
+                hint: "ctrl-c to stop; nothing is registered".to_owned(),
+                frame: 0,
+                pending: Vec::new(),
+                drawn: 0,
+                width,
+                finished: false,
+            };
+            let lines = state.frame_lines();
+            let plain = lines
+                .iter()
+                .map(|line| strip_styles(line))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                plain
+                    .iter()
+                    .filter(|line| line.contains("APPROVE THIS LOGIN"))
+                    .count(),
+                1
+            );
+            assert!(!plain.join("\n").contains("POSSESSING"));
+            assert!(
+                lines.iter().all(|line| display_width(line) <= width),
+                "live panel overflowed at {width} columns: {plain:?}"
+            );
         }
     }
 

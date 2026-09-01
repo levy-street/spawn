@@ -237,6 +237,41 @@ impl HostClient {
     }
 }
 
+/// Refresh the non-secret label opportunistically after the daemon registers.
+/// This must never hold up registration or turn an older server into a daemon
+/// failure; its only consumer is local human-facing account selection.
+pub(crate) async fn refresh_account_label() {
+    let config_dir = match crate::config::config_dir() {
+        Ok(config_dir) => config_dir,
+        Err(error) => {
+            tracing::debug!(%error, "account label cache has no config directory");
+            return;
+        }
+    };
+    let client = match tokio::task::spawn_blocking(|| HostClient::load(None)).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "account label cache has no authenticated client");
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(%error, "account label cache task did not finish");
+            return;
+        }
+    };
+    match client.host().await {
+        Ok(Some(host)) => {
+            if let Err(error) =
+                crate::state::remember_account_label(&config_dir, host.account_label())
+            {
+                tracing::warn!(%error, "caching the account label");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::debug!(%error, "account label refresh unavailable"),
+    }
+}
+
 fn ensure_success(status: StatusCode, operation: &str) -> Result<()> {
     if status.is_success() {
         return Ok(());
@@ -376,7 +411,7 @@ pub async fn run_instances(
             for dir in dirs {
                 println!(
                     "  {}  {}",
-                    instance_name(&dir),
+                    instance_label(&dir),
                     instance_server(&dir).unwrap_or_else(|| "server unknown".into())
                 );
             }
@@ -405,7 +440,7 @@ pub async fn run_menu(server_cli: Option<String>, explicit_config: bool) -> Resu
             return Ok(());
         };
         let _guard = ConfigDirGuard::set(&dir);
-        let account = instance_name(&dir);
+        let account = instance_label(&dir);
         let options = [
             ("Browser connections", "list, remove one, or clear all"),
             (
@@ -637,7 +672,7 @@ fn choose_instance(dirs: &[PathBuf]) -> Option<PathBuf> {
     }
     let labels = dirs
         .iter()
-        .map(|dir| instance_name(dir))
+        .map(|dir| instance_label(dir))
         .collect::<Vec<_>>();
     let details = dirs
         .iter()
@@ -655,16 +690,36 @@ fn choose_instance(dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn resolve_instance(dirs: &[PathBuf], requested: &str) -> Result<PathBuf> {
-    dirs.iter()
-        .find(|dir| instance_name(dir) == requested)
+    if let Some(exact) = dirs.iter().find(|dir| instance_name(dir) == requested) {
+        return Ok(exact.clone());
+    }
+    let matches = dirs
+        .iter()
+        .filter(|dir| {
+            instance_label(dir) == requested
+                || crate::state::shorten_account_id(&instance_name(dir)) == requested
+        })
         .cloned()
-        .with_context(|| format!("no SPAWN D account instance named {requested:?}"))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => Err(anyhow::anyhow!(
+            "no SPAWN D account instance named {requested:?}"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "more than one SPAWN D account instance is named {requested:?}"
+        )),
+    }
 }
 
 pub(crate) fn instance_name(dir: &Path) -> String {
     dir.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "default".into())
+}
+
+fn instance_label(dir: &Path) -> String {
+    crate::state::human_account_label(dir)
 }
 
 pub(crate) fn instance_server(dir: &Path) -> Option<String> {
@@ -747,5 +802,16 @@ mod tests {
         };
         assert_eq!(pin.label(), "browser 1234567890ab…");
         assert_eq!(pin.detail(), "platform unknown");
+    }
+
+    #[test]
+    fn account_instances_resolve_by_exact_or_short_human_identifier() {
+        let dir = PathBuf::from("/tmp/spawn/6eea3a19-ffdd-43c0-82ab-67ce091c13c7");
+        let dirs = vec![dir.clone()];
+        assert_eq!(
+            resolve_instance(&dirs, "6eea3a19-ffdd-43c0-82ab-67ce091c13c7").unwrap(),
+            dir
+        );
+        assert_eq!(resolve_instance(&dirs, "6eea3a19…13c7").unwrap(), dir);
     }
 }

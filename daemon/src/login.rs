@@ -164,7 +164,8 @@ pub async fn run_with_ui(
     let opener_available = browser_opener_available();
     let browser_behavior =
         browser_behavior(std::io::stdin().is_terminal(), opener_available, no_browser);
-    ui.begin(1, "[ APPROVE THIS LOGIN ]");
+    ui.begin(1, "waiting for you");
+    ui.set_detail(2, "");
 
     // The QR carries the full URL including the locally-appended #k= fragment.
     // A camera transfers it out of band; fragments never reach the HTTP server.
@@ -176,15 +177,22 @@ pub async fn run_with_ui(
         .then(|| render_qr(&approve_url).ok())
         .flatten();
 
-    ui.block(
-        approval_panel(
-            false,
-            &approve_url,
-            ui.width(),
-            browser_behavior.offer_enter,
-        ),
-        &approval_plain_lines(false, &approve_url, qr.as_deref()),
-    );
+    if ui.is_rich() {
+        ui.show_panel(
+            "APPROVE THIS LOGIN",
+            approval_rows(
+                false,
+                &approve_url,
+                ui.width(),
+                browser_behavior.offer_enter,
+            ),
+        );
+    } else {
+        ui.block(
+            Vec::new(),
+            &approval_plain_lines(false, &approve_url, qr.as_deref()),
+        );
+    }
 
     // The Enter offer must never stand between this machine and the poll loop.
     // A detached terminal reader opens the URL independently while polling
@@ -202,7 +210,7 @@ pub async fn run_with_ui(
             ui.block(qr.lines().map(str::to_owned).collect(), &[]);
         }
     }
-    ui.status(&waiting_status(0, start.expires_in));
+    ui.status(&waiting_status(0, start.expires_in, ui.width()));
 
     // 2. poll
     let poll_url = config::api_url(&server, "/api/auth/device/poll")?;
@@ -232,7 +240,11 @@ pub async fn run_with_ui(
         // so the periodic reminders would only repeat what is already on screen.
         // Plain mode has no live line and keeps them, unchanged.
         if ui.is_rich() {
-            ui.status(&waiting_status(elapsed.as_secs(), start.expires_in));
+            ui.status(&waiting_status(
+                elapsed.as_secs(),
+                start.expires_in,
+                ui.width(),
+            ));
         } else {
             if !elapsed_shown && elapsed >= Duration::from_secs(30) {
                 elapsed_shown = true;
@@ -289,10 +301,10 @@ pub async fn run_with_ui(
         if poll_has_success_fields(&body) {
             approval_done.store(true, Ordering::Release);
             ui.complete(1, "approved");
-            ui.begin(2, "[ SPAWN D IS STORING ]");
-            ui.status("you approved this login — SPAWN D is storing credentials");
+            ui.begin(2, "storing securely");
+            ui.status("approval received — SPAWN D is storing credentials");
             let account_id = body.account_id.clone();
-            let host_id = match commit_poll_success(
+            if let Err(error) = commit_poll_success(
                 &mut stored,
                 body,
                 &identity,
@@ -300,12 +312,9 @@ pub async fn run_with_ui(
                 &start.approval_nonce,
                 creds::save,
             ) {
-                Ok(host_id) => host_id,
-                Err(error) => {
-                    ui.fail(2, "credentials not stored");
-                    return Err(error);
-                }
-            };
+                ui.fail(2, "credentials not stored");
+                return Err(error);
+            }
             let service_reconfigured = if server_was_explicit {
                 reconfigure_installed_service(&server).map_err(|error| {
                     ui.fail(2, "service not updated");
@@ -314,8 +323,9 @@ pub async fn run_with_ui(
             } else {
                 false
             };
-            ui.complete(2, &format!("host {host_id}"));
+            ui.complete(2, "stored");
             ui.clear_status();
+            ui.restore_panel();
             return Ok(LoginOutcome {
                 account_id,
                 service_reconfigured,
@@ -358,22 +368,38 @@ pub async fn run_with_ui(
     }
 }
 
-/// The live-region panel for the approval: the only thing on screen the
-/// operator has to act on, given its own frame so it stops competing with the
-/// ceremony's commentary for attention.
+/// The action rows placed above progress inside the live approval frame. The
+/// link used to be a scrollback panel above a separate possession frame; that
+/// left two boxes claiming attention and made the running step look like a
+/// pointer to the other box.
 ///
 /// It offers one thing: the link. There used to be a pairing code to type into
 /// the app and this machine's fingerprint beside it, and together they read as
 /// three ways to approve where there is one. The link carries the host's key
 /// in its fragment, so the browser or phone that opens it checks the identity
 /// itself — there is nothing here for a person to compare or to type.
+#[cfg(test)]
 fn approval_panel(
     browser_opened: bool,
     approve_url: &str,
     width: usize,
     interactive: bool,
 ) -> Vec<String> {
-    use crate::tui::{bold, dim, hyperlink, render_panel, wrap_plain, wrap_words};
+    crate::tui::render_panel(
+        "APPROVE THIS LOGIN",
+        &approval_rows(browser_opened, approve_url, width, interactive),
+        width,
+        true,
+    )
+}
+
+fn approval_rows(
+    browser_opened: bool,
+    approve_url: &str,
+    width: usize,
+    interactive: bool,
+) -> Vec<String> {
+    use crate::tui::{bold, dim, hyperlink, wrap_plain, wrap_words};
     let inner = width.saturating_sub(4);
     // Every row is wrapped to the frame's interior: prose by word, the URL by
     // force. An unwrapped row pushes the border out and the whole panel goes
@@ -393,6 +419,7 @@ fn approval_panel(
     };
     let mut rows = vec![String::new()];
     rows.extend(prose(lead));
+    rows.push(String::new());
     // Every wrapped segment carries the same OSC 8 target, so the whole run is
     // clickable rather than just the first line.
     rows.extend(
@@ -400,7 +427,7 @@ fn approval_panel(
             .iter()
             .map(|line| hyperlink(approve_url, &bold(line, true), true)),
     );
-    render_panel("APPROVE THIS LOGIN", &rows, width, true)
+    rows
 }
 
 /// The one value on screen that has to be compared by eye, given the weight
@@ -491,11 +518,25 @@ fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str
 }
 
 /// The live status line, rebuilt each tick so elapsed and expiry stay current.
-fn waiting_status(elapsed: u64, expires_in: u64) -> String {
+fn waiting_status(elapsed: u64, expires_in: u64, width: usize) -> String {
     let minutes = expires_in.saturating_sub(elapsed).div_ceil(60);
-    format!(
-        "waiting for you to approve — this screen moves on by itself once you do ({elapsed}s) · expires in {minutes} min"
-    )
+    let variants = [
+        format!(
+            "waiting for you to approve — this screen moves on by itself once you do ({elapsed}s) · expires in {minutes} min"
+        ),
+        format!(
+            "waiting for approval — moves on by itself once approved ({elapsed}s) · {minutes} min left"
+        ),
+        format!("waiting for approval — moves on by itself ({elapsed}s) · {minutes} min left"),
+        format!("waiting for approval ({elapsed}s) · {minutes} min left"),
+        format!("waiting for approval ({elapsed}s)"),
+    ];
+    let available = width.saturating_sub(4);
+    variants
+        .iter()
+        .find(|status| status.chars().count() <= available)
+        .cloned()
+        .unwrap_or_else(|| variants.last().expect("a compact status").clone())
 }
 
 /// Read the one optional Enter in parallel with device-code polling.
@@ -1541,6 +1582,74 @@ mod tests {
         }
     }
 
+    fn merged_approval_panel(url: &str, width: usize) -> Vec<String> {
+        let mut rows = approval_rows(false, url, width, true);
+        rows.push(String::new());
+        let inner = width.saturating_sub(4);
+        rows.extend([
+            crate::tui::render_step(
+                crate::tui::StepState::Done,
+                1,
+                "Register this machine",
+                "Charlies-MacBook-Pro",
+                inner,
+                true,
+            ),
+            crate::tui::render_step(
+                crate::tui::StepState::Running,
+                2,
+                "Approve in your browser",
+                "waiting for you",
+                inner,
+                true,
+            ),
+            crate::tui::render_step(
+                crate::tui::StepState::Pending,
+                3,
+                "Store credentials",
+                "",
+                inner,
+                true,
+            ),
+        ]);
+        crate::tui::render_panel("APPROVE THIS LOGIN", &rows, width, true)
+    }
+
+    #[test]
+    fn approval_action_and_progress_are_one_panel_at_60_80_and_100_columns() {
+        let url = "http://localhost:3000/device?ref=dIF2cG14Xj3maek4#k=WsMbPmvzNwEnoPV1I";
+        for width in [60, 80, 100] {
+            let panel = merged_approval_panel(url, width);
+            assert!(
+                panel
+                    .iter()
+                    .all(|line| crate::tui::display_width(line) == width),
+                "ragged merged approval panel at {width}: {panel:?}"
+            );
+            let plain = strip_sgr(&panel.join("\n"));
+            assert_eq!(plain.matches("APPROVE THIS LOGIN").count(), 1);
+            assert!(plain.contains("Charlies-MacBook-Pro"));
+            assert!(plain.contains("waiting for you"));
+            assert!(plain.contains("Store credentials"));
+            assert!(!plain.contains("POSSESSING"));
+
+            let chunks = crate::tui::wrap_plain(url, width - 4);
+            assert_eq!(chunks.concat(), url);
+            assert!(chunks.iter().all(|chunk| plain.contains(chunk)));
+        }
+    }
+
+    #[test]
+    #[ignore = "report fixture; prints the exact 80-column approval wait"]
+    fn render_approval_report_sample() {
+        let url = "http://localhost:3000/device?ref=dIF2cG14Xj3maek4#k=WsMbPmvzNwEnoPV1I";
+        for line in merged_approval_panel(url, 80) {
+            println!("{}", strip_sgr(&line));
+        }
+        let status = format!("⠋ {}", waiting_status(12, 1_800, 80));
+        println!("  {status}");
+    }
+
     fn strip_sgr(text: &str) -> String {
         crate::tui::strip_styles(text)
     }
@@ -1650,18 +1759,34 @@ mod tests {
     #[test]
     fn the_waiting_status_counts_down_the_real_expiry() {
         assert_eq!(
-            waiting_status(0, 1800),
+            waiting_status(0, 1800, 100),
             "waiting for you to approve — this screen moves on by itself once you do (0s) · expires in 30 min"
         );
         assert_eq!(
-            waiting_status(33, 1800),
-            "waiting for you to approve — this screen moves on by itself once you do (33s) · expires in 30 min"
+            waiting_status(33, 1800, 80),
+            "waiting for approval — moves on by itself once approved (33s) · 30 min left"
         );
         // Past expiry must not underflow into a huge number.
         assert_eq!(
-            waiting_status(9_000, 1800),
-            "waiting for you to approve — this screen moves on by itself once you do (9000s) · expires in 0 min"
+            waiting_status(9_000, 1800, 60),
+            "waiting for approval (9000s) · 0 min left"
         );
+    }
+
+    #[test]
+    fn waiting_status_uses_complete_words_at_each_terminal_width() {
+        for width in [60, 80, 100] {
+            let status = waiting_status(12, 1_800, width);
+            assert!(
+                status.chars().count() + 4 <= width,
+                "status does not fit {width} columns: {status:?}"
+            );
+            assert!(
+                !status.ends_with('…'),
+                "copy should select a compact variant"
+            );
+            assert!(status.contains("12s"));
+        }
     }
 
     /// The check a hostile server cannot pass has to be legible, square, and

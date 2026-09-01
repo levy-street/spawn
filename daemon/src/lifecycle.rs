@@ -199,9 +199,7 @@ fn selected_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
 }
 
 fn instance_name(dir: &Path) -> String {
-    dir.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "default".into())
+    crate::state::human_account_label(dir)
 }
 
 struct ConfigDirGuard(Option<std::ffi::OsString>);

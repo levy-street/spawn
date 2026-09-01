@@ -1801,6 +1801,11 @@ async fn dispatch_loop(
                             ),
                         }
                     }
+                    // Human account labels are useful on the next local menu,
+                    // never on this control-path hot loop. Refresh in the
+                    // background so registration and frame dispatch do not
+                    // wait on another HTTP request.
+                    tokio::spawn(crate::manage::refresh_account_label());
                     rtc_sessions.reannounce_live_statuses().await;
                     daemon_account = resolve_daemon_account(proven_account, account_id.as_deref());
                     let newly_revoked = daemon_revoked

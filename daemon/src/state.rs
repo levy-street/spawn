@@ -163,6 +163,94 @@ pub fn read(config_dir: &Path) -> Result<Option<StateFile>> {
 }
 
 const ICE_SERVER_CACHE: &str = "ice-server-urls.json";
+const ACCOUNT_LABEL_CACHE: &str = "account-label.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AccountLabelCache {
+    label: String,
+}
+
+/// Cache the non-secret name people use for this account. The already-
+/// possessed menu is deliberately local-only, so it must never wait for one
+/// `/api/hosts/self` request per account just to make its rows legible.
+pub fn remember_account_label(config_dir: &Path, label: &str) -> Result<()> {
+    let label = label.trim();
+    if label.is_empty()
+        || label.chars().count() > 256
+        || label.chars().any(char::is_control)
+        || read_account_label(config_dir).is_ok_and(|current| current.as_deref() == Some(label))
+    {
+        return Ok(());
+    }
+    crate::platform::create_private_dir_all(config_dir)?;
+    let path = config_dir.join(ACCOUNT_LABEL_CACHE);
+    let temporary = config_dir.join(format!(
+        ".{ACCOUNT_LABEL_CACHE}.tmp.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = crate::platform::create_private_file_new(&temporary)?;
+        file.write_all(&serde_json::to_vec(&AccountLabelCache {
+            label: label.to_owned(),
+        })?)?;
+        file.sync_all()?;
+        crate::platform::durable_replace(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+pub fn read_account_label(config_dir: &Path) -> Result<Option<String>> {
+    let path = config_dir.join(ACCOUNT_LABEL_CACHE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if bytes.len() > 4 * 1024 {
+        anyhow::bail!("account label cache is oversized")
+    }
+    let cache: AccountLabelCache =
+        serde_json::from_slice(&bytes).with_context(|| format!("decoding {}", path.display()))?;
+    let label = cache.label.trim();
+    if label.is_empty() || label.chars().count() > 256 || label.chars().any(char::is_control) {
+        anyhow::bail!("account label cache contains an invalid label")
+    }
+    Ok(Some(label.to_owned()))
+}
+
+/// A person's label for an account-backed config directory. UUIDs are storage
+/// identifiers, not names; when the server label has not been cached yet, keep
+/// just enough of the UUID to distinguish two accounts at a glance.
+pub fn human_account_label(config_dir: &Path) -> String {
+    read_account_label(config_dir)
+        .ok()
+        .flatten()
+        .map(|label| shorten_account_id(&label))
+        .unwrap_or_else(|| {
+            config_dir
+                .file_name()
+                .map(|name| shorten_account_id(&name.to_string_lossy()))
+                .unwrap_or_else(|| "default".into())
+        })
+}
+
+pub fn shorten_account_id(value: &str) -> String {
+    let value = value.trim();
+    if uuid::Uuid::parse_str(value).is_ok() {
+        let chars = value.chars().collect::<Vec<_>>();
+        return format!(
+            "{}…{}",
+            chars[..8].iter().collect::<String>(),
+            chars[chars.len() - 4..].iter().collect::<String>()
+        );
+    }
+    value.to_owned()
+}
 
 /// Remember only the non-secret URLs from the latest server-provided ICE
 /// configuration. TURN usernames and credentials are deliberately never put
@@ -515,5 +603,29 @@ mod tests {
         let value = serde_json::to_value(state).unwrap();
         assert!(value.get("process_started_100ns").is_none());
         assert!(value.get("task_breakaway_denied").is_none());
+    }
+
+    #[test]
+    fn account_labels_are_cached_without_exposing_full_uuid_fallbacks() {
+        let base = tempfile::tempdir().unwrap();
+        let account = base.path().join("6eea3a19-ffdd-43c0-82ab-67ce091c13c7");
+        std::fs::create_dir(&account).unwrap();
+
+        assert_eq!(human_account_label(&account), "6eea3a19…13c7");
+        remember_account_label(&account, "  charlie@example.com  ").unwrap();
+        assert_eq!(
+            read_account_label(&account).unwrap().as_deref(),
+            Some("charlie@example.com")
+        );
+        assert_eq!(human_account_label(&account), "charlie@example.com");
+    }
+
+    #[test]
+    fn only_uuid_shaped_account_ids_are_shortened() {
+        assert_eq!(
+            shorten_account_id("6eea3a19-ffdd-43c0-82ab-67ce091c13c7"),
+            "6eea3a19…13c7"
+        );
+        assert_eq!(shorten_account_id("account-1"), "account-1");
     }
 }

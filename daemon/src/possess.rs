@@ -231,7 +231,7 @@ fn resume_action(existing: &[PathBuf]) -> ResumeAction {
     // Re-approving targets one instance, so it is only offered when there is no
     // ambiguity about which. With several, `spawnd login --config-dir` is the
     // honest answer and the hint below still names it.
-    let mut options: Vec<(&str, &str)> = vec![(keep.as_str(), "already possessed here")];
+    let mut options: Vec<(&str, &str)> = vec![(keep.as_str(), "leave this machine as it is")];
     options.extend(resume_options(single));
     resume_choice(
         crate::tui::prompt_choice("THIS MACHINE IS ALREADY POSSESSED", &options, 0),
@@ -247,9 +247,9 @@ fn resume_options(single: bool) -> Vec<(&'static str, &'static str)> {
     // Re-approving targets one instance, so it is only offered when there is no
     // ambiguity about which.
     if single {
-        options.push(("Approve a new browser or device", "run the sign-in again"));
+        options.push(("Approve a new browser or phone", "opens an approval link"));
     }
-    options.push(("Add another account", "sign in again, alongside this one"));
+    options.push(("Add another account", "sign in alongside this one"));
     options.push((
         "Manage this machine",
         "connections, approvals, sessions, accounts",
@@ -821,9 +821,7 @@ fn relogin_hint(server: &Url, dir: &Path) -> String {
 }
 
 fn instance_account(dir: &Path) -> String {
-    dir.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default()
+    crate::state::human_account_label(dir)
 }
 
 fn resume_line(account: &str) -> String {
@@ -989,6 +987,18 @@ mod tests {
     #[test]
     fn the_resume_menu_maps_every_row_to_an_action() {
         assert_eq!(resume_options(true).len(), 4);
+        assert_eq!(
+            resume_options(true),
+            vec![
+                ("Approve a new browser or phone", "opens an approval link"),
+                ("Add another account", "sign in alongside this one"),
+                (
+                    "Manage this machine",
+                    "connections, approvals, sessions, accounts"
+                ),
+                ("Check for a newer SPAWN D", "update the daemon in place"),
+            ]
+        );
         assert_eq!(resume_choice(0, true), ResumeAction::Keep);
         assert_eq!(resume_choice(1, true), ResumeAction::Reauthorize);
         assert_eq!(resume_choice(2, true), ResumeAction::NewAccount);

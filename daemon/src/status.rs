@@ -96,7 +96,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "default".into());
-    let mut account = account_id.clone();
+    let mut account = crate::state::human_account_label(dir);
     let mut host_name = None;
     let mut compatibility_notes = Vec::new();
     let mut browser_connections = stored
@@ -117,11 +117,16 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
                 match host_result {
                     Ok(Some(host)) => {
                         account_id = host.account.id.clone();
-                        account = host.account_label().to_owned();
+                        account = crate::state::shorten_account_id(host.account_label());
+                        if let Err(error) =
+                            crate::state::remember_account_label(dir, host.account_label())
+                        {
+                            tracing::warn!(%error, "caching the account label");
+                        }
                         host_name = Some(host.name);
                     }
                     Ok(None) => compatibility_notes.push(
-                        "your server doesn't support named account details yet; showing the account UUID"
+                        "your server doesn't support named account details yet; showing a shortened account ID"
                             .into(),
                     ),
                     Err(error) => compatibility_notes
@@ -273,12 +278,7 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
         if output.instances.len() > 1 {
             let _ = writeln!(text, "Instance {}", index + 1);
         }
-        let account = if instance.account == instance.account_id {
-            instance.account.clone()
-        } else {
-            format!("{} ({})", instance.account, instance.account_id)
-        };
-        let _ = writeln!(text, "  account      {account}");
+        let _ = writeln!(text, "  account      {}", instance.account);
         if let Some(host_name) = &instance.host_name {
             let _ = writeln!(text, "  machine      {host_name}");
         }
@@ -397,8 +397,8 @@ mod tests {
         let output = StatusOutput {
             host: "mac-studio".into(),
             instances: vec![InstanceStatus {
-                account: "9f1c2d3e".into(),
-                account_id: "9f1c2d3e".into(),
+                account: "9f1c2d3e…4e5f".into(),
+                account_id: "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".into(),
                 host_name: Some("mac-studio".into()),
                 config_dir: "/tmp/spawn/9f1c2d3e".into(),
                 server: "https://spawnd.dev/".into(),
@@ -434,6 +434,8 @@ mod tests {
         assert!(plain.contains("  connection   connected · 42 min · last error: none\n"));
         assert!(plain.contains("  service      running (launchd app.spawn.spawnd.3f9ac3e1)\n"));
         assert!(plain.contains("Charlie's MacBook — macOS\n"));
+        assert!(plain.contains("  account      9f1c2d3e…4e5f\n"));
+        assert!(!plain.contains("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"));
         assert!(!plain.contains("Other instances on this machine"));
 
         let json = serde_json::to_value(&output).unwrap();
@@ -448,6 +450,10 @@ mod tests {
         );
         assert_eq!(json["instances"][0]["service"]["running"], true);
         assert_eq!(json["instances"][0]["browser_pins"], 3);
+        assert_eq!(
+            json["instances"][0]["account_id"],
+            "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
+        );
     }
 
     #[test]
