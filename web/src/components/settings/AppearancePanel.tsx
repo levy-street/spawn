@@ -73,3 +73,50 @@ export function AppearancePanel() {
     </section>
   );
 }
+
+/**
+ * The same choice as a row of a menu — the account menu carries it so the
+ * theme is one press away from anywhere, without a trip through Settings.
+ *
+ * A track the width of the menu, three equal segments of glyphs and no
+ * heading: sun, moon and screen already are the words, so each keeps its
+ * name for the accessibility tree and as a hover title and shows nothing
+ * else. Choosing
+ * one keeps the menu open — the change lands on the whole window as the
+ * segment moves, which is the readout a person wants, and a menu that
+ * vanished the instant it was pressed would take the chance to change their
+ * mind away with it.
+ */
+export function ThemeMenuRow() {
+  const { preference, setPreference } = useTheme();
+  return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: the click is only stopped here so the segments below keep the menu open; the interactive elements are the radios themselves.
+    <div onClick={(event) => event.stopPropagation()}>
+      <div className="m-1 grid grid-cols-3 gap-0.5 rounded-md bg-popover-accent/50 p-0.5">
+        {OPTIONS.map(({ value, label, icon: Icon }) => {
+          const selected = preference === value;
+          return (
+            <button
+              key={value}
+              type="button"
+              role="menuitemradio"
+              aria-checked={selected}
+              aria-label={label}
+              title={label}
+              onClick={() => setPreference(value)}
+              className={cn(
+                "grid h-8 place-items-center rounded-[5px] outline-none transition-colors",
+                "focus-visible:ring-1 focus-visible:ring-ring",
+                selected
+                  ? "bg-popover-accent text-popover-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-popover-foreground",
+              )}
+            >
+              <Icon className="size-4" aria-hidden />
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}

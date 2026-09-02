@@ -36,6 +36,7 @@ import {
   reorderWrites,
 } from "@/components/nav/workspace-drag";
 import { openProfile } from "@/components/profile/profile-dialog-store";
+import { ThemeMenuRow } from "@/components/settings/AppearancePanel";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
@@ -841,6 +842,11 @@ export function Sidebar({
               </RailTooltip>
             )}
           >
+            {/* First, at the menu's top: the one control here that is a
+                setting rather than a departure, kept where the eye lands
+                when the menu rises from the account row. */}
+            <ThemeMenuRow />
+            <DropdownMenuSeparator />
             <DropdownMenuItem
               onSelect={() => {
                 onNavigate?.();
