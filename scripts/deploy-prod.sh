@@ -394,7 +394,14 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
     # own assets at build start, and every visitor gets HTML whose chunks 400
     # until the restart — which is minutes away, not milliseconds, because the
     # daemon compile below sits in between.
-    rm -rf web/.next.staged
+    #
+    # The live build's generated type stubs come along too: web/tsconfig.json
+    # includes both .next/types and .next.staged/types, so the staged build
+    # type-checks the stubs the *previous* build wrote, and a route deleted
+    # since then leaves a stub importing a file that no longer exists (the
+    # 2026-09-02 release failed on trust-ux-demo exactly this way). Nothing
+    # at runtime reads them, and the build that lands writes its own.
+    rm -rf web/.next/types web/.next.staged
     # V8 caps its own heap well below this host's RAM+swap, so a growing app
     # eventually dies with "Reached heap limit" on a machine that still has
     # memory to give. Raise the cap explicitly rather than discovering it
