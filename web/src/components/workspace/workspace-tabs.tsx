@@ -1233,30 +1233,65 @@ export function WorkspaceTabs({
       {orderedTabs.map((tab) => {
         const active = tab.id === activeTabId;
         const attention = tabAttentionCount(tab, sessionsById);
+        // The tab's shape, shared by the tab and by its rename: renaming
+        // swaps the label for a field and changes nothing else, so the tab
+        // keeps its place in the strip and its footing on the panel.
+        const shape = cn(
+          "flex h-8 min-w-40 items-center gap-1.5 rounded-md pl-3 text-xs font-medium transition-colors",
+          // The label stays level with the resting tabs: the extra
+          // height is all bottom padding, swallowed by flex centering.
+          // A connected tab continues the surface directly beneath it:
+          // a pane's header tint (card over background), washed exactly
+          // like the pane when that pane is unfocused; the empty tab's
+          // plain panel otherwise.
+          active && "bg-[var(--tab-surface)] text-foreground",
+          active &&
+            (look.connected && look.surface === "header"
+              ? look.dimmed
+                ? "[--tab-surface:color-mix(in_oklab,var(--foreground)_3.5%,color-mix(in_oklab,var(--card)_75%,var(--background)))] dark:[--tab-surface:color-mix(in_oklab,black_25%,color-mix(in_oklab,var(--card)_75%,var(--background)))]"
+                : "[--tab-surface:color-mix(in_oklab,var(--card)_75%,var(--background))]"
+              : "[--tab-surface:var(--background)]"),
+          // `tab-connected` flares the foot into the panel: see globals.
+          active && look.connected && "tab-connected -mb-1.5 h-[38px] rounded-b-none pb-1.5",
+          !active &&
+            "bg-background/40 text-muted-foreground hover:bg-background/60 hover:text-foreground",
+        );
         if (renamingId === tab.id) {
           return (
-            // The strip has no left padding, so the first tab's input would
-            // lose its border and focus ring to the panel edge.
-            <form
-              key={tab.id}
-              onSubmit={(event) => submitRename(tab.id, event)}
-              className="pb-0.5 pl-0.5"
-            >
-              <Input
-                autoFocus
-                aria-label={`Rename ${tab.name}`}
-                value={draft}
-                onChange={(event) => setDraft(event.currentTarget.value)}
-                onBlur={() => submitRename(tab.id)}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    setRenamingId(null);
-                  }
-                }}
-                className="h-7 w-32 px-2 text-xs"
-              />
-            </form>
+            <div key={tab.id} className="relative shrink-0">
+              <form
+                onSubmit={(event) => submitRename(tab.id, event)}
+                className={cn(shape, "pr-3.5")}
+              >
+                <input
+                  // biome-ignore lint/a11y/noAutofocus: the field replaces the label of the tab that was just clicked to rename it — landing in it is the gesture, not a surprise.
+                  autoFocus
+                  aria-label={`Rename ${tab.name}`}
+                  value={draft}
+                  // The field is the label's own text with a rule under it —
+                  // no box, no ring — and it is as wide as the name it holds:
+                  // `size` is its natural width, the tab's floor is its
+                  // minimum, and the label's ceiling is its maximum, so a
+                  // long name grows the tab exactly as the label would.
+                  size={Math.max(12, draft.length + 1)}
+                  onFocus={(event) => event.currentTarget.select()}
+                  onChange={(event) => setDraft(event.currentTarget.value)}
+                  onBlur={() => submitRename(tab.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setRenamingId(null);
+                    }
+                  }}
+                  className={cn(
+                    "mt-0.5 h-auto min-w-0 max-w-48 flex-auto border-0 border-b bg-transparent p-0 pb-0.5 text-xs font-medium leading-5 text-inherit outline-none",
+                    // A hairline of the label's own colour, faint: a rule to
+                    // write on, not a box drawn around the words.
+                    "border-current/15 focus:border-current/30",
+                  )}
+                />
+              </form>
+            </div>
           );
         }
         return (
@@ -1305,25 +1340,8 @@ export function WorkspaceTabs({
                 }
               }}
               className={cn(
-                "flex h-8 min-w-40 items-center gap-1.5 rounded-md pl-3 text-xs font-medium transition-colors",
+                shape,
                 canClose ? "pr-6.5" : "pr-3.5",
-                // The label stays level with the resting tabs: the extra
-                // height is all bottom padding, swallowed by flex centering.
-                // A connected tab continues the surface directly beneath it:
-                // a pane's header tint (card over background), washed exactly
-                // like the pane when that pane is unfocused; the empty tab's
-                // plain panel otherwise.
-                active && "bg-[var(--tab-surface)] text-foreground",
-                active &&
-                  (look.connected && look.surface === "header"
-                    ? look.dimmed
-                      ? "[--tab-surface:color-mix(in_oklab,var(--foreground)_3.5%,color-mix(in_oklab,var(--card)_75%,var(--background)))] dark:[--tab-surface:color-mix(in_oklab,black_25%,color-mix(in_oklab,var(--card)_75%,var(--background)))]"
-                      : "[--tab-surface:color-mix(in_oklab,var(--card)_75%,var(--background))]"
-                    : "[--tab-surface:var(--background)]"),
-                // `tab-connected` flares the foot into the panel: see globals.
-                active && look.connected && "tab-connected -mb-1.5 h-[38px] rounded-b-none pb-1.5",
-                !active &&
-                  "bg-background/40 text-muted-foreground hover:bg-background/60 hover:text-foreground",
                 // The badge is its own visual edge, so it sits closer in than
                 // a bare label wants to.
                 attention > 0 && "pl-2",
