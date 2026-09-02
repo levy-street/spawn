@@ -104,18 +104,26 @@ export function LegionHostDetail({
             <p className="mb-1.5 font-mono text-[9.5px] uppercase tracking-[0.16em] text-muted-foreground">
               {row.sessions.length} {row.sessions.length === 1 ? "session" : "sessions"}
             </p>
-            <ul className="space-y-0.5">
+            {/* The rows carry their own vertical padding for the hover ground,
+                and the last one's would otherwise add to the card's: pull it
+                back so the final title sits as far from the bottom edge as the
+                host's name sits from the top. */}
+            <ul className="-mb-1.5 space-y-0.5">
               {shown.map((session) => (
                 <li key={session.id}>
                   <Link
                     href={sessionHref(session.id, workspacesQ.data ?? [])}
                     onClick={onNavigate}
-                    className="-mx-1.5 flex items-center gap-2 rounded-md px-1.5 py-1.5 transition-colors hover:bg-accent"
+                    // On the baseline, not the centre: the title and its time
+                    // are set at different sizes, and two runs of text only
+                    // read as one line when they share a baseline. The dot
+                    // has no baseline and centres itself instead.
+                    className="-mx-1.5 flex items-baseline gap-2 rounded-md px-1.5 py-1.5 transition-colors hover:bg-accent"
                   >
                     {/* The app's own status dot rather than a private copy of
                      * its tone map: a waiting session must look the same here
                      * as it does on a pane header. */}
-                    <SessionStatusDot session={session} className="size-2 border-0" />
+                    <SessionStatusDot session={session} className="size-2 self-center border-0" />
                     <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
                     <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
                       {relativeTime(session.last_activity_at) ?? sessionActivityLabel(session)}
@@ -125,7 +133,7 @@ export function LegionHostDetail({
               ))}
             </ul>
             {overflow > 0 && (
-              <p className="mt-1 text-[10.5px] text-muted-foreground">+{overflow} more</p>
+              <p className="mt-2.5 text-[10.5px] text-muted-foreground">+{overflow} more</p>
             )}
           </>
         )}

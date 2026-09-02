@@ -40,19 +40,23 @@ export function DownloadMenu() {
        * whole thing sliding in from the far side of the screen.
        */
       menuClassName="w-68"
-      // The trigger keeps its 36px beside the account row, whatever the row
-      // does with the space it is given.
-      className="shrink-0"
+      // The trigger keeps its 28px beside the account row, whatever the row
+      // does with the space it is given — and stands 6px in from the pill's
+      // right edge, the same distance the avatar stands from its left, so
+      // its own hover ground reads as a button inside the row rather than a
+      // notch cut out of the row's end.
+      className="mr-1.5 shrink-0"
       renderTrigger={(props) => (
         <RailTooltip label="Get SPAWN D">
           <button
             {...props}
             type="button"
             aria-label="Get SPAWN D"
-            // No ground of its own: this sits inside the account row's pill,
-            // which lights for the whole row. Brightening the mark is what
-            // says the pointer is on this half of it.
-            className="grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:text-foreground"
+            // Two lights, nested: the account row's pill brightens for the
+            // whole row, and this button lays its own ground on top of that
+            // so the pointer resting on the mark reads as being on the
+            // button, not merely on the row it shares.
+            className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <Download className="size-4" aria-hidden />
           </button>
@@ -102,9 +106,12 @@ function DownloadMenuItems() {
         </DropdownMenuItem>
       ))}
       <DropdownMenuSeparator />
+      {/* The arrow trails: this row leaves the menu for a page, and an arrow
+          at the far edge says "onward" where one in the icon column would
+          only say "another download". */}
       <DropdownMenuItem href="/download">
-        <ArrowRight className="size-4" aria-hidden />
-        All downloads
+        <span className="min-w-0 flex-1">All downloads</span>
+        <ArrowRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />
       </DropdownMenuItem>
     </>
   );
