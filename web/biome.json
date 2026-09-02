@@ -17,7 +17,6 @@
       "!**/.next",
       "!**/node_modules",
       "!**/public/sw.js",
-      "!src/trust-ux/presentation.html",
       "!**/*.css"
     ]
   },

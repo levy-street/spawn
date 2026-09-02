@@ -1,4 +1,4 @@
-"""Workspace grid algebra — grid schema v3 (§4.4 of docs/OVERHAUL.md).
+"""Workspace grid algebra — grid schema v3 (proto/README.md, "Layout schema v3").
 
 Pure and deterministic: the same functions exist in TypeScript as
 ``web/src/lib/grid.ts``, and both implementations must pass the shared
@@ -65,7 +65,7 @@ def _copy_sorted(tiles: list[Tile]) -> list[Tile]:
 
 
 def validate_layout(layout: object) -> dict[str, Any]:
-    """The §4.4 invariants as ``{ok, errors}`` with fixture-exact error codes.
+    """The grid invariants as ``{ok, errors}`` with fixture-exact error codes.
 
     Emission order: version, count, per-tile errors in tile order
     (session_id, integer, bounds, size — an integer failure suppresses

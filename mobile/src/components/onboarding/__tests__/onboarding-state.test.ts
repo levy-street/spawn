@@ -1,6 +1,8 @@
 import {
   type OnboardingStepInput,
   resolveOnboardingStep,
+  setHostSkipped,
+  subscribeHostSkipped,
 } from "@/components/onboarding/onboarding-state";
 
 const READY_ACCOUNT = { emailVerified: true };
@@ -42,5 +44,20 @@ describe("resolveOnboardingStep", () => {
 
   it("keeps the host gate when the account owns hosts none of which trust this device", () => {
     expect(resolveOnboardingStep(state({ hostCount: 2, deviceTrustedHostCount: 0 }))).toBe("host");
+  });
+});
+
+describe("host skip state", () => {
+  it("notifies mounted gates as soon as the persisted choice changes", async () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribeHostSkipped(listener);
+
+    await setHostSkipped(true);
+    await setHostSkipped(false);
+    unsubscribe();
+    await setHostSkipped(true);
+
+    expect(listener.mock.calls).toEqual([[true], [false]]);
+    await setHostSkipped(false);
   });
 });

@@ -472,3 +472,82 @@ test("a tab aimed at half a window lands there, keeping its own arrangement", as
     widgetTile("00000000-0000-4000-8000-0000000000b2", 18, 0, 6, 24),
   ]);
 });
+
+test("a pane dropped on the strip's open ground gets a tab of its own", async ({ page }) => {
+  const store = await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ layout: AIMED_TABS })],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const strip = page.getByRole("tablist", { name: "Workspace tabs" });
+  await expect(strip.getByRole("tab", { name: "Alpha" })).toBeVisible();
+
+  // Alpha's one pane, dragged by its title bar toward the strip's bare
+  // ground — the open stretch after the last tab and the "+", short of the
+  // right-aligned controls at the strip's far end.
+  const header = page.getByRole("toolbar", { name: /window controls/ }).first();
+  const from = await header.boundingBox();
+  const stripBox = await strip.boundingBox();
+  const lastTab = await strip.getByRole("tab", { name: "Beta" }).boundingBox();
+  if (!from || !stripBox || !lastTab) throw new Error("geometry unavailable");
+  const groundX = lastTab.x + lastTab.width + 120;
+  const groundY = stripBox.y + stripBox.height / 2;
+
+  const chip = strip.locator("[data-workspace-newtab-ghost]");
+  await expect(chip).toBeHidden();
+
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(groundX, groundY, { steps: 12 });
+  // Resting on the ground lights the promise where the new tab would land.
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveText(/New tab/);
+
+  await page.mouse.up();
+  // The drop made the tab, moved the pane, and followed it.
+  const born = strip.getByRole("tab", { name: "Tab 3" });
+  await expect(born).toBeVisible();
+  await expect(born).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("toolbar", { name: /window controls/ })).toBeVisible();
+  await expect(chip).toBeHidden();
+
+  // One envelope write carries all of it: three tabs, the pane in the new one.
+  await expect.poll(() => store.requests.workspacePatches.length).toBeGreaterThan(0);
+  const patch = (store.requests.workspacePatches.at(-1)?.body as { layout: LayoutV3 }).layout;
+  expect(patch.tabs).toHaveLength(3);
+  const fresh = patch.tabs.at(-1);
+  expect(fresh?.name).toBe("Tab 3");
+  expect(fresh?.layout.tiles.map((tile) => tile.session_id)).toEqual([
+    "00000000-0000-4000-8000-0000000000a1",
+  ]);
+  expect(patch.tabs[0]?.layout.tiles).toHaveLength(0);
+});
+
+test("the strip's ground offers nothing to a duplicating drag", async ({ page }) => {
+  await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ layout: AIMED_TABS })],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const strip = page.getByRole("tablist", { name: "Workspace tabs" });
+  await expect(strip.getByRole("tab", { name: "Alpha" })).toBeVisible();
+
+  const header = page.getByRole("toolbar", { name: /window controls/ }).first();
+  const from = await header.boundingBox();
+  const stripBox = await strip.boundingBox();
+  if (!from || !stripBox) throw new Error("geometry unavailable");
+
+  const lastTab = await strip.getByRole("tab", { name: "Beta" }).boundingBox();
+  if (!lastTab) throw new Error("geometry unavailable");
+  await page.keyboard.down("Alt");
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(lastTab.x + lastTab.width + 120, stripBox.y + stripBox.height / 2, {
+    steps: 12,
+  });
+  // The copy belongs beside the pane it came from, so no chip lights.
+  await expect(strip.locator("[data-workspace-newtab-ghost]")).toBeHidden();
+  await page.mouse.up();
+  await page.keyboard.up("Alt");
+  await expect(strip.getByRole("tab", { name: "Tab 3" })).toHaveCount(0);
+});

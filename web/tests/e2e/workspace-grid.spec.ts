@@ -1,6 +1,7 @@
 import { expect, type Page, test } from "@playwright/test";
 import { GRID_SIZE, move, remove, resize, type Tile } from "../../src/lib/grid";
 import {
+  AGENT_ID,
   type AppMockOptions,
   envelope,
   HOST_ID,
@@ -424,11 +425,14 @@ test("⌘ turns a drag into a duplicate: the source stays put and a copy is crea
   });
   await page.keyboard.up("Meta");
 
-  // Same host, same folder — a second pane pointed at the same work.
+  // Same host, same folder, same kind of window — a second pane pointed at the
+  // same work, and one that stays a Codex window even before the copy's agent
+  // has taken its foreground.
   await expect.poll(() => store.requests.sessions.length).toBe(1);
   expect(store.requests.sessions[0]).toEqual({
     host_id: session().host_id,
     cwd: session().cwd,
+    agent_id: AGENT_ID,
   });
 
   // The source keeps its own tile; the copy takes the half it was dropped on.
@@ -481,5 +485,30 @@ test("the pane menu duplicates too, and names the ⌘ drag shortcut", async ({ p
   expect(store.requests.sessions[0]).toEqual({
     host_id: session().host_id,
     cwd: session().cwd,
+  });
+});
+
+test("a window duplicates as the type it was opened as, not as whatever holds its terminal", async ({
+  page,
+}) => {
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }];
+  // What a CLI that ships as a script looks like from the outside: the kernel
+  // reports the interpreter, which matches no agent's command. The window is
+  // still the window it was opened as, and its copy has to be one too.
+  const { store } = await setupGrid(page, initial, {
+    sessionFixtures: [session({ foreground_command: "python3", agent_id: AGENT_ID })],
+  });
+
+  await page
+    .getByRole("button", { name: /options$/ })
+    .first()
+    .click();
+  await page.getByRole("menuitem", { name: /Duplicate/ }).click();
+
+  await expect.poll(() => store.requests.sessions.length).toBe(1);
+  expect(store.requests.sessions[0]).toEqual({
+    host_id: session().host_id,
+    cwd: session().cwd,
+    agent_id: AGENT_ID,
   });
 });

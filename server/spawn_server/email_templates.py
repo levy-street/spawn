@@ -36,7 +36,7 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass
 
-BRAND = "spawn"
+BRAND = "SPAWN D"
 
 # --- spawn tokens, transcribed ----------------------------------------------
 # Converted from web/src/app/globals.css @theme; the marketing pages use these
@@ -332,17 +332,17 @@ def _render(
 def verify_email(*, link: str, site_url: str) -> RenderedEmail:
     return _render(
         subject="Verify your email address",
-        preheader="One click to confirm this address and finish setting up spawn.",
+        preheader="One click to confirm this address and finish setting up SPAWN D.",
         eyebrow="Account setup",
         accent=SKY,
         heading="Confirm your email address",
         paragraphs=[
-            "Confirming this address finishes setting up your spawn account, and it is "
+            "Confirming this address finishes setting up your SPAWN D account, and it is "
             "what makes account recovery possible later — a password reset can only be "
             "sent somewhere you control.",
         ],
         action=("Verify this address", link),
-        footnote="This link works once and expires in two days. If you didn't create a spawn account, you can ignore this message.",
+        footnote="This link works once and expires in two days. If you didn't create a SPAWN D account, you can ignore this message.",
         site_url=site_url,
     )
 
@@ -355,7 +355,7 @@ def password_reset(*, link: str, site_url: str) -> RenderedEmail:
         accent=AMBER,
         heading="Reset your password",
         paragraphs=[
-            "Someone asked to reset the password for this spawn account. If that was "
+            "Someone asked to reset the password for this SPAWN D account. If that was "
             "you, use the link below to choose a new one.",
             "Setting a new password signs out every device currently signed in to this "
             "account, including any you don't recognise.",
@@ -369,13 +369,17 @@ def password_reset(*, link: str, site_url: str) -> RenderedEmail:
 def invite(*, link: str, site_url: str, inviter: str | None = None) -> RenderedEmail:
     # The inviter goes in the body, not the heading: addresses are long and
     # arbitrary, and one set as an H1 wraps into two lines of shouting.
-    opening = f"{inviter} invited you to spawn." if inviter else "You've been invited to spawn."
+    opening = (
+        f"{inviter} invited you to SPAWN D."
+        if inviter
+        else "You've been invited to SPAWN D."
+    )
     return _render(
         subject=f"You're invited to {BRAND}",
         preheader="Your invitation link — it works once, and it expires.",
         eyebrow="Invitation",
         accent=EMERALD,
-        heading="You're invited to spawn",
+        heading="You're invited to SPAWN D",
         paragraphs=[
             f"{opening} It runs your coding agents on your own machines and gives you a "
             "terminal to them from any browser — your phone included.",
@@ -389,13 +393,13 @@ def invite(*, link: str, site_url: str, inviter: str | None = None) -> RenderedE
 
 def test_email(*, site_url: str) -> RenderedEmail:
     return _render(
-        subject="spawn test email",
+        subject="SPAWN D test email",
         preheader="Outbound email is working.",
         eyebrow="Deployment check",
         accent=EMERALD,
         heading="Outbound email is working",
         paragraphs=[
-            "This is a test message from your spawn deployment. If you're reading it, "
+            "This is a test message from your SPAWN D deployment. If you're reading it, "
             "delivery is configured correctly and account emails will reach your users.",
         ],
         footnote="Sent from the admin dashboard.",

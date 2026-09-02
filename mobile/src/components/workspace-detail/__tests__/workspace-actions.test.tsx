@@ -49,6 +49,7 @@ const mockLaunchedSession: Session = {
   activity_state: "active",
   activity_label: "Active",
   foreground_command: null,
+  agent_id: null,
 };
 const mockWorkspaceActions = {
   createTab: jest.fn(async () => mockWorkspace),

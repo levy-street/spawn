@@ -59,13 +59,13 @@ function normalizeAbsoluteBaseUrl(value: string): string {
     throw new Error("Enter a valid SPAWN D server URL");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Spawn API URL must use http or https");
+    throw new Error("SPAWN D server URL must use http or https");
   }
   if (url.hostname.length === 0) {
-    throw new Error("Spawn API URL must include a host");
+    throw new Error("SPAWN D server URL must include a host");
   }
   if (url.username || url.password || url.search || url.hash) {
-    throw new Error("Spawn API URL cannot include credentials, a query, or a fragment");
+    throw new Error("SPAWN D server URL cannot include credentials, a query, or a fragment");
   }
   return url.toString().replace(/\/+$/, "");
 }

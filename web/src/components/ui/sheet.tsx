@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { announceModalOpen } from "@/lib/modal-layer";
 import { cn } from "@/lib/utils";
 
 // Drag the grab handle down past this many pixels to dismiss.
@@ -48,6 +49,13 @@ export function BottomSheet({
   const dragStartRef = useRef<number | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
+
+  // A sheet takes the window like any modal, so anything already floating
+  // over it gives way (see `modal-layer`). Keyed on `open`, not on mount:
+  // the node outlives the close by one animation.
+  useEffect(() => {
+    if (open) announceModalOpen();
+  }, [open]);
 
   useEffect(() => {
     if (open) {

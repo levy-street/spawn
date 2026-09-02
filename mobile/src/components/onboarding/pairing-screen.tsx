@@ -12,11 +12,13 @@ import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { getMe } from "@/data/api/endpoints/account";
 import { qk } from "@/data/queryKeys";
+import { useSignOut } from "@/lib/use-sign-out";
 import { chrome, spacing, useTheme } from "@/theme";
 
 export function PairingScreen(): React.JSX.Element {
   const theme = useTheme();
   const router = useRouter();
+  const signOut = useSignOut();
   const params = useLocalSearchParams<{
     approvalRef?: string | string[];
     hostKey?: string | string[];
@@ -66,7 +68,20 @@ export function PairingScreen(): React.JSX.Element {
       testID="pairing-screen"
     >
       <Screen
-        header={<AppHeader onBack={() => leaveOnboarding(router)} title="Connect a host" />}
+        header={
+          <AppHeader
+            actions={[
+              {
+                accessibilityLabel: "Sign out",
+                busy: signOut.signingOut,
+                icon: "LogOut",
+                onPress: () => void signOut.signOut(),
+              },
+            ]}
+            onBack={() => leaveOnboarding(router)}
+            title="Connect a computer"
+          />
+        }
         padded={false}
         scroll
       >

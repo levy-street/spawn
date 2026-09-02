@@ -21,6 +21,7 @@ import {
   placeMenu,
   pointAnchor,
 } from "@/components/ui/menu-position";
+import { useDismissOnModalOpen } from "@/components/ui/modal-layer";
 import { BottomSheet } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
@@ -192,6 +193,12 @@ export const CascadeMenu = forwardRef<
   }, []);
 
   const asSheet = presentation === "sheet" || (presentation === "auto" && smallViewport);
+
+  // A menu opened before a modal is a leftover once the modal has the window;
+  // one opened from inside a modal never hears this (see `modal-layer`). Not
+  // while it is presenting as a sheet: there it *is* the modal, and would
+  // announce itself shut.
+  useDismissOnModalOpen(open && !asSheet, close);
 
   const { panel, depth } = resolvePanel(root, path);
   const pathKey = path.slice(0, depth).join("/");

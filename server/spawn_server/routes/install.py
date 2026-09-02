@@ -543,11 +543,11 @@ INSTALL_SCRIPT = dedent(
     WORKER_BIN="$BIN_DIR/spawn-worker"
 
     say() {
-      printf '%s\n' "spawn: $*"
+      printf '%s\n' "SPAWN D: $*"
     }
 
     die() {
-      printf '%s\n' "spawn: $*" >&2
+      printf '%s\n' "SPAWN D: $*" >&2
       exit 1
     }
 
@@ -570,7 +570,7 @@ INSTALL_SCRIPT = dedent(
     Usage: sh install.sh [options]
 
     Options:
-      --server URL       Spawn server URL. Default: $DEFAULT_SERVER
+      --server URL       spawnd server URL. Default: $DEFAULT_SERVER
       --repo URL         Git repo to build from. Default: $DEFAULT_REPO
       --branch NAME      Git branch to build. Default: $DEFAULT_BRANCH
       --no-login         Install only; do not run the device-code login flow.
@@ -981,7 +981,7 @@ INSTALL_SCRIPT = dedent(
       mkdir -p "$SERVICE_DIR"
       cat > "$SERVICE_DIR/spawnd.service" <<EOF
     [Unit]
-    Description=spawn daemon
+    Description=spawnd daemon
     After=network-online.target
     Wants=network-online.target
 

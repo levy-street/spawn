@@ -31,7 +31,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
 
   return {
     ...config,
-    name: config.name ?? "spawn",
+    name: config.name ?? "SPAWN D",
     slug: config.slug ?? "spawn",
     // The org shows as "levy-street" in the Expo dashboard, which is its display
     // name; `owner` takes the account slug, and that is `trevcavill`. Changing

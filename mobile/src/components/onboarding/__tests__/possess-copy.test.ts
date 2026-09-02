@@ -18,6 +18,6 @@ describe("possess copy stays consistent", () => {
     ).join("\n");
 
     expect(source).not.toContain("spawnd login");
-    expect(source).toContain("After installation, run spawnd possess on that machine.");
+    expect(source).toContain("run spawnd possess");
   });
 });
