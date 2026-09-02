@@ -1,6 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  getBrowserHostPinRevision,
+  subscribeToBrowserHostPinChanges,
+} from "@/lib/browser-host-pins";
 import type { CarriedEndorsement } from "@/lib/hostControl";
 import {
   DirectSessionUploadError,
@@ -39,11 +43,14 @@ import {
   iceServersNeedRefresh,
   notifySocketUnauthorized,
   parseInbound,
+  RTC_LATCH_TIMEOUT_MS,
   rtcBindingFrameMatches,
+  SIGNAL_SILENCE_SUSPECT_MS,
   SPAWN_WS_SUBPROTOCOL,
   sanitizeIceServers,
   sessionRtcTuple,
   socketCloseAction,
+  watchSuspendResume,
 } from "@/lib/ws";
 
 /**
@@ -285,6 +292,20 @@ export function useSessionSocket({
   // must inform the NEXT offer, not tear down a live connection.
   const resolveSignedRtcTrustRef = useRef(resolveSignedRtcTrust);
   resolveSignedRtcTrustRef.current = resolveSignedRtcTrust;
+  // A trust refusal stops reconnecting on purpose — retrying against an
+  // unverifiable host would be the wrong kind of persistence. But the copy on
+  // screen tells the reader that re-possessing the host brings the pane back,
+  // and with the warm terminal pool keeping panes mounted across navigation,
+  // nothing here ever noticed that they had. Local trust changes now move a
+  // revision, and this connect effect lists it as a dependency: approving a
+  // pin tears the effect down and runs it again with a fresh
+  // `reconnectStopped`, so the pane reconnects instead of waiting for a
+  // full page reload.
+  const hostPinRevision = useSyncExternalStore(
+    subscribeToBrowserHostPinChanges,
+    getBrowserHostPinRevision,
+    () => 0,
+  );
   const loadCarriedEndorsementsRef = useRef(loadCarriedEndorsements);
   loadCarriedEndorsementsRef.current = loadCarriedEndorsements;
   const initialSizeRef = useRef(initialSize);
@@ -337,6 +358,10 @@ export function useSessionSocket({
     schedule();
   }, []);
 
+  // `hostPinRevision` is a re-run trigger, not a value this effect reads: local
+  // trust changed, so the connection has to be decided again — including the
+  // refusal that set `reconnectStopped` and would otherwise never be revisited.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-run trigger, not a read
   useEffect(() => {
     const sessionGeneration = sessionGenerationRef.current + 1;
     sessionGenerationRef.current = sessionGeneration;
@@ -363,6 +388,7 @@ export function useSessionSocket({
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let signalWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcStartInFlight = false;
+    let rtcStartLatchedAt = 0;
     let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -371,7 +397,12 @@ export function useSessionSocket({
     let rtcConfigRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcConfigRefreshResolve: (() => void) | null = null;
     let iceRestartInFlight = false;
+    let iceRestartLatchedAt = 0;
     let resumeInFlight = false;
+    /** When the server was last heard on the current socket, whatever kind of
+     * frame it was. A socket claiming OPEN with nothing heard for longer than
+     * `SIGNAL_SILENCE_SUSPECT_MS` is a corpse a sleep left behind. */
+    let lastSignalFrameAt = 0;
     let rtcRetryAttempts = 0;
     let lastRtcIceServers: RTCIceServer[] | null = null;
     /** The deployment's answer to "is there a direct path?", from `rtc.config`. */
@@ -530,9 +561,19 @@ export function useSessionSocket({
     };
 
     const startRtc = async (iceServers: RTCIceServer[]) => {
-      if (!isActiveSessionGeneration() || rtcStartInFlight || rtcRef.current.pc) return;
+      if (!isActiveSessionGeneration()) return;
+      if (rtcStartInFlight) {
+        // Held past its deadline, the latch marks an attempt frozen mid-await
+        // (a trust read or createOffer that a suspend left never settling),
+        // not one still working — and honouring it would turn every retry
+        // entry into a no-op forever. Tear the husk down and start over.
+        if (Date.now() - rtcStartLatchedAt < RTC_LATCH_TIMEOUT_MS) return;
+        cleanupRtc(false);
+      }
+      if (rtcRef.current.pc) return;
       if (typeof RTCPeerConnection === "undefined") return;
       rtcStartInFlight = true;
+      rtcStartLatchedAt = Date.now();
       const rtcGeneration = rtcGenerationRef.current + 1;
       rtcGenerationRef.current = rtcGeneration;
       const rtcSessionId = newRtcSessionId();
@@ -1484,7 +1525,8 @@ export function useSessionSocket({
 
     const restartIce = async (_reason: "disconnected" | "failed" | "wake") => {
       const current = rtcRef.current;
-      if (iceRestartInFlight || !current.pc || !current.rtcSessionId) return;
+      if (iceRestartInFlight && Date.now() - iceRestartLatchedAt < RTC_LATCH_TIMEOUT_MS) return;
+      if (!current.pc || !current.rtcSessionId) return;
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
       if (!current.bindingNonce || current.bindingGeneration === null) {
         fallBackToFreshRtc(current.rtcGeneration);
@@ -1493,6 +1535,7 @@ export function useSessionSocket({
       const pc = current.pc;
       const expectedRtcGeneration = current.rtcGeneration;
       iceRestartInFlight = true;
+      iceRestartLatchedAt = Date.now();
       await refreshRtcConfigIfStale();
       if (
         !isActiveSessionGeneration() ||
@@ -1622,6 +1665,7 @@ export function useSessionSocket({
 
       ws.onopen = () => {
         if (!isCurrentWs()) return;
+        lastSignalFrameAt = Date.now();
         if (ws.protocol !== SPAWN_WS_SUBPROTOCOL) {
           ws.close(1002, "Required terminal signaling protocol was not selected");
           return;
@@ -1631,6 +1675,7 @@ export function useSessionSocket({
       };
       ws.onmessage = (ev) => {
         if (!isCurrentWs()) return;
+        lastSignalFrameAt = Date.now();
         const h = currentHandlers();
         if (!h) return;
         if (typeof ev.data === "string") {
@@ -1937,30 +1982,44 @@ export function useSessionSocket({
       reconnectTimer = setTimeout(connect, delay);
     };
 
+    const redialNow = () => {
+      const ws = wsRef.current;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      attempt = 0;
+      if (ws) {
+        wsRef.current = null;
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        try {
+          ws.close();
+        } catch {
+          // A replacement socket is opened below either way.
+        }
+      }
+      connect();
+    };
+
     const wake = () => {
       if (!isActiveSessionGeneration() || reconnectStopped) return;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-        attempt = 0;
-        if (ws) {
-          wsRef.current = null;
-          ws.onopen = null;
-          ws.onmessage = null;
-          ws.onerror = null;
-          ws.onclose = null;
-          try {
-            ws.close();
-          } catch {
-            // A replacement socket is opened below either way.
-          }
-        }
-        connect();
+        redialNow();
         return;
       }
       const pc = rtcRef.current.pc;
       if (pc?.connectionState === "connected") return;
+      if (Date.now() - lastSignalFrameAt > SIGNAL_SILENCE_SUSPECT_MS) {
+        // OPEN is the socket's claim, not the network's: after a sleep the
+        // TCP side is routinely gone with no onclose ever fired, and every
+        // frame signalled into it "succeeds" into nothing. The server pings
+        // every 25 s, so a live socket is never this quiet — redial, which
+        // also carries fresh TURN credentials in on the new rtc.config.
+        redialNow();
+        return;
+      }
       if (pc) void restartIce("wake");
       else void startRtcWithLatest();
     };
@@ -1971,6 +2030,10 @@ export function useSessionSocket({
     document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("online", wake);
     window.addEventListener("pageshow", wake);
+    // The desktop shell's webview sleeps and wakes with the machine without
+    // firing any of the three events above; the clock jump is the one signal
+    // that always arrives.
+    const stopSuspendWatch = watchSuspendResume(wake);
 
     connect();
 
@@ -1979,6 +2042,7 @@ export function useSessionSocket({
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("online", wake);
       window.removeEventListener("pageshow", wake);
+      stopSuspendWatch();
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (signalWatchdogTimer) clearTimeout(signalWatchdogTimer);
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
@@ -2004,7 +2068,14 @@ export function useSessionSocket({
       pendingInputExpiryTimerRef.current = null;
       if (isCurrentSessionGeneration()) activeSessionIdRef.current = null;
     };
-  }, [sessionId, enabled, settleUploadReadiness, armPendingInputExpiry, updateQueuedInputState]);
+  }, [
+    sessionId,
+    enabled,
+    hostPinRevision,
+    settleUploadReadiness,
+    armPendingInputExpiry,
+    updateQueuedInputState,
+  ]);
 
   const [pageVisible, setPageVisible] = useState(
     () => typeof document === "undefined" || !document.hidden,

@@ -187,6 +187,9 @@ test("device approval shows the locally derived fingerprint before confirmation"
 });
 
 test("the bare page keeps installation instructions and has no code entry", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Linux x86_64" });
+  });
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;

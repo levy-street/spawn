@@ -57,7 +57,10 @@ function LoginPageContent() {
           returnTo={returnTo}
           loading={configLoading}
         />
-        {configError ? (
+        {/* Only when there is truly nothing above this line: with the last
+            known providers still painted from cache, announcing an outage
+            under working buttons would contradict them. */}
+        {configError && (config?.providers ?? []).length === 0 ? (
           <p className="text-sm text-muted-foreground" role="status">
             Social sign-in is temporarily unavailable. Email sign-in still works.
           </p>

@@ -136,7 +136,7 @@ async def list_users(
     # account and only for accounts that have ever paid, so this is smaller
     # than the user list it decorates. Skipped entirely with billing off, which
     # also keeps this page working on a self-hosted install that has never run
-    # migration 0068.
+    # migration 0070.
     subscriptions: dict[str, Subscription] = {}
     if get_settings().billing_enabled:
         subscriptions = {

@@ -2,6 +2,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 import { authGutter } from "@/components/auth/auth-shell";
 import { ProviderMark } from "@/components/auth/provider-mark";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import type { AuthProviderOut, ProviderId } from "@/data/api/schemas/auth";
@@ -128,7 +129,20 @@ export function OAuthButtons({
   const apple = providers.find((provider) => provider.id === "apple");
   const showApple = appleReady && apple !== undefined;
 
-  if (loading || (listed.length === 0 && !showApple)) return null;
+  // While the server's answer is in flight the set holds its ground as ghost
+  // slabs, so the screen does not jump when the real buttons land. Only a
+  // server that has answered "no providers" collapses the section.
+  if (loading) {
+    return (
+      <View style={styles.container} testID="oauth-buttons-loading">
+        <View style={styles.buttons}>
+          <Skeleton style={styles.placeholder} />
+          <Skeleton style={styles.placeholder} />
+        </View>
+      </View>
+    );
+  }
+  if (listed.length === 0 && !showApple) return null;
 
   const pending = signIn.isPending;
   const press = (id: ProviderId) => () => {
@@ -214,6 +228,10 @@ const styles = StyleSheet.create({
     height: spacing[6],
     justifyContent: "center",
     width: spacing[6],
+  },
+  placeholder: {
+    height: sizing.control.button.lg,
+    width: "100%",
   },
   reason: {
     textAlign: "center",

@@ -4343,7 +4343,7 @@ mod tests {
         save_file_at(&target, &fixed_creds()).unwrap();
         match std::os::windows::fs::symlink_file(&target, &link) {
             Ok(()) => assert!(load_file_at(&link).is_err()),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
             Err(error) => panic!("creating credential symlink failed unexpectedly: {error}"),
         }
 

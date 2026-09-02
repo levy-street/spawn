@@ -247,6 +247,7 @@ export function LauncherFab({
       const session = await sessions.create({
         host_id: home.host.id,
         cwd: home.cwd,
+        ...(choice.kind === "agent" && { agent_id: choice.agent.id }),
         workspace_id: workspace.id,
         tile: placed,
       });

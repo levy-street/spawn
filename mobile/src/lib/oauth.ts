@@ -1,7 +1,9 @@
+import * as ExpoCrypto from "expo-crypto";
 import * as WebBrowser from "expo-web-browser";
 
 import { exchangeOAuthCode, getOAuthStartUrl } from "@/data/api/endpoints/auth";
 import type { ProviderId, TokenResponse } from "@/data/api/schemas/auth";
+import { encodeBase64Url } from "@/lib/crypto/bytes";
 
 /**
  * The scheme the server hands the one-time code back on.
@@ -13,6 +15,26 @@ import type { ProviderId, TokenResponse } from "@/data/api/schemas/auth";
  * redirect".
  */
 export const NATIVE_REDIRECT_URI = "spawn://auth/oauth";
+
+/**
+ * A PKCE pair for one sign-in.
+ *
+ * Only the challenge crosses the network on the way out. The one-time code the
+ * callback carries back therefore proves which account signed in, but redeeming
+ * it also takes the verifier — which never left this process. That is what ties
+ * the code to the app that asked for it, rather than to whoever happens to be
+ * holding it.
+ */
+export async function createPkcePair(): Promise<{ verifier: string; challenge: string }> {
+  const verifier = encodeBase64Url(ExpoCrypto.getRandomValues(new Uint8Array(32)));
+  // The verifier is base64url, so it is ASCII and one byte per character.
+  const ascii = new Uint8Array(new ArrayBuffer(verifier.length));
+  for (let index = 0; index < verifier.length; index += 1) {
+    ascii[index] = verifier.charCodeAt(index);
+  }
+  const digest = await ExpoCrypto.digest(ExpoCrypto.CryptoDigestAlgorithm.SHA256, ascii);
+  return { verifier, challenge: encodeBase64Url(new Uint8Array(digest)) };
+}
 
 export type OAuthSignInOutcome =
   | { status: "signed-in"; token: TokenResponse }
@@ -75,10 +97,14 @@ export async function signInWithProvider(
   const exchange = options.exchange ?? exchangeOAuthCode;
 
   let result: WebBrowser.WebBrowserAuthSessionResult;
+  let verifier: string;
   try {
+    const pkce = await createPkcePair();
+    verifier = pkce.verifier;
     const startUrl = await getOAuthStartUrl(provider, {
       redirectUri: NATIVE_REDIRECT_URI,
       invite: options.invite ?? null,
+      codeChallenge: pkce.challenge,
     });
     result = await browser.openAuthSessionAsync(startUrl, NATIVE_REDIRECT_URI);
   } catch (error) {
@@ -93,7 +119,10 @@ export async function signInWithProvider(
   if ("error" in callback) return { status: "failed", message: callback.error };
 
   try {
-    return { status: "signed-in", token: await exchange({ code: callback.code }) };
+    return {
+      status: "signed-in",
+      token: await exchange({ code: callback.code, code_verifier: verifier }),
+    };
   } catch (error) {
     return { status: "failed", message: messageFor(error, "Sign-in could not be completed.") };
   }

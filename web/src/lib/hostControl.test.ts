@@ -878,6 +878,47 @@ describe("HostControlClient", () => {
     first.client.close();
   });
 
+  test("wake redials a silent socket instead of signalling into a corpse", async () => {
+    // A sleep leaves the socket claiming OPEN with the TCP side gone: nothing
+    // arrives, nothing fires onclose, and an ICE restart offered into it goes
+    // nowhere. Wake must prove liveness by recency, not trust readyState.
+    const endpoint = await readyClient({ silenceSuspectMs: 20, reconnectBaseDelayMs: 1 });
+    endpoint.ws.receive({
+      type: "rtc.status",
+      session_id: endpoint.offer.session_id,
+      status: "connected",
+      binding_nonce: "d".repeat(32),
+      binding_generation: 4,
+      ...metadata,
+    });
+    endpoint.pc.connectionState = "disconnected";
+    await Bun.sleep(30);
+    const socketsBefore = FakeWebSocket.instances.length;
+    window.dispatchEvent(new Event("online"));
+    await waitFor(() => FakeWebSocket.instances.length === socketsBefore + 1);
+    expect(endpoint.pc.restartIceCalls).toBe(0);
+    expect(FakeWebSocket.instances.at(-1)).not.toBe(endpoint.ws);
+    endpoint.client.close();
+  });
+
+  test("wake keeps the gentle ICE-restart path while the socket is provably live", async () => {
+    const endpoint = await readyClient({ silenceSuspectMs: 60_000 });
+    endpoint.ws.receive({
+      type: "rtc.status",
+      session_id: endpoint.offer.session_id,
+      status: "connected",
+      binding_nonce: "e".repeat(32),
+      binding_generation: 5,
+      ...metadata,
+    });
+    endpoint.pc.connectionState = "disconnected";
+    const socketsBefore = FakeWebSocket.instances.length;
+    window.dispatchEvent(new Event("online"));
+    await waitFor(() => endpoint.pc.restartIceCalls === 1);
+    expect(FakeWebSocket.instances.length).toBe(socketsBefore);
+    endpoint.client.close();
+  });
+
   test("wake restarts ICE on the binding, then rebuilds if recovery never connects", async () => {
     const endpoint = await readyClient({ iceRestartTimeoutMs: 5 });
     endpoint.ws.receive({

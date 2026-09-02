@@ -20,6 +20,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     activity_state: "quiet",
     activity_label: "Quiet",
     foreground_command: null,
+    agent_id: null,
     ...overrides,
   };
 }
@@ -162,6 +163,42 @@ describe("parseAlertFrame", () => {
     expect(parseAlertFrame(JSON.stringify({ type: "alerts.ping" }))).toEqual({
       type: "alerts.ping",
     });
+  });
+
+  test("accepts a data-changed frame, detail and collection alike", () => {
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "data",
+          resource: "workspaces",
+          id: "w-1",
+          origin: "tab-1",
+          at: "2026-08-31T00:00:00Z",
+        }),
+      ),
+    ).toEqual({
+      type: "data",
+      resource: "workspaces",
+      id: "w-1",
+      origin: "tab-1",
+      at: "2026-08-31T00:00:00Z",
+    });
+    // A collection change carries no id and no origin (a daemon wrote it).
+    expect(
+      parseAlertFrame(JSON.stringify({ type: "data", resource: "sessions", id: null })),
+    ).toMatchObject({ type: "data", resource: "sessions", id: null, origin: null });
+  });
+
+  test("rejects a data frame that could not drive an invalidation", () => {
+    const rejected = [
+      JSON.stringify({ type: "data" }),
+      JSON.stringify({ type: "data", resource: "" }),
+      JSON.stringify({ type: "data", resource: 7 }),
+      JSON.stringify({ type: "data", resource: "x".repeat(65) }),
+      JSON.stringify({ type: "data", resource: "workspaces", id: 9 }),
+      JSON.stringify({ type: "data", resource: "workspaces", origin: "x".repeat(65) }),
+    ];
+    for (const raw of rejected) expect(parseAlertFrame(raw)).toBeNull();
   });
 
   test("rejects malformed, unknown, and hostile frames without throwing", () => {

@@ -1,5 +1,6 @@
 import {
   AUTH_GATE_DESTINATIONS,
+  createOnboardingRedirectTracker,
   createUnauthenticatedRedirect,
   resolveAuthGateDestination,
   shouldRenderAuthPath,
@@ -60,6 +61,26 @@ describe("auth path handling", () => {
     expect(shouldRenderAuthPath("/onboarding/host", AUTH_GATE_DESTINATIONS.tabs, true)).toBe(true);
     expect(shouldRenderAuthPath("/device", AUTH_GATE_DESTINATIONS.verifyEmail, true)).toBe(false);
     expect(shouldRenderAuthPath("/host", AUTH_GATE_DESTINATIONS.verifyEmail, true)).toBe(false);
+  });
+
+  it("treats onboarding as a one-time introduction, not a signed-in route fence", () => {
+    expect(shouldRenderAuthPath("/hosts", AUTH_GATE_DESTINATIONS.onboarding, true)).toBe(true);
+    expect(shouldRenderAuthPath("/workspaces", AUTH_GATE_DESTINATIONS.onboarding, true)).toBe(true);
+    expect(shouldRenderAuthPath("/onboarding", AUTH_GATE_DESTINATIONS.tabs, true)).toBe(true);
+    expect(shouldRenderAuthPath("/login", AUTH_GATE_DESTINATIONS.onboarding, true)).toBe(false);
+  });
+});
+
+describe("onboarding redirect tracking", () => {
+  it("introduces each account once and then lets back navigation stand", () => {
+    const tracker = createOnboardingRedirectTracker();
+
+    expect(tracker.shouldRedirect("account-a", "/workspaces")).toBe(true);
+    expect(tracker.shouldRedirect("account-a", "/hosts")).toBe(false);
+    expect(tracker.shouldRedirect("account-b", "/hosts")).toBe(true);
+    tracker.reset();
+    expect(tracker.shouldRedirect("account-b", "/onboarding")).toBe(false);
+    expect(tracker.shouldRedirect("account-b", "/workspaces")).toBe(false);
   });
 });
 

@@ -59,10 +59,26 @@ export interface HostPinUndeliveredEvent {
 
 export type TrustEvent = DeviceTrustEvent | HostPinUndeliveredEvent;
 
+/**
+ * A data-changed frame: some resource this account can see was written, by
+ * any client or by a daemon. Content-free on purpose — the frame says what
+ * *kind* of thing changed and the reader refetches what it already knows how
+ * to fetch, so the socket's content discipline holds. `origin` echoes the
+ * mutating client's `X-Spawn-Client` id, letting that client skip the
+ * refetch it would only race with its own optimistic write.
+ */
+export interface DataEvent {
+  resource: string;
+  id: string | null;
+  origin: string | null;
+  at: string;
+}
+
 /** Frames the socket can deliver. `alerts.ping` is an idle keepalive. */
 export type AlertFrame =
   | ({ type: "alert" } & AlertEvent)
   | ({ type: "trust" } & TrustEvent)
+  | ({ type: "data" } & DataEvent)
   | { type: "alerts.ping" };
 
 const TRUST_EVENT_KINDS = new Set<string>([
@@ -112,6 +128,24 @@ function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
   };
 }
 
+function parseDataFrame(record: Record<string, unknown>): AlertFrame | null {
+  const resource = record.resource;
+  // The resource is matched against the reader's own map, not a list here:
+  // an unknown one is a future server talking, and it costs nothing.
+  if (typeof resource !== "string" || !resource || resource.length > 64) return null;
+  const id = record.id;
+  if (id != null && (typeof id !== "string" || id.length > 64)) return null;
+  const origin = record.origin;
+  if (origin != null && (typeof origin !== "string" || origin.length > 64)) return null;
+  return {
+    type: "data",
+    resource,
+    id: id ?? null,
+    origin: origin ?? null,
+    at: typeof record.at === "string" ? record.at : "",
+  };
+}
+
 const EVENT_KINDS = new Set<string>(["agent.finished", "agent.awaiting_input", "session.died"]);
 
 /**
@@ -130,6 +164,7 @@ export function parseAlertFrame(raw: string): AlertFrame | null {
   const frame = parsed as Record<string, unknown>;
   if (frame.type === "alerts.ping") return { type: "alerts.ping" };
   if (frame.type === "trust") return parseTrustFrame(frame);
+  if (frame.type === "data") return parseDataFrame(frame);
   if (frame.type !== "alert") return null;
   if (typeof frame.event !== "string" || !EVENT_KINDS.has(frame.event)) return null;
   if (typeof frame.session_id !== "string" || !frame.session_id) return null;

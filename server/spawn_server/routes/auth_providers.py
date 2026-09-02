@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
+import string
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -112,6 +114,37 @@ def _aware(value: datetime) -> datetime:
 
 def _hash_state(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+_PKCE_ALPHABET = set(string.ascii_letters + string.digits + "-._~")
+
+
+def _clean_code_challenge(challenge: str | None, method: str | None) -> str | None:
+    """Validate a PKCE challenge from `/oauth/{provider}/start`.
+
+    Only S256 is accepted. `plain` would make the challenge and the verifier
+    the same string, so anyone who saw the redirect could redeem the code — the
+    thing this exists to prevent.
+    """
+    if not challenge:
+        return None
+    if (method or "S256") != "S256":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="only the S256 code challenge method is supported",
+        )
+    if not (43 <= len(challenge) <= 128) or set(challenge) - _PKCE_ALPHABET:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="code_challenge is malformed",
+        )
+    return challenge
+
+
+def _pkce_matches(challenge: str, verifier: str) -> bool:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    expected = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return secrets.compare_digest(expected, challenge)
 
 
 def _public_url(path: str = "") -> str:
@@ -231,12 +264,15 @@ def _is_native_redirect(return_to: str) -> bool:
     return return_to in get_settings().oauth_native_redirect_uri_list
 
 
-async def _issue_exchange_code(*, session: AsyncSession, user: User) -> str:
+async def _issue_exchange_code(
+    *, session: AsyncSession, user: User, code_challenge: str | None = None
+) -> str:
     code = secrets.token_urlsafe(32)
     settings = get_settings()
     session.add(
         AuthProviderExchange(
             code_hash=_hash_state(code),
+            code_challenge=code_challenge,
             user_id=user.id,
             expires_at=_now() + timedelta(seconds=settings.oauth_exchange_ttl_seconds),
             created_at=_now(),
@@ -533,7 +569,7 @@ async def _user_for_profile(
         # linking a provider to one, is not a signup and is never gated.
         if not await invites.signup_is_open(session):
             if invite_code_hash is None:
-                raise InviteRequired(profile.provider, "spawn is invite only right now")
+                raise InviteRequired(profile.provider, "SPAWN D is invite only right now")
             try:
                 invite = await invites.redeem_invite_hash(session, invite_code_hash)
             except ValueError as cause:
@@ -579,6 +615,8 @@ async def provider_start(
     return_to: str | None = Query(default="/"),
     redirect_uri: str | None = Query(default=None),
     invite: str | None = Query(default=None, max_length=256),
+    code_challenge: str | None = Query(default=None, max_length=128),
+    code_challenge_method: str | None = Query(default=None, max_length=16),
     session: AsyncSession = Depends(get_session),
     user: User | None = Depends(auth.current_user_optional),
 ) -> RedirectResponse:
@@ -586,6 +624,7 @@ async def provider_start(
     state = secrets.token_urlsafe(32)
     settings = get_settings()
     native = _native_redirect_uri(redirect_uri)
+    challenge = _clean_code_challenge(code_challenge, code_challenge_method)
     session.add(
         AuthProviderState(
             state_hash=_hash_state(state),
@@ -595,6 +634,9 @@ async def provider_start(
             # endpoint into an oracle for probing codes, and the redemption at
             # the callback is the only check that has to hold.
             invite_code_hash=invites.hash_code(invite) if invite else None,
+            # Only a native flow redeems a code later, so only it needs PKCE;
+            # the browser leg already ends on a cookie for the same origin.
+            code_challenge=challenge if native else None,
             user_id=user.id if user else None,
             expires_at=_now() + timedelta(minutes=settings.oauth_provider_state_ttl_minutes),
             created_at=_now(),
@@ -707,7 +749,9 @@ async def _complete_callback(
         # ran in a system web view with its own jar. Hand back a single-use code
         # instead and let it trade that for a token over the API, and set no
         # cookie at all — nothing here is a browser session.
-        code = await _issue_exchange_code(session=session, user=user)
+        code = await _issue_exchange_code(
+            session=session, user=user, code_challenge=state_row.code_challenge
+        )
         return RedirectResponse(
             f"{state_row.return_to}?{urlencode({'code': code})}",
             status_code=status.HTTP_302_FOUND,
@@ -742,6 +786,23 @@ async def provider_exchange(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="this sign-in code is invalid or has expired",
         )
+    # Bind the redemption to the client that started the flow. Without this the
+    # code proves only *which account* signed in, not *who asked* — so an
+    # attacker could complete OAuth with their own account and lure the code
+    # onto someone else's machine, where the app would sign itself into the
+    # attacker's account and possess that machine under it. Consuming the row
+    # first would let a wrong guess burn the user's real code, so check before
+    # marking it used, and mark it used on a failed verifier too so a bad code
+    # is spent either way.
+    if row.code_challenge is not None:
+        verifier = body.code_verifier or ""
+        if not verifier or not _pkce_matches(row.code_challenge, verifier):
+            row.used_at = _now()
+            await session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="this sign-in code was not issued to this app",
+            )
     row.used_at = _now()
     await session.commit()
 

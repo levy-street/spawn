@@ -56,7 +56,7 @@ async def signup(
         if not body.invite:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="spawn is invite only right now",
+                detail="SPAWN D is invite only right now",
             )
         try:
             invite = await redeem_invite(session, body.invite)

@@ -32,22 +32,32 @@ function row(page: import("@playwright/test").Page, name: string) {
   return page.getByRole("treeitem").filter({ hasText: name }).first();
 }
 
+/** The card opens over the right of the list, so a row is hovered by its
+ *  left edge — the part of it the card never covers. */
+const LEFT_EDGE = { position: { x: 40, y: 14 } };
+
 test("hovering a vector file previews the rendered image", async ({ page }) => {
   await mockApp(page, { files: previewFiles, fileRead: fileBytes });
   await page.goto(`/hosts/${HOST_ID}/files`);
 
-  await row(page, "logo.svg").hover();
+  await row(page, "logo.svg").hover(LEFT_EDGE);
   const card = page.locator("#file-preview-card");
   await expect(card).toBeVisible();
   // A blob URL, not the raw markup: an inline <svg> from an untrusted file
   // would execute any script it carries.
   await expect(card.locator("img")).toHaveAttribute("src", /^blob:/);
 
-  // Closing is geometric: another row is still inside the live region, so the
-  // card only goes once the pointer leaves the panel and the card behind.
-  await row(page, "assets").hover();
+  // A folder has nothing to show, so resting on one takes the card away
+  // rather than carrying it along.
+  await row(page, "assets").hover(LEFT_EDGE);
+  await expect(card).toBeHidden();
+
+  // So does the panel's own ground, below the last row.
+  await row(page, "logo.svg").hover(LEFT_EDGE);
   await expect(card).toBeVisible();
-  await page.mouse.move(4, 4);
+  const tree = await page.getByRole("tree", { name: "Files" }).boundingBox();
+  if (!tree) throw new Error("no tree");
+  await page.mouse.move(tree.x + 12, tree.y + tree.height - 8);
   await expect(card).toBeHidden();
 });
 

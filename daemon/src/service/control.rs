@@ -163,6 +163,17 @@ pub fn start_listener(
                     request.truncate(size);
                     decode_request(&request)
                 }
+                // A read that fails because the client is already gone — the
+                // instance was recycled under it, or a connect completed with
+                // nobody on the other end, which a loaded machine produces —
+                // has nobody to answer. Writing an error reply here only
+                // races the next client, who would read a rejection meant
+                // for no one (and never retry it). Recycle the instance and
+                // listen again; the client side retries within its deadline.
+                Err(error) if is_gone_client(&error) => {
+                    let _ = server.disconnect();
+                    continue;
+                }
                 Err(error) => Err(error.into()),
             };
             match command {
@@ -201,19 +212,60 @@ pub fn start_listener(
 
 #[cfg(windows)]
 pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
-    use std::io::{Read, Write};
+    let name = pipe_name(config_dir)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        // The listener serves one client per pipe instance and recycles the
+        // instance between clients, and DisconnectNamedPipe discards a framed
+        // reply the client has not read yet. That surfaces as "no process is
+        // on the other end of the pipe" (233) or a broken pipe — and not only
+        // mid-exchange: the recycle can land between our CreateFile and the
+        // SetNamedPipeHandleState that follows it, so opening the pipe is
+        // inside the retry too. Every control command is idempotent, so run
+        // the whole exchange again rather than surfacing a reply the server
+        // already sent.
+        let result = send_once(&name, deadline).and_then(|pipe| exchange(pipe, command));
+        match result {
+            Ok(pid) => return Ok(pid),
+            Err(error) if is_recycled_instance(&error) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The server-side twin of [`is_recycled_instance`]: a read that failed
+/// because no client is on the other end any more, whether it disconnected
+/// or was never really there.
+#[cfg(windows)]
+fn is_gone_client(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
+    error.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32)
+        || error.kind() == std::io::ErrorKind::BrokenPipe
+}
+
+#[cfg(windows)]
+fn is_recycled_instance(error: &anyhow::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
+    error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        io.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32)
+            || io.kind() == std::io::ErrorKind::BrokenPipe
+    })
+}
+
+#[cfg(windows)]
+fn send_once(name: &str, deadline: std::time::Instant) -> Result<std::fs::File> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_MESSAGE};
 
-    let name = pipe_name(config_dir)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    let mut pipe = loop {
+    let pipe = loop {
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&name)
+            .open(name)
         {
             Ok(pipe) => break pipe,
             Err(error)
@@ -239,14 +291,28 @@ pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
     {
         return Err(std::io::Error::last_os_error()).context("setting control pipe message mode");
     }
+    Ok(pipe)
+}
+
+#[cfg(windows)]
+fn exchange(mut pipe: std::fs::File, command: ControlCommand) -> Result<u32> {
+    use std::io::{BufRead, Read, Write};
+
     let mut request = serde_json::to_vec(&ControlRequest { v: 1, command })?;
     request.push(b'\n');
     pipe.write_all(&request)?;
     pipe.flush()?;
     let mut response = Vec::with_capacity(256);
-    pipe.take(4097).read_to_end(&mut response)?;
+    // A successful named-pipe server disconnect is surfaced as BrokenPipe on
+    // Windows, not as Unix-style EOF. The reply is already newline framed, so
+    // stop at that boundary instead of waiting for the server to disconnect.
+    let mut reader = std::io::BufReader::new(pipe.take((MAX_REQUEST_BYTES + 1) as u64));
+    reader.read_until(b'\n', &mut response)?;
     if response.len() > MAX_REQUEST_BYTES {
         bail!("control reply is oversized");
+    }
+    if !response.ends_with(b"\n") {
+        bail!("control reply is not newline terminated");
     }
     let reply: ControlReply =
         serde_json::from_slice(&response).context("decoding control reply")?;
@@ -455,5 +521,20 @@ mod tests {
         assert!(decode_request(b"{\"v\":1,\"command\":\"unknown\"}\n").is_err());
         assert!(decode_request(br#"{"v":1,"command":"ping"}"#).is_err());
         assert!(decode_request(&vec![b'x'; MAX_REQUEST_BYTES + 1]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_control_pipe_ping_reads_the_framed_reply_before_disconnect() {
+        let config = tempfile::tempdir().unwrap();
+        let reconnect = Box::leak(Box::new(tokio::sync::Notify::new()));
+        let shutdown = Box::leak(Box::new(tokio::sync::Notify::new()));
+        start_listener(config.path(), reconnect, shutdown).unwrap();
+        let path = config.path().to_path_buf();
+        let pid = tokio::task::spawn_blocking(move || send(&path, ControlCommand::Ping))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pid, std::process::id());
     }
 }

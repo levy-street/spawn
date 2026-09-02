@@ -208,6 +208,10 @@ class AuthProviderState(Base):
     # sitting in the database would be a usable credential; the invite table is
     # keyed on the same hash, so nothing is lost.
     invite_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # PKCE, carried across the provider round trip for native sign-ins. The
+    # client that opens the browser proves at redemption that it is the same
+    # client, so a code lured onto someone else's machine is useless there.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -235,6 +239,9 @@ class AuthProviderExchange(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    # Copied from the state row that minted this code. Non-NULL means the
+    # redeeming client must present the matching verifier.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -980,6 +987,17 @@ class Session(Base):
     # documented content-free exception: a process name, nothing else, so the
     # UI can label panes. See docs/TRUST.md.
     foreground_command: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The agent this window was opened as — what SPAWN D typed into its shell —
+    # and not what happens to hold the foreground this second. The two answer
+    # different questions: `foreground_command` says what is running now, which
+    # is a shell whenever the agent has been quit or is between runs, and which
+    # names an interpreter rather than a tool for any CLI that ships as a
+    # script (Hermes reports "python3"). Duplicating a window reproduces its
+    # type from this. NULL for a window opened as a plain shell, or one whose
+    # agent was stopped back to a prompt.
+    agent_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
+    )
 
     owner: Mapped[User] = relationship(back_populates="sessions")
     host: Mapped[Host] = relationship(back_populates="sessions")
@@ -1137,7 +1155,7 @@ class Workspace(Base):
     )
     cwd: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # Layout schema v3 (tabs over grid-schema-v3 grids), validated on every write by
-    # spawn_server.grid + routes/workspaces (docs/OVERHAUL.md §4.4).
+    # spawn_server.grid + routes/workspaces (proto/README.md, "Layout schema v3").
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # Sidebar ordering, contiguous from 0 per owner. Archived rows leave that
     # space entirely — they order by `archived_at` and their `position` is

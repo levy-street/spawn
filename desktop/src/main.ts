@@ -203,6 +203,8 @@ let configOrigin: string | null = null;
 /** The provider that got as far as the callback on an invite-only server. */
 let inviteRequiredFor: string | null = null;
 let lastProvider: string | null = null;
+/** The provider whose sign-in is out in the system browser right now. */
+let pendingProvider: string | null = null;
 let serverChoice: "hosted" | "self" = "hosted";
 let error: string | null = null;
 let notice: string | null = null;
@@ -350,13 +352,9 @@ const VERIFICATION_REFUSAL = "This host could not be verified.";
  * of the program that can. So these are buttons.
  */
 const RESUMED: Record<string, { title: string; body: string; action: string }> = {
-  already_possessed_here: {
-    title: `${OS_COPY.thisComputerCapitalized} is already possessed`,
-    body: "It already runs SPAWN D for this account, so nothing was changed — its daemon is running in the background and every device you own can reach it.",
-    action:
-      '<button class="btn btn-primary" data-action="open-app">Open SPAWN D</button>' +
-      '<button class="btn btn-ghost" data-action="possess-new-account">Add another account</button>',
-  },
+  // `already_possessed_here` is deliberately absent: resuming this account's
+  // own instance is a finished first run, and the possession poll opens the
+  // product instead of asking anyone to confirm it.
   already_possessed_other: {
     title: `${OS_COPY.thisComputerCapitalized} already runs SPAWN D`,
     body: "It is signed in to a different account, and nothing was changed. Adding this account registers a second instance beside it; the two stay separate and neither can see the other.",
@@ -612,6 +610,27 @@ function providerButtons(): string {
 }
 
 function authView(): string {
+  // A sign-in that went out to the system browser: without this, the idle form
+  // sat there as if the press had done nothing at all.
+  if (pendingProvider) {
+    const name = providerName(pendingProvider);
+    const body = `
+      <div class="stack">
+        <div class="inset">
+          <p>Finish signing in with <strong>${escapeHtml(name)}</strong> there. This screen moves on by itself when you come back.</p>
+          ${paceBar(`Waiting for ${name}…`)}
+        </div>
+        <div class="actions"><button class="btn btn-outline" data-action="cancel-oauth">Back to sign-in</button></div>
+      </div>`;
+    return sheet(
+      hatchServer(),
+      stacked(
+        "Finish in your browser",
+        `${escapeHtml(name)} sign-in continues in the browser SPAWN D just opened.`,
+        body,
+      ),
+    );
+  }
   const signup = authMode === "signup";
   const title = signup ? "Create your account" : "Welcome back";
   const description = signup
@@ -946,8 +965,13 @@ function hostView(): string {
       <div class="actions">${resumed.action}</div>
       ${cost}`;
   } else if (failure) {
+    // `begin_possession` downloads, installs and starts the daemon before a
+    // run exists, so a failure with no run — or one that never completed a
+    // step — is the install's, not the ceremony's. "Not approved" over a
+    // download error blamed the wrong step.
+    const installFailed = !runId || completedSteps.size === 0;
     action = `
-      <div class="failure" role="alert"><h3>This machine was not approved</h3><p>${escapeHtml(pairingFailureCopy(failure))}</p></div>
+      <div class="failure" role="alert"><h3>${installFailed ? "The daemon couldn’t be set up" : "This machine was not approved"}</h3><p>${escapeHtml(pairingFailureCopy(failure))}</p></div>
       <div class="actions">${
         serviceFailed
           ? '<button class="btn btn-outline" data-action="show-repair">Repair</button>'
@@ -986,7 +1010,7 @@ function hostView(): string {
 
   const copied = Date.now() < copiedUntil;
   const terminal = `
-    <details ${(terminalOpen ?? ((failure && !refused && failure !== "already_possessed_here") || stalled)) ? "open" : ""} data-panel="terminal">
+    <details ${(terminalOpen ?? ((failure && !refused) || stalled)) ? "open" : ""} data-panel="terminal">
       <summary>Use ${OS_COPY.shell} instead</summary>
       <div class="stack-tight">
         <div class="chip"><span class="dollar">$</span><code>${escapeHtml(terminalCommand)}</code><button type="button" class="${copied ? "done" : ""}" data-action="copy-command" aria-label="Copy install command">${copied ? "Copied" : "Copy"}</button></div>
@@ -1257,6 +1281,12 @@ async function act(action: string): Promise<void> {
     case "back-to-auth":
       setScreen("auth");
       break;
+    // The browser flow may still land; abandoning the wait only means the form
+    // comes back, and a late callback is handled as it always was.
+    case "cancel-oauth":
+      pendingProvider = null;
+      render();
+      break;
     case "retry-config":
       await loadConfig(true);
       break;
@@ -1371,6 +1401,7 @@ function setScreen(next: Screen): void {
   screen = next;
   error = null;
   notice = null;
+  pendingProvider = null;
   render();
 }
 
@@ -1447,7 +1478,16 @@ async function beginOAuth(provider: string): Promise<void> {
   const url = await guarded(() =>
     invoke<string>("oauth_start_url", { origin: preferences.server_origin, provider, invite }),
   );
-  if (url) await openUrl(url);
+  if (!url) return;
+  try {
+    await openUrl(url);
+  } catch (cause) {
+    error = describe(cause);
+    render();
+    return;
+  }
+  pendingProvider = provider;
+  render();
 }
 
 async function handleDeepLink(value: string): Promise<void> {
@@ -1458,6 +1498,9 @@ async function handleDeepLink(value: string): Promise<void> {
     return;
   }
   if (url.protocol !== "spawn:" || url.hostname !== OAUTH_CALLBACK.host || url.pathname !== OAUTH_CALLBACK.path) return;
+  // Whatever the browser answered, the wait for it is over.
+  pendingProvider = null;
+  render();
   const oauthError = url.searchParams.get("error");
   if (oauthError === "invite_required") {
     // The provider signed the person in, but the server wants a code before it
@@ -1505,9 +1548,17 @@ async function advance(): Promise<void> {
     return;
   }
   if (deviceGateRequired && !preferences.device_approved) {
-    setScreen("device");
-    startDevicePoll();
-    return;
+    // An approval is granted from a device a host trusts, so an account with
+    // no hosts has nobody who could answer one — a gate shown there waits for
+    // ever. Ask again before waiting: the command records the heal itself, and
+    // an unreachable server keeps the gate rather than waving it through.
+    if (await invoke<boolean>("device_gate_needed").catch(() => true)) {
+      setScreen("device");
+      startDevicePoll();
+      return;
+    }
+    deviceGateRequired = false;
+    preferences = await invoke<Preferences>("app_preferences");
   }
   // The host gate is where an out-of-date server actually bites, and this is
   // the only place a stored account ever passed. Without it, `initialize()`
@@ -1769,6 +1820,28 @@ function startPossessionPoll(): void {
           setScreen("done");
           // The product is the point: the window becomes it once the
           // gate has been read.
+          window.setTimeout(() => void guarded(() => invoke("open_app")), DONE_BEAT_MS);
+        }, SUCCESS_BEAT_MS);
+        return;
+      }
+      if (possession.status === "failed" && possession.error === "already_possessed_here") {
+        // Not a failure. The daemon resumed this account's own instance:
+        // this machine is possessed, the Rust side has just recorded the
+        // finished first run, and the product is the point — the card that
+        // used to sit here only asked someone to confirm what was already
+        // true, on every launch. (A *different* account's instance keeps its
+        // card: registering a second account beside it is a real choice.)
+        possessionPoll = clearTimer(possessionPoll);
+        ticker = clearTimer(ticker);
+        possession = { ...possession, status: "online", error: null };
+        syncPossessionSteps("online");
+        preferences = await invoke<Preferences>("app_preferences");
+        render();
+        // Through the done gate like any finished run: it reads for a beat,
+        // opens the product on its own, and owns the card that explains an
+        // opening that fails.
+        window.setTimeout(() => {
+          setScreen("done");
           window.setTimeout(() => void guarded(() => invoke("open_app")), DONE_BEAT_MS);
         }, SUCCESS_BEAT_MS);
         return;

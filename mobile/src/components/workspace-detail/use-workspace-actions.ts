@@ -28,7 +28,7 @@ import {
   useWorkspaceReorder,
 } from "@/data/queries/workspace-detail";
 import { qk } from "@/data/queryKeys";
-import { agentRunCommand, runningAgent } from "@/data/selectors/agent";
+import { agentRunCommand, sessionAgent } from "@/data/selectors/agent";
 import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import type { PaneId, TabId, Tile, WorkspaceLayoutV3 } from "@/data/types/layout";
 
@@ -150,10 +150,14 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
         tab.layout.tiles.some((candidate) => candidate.session_id === tile.session_id),
       );
       if (!sourceTab) throw new Error("That pane is no longer in this workspace.");
+      const movedAgent = sessionAgent(session ?? undefined, agents);
       const created = await createSession({
         host_id: host.id,
         cwd: "~",
         ...(session?.name ? { name: session.name } : {}),
+        // The window arrives on the new host as the same kind of window, so it
+        // is one even before its agent has taken the foreground over there.
+        ...(movedAgent ? { agent_id: movedAgent.id } : {}),
       });
       const nextTab = {
         ...sourceTab,
@@ -174,7 +178,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
         throw error;
       }
 
-      const agent = session ? runningAgent(session.foreground_command, agents) : null;
+      const agent = movedAgent;
       let launchError: Error | null = null;
       if (agent) {
         try {
@@ -231,10 +235,15 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
 
       if (!session) throw new Error("Session unavailable.");
       const access = await getSessionAccess(session.id);
+      const agent = sessionAgent(session, agents);
       const duplicate = await createSession({
         host_id: session.host_id,
         cwd: session.cwd,
         name: session.name,
+        // The copy is the same kind of window as its source — a Hermes window
+        // duplicates as a Hermes window — whatever process happens to hold the
+        // source's foreground right now.
+        ...(agent ? { agent_id: agent.id } : {}),
         skill_ids: access.skills.map((skill) => skill.id),
       });
       const layout = addTile(sourceTab.layout, { session_id: duplicate.id });
@@ -252,7 +261,6 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
         await deleteSession(duplicate.id).catch(() => undefined);
         throw error;
       }
-      const agent = runningAgent(session.foreground_command, agents);
       if (agent) {
         try {
           await pendingLaunches.persist(duplicate.id, agentRunCommand(agent));

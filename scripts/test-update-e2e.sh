@@ -201,11 +201,33 @@ update_test_start_daemon
 update_test_wait_host "$UPDATE_TREE_A" failed downgrade 30 >/dev/null
 cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
   || update_test_die "downgrade refusal changed the old binary"
+# The server may ask for a downgrade; only the host may consent. Asking alone
+# is refused, because a compromised control plane must not be able to roll the
+# fleet back to a known-vulnerable release (docs/TRUST.md).
 update_test_post_update '{"allow_downgrade":true}'
 [[ "$UPDATE_HTTP_STATUS" == "202" ]] \
   || update_test_die "allow_downgrade returned $UPDATE_HTTP_STATUS: $UPDATE_HTTP_BODY"
+update_test_wait_host "$UPDATE_TREE_A" failed downgrade 30 >/dev/null
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
+  || update_test_die "an unconsented downgrade changed the binary"
+printf '%s\n' "test-update-e2e: PASS downgrade refused without local consent"
+update_test_cleanup_fixture
+
+# With consent proven on the host, the same request proceeds. A fresh fixture
+# because the manual-update window would 429 a second request.
+printf '%s\n' "test-update-e2e: downgrade with local operator consent"
+update_test_new_fixture downgrade-consent
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon
+update_test_wait_host "$UPDATE_TREE_A" failed downgrade 30 >/dev/null
+touch "$UPDATE_DAEMON_HOME/.config/spawn/allow-downgrade"
+update_test_post_update '{"allow_downgrade":true}'
+[[ "$UPDATE_HTTP_STATUS" == "202" ]] \
+  || update_test_die "consented allow_downgrade returned $UPDATE_HTTP_STATUS: $UPDATE_HTTP_BODY"
 update_test_wait_host "$UPDATE_TREE_B" current "" 60 >/dev/null
-printf '%s\n' "test-update-e2e: PASS downgrade/allow_downgrade"
+printf '%s\n' "test-update-e2e: PASS downgrade/allow_downgrade with consent"
 update_test_cleanup_fixture
 
 printf 'test-update-e2e: passed in %ss (1 explicit SKIP)\n' "$((SECONDS - started_at))"

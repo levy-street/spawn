@@ -265,12 +265,12 @@ export function HostPairingStep({
           <EmptyState
             action={
               <Button onPress={pairAnother} variant="outline">
-                Connect another host
+                Connect another computer
               </Button>
             }
-            description={`${newHost.name} is connected. It will appear as soon as its daemon comes online.`}
+            description={`${newHost.name} is connected. It will appear as soon as SPAWN D comes online there.`}
             icon="ShieldCheck"
-            title="Host approved"
+            title="Computer approved"
           />
         </View>
       );
@@ -352,12 +352,12 @@ export function HostPairingStep({
         <EmptyState
           action={
             <Button onPress={pairAnother} variant="outline">
-              Connect another host
+              Connect another computer
             </Button>
           }
-          description={`${success.result.hostName} is connected. It will appear as soon as its daemon comes online.`}
+          description={`${success.result.hostName} is connected. It will appear as soon as SPAWN D comes online there.`}
           icon="ShieldCheck"
-          title="Host approved"
+          title="Computer approved"
         />
       </View>
     );

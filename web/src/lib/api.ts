@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CLIENT_INSTANCE_ID } from "@/lib/client-instance";
 import type { GridLayout, Tile, TileWidget } from "@/lib/grid";
 import { type ReleaseInfo, ReleaseSchema } from "@/lib/release";
 import type { LayoutV3, WorkspaceTab } from "@/lib/tabs";
@@ -42,6 +43,9 @@ export async function api<T>(
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
+      // Echoed as `origin` on the data-changed frames a mutation fans out,
+      // so this tab can tell its own echo from another client's change.
+      "X-Spawn-Client": CLIENT_INSTANCE_ID,
       ...headers,
     },
     ...rest,
@@ -333,6 +337,13 @@ export const SessionSchema = z.object({
   /** Basename of the foreground process, reported by the daemon; null until
    * the worker reports one (old workers never do). */
   foreground_command: z.string().nullable().default(null),
+  /**
+   * The agent this window was opened as — what SPAWN D typed into its shell —
+   * as opposed to `foreground_command`, which is whatever holds the terminal
+   * this second. Null for a window opened as a plain shell, or one stopped
+   * back to a prompt.
+   */
+  agent_id: z.string().uuid().nullable().default(null),
 });
 export type Session = z.infer<typeof SessionSchema>;
 
@@ -396,7 +407,7 @@ export const SessionAccessSchema = z.object({
 });
 export type SessionAccess = z.infer<typeof SessionAccessSchema>;
 
-/** Grid layout v2 (§4.4): a 12×12 canvas of non-overlapping session tiles. */
+/** Grid layout v2: a 12×12 canvas of non-overlapping session tiles. */
 export const TileWidgetSchema: z.ZodType<TileWidget> = z.object({
   kind: z.literal("files"),
   host_id: z.string().uuid(),
@@ -417,7 +428,7 @@ export const GridLayoutSchema: z.ZodType<GridLayout> = z.object({
   tiles: z.array(TileSchema),
 });
 
-/** Layout v3 (§4.4-tabs): ordered named tabs, each wrapping one tile grid. */
+/** Layout v3: ordered named tabs, each wrapping one tile grid. */
 export const WorkspaceTabSchema: z.ZodType<WorkspaceTab> = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -1357,12 +1368,15 @@ export const sessions = {
   /**
    * The daemon always spawns the login shell in `cwd` — no argv/env here.
    * `workspace_id` transactionally appends a tile to that workspace; omit
-   * `tile` to let the server auto-place (§4.4).
+   * `tile` to let the server auto-place.
    */
   create: (body: {
     host_id: string;
     cwd: string;
     name?: string;
+    /** The agent this window is being opened as, when it is being opened as
+     *  one: the type a duplicate of it reproduces. */
+    agent_id?: string | null;
     skill_ids?: string[];
     workspace_id?: string;
     tile?: { x: number; y: number; w: number; h: number };
@@ -1372,7 +1386,7 @@ export const sessions = {
       body: JSON.stringify(body),
       schema: SessionSchema,
     }),
-  update: (id: string, body: { name?: string | null }) =>
+  update: (id: string, body: { name?: string | null; agent_id?: string | null }) =>
     api(`/api/sessions/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
@@ -1470,7 +1484,12 @@ export const workspaces = {
    */
   create: (body?: {
     name?: string;
-    first_session?: { host_id: string; cwd: string; skill_ids?: string[] };
+    first_session?: {
+      host_id: string;
+      cwd: string;
+      agent_id?: string | null;
+      skill_ids?: string[];
+    };
     host_id?: string;
     cwd?: string;
     icon?: string | null;

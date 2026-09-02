@@ -14,6 +14,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import auth, billing_stripe
 from .agents_builtin import seed_builtin_agents
 from .config import get_settings
+from .data_events import DataEventMiddleware
 from .db import dispose_engine, get_sessionmaker, init_engine
 from .redis import lifespan_shutdown as redis_shutdown
 from .redis import lifespan_startup as redis_startup
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
 
     settings = get_settings()
     app.add_middleware(SessionRenewalMiddleware)
+    app.add_middleware(DataEventMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,

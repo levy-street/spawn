@@ -1356,7 +1356,7 @@ Note `conftest.py:14-27` sets env **before app import** and `SPAWN_PUBLIC_URL`
 is a hard assignment rather than `setdefault`. Billing tests must
 `monkeypatch.setenv` then `get_settings.cache_clear()`, as `test_config.py`
 already does. The schema comes from `Base.metadata.create_all`, not Alembic, so
-migration `0068` needs its own coverage in the `test_migration_00NN_*.py` style.
+migration `0070` needs its own coverage in the `test_migration_00NN_*.py` style.
 
 ### 9.2 Web
 
@@ -1416,7 +1416,7 @@ in the same commit, per the root `CLAUDE.md`.
 `docs/RELEASE.md` is the authority; read it in full before deploying. The
 ordering below exists because the wire and the schema move independently.
 
-1. **Migration `0068` first.** Additive only, so old code tolerates it and it
+1. **Migration `0070` first.** Additive only, so old code tolerates it and it
    runs while the previous processes drain. Confirm `alembic heads` is a single
    head after any merge.
 2. **Server with `SPAWN_BILLING_ENABLED=false`.** Everything ships dark: the

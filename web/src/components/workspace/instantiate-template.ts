@@ -84,14 +84,16 @@ export async function instantiateTemplate(
         .layout;
     }
     for (const tile of sessionTiles) {
+      const agent = tile.run.kind === "agent" ? matchAgent(tile.run.command, definitions) : null;
       const session = await sessions.create({
         host_id: host.id,
         cwd,
+        ...(agent && { agent_id: agent.id }),
         workspace_id: workspace.id,
         tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
       });
       if (tile.run.kind === "agent") {
-        pendingLaunch.set(session.id, launchCommand(tile.run.command, definitions));
+        pendingLaunch.set(session.id, agent ? agentRunCommand(agent) : tile.run.command);
       }
       focusSessionId ??= session.id;
     }
@@ -105,12 +107,12 @@ export async function instantiateTemplate(
 }
 
 /**
- * The template's stored command, re-resolved through the matching definition
- * so today's environment and yolo choice apply. Falls back to the stored
- * string when nothing matches — the definition may since have been deleted.
+ * The definition behind a template's stored command, so today's environment,
+ * yolo choice and window type all come from it. Null when nothing matches —
+ * the definition may since have been deleted, and the stored string is then
+ * still a command worth typing, just not a type worth recording.
  */
-function launchCommand(stored: string, definitions: readonly Agent[]): string {
+function matchAgent(stored: string, definitions: readonly Agent[]): Agent | null {
   const name = commandBasename(stored).toLowerCase();
-  const agent = definitions.find((item) => commandBasename(item.command).toLowerCase() === name);
-  return agent ? agentRunCommand(agent) : stored;
+  return definitions.find((item) => commandBasename(item.command).toLowerCase() === name) ?? null;
 }

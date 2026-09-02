@@ -149,7 +149,7 @@ describe("HostPairingStep link and machine wait", () => {
       await screen.findByText("curl -fsSL https://spawn.example/install.sh | sh"),
     ).toBeOnTheScreen();
     await fireEvent.press(screen.getByRole("radio", { name: "Windows" }));
-    expect(screen.getByText("Open PowerShell on your PC")).toBeOnTheScreen();
+    expect(screen.getByText("On that computer, paste this into a terminal")).toBeOnTheScreen();
     await fireEvent.press(screen.getByRole("button", { name: "Copy install command" }));
 
     expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
@@ -168,7 +168,7 @@ describe("HostPairingStep link and machine wait", () => {
     });
 
     await fireEvent.press(screen.getByRole("button", { name: "Copy install command" }));
-    expect(screen.queryByText("Host approved")).toBeNull();
+    expect(screen.queryByText("Computer approved")).toBeNull();
 
     const newHost = {
       ...onlineHost,
@@ -178,13 +178,13 @@ describe("HostPairingStep link and machine wait", () => {
     mockHosts = [onlineHost, newHost];
     await screen.rerender(<HostPairingStep accountId={ACCOUNT_ID} onExit={onExit} />);
 
-    expect(await screen.findByText("Host approved")).toBeOnTheScreen();
+    expect(await screen.findByText("Computer approved")).toBeOnTheScreen();
     expect(
       screen.getByText(
-        "Studio Mac is connected. It will appear as soon as its daemon comes online.",
+        "Studio Mac is connected. It will appear as soon as SPAWN D comes online there.",
       ),
     ).toBeOnTheScreen();
-    expect(screen.getByRole("button", { name: "Connect another host" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Connect another computer" })).toBeOnTheScreen();
 
     await screen.unmount();
   });

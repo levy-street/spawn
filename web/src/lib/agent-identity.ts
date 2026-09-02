@@ -3,10 +3,34 @@
  * to draw, and what to call the thing in prose. Lives in `lib` so both the
  * icon component and the session-title helpers can read it.
  */
-const SHELL_RE = /^(bash|zsh|fish|sh|dash)$/;
+/**
+ * The one list of shells, read here for the icon and by `lib/sessions` for
+ * the prompt test — a second copy drifted once already. Names are lower case
+ * with any Windows executable suffix already stripped.
+ */
+export const SHELL_COMMANDS: ReadonlySet<string> = new Set([
+  "bash",
+  "zsh",
+  "fish",
+  "sh",
+  "dash",
+  "powershell",
+  "pwsh",
+  "cmd",
+]);
+
+/**
+ * The daemon reports the kernel's own name for the foreground process, and on
+ * Windows that carries the executable extension — "claude.exe", "pwsh.exe" —
+ * which no agent definition or shell list spells out. Strip it before any
+ * comparison so the same program reads the same on every platform.
+ */
+export function stripExecutableSuffix(name: string): string {
+  return name.replace(/\.(exe|com|bat|cmd|ps1)$/i, "");
+}
 
 export type ResolvedAgentIcon = {
-  icon: "claude-code" | "codex" | "opencode" | "aider" | "shell" | "monogram";
+  icon: "claude-code" | "codex" | "opencode" | "aider" | "hermes" | "shell" | "monogram";
   /** Tooltip / accessible name: brand name, shell name, or the raw input. */
   label: string;
   /** Monogram letter (only for `icon: "monogram"`). */
@@ -23,12 +47,13 @@ export function commandBasename(command: string): string {
 }
 
 function matchName(name: string): ResolvedAgentIcon | null {
-  const lower = name.toLowerCase();
+  const lower = stripExecutableSuffix(name.toLowerCase());
   if (lower.includes("claude")) return { icon: "claude-code", label: "Claude Code" };
   if (lower.includes("codex")) return { icon: "codex", label: "Codex" };
   if (lower.includes("opencode")) return { icon: "opencode", label: "OpenCode" };
   if (lower.includes("aider")) return { icon: "aider", label: "Aider" };
-  if (SHELL_RE.test(lower)) return { icon: "shell", label: lower };
+  if (lower.includes("hermes")) return { icon: "hermes", label: "Hermes Agent" };
+  if (SHELL_COMMANDS.has(lower)) return { icon: "shell", label: lower };
   return null;
 }
 

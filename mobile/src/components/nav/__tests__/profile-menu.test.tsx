@@ -102,6 +102,25 @@ describe("ProfileMenu", () => {
     expect(screen.queryByTestId("profile-sheet")).toBeNull();
   });
 
+  it("carries the theme choice, and stays up while it changes", async () => {
+    const { screen } = await renderMenu();
+
+    await fireEvent.press(screen.getByLabelText("Open profile menu"));
+    expect(screen.getByTestId("profile-theme-mode")).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "System" }).props["accessibilityState"].checked).toBe(
+      true,
+    );
+
+    await fireEvent.press(screen.getByRole("radio", { name: "Dark" }));
+
+    // A value, not an action: the sheet holds so the change can be seen and
+    // undone, the way Appearance in Settings behaves.
+    expect(screen.getByRole("radio", { name: "Dark" }).props["accessibilityState"].checked).toBe(
+      true,
+    );
+    expect(screen.getByTestId("profile-sheet")).toBeTruthy();
+  });
+
   it("mirrors the account sign-out cleanup even when the request fails", async () => {
     jest.mocked(logOut).mockRejectedValueOnce(new Error("offline"));
     const { clear, screen } = await renderMenu();

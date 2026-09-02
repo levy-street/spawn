@@ -1,6 +1,10 @@
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use reqwest::Method;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use url::Url;
 
 use crate::api::ApiClient;
@@ -57,14 +61,44 @@ pub async fn password_signup(
     finish_auth(origin, response).await
 }
 
+/// The PKCE verifier for the sign-in this app is currently running.
+///
+/// A `spawn://auth/oauth?code=…` link arrives from the operating system, and
+/// the OS does not say who sent it. Without this, any such link would be
+/// exchanged: an attacker could complete OAuth with their own account and lure
+/// someone into opening the resulting link, at which point this app would sign
+/// itself into the attacker's account — and then, because the host gate
+/// possesses on arrival, register that person's computer as a host under it.
+/// The verifier never leaves this process until redemption, so a code minted
+/// for a flow that started somewhere else cannot be spent here.
+static PENDING_OAUTH: Mutex<Option<String>> = Mutex::new(None);
+
+fn begin_pkce() -> Result<String> {
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let verifier = URL_SAFE_NO_PAD.encode(raw);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    *PENDING_OAUTH.lock().expect("pending OAuth lock") = Some(verifier);
+    Ok(challenge)
+}
+
+/// Take the pending verifier, so a code can be redeemed at most once and only
+/// by the flow that is actually outstanding.
+fn take_pkce_verifier() -> Option<String> {
+    PENDING_OAUTH.lock().expect("pending OAuth lock").take()
+}
+
 pub fn oauth_start_url(origin: &str, provider: &str, invite: Option<&str>) -> Result<String> {
     if !OAUTH_PROVIDERS.contains(&provider) {
         bail!("unsupported OAuth provider")
     }
+    let challenge = begin_pkce()?;
     let mut url = Url::parse(origin)?.join(&format!("/api/auth/oauth/{provider}/start"))?;
     url.query_pairs_mut()
         .append_pair("return_to", "/")
-        .append_pair("redirect_uri", OAUTH_REDIRECT_URI);
+        .append_pair("redirect_uri", OAUTH_REDIRECT_URI)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
     if let Some(invite) = invite.filter(|value| !value.trim().is_empty()) {
         url.query_pairs_mut().append_pair("invite", invite.trim());
     }
@@ -72,12 +106,15 @@ pub fn oauth_start_url(origin: &str, provider: &str, invite: Option<&str>) -> Re
 }
 
 pub async fn exchange_oauth_code(origin: &str, code: &str) -> Result<AuthOutcome> {
+    let Some(verifier) = take_pkce_verifier() else {
+        bail!("This sign-in did not start in SPAWN D. Open SPAWN D and sign in from there.")
+    };
     let api = ApiClient::new(origin)?;
     let response: TokenResponse = api
         .anonymous_json(
             Method::POST,
             "/api/auth/oauth/exchange",
-            &json!({ "code": code }),
+            &json!({ "code": code, "code_verifier": verifier }),
         )
         .await?;
     finish_auth(origin, response).await
@@ -189,9 +226,11 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
     {
         bail!("Registered device does not match the local identity")
     }
-    let approval_required = before
-        .iter()
-        .any(|device| device.id != registered.id && device.revoked_at.is_none() && !device.is_root);
+    let hosts: serde_json::Value = api
+        .authenticated_get("/api/hosts")
+        .await
+        .context("checking this account's hosts")?;
+    let approval_required = approval_is_required(&before, &registered.id, &hosts);
     if approval_required {
         let _: serde_json::Value = api
             .authenticated_json(
@@ -239,6 +278,60 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
     })
 }
 
+/// Whether registering this device must wait on another device's approval.
+///
+/// Only when one is grantable: an approval is granted from a device a host
+/// trusts, so an account with zero hosts has nobody who could answer, and the
+/// gate would deadlock a fresh install. Nothing is lost by skipping it there —
+/// with no hosts there is nothing an approval protects, and the first
+/// possession pins the possessing device directly, exactly how the web
+/// bootstraps.
+fn approval_is_required(
+    devices: &[BrowserDevice],
+    registered_id: &str,
+    hosts: &serde_json::Value,
+) -> bool {
+    any_hosts(hosts)
+        && devices.iter().any(|device| {
+            device.id != registered_id && device.revoked_at.is_none() && !device.is_root
+        })
+}
+
+/// `/api/hosts` answers a bare array today; read the wrapped form too, as
+/// `install.rs` does when it watches for the pinned host.
+fn any_hosts(hosts: &serde_json::Value) -> bool {
+    hosts
+        .as_array()
+        .or_else(|| hosts.get("hosts").and_then(serde_json::Value::as_array))
+        .is_some_and(|entries| !entries.is_empty())
+}
+
+/// The device gate, re-asked for an install that is already signed in.
+///
+/// An earlier release required approval whenever another device existed, even
+/// when no host could grant one, and recorded that in `device_approved` — so a
+/// deadlocked install stays deadlocked across updates unless the question is
+/// asked again. When approval is not grantable, record the device as approved,
+/// as `finish_auth` now decides at sign-in, and let the wizard move on.
+pub async fn device_gate_needed() -> Result<bool> {
+    let preferences = storage::load_preferences()?;
+    if preferences.device_approved {
+        return Ok(false);
+    }
+    let api = ApiClient::new(&preferences.server_origin)?;
+    let hosts: serde_json::Value = api
+        .authenticated_get("/api/hosts")
+        .await
+        .context("checking this account's hosts")?;
+    if any_hosts(&hosts) {
+        return Ok(true);
+    }
+    let mut updated = preferences;
+    updated.device_approved = true;
+    storage::save_preferences(&updated)?;
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,8 +347,20 @@ mod tests {
         assert!(!endpoint_exists(reqwest::StatusCode::METHOD_NOT_ALLOWED));
     }
 
+    /// `PENDING_OAUTH` is process-wide on purpose: the app has one window and
+    /// one sign-in at a time, and a newly started flow should invalidate an
+    /// abandoned one. Tests that drive it therefore have to take turns.
+    static OAUTH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn oauth_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = OAUTH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        take_pkce_verifier();
+        guard
+    }
+
     #[test]
     fn oauth_hands_back_to_the_redirect_every_server_release_allows() {
+        let _guard = oauth_test_guard();
         let value = oauth_start_url("https://spawnd.dev", "google", None).unwrap();
         let parsed = Url::parse(&value).unwrap();
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
@@ -269,7 +374,50 @@ mod tests {
     }
 
     #[test]
+    fn oauth_start_commits_to_a_pkce_challenge_the_verifier_opens() {
+        let _guard = oauth_test_guard();
+        let value = oauth_start_url("https://spawnd.dev", "google", None).unwrap();
+        let parsed = Url::parse(&value).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        let challenge = params.get("code_challenge").expect("a challenge is sent");
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        let verifier = take_pkce_verifier().expect("a verifier is held");
+        assert!(verifier.len() >= 43, "{verifier}");
+        assert_ne!(&verifier, challenge, "the challenge is not the verifier");
+        assert_eq!(
+            &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+            challenge
+        );
+        // Taken exactly once: a second callback has nothing to spend.
+        assert!(take_pkce_verifier().is_none());
+    }
+
+    // The guard is held across the await on purpose: it serializes the
+    // process-global `PENDING_OAUTH` against the other tests in this module,
+    // which is the whole point of taking it, and no other task contends for it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_code_for_a_flow_that_started_elsewhere_is_never_exchanged() {
+        let _guard = oauth_test_guard();
+        // Nothing is pending — no `oauth_start_url` ran for this flow. The
+        // deep link an attacker lured onto this machine dies here, before any
+        // request is made.
+        assert!(take_pkce_verifier().is_none());
+        let error = exchange_oauth_code("https://spawnd.dev", &"a".repeat(32))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("did not start in SPAWN D"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn oauth_carries_an_invite_only_when_one_was_typed() {
+        let _guard = oauth_test_guard();
         let value = oauth_start_url("https://spawnd.dev", "apple", Some("  ")).unwrap();
         assert!(!value.contains("invite="));
         let value = oauth_start_url("https://spawnd.dev", "apple", Some(" ABC-123 ")).unwrap();
@@ -292,6 +440,55 @@ mod tests {
         assert_eq!(parsed.providers.len(), 2);
         assert_eq!(parsed.providers[1].id, "apple");
         assert!(parsed.email_verification_required && parsed.invite_only);
+    }
+
+    #[test]
+    fn approval_is_only_required_when_a_host_could_grant_it() {
+        let device = |id: &str, revoked: bool, is_root: bool| BrowserDevice {
+            id: id.into(),
+            key_algorithm: "ed25519".into(),
+            public_key: "k".into(),
+            label: None,
+            revoked_at: revoked.then(|| "2026-01-01T00:00:00Z".into()),
+            is_root,
+        };
+        let devices = vec![device("other", false, false), device("this", false, false)];
+        let hosts = serde_json::json!([{ "id": "host-1" }]);
+        assert!(approval_is_required(&devices, "this", &hosts));
+        // Zero hosts: nobody could grant an approval, so none is asked for —
+        // requiring one anyway deadlocked every fresh install on such an
+        // account.
+        assert!(!approval_is_required(
+            &devices,
+            "this",
+            &serde_json::json!([])
+        ));
+        assert!(!approval_is_required(
+            &devices,
+            "this",
+            &serde_json::json!({ "hosts": [] })
+        ));
+        assert!(approval_is_required(
+            &devices,
+            "this",
+            &serde_json::json!({ "hosts": [{}] })
+        ));
+        // Only another live, non-root device counts as an approver.
+        assert!(!approval_is_required(
+            &[device("this", false, false)],
+            "this",
+            &hosts
+        ));
+        assert!(!approval_is_required(
+            &[device("other", true, false), device("this", false, false)],
+            "this",
+            &hosts
+        ));
+        assert!(!approval_is_required(
+            &[device("other", false, true), device("this", false, false)],
+            "this",
+            &hosts
+        ));
     }
 
     #[test]

@@ -11,9 +11,11 @@ import {
 import { Pressable, StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
+  Easing,
   interpolate,
   useAnimatedStyle,
   useSharedValue,
+  withRepeat,
   withTiming,
 } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -41,6 +43,24 @@ const GLYPH = {
 
 export type ToastVariant = "default" | "success" | "error";
 
+/** A button on the notice itself, for a notice that asks rather than tells. */
+export interface ToastAction {
+  label: string;
+  onPress: () => void;
+  /** `primary` is the one the notice is recommending. */
+  variant?: "primary" | "secondary";
+}
+
+/**
+ * How far along, when a notice reports work rather than an event.
+ *
+ * `"indeterminate"` is a bar that moves without claiming a position, and is
+ * the honest answer here: the daemon reports update *state* and never byte
+ * counts, and `expo-updates` exposes no progress at all. A number is only
+ * passed where something real is counted.
+ */
+export type ToastProgress = "indeterminate" | number;
+
 export interface ToastShowOptions {
   detail?: string;
   variant?: ToastVariant;
@@ -48,6 +68,17 @@ export interface ToastShowOptions {
   durationMs?: number;
   onPress?: () => void;
   actionLabel?: string;
+  /**
+   * Stays until something dismisses it. For a notice about a *condition*
+   * rather than an event — an update waiting to be taken is still waiting
+   * five seconds later, and a notice that expires on its own has told the
+   * person nothing they could act on.
+   */
+  persistent?: boolean;
+  /** Buttons on the notice, under the text. */
+  actions?: readonly ToastAction[];
+  /** Draws a progress bar under the text. */
+  progress?: ToastProgress;
 }
 
 export interface ToastRecord {
@@ -60,11 +91,15 @@ export interface ToastRecord {
   expiresAt: number;
   onPress?: () => void;
   actionLabel?: string;
+  persistent?: boolean;
+  actions?: readonly ToastAction[];
+  progress?: ToastProgress;
   leaving: boolean;
 }
 
 export type ToastQueueAction =
   | { type: "enqueue"; toast: ToastRecord }
+  | { type: "update"; id: string; patch: Partial<ToastRecord> }
   | { type: "dismiss"; id: string }
   | { type: "remove"; id: string }
   | { type: "clear" };
@@ -101,17 +136,33 @@ export function toastQueueReducer(
                 ...(action.toast.actionLabel === undefined
                   ? {}
                   : { actionLabel: action.toast.actionLabel }),
+                ...(action.toast.persistent === undefined
+                  ? {}
+                  : { persistent: action.toast.persistent }),
+                ...(action.toast.actions === undefined ? {} : { actions: action.toast.actions }),
+                ...(action.toast.progress === undefined ? {} : { progress: action.toast.progress }),
                 leaving: false,
               }
             : item,
         );
       }
       const leaving = state.filter((item) => item.leaving);
-      const live = [...state.filter((item) => !item.leaving), action.toast].slice(
-        -MAX_VISIBLE_TOASTS,
-      );
-      return [...leaving, ...live];
+      // Persistent notices are held back from eviction first. One of them is a
+      // condition someone still has to answer — an update waiting to be taken
+      // — and losing it to a burst of transient notices would drop the only
+      // notice on screen that was asking a question.
+      const candidates = [...state.filter((item) => !item.leaving), action.toast];
+      const sticky = candidates.filter((item) => item.persistent);
+      const transient = candidates.filter((item) => !item.persistent);
+      const room = Math.max(0, MAX_VISIBLE_TOASTS - sticky.length);
+      return [...leaving, ...sticky, ...transient.slice(-room)];
     }
+    case "update":
+      // Unknown ids are ignored: the notice may have been dismissed by hand
+      // while the work that owns it was still running.
+      return state.map((item) =>
+        item.id === action.id && !item.leaving ? { ...item, ...action.patch } : item,
+      );
     case "dismiss":
       return state.map((item) => (item.id === action.id ? { ...item, leaving: true } : item));
     case "remove":
@@ -125,11 +176,99 @@ export interface ToastApi {
   show: (message: string, options?: ToastShowOptions) => string;
   success: (message: string, options?: Omit<ToastShowOptions, "variant">) => string;
   error: (message: string, options?: Omit<ToastShowOptions, "variant">) => string;
+  /**
+   * Change a notice already on screen, in place. A notice reporting work has
+   * to move — "update available" becomes "updating…" with a bar — and showing
+   * again would animate a second row in beside the first.
+   */
+  update: (id: string, patch: Partial<Omit<ToastShowOptions, "durationMs" | "variant">>) => void;
   dismiss: (id: string) => void;
   clear: () => void;
 }
 
 const ToastContext = createContext<ToastApi | null>(null);
+
+/**
+ * The bar under a notice that is reporting work.
+ *
+ * Indeterminate is a stripe travelling the track: it says "still going"
+ * without claiming a position, which is all we honestly know for a daemon
+ * update — the daemon reports state, never byte counts — or a mobile OTA,
+ * where `expo-updates` gives nothing to count. A number is only passed where
+ * something real is counted, and is clamped so a bad total cannot paint
+ * outside the track.
+ *
+ * Reduced motion holds a still, part-filled track rather than freezing the
+ * stripe mid-flight, which would read as stalled.
+ */
+export function ToastProgressBar({ progress }: { progress: ToastProgress }): React.JSX.Element {
+  const theme = useTheme();
+  const reducedMotion = useReducedMotionPreference();
+  const travel = useSharedValue(0);
+  const determinate = typeof progress === "number";
+  const percent = determinate ? Math.max(0, Math.min(100, Math.round(progress))) : 0;
+
+  useEffect(() => {
+    if (determinate || reducedMotion) return;
+    travel.value = 0;
+    travel.value = withRepeat(
+      withTiming(1, { duration: 1400, easing: Easing.inOut(Easing.ease) }),
+      -1,
+      false,
+    );
+  }, [determinate, reducedMotion, travel]);
+
+  const stripeStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: interpolate(travel.value, [0, 1], [-40, 120]) }],
+  }));
+
+  const track = (
+    <View
+      style={[
+        styles.progressTrack,
+        {
+          backgroundColor: theme.colors.muted,
+          borderRadius: theme.radii.pill,
+          height: theme.space(1),
+          marginTop: theme.space(2),
+        },
+      ]}
+    >
+      {determinate ? (
+        <View
+          style={{
+            backgroundColor: theme.colors.primary,
+            borderRadius: theme.radii.pill,
+            height: "100%",
+            width: `${percent}%`,
+          }}
+        />
+      ) : (
+        <Animated.View
+          style={[
+            {
+              backgroundColor: theme.colors.primary,
+              borderRadius: theme.radii.pill,
+              height: "100%",
+              width: reducedMotion ? "50%" : "35%",
+            },
+            reducedMotion ? undefined : stripeStyle,
+          ]}
+        />
+      )}
+    </View>
+  );
+
+  if (!determinate) return track;
+  return (
+    <View style={styles.progressRow}>
+      <View style={styles.progressFill}>{track}</View>
+      <Text color="mutedForeground" style={{ marginTop: theme.space(2) }} variant="caption">
+        {percent}%
+      </Text>
+    </View>
+  );
+}
 
 export interface ToastProps {
   toast: ToastRecord;
@@ -164,6 +303,12 @@ export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
   // is left rather than guessing whether it is about to go.
   useEffect(() => {
     if (reducedMotion || toast.leaving) return;
+    // A persistent notice is not spending anything: it waits for an answer,
+    // and a hairline draining to nothing would say it was about to go.
+    if (toast.persistent) {
+      remaining.value = 0;
+      return;
+    }
     // Read from the deadline rather than the duration, so a notice that was
     // refreshed by a repeat, or remounted, shows the time it actually has.
     const timeLeft = Math.max(0, toast.expiresAt - Date.now());
@@ -172,7 +317,15 @@ export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
       duration: timeLeft,
       easing: theme.motion.easing.linear,
     });
-  }, [reducedMotion, remaining, theme.motion, toast.durationMs, toast.expiresAt, toast.leaving]);
+  }, [
+    reducedMotion,
+    remaining,
+    theme.motion,
+    toast.durationMs,
+    toast.expiresAt,
+    toast.leaving,
+    toast.persistent,
+  ]);
 
   const dismiss = useCallback(() => onDismiss(toast.id), [onDismiss, toast.id]);
 
@@ -290,6 +443,40 @@ export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
         >
           {toast.detail}
         </Text>
+      ) : null}
+      {toast.progress === undefined ? null : <ToastProgressBar progress={toast.progress} />}
+      {toast.actions?.length ? (
+        <View style={[styles.actions, { gap: theme.space(1.5), marginTop: theme.space(2) }]}>
+          {toast.actions.map((action) => (
+            <Pressable
+              accessibilityLabel={action.label}
+              accessibilityRole="button"
+              key={action.label}
+              onPress={action.onPress}
+              style={[
+                styles.action,
+                {
+                  backgroundColor:
+                    action.variant === "primary" ? theme.colors.primary : "transparent",
+                  borderColor:
+                    action.variant === "primary" ? theme.colors.primary : theme.colors.border,
+                  borderRadius: theme.radii.lg,
+                  borderWidth: borderWidth.hairline,
+                  paddingHorizontal: theme.space(2.5),
+                  paddingVertical: theme.space(1),
+                },
+              ]}
+            >
+              <Text
+                color={action.variant === "primary" ? "primaryForeground" : "mutedForeground"}
+                variant="caption"
+                weight="medium"
+              >
+                {action.label}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
       ) : null}
     </View>
   );
@@ -413,6 +600,8 @@ export function ToastProvider({ children }: PropsWithChildren): React.JSX.Elemen
       );
       const id = duplicate?.id ?? `toast-${nextId.current++}`;
       const now = Date.now();
+      // A persistent notice carries no deadline; the sweeper below skips it.
+      const expiresAt = options.persistent ? Number.POSITIVE_INFINITY : now + durationMs;
       dispatch({
         type: "enqueue",
         toast: {
@@ -422,9 +611,12 @@ export function ToastProvider({ children }: PropsWithChildren): React.JSX.Elemen
           variant,
           ...(options.icon === undefined ? {} : { icon: options.icon }),
           durationMs,
-          expiresAt: now + durationMs,
+          expiresAt,
           ...(options.onPress === undefined ? {} : { onPress: options.onPress }),
           ...(options.actionLabel === undefined ? {} : { actionLabel: options.actionLabel }),
+          ...(options.persistent === undefined ? {} : { persistent: options.persistent }),
+          ...(options.actions === undefined ? {} : { actions: options.actions }),
+          ...(options.progress === undefined ? {} : { progress: options.progress }),
           leaving: false,
         },
       });
@@ -435,6 +627,13 @@ export function ToastProvider({ children }: PropsWithChildren): React.JSX.Elemen
     [theme.motion.duration.toastError, theme.motion.duration.toastInfo],
   );
 
+  const update = useCallback(
+    (id: string, patch: Partial<Omit<ToastShowOptions, "durationMs" | "variant">>) => {
+      dispatch({ type: "update", id, patch });
+    },
+    [],
+  );
+
   const clear = useCallback(() => {
     for (const timer of removalTimers.current.values()) clearTimeout(timer);
     removalTimers.current.clear();
@@ -442,7 +641,9 @@ export function ToastProvider({ children }: PropsWithChildren): React.JSX.Elemen
   }, []);
 
   useEffect(() => {
-    const live = queue.filter((item) => !item.leaving);
+    const live = queue.filter(
+      (item) => !item.leaving && item.expiresAt !== Number.POSITIVE_INFINITY,
+    );
     if (live.length === 0) return;
     const soonest = Math.min(...live.map((item) => item.expiresAt));
     const timer = setTimeout(
@@ -467,12 +668,13 @@ export function ToastProvider({ children }: PropsWithChildren): React.JSX.Elemen
   const api = useMemo<ToastApi>(
     () => ({
       show,
+      update,
       success: (message, options) => show(message, { ...options, variant: "success" }),
       error: (message, options) => show(message, { ...options, variant: "error" }),
       dismiss,
       clear,
     }),
-    [clear, dismiss, show],
+    [clear, dismiss, show, update],
   );
 
   return (
@@ -531,9 +733,30 @@ const styles = StyleSheet.create({
   host: {
     position: "absolute",
   },
+  action: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  actions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+  },
   messageColumn: {
     flex: 1,
     minWidth: 0,
+  },
+  progressFill: {
+    flex: 1,
+    minWidth: 0,
+  },
+  progressRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: spacing[2],
+  },
+  progressTrack: {
+    overflow: "hidden",
   },
   plate: {
     alignItems: "center",

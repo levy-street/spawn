@@ -14,6 +14,12 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="mobile release scripts require POSIX shell semantics"
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SCRIPT = REPO_ROOT / "scripts" / "update-mobile-prod.sh"
 
@@ -41,7 +47,7 @@ def _git(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _write_executable(path: Path, body: str) -> None:
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 

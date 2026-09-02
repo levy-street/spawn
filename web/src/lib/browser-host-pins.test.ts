@@ -9,10 +9,12 @@ import {
   BROWSER_HOST_PIN_STORE_NAME,
   BrowserHostPinError,
   forgetActiveBrowserHostPins,
+  getBrowserHostPinRevision,
   loadBrowserHostPin,
   loadBrowserHostPinByHostId,
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
+  subscribeToBrowserHostPinChanges,
 } from "./browser-host-pins";
 import { ed25519PublicKeyFingerprint, encodeBase64Url } from "./signed-signal";
 
@@ -776,6 +778,34 @@ describe("approveBrowserHostPin Host ID seeding", () => {
     );
     expect(bound?.hostPublicKey).toBe(HOST_KEY);
     expect(bound?.hostIds).toEqual([HOST_ID]);
+  });
+
+  test("announces a revision when trust changes, so a refused pane can retry", async () => {
+    const factory = new IDBFactory();
+    const seen: number[] = [];
+    const unsubscribe = subscribeToBrowserHostPinChanges(() =>
+      seen.push(getBrowserHostPinRevision()),
+    );
+    try {
+      const before = getBrowserHostPinRevision();
+      await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+      expect(seen.length).toBe(1);
+      expect(getBrowserHostPinRevision()).toBeGreaterThan(before);
+
+      await revokeBrowserHostPin(revokeInput(), options(factory));
+      expect(seen.length).toBe(2);
+
+      // Forgetting nothing changed nothing, so it says nothing.
+      await forgetActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, options(factory));
+      expect(seen.length).toBe(2);
+    } finally {
+      unsubscribe();
+    }
+
+    // And a listener that has unsubscribed stops hearing.
+    const quiet = seen.length;
+    await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+    expect(seen.length).toBe(quiet);
   });
 
   test("re-approving unions new Host IDs without dropping existing ones", async () => {

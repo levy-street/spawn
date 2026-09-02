@@ -316,8 +316,17 @@ Built-in agents (server-seeded, idempotent, `owner_user_id = null`):
 - **codex** — command `codex`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`, yolo `--dangerously-bypass-approvals-and-sandbox`
 - **opencode** — command `opencode`, install `npm install -g opencode-ai`, yolo `OPENCODE_PERMISSION` (it has no flag; permissions are configuration)
 - **aider-sonnet** — command `aider --model claude-sonnet-4-6`, install `pipx install aider-chat || pip install --user aider-chat`, yolo `--yes-always`
+- **hermes** — command `hermes`, install `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`, yolo `--yolo`
 
 There is no `shell` built-in: sessions *are* shells.
+
+`hermes` installs from a vendor script rather than a registry, so
+`latest_tool_version` cannot resolve an update target for it and the tools
+panel shows its installed version with no "latest" — the only npm package
+carrying that name is an unofficial third-party bridge, and pointing a
+built-in at one would be a supply-chain decision, not a version check. It does
+get the daemon's self-updater (`hermes update --yes`), the same treatment as
+`claude-code`.
 
 > spawn does not manage agent-CLI provider credentials. Each agent CLI handles
 > its own login interactively on the host (e.g. `claude /login` writes
@@ -817,6 +826,29 @@ still be `running`.
   one event is published for this transition, never a finish as well.
 - `alerts.ping` — idle keepalive, roughly every 25 s. Carries no meaning
   beyond "the link is alive"; a client that stops seeing them should redial.
+
+### Data-changed frames
+
+The socket's third family (beside `alert` and `trust`), and the reason every
+open client shows the same account at the same moment:
+
+```json
+{"type": "data", "resource": "workspaces", "id": "workspace-uuid", "origin": "client-uuid", "at": "2026-08-31T10:00:00+00:00"}
+```
+
+One frame is published per successful mutation of client-visible data —
+`workspaces`, `workspace-templates`, `sessions`, `hosts`, `agents`, `profile`
+— whether it arrived over HTTP (`data_events.py`'s response hook covers every
+route under those prefixes) or from the daemon socket (a session started or
+ended on the host itself; a host's presence flipping at register/disconnect).
+The frame is deliberately content-free: it names what *kind* of thing changed,
+never what it changed to, so the socket's content discipline holds and the
+client refetches through the same GET it already uses. `id` is the mutated
+row when the path named one, else null. `origin` echoes the mutating request's
+`X-Spawn-Client` header — a self-chosen per-tab (web) or per-launch (mobile)
+id, advisory routing only — so the client that made the change can skip the
+refetch it would only race with its own optimistic state. Frames with an
+unknown `resource` are a future server talking and must be dropped silently.
 
 ## Direct per-session DataChannels
 

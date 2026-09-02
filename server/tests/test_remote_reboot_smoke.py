@@ -8,6 +8,12 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="the remote reboot smoke harness requires POSIX shell semantics"
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "smoke-remote-systemd-reboot.sh"
 

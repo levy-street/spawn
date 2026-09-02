@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
 import { type AdminEmail, type AdminInvite, type AdminUser, ApiError, admin } from "@/lib/api";
 import { useAuthConfig } from "@/lib/auth";
 import { hostLimitOverrideLabel } from "@/lib/billing";
@@ -135,13 +136,7 @@ function Emails() {
             </tr>
           </thead>
           <tbody className="divide-y divide-border" data-testid="admin-emails">
-            {emails.isLoading && (
-              <tr>
-                <td className="px-3 py-3 text-muted-foreground" colSpan={5}>
-                  Loading…
-                </td>
-              </tr>
-            )}
+            {emails.isLoading && <LoadingRow colSpan={5} label="Loading email" />}
             {!emails.isLoading && (emails.data ?? []).length === 0 && (
               <tr>
                 <td className="px-3 py-3 text-muted-foreground" colSpan={5}>
@@ -360,13 +355,7 @@ function Users() {
             </tr>
           </thead>
           <tbody className="divide-y divide-border" data-testid="admin-users">
-            {users.isLoading && (
-              <tr>
-                <td className="px-3 py-3 text-muted-foreground" colSpan={columns}>
-                  Loading…
-                </td>
-              </tr>
-            )}
+            {users.isLoading && <LoadingRow colSpan={columns} label="Loading users" />}
             {(users.data ?? []).map((user) => (
               <tr key={user.id}>
                 <td className="px-3 py-2">
@@ -563,13 +552,7 @@ function Invites() {
             </tr>
           </thead>
           <tbody className="divide-y divide-border" data-testid="admin-invites">
-            {invites.isLoading && (
-              <tr>
-                <td className="px-3 py-3 text-muted-foreground" colSpan={5}>
-                  Loading…
-                </td>
-              </tr>
-            )}
+            {invites.isLoading && <LoadingRow colSpan={5} label="Loading invites" />}
             {!invites.isLoading && (invites.data ?? []).length === 0 && (
               <tr>
                 <td className="px-3 py-3 text-muted-foreground" colSpan={5}>
@@ -607,5 +590,22 @@ function Invites() {
         </table>
       </div>
     </section>
+  );
+}
+
+/**
+ * A table's loading state in the shape of the rows to come — two placeholder
+ * lines across the table — rather than a word in its first cell.
+ */
+function LoadingRow({ colSpan, label }: { colSpan: number; label: string }) {
+  return (
+    <tr>
+      <td className="px-3 py-3" colSpan={colSpan}>
+        <div role="status" aria-label={label} className="space-y-2">
+          <Skeleton className="h-4 w-2/5" />
+          <Skeleton className="h-4 w-3/5" />
+        </div>
+      </td>
+    </tr>
   );
 }

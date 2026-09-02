@@ -22,6 +22,7 @@ from sqlalchemy.orm import aliased
 from .. import auth as auth_mod
 from .. import host_capacity, legion, release
 from ..config import get_settings
+from ..data_events import publish_data_changed
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Session
@@ -2185,6 +2186,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             )
                         await _bounded_send_text(conn, registered_payload)
                         registered = True
+                        await publish_data_changed(host.owner_user_id, "hosts", host.id)
                         conn.durable_owner_valid_until = (
                             time.monotonic() + DURABLE_OWNERSHIP_CACHE_SECONDS
                         )
@@ -2283,10 +2285,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         durable_owner = False
                         started = False
                         rejected_owner = False
+                        started_owner_id: str | None = None
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
                             session_row = await session.get(Session, sid) if durable_owner else None
                             if session_row is not None and session_row.host_id == host.id:
+                                started_owner_id = session_row.owner_user_id
                                 result = await session.execute(
                                     update(Session)
                                     .where(
@@ -2325,6 +2329,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             if not published:
                                 await _close_daemon_consistency_failure(conn)
                                 break
+                            # The per-session event above reaches only panes
+                            # already open on this session; the account-wide
+                            # frame is what flips the list everywhere else.
+                            if started_owner_id is not None:
+                                await publish_data_changed(started_owner_id, "sessions", sid)
                     else:
                         await errors.send("invalid_frame", ftype)
 
@@ -2582,6 +2591,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         quiet_watch.cancel(sid)
                         if died_alert is not None:
                             await _publish_user_alert(conn, alert_owner_id, died_alert)
+                        if exited:
+                            # The alert above is a courtesy some accounts mute;
+                            # the data frame is what removes the pane from
+                            # every other open client either way.
+                            await publish_data_changed(alert_owner_id, "sessions", sid)
                         detached = await broker.detach_session(
                             sid,
                             expected_daemon=conn,
@@ -2822,13 +2836,15 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     session, host.id, conn.id, conn.host_generation
                 )
             async with _bounded_host_ownership_session() as session:
-                await _mark_host_offline_if_owner(
+                marked_offline = await _mark_host_offline_if_owner(
                     session,
                     host.id,
                     conn.id,
                     conn.host_generation,
                     reason=disconnect_reason,
                 )
+            if marked_offline:
+                await publish_data_changed(host.owner_user_id, "hosts", host.id)
         log.info("daemon disconnected host=%s", host.id)
 
 

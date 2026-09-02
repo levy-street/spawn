@@ -134,7 +134,7 @@ describe("onboarding security states", () => {
 
     expect(screen.queryByRole("radio", { name: "Windows" })).toBeNull();
     await fireEvent.press(screen.getByRole("radio", { name: "Windows (WSL)" }));
-    expect(screen.getByText("Open PowerShell on your PC")).toBeOnTheScreen();
+    expect(screen.getByText("On that computer, paste this into a terminal")).toBeOnTheScreen();
     await fireEvent.press(screen.getByLabelText("Copy install command"));
     expect(Clipboard.setStringAsync).toHaveBeenLastCalledWith(
       'wsl -- bash -c "curl -fsSL https://spawnd.dev/install.sh | sh"',
@@ -158,7 +158,7 @@ describe("onboarding security states", () => {
     expect(screen.queryByRole("radio", { name: "Windows (WSL)" })).toBeNull();
 
     await fireEvent.press(screen.getByRole("radio", { name: "Windows" }));
-    expect(screen.getByText("Open PowerShell on your PC")).toBeOnTheScreen();
+    expect(screen.getByText("On that computer, paste this into a terminal")).toBeOnTheScreen();
     expect(screen.getByText("irm https://spawn.example/install.ps1 | iex")).toBeOnTheScreen();
     await fireEvent.press(screen.getByLabelText("Copy install command"));
     expect(Clipboard.setStringAsync).toHaveBeenLastCalledWith(
@@ -190,11 +190,13 @@ describe("onboarding security states", () => {
 
     expect(
       screen.getByText(
-        "Install the daemon on a machine you control, then approve it from the link spawnd possess prints. It appears here once it's online.",
+        "A host is a computer SPAWN D opens terminals on — usually your own Mac, Linux, or Windows machine.",
       ),
     ).toBeOnTheScreen();
     expect(
-      screen.getByText("After installation, run spawnd possess on that machine."),
+      screen.getByText(
+        "When the install finishes it prints a link. Open it on this phone or scan the QR code.",
+      ),
     ).toBeOnTheScreen();
     expect(
       screen.getByText(

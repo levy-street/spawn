@@ -7,7 +7,6 @@ import {
   ExternalLink,
   LayoutTemplate,
   Palette,
-  Server,
   ShieldCheck,
   User,
   Wrench,
