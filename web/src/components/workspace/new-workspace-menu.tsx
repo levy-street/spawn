@@ -66,11 +66,13 @@ export function NewWorkspaceMenu({
       // the folder just chosen. Booting a terminal nobody asked for makes the
       // first thing you do closing it.
       const result = await workspaces.create({ host_id: host.id, cwd });
+      // The envelope the view is about to ask for is already in hand: seed
+      // it, so the new workspace opens without a "Loading workspace" beat.
+      queryClient.setQueryData(["workspace", result.workspace.id], result.workspace);
       return { workspaceId: result.workspace.id, focusSessionId: null };
     },
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
-      queryClient.invalidateQueries({ queryKey: ["workspace", result.workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       onCreated?.(result);
     },
