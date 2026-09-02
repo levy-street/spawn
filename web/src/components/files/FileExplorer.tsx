@@ -420,7 +420,9 @@ export const FileExplorer = forwardRef<
       const panel = containerRef.current?.getBoundingClientRect() ?? null;
       const card = document.getElementById("file-preview-card")?.getBoundingClientRect() ?? null;
       if (!panel && !card) return true;
-      // Anywhere in the list keeps it up; rows handle swapping between files.
+      // Inside the list the rows decide: another file swaps the card, and a
+      // folder or the bare panel (below the last row, between rows) takes it
+      // away — see the row's pointerenter and the tree's pointermove.
       if (panel && within(panel, x, y)) return false;
       if (card) {
         const cardOnRight = panel
@@ -1081,6 +1083,14 @@ export const FileExplorer = forwardRef<
         tabIndex={0}
         onKeyDown={onRowKeyDown}
         onScroll={() => hover.cancel()}
+        // The card is about a file, so it goes the moment the pointer is on
+        // something that is not one: the panel's own ground, past the last
+        // row or in the gutter beside them. A pinned card stays — Space
+        // asked for it, and only Escape answers that.
+        onPointerMove={(event) => {
+          if (hover.value === null || hover.pinned) return;
+          if (!(event.target as Element).closest("[role='treeitem']")) hover.cancel();
+        }}
         className={cn(
           "min-h-0 flex-1 overflow-y-auto py-1 outline-none focus-visible:ring-1 focus-visible:ring-ring",
           dropDir && resolvedRoot === dropDir && "bg-primary/5",
@@ -1213,7 +1223,14 @@ export const FileExplorer = forwardRef<
                 // Enter/leave, never move: they fire once per row, so running
                 // the pointer down a list cannot re-trigger a fetch per pixel.
                 onPointerEnter={() => {
-                  if (isDir || isRenaming || menu || dropDir || viewing) return;
+                  // A folder has nothing to preview, and resting on one is
+                  // the pointer saying it has moved on from the file whose
+                  // card is up — so the card goes, unless it was pinned.
+                  if (isDir) {
+                    if (!hover.pinned) hover.cancel();
+                    return;
+                  }
+                  if (isRenaming || menu || dropDir || viewing) return;
                   hover.enter({ path: entry.path });
                 }}
                 onContextMenu={(e) => openContextMenu(e, entry, parentDir)}
