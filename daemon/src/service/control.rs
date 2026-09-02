@@ -163,6 +163,17 @@ pub fn start_listener(
                     request.truncate(size);
                     decode_request(&request)
                 }
+                // A read that fails because the client is already gone — the
+                // instance was recycled under it, or a connect completed with
+                // nobody on the other end, which a loaded machine produces —
+                // has nobody to answer. Writing an error reply here only
+                // races the next client, who would read a rejection meant
+                // for no one (and never retry it). Recycle the instance and
+                // listen again; the client side retries within its deadline.
+                Err(error) if is_gone_client(&error) => {
+                    let _ = server.disconnect();
+                    continue;
+                }
                 Err(error) => Err(error.into()),
             };
             match command {
@@ -222,6 +233,16 @@ pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
             Err(error) => return Err(error),
         }
     }
+}
+
+/// The server-side twin of [`is_recycled_instance`]: a read that failed
+/// because no client is on the other end any more, whether it disconnected
+/// or was never really there.
+#[cfg(windows)]
+fn is_gone_client(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
+    error.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32)
+        || error.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 #[cfg(windows)]
