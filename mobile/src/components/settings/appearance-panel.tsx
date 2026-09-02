@@ -5,7 +5,7 @@ import { SegmentedControl } from "@/components/ui/segmented-control";
 import { Text } from "@/components/ui/text";
 import { type ThemeMode, useThemeMode } from "@/theme";
 
-const THEME_OPTIONS = [
+export const THEME_OPTIONS = [
   { label: "Light", value: "light" },
   { label: "Dark", value: "dark" },
   { label: "System", value: "system" },

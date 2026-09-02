@@ -152,7 +152,7 @@ export const DropdownMenu = forwardRef<
   const focusItem = (direction: 1 | -1) => {
     const items = Array.from(
       rootRef.current?.querySelectorAll<HTMLElement>(
-        "[role='menuitem']:not([aria-disabled]),[role='menuitemcheckbox']:not([aria-disabled])",
+        "[role='menuitem']:not([aria-disabled]),[role='menuitemcheckbox']:not([aria-disabled]),[role='menuitemradio']:not([aria-disabled])",
       ) ?? [],
     );
     if (items.length === 0) return;
