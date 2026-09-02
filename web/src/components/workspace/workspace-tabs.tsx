@@ -47,6 +47,7 @@ import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import {
+  ApiError,
   agents,
   type Host,
   hosts,
@@ -59,7 +60,7 @@ import {
 import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE } from "@/lib/grid";
 import { basename } from "@/lib/paths";
-import { runningAgent } from "@/lib/sessions";
+import { sessionAgent } from "@/lib/sessions";
 import {
   addTab,
   allTiles,
@@ -955,6 +956,12 @@ export function WorkspaceTabs({
         throw new Error(`A workspace holds at most ${MAX_TABS} tabs.`);
       }
       const sessionsById = new Map((sessionsQ.data ?? []).map((item) => [item.id, item]));
+      // Awaited rather than read from the hook: a duplicate fired before the
+      // registry query settles would silently copy every agent pane as a bare
+      // shell. Failure falls back to the empty list it used to read.
+      const definitions = await queryClient
+        .ensureQueryData({ queryKey: ["agents"], queryFn: agents.list })
+        .catch(() => []);
       const copiedIds = new Map<string, string>();
       const created: string[] = [];
       try {
@@ -968,14 +975,15 @@ export function WorkspaceTabs({
           if (!source) continue; // a tile whose session is already gone
           const access = await sessionAccess.get(source.id).catch(() => null);
           const skillIds = access?.skills.map((skill) => skill.id) ?? [];
+          const agent = sessionAgent(source, definitions);
           const copy = await sessions.create({
             host_id: source.host_id,
             cwd: source.cwd,
+            ...(agent && { agent_id: agent.id }),
             ...(skillIds.length > 0 && { skill_ids: skillIds }),
           });
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
-          const agent = runningAgent(source, agentsQ.data ?? []);
           if (agent) pendingLaunch.set(copy.id, agentRunCommand(agent));
         }
         const next = duplicateTab(
@@ -1012,18 +1020,32 @@ export function WorkspaceTabs({
     const sessionIds = tab.layout.tiles
       .filter((tile) => !tile.widget)
       .map((tile) => tile.session_id);
-    if (sessionIds.length > 0) {
+    // Only sessions that still exist earn the "process killed" warning — a
+    // tab holding nothing but dead panes closes without ceremony. Until the
+    // session list has loaded, assume everything is live rather than skip a
+    // destructive confirmation.
+    const known = sessionsQ.data;
+    const liveCount = known
+      ? sessionIds.filter((id) => known.some((session) => session.id === id)).length
+      : sessionIds.length;
+    if (liveCount > 0) {
       const accepted = await confirm({
         title: `Close ${tab.name}?`,
-        body: `${sessionIds.length === 1 ? "Its session" : `Its ${sessionIds.length} sessions`} will be closed and the running ${sessionIds.length === 1 ? "process" : "processes"} killed.`,
+        body: `${liveCount === 1 ? "Its session" : `Its ${liveCount} sessions`} will be closed and the running ${liveCount === 1 ? "process" : "processes"} killed.`,
         confirmLabel: "Close tab",
         destructive: true,
       });
       if (!accepted) return;
+    }
+    if (sessionIds.length > 0) {
       const results = await Promise.allSettled(sessionIds.map((id) => sessions.remove(id)));
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       const failed = results.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected" &&
+          // A session the server has already dropped is the outcome closing
+          // asked for; only a failure that leaves one running keeps the tab.
+          !(result.reason instanceof ApiError && result.reason.status === 404),
       );
       if (failed) {
         onError?.(failed.reason instanceof Error ? failed.reason.message : String(failed.reason));
@@ -1187,6 +1209,13 @@ export function WorkspaceTabs({
       // Two strips are two tablists, and "Workspace tabs" twice over says
       // nothing about which workspace either one holds.
       aria-label={splitChrome ? `${splitChrome.workspaceName} tabs` : "Workspace tabs"}
+      // Stamped for the grid's pane drag, the same contract as each tab
+      // button below: the strip's own ground (not a tab, not a control) is
+      // where a dragged pane can be dropped to get a tab of its own, and the
+      // owner says whose envelope that tab would join (a split shows two
+      // strips; see ownStripGroundAt in WorkspaceGrid).
+      data-workspace-tab-strip
+      data-workspace-tab-strip-owner={workspace.id}
       className="flex h-11 shrink-0 items-end gap-1.5 overflow-x-auto bg-shell pr-1.5 pb-1.5"
     >
       {splitChrome && (
@@ -1204,30 +1233,65 @@ export function WorkspaceTabs({
       {orderedTabs.map((tab) => {
         const active = tab.id === activeTabId;
         const attention = tabAttentionCount(tab, sessionsById);
+        // The tab's shape, shared by the tab and by its rename: renaming
+        // swaps the label for a field and changes nothing else, so the tab
+        // keeps its place in the strip and its footing on the panel.
+        const shape = cn(
+          "flex h-8 min-w-40 items-center gap-1.5 rounded-md pl-3 text-xs font-medium transition-colors",
+          // The label stays level with the resting tabs: the extra
+          // height is all bottom padding, swallowed by flex centering.
+          // A connected tab continues the surface directly beneath it:
+          // a pane's header tint (card over background), washed exactly
+          // like the pane when that pane is unfocused; the empty tab's
+          // plain panel otherwise.
+          active && "bg-[var(--tab-surface)] text-foreground",
+          active &&
+            (look.connected && look.surface === "header"
+              ? look.dimmed
+                ? "[--tab-surface:color-mix(in_oklab,var(--foreground)_3.5%,color-mix(in_oklab,var(--card)_75%,var(--background)))] dark:[--tab-surface:color-mix(in_oklab,black_25%,color-mix(in_oklab,var(--card)_75%,var(--background)))]"
+                : "[--tab-surface:color-mix(in_oklab,var(--card)_75%,var(--background))]"
+              : "[--tab-surface:var(--background)]"),
+          // `tab-connected` flares the foot into the panel: see globals.
+          active && look.connected && "tab-connected -mb-1.5 h-[38px] rounded-b-none pb-1.5",
+          !active &&
+            "bg-background/40 text-muted-foreground hover:bg-background/60 hover:text-foreground",
+        );
         if (renamingId === tab.id) {
           return (
-            // The strip has no left padding, so the first tab's input would
-            // lose its border and focus ring to the panel edge.
-            <form
-              key={tab.id}
-              onSubmit={(event) => submitRename(tab.id, event)}
-              className="pb-0.5 pl-0.5"
-            >
-              <Input
-                autoFocus
-                aria-label={`Rename ${tab.name}`}
-                value={draft}
-                onChange={(event) => setDraft(event.currentTarget.value)}
-                onBlur={() => submitRename(tab.id)}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    setRenamingId(null);
-                  }
-                }}
-                className="h-7 w-32 px-2 text-xs"
-              />
-            </form>
+            <div key={tab.id} className="relative shrink-0">
+              <form
+                onSubmit={(event) => submitRename(tab.id, event)}
+                className={cn(shape, "pr-3.5")}
+              >
+                <input
+                  // biome-ignore lint/a11y/noAutofocus: the field replaces the label of the tab that was just clicked to rename it — landing in it is the gesture, not a surprise.
+                  autoFocus
+                  aria-label={`Rename ${tab.name}`}
+                  value={draft}
+                  // The field is the label's own text with a rule under it —
+                  // no box, no ring — and it is as wide as the name it holds:
+                  // `size` is its natural width, the tab's floor is its
+                  // minimum, and the label's ceiling is its maximum, so a
+                  // long name grows the tab exactly as the label would.
+                  size={Math.max(12, draft.length + 1)}
+                  onFocus={(event) => event.currentTarget.select()}
+                  onChange={(event) => setDraft(event.currentTarget.value)}
+                  onBlur={() => submitRename(tab.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setRenamingId(null);
+                    }
+                  }}
+                  className={cn(
+                    "mt-0.5 h-auto min-w-0 max-w-48 flex-auto border-0 border-b bg-transparent p-0 pb-0.5 text-xs font-medium leading-5 text-inherit outline-none",
+                    // A hairline of the label's own colour, faint: a rule to
+                    // write on, not a box drawn around the words.
+                    "border-current/15 focus:border-current/30",
+                  )}
+                />
+              </form>
+            </div>
           );
         }
         return (
@@ -1276,25 +1340,8 @@ export function WorkspaceTabs({
                 }
               }}
               className={cn(
-                "flex h-8 min-w-40 items-center gap-1.5 rounded-md pl-3 text-xs font-medium transition-colors",
+                shape,
                 canClose ? "pr-6.5" : "pr-3.5",
-                // The label stays level with the resting tabs: the extra
-                // height is all bottom padding, swallowed by flex centering.
-                // A connected tab continues the surface directly beneath it:
-                // a pane's header tint (card over background), washed exactly
-                // like the pane when that pane is unfocused; the empty tab's
-                // plain panel otherwise.
-                active && "bg-[var(--tab-surface)] text-foreground",
-                active &&
-                  (look.connected && look.surface === "header"
-                    ? look.dimmed
-                      ? "[--tab-surface:color-mix(in_oklab,var(--foreground)_3.5%,color-mix(in_oklab,var(--card)_75%,var(--background)))] dark:[--tab-surface:color-mix(in_oklab,black_25%,color-mix(in_oklab,var(--card)_75%,var(--background)))]"
-                      : "[--tab-surface:color-mix(in_oklab,var(--card)_75%,var(--background))]"
-                    : "[--tab-surface:var(--background)]"),
-                // `tab-connected` flares the foot into the panel: see globals.
-                active && look.connected && "tab-connected -mb-1.5 h-[38px] rounded-b-none pb-1.5",
-                !active &&
-                  "bg-background/40 text-muted-foreground hover:bg-background/60 hover:text-foreground",
                 // The badge is its own visual edge, so it sits closer in than
                 // a bare label wants to.
                 attention > 0 && "pl-2",
@@ -1339,6 +1386,20 @@ export function WorkspaceTabs({
       >
         <Copy className="size-3.5 shrink-0" aria-hidden />
         <span ref={tabGhostLabelRef} className="max-w-48 truncate" />
+      </div>
+      {/* The pane drag's promise, dressed as the tab ghost above: resting a
+          dragged window on the strip's open ground lights this chip where the
+          new tab would land, and the drop makes that tab and carries the
+          window into it. The grid owns the hover — it stamps data-newtab-hover
+          here mid-gesture (see WorkspaceGrid), the same wiring as the
+          launcher's bin morph — so nothing about the drag re-renders React. */}
+      <div
+        aria-hidden
+        data-workspace-newtab-ghost
+        className="hidden h-8 shrink-0 items-center gap-1.5 rounded-md border-2 border-dashed border-ring bg-ring/10 px-3 text-xs font-medium text-foreground data-[newtab-hover]:flex"
+      >
+        <Plus className="size-3.5 shrink-0" aria-hidden />
+        New tab
       </div>
       {/* A tab is only ever wanted for what goes in it, so the "+" asks what
           that is first and makes the tab and the window together. The tab is

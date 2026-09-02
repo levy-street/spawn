@@ -71,6 +71,7 @@ const session = {
   activity_state: "active",
   activity_label: "Active",
   foreground_command: "codex",
+  agent_id: null,
 };
 
 const skill = {
@@ -82,6 +83,11 @@ const skill = {
   enabled_by_default: false,
   created_at: NOW,
 };
+
+it("reads a session from a server that predates the window's recorded type", () => {
+  const { agent_id: _omitted, ...older } = session;
+  expect(SessionOutSchema.parse(older).agent_id).toBeNull();
+});
 
 it("round-trips auth/account response JSON", () => {
   // The plan block rides on `UserOut` itself, so the token responses carry

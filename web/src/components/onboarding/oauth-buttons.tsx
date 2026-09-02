@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import type { AuthProvider } from "@/lib/api";
 
 /**
@@ -76,7 +77,25 @@ export function OAuthButtons({
   invite?: string | null;
   loading?: boolean;
 }) {
-  if (loading || providers.length === 0) return null;
+  // While the server's answer is in flight the set holds its ground as ghost
+  // buttons, so the form does not jump when the real ones land. Only a server
+  // that has answered "no providers" collapses the section.
+  if (providers.length === 0) {
+    if (!loading) return null;
+    return (
+      <div className="space-y-4" aria-hidden data-testid="oauth-buttons-loading">
+        <div className="space-y-2">
+          <Skeleton className="h-11 w-full" />
+          <Skeleton className="h-11 w-full" />
+        </div>
+        <div className="flex items-center gap-3 font-sigil text-[10px] uppercase tracking-[0.22em] text-ash">
+          <div className="h-px flex-1 bg-line-g" aria-hidden />
+          <span>or use email</span>
+          <div className="h-px flex-1 bg-line-g" aria-hidden />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">

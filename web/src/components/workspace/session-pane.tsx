@@ -484,6 +484,15 @@ export function SessionPane({
               {muted ? "Unmute alerts" : "Mute alerts"}
             </DropdownMenuItem>
           )}
+          {!session && (
+            /* With the session gone every session action above is gone with
+               it, and a menu with nothing in it is a bug drawn on screen. The
+               one thing a dead pane can still do is leave. */
+            <DropdownMenuItem onSelect={() => onRemoveFromWorkspace(sessionId)}>
+              <X className="size-4" aria-hidden />
+              Remove from workspace
+            </DropdownMenuItem>
+          )}
           {stacked && (
             <>
               <DropdownMenuSeparator />
@@ -498,22 +507,22 @@ export function SessionPane({
             </>
           )}
         </DropdownMenu>
-        {session && (
-          /* Closing has its own control, at the far right where a window's
-             close has always been. The confirmation dialog protects against
-             accidental clicks, so the X can express its intent directly. */
-          <button
-            type="button"
-            aria-label={`Close ${title}`}
-            disabled={closeM.isPending}
-            onClick={closeSession}
-            // Pulled back off the bar's rhythm: the two controls are one
-            // cluster at the end of the header, not two more items in the row.
-            className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive disabled:opacity-50"
-          >
-            <X className="size-3.5" aria-hidden />
-          </button>
-        )}
+        {/* Closing has its own control, at the far right where a window's
+            close has always been. The confirmation dialog protects against
+            accidental clicks, so the X can express its intent directly. A
+            pane whose session is gone has no process to kill, so its X skips
+            the ceremony and just takes the dead pane out of the layout. */}
+        <button
+          type="button"
+          aria-label={session ? `Close ${title}` : "Remove from workspace"}
+          disabled={closeM.isPending}
+          onClick={session ? closeSession : () => onRemoveFromWorkspace(sessionId)}
+          // Pulled back off the bar's rhythm: the two controls are one
+          // cluster at the end of the header, not two more items in the row.
+          className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive disabled:opacity-50"
+        >
+          <X className="size-3.5" aria-hidden />
+        </button>
       </header>
 
       {session ? (
@@ -554,8 +563,19 @@ export function SessionPane({
           )}
         </div>
       ) : (
-        <div className="grid min-h-0 flex-1 place-items-center p-6 text-center text-sm text-muted-foreground">
-          This session no longer exists. Remove it from the workspace.
+        <div className="grid min-h-0 flex-1 place-items-center p-6">
+          {/* Offer the way out rather than describing it: removing the pane is
+              a layout edit, nothing here is running, so no confirmation. */}
+          <div className="flex max-w-xs flex-col items-center gap-3 text-center">
+            <p className="text-sm text-muted-foreground">This session no longer exists.</p>
+            <button
+              type="button"
+              onClick={() => onRemoveFromWorkspace(sessionId)}
+              className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-xs font-medium hover:bg-accent"
+            >
+              Remove from workspace
+            </button>
+          </div>
         </div>
       )}
 

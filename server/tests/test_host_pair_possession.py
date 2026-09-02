@@ -80,10 +80,10 @@ def test_rust_signature_rejects_every_ceremony_binding_mutation(field: str) -> N
 @pytest.mark.parametrize(
     "device_code",
     [
-        "A" * 42,
-        "A" * 43 + "=",
-        "!" * 43,
-        "A" * (16 * 1024 * 1024),
+        pytest.param("A" * 42, id="wrong-length"),
+        pytest.param("A" * 43 + "=", id="padded"),
+        pytest.param("!" * 43, id="non-base64url"),
+        pytest.param("A" * (16 * 1024 * 1024), id="oversized"),
     ],
 )
 def test_device_code_decoder_rejects_malformed_or_oversized_wire(device_code: str) -> None:

@@ -8,6 +8,12 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="production deploy scripts require POSIX shell semantics"
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy-prod.sh"
 HEALTH_SCRIPT = REPO_ROOT / "scripts" / "health-check.sh"
@@ -15,7 +21,7 @@ RELEASE_LIB = REPO_ROOT / "scripts" / "release-lib.sh"
 
 
 def _write_executable(path: Path, body: str) -> None:
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 

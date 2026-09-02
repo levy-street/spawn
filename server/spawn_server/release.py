@@ -425,6 +425,20 @@ def _published_desktop_artifact_exists(path: Path) -> bool:
         return False
 
 
+def _latest_published_desktop_version(directory: Path) -> str | None:
+    """The version `scripts/publish-desktop.sh` last uploaded, read from the
+    Tauri updater manifest it writes beside the images. Only the version is
+    taken on faith — whether that version's images are still present is
+    re-proven against the directory exactly like the checkout's own."""
+    try:
+        raw = json.loads((directory / "latest.json").read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return _clean_desktop_version(raw.get("version"))
+
+
 def _warn_missing_desktop_dir_once(directory: Path) -> None:
     global _desktop_dir_warned
     if is_local_deployment(getattr(get_settings(), "public_url", "")):
@@ -459,9 +473,13 @@ def desktop_release(identity: _ReleaseIdentity | None = None) -> schemas.Release
     Two absences, deliberately not treated alike:
 
     - **The release directory exists and the image is not in it.** That is a
-      release which has not been published yet. Say nothing, exactly as the
-      daemon block says nothing without a manifest. The download surfaces
-      already handle a null block: they fall through to `/desktop-build` and
+      release which has not been published yet. Advertise the build
+      `publish-desktop.sh` last uploaded instead: its `latest.json` names the
+      version, and the directory still has to prove that version's images the
+      usual way. The old build's tree is unknowable from disk, so it goes out
+      as None. With no readable manifest, or one whose images are also gone,
+      say nothing, exactly as the daemon block says nothing without a
+      manifest — the download surfaces fall through to `/desktop-build` and
       then to "Coming soon".
     - **The release directory does not exist.** Then nothing has been
       established, and withholding the block would trade a 404 for a Mac
@@ -483,7 +501,15 @@ def desktop_release(identity: _ReleaseIdentity | None = None) -> schemas.Release
             version=version, tree=tree, platforms=list(FAIL_OPEN_DESKTOP_PLATFORMS)
         )
     if PRIMARY_DESKTOP_PLATFORM not in published:
-        return None
+        # A deploy that landed before its publish. The gap is real but it is
+        # not a reason to pull a download that was fine yesterday.
+        previous = _latest_published_desktop_version(directory)
+        if previous is None:
+            return None
+        previous_published = published_desktop_platforms(previous, root=directory)
+        if previous_published is None or PRIMARY_DESKTOP_PLATFORM not in previous_published:
+            return None
+        return schemas.ReleaseDesktop(version=previous, tree=None, platforms=previous_published)
     # Narrowed to what is on disk, so the Intel link on /download appears only
     # when the Intel image does. A finished `publish-desktop.sh` uploads both
     # or neither, so a real release still lists both.

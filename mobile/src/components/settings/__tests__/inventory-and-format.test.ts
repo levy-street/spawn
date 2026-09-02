@@ -47,7 +47,7 @@ describe("settings presentation formatters", () => {
 
     expect(formatProfileMemory(16 * 1024 ** 3)).toBe("16 GB");
     expect(formatProfileDuration(3_720)).toBe("1h 2m");
-    expect(profileStatsLine(profile)).toBe("2 hosts · 12 cores · 16 GB · 5 agent runs · spawnd");
+    expect(profileStatsLine(profile)).toBe("2 hosts · 12 cores · 16 GB · 5 agent runs · SPAWN D");
     expect(profileStatsLine(profile)).not.toContain("claude");
   });
 

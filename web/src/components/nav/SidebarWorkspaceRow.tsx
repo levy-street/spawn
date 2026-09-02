@@ -23,7 +23,6 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import type { Workspace } from "@/lib/api";
@@ -111,7 +110,10 @@ export function SidebarWorkspaceRow({
               )}
             />
             {attentionCount > 0 && (
-              <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-card bg-warning" />
+              // Astride the tile's top-right corner, ringed in the rail's own
+              // ground (bg-shell, not card) so the gap reads as the sidebar
+              // showing through — an inset dot, not a haloed one.
+              <span className="absolute -right-1 -top-1 size-3 rounded-full border-2 border-shell bg-warning" />
             )}
           </Link>
         </RailTooltip>
@@ -133,13 +135,28 @@ export function SidebarWorkspaceRow({
     >
       <div className="group/workspace relative">
         {editing ? (
-          <form onSubmit={submitRename} className="flex h-(--row-h) items-center gap-1 px-1">
-            <Input
+          // The row itself, with the name made writable: the same shape, the
+          // same mark, and the label swapped for a field that is nothing but
+          // the text with a faint rule under it — the tab strip's rename,
+          // drawn a row wide.
+          <form
+            onSubmit={submitRename}
+            className={cn(sidebarRowClass(active), "pr-3 text-foreground")}
+          >
+            <SidebarIconSlot>
+              <WorkspaceAvatar name={workspace.name} icon={workspace.icon} />
+            </SidebarIconSlot>
+            <input
+              // biome-ignore lint/a11y/noAutofocus: the field replaces the name of the row that was just asked to rename itself — landing in it is the gesture, not a surprise.
               autoFocus
               aria-label={`Rename ${workspace.name}`}
-              className="h-7 min-w-0 flex-1 px-2 text-xs"
+              className={cn(
+                "mt-0.5 h-auto min-w-0 flex-1 border-0 border-b bg-transparent p-0 pb-0.5 text-sm font-medium leading-5 text-inherit outline-none",
+                "border-current/15 focus:border-current/30 disabled:opacity-50",
+              )}
               value={draft}
               disabled={busy}
+              onFocus={(event) => event.currentTarget.select()}
               onChange={(event) => setDraft(event.currentTarget.value)}
               onBlur={() => submitRename()}
               onKeyDown={(event) => {

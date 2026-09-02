@@ -691,6 +691,13 @@ pub fn durable_replace(from: &Path, to: &Path) -> io::Result<()> {
     move_file(from, to, true)
 }
 
+/// No-op: Windows has no directory fsync, and `move_file` already passes
+/// `MOVEFILE_WRITE_THROUGH`, so the rename is committed before it returns.
+/// Present so callers can stay platform-agnostic.
+pub fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 pub fn rename_noreplace_at(parent: &Dir, from: &Path, to: &Path) -> io::Result<()> {
     move_file_at_verified(parent, from, to, false)
 }
@@ -1100,6 +1107,13 @@ fn ascii_lower_u16(value: u16) -> u16 {
 }
 
 #[cfg(test)]
+pub fn symlink_fixture_unavailable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        || error.raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1236,7 +1250,7 @@ mod tests {
                 open_private_file(&file_link, false).unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied
             ),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) if symlink_fixture_unavailable(&error) => {}
             Err(error) => panic!("creating file symlink failed unexpectedly: {error}"),
         }
 
@@ -1248,7 +1262,7 @@ mod tests {
                 open_private_dir(&dir_link).unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied
             ),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) if symlink_fixture_unavailable(&error) => {}
             Err(error) => panic!("creating directory symlink failed unexpectedly: {error}"),
         }
     }

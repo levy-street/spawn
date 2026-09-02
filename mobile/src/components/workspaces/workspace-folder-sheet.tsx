@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 
 import { FolderPicker } from "@/components/launcher/folder-picker";
+import { pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
 import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
@@ -146,6 +147,9 @@ export function WorkspaceFolderSheet({
               haptics.selection();
               onPick({ hostId: host.id, hostName: host.name, path });
             }}
+            // Without this the picker defaults to POSIX and mangles every path
+            // on a Windows host — separators, the drive root, the home check.
+            pathFlavor={pathFlavorForHostOS(host.os)}
             recentDirectories={recents.data ?? []}
             recentError={recents.error instanceof Error ? recents.error.message : null}
             transport={transport}

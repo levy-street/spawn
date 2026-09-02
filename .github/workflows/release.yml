@@ -1,0 +1,275 @@
+name: release
+
+# What a push to master owes, done in the order docs/RELEASE.md forces.
+#
+# This workflow decides nothing on its own: `scripts/release-plan.sh` compares
+# subtree hashes between the deployed commit and this one and reports which
+# pieces changed, and every job below is gated on that answer. Most pushes owe
+# one or two rows; a push that changes only docs owes none and this finishes in
+# seconds.
+#
+# The order is not a preference. The daemon prebuilts must be published before
+# or with the server that advertises them, because a daemon refused at the
+# handshake heals itself from the manifest that server serves — publish the
+# server first and every daemon in the field spends its retry loop fetching a
+# build that is refused just the same. The mobile OTA goes last for the mirror
+# reason: the server must already be up, so no phone fetches JavaScript newer
+# than the API it talks to.
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Commit currently in production (default: the previous commit)"
+        required: false
+
+# A half-finished release is worse than a queued one, so releases never cancel
+# each other and never overlap.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: what does this owe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # EXPO_TOKEN is an environment secret, and the fingerprint check needs it;
+    # without an environment the mobile row would silently read "unknown" and
+    # a release that owed a store build would quietly not do one. The policy
+    # permits only master, which is also what this workflow runs on.
+    environment: production
+    outputs:
+      deploy: ${{ steps.plan.outputs.deploy }}
+      daemon_prebuilts: ${{ steps.plan.outputs.daemon_prebuilts }}
+      mobile_ota: ${{ steps.plan.outputs.mobile_ota }}
+      mobile_native_build: ${{ steps.plan.outputs.mobile_native_build }}
+      desktop_publish: ${{ steps.plan.outputs.desktop_publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-plan.sh compares two commits' subtrees, so it needs both.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: npm ci
+
+      - name: Work out what changed
+        id: plan
+        env:
+          # The fingerprint comparison asks EAS what native shell the last
+          # production build had. Without it the mobile row is "unknown", and
+          # the store-build job below refuses to guess.
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          FROM: ${{ github.event.inputs.from }}
+        run: |
+          set -euo pipefail
+          args=(--json)
+          if [ -n "${FROM:-}" ]; then
+            args+=(--from "$FROM")
+          elif [ -n "${{ github.event.before }}" ] && \
+               git rev-parse --verify --quiet "${{ github.event.before }}^{commit}" >/dev/null; then
+            args+=(--from "${{ github.event.before }}")
+          fi
+          [ -n "${EXPO_TOKEN:-}" ] || args+=(--no-fingerprint)
+          scripts/release-plan.sh "${args[@]}" | tee /tmp/plan.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          plan = json.load(open("/tmp/plan.json"))
+          for key in ("deploy", "daemon_prebuilts", "mobile_ota", "desktop_publish"):
+              print(f"{key}={str(plan[key]).lower()}")
+          print(f"mobile_native_build={plan['mobile_native_build']}")
+          PY
+
+      - name: Say it out loud
+        run: |
+          {
+            echo "### Release plan"
+            echo '```json'
+            cat /tmp/plan.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The daemon binaries themselves are built and published by prebuilt.yml,
+  # which fires on the same push. This job waits for that rolling release to
+  # describe *this* commit before the deploy is allowed to consume it.
+  await_prebuilts:
+    name: wait for prebuilt-latest
+    needs: plan
+    if: needs.plan.outputs.daemon_prebuilts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for the rolling release to describe this daemon tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          want="$(git rev-parse HEAD:daemon)"
+          for _ in $(seq 1 60); do
+            got="$(gh release download prebuilt-latest --repo "$GITHUB_REPOSITORY" \
+                     --pattern TREE --output - 2>/dev/null || true)"
+            if [ "$got" = "$want" ]; then
+              echo "prebuilt-latest describes $want"; exit 0
+            fi
+            echo "prebuilt-latest is at '${got:-none}', waiting for $want"
+            sleep 60
+          done
+          echo "::error::prebuilt-latest never described $want; the deploy would be refused anyway" >&2
+          exit 1
+
+  deploy:
+    name: server, web, daemon manifest and the phone
+    needs: [plan, await_prebuilts]
+    # A daemon-only change still deploys, because that is what publishes the
+    # signed manifest. always() keeps this reachable when await-prebuilts was
+    # skipped for a release that owes no prebuilts.
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      needs.await_prebuilts.result != 'failure' &&
+      needs.await_prebuilts.result != 'cancelled' &&
+      (needs.plan.outputs.deploy == 'true' ||
+       needs.plan.outputs.daemon_prebuilts == 'true' ||
+       needs.plan.outputs.mobile_ota == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      # The manifest is signed through the server project's pinned crypto, and
+      # the OTA proves its bake with `npx expo config` — so both toolchains
+      # have to be here, not just ssh.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: npm ci
+
+      - name: Authorise SSH to the production host
+        env:
+          DEPLOY_KEY: ${{ secrets.SPAWN_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SPAWN_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [ -n "${DEPLOY_KEY:-}" ] || { echo "::error::SPAWN_DEPLOY_SSH_KEY is not set" >&2; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Pinned, never scanned: TOFU against a host that deploys production
+          # is the one place a first connection must not be trusted blindly.
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          # Keepalives are load-bearing: the runner's NAT drops a connection
+          # that goes quiet, and a deploy has minutes-long silent phases. The
+          # first release hung for forty minutes on exactly this.
+          printf 'Host spawnd-prod\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  ServerAliveInterval 15\n  ServerAliveCountMax 8\n' \
+            "${{ vars.SPAWN_DEPLOY_HOSTNAME }}" "${{ vars.SPAWN_DEPLOY_USER }}" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Provide the offline daemon release-signing key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.SPAWN_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          # deploy-prod.sh refuses to publish prebuilts without this, and that
+          # refusal is correct: an unsigned manifest is not a release. See the
+          # note in docs/RELEASE.md about what putting this key here costs.
+          [ -n "${RELEASE_SIGNING_KEY:-}" ] || { echo "::error::SPAWN_RELEASE_SIGNING_KEY is not set" >&2; exit 1; }
+          install -d -m 700 ~/.config/spawn
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > ~/.config/spawn/release-signing.key
+          chmod 600 ~/.config/spawn/release-signing.key
+
+      - name: Deploy server, web, the signed daemon manifest and the OTA
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          # release-lib.sh pulls prebuilt-latest with gh, which needs a token
+          # on a runner (and this repository is private).
+          GH_TOKEN: ${{ github.token }}
+          # Inherited values are refused by the script, so name it explicitly.
+          SPAWN_DEPLOY_MOBILE_CHANNEL: production
+        run: |
+          set -euo pipefail
+          scripts/deploy-prod.sh spawnd-prod --api-proxy-target http://127.0.0.1:8001
+
+  # Only when the tree no longer fits the native shell already on phones.
+  # Most releases skip this; see the mobile note in docs/RELEASE.md.
+  mobile-store-build:
+    name: TestFlight and Play
+    needs: [plan, deploy]
+    if: needs.plan.outputs.mobile_native_build == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: npm ci
+      - name: Build and submit both stores
+        working-directory: mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          # EAS otherwise tries to switch ASSOCIATED_DOMAINS off, Apple's API
+          # rejects the patch, and the build dies. Universal links want it on.
+          EXPO_NO_CAPABILITY_SYNC: "1"
+        run: |
+          set -euo pipefail
+          [ -n "${EXPO_TOKEN:-}" ] || { echo "::error::EXPO_TOKEN is not set" >&2; exit 1; }
+          # eas-cli is not one of mobile's devDependencies, so npx must be told
+          # to fetch it — a bare `npx eas` cannot determine an executable.
+          npx --yes eas-cli build --platform all --profile production --non-interactive --auto-submit
+
+  # desktop.yml builds and signs the app on the same push. Promoting those
+  # artifacts needs the offline Tauri updater key, which signs latest.json.
+  desktop-publish:
+    name: publish the desktop app
+    needs: [plan, deploy]
+    if: needs.plan.outputs.desktop_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Not yet wired
+        run: |
+          echo "::warning::desktop publication is not automated yet."
+          {
+            echo "### Desktop still needs a person"
+            echo
+            echo "\`desktop/\` changed, so this release owes a desktop publish."
+            echo "Download the signed artifacts from the \`Desktop artifacts\` run"
+            echo "for this commit, sign the payloads with the offline Tauri"
+            echo "updater key, assemble \`latest.json\`, then:"
+            echo
+            echo '```'
+            echo "scripts/publish-desktop.sh spawnd-prod <artifact-dir>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

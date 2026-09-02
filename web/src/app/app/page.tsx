@@ -3,13 +3,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { Plus, Server } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Trident } from "@/components/icons/BrandMark";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
-import { Spinner } from "@/components/ui/spinner";
+import { PageSpinner } from "@/components/ui/spinner";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
+import { WorkspaceSplit } from "@/components/workspace/workspace-split";
 import { hosts, workspaces } from "@/lib/api";
 import { useAuth, useAuthConfig } from "@/lib/auth";
 
@@ -27,6 +28,16 @@ export default function AppEntryPage() {
   const router = useRouter();
   const { user, loading: authLoading, error: authError } = useAuth();
   const { config, loading: configLoading, error: configError } = useAuthConfig();
+  // The workspace this page just made, drawn here until the address bar
+  // catches up. Every later workspace is created from inside one that is
+  // already on screen, so it simply appears; the first one used to fall
+  // through to the entry spinner below while the route changed, and a
+  // full-page loader between picking a folder and seeing it was the one
+  // creation that looked different from all the others.
+  const [created, setCreated] = useState<{
+    workspaceId: string;
+    focusSessionId: string | null;
+  } | null>(null);
   const hostsQ = useQuery({
     queryKey: ["hosts"],
     queryFn: hosts.list,
@@ -97,7 +108,7 @@ export default function AppEntryPage() {
     workspacesQ.isLoading,
   ]);
 
-  if (authLoading) return <AppEntrySpinner />;
+  if (authLoading) return <PageSpinner label="Opening your workspace" />;
   if (authError) {
     return (
       <EmptyState
@@ -107,10 +118,10 @@ export default function AppEntryPage() {
     );
   }
 
-  if (!user) return <AppEntrySpinner />;
+  if (!user) return <PageSpinner label="Opening your workspace" />;
 
   if (configLoading || hostsQ.isLoading || workspacesQ.isLoading || verificationIncomplete) {
-    return <AppEntrySpinner />;
+    return <PageSpinner label="Opening your workspace" />;
   }
 
   if (configError || hostsQ.error || workspacesQ.error) {
@@ -130,6 +141,20 @@ export default function AppEntryPage() {
           </Button>
         }
       />
+    );
+  }
+
+  if (created) {
+    // The same tree /w/[id] renders, under the same shell, so the replace
+    // that follows swaps the URL beneath a page that is already showing it.
+    return (
+      <AppShell mainClassName="overflow-hidden !pb-0">
+        <WorkspaceSplit
+          workspaceId={created.workspaceId}
+          focusParam={created.focusSessionId}
+          tabParam={null}
+        />
+      </AppShell>
     );
   }
 
@@ -168,6 +193,7 @@ export default function AppEntryPage() {
               }
               onCreated={({ workspaceId, focusSessionId }) => {
                 window.localStorage.setItem("spawn.workspaces.last", workspaceId);
+                setCreated({ workspaceId, focusSessionId });
                 router.replace(
                   focusSessionId
                     ? `/w/${workspaceId}?focus=${focusSessionId}`
@@ -181,13 +207,5 @@ export default function AppEntryPage() {
     );
   }
 
-  return <AppEntrySpinner />;
-}
-
-function AppEntrySpinner() {
-  return (
-    <div className="flex min-h-vv items-center justify-center">
-      <Spinner size={20} label="Opening your workspace" />
-    </div>
-  );
+  return <PageSpinner label="Opening your workspace" />;
 }

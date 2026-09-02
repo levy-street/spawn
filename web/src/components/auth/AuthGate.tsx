@@ -2,13 +2,14 @@
 
 import { useRouter } from "next/navigation";
 import { type ReactNode, useEffect } from "react";
+import { PageSpinner } from "@/components/ui/spinner";
 import { useAuth } from "@/lib/auth";
 import { stashDeviceApproval } from "@/lib/device-approval-stash";
 
 /**
  * Wraps protected pages. If the `me()` call resolves to `null` (401), we
- * redirect to /login. While loading, render a tiny placeholder so we don't
- * flash the page contents to anonymous users.
+ * redirect to /login. While loading, hold the page back behind the shared
+ * page spinner so we don't flash the page contents to anonymous users.
  *
  * The current path + query is carried as `?next=`. `/device` first stashes its
  * ref and out-of-band `#k=` in tab-scoped sessionStorage: a URL fragment cannot
@@ -33,13 +34,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     }
   }, [loading, user, router]);
 
-  if (loading) {
-    return (
-      <div className="flex min-h-vv items-center justify-center text-sm text-muted-foreground">
-        Loading...
-      </div>
-    );
-  }
+  if (loading) return <PageSpinner label="Loading account" />;
   if (!user) return null;
   return <>{children}</>;
 }

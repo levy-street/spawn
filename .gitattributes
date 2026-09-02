@@ -3,24 +3,25 @@
 # "Binary files differ" and thus slip through code review unseen. See the
 # trust-envelope.ts incident fixed in the same series as this file's addition.
 #
-# `text` normalizes line endings to LF; `diff` overrides git's NUL-byte binary
-# heuristic so these paths always produce a textual diff.
-*.ts    text diff
-*.tsx   text diff
-*.js    text diff
-*.mjs   text diff
-*.cjs   text diff
-*.jsx   text diff
-*.rs    text diff
-*.py    text diff
-*.sh    text diff
-*.json  text diff
-*.jsonc text diff
-*.toml  text diff
-*.yaml  text diff
-*.yml   text diff
-*.css   text diff
-*.scss  text diff
-*.html  text diff
-*.md    text diff
-*.sql   text diff
+# `text` normalizes line endings in the index; `eol=lf` also keeps Windows
+# checkouts compatible with the repo's formatters. `diff` overrides git's
+# NUL-byte binary heuristic so these paths always produce a textual diff.
+*.ts    text eol=lf diff
+*.tsx   text eol=lf diff
+*.js    text eol=lf diff
+*.mjs   text eol=lf diff
+*.cjs   text eol=lf diff
+*.jsx   text eol=lf diff
+*.rs    text eol=lf diff
+*.py    text eol=lf diff
+*.sh    text eol=lf diff
+*.json  text eol=lf diff
+*.jsonc text eol=lf diff
+*.toml  text eol=lf diff
+*.yaml  text eol=lf diff
+*.yml   text eol=lf diff
+*.css   text eol=lf diff
+*.scss  text eol=lf diff
+*.html  text eol=lf diff
+*.md    text eol=lf diff
+*.sql   text eol=lf diff

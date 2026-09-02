@@ -72,7 +72,12 @@ export const AccountDeleteRequestSchema = z.object({
   password: z.string().nullable().optional(),
 });
 export const AuthProviderOutSchema = z.object({ id: ProviderIdSchema, name: z.string() });
-export const OAuthExchangeRequestSchema = z.object({ code: z.string().min(16).max(256) });
+export const OAuthExchangeRequestSchema = z.object({
+  code: z.string().min(16).max(256),
+  // PKCE: proves this app started the flow the code came back from. Optional
+  // on the wire so a server that predates it still accepts the request.
+  code_verifier: z.string().min(43).max(128).optional(),
+});
 // Sign in with Apple on iOS never leaves the app, so there is no callback and no
 // one-time code: the identity token Apple hands the button goes straight up.
 export const AppleNativeSignInSchema = z.object({

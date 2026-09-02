@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen } from "@testing-library/react-native";
+import { act, fireEvent, render, screen } from "@testing-library/react-native";
 
 import {
   APPROVED_DWELL_MS,
   DeviceApprovalCeremony,
 } from "@/components/trust/device-approval-ceremony";
+import { ApiError } from "@/data/api/client";
 import { DeviceIdentityError } from "@/lib/crypto/identity";
 import { ThemeProvider } from "@/theme";
 
@@ -91,6 +92,7 @@ async function renderCeremony(onRequestClose: () => void = jest.fn()) {
       </ThemeProvider>
     </QueryClientProvider>,
   );
+  return client;
 }
 
 describe("device approval ceremony", () => {
@@ -137,15 +139,19 @@ describe("device approval ceremony", () => {
       ),
       refetch,
     };
-    await renderCeremony();
+    const client = await renderCeremony();
+    const resetQueries = jest.spyOn(client, "resetQueries");
     expect(mockRequestApproval).not.toHaveBeenCalled();
-    expect(screen.getByText(/no identity yet/i)).toBeOnTheScreen();
+    expect(screen.getByText(/identity storage is unavailable/i)).toBeOnTheScreen();
     // The cause, not the internal sentence that threw.
-    expect(screen.getByText(/could not save SPAWN D's key/i)).toBeOnTheScreen();
-    expect(screen.getByText(/try again/i)).toBeOnTheScreen();
+    expect(screen.getByText(/could not save SPAWN D's identity key/i)).toBeOnTheScreen();
+    await fireEvent.press(screen.getByText(/try again/i));
+    expect(resetQueries).toHaveBeenCalledWith({
+      queryKey: ["browser-device-registration", "00000000-0000-4000-8000-00000000cccc"],
+    });
   });
 
-  test("a cause no retry can answer is not offered one", async () => {
+  test("a corrupt identity offers a fresh start instead of a futile retry", async () => {
     mockPhoneQuery = {
       data: undefined,
       isPending: false,
@@ -155,9 +161,49 @@ describe("device approval ceremony", () => {
       refetch: jest.fn(),
     };
     await renderCeremony();
-    expect(screen.getByText(/unreadable/i)).toBeOnTheScreen();
+    expect(screen.getAllByText(/unreadable/i)).not.toHaveLength(0);
     // Pressing Try again would run the same read into the same damaged record.
     expect(screen.queryByText(/try again/i)).toBeNull();
+    expect(screen.getByText(/start fresh on this phone/i)).toBeOnTheScreen();
+  });
+
+  test("a tombstoned key the heal could not clear names the cause and offers a fresh start", async () => {
+    // What today's server says, with no `code` field: the 409 detail alone.
+    const detail = "revoked browser public keys cannot be registered again";
+    mockPhoneQuery = {
+      data: undefined,
+      isPending: false,
+      isSuccess: false,
+      isError: true,
+      error: new ApiError(409, "http_409", detail, detail),
+      refetch: jest.fn(),
+    };
+    await renderCeremony();
+    expect(mockRequestApproval).not.toHaveBeenCalled();
+    expect(screen.getByText(/old identity was retired/i)).toBeOnTheScreen();
+    // A retry would resubmit the same tombstoned key.
+    expect(screen.queryByText(/try again/i)).toBeNull();
+    expect(screen.getByText(/start fresh on this phone/i)).toBeOnTheScreen();
+    expect(screen.queryByText(/sign out/i)).toBeNull();
+  });
+
+  test("explains an automatic tombstone recovery while continuing approval", async () => {
+    mockPhoneQuery = {
+      data: {
+        id: PHONE_ID,
+        identityRecovery: "device_key_revoked",
+        label: "SPAWN D on iPhone",
+        public_key: PHONE_KEY,
+        revoked_at: null,
+      },
+      isPending: false,
+      isSuccess: true,
+      isError: false,
+    };
+    await renderCeremony();
+    expect(screen.getByText(/old key was revoked.*created a fresh identity/i)).toBeOnTheScreen();
+    // The fresh key is an ordinary unapproved device: the knock goes up as usual.
+    expect(mockRequestApproval).toHaveBeenCalledWith(PHONE_ID);
   });
 
   test("a matched number is never contradicted while the host catches up", async () => {

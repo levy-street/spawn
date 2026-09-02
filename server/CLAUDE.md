@@ -26,7 +26,7 @@ spawn_server/
   main.py       app assembly, startup, route registration
   <concern>.py  one module per concern: auth, billing, billing_stripe,
                 config, db, redis, mail, push, web_push, release, invites,
-                limits, rate_limit, trust_events, host_status, …
+                limits, rate_limit, trust_events, data_events, host_status, …
                 billing_stripe.py is the only module that imports `stripe`
 alembic/        migrations
 tests/          pytest; test_<module>.py mirrors the module it covers

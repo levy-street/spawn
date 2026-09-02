@@ -4,6 +4,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { cva, type VariantProps } from "class-variance-authority";
 import { X } from "lucide-react";
 import * as React from "react";
+import { useAnnounceModalOpen } from "@/components/ui/modal-layer";
 import { cn } from "@/lib/utils";
 
 /**
@@ -72,34 +73,39 @@ const DialogContent = React.forwardRef<
   React.ComponentRef<typeof DialogPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> &
     VariantProps<typeof contentVariants> & { hideClose?: boolean }
->(({ size, hideClose = false, className, children, ...props }, ref) => (
-  <DialogPrimitive.Portal>
-    {/* Tagged so a dialog holding portaled menus can tell a click on the
+>(({ size, hideClose = false, className, children, ...props }, ref) => {
+  // Portalled content mounts as the dialog opens, which is the moment any menu
+  // already floating over the window has to give way (see `modal-layer`).
+  useAnnounceModalOpen();
+  return (
+    <DialogPrimitive.Portal>
+      {/* Tagged so a dialog holding portaled menus can tell a click on the
         scrim (dismiss) from one on a menu it opened itself (do not). */}
-    <DialogPrimitive.Overlay
-      data-dialog-overlay=""
-      className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0"
-    />
-    <DialogPrimitive.Content
-      ref={ref}
-      className={cn(contentVariants({ size }), className)}
-      {...props}
-    >
-      {children}
-      {!hideClose && (
-        <DialogPrimitive.Close asChild>
-          <button
-            type="button"
-            aria-label="Close"
-            className="absolute right-3 top-3 mt-[env(safe-area-inset-top)] rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:mt-0"
-          >
-            <X className="size-4" />
-          </button>
-        </DialogPrimitive.Close>
-      )}
-    </DialogPrimitive.Content>
-  </DialogPrimitive.Portal>
-));
+      <DialogPrimitive.Overlay
+        data-dialog-overlay=""
+        className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0"
+      />
+      <DialogPrimitive.Content
+        ref={ref}
+        className={cn(contentVariants({ size }), className)}
+        {...props}
+      >
+        {children}
+        {!hideClose && (
+          <DialogPrimitive.Close asChild>
+            <button
+              type="button"
+              aria-label="Close"
+              className="absolute right-3 top-3 mt-[env(safe-area-inset-top)] rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:mt-0"
+            >
+              <X className="size-4" />
+            </button>
+          </DialogPrimitive.Close>
+        )}
+      </DialogPrimitive.Content>
+    </DialogPrimitive.Portal>
+  );
+});
 DialogContent.displayName = "DialogContent";
 
 function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {

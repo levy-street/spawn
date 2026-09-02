@@ -16,6 +16,7 @@ import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { LegionStrip } from "@/components/legion/LegionStrip";
+import { DownloadMenu } from "@/components/nav/download-menu";
 import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
 import { SidebarWorkspacePair, SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
 import {
@@ -35,6 +36,7 @@ import {
   reorderWrites,
 } from "@/components/nav/workspace-drag";
 import { openProfile } from "@/components/profile/profile-dialog-store";
+import { ThemeMenuRow } from "@/components/settings/AppearancePanel";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
@@ -802,58 +804,79 @@ export function Sidebar({
           </Button>
         </RailTooltip>
 
-        <DropdownMenu
-          side="top"
-          align="start"
-          className="block w-full"
-          renderTrigger={(props) => (
-            <RailTooltip label={user?.email ?? "Account"} disabled={!collapsed}>
-              <Button
-                {...props}
-                type="button"
-                variant="ghost"
-                size="sm"
-                aria-label="Account menu"
-                className={cn(sidebarRowClass(false), "h-11 justify-start px-0")}
-              >
-                <SidebarIconSlot>
-                  <span className="grid size-6 place-items-center rounded-full bg-secondary text-[11px] font-semibold uppercase text-secondary-foreground">
-                    {(user?.email ?? "?").slice(0, 1)}
-                  </span>
-                </SidebarIconSlot>
-                <SidebarRowLabel collapsed={collapsed} className="text-xs">
-                  {user?.email ?? "—"}
-                </SidebarRowLabel>
-              </Button>
-            </RailTooltip>
-          )}
-        >
-          <DropdownMenuItem
-            onSelect={() => {
-              onNavigate?.();
-              openProfile();
-            }}
+        {/* One row, two controls: the account menu, and the apps beside it.
+            The lit ground belongs to the row rather than to either control, so
+            the download button sits inside the same pill instead of floating
+            off its right edge — and whichever half the pointer is on brightens
+            its own contents. */}
+        <div className="flex items-center rounded-lg transition-colors hover:bg-accent/50">
+          <DropdownMenu
+            side="top"
+            align="start"
+            className="block min-w-0 flex-1"
+            renderTrigger={(props) => (
+              <RailTooltip label={user?.email ?? "Account"} disabled={!collapsed}>
+                <Button
+                  {...props}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Account menu"
+                  className={cn(
+                    sidebarRowClass(false),
+                    "h-11 justify-start px-0",
+                    // The row's own ground is the pill around both controls;
+                    // a second one here would double the tint.
+                    "hover:bg-transparent",
+                  )}
+                >
+                  <SidebarIconSlot>
+                    <span className="grid size-6 place-items-center rounded-full bg-secondary text-[11px] font-semibold uppercase text-secondary-foreground">
+                      {(user?.email ?? "?").slice(0, 1)}
+                    </span>
+                  </SidebarIconSlot>
+                  {/* No size override: the address reads at the same size as
+                      the Settings row above it — footer rows are one rhythm. */}
+                  <SidebarRowLabel collapsed={collapsed}>{user?.email ?? "—"}</SidebarRowLabel>
+                </Button>
+              </RailTooltip>
+            )}
           >
-            <UserRound className="size-4" aria-hidden />
-            Profile
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          {/* Settings has its own rail row above; Access keeps the one-click
-              reach the v5 Access UX asks for (docs/TRUST_UX.md). */}
-          <DropdownMenuItem onSelect={() => openSettings("access")}>
-            <ShieldCheck className="size-4" aria-hidden />
-            Access
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            destructive
-            onSelect={() => {
-              void logout();
-            }}
-          >
-            <LogOut className="size-4" aria-hidden />
-            Log out
-          </DropdownMenuItem>
-        </DropdownMenu>
+            {/* First, at the menu's top: the one control here that is a
+                setting rather than a departure, kept where the eye lands
+                when the menu rises from the account row. */}
+            <ThemeMenuRow />
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onSelect={() => {
+                onNavigate?.();
+                openProfile();
+              }}
+            >
+              <UserRound className="size-4" aria-hidden />
+              Profile
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            {/* Settings has its own rail row above; Access keeps the one-click
+                reach the v5 Access UX asks for (docs/TRUST_UX.md). */}
+            <DropdownMenuItem onSelect={() => openSettings("access")}>
+              <ShieldCheck className="size-4" aria-hidden />
+              Access
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              destructive
+              onSelect={() => {
+                void logout();
+              }}
+            >
+              <LogOut className="size-4" aria-hidden />
+              Log out
+            </DropdownMenuItem>
+          </DropdownMenu>
+          {/* On the rail the row is an avatar alone; the extra control waits
+              for the panel where it has room to explain itself on hover. */}
+          {!collapsed && <DownloadMenu />}
+        </div>
       </div>
     </div>
   );

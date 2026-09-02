@@ -245,13 +245,21 @@ impl Sampler {
 /// Best-effort discrete-GPU name. Never fails loudly and never blocks: a host
 /// with no `nvidia-smi` simply reports no GPU, which is also true of every Mac.
 async fn discover_gpu() -> Option<String> {
-    let output = tokio::process::Command::new("nvidia-smi")
+    let mut command = tokio::process::Command::new("nvidia-smi");
+    command
         .args(["--query-gpu=name", "--format=csv,noheader"])
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        // The daemon has no console in either Windows service mode. A console
+        // utility launched without this flag briefly presents its own window
+        // on every control-socket reconnect.
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().await.ok()?;
     if !output.status.success() {
         return None;
     }

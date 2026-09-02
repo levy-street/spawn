@@ -24,7 +24,10 @@ mobile/CLAUDE.md|mobile/src/app
 mobile/CLAUDE.md|mobile/src/components
 mobile/CLAUDE.md|mobile/src/data
 server/CLAUDE.md|server/spawn_server
-daemon/CLAUDE.md|daemon/src"
+daemon/CLAUDE.md|daemon/src
+desktop/CLAUDE.md|desktop/src
+desktop/CLAUDE.md|desktop/src-tauri
+desktop/CLAUDE.md|desktop/src-tauri/src"
 
 subdirs_of() {
   # Tracked directories directly under $1, one per line, no recursion.

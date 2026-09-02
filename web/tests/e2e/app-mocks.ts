@@ -111,6 +111,7 @@ export function session(overrides: Record<string, unknown> = {}) {
     activity_label: "Quiet",
     exit_code: null,
     foreground_command: "zsh",
+    agent_id: null,
     ...overrides,
   };
 }
@@ -1617,6 +1618,9 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         host_name: selectedHost?.name ?? null,
         cwd: body.cwd,
         name: body.name ?? null,
+        // The window's recorded type, as the server keeps it: what a duplicate
+        // is copied as, whatever the shell's foreground says a moment later.
+        agent_id: typeof body.agent_id === "string" ? body.agent_id : null,
       });
       store.sessions.push(created);
       if (Array.isArray(body.skill_ids)) {

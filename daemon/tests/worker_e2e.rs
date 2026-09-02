@@ -1127,14 +1127,62 @@ cat
 mod windows {
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::OsStringExt;
     use std::path::Path;
     use std::time::Duration;
 
     use spawnd::sessiond::{endpoint, wire, worker};
     use uuid::Uuid;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
 
     const WORKER_BIN: &str = env!("CARGO_BIN_EXE_spawn-worker");
     const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn direct_child_process_names(parent_pid: u32) -> Vec<OsString> {
+        // SAFETY: the snapshot has no borrowed inputs and is closed below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        assert_ne!(
+            snapshot,
+            INVALID_HANDLE_VALUE,
+            "creating process snapshot failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `entry` has the documented size and remains live for the
+        // complete enumeration; `snapshot` is a live process snapshot.
+        let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) };
+        if has_entry == 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: `snapshot` is owned by this function and still live.
+            unsafe { CloseHandle(snapshot) };
+            panic!("reading process snapshot failed: {error}");
+        }
+
+        let mut names = Vec::new();
+        while has_entry != 0 {
+            if entry.th32ParentProcessID == parent_pid {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                names.push(OsString::from_wide(&entry.szExeFile[..end]));
+            }
+            // SAFETY: same initialized entry and live snapshot as above.
+            has_entry = unsafe { Process32NextW(snapshot, &mut entry) };
+        }
+        // SAFETY: `snapshot` is owned by this function and closed exactly once.
+        unsafe { CloseHandle(snapshot) };
+        names
+    }
 
     fn test_runner_denied_worker_breakaway(error: &anyhow::Error) -> bool {
         let breakaway_denied = error
@@ -1324,6 +1372,115 @@ mod windows {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 endpoint::LockAttempt::Busy => panic!("worker retained reservation after exit"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_worker_keeps_windows_powershell_interactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker_dir = temp.path().join("workers");
+        endpoint::ensure_private_dir(&worker_dir).unwrap();
+
+        let session_id = Uuid::new_v4();
+        let launched = launch_and_connect(&worker_dir, session_id).await;
+        let (worker, _worker_endpoint, mut stream) = match launched {
+            Ok(launched) => launched,
+            Err(error) if test_runner_denied_worker_breakaway(&error) => {
+                eprintln!(
+                    "skipping real PowerShell end-to-end case: the test runner job denies worker breakaway"
+                );
+                return;
+            }
+            Err(error) => panic!("launch worker fixture: {error:#}"),
+        };
+        let (frame_type, payload) = read_frame(&mut stream).await;
+        assert_eq!(frame_type, wire::T_HELLO);
+        let hello: wire::Hello = wire::decode_json(&payload).unwrap();
+        assert_eq!(hello.state, "awaiting_start");
+
+        // Production's login-shell resolver sends a canonical verbatim path;
+        // the worker must convert that identity-safe spelling at the final
+        // CreateProcess boundary so Windows PowerShell stays alive in ConPTY.
+        let powershell = std::fs::canonicalize(
+            Path::new(&std::env::var_os("SystemRoot").unwrap())
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+        )
+        .unwrap();
+        let spec = wire::StartSpec {
+            cwd: temp.path().to_string_lossy().into_owned(),
+            argv: vec![powershell.to_string_lossy().into_owned(), "-NoLogo".into()],
+            env: std::env::vars().collect(),
+            cols: 80,
+            rows: 24,
+        };
+        wire::write_json_frame(&mut stream, wire::T_START, &spec)
+            .await
+            .unwrap();
+        let (frame_type, payload) = read_frame(&mut stream).await;
+        assert_eq!(frame_type, wire::T_STARTED);
+        let started: wire::Started = wire::decode_json(&payload).unwrap();
+        assert!(started.pid > 1);
+
+        // CreatePseudoConsole intentionally starts one headless conhost for
+        // the remote terminal. A second conhost is the worker's own classic
+        // console, which briefly presents a local window during session.create.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let children = direct_child_process_names(worker.pid);
+        let console_hosts = children
+            .iter()
+            .filter(|name| name.eq_ignore_ascii_case(OsStr::new("conhost.exe")))
+            .count();
+        assert!(
+            console_hosts <= 1,
+            "detached worker created a classic console host beside ConPTY: {children:?}"
+        );
+
+        // Keep the marker split in the input so terminal echo cannot satisfy
+        // the assertion; only PowerShell executing the command can join it.
+        wire::write_frame(
+            &mut stream,
+            wire::T_INPUT,
+            b"Write-Output ([string]::Concat('SPAWN-','POWERSHELL-ALIVE'))\r",
+        )
+        .await
+        .unwrap();
+        let mut output = Vec::new();
+        while !output
+            .windows(b"SPAWN-POWERSHELL-ALIVE".len())
+            .any(|window| window == b"SPAWN-POWERSHELL-ALIVE")
+        {
+            let (frame_type, payload) = read_frame(&mut stream).await;
+            match frame_type {
+                wire::T_OUTPUT => {
+                    let (_, bytes) = wire::decode_output(&payload).unwrap();
+                    output.extend_from_slice(bytes);
+                }
+                wire::T_FOREGROUND => {}
+                wire::T_EXIT => panic!(
+                    "PowerShell exited before processing input: {:?}",
+                    wire::decode_json::<wire::ExitInfo>(&payload).unwrap()
+                ),
+                other => panic!("unexpected worker frame {other}"),
+            }
+        }
+
+        wire::write_frame(&mut stream, wire::T_INPUT, b"exit\r")
+            .await
+            .unwrap();
+        loop {
+            let (frame_type, payload) = read_frame(&mut stream).await;
+            match frame_type {
+                wire::T_EXIT => {
+                    let exit: wire::ExitInfo = wire::decode_json(&payload).unwrap();
+                    assert_eq!(exit.exit_code, Some(0));
+                    break;
+                }
+                wire::T_OUTPUT | wire::T_FOREGROUND => {}
+                other => panic!("unexpected worker frame {other}"),
             }
         }
     }

@@ -1,5 +1,11 @@
-import { agentDisplayName, commandBasename } from "@/lib/agent-identity";
-import type { Agent, Session } from "@/lib/api";
+import {
+  agentDisplayName,
+  commandBasename,
+  SHELL_COMMANDS,
+  stripExecutableSuffix,
+} from "@/lib/agent-identity";
+import type { Agent, Session, Workspace } from "@/lib/api";
+import { tabOfSession } from "@/lib/tabs";
 
 /**
  * Pure derivation helpers for sessions: display titles, activity labels and
@@ -90,17 +96,16 @@ export function sessionNeedsAttention(session: Session): "waiting" | "dead" | nu
   return null;
 }
 
-const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash"]);
-
 /**
  * True when a reported foreground command is a shell. The daemon reports the
  * process basename only; login shells prefix argv[0] with "-" (e.g. "-zsh"),
- * which the kernel-derived name can carry through.
+ * which the kernel-derived name can carry through, and Windows carries the
+ * executable extension ("pwsh.exe").
  */
 export function isShellCommand(command: string | null | undefined): boolean {
   if (!command) return false;
   const name = command.startsWith("-") ? command.slice(1) : command;
-  return SHELL_COMMANDS.has(name.toLowerCase());
+  return SHELL_COMMANDS.has(stripExecutableSuffix(name.toLowerCase()));
 }
 
 /**
@@ -112,11 +117,32 @@ export function sessionAtShell(session: Session): boolean {
 }
 
 /**
+ * Where opening a session should land: the workspace tab holding it, focused
+ * on it — or the standalone session page, which exists even for a session no
+ * workspace references. Same rule the alert toasts navigate by.
+ */
+export function sessionHref(
+  sessionId: string,
+  workspaces: readonly Pick<Workspace, "id" | "layout">[],
+): string {
+  for (const workspace of workspaces) {
+    const tab = tabOfSession(workspace.layout, sessionId);
+    if (tab) return `/w/${workspace.id}?tab=${tab.id}&focus=${sessionId}`;
+  }
+  return `/sessions/${sessionId}`;
+}
+
+/**
  * Which installed agent a session is running, matched on the daemon-reported
  * foreground process: its basename against the first real word of an agent's
  * command (env assignments skipped, path stripped). Null for a shell prompt,
  * or for a foreground process no agent claims — the caller then treats the
  * session as a plain shell.
+ *
+ * Both sides are compared with the Windows executable extension stripped: a
+ * Windows host reports "claude.exe" for the agent the registry spells
+ * "claude", and an exact match would call that pane a plain shell — which is
+ * how duplicating a Claude Code pane on Windows used to produce an empty one.
  */
 export function runningAgent<T extends Pick<Agent, "command">>(
   session: Pick<Session, "foreground_command"> | undefined,
@@ -125,6 +151,36 @@ export function runningAgent<T extends Pick<Agent, "command">>(
   const reported = session?.foreground_command?.trim();
   if (!reported || isShellCommand(reported)) return null;
   // Login shells prefix argv[0] with "-"; the same can reach any basename.
-  const name = (reported.startsWith("-") ? reported.slice(1) : reported).toLowerCase();
-  return agents.find((agent) => commandBasename(agent.command).toLowerCase() === name) ?? null;
+  const name = stripExecutableSuffix(
+    (reported.startsWith("-") ? reported.slice(1) : reported).toLowerCase(),
+  );
+  return (
+    agents.find(
+      (agent) => stripExecutableSuffix(commandBasename(agent.command).toLowerCase()) === name,
+    ) ?? null
+  );
+}
+
+/**
+ * What kind of window this is: the agent it was opened as, else whatever its
+ * foreground process says is running in it.
+ *
+ * The recorded type comes first because it is the durable answer. The
+ * foreground is a snapshot of one process: it says "shell" for a window whose
+ * agent has been quit or is between runs, and it names the interpreter rather
+ * than the tool for any CLI that ships as a script — a Hermes window reports
+ * "python3", which matches no agent's command and used to duplicate as a bare
+ * shell. A window opened by hand — someone typed `claude` at the prompt
+ * themselves — has nothing recorded, and the foreground is then the only
+ * answer there is, so it is still asked.
+ */
+export function sessionAgent<T extends Pick<Agent, "id" | "command">>(
+  session: Pick<Session, "foreground_command" | "agent_id"> | undefined,
+  agents: readonly T[],
+): T | null {
+  const recorded = session?.agent_id;
+  const known = recorded ? agents.find((agent) => agent.id === recorded) : undefined;
+  // A recorded id no agent claims — a custom definition deleted since — is a
+  // type nothing can launch any more, so the live process answers instead.
+  return known ?? runningAgent(session, agents);
 }

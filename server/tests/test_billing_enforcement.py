@@ -158,7 +158,7 @@ async def test_the_admin_list_reports_no_limit_while_billing_is_off(client):
     """A self-hosted operator sees an unlimited fleet, and no subscription is read.
 
     The subscription table is not queried at all on this path, so the page also
-    works on an install that has never run migration 0068.
+    works on an install that has never run migration 0070.
     """
     # The first account on a deployment is bootstrapped to admin.
     admin_id, admin_auth = await _signup(client, "operator@example.com")

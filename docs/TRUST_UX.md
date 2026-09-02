@@ -11,8 +11,8 @@ the reference implementation of every screen and state lives at `web/src/trust-u
 > §4; the four-digit device↔device number, §2); this document is authoritative where they
 > differ.
 
-The protocol ([TRUST_DEVICE_MESH.md](../../../docs/TRUST_DEVICE_MESH.md), governed by
-[TRUST.md](../../../docs/TRUST.md)) is an endorsement mesh: device keys, host anchors,
+The protocol ([TRUST_DEVICE_MESH.md](TRUST_DEVICE_MESH.md), governed by
+[TRUST.md](TRUST.md)) is an endorsement mesh: device keys, host anchors,
 account-scoped signed chains, a passkey-sealed root, committed-SAS ceremonies, an add-only
 revocation set, background healing. **None of that vocabulary reaches a screen.** The user
 gets a flat list, one number to type, and three verbs.

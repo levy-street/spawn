@@ -10,7 +10,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { type Agent, agents, hosts, type Session } from "@/lib/api";
+import { type Agent, agents, hosts, type Session, sessions } from "@/lib/api";
 import { sessionAtShell } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { agentInstallAndRunCommand, agentRunCommand } from "./agent-command";
@@ -102,6 +102,12 @@ export function AgentSwitcher({
          */
         const basename = commandBasename(command);
         if (basename) writeForegroundToCache(queryClient, session.id, basename);
+        // What the window now *is*, which outlives the process: the foreground
+        // goes back to a shell the moment the agent is quit, and reports an
+        // interpreter's name for any CLI that ships as a script. A duplicate
+        // reads this. Best-effort — a window whose type failed to save still
+        // has the agent running in it.
+        void retype(queryClient, session.id, agent.id);
       },
     );
   };
@@ -112,7 +118,11 @@ export function AgentSwitcher({
     if (!handle || !running) return;
     void runInShell({ session, handle, command: "", purpose: "Returning to the shell" }).then(
       (result) => {
-        if (result === "sent") writeForegroundToCache(queryClient, session.id, null);
+        if (result !== "sent") return;
+        writeForegroundToCache(queryClient, session.id, null);
+        // Deliberately back at a prompt: this is a shell window again, and a
+        // duplicate of it should be one.
+        void retype(queryClient, session.id, null);
       },
     );
   };
@@ -203,6 +213,37 @@ export function AgentSwitcher({
         </>
       )}
     </DropdownMenu>
+  );
+}
+
+/**
+ * Record what kind of window this is now — the agent launched into it, or null
+ * for a window stopped back to a bare prompt — and keep both caches in step so
+ * a duplicate fired before the next poll still copies the right type.
+ */
+async function retype(
+  queryClient: ReturnType<typeof useQueryClient>,
+  sessionId: string,
+  agentId: string | null,
+): Promise<void> {
+  try {
+    const saved = await sessions.update(sessionId, { agent_id: agentId });
+    writeSessionAgentToCache(queryClient, sessionId, saved.agent_id);
+  } catch {
+    // The type is a convenience the running agent does not depend on.
+  }
+}
+
+function writeSessionAgentToCache(
+  queryClient: ReturnType<typeof useQueryClient>,
+  sessionId: string,
+  agentId: string | null,
+): void {
+  queryClient.setQueryData<Session>(["session", sessionId], (current) =>
+    current ? { ...current, agent_id: agentId } : current,
+  );
+  queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+    current?.map((item) => (item.id === sessionId ? { ...item, agent_id: agentId } : item)),
   );
 }
 

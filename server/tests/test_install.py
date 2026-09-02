@@ -17,6 +17,10 @@ import pytest
 
 from spawn_server.routes import install as install_routes
 
+requires_posix_shell = pytest.mark.skipif(
+    os.name == "nt", reason="the Unix installer harness requires POSIX path semantics"
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_repo_root(monkeypatch, tmp_path):
@@ -30,7 +34,7 @@ def _isolate_repo_root(monkeypatch, tmp_path):
 
 
 def _write_executable(path: Path, body: str) -> None:
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -213,7 +217,7 @@ async def _install_script_file(client, tmp_path: Path) -> Path:
     r = await client.get("/install.sh")
     assert r.status_code == 200
     script = tmp_path / "install.sh"
-    script.write_text(r.text)
+    script.write_text(r.text, encoding="utf-8")
     return script
 
 
@@ -400,6 +404,7 @@ async def test_manifest_and_signature_are_served_byte_exact_with_no_store(
     assert (await client.get("/api/install/manifest.json.sig")).content == signature
 
 
+@requires_posix_shell
 async def test_installer_smoke_uses_real_curl_against_local_http_server(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
     server, base_url = _run_smoke_http_server(script.read_text())
@@ -530,6 +535,7 @@ async def test_install_script_uses_valid_manifest_hashes(client, tmp_path: Path,
         ("Linux", "aarch64", "linux-aarch64"),
     ],
 )
+@requires_posix_shell
 async def test_installer_downloads_prebuilt_for_supported_targets(
     client, tmp_path: Path, os_name: str, arch: str, target: str
 ):
@@ -554,6 +560,7 @@ async def test_installer_downloads_prebuilt_for_supported_targets(
     assert "skipping login" in result.stdout
 
 
+@requires_posix_shell
 async def test_installer_prebuilt_only_fails_without_source_fallback(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
 
@@ -572,6 +579,7 @@ async def test_installer_prebuilt_only_fails_without_source_fallback(client, tmp
     assert _log(logs, "cargo.log") == ""
 
 
+@requires_posix_shell
 async def test_installer_bad_prebuilt_falls_back_to_source_build(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
 
@@ -595,6 +603,7 @@ async def test_installer_bad_prebuilt_falls_back_to_source_build(client, tmp_pat
     assert (install_root / "bin" / "spawn-worker").is_file()
 
 
+@requires_posix_shell
 async def test_installer_refreshes_rust_via_rustup_before_source_build(client, tmp_path: Path):
     # With rustup available, the installer brings stable current before the
     # --locked source build, so a lagging toolchain — too old for the lock file
@@ -618,6 +627,7 @@ async def test_installer_refreshes_rust_via_rustup_before_source_build(client, t
     assert (install_root / "bin" / "spawnd").is_file()
 
 
+@requires_posix_shell
 async def test_installer_without_rustup_stops_on_too_old_cargo(client, tmp_path: Path):
     # No rustup to self-update: an existing cargo below the floor must stop with
     # guidance, not crash mid-build on a lock file / MSRV it can't satisfy.
@@ -641,6 +651,7 @@ async def test_installer_without_rustup_stops_on_too_old_cargo(client, tmp_path:
     assert not (install_root / "bin" / "spawnd").is_file()
 
 
+@requires_posix_shell
 async def test_installer_default_runs_possess_on_linux(client, tmp_path: Path):
     # The default install hands off to `spawnd possess`, which owns login + the
     # supervised background service. That systemd/launchd setup lives in the
@@ -660,6 +671,7 @@ async def test_installer_default_runs_possess_on_linux(client, tmp_path: Path):
     assert _log(logs, "systemctl.log") == ""
 
 
+@requires_posix_shell
 async def test_installer_default_runs_possess_on_macos(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
 
@@ -675,11 +687,12 @@ async def test_installer_default_runs_possess_on_macos(client, tmp_path: Path):
     assert _log(logs, "launchctl.log") == ""
 
 
+@requires_posix_shell
 async def test_installer_accepts_and_ignores_legacy_setup_flags(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
     token = "S" * 43
     notice = (
-        "spawn: the --setup flag is no longer needed; "
+        "SPAWN D: the --setup flag is no longer needed; "
         "approval happens through the link spawnd prints"
     )
 
@@ -719,6 +732,7 @@ async def test_installer_accepts_and_ignores_legacy_setup_flags(client, tmp_path
     assert "--setup requires a token" in empty.stderr
 
 
+@requires_posix_shell
 async def test_installer_replaces_existing_binary_on_reinstall(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
     install_root = tmp_path / "install-root"
@@ -757,6 +771,7 @@ async def test_installer_replaces_existing_binary_on_reinstall(client, tmp_path:
     assert "installed spawnd fake 1.0" in second.stdout
 
 
+@requires_posix_shell
 async def test_installer_start_flags_control_login_and_services(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
 
@@ -1005,6 +1020,7 @@ async def test_install_powershell_renders_hash_pinned_script(client, monkeypatch
     assert f"spawn-worker:windows-x86_64) printf %s {worker_sha.lower()} ;;" in shell.text
 
 
+@requires_posix_shell
 @pytest.mark.parametrize("os_name", ["MINGW_NT-10.0", "MSYS_NT-10.0", "CYGWIN_NT-10.0"])
 async def test_shell_installer_redirects_native_windows_without_source_fallback(
     client, tmp_path: Path, os_name: str

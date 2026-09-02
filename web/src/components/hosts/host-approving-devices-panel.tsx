@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Laptop } from "lucide-react";
+import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, browserDevices, trust } from "@/lib/api";
 import { hostPinCapacityWarning } from "@/lib/host-pin-hygiene";
 
@@ -49,7 +50,22 @@ export function HostApprovingDevicesPanel({ hostId }: { hostId: string }) {
           <p>{warning}</p>
         </div>
       )}
-      {status.isLoading && <p className="px-4 py-3 text-sm text-muted-foreground">Loading…</p>}
+      {status.isLoading && (
+        // Two rows in the list's own shape, so the panel fills with what is
+        // coming rather than announcing that something is.
+        <div
+          role="status"
+          aria-label="Loading approving devices"
+          className="divide-y divide-border"
+        >
+          {["one", "two"].map((key) => (
+            <div key={key} className="flex items-center gap-3 px-4 py-3">
+              <Skeleton className="size-8 shrink-0 rounded-lg" />
+              <Skeleton className="h-4 w-1/2" />
+            </div>
+          ))}
+        </div>
+      )}
       {status.error && !(status.error instanceof ApiError && status.error.status === 404) && (
         <p className="px-4 py-3 text-sm text-destructive">Could not load approving devices.</p>
       )}

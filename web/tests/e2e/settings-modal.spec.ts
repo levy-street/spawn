@@ -76,6 +76,9 @@ test("the connect flow lives on its own page, reached from the legion", async ({
 });
 
 test("the legion add-machine flow waits after copying the plain command", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Linux x86_64" });
+  });
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await mockApp(page, { hosts: [host] });
   await page.goto("/legion");

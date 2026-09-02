@@ -7,6 +7,12 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="production deploy scripts require POSIX shell semantics"
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy-prod.sh"
 
@@ -30,7 +36,7 @@ def _git(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _write_executable(path: Path, body: str) -> None:
-    path.write_text(body)
+    path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -92,10 +98,11 @@ if [[ "{name}" == "bun" && "${{1:-}}" == "run" && "${{2:-}}" == "build" ]]; then
   # A real build freezes the proxy target into the routes manifest; the deploy
   # verifies that bake before restarting anything. SPAWN_TEST_BAKED_TARGET lets
   # a test simulate a build that baked something other than what was asked for.
-  mkdir -p .next
+  dist_dir="${{SPAWN_NEXT_DIST_DIR:-.next}}"
+  mkdir -p "$dist_dir"
   baked="${{SPAWN_TEST_BAKED_TARGET:-$SPAWN_API_PROXY_TARGET}}"
   printf '{{"rewrites":{{"afterFiles":[{{"source":"/api/:path*","destination":"%s/api/:path*"}}]}}}}\\n' \\
-    "$baked" > .next/routes-manifest.json
+    "$baked" > "$dist_dir/routes-manifest.json"
 fi
 if [[ "{name}" == "curl" ]]; then
   url="${{@: -1}}"
@@ -132,6 +139,9 @@ def _fake_ssh(tmp_path: Path, remote_home: Path) -> Path:
         fakebin / "ssh",
         f"""#!/usr/bin/env bash
 set -euo pipefail
+# The deploy pins keepalive -o options on every connection; consume them the
+# way real ssh does so $1 is the host and $2 the command.
+while [[ "${{1:-}}" == "-o" ]]; do shift 2; done
 printf '%s\\n' "$1" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-host.log"
 printf '%s\\n' "$2" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-command.log"
 script="$SPAWN_DEPLOY_TEST_LOG_DIR/remote-script.sh"

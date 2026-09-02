@@ -99,10 +99,40 @@ What a bump then does is already built, end to end — do not re-derive it:
   unwritable install directory, self-update disabled) logs the exact reinstall
   command hourly and retries every five minutes.
 - **the browser reloads.** The refusal raises `spawn:client-stale` with
-  `hard: true`, which is the release watcher's hard prompt: a short countdown,
-  then a reload.
+  `hard: true`, which is the release watcher's hard prompt: a full-screen
+  overlay with a bar spending the countdown, then a reload.
 - **the phone** handles `protocol.required` on its sockets the same way and
   routes it into the update path.
+
+### The forced update, and when you are choosing it
+
+A protocol bump is the *only* thing that forces an update, and you do not
+switch it on separately — bumping the name is switching it on. There is no
+"mandatory release" flag to remember, deliberately: a flag someone forgets is
+a fleet stuck on a build the server refuses, and a flag someone sets by habit
+is a person locked out of their work over a release that would have been fine.
+The question is always the same one the bump already asks. Would a peer
+speaking the old name be *wrong*, not merely behind?
+
+What the bump then buys the person, on top of the machinery above:
+
+- **the browser and the phone take the whole screen.** Not a dialog: a dialog
+  implies something behind it you could go back to, and after a refusal there
+  isn't — every socket in the app has just been closed. Both show a progress
+  bar while the new version is fetched, and neither offers Later, because
+  there is no version of "later" in which the app works.
+- **the bar is indeterminate on the phone**, because `expo-updates` reports no
+  progress; in the browser it spends the reload countdown, which is a real
+  quantity. Neither invents a percentage. If you are tempted to add one, the
+  number would have to come from somewhere that measures it.
+- **an update the app cannot take strands the person gently.** A phone whose
+  *native runtime* is too old cannot fix itself with an OTA, so it is sent to
+  the store — and while there is no listing, it is told plainly and let out of
+  the dialog rather than held in one with no button that works.
+
+So before bumping, check the order below is possible at all; and after
+deploying, watch that daemons actually land on the new build rather than
+looping. A bump you cannot complete is worse than the drift it was fixing.
 
 So the order of operations for a bump is forced: the daemon prebuilts that
 speak the new protocol must be published **before or with** the server that
@@ -148,6 +178,58 @@ are `AZURE_KEY_VAULT_URL`, `AZURE_KEY_VAULT_CERTIFICATE`,
 distinguished name). Revoke the federated credential quickly if a permitted CI
 run is compromised: it still cannot mint the offline Ed25519 manifest, but
 until it is gone it can request publisher-valid PE signatures.
+
+### The Apple signing identity
+
+The same rule as Windows, arrived at later: **a signing identity is reachable
+only from `master`, and only through a protected environment.** A GitHub
+`environment:` is the sole gate that survives a modified workflow, because an
+attacker who pushes a branch can delete an `if:` but cannot grant themselves an
+environment's secrets — so the Apple credentials must be *environment* secrets,
+not repository secrets. Moving them is a settings change, not a code change, and
+the workflows above assume it has been made:
+
+| | |
+|---|---|
+| `macos-code-signing` | Custom branch policy naming `master` (not `protected_branches` — see the Windows note above, `master` carries no protection rule). Holds `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_PRIVATE_KEY`. |
+| `unsigned-builds` | No protection rules, no secrets. Exists only so `prebuilt.yml` has somewhere to run off master. |
+
+`desktop.yml` gates both platform jobs identically — protected environment plus
+`if: master` — because both exist only to produce signed artifacts and neither
+can do anything useful from a branch. Build the app locally instead. The `if` is
+not redundant with the environment: without it a branch dispatch fails at the
+environment gate, which reads as a broken pipeline rather than a job with
+nothing to do.
+
+The two daemon signing paths in `prebuilt.yml` are deliberately *not* symmetric,
+and it is worth knowing which way:
+
+- **macOS daemon binaries publish ad-hoc signed.** The Developer ID path is
+  dormant behind the `SIGN_DAEMON_WITH_DEVELOPER_ID` variable, because turning
+  it on changes what every existing host is asked, once — read "The macOS
+  consent dialogs" before you do. Ad-hoc is not a failure: the binary runs, it
+  just re-asks for folder access after each self-update, because TCC keys the
+  grant on the signing identity and an ad-hoc identity is the binary's own hash.
+- **Windows daemon binaries do not publish at all unless Authenticode-signed**,
+  on master. An unsigned PE is not merely unpolished — it trips SmartScreen and
+  makes no publisher claim at all.
+
+So the Mac daemon ships today without a Developer ID and the Windows one refuses
+to ship without a certificate. That asymmetry is a choice about consent prompts,
+not an oversight.
+
+`prebuilt.yml`'s macOS job still runs on any ref, because it also builds the
+daemon binaries a dev host pulls. It picks its environment by ref, so off master
+it runs in `unsigned-builds`, the certificate resolves empty, and the signing
+step falls back to ad-hoc — which is what it did before the Developer ID was
+introduced. The step also refuses the Developer ID off master on its own, so the
+protection does not rest on the environment alone.
+
+Both workflows pin every third-party action to a commit SHA. A mutable tag like
+`@v0` or `@stable` is a standing invitation: whoever controls it runs code
+inside a job holding the release identity. Re-pin deliberately when upgrading —
+`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` — and keep the tag in the
+trailing comment so the intent stays readable.
 
 ### The Windows signing identity
 
@@ -197,11 +279,17 @@ To provision this from nothing — a new tenant, or a rotated certificate — se
 [AZURE_SIGNING_SETUP.md](AZURE_SIGNING_SETUP.md).
 
 The Windows prebuilt job deliberately remains buildable while signing is
-being provisioned: when all three Azure secrets are absent it uploads an
-unsigned Actions artifact, while a partial signing configuration is a hard
-failure. An unsigned Windows pair must not be treated as release-ready or
-promoted in Windows-facing UI. Once credentials exist, signing, exact subject,
-timestamp and SignTool verification are hard gates before artifact upload.
+being provisioned: when all three Azure secrets are absent it still builds and,
+**off master**, uploads an unsigned Actions artifact, while a partial signing
+configuration is a hard failure. On `master` an unsigned pair is not uploaded at
+all. That is the fail-closed half, and it matters: `prebuilt-latest` is the prod
+install channel, so an absent Azure identity must leave Windows *missing* from
+the rolling release — the same graceful degradation `linux-aarch64` already has,
+loud at deploy (`publish_prebuilts`) and verify (`SKIP`) time — rather than
+quietly publishing unsigned `.exe`s to users. An unsigned Windows pair must not
+be treated as release-ready or promoted in Windows-facing UI. Once credentials
+exist, signing, exact subject, timestamp and SignTool verification are hard
+gates before artifact upload.
 
 `desktop.yml` is deliberately not tolerant that way — a release build of the app
 either signs or fails. The buildability it gives up is covered instead by the
@@ -284,11 +372,25 @@ compiled into the expected daemon source, and proves `release_counter` equals
 the server/web identity, daemon tree and served binary hashes, and mobile
 identity. A failed signature or counter row is a failed release.
 
-The counter is also the downgrade boundary. Automatic daemon updates never
-downgrade. A deliberate operator retry may bypass the monotonicity check only
-through `POST /api/hosts/{id}/update` with
-`{"allow_downgrade": true}`. Use that override only when the older signed
-release is the intended recovery; it does not permit unsigned updates.
+The counter is also the downgrade boundary, and it takes two keys to cross it.
+Automatic daemon updates never downgrade. A deliberate operator retry asks
+through `POST /api/hosts/{id}/update` with `{"allow_downgrade": true}` — but
+asking is not consent. The daemon honours it only when someone with a shell on
+that host has also armed the rollback:
+
+```
+touch "$SPAWN_CONFIG_DIR/allow-downgrade"     # or ~/.config/spawn/allow-downgrade
+```
+
+The arming expires 30 minutes after that file's mtime, so a forgotten one does
+not become a standing permission, and re-arming is another `touch`. The reason
+for the second key is `docs/TRUST.md`: the control plane is untrusted, and a
+server-side boolean would let a compromised one replay an older validly-signed
+manifest and roll the fleet back to a known-vulnerable release. The signature
+root of trust would still hold — nothing unsigned can be pushed — but rollback
+protection is the one guarantee the counter exists to give, so it is not the
+server's to waive. Use the override only when the older signed release is the
+intended recovery; it does not permit unsigned updates.
 
 ### Proving the updater
 
@@ -329,6 +431,127 @@ privileged steps without the explicit environment gate. Toxiproxy and
 mitmproxy remain useful optional manual comparators, but neither is a test
 dependency: the committed fault proxy uses Python's standard library.
 
+## What a release needs, and what does it
+
+Work out what a release owes before doing any of it. Every rule below is a
+question about **which tree changed**, because that is what the identities at
+`/api/release` are derived from — not what the change felt like.
+
+| changed | the release owes | who does it |
+| --- | --- | --- |
+| `daemon/` | signed prebuilts for every target | `prebuilt.yml` builds on a master push; **you** sign the manifest, via `deploy-prod.sh` |
+| `desktop/` | a signed, notarized app per platform | `desktop.yml` builds on a master push; **you** sign the payloads and write `latest.json` |
+| `mobile/` | an EAS OTA on the matching channel | `deploy-prod.sh`, during the deploy |
+| `server/`, `web/` | a deploy | `deploy-prod.sh` |
+| a protocol name | all of the above, in the order below | see "The wire protocols" |
+
+`scripts/release-plan.sh` is that table executed. Given two commits it reports
+which rows are owed, so a pipeline can decide instead of a person remembering:
+
+```bash
+scripts/release-plan.sh --from <deployed commit> --to <commit being released>
+scripts/release-plan.sh --json          # for a workflow to branch on
+scripts/release-plan.sh --no-fingerprint  # offline; mobile_native becomes "unknown"
+```
+
+It compares **subtree hashes**, not paths, because a subtree hash is exactly
+the identity `/api/release` publishes for that piece — no path glob to get
+subtly wrong.
+
+The mobile row is the one worth understanding, because "did `mobile/` change"
+is the wrong question. An OTA carries JavaScript and assets, never native code,
+and it only reaches installs whose `runtimeVersion` matches — which under this
+project's `appVersion` policy means the version in `mobile/app.json`. So the
+real question is whether the tree still fits the native shell already on
+people's phones, and Expo answers it exactly: `eas fingerprint:compare` against
+the last finished production build. Matching fingerprints mean an OTA is
+enough. Differing ones mean a store build is owed — and shipping the OTA alone
+would either be refused by every install or, worse, hand them JavaScript that
+calls native code their shell does not have. Most releases do not need one;
+this is how a release knows it is one of the ones that does.
+
+Three of those rows say "you", and that is not an omission to be automated
+away later. **The offline keys never enter CI** — the Ed25519 daemon release
+key and the Tauri updater key both live on the operator Mac, and CI holds only
+platform code-signing credentials (Apple notarization, Azure Authenticode).
+That split is what stops one compromised CI run from shipping a daemon or an
+app to every machine in the fleet. So the automation stops exactly where a
+signature starts: CI produces artifacts and evidence, a person with the key
+promotes them.
+
+The mobile OTA is the one piece with no offline key, and it is still not a
+workflow. It runs inside `deploy-prod.sh` because that is the only place the
+*order* can be promised: the server is already up when the bundle is
+published, so phones never fetch JavaScript newer than the API it talks to. A
+workflow firing on a push to master could not make that promise. It used to be
+a printed reminder, which is a step that gets skipped on exactly the release
+where it mattered, and fails silently — the two frontends drift while
+everything looks fine.
+
+### The master pipeline, and the one decision it puts in front of you
+
+`.github/workflows/release.yml` runs on every push to `master`. It calls
+`release-plan.sh` first and gates every job on the answer, so a docs-only push
+finishes in seconds and a daemon-only push deploys without touching the phone.
+The order inside it is the forced one described above: prebuilts land before
+the server that advertises them, and the OTA goes after the server is up.
+
+It is **armed**, as of 2026-08-31. What that means, precisely, is worth stating
+once rather than rediscovering during an incident.
+
+Everything above says the offline keys never enter CI: the Ed25519 daemon
+release key and the Tauri updater key live on the operator's Mac, and that split
+is what stops one compromised CI run from shipping a daemon to every machine in
+the fleet. A fully automatic master release cannot honour that split, because
+publishing prebuilts *means* signing a manifest. So the daemon release key is
+now a secret in the `production` environment, and the consequence is exact:
+
+**anything that can run a workflow on `master` can sign a daemon build that
+every host installs and runs as a service.** That is a deliberate trade for a
+zero-human-step release, not an oversight. Treat the key as CI-exposed: rotate
+it on any suspicion, keep the environment's branch policy at `master`, and
+remember that the daemon's pinned key list in `release_key.rs` is what makes
+rotation possible at all.
+
+The Tauri updater key is **not** in CI, and desktop publication stays with a
+person, because `latest.json` is assembled from artifacts someone has looked at.
+That job prints exactly what to run.
+
+What is configured, so it can be audited rather than guessed:
+
+| `production` environment | branch policy `master` (custom policy — `protected_branches` matches nothing here) |
+| --- | --- |
+| `EXPO_TOKEN` | Expo access token, note "github-actions release.yml (spawn) verified". Local runs need none because `~/.expo/state.json` holds a session; CI has no session. |
+| `SPAWN_DEPLOY_SSH_KEY` | A dedicated ed25519 deploy key, `github-actions-release@spawn` in the prod `authorized_keys`. Revoke by deleting that line. |
+| `SPAWN_DEPLOY_KNOWN_HOSTS` | The pinned prod host key. The workflow never runs `ssh-keyscan`: trusting a host key on first connection is the one thing a production deploy must not do. |
+| `SPAWN_RELEASE_SIGNING_KEY` | The offline daemon release key, per the trade above. |
+| vars `SPAWN_DEPLOY_HOSTNAME`, `SPAWN_DEPLOY_USER` | The prod host and account. |
+
+**The pipeline has never run.** `workflow_dispatch` cannot see a workflow that
+is not on the default branch, so `release.yml` cannot be exercised before the
+merge that puts it there — the first real run is the merge itself, and it wants
+watching rather than assuming. The same is true of `desktop.yml` and
+`windows.yml`.
+
+### Things that will bite you off master
+
+`workflow_dispatch` only sees workflows that exist on the **default branch**.
+`windows.yml` and `desktop.yml` are not on master yet, so from a feature branch
+they cannot be dispatched at all; `[package]` in a commit subject is the only
+trigger that reaches `windows-package` from a branch. Merging is what fixes
+this, and it fixes it for good.
+
+Windows signing is restricted to `master` by the `windows-code-signing`
+environment's branch policy, so **a branch build can never be Authenticode
+signed**. Anything built from a branch is a rehearsal artifact: fine for a dev
+deployment, never a release. `publish-desktop.sh` enforces this independently
+by refusing a Windows setup EXE with no certificate table.
+
+`prebuilt.yml` will build on a dispatch from any ref, but its publish job is
+master-only on purpose — the rolling `prebuilt-latest` release is the
+production install channel. Branch binaries come out as run artifacts, which is
+the supported way to stage a dev host.
+
 ## The server and the web app go out together
 
 Deployment is over SSH, from a coding agent, using the script in this repo:
@@ -352,9 +575,18 @@ The script refuses to run when the release would not be what it looks like:
 
 And it checks its own work:
 
+- the web build lands in `web/.next.staged` and is swapped into `web/.next` by
+  two renames immediately before the restart, so the previous build serves
+  untouched through the whole build (including the daemon compile) and the
+  visible switch is milliseconds. The displaced build stays at
+  `web/.next.prev`; rolling back is one swap back plus a restart.
+- the remote script is delivered to a file on the host and executed from it,
+  never streamed over ssh stdin — a dropped connection now fails the deploy
+  loudly instead of silently ending the script mid-run — and every ssh/scp
+  connection carries keepalives so a NAT cannot wedge a quiet phase.
 - after the web build and **before any restart**, the proxy target actually
-  baked into `.next/routes-manifest.json` is compared against the requested
-  one; a mismatch aborts with the previous build still serving
+  baked into `.next.staged/routes-manifest.json` is compared against the
+  requested one; a mismatch aborts with the previous build still serving
 - after the restart, `/healthz` is fetched **through the web app's rewrite**,
   then an anonymous `spawn.alerts.v1` WebSocket must upgrade through the public
   origin and close with the expected 1008 auth policy code. Together they
@@ -399,8 +631,11 @@ same directory `scripts/publish-desktop.sh` uploads to under the same variable
 name — and the server looks in it before advertising a desktop version. The
 primary Apple-silicon DMG gates the block, and its platform list is narrowed to
 the non-empty Apple DMGs and Windows setup EXE actually present. A deploy that
-lands before the publish therefore says nothing about the desktop app rather
-than pointing the download button at a 404. If the directory does not exist at
+lands before the publish therefore keeps advertising the previously published
+build — the version the directory's own `latest.json` names, with a null tree
+since the old build's tree is unknowable from disk — rather than pointing the
+download button at a 404. Only with no readable `latest.json`, or one whose
+images are also gone, does it say nothing about the desktop app. If the directory does not exist at
 all the server cannot check, so it fails open with all expected platforms and
 logs an error naming this variable; a download that vanishes silently would be
 the harder failure to notice.
@@ -484,12 +719,38 @@ canonical `SPAWN-D_<version>_windows-x86_64-setup.exe`; the same EXE is both the
 public download and updater payload. The workflow produces no MSI.
 
 A release build leaves `SPAWN_DESKTOP_SERVER_ORIGIN` unset, which is what makes
-it point at `https://spawnd.dev` and what keeps it on the signed app channel. A
-build that sets it — one made for a dev deployment — defaults to that server
-instead and takes no updates at all, so it can never quietly replace itself
-with the production app. Setting it during a release is therefore a way to ship
-an app that talks to the wrong fleet and cannot be updated out of it; leave it
-alone unless that is the point (`desktop/CLAUDE.md`).
+it point at `https://spawnd.dev` and what keeps it on the vendor's signed app
+channel. A build that sets it — one made for a dev deployment — defaults to
+that server instead **and takes its updates from that server too**, never from
+production, so it can never quietly replace itself with the production app.
+Setting it during a release is therefore a way to ship an app that talks to the
+wrong fleet and updates from it; leave it alone unless that is the point
+(`desktop/CLAUDE.md`).
+
+### Serving a deployment's own app channel
+
+A deployment that hands out desktop apps should serve the channel those apps
+read, or they never hear about a fix. The layout is the vendor's, under that
+deployment's `/desktop/`:
+
+- `SPAWN-D_<version>_<platform>.app.tar.gz` — the macOS updater payload, made
+  with `COPYFILE_DISABLE=1 tar -czf … -C bundle/macos "SPAWN D.app"`. The DMG
+  is the *download*; the tarball is the *update*, and both must be published.
+- `SPAWN-D_<version>_windows-x86_64-setup.exe` — on Windows one file is both.
+- `latest.json` — `{version, notes, pub_date, platforms{<platform>{signature,
+  url}}}`, where `signature` is the contents of the payload's `.sig` and `url`
+  is absolute, on that deployment's origin.
+
+Every payload is signed with the offline updater key
+(`npx tauri signer sign -f ~/.tauri/spawn-desktop.key <payload>`, password in
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, never on argv). The app verifies against
+the pubkey compiled into `tauri.conf.json`, which is the same on every channel,
+so a dev channel is a different audience rather than a lower bar: an
+unsigned or wrongly-signed payload is refused there exactly as in production.
+
+Write `latest.json` last. A payload with no manifest entry is invisible, which
+is safe; a manifest naming a payload that is not there yet is an update every
+app will try and fail to take.
 
 The Apple credentials are
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
@@ -931,7 +1192,7 @@ means the `/api/billing/*` routes answer 404, no host limit is enforced,
 render exactly what they render today. That is what makes the first several
 steps below deployable and verifiable in production before any money exists.
 
-1. **Migration `0068` first.** Additive only — two tables and one nullable
+1. **Migration `0070` first.** Additive only — two tables and one nullable
    column — so old code tolerates it and it runs while the previous processes
    drain. Confirm `alembic heads` is a single head after any merge.
 2. **Server with `SPAWN_BILLING_ENABLED=false`.** A genuine no-op deploy:
@@ -1028,7 +1289,10 @@ standard-user accounts.
 
 1. Confirm the checkout is clean and pushed. When daemon or Windows code
    changed, require the native `windows-check` check/clippy/test and PowerShell
-   smoke to pass, plus the existing Unix suite. For a first Windows launch,
+   smoke to pass, plus the existing Unix suite. `windows-check` triggers on
+   pushes touching `daemon/**`, `desktop/**` or its own workflow, so a release
+   whose last commit changed neither will show no run — that is the filter
+   working, not a missing gate; dispatch it if you want one anyway. For a first Windows launch,
    [WINDOWS_VALIDATION.md](WINDOWS_VALIDATION.md) must be closed first. When prebuilts will be
    published, confirm the local offline daemon release-signing key is present
    and readable.

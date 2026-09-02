@@ -3105,7 +3105,7 @@ mod tests {
                 assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
                 assert_ne!(Path::new(&result.path), destination_link);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
             Err(error) => panic!("creating file symlink failed unexpectedly: {error}"),
         }
 
@@ -3126,7 +3126,7 @@ mod tests {
                 assert!(error.to_string().contains("capability component"));
                 assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) if crate::platform::symlink_fixture_unavailable(&error) => {}
             Err(error) => panic!("creating directory symlink failed unexpectedly: {error}"),
         }
     }

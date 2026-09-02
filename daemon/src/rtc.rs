@@ -2164,8 +2164,16 @@ fn install_data_channel_handler(
             }
         });
     }
-    let handler_pc = Arc::clone(pc);
+    // Handlers a peer owns must never own the peer back. A strong handle in a
+    // closure the peer stores is a reference cycle `close()` does not break:
+    // the peer is never dropped, and a peer that is never dropped never gives
+    // its ICE sockets back — 101 pinned ports, lost one browser reconnect at
+    // a time, until every new session can only reach the TURN relay.
+    let handler_pc = Arc::downgrade(pc);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let Some(pc) = handler_pc.upgrade() else {
+            return Box::pin(async {});
+        };
         let binding = binding.clone();
         let registry = registry.clone();
         let controls = controls.clone();
@@ -2180,7 +2188,6 @@ fn install_data_channel_handler(
         let out_tx = out_tx.clone();
         let channels = Arc::clone(&channels);
         let close = Arc::clone(&close);
-        let pc = Arc::clone(&handler_pc);
         let sessions = sessions.clone();
         let reliable = dc.ordered()
             && dc.max_packet_lifetime().is_none()
@@ -2316,7 +2323,7 @@ fn install_data_channel_handler(
             let open_fence = Arc::clone(&fence);
             let open_control = binding.control.clone();
             let open_channels = Arc::clone(&channels);
-            let open_pc = Arc::clone(&pc);
+            let open_pc = Arc::downgrade(&pc);
             let open_sessions = sessions.clone();
             let open_close = Arc::clone(&close);
             let open_signal_id = binding.signaling.signal_id.clone();
@@ -2331,12 +2338,13 @@ fn install_data_channel_handler(
                 let fence = Arc::clone(&open_fence);
                 let control = open_control.clone();
                 let channels = Arc::clone(&open_channels);
-                let pc = Arc::clone(&open_pc);
+                let pc = open_pc.clone();
                 let sessions = open_sessions.clone();
                 let close = Arc::clone(&open_close);
                 let signal_id = open_signal_id.clone();
                 let generation = open_generation.clone();
                 Box::pin(async move {
+                    let Some(pc) = pc.upgrade() else { return };
                     if !active.load(Ordering::Acquire) || !registry.is_current(session) {
                         let _ = dc.close().await;
                         return;
@@ -2614,7 +2622,7 @@ fn install_data_channel_handler(
 
             let close_active = Arc::clone(&active);
             let close_channels = Arc::clone(&channels);
-            let close_pc = Arc::clone(&pc);
+            let close_pc = Arc::downgrade(&pc);
             let close_sessions = sessions;
             let close_coordinator = Arc::clone(&close);
             let close_session_id = binding.signaling.signal_id.clone();
@@ -2622,7 +2630,7 @@ fn install_data_channel_handler(
             dc.on_close(Box::new(move || {
                 let active = Arc::clone(&close_active);
                 let channels = Arc::clone(&close_channels);
-                let pc = Arc::clone(&close_pc);
+                let pc = close_pc.clone();
                 let sessions = close_sessions.clone();
                 let close = Arc::clone(&close_coordinator);
                 let signal_id = close_session_id.clone();
@@ -2632,7 +2640,9 @@ fn install_data_channel_handler(
                     channels.stop();
                     active.store(false, Ordering::Release);
                     debug_assert_eq!(close.initiate(), initiating_deadline);
-                    sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
+                    if let Some(pc) = pc.upgrade() {
+                        sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
+                    }
                 })
             }));
         })
@@ -2913,7 +2923,7 @@ fn install_control_data_channel(
     let open_registry = registry;
     let open_fence = fence;
     let open_channels = Arc::clone(&channels);
-    let open_pc = Arc::clone(&pc);
+    let open_pc = Arc::downgrade(&pc);
     let open_sessions = sessions.clone();
     let open_close = Arc::clone(&close);
     let open_signal_id = signal_id.clone();
@@ -2927,12 +2937,13 @@ fn install_control_data_channel(
         let registry = open_registry.clone();
         let fence = Arc::clone(&open_fence);
         let channels = Arc::clone(&open_channels);
-        let pc = Arc::clone(&open_pc);
+        let pc = open_pc.clone();
         let sessions = open_sessions.clone();
         let close = Arc::clone(&open_close);
         let signal_id = open_signal_id.clone();
         let generation = open_generation.clone();
         Box::pin(async move {
+            let Some(pc) = pc.upgrade() else { return };
             if !active.load(Ordering::Acquire) || !registry.is_current(session) {
                 return;
             }
@@ -2970,11 +2981,12 @@ fn install_control_data_channel(
         })
     }));
 
+    let close_pc = Arc::downgrade(&pc);
     dc.on_close(Box::new(move || {
         let close_tx = close_tx.clone();
         let channels = Arc::clone(&channels);
         let active = Arc::clone(&active);
-        let pc = Arc::clone(&pc);
+        let pc = close_pc.clone();
         let sessions = sessions.clone();
         let signal_id = signal_id.clone();
         let generation = generation.clone();
@@ -2998,7 +3010,9 @@ fn install_control_data_channel(
             channels.stop();
             active.store(false, Ordering::Release);
             debug_assert_eq!(close.initiate(), upload_deadline);
-            sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
+            if let Some(pc) = pc.upgrade() {
+                sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
+            }
         })
     }));
 }
@@ -3837,10 +3851,14 @@ fn install_host_data_channel_handler(
     files_override: Option<Arc<HostFileService>>,
 ) {
     let accepted = Arc::new(AtomicBool::new(false));
-    let handler_pc = Arc::clone(pc);
+    // As in install_data_channel_handler: the peer must not own a handle to
+    // itself, or it is never dropped and its ICE ports never come back.
+    let handler_pc = Arc::downgrade(pc);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let Some(pc) = handler_pc.upgrade() else {
+            return Box::pin(async {});
+        };
         let accepted = Arc::clone(&accepted);
-        let pc = Arc::clone(&handler_pc);
         let signal_id = signal_id.clone();
         let binding = binding.clone();
         let signaling = signaling.clone();
@@ -4021,6 +4039,244 @@ async fn send_json_dynamic(signaling: &RtcWsSender, frame: Outbound) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ports a peer's host candidates are bound to, straight from its SDP.
+    fn local_candidate_addrs(sdp: &str) -> Vec<std::net::SocketAddr> {
+        sdp.lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.trim_start_matches("a=").split(' ').collect();
+                if !fields.first()?.starts_with("candidate:") || fields.get(7) != Some(&"host") {
+                    return None;
+                }
+                let ip: IpAddr = fields.get(4)?.parse().ok()?;
+                let port: u16 = fields.get(5)?.parse().ok()?;
+                Some(std::net::SocketAddr::new(ip, port))
+            })
+            .collect()
+    }
+
+    /// Every ICE socket this daemon binds lives in the 101-port range
+    /// [`RTC_UDP_PORT_MIN`]..=[`RTC_UDP_PORT_MAX`], shared by every peer it
+    /// ever answers. A closed peer that keeps its sockets bound exhausts the
+    /// range within a few browser reconnects, after which no new peer can
+    /// gather a host or server-reflexive candidate and every session falls
+    /// back to the TURN relay. Closing a peer must give its ports back.
+    #[tokio::test]
+    async fn a_closed_peer_releases_its_ice_ports() {
+        let api = build_api().unwrap();
+        let pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let _channel = pc.create_data_channel("probe", None).await.unwrap();
+        let mut gathered = pc.gathering_complete_promise().await;
+        let offer = pc.create_offer(None).await.unwrap();
+        pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let addrs = local_candidate_addrs(&pc.local_description().await.unwrap().sdp);
+        assert!(!addrs.is_empty(), "the peer gathered no host candidate");
+        for addr in &addrs {
+            assert!(
+                (RTC_UDP_PORT_MIN..=RTC_UDP_PORT_MAX).contains(&addr.port()),
+                "{addr} is outside the pinned range"
+            );
+            assert!(
+                std::net::UdpSocket::bind(addr).is_err(),
+                "{addr} is not bound while the peer is open"
+            );
+        }
+
+        pc.close().await.unwrap();
+        drop(pc);
+        assert_ports_released(&addrs, "closed and dropped peer").await;
+    }
+
+    async fn assert_ports_released(addrs: &[std::net::SocketAddr], what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut held = addrs.to_vec();
+        loop {
+            held.retain(|addr| std::net::UdpSocket::bind(addr).is_err());
+            if held.is_empty() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} still holds its ICE ports: {held:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_state(pc: &RTCPeerConnection, wanted: RTCPeerConnectionState) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while pc.connection_state() != wanted {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "peer never reached {wanted:?}, is {:?}",
+                pc.connection_state()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The same promise for a peer that actually connected: a browser-shaped
+    /// offerer negotiates a data channel with a daemon-configured answerer,
+    /// the pair goes Connected, and closing the answerer frees its ports —
+    /// with handles to it still alive, as they are in the daemon.
+    #[tokio::test]
+    async fn a_closed_connected_peer_releases_its_ice_ports() {
+        let browser = Arc::new(
+            APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let daemon = Arc::new(
+            build_api()
+                .unwrap()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let _channel = browser.create_data_channel("probe", None).await.unwrap();
+
+        let mut browser_gathered = browser.gathering_complete_promise().await;
+        let offer = browser.create_offer(None).await.unwrap();
+        browser.set_local_description(offer).await.unwrap();
+        let _ = browser_gathered.recv().await;
+        let offer = browser.local_description().await.unwrap();
+
+        daemon.set_remote_description(offer).await.unwrap();
+        let mut daemon_gathered = daemon.gathering_complete_promise().await;
+        let answer = daemon.create_answer(None).await.unwrap();
+        daemon.set_local_description(answer).await.unwrap();
+        let _ = daemon_gathered.recv().await;
+        let answer = daemon.local_description().await.unwrap();
+        let addrs = local_candidate_addrs(&answer.sdp);
+        assert!(
+            !addrs.is_empty(),
+            "the daemon peer gathered no host candidate"
+        );
+
+        browser.set_remote_description(answer).await.unwrap();
+        wait_for_state(&daemon, RTCPeerConnectionState::Connected).await;
+        for addr in &addrs {
+            assert!(
+                std::net::UdpSocket::bind(addr).is_err(),
+                "{addr} is not bound while the peer is connected"
+            );
+        }
+
+        // webrtc-rs frees a peer's sockets when the last handle to the peer
+        // drops, not when it is closed. The daemon relies on that: it must
+        // hold no handle of its own once a peer is retired, or the ports stay
+        // bound for as long as the daemon runs.
+        daemon.close().await.unwrap();
+        drop(daemon);
+        assert_ports_released(&addrs, "closed and dropped connected peer").await;
+        browser.close().await.unwrap();
+    }
+
+    /// The real path: a browser negotiates a session through the daemon,
+    /// then goes away. Every handler and task the daemon installed on that
+    /// peer must let go of it, so the peer is dropped and its pinned ICE
+    /// ports are free for the next connection.
+    #[tokio::test]
+    async fn a_departed_browser_leaves_no_peer_and_no_bound_ports_behind() {
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, mut commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        Vec::new(),
+                    )));
+                }
+            }
+        });
+        let sessions = RtcSessions::new();
+        let signal_id = format!("departed-browser-{}", Uuid::new_v4());
+        let client =
+            connect_rtc_session(&sessions, &registry, session_id, &signal_id, "generation").await;
+        let (peer, addrs) = {
+            let peers = sessions.peers.lock().await;
+            let pc = &peers.get(&signal_id).expect("active real peer").pc;
+            let answer = pc.local_description().await.expect("the daemon answered");
+            (Arc::downgrade(pc), local_candidate_addrs(&answer.sdp))
+        };
+        assert!(
+            !addrs.is_empty(),
+            "the daemon peer gathered no host candidate"
+        );
+
+        // The tab closes, the laptop lid shuts: the browser is simply gone.
+        close_test_peer(&client.pc).await;
+        drop(client);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while peer.upgrade().is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon still holds a handle to the departed browser's peer"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_ports_released(&addrs, "the departed browser's peer").await;
+        worker.abort();
+    }
+
+    /// The host-control peer has the same shape and the same promise: once
+    /// the browser is gone and the peer is closed, nothing the daemon
+    /// installed on it may keep it alive. The paired-endpoint harness builds
+    /// the daemon peer on a plain API and has no reaper, so this test closes
+    /// the peer itself, as close_host_if_same would, and its ports are
+    /// ordinary ephemeral ones rather than the pinned range; the handlers
+    /// under test are the real ones either way.
+    #[tokio::test]
+    async fn a_departed_host_control_browser_leaves_no_peer_and_no_bound_ports_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "0".repeat(32),
+            binding_generation: 1,
+            protocol: HOST_CONTROL_LABEL.to_owned(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, messages_rx) =
+            paired_host_endpoint(files, binding, "departed-host-browser").await;
+        let answer = daemon_pc.local_description().await.unwrap();
+        let addrs = local_candidate_addrs(&answer.sdp);
+        assert!(
+            !addrs.is_empty(),
+            "the daemon peer gathered no host candidate"
+        );
+        let peer = Arc::downgrade(&daemon_pc);
+
+        browser_pc.close().await.unwrap();
+        drop(channel);
+        drop(messages_rx);
+        drop(browser_pc);
+        // What close_host_if_same does once the peer fails: close it, and let
+        // go of the daemon's own handle.
+        close_test_peer(&daemon_pc).await;
+        drop(daemon_pc);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while peer.upgrade().is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon still holds a handle to the departed browser's host peer"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_ports_released(&addrs, "the departed browser's host peer").await;
+    }
 
     const BROWSER_MDNS_CANDIDATE: &str =
         "candidate:842163049 1 udp 1677729535 33cde59c-1be0-47b5-9ae5-786881bd0089.local 50123 typ host generation 0 ufrag Xk4b network-cost 999";
@@ -4813,7 +5069,12 @@ mod tests {
                 None,
                 false,
                 None,
-                registry,
+                // The registry outlives every peer in the daemon. Hold it
+                // here too: once a retired peer is really dropped, a moved
+                // registry would go with it, closing the worker's command
+                // channel and leaving the checks below unable to tell "no
+                // frame" from "no worker".
+                registry.clone(),
                 out_tx,
                 None,
             )

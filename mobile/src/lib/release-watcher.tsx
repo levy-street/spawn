@@ -3,6 +3,7 @@ import { AppState, Linking, StyleSheet, View } from "react-native";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Text } from "@/components/ui/text";
+import { ToastProgressBar } from "@/components/ui/toast";
 import type { Release } from "@/data/api/schemas/release";
 import { useRelease } from "@/data/queries/release";
 import { subscribeProtocolRequired } from "@/data/realtime/socket";
@@ -12,7 +13,7 @@ import {
   type MobileUpdatesClient,
   mobileUpdates,
 } from "@/lib/updates";
-import { spacing } from "@/theme";
+import { layer, spacing, useTheme } from "@/theme";
 
 const RELEASE_CHECK_MS = 15 * 60 * 1_000;
 const SOFT_SNOOZE_MS = 30 * 60 * 1_000;
@@ -45,6 +46,15 @@ export function ReleaseWatcher({
   const pendingHardRef = useRef(false);
   const snoozeUntilRef = useRef(0);
   const [prompt, setPrompt] = useState<UpdatePrompt | null>(null);
+  /**
+   * A required update is running right now.
+   *
+   * Without this the hard path fetched a bundle in silence — seconds of
+   * nothing on a screen whose sockets had just been refused — and only spoke
+   * once it was ready to restart. The work is not optional, so it takes the
+   * screen while it happens.
+   */
+  const [forcedBusy, setForcedBusy] = useState(false);
   refetchRef.current = release.refetch;
 
   const present = useCallback((next: UpdatePrompt) => {
@@ -66,6 +76,7 @@ export function ReleaseWatcher({
 
       checkingRef.current = true;
       pendingHardRef.current = hard;
+      if (hard && mountedRef.current) setForcedBusy(true);
       try {
         const result = await refetchRef.current();
         const currentHard = pendingHardRef.current;
@@ -104,6 +115,7 @@ export function ReleaseWatcher({
         if (becameHard) present({ kind: "store", hard: true });
       } finally {
         checkingRef.current = false;
+        if (mountedRef.current) setForcedBusy(false);
       }
     },
     [now, present, updates],
@@ -126,6 +138,13 @@ export function ReleaseWatcher({
   }, [check]);
 
   if (!updates.isEnabled) return null;
+
+  // A required update in flight owns the screen. Everything else in the app is
+  // already unusable — the server refused this build at the handshake — so a
+  // dismissible notice over it would be a lie about what still works.
+  if (forcedBusy) {
+    return <ForcedUpdateOverlay />;
+  }
 
   const later = () => {
     snoozeUntilRef.current = now() + SOFT_SNOOZE_MS;
@@ -172,6 +191,10 @@ export function ReleaseWatcher({
     );
   }
 
+  if (prompt?.kind === "restart" && prompt.hard) {
+    return <ForcedUpdateOverlay onRestart={() => void updates.reloadAsync()} />;
+  }
+
   return (
     <Dialog
       footer={
@@ -196,8 +219,70 @@ export function ReleaseWatcher({
   );
 }
 
+/**
+ * The whole screen, while a required update is taken.
+ *
+ * Reached only from a protocol refusal: the server has closed the socket
+ * saying it will not speak this build's version, so there is nothing behind
+ * this to go back to — which is why it is a plain overlay and not a Dialog.
+ *
+ * The bar is indeterminate because `expo-updates` reports no progress at all.
+ * It says "still going", which is the whole of what is known; a percentage
+ * here would be a number nobody measured.
+ */
+function ForcedUpdateOverlay({ onRestart }: { onRestart?: () => void }): React.JSX.Element {
+  const theme = useTheme();
+  return (
+    <View
+      accessibilityLiveRegion="polite"
+      accessibilityRole="alert"
+      style={[
+        styles.overlay,
+        { backgroundColor: theme.colors.background, padding: theme.space(6), zIndex: layer.modal },
+      ]}
+    >
+      <View style={styles.overlayBody}>
+        <Text style={styles.centered} variant="uiBase" weight="medium">
+          SPAWN D needs to update
+        </Text>
+        <Text
+          color="mutedForeground"
+          style={[styles.centered, { marginTop: theme.space(2) }]}
+          variant="caption"
+        >
+          {onRestart
+            ? "The update is ready. Restarting picks it up; your sessions keep running."
+            : "This version can no longer talk to the server. Getting the new one now."}
+        </Text>
+        {onRestart ? null : <ToastProgressBar progress="indeterminate" />}
+        {onRestart ? (
+          <Button onPress={onRestart} style={{ marginTop: theme.space(5) }}>
+            Restart now
+          </Button>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
+  centered: {
+    textAlign: "center",
+  },
   content: {
     padding: spacing[4],
+  },
+  overlay: {
+    alignItems: "center",
+    bottom: 0,
+    justifyContent: "center",
+    left: 0,
+    position: "absolute",
+    right: 0,
+    top: 0,
+  },
+  overlayBody: {
+    maxWidth: 360,
+    width: "100%",
   },
 });

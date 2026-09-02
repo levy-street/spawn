@@ -117,6 +117,49 @@ export function iceServersNeedRefresh(
   return false;
 }
 
+/**
+ * A live socket hears a server ping at least every 25 s. Silence past this,
+ * on a socket still claiming OPEN, says the socket is a corpse a sleep left
+ * behind — macOS suspend routinely half-opens TCP without ever firing
+ * `onclose`, and everything sent into one "succeeds" into nothing.
+ */
+export const SIGNAL_SILENCE_SUSPECT_MS = 35_000;
+
+/**
+ * An RTC start or ICE restart still "in flight" after this long is presumed
+ * frozen, not slow: its awaits (an IndexedDB trust read, `createOffer` on a
+ * post-suspend WebKit) can simply never settle after a sleep, and the latch
+ * they hold would otherwise turn every later retry into a no-op — the exact
+ * shape of "reconnecting forever until a reload". A healthy pass finishes in
+ * a couple of seconds; every legitimate timer inside one is 10 s or less.
+ */
+export const RTC_LATCH_TIMEOUT_MS = 20_000;
+
+/**
+ * The wake signal none of the browser's events deliver: a machine that slept
+ * with the page visible and frontmost fires no `visibilitychange`, fires
+ * `online` only if the network stack noticed, and `pageshow` only from
+ * bfcache — inside the desktop shell's webview, typically nothing at all. A
+ * timer that should have ticked every `intervalMs` and instead skipped more
+ * than `gapMs` proves the clock jumped, which only a suspend does.
+ */
+export function watchSuspendResume(
+  onResume: () => void,
+  intervalMs = 15_000,
+  gapMs = 45_000,
+  now: () => number = Date.now,
+): () => void {
+  if (typeof window === "undefined") return () => {};
+  let last = now();
+  const timer = setInterval(() => {
+    const current = now();
+    const gap = current - last;
+    last = current;
+    if (gap > gapMs) onResume();
+  }, intervalMs);
+  return () => clearInterval(timer);
+}
+
 function originForWs(): string {
   if (WS_URL) return WS_URL;
   if (typeof window === "undefined") return "ws://localhost:3000";

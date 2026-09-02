@@ -8,7 +8,9 @@ import {
   sessionActivityDetail,
   sessionActivityLabel,
   sessionActivityTone,
+  sessionAgent,
   sessionAtShell,
+  sessionHref,
   sessionNeedsAttention,
   sessionTitle,
   sessionTitleDetail,
@@ -31,6 +33,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     activity_state: "unknown",
     activity_label: "Unknown",
     foreground_command: null,
+    agent_id: null,
     ...overrides,
   };
 }
@@ -120,6 +123,13 @@ describe("isShellCommand", () => {
     }
   });
 
+  test("matches the Windows shells, extension and all", () => {
+    for (const shell of ["powershell", "pwsh", "cmd"]) {
+      expect(isShellCommand(shell)).toBe(true);
+      expect(isShellCommand(`${shell}.exe`)).toBe(true);
+    }
+  });
+
   test("rejects agents, null, and lookalikes", () => {
     expect(isShellCommand(null)).toBe(false);
     expect(isShellCommand(undefined)).toBe(false);
@@ -159,5 +169,67 @@ describe("runningAgent", () => {
 
   test("an unclaimed foreground process is not an agent either", () => {
     expect(runningAgent(makeSession({ foreground_command: "vim" }), agents)).toBeNull();
+  });
+
+  test("a Windows host's .exe suffix does not hide the agent", () => {
+    // The kernel-reported name carries the extension there; the registry's
+    // command does not. Both spellings must land on the same agent, or a
+    // duplicated Claude pane comes back as an empty shell.
+    expect(runningAgent(makeSession({ foreground_command: "claude.exe" }), agents)?.id).toBe("a1");
+    expect(runningAgent(makeSession({ foreground_command: "CODEX.EXE" }), agents)?.id).toBe("a2");
+    expect(runningAgent(makeSession({ foreground_command: "powershell.exe" }), agents)).toBeNull();
+  });
+});
+
+describe("sessionHref", () => {
+  const layout = {
+    version: 3 as const,
+    active_tab: "t1",
+    tabs: [
+      {
+        id: "t1",
+        name: "Build",
+        layout: { version: 3 as const, tiles: [{ session_id: "s1", x: 0, y: 0, w: 12, h: 8 }] },
+      },
+    ],
+  };
+
+  test("lands on the workspace tab holding the session, focused on it", () => {
+    expect(sessionHref("s1", [{ id: "w1", layout }])).toBe("/w/w1?tab=t1&focus=s1");
+  });
+
+  test("falls back to the standalone page for an unreferenced session", () => {
+    expect(sessionHref("s2", [{ id: "w1", layout }])).toBe("/sessions/s2");
+    expect(sessionHref("s2", [])).toBe("/sessions/s2");
+  });
+});
+
+describe("sessionAgent", () => {
+  const agents = [
+    { id: "a1", command: "claude" },
+    { id: "a2", command: "hermes" },
+  ];
+
+  test("the recorded type answers even when no process backs it up", () => {
+    // A Hermes CLI is a venv console script, so the kernel calls the process
+    // "python3" — the name of no agent's command. The window is still a
+    // Hermes window, and a duplicate of it has to be one.
+    const hermes = makeSession({ agent_id: "a2", foreground_command: "python3" });
+    expect(sessionAgent(hermes, agents)?.id).toBe("a2");
+    // Quit the agent and the window keeps its type; only the process changed.
+    expect(
+      sessionAgent(makeSession({ agent_id: "a2", foreground_command: "-zsh" }), agents)?.id,
+    ).toBe("a2");
+  });
+
+  test("falls back to the foreground for a window nothing typed itself into", () => {
+    expect(sessionAgent(makeSession({ foreground_command: "claude" }), agents)?.id).toBe("a1");
+    expect(sessionAgent(makeSession({ foreground_command: "-zsh" }), agents)).toBeNull();
+  });
+
+  test("a recorded type no definition claims any more falls back too", () => {
+    const deleted = makeSession({ agent_id: "gone", foreground_command: "claude" });
+    expect(sessionAgent(deleted, agents)?.id).toBe("a1");
+    expect(sessionAgent(makeSession({ agent_id: "gone" }), agents)).toBeNull();
   });
 });

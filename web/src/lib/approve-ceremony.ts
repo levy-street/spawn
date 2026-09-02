@@ -631,9 +631,18 @@ export function useApproveDeviceCeremony({
         if (Object.keys(change).length > 0) patch(pairing.id, change);
       }
     }
+    // Whichever step this pass claims, so a failure can hand it back. The
+    // guard exists to stop a second poll racing the same call, not to record
+    // that the call succeeded — and it is taken BEFORE the await, so without
+    // this a single transient relay failure would leave the guard set with the
+    // work never done, and no later poll would ever retry: the ceremony sits
+    // on "Securing the connection…" until the page is reloaded. The
+    // reciprocate path below already hands its guard back this way.
+    let claimed: string | null = null;
     try {
       if (amJoiner && !pairing.joiner_nonce && !actedRef.current.has(`contribute:${pairing.id}`)) {
-        actedRef.current.add(`contribute:${pairing.id}`);
+        claimed = `contribute:${pairing.id}`;
+        actedRef.current.add(claimed);
         const nonce = freshSasNonce();
         noncesRef.current.set(pairing.id, nonce);
         patch(pairing.id, {});
@@ -652,7 +661,8 @@ export function useApproveDeviceCeremony({
       ) {
         const nonce = noncesRef.current.get(pairing.id);
         if (!nonce) return; // not started in this session; cannot open the commitment
-        actedRef.current.add(`reveal:${pairing.id}`);
+        claimed = `reveal:${pairing.id}`;
+        actedRef.current.add(claimed);
         await trust.revealPairing(pairing.id, { initiator_nonce: b64urlEncode(nonce) });
         await invalidatePairings();
         return;
@@ -663,7 +673,8 @@ export function useApproveDeviceCeremony({
         pairing.joiner_public_key &&
         !actedRef.current.has(`sas:${pairing.id}`)
       ) {
-        actedRef.current.add(`sas:${pairing.id}`);
+        claimed = `sas:${pairing.id}`;
+        actedRef.current.add(claimed);
         // Snapshot the exact bytes that go into the number. These — and only
         // these — are what the human's match authenticates, so they are pinned
         // into the record and every later verify/sign uses the pinned copies.
@@ -707,7 +718,12 @@ export function useApproveDeviceCeremony({
       }
     } catch {
       // Transient relay races (e.g. set-once 409 from a duplicate poll) are safe
-      // to ignore — the next poll reconciles from the authoritative state.
+      // to ignore — the next poll reconciles from the authoritative state. But
+      // it can only reconcile if this step is retryable, so give the guard
+      // back. Re-running a step the relay actually did accept is harmless: the
+      // 409 is idempotent, and the next poll sees the nonce on the row and
+      // stops matching the branch at all.
+      if (claimed) actedRef.current.delete(claimed);
     }
   }
 

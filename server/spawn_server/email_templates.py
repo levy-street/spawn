@@ -373,7 +373,11 @@ def password_reset(*, link: str, site_url: str) -> RenderedEmail:
 def invite(*, link: str, site_url: str, inviter: str | None = None) -> RenderedEmail:
     # The inviter goes in the body, not the heading: addresses are long and
     # arbitrary, and one set as an H1 wraps into two lines of shouting.
-    opening = f"{inviter} invited you to SPAWN D." if inviter else "You've been invited to SPAWN D."
+    opening = (
+        f"{inviter} invited you to SPAWN D."
+        if inviter
+        else "You've been invited to SPAWN D."
+    )
     return _render(
         subject=f"You're invited to {BRAND}",
         preheader="Your invitation link — it works once, and it expires.",

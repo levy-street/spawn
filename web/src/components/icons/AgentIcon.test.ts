@@ -7,6 +7,7 @@ describe("resolveAgentIcon", () => {
     expect(resolveAgentIcon("codex").icon).toBe("codex");
     expect(resolveAgentIcon("opencode").icon).toBe("opencode");
     expect(resolveAgentIcon("aider-sonnet").icon).toBe("aider");
+    expect(resolveAgentIcon("hermes").icon).toBe("hermes");
   });
 
   test("kind wins over command", () => {
@@ -16,6 +17,7 @@ describe("resolveAgentIcon", () => {
   test("falls back to command basename", () => {
     expect(resolveAgentIcon(undefined, "/usr/local/bin/claude").icon).toBe("claude-code");
     expect(resolveAgentIcon(null, "aider --model sonnet").icon).toBe("aider");
+    expect(resolveAgentIcon(null, "hermes --yolo").icon).toBe("hermes");
   });
 
   test("skips env-prefix tokens in commands", () => {
@@ -23,12 +25,17 @@ describe("resolveAgentIcon", () => {
   });
 
   test("shell names get the terminal glyph, labeled by shell", () => {
-    for (const shell of ["bash", "zsh", "fish", "sh", "dash"]) {
+    for (const shell of ["bash", "zsh", "fish", "sh", "dash", "powershell", "pwsh", "cmd"]) {
       const resolved = resolveAgentIcon(undefined, `/bin/${shell}`);
       expect(resolved.icon).toBe("shell");
       expect(resolved.label).toBe(shell);
     }
     expect(resolveAgentIcon("zsh").icon).toBe("shell");
+  });
+
+  test("a Windows .exe suffix neither hides a brand nor un-shells a shell", () => {
+    expect(resolveAgentIcon(undefined, "claude.exe").icon).toBe("claude-code");
+    expect(resolveAgentIcon(undefined, "pwsh.exe").icon).toBe("shell");
   });
 
   test("unknown kinds become monograms with the first letter", () => {
@@ -49,6 +56,7 @@ describe("agentDisplayName", () => {
   test("names known agents by brand", () => {
     expect(agentDisplayName("claude")).toBe("Claude Code");
     expect(agentDisplayName("/usr/local/bin/codex")).toBe("Codex");
+    expect(agentDisplayName("hermes")).toBe("Hermes Agent");
   });
 
   test("nothing running reads as a shell", () => {

@@ -216,13 +216,33 @@ rejects a value that is not an http(s) origin, ends in a slash, or holds
 whitespace: a bad one is only visible at runtime as an app that reaches no
 server at all.
 
-A build pointed anywhere but `https://spawnd.dev` also takes **no updates**
-from the signed app channel. That channel carries the app for the vendor's
-server, signed by the offline updater key, so a build made for a dev deployment
-would check production on launch and — the first time production went ahead of
-it — replace itself with the production app, moving the machine to another
-fleet. Such a build is updated by whoever built it, and its update surface says
-so.
+A build takes updates **from the deployment it points at, and only that one**.
+`updater_config::OWN_ENDPOINT` is `<that origin>/desktop/latest.json`, baked by
+the same `concat!` that bakes the origin so the two cannot drift; the vendor's
+origin keeps the vendor's stable/beta channels. The rule being kept is that no
+update ever moves a machine between fleets — a dev build must never check
+production, because the first time production went ahead of it, it would
+replace itself with the production app. Reading its *own* channel is the
+opposite of that mistake: it is how a dev deployment ships a fix to the apps it
+handed out.
+
+`tauri.conf.json` pins the vendor endpoint, which is right for a release build
+and wrong for every other one, so `lib.rs` builds the updater through
+`updater_builder().endpoints(…)` rather than `app.updater()`. The pinned
+**pubkey** is used either way: every payload on every channel carries a
+detached signature from the offline updater key, so a channel that serves an
+update it did not have signed is refused. Publishing to a dev channel needs the
+same key a release does (`~/.tauri/spawn-desktop.key`) — a dev channel is a
+different audience, not a lower bar.
+
+A plain-HTTP origin (`npm run dev`, `http://localhost:3000`) takes no updates
+at all. An update is code, and a loopback origin has no transport
+authentication to fetch it over; such a build is updated by installing the next
+one.
+
+Publishing to a dev channel is `latest.json` beside the payloads under that
+deployment's `/desktop/`, exactly as the vendor's channel is laid out — see
+"Serving a deployment's own app channel" in `docs/RELEASE.md`.
 
 `scripts/dev.sh --onboarding` (`npm run dev --onboarding`) rebuilds this app
 when anything under `src/`, `src-tauri/src/`, the icons or the configs is newer

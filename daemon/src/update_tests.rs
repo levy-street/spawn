@@ -74,9 +74,12 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
         Some(signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap();
 
@@ -85,9 +88,12 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
         None,
         &request,
         "darwin-aarch64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap_err();
     assert_eq!(
@@ -102,9 +108,12 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
         Some(&bad),
         &request,
         "darwin-aarch64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap_err();
     assert_eq!(failure.error, "manifest_bad_signature");
@@ -116,9 +125,12 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
         Some(valid_signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        false,
-        &[&wrong_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&wrong_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap_err();
     assert_eq!(failure.error, "manifest_bad_signature");
@@ -134,9 +146,12 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
         Some(signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap_err();
     assert_eq!(
@@ -144,15 +159,41 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
         (UpdateStage::Precondition, "downgrade")
     );
 
+    // The server asking is not the server deciding: `allow_downgrade` on the
+    // frame no longer bypasses the counter on its own, because docs/TRUST.md
+    // treats the control plane as hostile and rollback protection is the one
+    // guarantee the counter exists to give.
     request.allow_downgrade = true;
+    let asked_only = verify_manifest_bytes(
+        &older,
+        Some(signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        (asked_only.stage, asked_only.error),
+        (UpdateStage::Precondition, "downgrade")
+    );
+
+    // With local consent proven on the host as well, it proceeds.
     verify_manifest_bytes(
         &older,
         Some(signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: true,
+        },
     )
     .unwrap();
 
@@ -163,9 +204,12 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
         Some(equal_signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap();
 
@@ -174,9 +218,12 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
         None,
         &request,
         "darwin-aarch64",
-        true,
-        &[],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: true,
+            public_keys: &[],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap();
 
@@ -186,9 +233,12 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
         Some(equal_signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap_err();
     assert_eq!(
@@ -504,9 +554,12 @@ fn signed_manifest_accepts_the_windows_target_and_rejects_target_substitution() 
         Some(signature.as_bytes()),
         &request,
         "windows-x86_64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap();
     let failure = verify_manifest_bytes(
@@ -514,9 +567,12 @@ fn signed_manifest_accepts_the_windows_target_and_rejects_target_substitution() 
         Some(signature.as_bytes()),
         &request,
         "linux-x86_64",
-        false,
-        &[&public_key],
-        Some(1_000),
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: Some(1_000),
+            downgrade_authorized: false,
+        },
     )
     .unwrap_err();
     assert_eq!(failure.error, "manifest_mismatch");

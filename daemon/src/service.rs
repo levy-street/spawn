@@ -162,6 +162,42 @@ fn systemd_unit_name(config_dir: &Path) -> String {
     format!("spawn{}.service", instance_tag(config_dir))
 }
 
+/// Quote a value for use inside a systemd unit.
+///
+/// A unit file is a config format, not a shell, and every one of its hazards
+/// is silent. An unquoted `ExecStart` argument splits on whitespace, so a
+/// server URL or a config path containing a space becomes two arguments. `%`
+/// introduces a specifier systemd expands before anything sees it — `%h` is
+/// the home directory, `%%` is how you write a literal percent. And a newline
+/// simply ends the directive, so a value carrying one does not corrupt a
+/// setting, it *adds* settings. The launchd plist and the Windows task XML
+/// both escape their values already; this is systemd catching up with them.
+fn systemd_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' | '\\' => {
+                quoted.push('\\');
+                quoted.push(character);
+            }
+            '%' => quoted.push_str("%%"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// `Description=` is free text rather than an argument list, so it is not
+/// quoted — but it still expands specifiers and still ends at a newline.
+fn systemd_description(value: &str) -> String {
+    value.replace('%', "%%").replace(['\n', '\r'], " ")
+}
+
 fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String {
     // KillMode=process: the agent workers run in their own process groups and
     // must survive `systemctl restart` / upgrades (docs/SESSIOND.md).
@@ -172,7 +208,7 @@ fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String 
          Wants=network-online.target\n\
          \n\
          [Service]\n\
-         Environment=PATH={path}\n\
+         Environment={path}\n\
          Environment=SPAWN_DISABLE_KEYRING=1\n\
          ExecStart={bin} --config-dir {config_dir} --server {server} run\n\
          Restart=on-failure\n\
@@ -181,11 +217,11 @@ fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String 
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        name = instance_name(config_dir),
-        path = service_path(),
-        bin = bin.display(),
-        config_dir = config_dir.display(),
-        server = server,
+        name = systemd_description(&instance_name(config_dir)),
+        path = systemd_quote(&format!("PATH={}", service_path())),
+        bin = systemd_quote(&bin.display().to_string()),
+        config_dir = systemd_quote(&config_dir.display().to_string()),
+        server = systemd_quote(server),
     )
 }
 
@@ -821,6 +857,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn systemd_unit_values_survive_spaces_percents_and_newlines() {
+        let quoted = systemd_quote("/opt/spawn d/spawnd");
+        assert_eq!(quoted, "\"/opt/spawn d/spawnd\"");
+        // `%h` would otherwise expand to the home directory.
+        assert_eq!(systemd_quote("100%h"), "\"100%%h\"");
+        // A newline must stay inside the value instead of ending the directive.
+        let injected = systemd_quote("https://x/\nExecStart=/bin/sh -c evil");
+        assert!(!injected.contains('\n'), "{injected}");
+        assert!(injected.contains("\\n"), "{injected}");
+        assert_eq!(systemd_quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert!(!systemd_description("spawn\nExecStart=x").contains('\n'));
+        assert_eq!(systemd_description("50%"), "50%%");
+    }
+
+    #[test]
+    fn systemd_unit_contents_quotes_every_interpolated_value() {
+        let unit = systemd_unit_contents(
+            Path::new("/srv/spawn dir"),
+            Path::new("/opt/bin/spawnd"),
+            "https://example.test/\nExecStart=/bin/sh",
+        );
+        let directives = unit
+            .lines()
+            .filter(|line| line.starts_with("ExecStart="))
+            .count();
+        assert_eq!(directives, 1, "a value started a second directive: {unit}");
+        assert!(unit.contains("\"/srv/spawn dir\""), "{unit}");
+    }
+
+    #[test]
     fn distinct_roots_get_distinct_unit_names_and_labels() {
         let alice = Path::new("/srv/spawn/alice");
         let bob = Path::new("/srv/spawn/bob");
@@ -835,7 +901,9 @@ mod tests {
     fn systemd_unit_embeds_config_dir_and_survives_restart() {
         let dir = Path::new("/srv/spawn/alice");
         let unit = systemd_unit_contents(dir, Path::new("/usr/bin/spawnd"), "https://spawnd.dev");
-        assert!(unit.contains("ExecStart=/usr/bin/spawnd --config-dir /srv/spawn/alice --server https://spawnd.dev run"));
+        assert!(unit.contains(
+            "ExecStart=\"/usr/bin/spawnd\" --config-dir \"/srv/spawn/alice\" --server \"https://spawnd.dev\" run"
+        ));
         assert!(unit.contains("KillMode=process")); // workers survive restarts
         assert!(unit.contains("WantedBy=default.target"));
     }

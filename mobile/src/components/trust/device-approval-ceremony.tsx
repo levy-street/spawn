@@ -25,8 +25,12 @@ import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { useDeviceCeremony } from "@/data/trust/ceremony";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
-import { describeDeviceRegistrationFailure } from "@/data/trust/registration";
+import {
+  describeDeviceRegistrationFailure,
+  startFreshDeviceIdentity,
+} from "@/data/trust/registration";
 import { haptics } from "@/lib/haptics";
+import { useSignOut } from "@/lib/use-sign-out";
 import { spacing, useTheme } from "@/theme";
 
 /** How long the approved card stays up before the sheet closes itself. */
@@ -80,6 +84,7 @@ export function DeviceApprovalCeremony({
   const devices = useAccountDevices(phoneQuery.isSuccess);
   const endorsements = usePendingEndorsements(accountId ?? "", phone?.id ?? null);
   const approvals = useDeviceHostApprovals(true);
+  const signOut = useSignOut();
   const [serverOrigin, setServerOrigin] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -88,6 +93,24 @@ export function DeviceApprovalCeremony({
       .then((baseUrl) => setServerOrigin(serverOriginFromBaseUrl(baseUrl)))
       .catch(() => setServerOrigin(null));
   }, []);
+
+  // Replace only this phone's saved key, then let the registration query mint
+  // and register the new one. The manual form of the automatic heal, for the
+  // refusals that are final for the old key but were not healed on their own.
+  const startFresh = useMutation({
+    mutationFn: async () => {
+      if (accountId === undefined) throw new Error("Your account is still loading.");
+      await startFreshDeviceIdentity(accountId);
+      await queryClient.resetQueries({ queryKey: qk.browserDeviceRegistration(accountId) });
+    },
+    onError: (cause: unknown) => {
+      setActionError(
+        cause instanceof Error
+          ? cause.message
+          : "SPAWN D could not create a fresh identity on this phone.",
+      );
+    },
+  });
 
   const target = approvals.approvals.find((entry) => entry.host.id === hostId);
   const hostName = target?.host.name ?? "This host";
@@ -210,7 +233,7 @@ export function DeviceApprovalCeremony({
                 : phase === "settling"
                   ? "Finishing up"
                   : phase === "identity-blocked"
-                    ? "This device has no identity yet"
+                    ? registrationFailure.title
                     : phase === "waiting"
                       ? `${hostName} is waiting on your say-so`
                       : `${hostName} has not approved this device`}
@@ -221,7 +244,7 @@ export function DeviceApprovalCeremony({
               : phase === "settling"
                 ? `The number matched. ${hostName} is picking up the approval now.`
                 : phase === "identity-blocked"
-                  ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
+                  ? "SPAWN D could not finish setting up this phone's identity."
                   : phase === "waiting"
                     ? `A prompt is up on every screen already signed in${signedInAs} — including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there.`
                     : phase === "pair-only"
@@ -238,11 +261,48 @@ export function DeviceApprovalCeremony({
             {registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`}
           </Text>
           {registrationFailure.canRetry ? (
-            <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
+            <Button
+              onPress={() => {
+                if (accountId !== undefined) {
+                  void queryClient.resetQueries({
+                    queryKey: qk.browserDeviceRegistration(accountId),
+                  });
+                }
+              }}
+              size="sm"
+              variant="outline"
+            >
               Try again
             </Button>
           ) : null}
+          {registrationFailure.canStartFresh ? (
+            <Button loading={startFresh.isPending} onPress={() => startFresh.mutate()} size="sm">
+              Start fresh on this phone
+            </Button>
+          ) : null}
+          {registrationFailure.canSignOut ? (
+            <Button
+              loading={signOut.signingOut}
+              onPress={() => void signOut.signOut()}
+              size="sm"
+              variant="ghost"
+            >
+              Sign out
+            </Button>
+          ) : null}
         </View>
+      ) : null}
+
+      {phone?.identityRecovery === "device_key_revoked" ? (
+        <Text
+          accessibilityLiveRegion="polite"
+          color="mutedForeground"
+          style={styles.centered}
+          variant="caption"
+        >
+          This phone's old key was revoked, so SPAWN D created a fresh identity — approve it from
+          another device.
+        </Text>
       ) : null}
 
       {check !== null && phase !== "done" ? (

@@ -4,6 +4,7 @@ import {
   commandBasename,
   identifyAgent,
   runningAgent,
+  sessionAgent,
   sortAgents,
 } from "@/data/selectors/agent";
 import type { AgentDef } from "@/data/types/domain";
@@ -34,6 +35,7 @@ const BUILT_INS = [
     kind: "aider",
     command: "aider --model claude-sonnet-4-6",
   }),
+  agent({ id: "hermes", name: "hermes", kind: "hermes", command: "hermes" }),
 ];
 
 describe("agent identity", () => {
@@ -42,6 +44,7 @@ describe("agent identity", () => {
     ["codex", "codex", "Codex"],
     ["opencode", "opencode", "OpenCode"],
     ["aider", "aider", "Aider Sonnet"],
+    ["hermes", "hermes", "Hermes Agent"],
   ])("recognizes %s", (command, logoKey, displayName) => {
     expect(identifyAgent(command, BUILT_INS)).toMatchObject({ logoKey, displayName });
   });
@@ -79,6 +82,22 @@ describe("agent identity", () => {
     expect(commandBasename("A=1 B=2")).toBeNull();
     expect(commandBasename("  ")).toBeNull();
   });
+
+  it("reads a Windows host's .exe suffix as the same program", () => {
+    // Windows reports "claude.exe" for the definition spelled "claude"; an
+    // exact match would call that pane a plain shell and a duplicate of it
+    // would come back empty.
+    expect(runningAgent("claude.exe", BUILT_INS)?.id).toBe("claude");
+    expect(identifyAgent("CODEX.EXE", BUILT_INS)).toMatchObject({
+      displayName: "Codex",
+      logoKey: "codex",
+    });
+    expect(identifyAgent("powershell.exe", BUILT_INS)).toMatchObject({
+      displayName: "Shell",
+      logoKey: "shell",
+    });
+    expect(runningAgent("pwsh.exe", BUILT_INS)).toBeNull();
+  });
 });
 
 describe("agent launch commands", () => {
@@ -111,5 +130,32 @@ describe("agent launch commands", () => {
       agent({ id: "c", owner_user_id: "user", name: "Charlie" }),
     ]);
     expect(sorted.map((item) => item.id)).toEqual(["a", "b", "c", "z"]);
+  });
+});
+
+describe("sessionAgent", () => {
+  const claude = agent({ id: "a1", name: "claude-code", kind: "claude-code", command: "claude" });
+  const hermes = agent({ id: "a2", name: "hermes", kind: "hermes", command: "hermes" });
+  const agents = [claude, hermes];
+  const session = (agent_id: string | null, foreground_command: string | null) =>
+    ({ agent_id, foreground_command }) as const;
+
+  it("answers with the recorded type when no process backs it up", () => {
+    // A Hermes CLI is a venv console script, so the kernel calls the process
+    // "python3" — the name of no agent's command. The window is still a Hermes
+    // window, and a duplicate of it has to be one.
+    expect(sessionAgent(session("a2", "python3"), agents)).toBe(hermes);
+    // Quit the agent and the window keeps its type; only the process changed.
+    expect(sessionAgent(session("a2", "-zsh"), agents)).toBe(hermes);
+  });
+
+  it("falls back to the foreground for a window nothing typed itself into", () => {
+    expect(sessionAgent(session(null, "claude"), agents)).toBe(claude);
+    expect(sessionAgent(session(null, "-zsh"), agents)).toBeNull();
+  });
+
+  it("falls back when the recorded type is a definition since deleted", () => {
+    expect(sessionAgent(session("gone", "claude"), agents)).toBe(claude);
+    expect(sessionAgent(session("gone", null), agents)).toBeNull();
   });
 });

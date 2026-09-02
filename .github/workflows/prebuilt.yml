@@ -25,12 +25,19 @@ jobs:
   macos:
     runs-on: macos-14 # Apple Silicon; also cross-builds x86_64 from here
     timeout-minutes: 40
+    # The Apple Developer ID lives in the `macos-code-signing` environment,
+    # whose deployment branch policy permits only `master`. Off master the job
+    # runs in `unsigned-builds`, which holds no secrets — so a pushed branch
+    # plus `gh workflow run --ref` cannot load the exportable .p12 into a
+    # runner, and the signing step below falls back to ad-hoc. Both
+    # environments must exist; see docs/AZURE_SIGNING_SETUP.md.
+    environment: ${{ github.ref == 'refs/heads/master' && 'macos-code-signing' || 'unsigned-builds' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install Rust (stable + x86_64 target)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: x86_64-apple-darwin
 
@@ -93,6 +100,12 @@ jobs:
         run: |
           set -eu
           identity="-"
+          # Belt and braces with the environment scoping on the job: the
+          # Developer ID is a release identity and only master cuts releases.
+          if [ "${GITHUB_REF:-}" != "refs/heads/master" ] && [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            echo "Refusing the Developer ID off master; signing ad-hoc." >&2
+            APPLE_CERTIFICATE=""
+          fi
           if [ "${DEVELOPER_ID:-}" = "true" ] && [ -n "${APPLE_CERTIFICATE:-}" ]; then
             keychain="$RUNNER_TEMP/spawnd-signing.keychain-db"
             password="$(uuidgen)"
@@ -155,7 +168,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -201,7 +214,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -246,7 +259,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust (stable MSVC)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -304,6 +317,7 @@ jobs:
           if (($secrets | Where-Object { $_ }).Count -eq 0) {
             'enabled=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             Write-Host 'Azure credentials are absent; keeping the Windows pair unsigned.'
+            Write-Host 'Unsigned Windows binaries are not uploaded on master, so they cannot reach prebuilt-latest.'
           } elseif (($required | Where-Object { $_ }).Count -ne $required.Count) {
             throw 'Windows signing is partially configured; provide all Azure secrets and signing variables.'
           } else {
@@ -312,7 +326,7 @@ jobs:
 
       - name: Azure login
         if: steps.signing-config.outputs.enabled == 'true'
-        uses: azure/login@v3
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -377,7 +391,14 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $file" }
           }
 
+      # Fail closed. `prebuilt-latest` is the prod install channel, so an
+      # unsigned pair must never enter it: off master an unsigned build is a
+      # dev artifact and still uploads, but on master an absent Azure identity
+      # means Windows is simply missing from the release — the same graceful
+      # degradation linux-aarch64 already has, loud at deploy and verify time —
+      # rather than silently shipping unsigned .exes to users.
       - name: Upload windows-x86_64 artifacts
+        if: steps.signing-config.outputs.enabled == 'true' || github.ref != 'refs/heads/master'
         uses: actions/upload-artifact@v4
         with:
           name: prebuilt-windows-x86_64

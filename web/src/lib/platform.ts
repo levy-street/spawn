@@ -37,7 +37,11 @@ const DESKTOP_ARTIFACT = new RegExp(
 
 export interface DesktopRelease {
   version: string;
-  tree: string;
+  /**
+   * Null during a publish gap, when the server falls back to the previously
+   * published build whose tree it cannot know.
+   */
+  tree: string | null;
   platforms: DesktopPlatform[];
 }
 
@@ -69,9 +73,13 @@ export function desktopReleaseFromPayload(payload: unknown): DesktopRelease | nu
   if (typeof desktop !== "object" || desktop === null) return null;
   const value = desktop as Record<string, unknown>;
   if (typeof value.version !== "string" || value.version.trim() === "") return null;
-  if (typeof value.tree !== "string" || !/^[0-9a-f]{40}$/u.test(value.tree)) return null;
+  let tree: string | null = null;
+  if (value.tree !== undefined && value.tree !== null) {
+    if (typeof value.tree !== "string" || !/^[0-9a-f]{40}$/u.test(value.tree)) return null;
+    tree = value.tree;
+  }
   const platforms = parseDesktopPlatforms(value.platforms);
-  return platforms ? { version: value.version, tree: value.tree, platforms } : null;
+  return platforms ? { version: value.version, tree, platforms } : null;
 }
 
 /** Parse the development route's deliberately smaller identity. */
