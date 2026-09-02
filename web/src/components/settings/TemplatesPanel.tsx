@@ -7,6 +7,7 @@ import { WorkspaceAvatar } from "@/components/nav/sidebar-parts";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import { type WorkspaceTemplate, workspaceTemplates } from "@/lib/api";
 
@@ -98,7 +99,19 @@ export function TemplatesPanel() {
       )}
 
       {q.isLoading ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        // The list's own frame, already holding the shape of its rows.
+        <div
+          role="status"
+          aria-label="Loading templates"
+          className="divide-y divide-border rounded-md border border-border"
+        >
+          {["one", "two"].map((key) => (
+            <div key={key} className="flex items-center gap-3 px-3 py-2.5">
+              <Skeleton className="size-8 shrink-0" />
+              <Skeleton className="h-4 w-2/5" />
+            </div>
+          ))}
+        </div>
       ) : templates.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           No templates yet. Open a workspace and choose "Save as template" from its ⋯ menu.
