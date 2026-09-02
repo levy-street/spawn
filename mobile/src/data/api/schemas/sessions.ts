@@ -11,11 +11,18 @@ export const SessionCreateSchema = z.object({
   host_id: UUIDSchema,
   cwd: z.string(),
   name: z.string().max(128).nullable().optional(),
+  /** The agent this window is being opened as: the type a duplicate copies. */
+  agent_id: UUIDSchema.nullable().optional(),
   skill_ids: z.array(UUIDSchema).nullable().optional(),
   workspace_id: UUIDSchema.nullable().optional(),
   tile: TilePlacementSchema.nullable().optional(),
 });
-export const SessionPatchSchema = z.object({ name: z.string().nullable().optional() });
+export const SessionPatchSchema = z.object({
+  name: z.string().nullable().optional(),
+  /** Sent when an agent is launched into a running window, and sent as null
+   *  when it is stopped back to a bare prompt. Omitted leaves the type be. */
+  agent_id: UUIDSchema.nullable().optional(),
+});
 export const SessionOutSchema = z.object({
   id: UUIDSchema,
   name: z.string().nullable(),
@@ -32,6 +39,12 @@ export const SessionOutSchema = z.object({
   activity_state: z.string(),
   activity_label: z.string(),
   foreground_command: z.string().nullable(),
+  /**
+   * What this window was opened as, as opposed to `foreground_command`, which
+   * is whatever holds the terminal this second. Defaulted rather than required
+   * so a bundle that reaches a phone before its server does still parses.
+   */
+  agent_id: UUIDSchema.nullable().default(null),
 });
 
 export type TilePlacement = z.infer<typeof TilePlacementSchema>;

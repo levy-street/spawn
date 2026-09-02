@@ -1,7 +1,8 @@
 import { autoPlace, type GridLayout, readingOrder, remove, type Tile } from "@/lib/grid";
 
 /**
- * Layout schema v3 — the tab envelope (docs/OVERHAUL.md §4.4-tabs).
+ * Layout schema v3 — the tab envelope. Contract: proto/README.md,
+ * "Layout schema v3".
  *
  * A workspace holds an ordered list of named tabs, each wrapping one tile
  * grid; the v2 algebra in `lib/grid.ts` (and its conformance fixtures) is

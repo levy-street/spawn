@@ -60,7 +60,13 @@ export function DeviceApprovalScreen({
  * The body without a screen frame, so setup can present the same ceremony as a
  * step rather than duplicating it.
  */
-export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.Element {
+export function DeviceApprovalBody({
+  hostId,
+  onExit,
+}: {
+  hostId?: string;
+  onExit?: () => void;
+}): React.JSX.Element {
   const router = useRouter();
   const queryClient = useQueryClient();
   const me = useMeSettingsQuery();
@@ -203,6 +209,12 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
           ) : null}
         </View>
       ) : null}
+
+      {onExit === undefined ? null : (
+        <Button onPress={onExit} variant="ghost">
+          Skip for now
+        </Button>
+      )}
 
       <View style={styles.section}>
         <SectionHeader title="This device" />

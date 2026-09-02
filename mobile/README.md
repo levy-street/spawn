@@ -97,9 +97,9 @@ daemon reachable from the phone; the configured `apiUrl` must still be routable 
 1. Sign in with email and password, or create an account.
 2. If the server requires email verification, confirm the message and return to the app.
 3. The app creates and registers this phone's device identity.
-4. If the account has no host, follow the host install instructions and enter the eight-character
-   pairing code. Compare the displayed fingerprints before approving. You may skip host pairing
-   and return to it later.
+4. If the account has no host, follow the host install instructions. The installer opens an
+   approval link; open it on this phone and compare the displayed fingerprints before approving.
+   You may skip possessing a host and return to it later.
 5. After setup, the four native roots are Workspaces, Hosts, Files, and Settings.
 
 OAuth buttons are intentionally unavailable in Expo Go. Use email and password.

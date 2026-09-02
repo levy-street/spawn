@@ -569,7 +569,7 @@ async def _user_for_profile(
         # linking a provider to one, is not a signup and is never gated.
         if not await invites.signup_is_open(session):
             if invite_code_hash is None:
-                raise InviteRequired(profile.provider, "spawn is invite only right now")
+                raise InviteRequired(profile.provider, "SPAWN D is invite only right now")
             try:
                 invite = await invites.redeem_invite_hash(session, invite_code_hash)
             except ValueError as cause:

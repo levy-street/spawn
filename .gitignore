@@ -9,7 +9,8 @@ __pycache__/
 .mypy_cache/
 .python-version
 .env
-.env.local
+.env.*
+!.env.example
 
 # uv
 .uv/
@@ -30,6 +31,7 @@ build/
 bun.lockb
 test-results/
 playwright-report/
+coverage/
 
 # Editors / OS
 .vscode/
@@ -37,6 +39,14 @@ playwright-report/
 .DS_Store
 *.swp
 *~
+.eslintcache
+
+# Merge and edit leftovers. `git add -A` after a conflict is how these land.
+# The vendored sctp crate ships a real Cargo.toml.orig, so exempt the vendor tree.
+*.orig
+*.rej
+*.bak
+!daemon/vendor/**/*.orig
 
 # Local data
 *.db
@@ -51,11 +61,16 @@ data/redis/
 
 # Spawn local state
 .spawn/
-spawn.log
+
+# Logs, wherever a script or a daemon drops one.
+*.log
 
 # Local agent workspace: worktrees, settings, and mailbox state. Never
 # something a clone or a contributor's `git add -A` should pick up.
 .claude/
+.claude-flow/
+# Planning scaffolding written by the GSD tooling, per-checkout and disposable.
+.planning/
 
 # Downloaded credential files: never let `git add -A` publish one.
 *credentials.csv
@@ -78,3 +93,10 @@ Screenshot *.png
 /*.p12
 /*.p8
 /*.mobileprovision
+
+# Expo's shared project state, written by the CLI beside mobile/.expo/.
+.expo-shared/
+
+# The WiX toolset scripts/publish-desktop.sh downloads to build the Windows
+# installer. Tens of megabytes of vendor binaries, refetched on demand.
+desktop/src-tauri/WixTools/

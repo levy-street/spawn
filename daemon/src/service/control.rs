@@ -163,6 +163,17 @@ pub fn start_listener(
                     request.truncate(size);
                     decode_request(&request)
                 }
+                // A read that fails because the client is already gone — the
+                // instance was recycled under it, or a connect completed with
+                // nobody on the other end, which a loaded machine produces —
+                // has nobody to answer. Writing an error reply here only
+                // races the next client, who would read a rejection meant
+                // for no one (and never retry it). Recycle the instance and
+                // listen again; the client side retries within its deadline.
+                Err(error) if is_gone_client(&error) => {
+                    let _ = server.disconnect();
+                    continue;
+                }
                 Err(error) => Err(error.into()),
             };
             match command {
@@ -204,22 +215,34 @@ pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
     let name = pipe_name(config_dir)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        let pipe = send_once(&name, deadline)?;
-        match exchange(pipe, command) {
+        // The listener serves one client per pipe instance and recycles the
+        // instance between clients, and DisconnectNamedPipe discards a framed
+        // reply the client has not read yet. That surfaces as "no process is
+        // on the other end of the pipe" (233) or a broken pipe — and not only
+        // mid-exchange: the recycle can land between our CreateFile and the
+        // SetNamedPipeHandleState that follows it, so opening the pipe is
+        // inside the retry too. Every control command is idempotent, so run
+        // the whole exchange again rather than surfacing a reply the server
+        // already sent.
+        let result = send_once(&name, deadline).and_then(|pipe| exchange(pipe, command));
+        match result {
             Ok(pid) => return Ok(pid),
-            // The listener serves one client per pipe instance and
-            // recycles the instance between clients, and DisconnectNamedPipe
-            // discards a framed reply the client has not read yet. That
-            // surfaces here as "no process is on the other end of the
-            // pipe" (233) or a broken pipe mid-exchange. Every control
-            // command is idempotent, so run the whole exchange again
-            // rather than surfacing a reply the server already sent.
             Err(error) if is_recycled_instance(&error) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+/// The server-side twin of [`is_recycled_instance`]: a read that failed
+/// because no client is on the other end any more, whether it disconnected
+/// or was never really there.
+#[cfg(windows)]
+fn is_gone_client(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
+    error.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32)
+        || error.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 #[cfg(windows)]

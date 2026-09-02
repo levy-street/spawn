@@ -60,7 +60,7 @@ import {
 import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE } from "@/lib/grid";
 import { basename } from "@/lib/paths";
-import { runningAgent } from "@/lib/sessions";
+import { sessionAgent } from "@/lib/sessions";
 import {
   addTab,
   allTiles,
@@ -956,6 +956,12 @@ export function WorkspaceTabs({
         throw new Error(`A workspace holds at most ${MAX_TABS} tabs.`);
       }
       const sessionsById = new Map((sessionsQ.data ?? []).map((item) => [item.id, item]));
+      // Awaited rather than read from the hook: a duplicate fired before the
+      // registry query settles would silently copy every agent pane as a bare
+      // shell. Failure falls back to the empty list it used to read.
+      const definitions = await queryClient
+        .ensureQueryData({ queryKey: ["agents"], queryFn: agents.list })
+        .catch(() => []);
       const copiedIds = new Map<string, string>();
       const created: string[] = [];
       try {
@@ -969,14 +975,15 @@ export function WorkspaceTabs({
           if (!source) continue; // a tile whose session is already gone
           const access = await sessionAccess.get(source.id).catch(() => null);
           const skillIds = access?.skills.map((skill) => skill.id) ?? [];
+          const agent = sessionAgent(source, definitions);
           const copy = await sessions.create({
             host_id: source.host_id,
             cwd: source.cwd,
+            ...(agent && { agent_id: agent.id }),
             ...(skillIds.length > 0 && { skill_ids: skillIds }),
           });
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
-          const agent = runningAgent(source, agentsQ.data ?? []);
           if (agent) pendingLaunch.set(copy.id, agentRunCommand(agent));
         }
         const next = duplicateTab(
@@ -1202,6 +1209,13 @@ export function WorkspaceTabs({
       // Two strips are two tablists, and "Workspace tabs" twice over says
       // nothing about which workspace either one holds.
       aria-label={splitChrome ? `${splitChrome.workspaceName} tabs` : "Workspace tabs"}
+      // Stamped for the grid's pane drag, the same contract as each tab
+      // button below: the strip's own ground (not a tab, not a control) is
+      // where a dragged pane can be dropped to get a tab of its own, and the
+      // owner says whose envelope that tab would join (a split shows two
+      // strips; see ownStripGroundAt in WorkspaceGrid).
+      data-workspace-tab-strip
+      data-workspace-tab-strip-owner={workspace.id}
       className="flex h-11 shrink-0 items-end gap-1.5 overflow-x-auto bg-shell pr-1.5 pb-1.5"
     >
       {splitChrome && (
@@ -1354,6 +1368,20 @@ export function WorkspaceTabs({
       >
         <Copy className="size-3.5 shrink-0" aria-hidden />
         <span ref={tabGhostLabelRef} className="max-w-48 truncate" />
+      </div>
+      {/* The pane drag's promise, dressed as the tab ghost above: resting a
+          dragged window on the strip's open ground lights this chip where the
+          new tab would land, and the drop makes that tab and carries the
+          window into it. The grid owns the hover — it stamps data-newtab-hover
+          here mid-gesture (see WorkspaceGrid), the same wiring as the
+          launcher's bin morph — so nothing about the drag re-renders React. */}
+      <div
+        aria-hidden
+        data-workspace-newtab-ghost
+        className="hidden h-8 shrink-0 items-center gap-1.5 rounded-md border-2 border-dashed border-ring bg-ring/10 px-3 text-xs font-medium text-foreground data-[newtab-hover]:flex"
+      >
+        <Plus className="size-3.5 shrink-0" aria-hidden />
+        New tab
       </div>
       {/* A tab is only ever wanted for what goes in it, so the "+" asks what
           that is first and makes the tab and the window together. The tab is

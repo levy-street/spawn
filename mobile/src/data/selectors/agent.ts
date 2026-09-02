@@ -1,7 +1,14 @@
 import type { AgentDef, AgentIdentity, AgentLogoKey, Session } from "@/data/types/domain";
 
-const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash"]);
+const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash", "powershell", "pwsh", "cmd"]);
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/**
+ * The daemon reports the kernel's own name for the foreground process, and on
+ * Windows that carries the executable extension — "claude.exe", "pwsh.exe" —
+ * which no agent definition or shell list spells out. Stripped before every
+ * comparison so the same program reads the same on every platform.
+ */
+const WINDOWS_EXECUTABLE_SUFFIX = /\.(exe|com|bat|cmd|ps1)$/i;
 const SAFE_SHELL_VALUE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 const SAFE_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -19,6 +26,7 @@ const BRANDS: Array<{ needle: string; brand: Brand }> = [
   { needle: "codex", brand: { kind: "codex", displayName: "Codex", logoKey: "codex" } },
   { needle: "opencode", brand: { kind: "opencode", displayName: "OpenCode", logoKey: "opencode" } },
   { needle: "aider", brand: { kind: "aider", displayName: "Aider Sonnet", logoKey: "aider" } },
+  { needle: "hermes", brand: { kind: "hermes", displayName: "Hermes Agent", logoKey: "hermes" } },
 ];
 
 export function commandBasename(command: string | null | undefined): string | null {
@@ -29,8 +37,14 @@ export function commandBasename(command: string | null | undefined): string | nu
   return normalized || null;
 }
 
-export function isShellCommand(command: string | null | undefined): boolean {
+/** The basename lowered and shorn of a Windows executable extension. */
+function normalizedBasename(command: string | null | undefined): string | null {
   const basename = commandBasename(command)?.toLowerCase();
+  return basename ? basename.replace(WINDOWS_EXECUTABLE_SUFFIX, "") : null;
+}
+
+export function isShellCommand(command: string | null | undefined): boolean {
+  const basename = normalizedBasename(command);
   return basename ? SHELL_COMMANDS.has(basename) : false;
 }
 
@@ -38,9 +52,32 @@ export function runningAgent(
   foregroundCommand: string | null,
   agents: readonly AgentDef[],
 ): AgentDef | null {
-  const reported = commandBasename(foregroundCommand)?.toLowerCase();
+  const reported = normalizedBasename(foregroundCommand);
   if (!reported || SHELL_COMMANDS.has(reported)) return null;
-  return agents.find((agent) => commandBasename(agent.command)?.toLowerCase() === reported) ?? null;
+  return agents.find((agent) => normalizedBasename(agent.command) === reported) ?? null;
+}
+
+/**
+ * What kind of window this is: the agent it was opened as, else whatever its
+ * foreground process says is running in it.
+ *
+ * The recorded type comes first because it is the durable answer. The
+ * foreground is a snapshot of one process: it says "shell" for a window whose
+ * agent has been quit or is between runs, and it names the interpreter rather
+ * than the tool for any CLI that ships as a script — a Hermes window reports
+ * "python3", which matches no agent's command and used to duplicate as a bare
+ * shell. A window someone typed an agent into by hand has nothing recorded, so
+ * the foreground is still asked.
+ */
+export function sessionAgent(
+  session: Pick<Session, "foreground_command" | "agent_id"> | undefined,
+  agents: readonly AgentDef[],
+): AgentDef | null {
+  const recorded = session?.agent_id;
+  const known = recorded ? agents.find((agent) => agent.id === recorded) : undefined;
+  // A recorded id no agent claims — a custom definition deleted since — is a
+  // type nothing can launch any more, so the live process answers instead.
+  return known ?? runningAgent(session?.foreground_command ?? null, agents);
 }
 
 function brandFor(value: string | null | undefined): Brand | null {
@@ -53,7 +90,7 @@ export function identifyAgent(
   agents: readonly AgentDef[],
 ): AgentIdentity {
   const basename = commandBasename(foregroundCommand);
-  if (!basename || SHELL_COMMANDS.has(basename.toLowerCase())) {
+  if (!basename || isShellCommand(foregroundCommand)) {
     return { kind: "shell", displayName: "Shell", logoKey: "shell", monogramSeed: "Shell" };
   }
 

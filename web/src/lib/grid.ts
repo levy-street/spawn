@@ -1,10 +1,10 @@
 /**
  * Pure 24×24 packed-grid algebra for workspace grid schema v3.
  *
- * Contract: docs/OVERHAUL.md §4.4. The cross-language conformance suite in
+ * Contract: proto/README.md, "Layout schema v3". The cross-language suite in
  * proto/layout-v3-fixtures.json is the authority on every behavior here and is
  * shared with the Python twin (server/spawn_server/grid.py); both
- * implementations must pass every fixture case. Behavior the §4.4 prose leaves
+ * implementations must pass every fixture case. Behavior the proto prose leaves
  * open is pinned by the fixture file's `_rules` list.
  *
  * The canvas is free-form: `move` and `resize` never repack, so gaps between
@@ -123,7 +123,7 @@ function clamp(v: number, min: number, max: number): number {
 }
 
 /**
- * Checks the §4.4 invariants on an arbitrary value. Errors are reported in a
+ * Checks the grid invariants on an arbitrary value. Errors are reported in a
  * fixed order: shape (alone, when the value has no tiles array to inspect),
  * version, count, then per-tile errors in tile order (session_id, integer,
  * bounds, size — an `integer` failure suppresses bounds/size for that tile),

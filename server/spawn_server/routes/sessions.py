@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, grid, legion, schemas
 from ..db import get_session
-from ..models import Host, RecentDir, Session, User, Workspace
+from ..models import Agent, Host, RecentDir, Session, User, Workspace
 from ..ws.broker import get_broker
 from . import capabilities
 
@@ -91,9 +91,7 @@ def _to_out(session_row: Session, host_name: str | None = None) -> schemas.Sessi
     return out
 
 
-async def upsert_recent_dir(
-    db: AsyncSession, *, user: User, host_id: str, path: str
-) -> None:
+async def upsert_recent_dir(db: AsyncSession, *, user: User, host_id: str, path: str) -> None:
     """Record `path` as most recent for (owner, host), keeping at most 8."""
     now = _utcnow()
     existing = (
@@ -154,6 +152,19 @@ async def dispatch_session_launch(
         log.warning("%s dispatch failed: %s", frame_type, e)
 
 
+async def resolve_agent_id(db: AsyncSession, *, user: User, agent_id: str | None) -> str | None:
+    """The agent a window is being opened as, checked against what this user
+    can see: their own definitions and the built-ins (owner NULL). An id that
+    names neither is refused rather than stored, so a window never claims to be
+    a type nothing can launch."""
+    if agent_id is None:
+        return None
+    agent = await db.get(Agent, agent_id)
+    if agent is None or agent.owner_user_id not in (None, user.id):
+        raise HTTPException(status_code=404, detail="agent not found")
+    return agent.id
+
+
 async def create_session_row(
     db: AsyncSession,
     *,
@@ -162,6 +173,7 @@ async def create_session_row(
     cwd: str,
     name: str | None,
     skill_ids: list[str] | None,
+    agent_id: str | None = None,
 ) -> Session:
     """Add the Session row and its skill grants inside the open transaction."""
     explicit_name = name.strip() if name and name.strip() else None
@@ -171,6 +183,7 @@ async def create_session_row(
         cwd=cwd,
         name=explicit_name or _default_session_name(host.name, cwd),
         status="starting",
+        agent_id=await resolve_agent_id(db, user=user, agent_id=agent_id),
     )
     db.add(session_row)
     await db.flush()
@@ -184,9 +197,7 @@ async def create_session_row(
     return session_row
 
 
-def _append_tile(
-    layout: dict, *, session_id: str, tile: schemas.TilePlacement | None
-) -> dict:
+def _append_tile(layout: dict, *, session_id: str, tile: schemas.TilePlacement | None) -> dict:
     """Append the new session's tile to the envelope's active tab, auto-placing
     when no explicit tile is given. `layout` is a v3 envelope (see
     workspaces.parse_workspace_layout); the returned envelope shares every
@@ -260,6 +271,11 @@ async def patch_session(
         next_name = body.name.strip() if body.name is not None else ""
         session_row.name = next_name or None
 
+    # An explicit null is how a window that has been stopped back to a bare
+    # prompt says it is a shell again; omitting the field leaves the type be.
+    if "agent_id" in body.model_fields_set:
+        session_row.agent_id = await resolve_agent_id(db, user=user, agent_id=body.agent_id)
+
     await db.commit()
     await db.refresh(session_row)
     host = await db.get(Host, session_row.host_id)
@@ -296,6 +312,7 @@ async def create_session(
         cwd=body.cwd,
         name=body.name,
         skill_ids=body.skill_ids,
+        agent_id=body.agent_id,
     )
 
     if workspace is not None:

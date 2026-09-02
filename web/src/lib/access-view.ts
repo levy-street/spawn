@@ -2,7 +2,7 @@
  * Access-screen view derivation (docs/TRUST_UX.md).
  *
  * Pure functions from server records (devices, endorsement edges, hosts, pin
- * details, passkeys) to the view models the trust-ux components render. All
+ * details, passkeys) to the view models the Access panel renders. All
  * display, no authorization: every rule here can be wrong without a single
  * trust decision changing, because admission stays daemon-side.
  *
@@ -12,7 +12,35 @@
  * needs to know the banned list.
  */
 
-import type { DeviceVM, HostVM, TrustEventVM } from "@/trust-ux/types";
+export type DeviceKind = "phone" | "laptop";
+
+/** One row in the device roster. `provenance` is the audit surface in plain words. */
+export interface DeviceVM {
+  id: string;
+  name: string;
+  kind: DeviceKind;
+  isThisDevice?: boolean;
+  provenance: string;
+  lastSeen: string;
+  staleLabel?: string;
+  waiting?: boolean;
+}
+
+export interface HostVM {
+  id: string;
+  name: string;
+  provenance: string;
+  online: boolean;
+}
+
+export type TrustEventKind = "approved" | "removed" | "passkey";
+
+export interface TrustEventVM {
+  id: string;
+  text: string;
+  when: string;
+  kind: TrustEventKind;
+}
 
 // Structural subsets of the api.ts types, so derivation stays testable with
 // plain literals and never accidentally depends on transport details.

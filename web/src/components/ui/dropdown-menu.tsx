@@ -22,6 +22,7 @@ import {
   placeMenu,
   pointAnchor,
 } from "@/components/ui/menu-position";
+import { useDismissOnModalOpen } from "@/components/ui/modal-layer";
 import { cn } from "@/lib/utils";
 
 /** Imperative handle: open the menu at a viewport point (e.g. a right-click),
@@ -69,6 +70,10 @@ export const DropdownMenu = forwardRef<
     setOpen(false);
     setPoint(null);
   }, []);
+
+  // A menu opened before a modal is a leftover once the modal has the window;
+  // one opened from inside a modal never hears this (see `modal-layer`).
+  useDismissOnModalOpen(open, close);
 
   useImperativeHandle(
     ref,
@@ -209,12 +214,16 @@ export const DropdownMenu = forwardRef<
   );
 });
 
-const ITEM_CLASS =
+/** The row shape, exported for the rare item a menu has to hand-roll — a
+ *  download row that owns its own link attributes and progress. */
+export const DROPDOWN_ITEM_CLASS =
   "flex w-full select-none items-center gap-2 rounded-md px-2 py-2 text-left text-sm outline-none transition-colors hover:bg-popover-accent focus-visible:bg-popover-accent disabled:pointer-events-none disabled:opacity-50";
 
 export function DropdownMenuItem({
   onSelect,
   href,
+  external = false,
+  newTab = false,
   checked,
   destructive = false,
   disabled = false,
@@ -223,6 +232,13 @@ export function DropdownMenuItem({
 }: {
   onSelect?: () => void;
   href?: string;
+  /**
+   * Render `href` as a plain anchor instead of a route `Link`: for a file the
+   * browser should download (a .dmg is not a route) or another site entirely.
+   */
+  external?: boolean;
+  /** With `external`: open in a new tab (a store listing, not a download). */
+  newTab?: boolean;
   /** Pass to make the item a toggle: renders a checkbox showing its state. */
   checked?: boolean;
   destructive?: boolean;
@@ -231,10 +247,22 @@ export function DropdownMenuItem({
   children: ReactNode;
 }) {
   const classes = cn(
-    ITEM_CLASS,
+    DROPDOWN_ITEM_CLASS,
     destructive && "text-destructive hover:bg-destructive/10 focus-visible:bg-destructive/10",
     className,
   );
+  if (href && external) {
+    return (
+      <a
+        role="menuitem"
+        href={href}
+        className={classes}
+        {...(newTab ? { target: "_blank", rel: "noreferrer" } : {})}
+      >
+        {children}
+      </a>
+    );
+  }
   if (href) {
     return (
       <Link role="menuitem" href={href} className={classes}>

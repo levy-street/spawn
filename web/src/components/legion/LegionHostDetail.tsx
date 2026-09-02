@@ -1,11 +1,14 @@
 "use client";
+import { useQuery } from "@tanstack/react-query";
+import Link from "next/link";
 import { CapacityBar, LegionDot } from "@/components/legion/legion-parts";
 import { SessionStatusDot } from "@/components/ui/status";
+import { workspaces } from "@/lib/api";
 import { hostHealthPanel } from "@/lib/host-health";
 import { formatHostPlatform } from "@/lib/host-platform";
 import type { LegionHostRow } from "@/lib/legion";
 import { bucketFill, capacityLabel, specLine } from "@/lib/legion";
-import { relativeTime, sessionActivityLabel, sessionTitle } from "@/lib/sessions";
+import { relativeTime, sessionActivityLabel, sessionHref, sessionTitle } from "@/lib/sessions";
 
 /**
  * Everything about one machine, in a card that opens when you rest on its row.
@@ -20,17 +23,33 @@ import { relativeTime, sessionActivityLabel, sessionTitle } from "@/lib/sessions
  * for exact figures: a hover must not cost a WebRTC connection. `/legion` is
  * where you go to pay for that.
  *
- * Read-only, with nothing to click. The card is a `role="tooltip"` with pointer
- * events off so it cannot steal the hover that opened it, which means any
- * control in here would be unreachable — and unnecessary, since the row it
- * describes is itself the link to that host's page.
+ * The sessions are the card's one set of controls: each is the door to where
+ * that session lives, because "what is running there" and "take me to it" are
+ * the same thought. That requires the strip to keep the card open while the
+ * pointer travels onto it — the geometric close it borrows from the file
+ * explorer's preview — and it is why the card renders `interactive`. For the
+ * keyboard the row itself remains the way in: it links to the host page,
+ * which lists the same sessions as real tab stops.
  */
 
 /** Sessions listed before the card defers to the host page. */
 const SESSION_LIMIT = 6;
 
-export function LegionHostDetail({ row }: { row: LegionHostRow }) {
+export function LegionHostDetail({
+  row,
+  onNavigate,
+}: {
+  row: LegionHostRow;
+  onNavigate?: () => void;
+}) {
   const host = row.host;
+  // The same query the sidebar polls, so the lookup costs no request and can
+  // never disagree with the workspace tree the card floats beside.
+  const workspacesQ = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: () => workspaces.list(),
+    staleTime: 30_000,
+  });
   const online = host.status === "online";
   const spec = specLine(host);
   const shown = row.sessions.slice(0, SESSION_LIMIT);
@@ -38,7 +57,7 @@ export function LegionHostDetail({ row }: { row: LegionHostRow }) {
   const health = hostHealthPanel(host);
 
   return (
-    <div className="w-64 max-w-[min(18rem,calc(100vw-2rem))] p-3 text-sm">
+    <div className="w-72 max-w-[min(20rem,calc(100vw-2rem))] p-3 text-sm">
       <header className="flex items-center gap-2">
         <LegionDot tone={row.tone} label={row.tone} />
         <span className="min-w-0 flex-1 truncate font-medium">{host.name}</span>
@@ -85,17 +104,23 @@ export function LegionHostDetail({ row }: { row: LegionHostRow }) {
             <p className="mb-1.5 font-mono text-[9.5px] uppercase tracking-[0.16em] text-muted-foreground">
               {row.sessions.length} {row.sessions.length === 1 ? "session" : "sessions"}
             </p>
-            <ul className="space-y-1">
+            <ul className="space-y-0.5">
               {shown.map((session) => (
-                <li key={session.id} className="flex items-center gap-2">
-                  {/* The app's own status dot rather than a private copy of
-                   * its tone map: a waiting session must look the same here as
-                   * it does on a pane header. */}
-                  <SessionStatusDot session={session} className="size-1.5 border-0" />
-                  <span className="min-w-0 flex-1 truncate text-xs">{sessionTitle(session)}</span>
-                  <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">
-                    {relativeTime(session.last_activity_at) ?? sessionActivityLabel(session)}
-                  </span>
+                <li key={session.id}>
+                  <Link
+                    href={sessionHref(session.id, workspacesQ.data ?? [])}
+                    onClick={onNavigate}
+                    className="-mx-1.5 flex items-center gap-2 rounded-md px-1.5 py-1.5 transition-colors hover:bg-accent"
+                  >
+                    {/* The app's own status dot rather than a private copy of
+                     * its tone map: a waiting session must look the same here
+                     * as it does on a pane header. */}
+                    <SessionStatusDot session={session} className="size-2 border-0" />
+                    <span className="min-w-0 flex-1 truncate text-sm">{sessionTitle(session)}</span>
+                    <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                      {relativeTime(session.last_activity_at) ?? sessionActivityLabel(session)}
+                    </span>
+                  </Link>
                 </li>
               ))}
             </ul>
