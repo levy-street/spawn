@@ -23,7 +23,10 @@ import {
   openHostPinStore,
   PinStoreError,
 } from "@/data/trust/host-pins";
-import { ensureDeviceRegistered } from "@/data/trust/registration";
+import {
+  describeDeviceRegistrationFailure,
+  ensureDeviceRegistered,
+} from "@/data/trust/registration";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
 import {
   DeviceIdentityError,
@@ -431,9 +434,10 @@ export function useRegisteredPhone(accountId: string | undefined) {
     // Never run against a half-loaded account: a query keyed on "" used to
     // throw before the account arrived and its failure looked real.
     enabled: accountId !== undefined,
-    // Registration is idempotent, so one silent retry absorbs a network blip;
-    // a real failure still surfaces (and callers must show it, not shrug).
-    retry: 1,
+    // Absorb one transient network/server blip, but never resubmit a key the
+    // server has identified as permanently unusable.
+    retry: (failureCount, error) =>
+      failureCount < 1 && describeDeviceRegistrationFailure(error).canRetry,
   });
 }
 
