@@ -22,7 +22,7 @@ export const HealthzResponseSchema = z.object({ status: z.literal("ok") });
 export const UserBillingSchema = z.object({
   enabled: z.boolean().default(false),
   tier: z.string().default("free"),
-  /** Display name, from the server. The Legion tier is spelled "the Legion plan". */
+  /** Display name, from the server ("Coven", "Legion", "Pandemonium"). */
   tier_name: z.string().default("Free"),
   /** null = unlimited. */
   host_limit: z.number().int().nullable().default(null),
