@@ -18,7 +18,10 @@ import type { Faq, RelatedLink } from "@/lib/grimoire/types";
 import { cn } from "@/lib/utils";
 
 /*
- * The grimoire frame: the pressroom's chrome around a landing page. The
+ * The grimoire frame: the pressroom's chrome around a landing page. Small red
+ * type — eyebrows, step numerals — is set in ember, the AA-safe hellfire
+ * (6.2:1 on the void; hellfire itself is 4.4:1, fine for the large H1 accent,
+ * short of the 4.5:1 small text needs). The
  * same parts the landing, /security, and /download print with — masthead,
  * a hero struck on the press bed with registration marks, poster headings
  * in caps, hairline-bordered sections, the bone slab, the install chip, the
@@ -162,7 +165,7 @@ export function Start({ heading }: { heading: string }) {
   return (
     <Section id="start">
       <div className="mx-auto w-full max-w-3xl">
-        <Eyebrow className="mb-5">Start</Eyebrow>
+        <Eyebrow className="mb-5 text-ember">Start</Eyebrow>
         <H2>{heading}</H2>
         <div className="mt-9 flex flex-col items-stretch gap-4 sm:flex-row sm:items-center">
           <InstallCommand command={INSTALL_COMMAND} />
@@ -291,7 +294,7 @@ function Hero({
       />
       <RegistrationMarks />
       <div className="relative z-10 mx-auto w-full max-w-3xl text-center">
-        <Eyebrow className="mb-5">{eyebrow}</Eyebrow>
+        <Eyebrow className="mb-5 text-ember">{eyebrow}</Eyebrow>
         <h1
           className={cn(
             poster.className,
@@ -319,7 +322,7 @@ function FaqSection({ faq }: { faq: Faq[] }) {
   return (
     <Section id="faq">
       <Prose>
-        <Eyebrow className="mb-5">Questions</Eyebrow>
+        <Eyebrow className="mb-5 text-ember">Questions</Eyebrow>
         <dl className="space-y-9">
           {faq.map((item) => (
             <div key={item.q}>
@@ -342,7 +345,7 @@ function RelatedSection({ related }: { related: RelatedLink[] }) {
   return (
     <Section id="related" className="border-b-0">
       <Prose>
-        <Eyebrow className="mb-5">Related</Eyebrow>
+        <Eyebrow className="mb-5 text-ember">Related</Eyebrow>
         <ul className="space-y-4">
           {related.map((entry) => (
             <li key={entry.href} className="text-[15.5px] leading-7">
