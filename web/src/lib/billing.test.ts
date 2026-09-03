@@ -9,6 +9,7 @@ import {
   hostsUsedLabel,
   overBy,
   periodNotice,
+  planArt,
   planDirection,
   priceLabel,
   serverMessage,
@@ -18,7 +19,7 @@ import {
 const TIERS = [
   { key: "free", name: "Free", price_cents: 0, host_limit: 1 },
   { key: "coven", name: "Coven", price_cents: 500, host_limit: 3 },
-  { key: "legion", name: "the Legion plan", price_cents: 2000, host_limit: 20 },
+  { key: "legion", name: "Legion", price_cents: 2000, host_limit: 20 },
   { key: "pandemonium", name: "Pandemonium", price_cents: 5000, host_limit: null },
 ];
 
@@ -159,5 +160,14 @@ describe("the structured refusals", () => {
     expect(hostLimitFacts(new ApiError(409, "http_409", "Conflict", "a string detail"))).toBeNull();
     expect(hostLimitFacts(new Error("host_limit"))).toBeNull();
     expect(hostSelectionRequired(null)).toBeNull();
+  });
+});
+
+describe("planArt", () => {
+  test("every tier the server sells has a plate, and an unknown one has none", () => {
+    for (const tier of ["free", "coven", "legion", "pandemonium"]) {
+      expect(planArt(tier)).toBe(`/brand/plans/${tier}.png`);
+    }
+    expect(planArt("archfiend")).toBeNull();
   });
 });

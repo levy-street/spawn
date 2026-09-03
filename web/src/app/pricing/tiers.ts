@@ -10,9 +10,9 @@ import type { BillingTier } from "@/lib/api";
 export const FALLBACK_TIERS: readonly BillingTier[] = [
   { key: "free", name: "Free", price_cents: 0, host_limit: 1 },
   { key: "coven", name: "Coven", price_cents: 500, host_limit: 3 },
-  // "the Legion plan", spelled out, here as everywhere: `/legion` is the fleet
-  // page, and bare "Legion" in a billing sentence reads as that page.
-  { key: "legion", name: "the Legion plan", price_cents: 2000, host_limit: 20 },
+  // "Legion" shares its noun with the `/legion` fleet page on purpose: the
+  // plan is named for the fleet, and the sentence around it carries "plan".
+  { key: "legion", name: "Legion", price_cents: 2000, host_limit: 20 },
   { key: "pandemonium", name: "Pandemonium", price_cents: 5000, host_limit: null },
 ];
 
@@ -28,15 +28,44 @@ export const TIER_BLURB: Record<string, string> = {
   free: "One host, at no cost, on every deployment. Enough to possess the machine you actually work on and never think about this page again.",
   coven:
     "The laptop, the desktop, and the box under the stairs. Three registrations — the first plan most people ever need.",
-  legion:
-    "Twenty registrations, for a fleet you tend rather than a desk you sit at. Named for the crowd, not for the page.",
+  legion: "Twenty registrations: a rack, a lab, or a small team's machines under one account.",
   pandemonium:
     "Every machine you can reach. No count, no ceiling, and no conversation about it again.",
 };
 
+/**
+ * Where a card stands against the plan the reader is on. `none` is a visitor
+ * with nothing to compare against — signed out, or a deployment whose account
+ * block has not arrived — and reads exactly as it always did.
+ */
+export type TierRelation = "none" | "current" | "upgrade" | "downgrade";
+
+export function tierRelation(
+  key: string,
+  currentTier: string | null,
+  tiers: readonly BillingTier[],
+): TierRelation {
+  if (currentTier === null) return "none";
+  if (key === currentTier) return "current";
+  const price = (tierKey: string) => tiers.find((tier) => tier.key === tierKey)?.price_cents;
+  const mine = price(currentTier);
+  const theirs = price(key);
+  if (mine === undefined || theirs === undefined) return "none";
+  return theirs > mine ? "upgrade" : "downgrade";
+}
+
 /** Standard verbs. `Upgrade`, never `Ascend`. */
-export function tierAction(key: string): string {
-  return key === "free" ? "Sign up" : "Upgrade";
+export function tierAction(key: string, relation: TierRelation = "none"): string {
+  switch (relation) {
+    case "current":
+      return "Current plan";
+    case "upgrade":
+      return "Upgrade";
+    case "downgrade":
+      return "Downgrade";
+    default:
+      return key === "free" ? "Sign up" : "Upgrade";
+  }
 }
 
 /** `$5`, `$0`, and `$5.50` if a price ever stops being round. */

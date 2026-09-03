@@ -189,3 +189,20 @@ export function serverMessage(error: unknown): string | null {
   }
   return null;
 }
+
+/**
+ * The plate each plan wears inside the app: the landing page's ink, one
+ * picture per tier, keyed by the server's tier key. Unknown tiers get no art
+ * rather than someone else's — a plan the server adds later is drawn plain
+ * until a picture is cut for it.
+ */
+const PLAN_ART: Record<string, string> = {
+  free: "/brand/plans/free.png",
+  coven: "/brand/plans/coven.png",
+  legion: "/brand/plans/legion.png",
+  pandemonium: "/brand/plans/pandemonium.png",
+};
+
+export function planArt(tier: string): string | null {
+  return PLAN_ART[tier] ?? null;
+}

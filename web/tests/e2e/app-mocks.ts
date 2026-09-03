@@ -256,11 +256,11 @@ export interface BillingTierMock {
 }
 
 /** The tiers this product sells, exactly as `routes/auth_config.py` lists them
- *  — cheapest first, and the Legion tier spelled "the Legion plan". */
+ *  — cheapest first. */
 export const BILLING_TIERS: BillingTierMock[] = [
   { key: "free", name: "Free", price_cents: 0, host_limit: 1 },
   { key: "coven", name: "Coven", price_cents: 500, host_limit: 3 },
-  { key: "legion", name: "the Legion plan", price_cents: 2000, host_limit: 20 },
+  { key: "legion", name: "Legion", price_cents: 2000, host_limit: 20 },
   { key: "pandemonium", name: "Pandemonium", price_cents: 5000, host_limit: null },
 ];
 
@@ -995,6 +995,12 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       if (path === "/api/billing/portal" && method === "POST") {
         store.requests.billing.push({ path });
         await json(route, { url: "/legion?portal=1" });
+        return;
+      }
+      if (path === "/api/billing/upgrade" && method === "POST") {
+        const body = await readBody();
+        store.requests.billing.push({ path, ...body });
+        await json(route, { url: `/legion?upgrade=${String(body.tier)}` });
         return;
       }
       if (path === "/api/billing/change-plan" && method === "POST") {

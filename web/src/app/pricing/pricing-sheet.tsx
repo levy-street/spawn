@@ -11,8 +11,10 @@ import {
   GITHUB_URL,
   RegistrationMarks,
 } from "@/components/brand/press";
+import { useBilling } from "@/hooks/useBilling";
 import type { BillingTier } from "@/lib/api";
 import { useAuth, useAuthConfig } from "@/lib/auth";
+import { planArt } from "@/lib/billing";
 import { poster } from "@/lib/fonts";
 import { cn } from "@/lib/utils";
 import {
@@ -21,7 +23,9 @@ import {
   priceLabel,
   RECOMMENDED_TIER,
   TIER_BLURB,
+  type TierRelation,
   tierAction,
+  tierRelation,
 } from "./tiers";
 
 /**
@@ -68,6 +72,16 @@ function PlansSheet({ tiers }: { tiers: readonly BillingTier[] }) {
   // route. `user` is null on the first client render — matching the HTML this
   // hydrates — and the href firms up after mount.
   const actionHref = user ? "/app" : "/signup";
+  // The plan the reader is on, so each card can say whether it is theirs, a
+  // step up, or a step down. Null on the first client render, like `user`,
+  // so the HTML this hydrates is the visitor's page; the cards learn the
+  // plan a render later. Recommended only means something to somebody who
+  // has not chosen yet.
+  const { account } = useBilling();
+  const currentTier = account?.tier ?? null;
+  const chooseFor = currentTier === null || currentTier === "free";
+  const freeTier = tiers.find((tier) => tier.price_cents === 0);
+  const paidTiers = tiers.filter((tier) => tier.price_cents > 0);
 
   return (
     <>
@@ -106,25 +120,28 @@ function PlansSheet({ tiers }: { tiers: readonly BillingTier[] }) {
           <p className="mb-10 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
             Monthly · US dollars · cancel any time
           </p>
-          <div
-            data-testid="pricing-tiers"
-            className="grid min-w-0 gap-6 md:grid-cols-2 xl:grid-cols-4"
-          >
-            {tiers.map((tier) => (
-              <TierCard
-                key={tier.key}
-                tier={tier}
+          {/* Free is the floor, not a column: one bar across the top, and the
+           * three plans that cost something stand beneath it in a row. */}
+          <div data-testid="pricing-tiers" className="min-w-0 space-y-6">
+            {freeTier !== undefined && (
+              <FreeBar
+                tier={freeTier}
                 href={actionHref}
-                recommended={tier.key === RECOMMENDED_TIER}
+                relation={tierRelation(freeTier.key, currentTier, tiers)}
               />
-            ))}
+            )}
+            <div className="grid min-w-0 gap-6 md:grid-cols-3">
+              {paidTiers.map((tier) => (
+                <TierCard
+                  key={tier.key}
+                  tier={tier}
+                  href={actionHref}
+                  recommended={chooseFor && tier.key === RECOMMENDED_TIER}
+                  relation={tierRelation(tier.key, currentTier, tiers)}
+                />
+              ))}
+            </div>
           </div>
-          <p className="mt-10 max-w-[62ch] text-[15px] leading-7 text-ash">
-            Already signed in? Plans live in{" "}
-            <span className="text-bone">Settings → Subscription</span>, and so does cancelling.
-            Nothing about billing appears anywhere else in the app until the moment you try to add a
-            host past your limit.
-          </p>
         </div>
       </section>
 
@@ -169,29 +186,140 @@ function PlansSheet({ tiers }: { tiers: readonly BillingTier[] }) {
   );
 }
 
+/**
+ * The free plan as a bar: plate on the left, the offer in the middle, the one
+ * door on the right. It is the floor every deployment stands on rather than
+ * a choice among four, and a row of its own says so.
+ */
+function FreeBar({
+  tier,
+  href,
+  relation,
+}: {
+  tier: BillingTier;
+  href: string;
+  relation: TierRelation;
+}) {
+  const art = planArt(tier.key);
+  const current = relation === "current";
+  return (
+    <article
+      data-testid={`pricing-tier-${tier.key}`}
+      data-plan-relation={relation}
+      className={cn(
+        "group/tier flex min-w-0 flex-col overflow-hidden rounded-sm border bg-char md:flex-row",
+        current ? "border-ember" : "border-line-strong",
+      )}
+    >
+      {art !== null && (
+        <div
+          aria-hidden
+          className="relative aspect-[3/1] shrink-0 overflow-hidden border-line-g border-b md:aspect-auto md:w-[36%] md:border-r md:border-b-0"
+        >
+          {/* biome-ignore lint/performance/noImgElement: static brand art, no optimisation needed */}
+          <img
+            src={art}
+            alt=""
+            className="size-full object-cover object-[50%_45%] opacity-90 transition-transform duration-500 group-hover/tier:scale-[1.03]"
+          />
+          <div className="absolute inset-0 bg-gradient-to-t from-char via-transparent to-transparent md:bg-gradient-to-l md:from-char md:via-transparent" />
+        </div>
+      )}
+      <div className="flex min-w-0 flex-1 flex-col gap-6 p-7 md:flex-row md:items-center md:gap-10">
+        <div className="min-w-0 flex-1">
+          {current && <Eyebrow className="mb-3">Your plan</Eyebrow>}
+          <h3
+            className={cn(
+              poster.className,
+              "text-[26px] leading-[1.08] font-light text-bone uppercase",
+            )}
+          >
+            {tier.name}
+          </h3>
+          <p className="mt-3 flex items-baseline gap-2">
+            <span className={cn(poster.className, "text-[40px] leading-none font-light text-bone")}>
+              {priceLabel(tier.price_cents)}
+            </span>
+            <span className="font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
+              forever
+            </span>
+          </p>
+          <p className="mt-2 font-sigil text-[12px] tracking-[0.18em] text-ember uppercase">
+            {hostLabel(tier.host_limit)}
+          </p>
+          <p className="mt-4 max-w-[56ch] text-[15px] leading-7 text-ash">
+            {TIER_BLURB[tier.key] ?? ""}
+          </p>
+        </div>
+        {current ? (
+          <span className={cn(CTA_CURRENT, "md:shrink-0")}>{tierAction(tier.key, relation)}</span>
+        ) : (
+          <Link href={href} className={cn(CTA_GHOST, "md:shrink-0")}>
+            {tierAction(tier.key, relation)}
+          </Link>
+        )}
+      </div>
+    </article>
+  );
+}
+
+/** The card that is already yours: says so, and leads nowhere. */
+const CTA_CURRENT =
+  "inline-flex cursor-default items-center justify-center gap-2 rounded-sm border border-line-strong px-7 py-[15px] font-sigil text-[13px] font-medium tracking-[0.14em] text-ash uppercase";
+
 function TierCard({
   tier,
   href,
   recommended,
+  relation,
 }: {
   tier: BillingTier;
   href: string;
   recommended: boolean;
+  relation: TierRelation;
 }) {
   const free = tier.price_cents === 0;
-  const action = tierAction(tier.key);
+  const current = relation === "current";
+  const action = tierAction(tier.key, relation);
+  const art = planArt(tier.key);
   return (
     <article
       data-testid={`pricing-tier-${tier.key}`}
+      data-plan-relation={relation}
       className={cn(
-        "flex min-w-0 flex-col rounded-sm border bg-char p-7",
-        recommended ? "border-hellfire" : "border-line-strong",
+        "group/tier flex min-w-0 flex-col overflow-hidden rounded-sm border bg-char p-7",
+        current ? "border-ember" : recommended ? "border-hellfire" : "border-line-strong",
       )}
     >
-      <div className="mb-5 min-h-[18px]">{recommended ? <Eyebrow>Recommended</Eyebrow> : null}</div>
-      {/* Two lines of room whether the name needs them or not: "the Legion
-       * plan" wraps where the other three do not, and a row of cards whose
-       * prices sit at four different heights reads as four different pages. */}
+      {/* The plan's plate, bled to the card's edges: the same ink the app
+       * wears in Settings, so the thing you buy here is the thing you see
+       * there. Red on transparent, so the card's own char is its ground, and
+       * it fades into that ground where the copy begins. */}
+      {art !== null && (
+        <div
+          aria-hidden
+          className="relative -mx-7 -mt-7 mb-6 aspect-[3/2] overflow-hidden border-line-g border-b"
+        >
+          {/* biome-ignore lint/performance/noImgElement: static brand art, no optimisation needed */}
+          <img
+            src={art}
+            alt=""
+            className="size-full object-cover opacity-90 transition-transform duration-500 group-hover/tier:scale-[1.03]"
+          />
+          <div className="absolute inset-x-0 bottom-0 h-2/5 bg-gradient-to-t from-char to-transparent" />
+        </div>
+      )}
+      <div className="mb-5 min-h-[18px]">
+        {current ? (
+          <Eyebrow>Your plan</Eyebrow>
+        ) : recommended ? (
+          <Eyebrow>Recommended</Eyebrow>
+        ) : null}
+      </div>
+      {/* Two lines of room whether the name needs them or not: a longer name in
+       * one column would set that price lower than the others, and a row of
+       * cards whose prices sit at four different heights reads as four
+       * different pages. */}
       <h3
         className={cn(
           poster.className,
@@ -215,12 +343,16 @@ function TierCard({
       {/* One slab on the row, and it belongs to the recommended column. The
        * other three take the same shape and measure in the card's own ground,
        * so the four actions line up instead of arguing. */}
-      <Link href={href} className={cn("mt-8 w-full", recommended ? CTA_SLAB : CTA_GHOST)}>
-        {action}
-        {recommended ? (
-          <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-        ) : null}
-      </Link>
+      {current ? (
+        <span className={cn("mt-8 w-full", CTA_CURRENT)}>{action}</span>
+      ) : (
+        <Link href={href} className={cn("mt-8 w-full", recommended ? CTA_SLAB : CTA_GHOST)}>
+          {action}
+          {recommended ? (
+            <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+          ) : null}
+        </Link>
+      )}
     </article>
   );
 }

@@ -3,7 +3,7 @@
 import { Check, Copy, Loader2 } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode, RefObject } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { useDesktopDownload } from "@/hooks/useDesktopDownload";
 import { useDesktopShell } from "@/hooks/useDesktopShell";
@@ -139,7 +139,22 @@ function useMastheadScrub(): {
  */
 function useBillingLink(serverAnswer: boolean): boolean {
   const { config } = useAuthConfig();
-  return config ? config.billing.enabled : serverAnswer;
+  // `useAuthConfig` seeds itself from a localStorage copy as placeholder
+  // data, which the browser has during hydration and the server never did.
+  // Reading it on the first client render put a Pricing link where the HTML
+  // had Security, and React refused the tree. So the first client render
+  // repeats the server's answer, and the config takes over one render later.
+  const hydrated = useSyncExternalStore(
+    subscribeToNothing,
+    () => true,
+    () => false,
+  );
+  return hydrated && config ? config.billing.enabled : serverAnswer;
+}
+
+/** A store that never changes: `useSyncExternalStore` only wants its snapshots. */
+function subscribeToNothing() {
+  return () => {};
 }
 
 /**
@@ -152,15 +167,17 @@ function useBillingLink(serverAnswer: boolean): boolean {
  */
 export function Masthead({
   current,
-  billingEnabled = false,
 }: {
   current?: "security" | "download" | "pricing";
-  /** What the page's server render knew about billing. See `useBillingLink`. */
+  /**
+   * What the page's server render knew about billing. The masthead no
+   * longer carries a pricing link — that lives in the colophon, which reads
+   * this same answer — but pages pass it to both, so it stays accepted.
+   */
   billingEnabled?: boolean;
 }) {
   const { navRef, brandRef, markRef, wordRef } = useMastheadScrub();
   const { user } = useAuth();
-  const showPricing = useBillingLink(billingEnabled);
   // Inside the app every zone but the brand leads somewhere the window cannot
   // come back from, and the brand itself has to lead the other way: whoever is
   // reading this in there wants the product, not more of the site.
@@ -178,15 +195,6 @@ export function Masthead({
         <div className="hidden items-center gap-7 sm:flex sm:gap-10">
           {inShell ? null : (
             <>
-              {showPricing && (
-                <Link
-                  href="/pricing"
-                  aria-current={current === "pricing" ? "page" : undefined}
-                  className={zoneLink(current === "pricing")}
-                >
-                  Pricing
-                </Link>
-              )}
               <Link
                 href="/security"
                 aria-current={current === "security" ? "page" : undefined}

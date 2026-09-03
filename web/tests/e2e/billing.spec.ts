@@ -121,6 +121,25 @@ test("a free account is offered an upgrade, which starts Checkout", async ({ pag
   await expect.poll(() => store.requests.billing.map((row) => row.tier)).toEqual(["coven"]);
 });
 
+test("moving up a plan goes to Stripe to confirm and pay", async ({ page }) => {
+  const store = await mockApp(page, {
+    hosts: [host],
+    billing: { tier: "coven", host_limit: 3, has_subscription: true },
+  });
+  await openSettings(page, "subscription");
+  await page.getByRole("button", { name: "Change plan" }).click();
+  const dialog = page.getByTestId("plan-change-dialog");
+  await dialog.getByRole("radio", { name: /Legion/ }).check();
+  await expect(dialog).toContainText("Stripe shows the prorated charge");
+  await dialog.getByTestId("plan-change-confirm").click();
+
+  // The confirmation page, not our own change: nothing moved on our side.
+  await expect
+    .poll(() => store.requests.billing.map((row) => row.path))
+    .toEqual(["/api/billing/upgrade"]);
+  await expect(page).toHaveURL(/upgrade=legion/);
+});
+
 test("a downgrade asks which machines to keep, releases them, then changes plan", async ({
   page,
 }) => {
@@ -306,4 +325,33 @@ test("a self-hosted deployment shows no billing anywhere", async ({ page }) => {
   await expect(page.getByTestId("legion-capacity-notice")).toHaveCount(0);
   // Nothing asked the billing API anything.
   expect(store.requests.billing).toHaveLength(0);
+});
+
+test("coming back from Stripe lands where you left, with the plan panel open", async ({ page }) => {
+  await mockApp(page, {
+    hosts: [host],
+    billing: { tier: "coven", host_limit: 3, has_subscription: true },
+  });
+  // What `leaveForBilling` writes on the way out, when Settings was opened
+  // from the fleet page.
+  await page.goto("/legion");
+  await page.evaluate(() => sessionStorage.setItem("spawn.billing.return", "/legion"));
+
+  // Where the server's success_url brings the browser back.
+  await page.goto("/app?billing=complete");
+  await expect(page).toHaveURL(/\/legion$/);
+  await expect(page.getByRole("heading", { name: "Subscription", exact: true })).toBeVisible();
+  await expect(page.getByText("Payment received")).toBeVisible();
+  // The flag is gone, so a reload is an ordinary visit.
+  expect(new URL(page.url()).searchParams.get("billing")).toBeNull();
+});
+
+test("a cancelled checkout comes back to the app, not the marketing page", async ({ page }) => {
+  await mockApp(page, { hosts: [host], billing: { tier: "free", host_limit: 1 } });
+  await page.goto("/app?billing=cancelled");
+  // No note of where they left from, so the entry page's own choice — the
+  // last workspace — stands, with the flag consumed on the way.
+  await expect(page).toHaveURL(/\/w\/[0-9a-f-]+$/);
+  await expect(page.getByText("Checkout cancelled")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Subscription", exact: true })).toBeVisible();
 });

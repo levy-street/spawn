@@ -19,7 +19,7 @@ import { expect, type Page, test } from "@playwright/test";
 const TIERS = [
   { key: "free", name: "Free", price_cents: 0, host_limit: 1 },
   { key: "coven", name: "Coven", price_cents: 500, host_limit: 3 },
-  { key: "legion", name: "the Legion plan", price_cents: 2000, host_limit: 20 },
+  { key: "legion", name: "Legion", price_cents: 2000, host_limit: 20 },
   { key: "pandemonium", name: "Pandemonium", price_cents: 5000, host_limit: null },
 ];
 
@@ -91,7 +91,7 @@ test("the pricing page prints four tiers, and the Legion tier is never bare", as
   await expect(coven).toContainText("Recommended");
 
   const legion = page.getByTestId("pricing-tier-legion");
-  await expect(legion).toContainText("the Legion plan");
+  await expect(legion).toContainText("Legion");
   await expect(legion).toContainText("$20");
   await expect(legion).toContainText("20 hosts");
 
@@ -99,11 +99,6 @@ test("the pricing page prints four tiers, and the Legion tier is never bare", as
   await expect(pandemonium).toContainText("Pandemonium");
   await expect(pandemonium).toContainText("$50");
   await expect(pandemonium).toContainText("Unlimited hosts");
-
-  // The plan is "the Legion plan" everywhere or it is a bug; `/legion` is the
-  // fleet page and bare "Legion" in a billing sentence reads as that page.
-  const words = await pageWords(page);
-  expect(words.replace(/the Legion plan/gu, "")).not.toMatch(/Legion/u);
 });
 
 test("the pricing page states the rules a price has to state", async ({ page }) => {
@@ -190,7 +185,9 @@ test("a self-hosted server shows no shop and no pricing link anywhere", async ({
 test("the masthead offers pricing exactly when the server sells something", async ({ page }) => {
   await mockBilling(page, true);
   await visit(page, "/pricing");
-  await expect(masthead(page).getByRole("link", { name: "Pricing" })).toBeVisible();
+  // The header never carries it; the colophon does, and only where there is
+  // something to sell.
+  await expect(masthead(page).getByRole("link", { name: "Pricing" })).toHaveCount(0);
   await expect(colophon(page).getByRole("link", { name: "Pricing" })).toBeVisible();
   // The legal pages are not billing-conditional; they exist on every deployment.
   await expect(colophon(page).getByRole("link", { name: "Terms" })).toBeVisible();

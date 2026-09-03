@@ -3,9 +3,9 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
-import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef } from "react";
+import { openAddMachine } from "@/components/hosts/add-machine-dialog-store";
 import { useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
 import { browserDevices, trust } from "@/lib/api";
@@ -187,9 +187,13 @@ export function SessionApprovalGate() {
             <Button variant="ghost" className="w-full" onClick={() => router.push("/app")}>
               Go back
             </Button>
-            <Link href="/device" className="text-xs text-muted-foreground underline">
+            <button
+              type="button"
+              className="text-xs text-muted-foreground underline"
+              onClick={openAddMachine}
+            >
               No other device? Possess a host directly
-            </Link>
+            </button>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

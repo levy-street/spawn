@@ -4,19 +4,11 @@ import { useQuery } from "@tanstack/react-query";
 import { Plus, Radio, RadioTower } from "lucide-react";
 import { useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
-import { ConnectHostSection } from "@/components/hosts/connect-host";
+import { openAddMachine } from "@/components/hosts/add-machine-dialog-store";
 import { LegionHostCard } from "@/components/legion/LegionHostCard";
 import { Stat } from "@/components/legion/legion-parts";
 import { AppShell } from "@/components/nav/AppShell";
-import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useBilling } from "@/hooks/useBilling";
 import { hosts, sessions } from "@/lib/api";
@@ -45,7 +37,6 @@ export default function LegionPage() {
 
 function LegionBody() {
   const [liveMetrics, setLiveMetrics] = useState(false);
-  const [addMachineOpen, setAddMachineOpen] = useState(false);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, refetchInterval: 15_000 });
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -60,7 +51,13 @@ function LegionBody() {
   // count; the plan is the other half of the same sentence, and saying it here
   // is cheaper than letting somebody find out at the end of a ceremony.
   const { enabled: billingEnabled, account } = useBilling();
-  const plan = billingEnabled ? account : null;
+  // The limit from the plan block, the count from the fleet on this very
+  // page: `/api/me` is cached and its count does not move when a machine is
+  // added or released, and "0/1" beside a card for one machine is a lie.
+  const plan =
+    billingEnabled && account !== null
+      ? { ...account, host_count: hostsQ.data?.length ?? account.host_count }
+      : null;
   const full = plan !== null && atCapacity(plan);
 
   return (
@@ -86,7 +83,7 @@ function LegionBody() {
             )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" size="sm" onClick={() => setAddMachineOpen(true)}>
+            <Button type="button" size="sm" onClick={openAddMachine}>
               <Plus className="size-4" aria-hidden />
               Add a machine
             </Button>
@@ -158,7 +155,7 @@ function LegionBody() {
               variant="outline"
               size="sm"
               className="mt-4"
-              onClick={() => setAddMachineOpen(true)}
+              onClick={openAddMachine}
             >
               <Plus className="size-4" aria-hidden />
               Add a machine
@@ -174,7 +171,7 @@ function LegionBody() {
              * looking at, so the surface that shows it should ask for one more. */}
             <button
               type="button"
-              onClick={() => setAddMachineOpen(true)}
+              onClick={openAddMachine}
               className="group/slot flex min-h-28 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
             >
               <Plus
@@ -188,48 +185,6 @@ function LegionBody() {
             </button>
           </div>
         )}
-        <Dialog open={addMachineOpen} onOpenChange={setAddMachineOpen}>
-          <DialogContent size="lg">
-            <DialogHeader>
-              <DialogTitle>Add a machine</DialogTitle>
-              <DialogDescription>
-                Install SPAWN D, approve the machine, and keep this window open until it comes
-                online.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="overflow-y-auto px-4 pb-4">
-              {full && plan !== null && (
-                // What the still-live button owed the reader. The ceremony
-                // below is left intact on purpose: releasing a machine in
-                // another tab, or changing plan from here, makes it work.
-                <div
-                  className="mb-4 space-y-2 rounded-lg border border-warning/50 bg-warning/5 p-3"
-                  data-testid="legion-capacity-notice"
-                >
-                  <p className="text-sm font-medium">
-                    {plan.tier_name} is full at{" "}
-                    <span className="tabular-nums">{hostsUsedLabel(plan)}</span>
-                  </p>
-                  <p className="text-sm leading-6 text-muted-foreground">
-                    A new machine will be refused at the end of this ceremony. Release one from the
-                    fleet behind this dialog, or move to a plan with more room first.
-                  </p>
-                  <Button
-                    type="button"
-                    size="sm"
-                    onClick={() => {
-                      setAddMachineOpen(false);
-                      openSettings("subscription");
-                    }}
-                  >
-                    Change plan
-                  </Button>
-                </div>
-              )}
-              <ConnectHostSection frameless />
-            </div>
-          </DialogContent>
-        </Dialog>
       </div>
     </div>
   );
