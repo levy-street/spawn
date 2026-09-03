@@ -56,7 +56,7 @@ function Block({ block }: { block: ArticleBlock }) {
               {block.steps.map((step, index) => (
                 <li key={step.title} id={`step-${index + 1}`} className="scroll-mt-24">
                   <h3 className="mb-2 text-[16px] leading-7 font-semibold text-bone">
-                    <span className="mr-3 font-sigil text-[12px] tracking-[0.12em] text-hellfire">
+                    <span className="mr-3 font-sigil text-[12px] tracking-[0.12em] text-ember">
                       {String(index + 1).padStart(2, "0")}
                     </span>
                     {step.title}
