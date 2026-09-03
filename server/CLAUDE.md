@@ -12,7 +12,7 @@ the same commit.
 ```
 spawn_server/
   routes/       one module per HTTP surface: auth, auth_config,
-                auth_providers, account_recovery, admin, agents,
+                auth_providers, account_recovery, admin, agents, billing,
                 browser_devices, capabilities, device, device_pairing,
                 host_introductions, hosts, install, profile, push, release,
                 root_introductions, sessions, trust_bundle,
@@ -24,9 +24,10 @@ spawn_server/
   models.py     SQLAlchemy models — the schema of record
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
-  <concern>.py  one module per concern: auth, config, db, redis, mail, push,
-                web_push, release, invites, limits, rate_limit, trust_events,
-                data_events, host_status, …
+  <concern>.py  one module per concern: auth, billing, billing_stripe,
+                config, db, redis, mail, push, web_push, release, invites,
+                limits, rate_limit, trust_events, data_events, host_status, …
+                billing_stripe.py is the only module that imports `stripe`
 alembic/        migrations
 tests/          pytest; test_<module>.py mirrors the module it covers
 ```

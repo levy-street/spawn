@@ -178,7 +178,7 @@ async def confirm_password_reset(
     access_token = auth.issue_access_token(user.id, user.session_epoch)
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
-        access_token=access_token, user=schemas.UserOut.model_validate(user)
+        access_token=access_token, user=await schemas.user_out(session, user)
     )
 
 
@@ -209,4 +209,4 @@ async def confirm_email_verification(
         user.email_verified_at = datetime.now(UTC)
     await session.commit()
     await session.refresh(user)
-    return schemas.MeResponse(user=schemas.UserOut.model_validate(user))
+    return schemas.MeResponse(user=await schemas.user_out(session, user))

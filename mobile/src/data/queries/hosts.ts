@@ -101,10 +101,18 @@ export async function removeHostWithTrust(
   await dependencies.removeRemote(host.id);
 }
 
-export function useHostsQuery() {
+/**
+ * The account's hosts, polled while something is watching them.
+ *
+ * `enabled` exists for the surfaces that mount for the whole session but only
+ * need the list occasionally — a global observer left on would otherwise put
+ * the ten-second poll under every screen in the app, forever.
+ */
+export function useHostsQuery(enabled = true) {
   return useQuery({
     queryKey: qk.hosts(),
     queryFn: listHosts,
+    enabled,
     refetchInterval: HOSTS_REFRESH_MS,
   });
 }
@@ -256,6 +264,10 @@ export function useRemoveHostMutation() {
       queryClient.removeQueries({ queryKey: qk.host(host.id) });
       void queryClient.invalidateQueries({ queryKey: qk.hosts() });
       void queryClient.invalidateQueries({ queryKey: qk.sessions() });
+      // Releasing a host frees a plan slot synchronously on the server, so the
+      // account's plan block is stale the moment this returns — and it is what
+      // decides whether the over-limit reconciliation is still owed.
+      void queryClient.invalidateQueries({ queryKey: qk.me() });
     },
   });
 }

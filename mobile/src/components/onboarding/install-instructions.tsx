@@ -12,14 +12,24 @@ import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { Text } from "@/components/ui/text";
+import type { UserBilling } from "@/data/api/schemas/auth";
+import { atHostLimit, HOST_LIMIT_TITLE, hostLimitDescription } from "@/data/selectors/billing";
 import { presentShareSheet } from "@/lib/share";
-import { chrome, duration, spacing, useTheme } from "@/theme";
+import { borderWidth, chrome, duration, spacing, useTheme } from "@/theme";
 
 export interface InstallInstructionsProps {
   defaultTargetId?: InstallTargetId;
   onCommandCopied?: () => void;
   onSkip?: () => void;
   targets?: readonly InstallTarget[];
+  /**
+   * The account's plan state, so a full plan says so *before* somebody walks to
+   * another machine and installs a daemon that will be refused.
+   *
+   * Null on a deployment with billing off, which is every self-hosted install,
+   * and the notice then never appears.
+   */
+  billing?: UserBilling | null;
 }
 
 function defaultInstallTarget(): InstallTarget {
@@ -29,6 +39,7 @@ function defaultInstallTarget(): InstallTarget {
 }
 
 export function InstallInstructions({
+  billing = null,
   defaultTargetId = "unix",
   onCommandCopied,
   onSkip,
@@ -75,105 +86,135 @@ export function InstallInstructions({
 
   return (
     <View style={styles.container}>
-      <View style={styles.heading}>
-        <Text accessibilityRole="header" variant="title">
-          Connect your first computer
-        </Text>
-        <Text color="mutedForeground">
-          A host is a computer SPAWN D opens terminals on — usually your own Mac, Linux, or Windows
-          machine.
-        </Text>
-      </View>
-
-      <View style={styles.targetChoice}>
-        <Text color="mutedForeground">Choose the computer you're installing on.</Text>
-        <SegmentedControl<InstallTargetId>
-          accessibilityLabel="Host operating system"
-          onChange={(targetId) => {
-            setActiveTargetId(targetId);
-            setCopied(false);
-          }}
-          options={targets.map((target) => ({ label: target.label, value: target.id }))}
-          testID="install-target"
-          value={activeTarget.id}
-        />
-      </View>
-
-      <View style={styles.instruction}>
+      {/* Said here rather than only after the refusal: the alternative is
+          someone walking to another machine, installing a daemon and finding
+          out at the approval. Account state and an action available in this
+          app — no price, no venue, no verb pointed off-platform. §6.3. */}
+      {atHostLimit(billing) ? (
         <View
+          accessibilityRole="alert"
           style={[
-            styles.number,
-            { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
+            styles.limitNotice,
+            {
+              backgroundColor: theme.colors.muted,
+              borderColor: theme.colors.border,
+              borderRadius: theme.radii.md,
+            },
           ]}
+          testID="host-limit-notice"
         >
-          <Text color="background" variant="label">
-            1
-          </Text>
+          <Text variant="label">{HOST_LIMIT_TITLE}</Text>
+          <Text color="mutedForeground">{hostLimitDescription(billing.host_limit)}</Text>
         </View>
-        <View style={styles.instructionCopy}>
-          <Text weight="medium">On that computer, paste this into a terminal</Text>
-          <Text color="mutedForeground">
-            This installs SPAWN D and starts the computer-side service.
-          </Text>
-        </View>
-      </View>
+      ) : null}
 
-      <Card style={styles.commandWell} variant="flat">
-        <View
-          accessibilityLabel={activeTarget.commandAccessibilityLabel}
-          style={styles.commandLine}
-        >
-          <Text color="mutedForeground" variant="mono">
-            {activeTarget.prompt}
-          </Text>
-          <Text selectable style={styles.command} variant="mono">
-            {activeTarget.command}
-          </Text>
-        </View>
-        <View style={styles.commandActions}>
-          <Button
-            accessibilityLabel={copied ? "Install command copied" : "Copy install command"}
-            onPress={() => void copyCommand()}
-            size="sm"
-            variant="outline"
-          >
-            <Icon color="foreground" name={copied ? "Check" : "Copy"} size={spacing[4]} />
-            {copied ? "Copied" : "Copy command"}
-          </Button>
-          <Button
-            accessibilityLabel="Share install command"
-            onPress={() => void shareCommand()}
-            size="sm"
-            variant="outline"
-          >
-            <Icon color="foreground" name="Send" size={spacing[4]} />
-            Share
-          </Button>
-        </View>
-      </Card>
-      <Text color="mutedForeground" variant="caption">
-        Already running SPAWN D for another account on that machine? Run spawnd possess
-        --new-account instead.
-      </Text>
+      {/* At the limit there is nothing to install: the daemon would only be
+          turned away at the end of the ceremony. The notice above is the
+          whole screen, plus the way on below. */}
+      {atHostLimit(billing) ? null : (
+        <>
+          <View style={styles.heading}>
+            <Text accessibilityRole="header" variant="title">
+              Connect your first computer
+            </Text>
+            <Text color="mutedForeground">
+              A host is a computer SPAWN D opens terminals on — usually your own Mac, Linux, or
+              Windows machine.
+            </Text>
+          </View>
 
-      <View style={styles.instruction}>
-        <View
-          style={[
-            styles.number,
-            { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
-          ]}
-        >
-          <Text color="background" variant="label">
-            2
+          <View style={styles.targetChoice}>
+            <Text color="mutedForeground">Choose the computer you're installing on.</Text>
+            <SegmentedControl<InstallTargetId>
+              accessibilityLabel="Host operating system"
+              onChange={(targetId) => {
+                setActiveTargetId(targetId);
+                setCopied(false);
+              }}
+              options={targets.map((target) => ({ label: target.label, value: target.id }))}
+              testID="install-target"
+              value={activeTarget.id}
+            />
+          </View>
+
+          <View style={styles.instruction}>
+            <View
+              style={[
+                styles.number,
+                { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
+              ]}
+            >
+              <Text color="background" variant="label">
+                1
+              </Text>
+            </View>
+            <View style={styles.instructionCopy}>
+              <Text weight="medium">On that computer, paste this into a terminal</Text>
+              <Text color="mutedForeground">
+                This installs SPAWN D and starts the computer-side service.
+              </Text>
+            </View>
+          </View>
+
+          <Card style={styles.commandWell} variant="flat">
+            <View
+              accessibilityLabel={activeTarget.commandAccessibilityLabel}
+              style={styles.commandLine}
+            >
+              <Text color="mutedForeground" variant="mono">
+                {activeTarget.prompt}
+              </Text>
+              <Text selectable style={styles.command} variant="mono">
+                {activeTarget.command}
+              </Text>
+            </View>
+            <View style={styles.commandActions}>
+              <Button
+                accessibilityLabel={copied ? "Install command copied" : "Copy install command"}
+                onPress={() => void copyCommand()}
+                size="sm"
+                variant="outline"
+              >
+                <Icon color="foreground" name={copied ? "Check" : "Copy"} size={spacing[4]} />
+                {copied ? "Copied" : "Copy command"}
+              </Button>
+              <Button
+                accessibilityLabel="Share install command"
+                onPress={() => void shareCommand()}
+                size="sm"
+                variant="outline"
+              >
+                <Icon color="foreground" name="Send" size={spacing[4]} />
+                Share
+              </Button>
+            </View>
+          </Card>
+          <Text color="mutedForeground" variant="caption">
+            Already running SPAWN D for another account on that machine? Run spawnd possess
+            --new-account instead, and it joins as a second, separate host.
           </Text>
-        </View>
-        <View style={styles.instructionCopy}>
-          <Text weight="medium">Approve it from this phone</Text>
-          <Text color="mutedForeground">
-            When the install finishes it prints a link. Open it on this phone or scan the QR code.
-          </Text>
-        </View>
-      </View>
+
+          <View style={styles.instruction}>
+            <View
+              style={[
+                styles.number,
+                { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
+              ]}
+            >
+              <Text color="background" variant="label">
+                2
+              </Text>
+            </View>
+            <View style={styles.instructionCopy}>
+              <Text weight="medium">Approve it from this phone</Text>
+              <Text color="mutedForeground">
+                When the install finishes it prints a link. Open it on this phone or scan the QR
+                code.
+              </Text>
+            </View>
+          </View>
+        </>
+      )}
 
       {onSkip !== undefined ? (
         <View style={styles.actions}>
@@ -224,6 +265,11 @@ const styles = StyleSheet.create({
   instructionCopy: {
     flex: 1,
     gap: spacing[1],
+  },
+  limitNotice: {
+    borderWidth: borderWidth.hairline,
+    gap: spacing[1],
+    padding: spacing[3],
   },
   number: {
     alignItems: "center",

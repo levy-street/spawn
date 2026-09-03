@@ -15,12 +15,15 @@ import { AccessCeremonyHost } from "@/components/access/ceremony-host";
 import { HostGossipSync } from "@/components/access/host-gossip-sync";
 import { SessionApprovalGate } from "@/components/access/session-approval-gate";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
+import { AddMachineDialog } from "@/components/hosts/AddMachineDialog";
+import { HostLimitReconciliation } from "@/components/hosts/host-limit-reconciliation";
 import { HostPinUndeliveredAlerts } from "@/components/hosts/host-pin-undelivered-alerts";
 import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { WorkspaceCarryOverlay } from "@/components/nav/workspace-carry";
 import { ProfileDialog } from "@/components/profile/ProfileDialog";
 import { HostUpdateNotifier } from "@/components/release/HostUpdateNotifier";
+import { BillingReturnHandler } from "@/components/settings/billing-return";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { DeviceApprovalPrompt } from "@/components/trust/DeviceApprovalPrompt";
 import { Button } from "@/components/ui/button";
@@ -304,12 +307,20 @@ export function AppShell({
       <ToastHost />
       <HostUpdateNotifier />
       <SettingsDialog />
+      <AddMachineDialog />
+      <BillingReturnHandler />
       <ProfileDialog />
       <AccessCeremonyHost />
       <SessionApprovalGate />
       <HostGossipSync />
       <DeviceApprovalPrompt accountId={user?.id ?? null} />
       <HostPinUndeliveredAlerts enabled={user !== null} />
+      {/* Last, and app-wide on purpose: an account holding more machines than
+          its plan admits must answer for that wherever it lands, and this is
+          the only mount point every product route shares. It renders nothing
+          at all on a deployment without billing, or on an account inside its
+          limit (docs/BILLING.md §5.7). */}
+      <HostLimitReconciliation />
     </div>
   );
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronUp, Server } from "lucide-react";
+import { ArrowRight, ChevronUp, LayoutGrid, Server } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -262,15 +262,26 @@ export function LegionStrip({
               />
             ))}
           </ul>
-          {overflow > 0 && (
-            // Dressed as the row it sits under, pointing the way it leads.
-            <Link href="/legion" onClick={onNavigate} className={sidebarRowClass(false)}>
-              <SidebarIconSlot>
-                <Server className="size-4 opacity-60" aria-hidden />
-              </SidebarIconSlot>
-              <SidebarRowLabel collapsed={false}>View all ({summary.hosts})</SidebarRowLabel>
-            </Link>
-          )}
+          {/* Always there, dressed as the row it sits under: the strip shows
+           * at most a few machines and none of their figures, and the page
+           * with the rest is one row away rather than a hunt. */}
+          <Link
+            href="/legion"
+            onClick={onNavigate}
+            className={cn(sidebarRowClass(false), "group/view")}
+          >
+            <SidebarIconSlot>
+              <LayoutGrid className="size-4" aria-hidden />
+            </SidebarIconSlot>
+            <SidebarRowLabel collapsed={false}>
+              {overflow > 0 ? `View all hosts (${summary.hosts})` : "View hosts"}
+            </SidebarRowLabel>
+            {/* Points the way it leads, and leans into it under the pointer. */}
+            <ArrowRight
+              aria-hidden
+              className="mr-2.5 size-3.5 shrink-0 transition-transform duration-150 group-hover/view:translate-x-0.5"
+            />
+          </Link>
         </div>
       </Collapse>
 

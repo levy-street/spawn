@@ -5,7 +5,8 @@ export type PairingFailureCode =
   | "denied"
   | "key_conflict"
   | "pin_conflict"
-  | "pin_limit";
+  | "pin_limit"
+  | "host_limit";
 
 export const PAIRING_FAILURE_COPY: Record<PairingFailureCode, string> = {
   expired: "That approval expired. On the machine, run spawnd possess again.",
@@ -19,6 +20,13 @@ export const PAIRING_FAILURE_COPY: Record<PairingFailureCode, string> = {
     "The browser that approved this machine doesn't match its earlier approval. Approve again from a browser you've used with this host before — or remove the host on the web and start fresh.",
   pin_limit:
     "This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again.",
+  /* The plain-text fallback. Where a button can be drawn — the possession
+   * ceremony — a dedicated branch says the same thing and offers the two
+   * ways out; this is what the rest of the catalogue's callers show. It says
+   * plainly that nothing happened on the machine, because the daemon is
+   * sitting there waiting and the reader is about to go and look at it. */
+  host_limit:
+    "This account already holds every machine its plan admits, so this one was not registered and nothing on it was changed. Release a machine from your legion, or move to a plan with room for more, then run spawnd possess again.",
 };
 
 const FAILURE_CODES = new Set<PairingFailureCode>([
@@ -27,6 +35,7 @@ const FAILURE_CODES = new Set<PairingFailureCode>([
   "key_conflict",
   "pin_conflict",
   "pin_limit",
+  "host_limit",
 ]);
 
 function asFailureCode(value: unknown): PairingFailureCode | null {
@@ -38,6 +47,10 @@ function asFailureCode(value: unknown): PairingFailureCode | null {
   if (normalized.includes("user code is expired") || normalized.includes("expired_token")) {
     return "expired";
   }
+  // Substring, not word: a wrapped server sentence can carry the code inside
+  // it. Two codes now end in "limit", so the thing that keeps this honest is
+  // that the needle is always the WHOLE code — "…host_limit…" cannot contain
+  // "pin_limit" and vice versa. Never loosen this to match on a suffix.
   for (const code of FAILURE_CODES) {
     if (normalized.includes(code)) return code;
   }

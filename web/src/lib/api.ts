@@ -76,12 +76,34 @@ export async function api<T>(
 
 // ---------- Schemas ----------
 
+/** Per-account plan state, carried on every shape that returns a user.
+ *
+ * Null means this deployment has no billing at all — a self-hosted server
+ * never populates it, and every client renders no billing UI in that state.
+ * Every field is defaulted, because `/api/me` gates app launch and a stricter
+ * shape here would break the launch path rather than a screen. */
+export const UserBillingSchema = z.object({
+  enabled: z.boolean().default(false),
+  tier: z.string().default("free"),
+  tier_name: z.string().default("Free"),
+  /** null = unlimited. */
+  host_limit: z.number().int().nullable().default(null),
+  host_count: z.number().int().default(0),
+  over_limit: z.boolean().default(false),
+  /** Stripe's own subscription status, verbatim, or null for no subscription. */
+  status: z.string().nullable().default(null),
+  current_period_end: z.string().nullable().default(null),
+  cancel_at_period_end: z.boolean().default(false),
+});
+export type UserBilling = z.infer<typeof UserBillingSchema>;
+
 export const UserSchema = z.object({
   id: z.string().uuid(),
   email: z.string().email(),
   created_at: z.string(),
   email_verified_at: z.string().nullable().default(null),
   is_admin: z.boolean().default(false),
+  billing: UserBillingSchema.nullish().transform((value) => value ?? null),
 });
 export type User = z.infer<typeof UserSchema>;
 
@@ -231,6 +253,7 @@ export const ProfileSchema = z.object({
    * the browser's clock, so a viewer in UTC+13 colours the squares the streak
    * counter actually counted. */
   today: z.string(),
+  billing: UserBillingSchema.nullish().transform((value) => value ?? null),
 });
 export type Profile = z.infer<typeof ProfileSchema>;
 
@@ -509,12 +532,59 @@ export const AuthProviderSchema = z.object({
 });
 export type AuthProvider = z.infer<typeof AuthProviderSchema>;
 
+/** One plan as a pricing surface lists it. Display only; nothing charges from here. */
+export const BillingTierSchema = z.object({
+  key: z.string(),
+  /** Display name, as the person reads it ("Coven", "Legion", "Pandemonium"). */
+  name: z.string(),
+  /** Monthly, USD, in cents. */
+  price_cents: z.number().int().default(0),
+  /** null = unlimited. */
+  host_limit: z.number().int().nullable().default(null),
+});
+export type BillingTier = z.infer<typeof BillingTierSchema>;
+
+export const BillingConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  free_host_limit: z.number().int().default(1),
+  tiers: z.array(BillingTierSchema).default([]),
+  /** Whether the mobile apps may show an off-platform upgrade link. */
+  mobile_upgrade_link: z.boolean().default(false),
+});
+export type BillingConfig = z.infer<typeof BillingConfigSchema>;
+
+/** `GET /api/billing/state` — the one read every billing surface uses. */
+export const BillingStateSchema = z.object({
+  tier: z.string(),
+  tier_name: z.string(),
+  host_limit: z.number().int().nullable().default(null),
+  host_count: z.number().int(),
+  over_limit: z.boolean(),
+  status: z.string().nullable().default(null),
+  current_period_end: z.string().nullable().default(null),
+  cancel_at_period_end: z.boolean().default(false),
+  has_subscription: z.boolean().default(false),
+  reason: z.string(),
+  tiers: z.array(BillingTierSchema).default([]),
+});
+export type BillingState = z.infer<typeof BillingStateSchema>;
+
 /** `GET /api/auth/config` — everything the auth/onboarding UI must know. */
 export const AuthConfigSchema = z.object({
   providers: z.array(AuthProviderSchema).default([]),
   /** True only when the server actually enforces verification (mailer ready). */
   email_verification_required: z.boolean().default(false),
   invite_only: z.boolean().default(false),
+  /** False means this deployment has no billing: render no billing UI at all,
+   *  no Subscription tab and no pricing link anywhere. It mirrors the exact
+   *  condition `routes/device.py` enforces, so a client never shows a gate the
+   *  server will not apply. */
+  billing: BillingConfigSchema.default({
+    enabled: false,
+    free_host_limit: 1,
+    tiers: [],
+    mobile_upgrade_link: false,
+  }),
 });
 export type AuthConfig = z.infer<typeof AuthConfigSchema>;
 
@@ -833,6 +903,15 @@ export const AdminUserSchema = z.object({
   host_count: z.number().int().default(0),
   session_count: z.number().int().default(0),
   browser_device_count: z.number().int().default(0),
+  /** `User.host_limit_override`, verbatim: null = no override, 0 = unlimited,
+   *  any other integer = that many hosts. Never write it without reading that
+   *  sentence twice — `0` means the opposite of what it looks like. */
+  host_limit_override: z.number().int().nullable().default(null),
+  /** What the account is *sold*: the subscription row's tier, or "free". A
+   *  comped account legitimately differs from what it is allowed. */
+  billing_tier: z.string().default("free"),
+  /** What is actually enforced. null = unlimited. */
+  effective_host_limit: z.number().int().nullable().default(null),
 });
 export type AdminUser = z.infer<typeof AdminUserSchema>;
 
@@ -890,10 +969,64 @@ export const admin = {
     }),
   revokeInvite: (id: string) =>
     api(`/api/admin/invites/${id}/revoke`, { method: "POST", schema: AdminInviteSchema }),
+  /**
+   * Comp an account, or stop comping it — how internal accounts never pay.
+   *
+   * `null` clears the override and hands the account back to its subscription;
+   * `0` is UNLIMITED, not zero hosts; any other integer is that many. The
+   * override outranks any subscription and needs no Stripe call, which is the
+   * point: comping is our decision about our own product, not a discount
+   * someone has to remember to cancel in a dashboard.
+   */
+  setHostLimitOverride: (userId: string, hostLimitOverride: number | null) =>
+    api(`/api/admin/users/${userId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ host_limit_override: hostLimitOverride }),
+      schema: AdminUserSchema,
+    }),
 };
 
 export const profile = {
   get: () => api("/api/profile", { method: "GET", schema: ProfileSchema }),
+};
+
+/** `/api/billing/*`. Every one of these 404s on a deployment with billing off,
+ *  which is the point: a self-hosted install has no discoverable billing API. */
+export const billing = {
+  state: () => api("/api/billing/state", { method: "GET", schema: BillingStateSchema }),
+  /** Starts a Stripe Checkout session and returns the page to send the browser to.
+   *  The body carries a tier NAME, never a price id and never an amount. */
+  checkout: (tier: string) =>
+    api("/api/billing/checkout", {
+      method: "POST",
+      body: JSON.stringify({ tier }),
+      schema: z.object({ url: z.string() }),
+    }),
+  /** Stripe's Customer Portal: payment method, invoices, cancellation. */
+  portal: () =>
+    api("/api/billing/portal", {
+      method: "POST",
+      schema: z.object({ url: z.string() }),
+    }),
+  /** A move UP a plan: the Stripe-hosted page that shows the prorated
+   *  charge, takes the payment, and sends the browser back. Same
+   *  `host_selection_required` precondition as `changePlan`. */
+  upgrade: (tier: string) =>
+    api("/api/billing/upgrade", {
+      method: "POST",
+      body: JSON.stringify({ tier }),
+      schema: z.object({ url: z.string() }),
+    }),
+  /** Our own plan change — the way DOWN. Answers 409 `host_selection_required`
+   *  when the account holds more hosts than the target tier admits — release
+   *  them through `hosts.remove` first, then call this again. The server never
+   *  releases a host on a billing signal. */
+  changePlan: (tier: string) =>
+    api("/api/billing/change-plan", {
+      method: "POST",
+      body: JSON.stringify({ tier }),
+      schema: BillingStateSchema,
+    }),
 };
 
 export const release = {

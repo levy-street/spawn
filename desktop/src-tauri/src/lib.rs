@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod billing;
 mod crypto;
 mod install;
 mod models;
@@ -13,12 +14,13 @@ mod window;
 
 use models::{
     AccountState, AuthConfig, AuthOutcome, DesktopPreferences, DeviceApprovalProgress, LocalStatus,
-    PossessionProgress,
+    PossessionProgress, SubscriptionState,
 };
 use serde::Serialize;
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
 #[derive(Default)]
@@ -221,6 +223,28 @@ fn hosted_origin() -> &'static str {
     models::HOSTED_ORIGIN
 }
 
+/// What the account's plan admits. Never an error: see `billing`.
+#[tauri::command]
+async fn subscription_state() -> SubscriptionState {
+    billing::subscription_state().await
+}
+
+/// Open the plan page in the system browser.
+///
+/// The system browser, never a webview inside this window. An embedded one
+/// breaks password managers, complicates 3-D Secure and degrades Stripe's fraud
+/// signals, for no benefit whatever — and the plan page wants the browser
+/// session the person already has. `OpenerExt` is the same mechanism
+/// `window::create` uses to walk a navigation out of the product, so this needs
+/// no capability the app does not already hold.
+#[tauri::command]
+fn open_upgrade(app: tauri::AppHandle) -> Result<(), String> {
+    let url = billing::plans_url().map_err(command_error)?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(command_error)
+}
+
 #[tauri::command]
 fn terminal_install_command() -> Result<String, String> {
     let preferences = storage::load_preferences().map_err(command_error)?;
@@ -402,6 +426,8 @@ pub fn run() {
             poll_possession,
             approve_possession,
             hosted_origin,
+            subscription_state,
+            open_upgrade,
             terminal_install_command,
             local_status,
             possession_log_tail,

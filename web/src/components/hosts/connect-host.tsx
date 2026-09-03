@@ -2,15 +2,19 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CheckCircle2, Circle, Copy, Loader2, Terminal } from "lucide-react";
+import Link from "next/link";
 import { type JSX, useEffect, useMemo, useRef, useState } from "react";
 import { NumberCheck } from "@/components/access/number-check";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PaceBar } from "@/components/ui/pace-bar";
 import { StatusDot } from "@/components/ui/status";
+import { useBilling } from "@/hooks/useBilling";
 import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { ApiError, auth, type DevicePendingApproval, type Host, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { hostLimitFacts, hostsUsedLabel, type LimitFacts } from "@/lib/billing";
 import {
   createHostPairApprovalProof,
   loadBrowserDeviceIdentity,
@@ -148,6 +152,17 @@ export function ConnectHostSection(props: {
    * knows the answer up front passes it and is immune to that.
    */
   priorOnlineHostIds?: readonly string[];
+  /**
+   * Whether a plan that will not admit this machine may say so here, with the
+   * two controls that answer it.
+   *
+   * On by default, and turned OFF by onboarding alone (docs/BILLING.md §5.8).
+   * The first host is free on every tier, so a paywall in front of somebody's
+   * first machine is a wall they cannot have hit — and it would be the worst
+   * possible first impression of the product. The refusal still renders as
+   * plain catalogue copy there; only the upgrade prompt is withheld.
+   */
+  billingBlock?: boolean;
 }): JSX.Element {
   const {
     onHostOnline,
@@ -157,6 +172,7 @@ export function ConnectHostSection(props: {
     resumeApprovedHost = null,
     awaitsHostArrival = false,
     priorOnlineHostIds,
+    billingBlock = true,
   } = props;
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
   const [chosenTarget, setChosenTarget] = useState<InstallTargetId | null>(null);
@@ -407,12 +423,23 @@ export function ConnectHostSection(props: {
                 )}
               </Button>
             </div>
-            <p className="text-xs leading-5 text-muted-foreground">
-              After installation, run <code>spawnd possess</code> on that machine.
-            </p>
+            <ol className="space-y-1.5 text-xs leading-5 text-muted-foreground">
+              <li className="flex gap-2">
+                <span className="w-3 shrink-0 font-mono text-foreground">1</span>
+                <span>Run that command in a terminal on the machine you are adding.</span>
+              </li>
+              <li className="flex gap-2">
+                <span className="w-3 shrink-0 font-mono text-foreground">2</span>
+                <span>
+                  When it finishes, run <code>spawnd possess</code> there. It opens a link for you
+                  to approve the machine from this account.
+                </span>
+              </li>
+            </ol>
             <p className="text-xs leading-5 text-muted-foreground">
               Already running SPAWN D for another account on that machine? Run{" "}
-              <code>spawnd possess --new-account</code> instead.
+              <code>spawnd possess --new-account</code> instead, and it joins as a second, separate
+              host.
             </p>
           </section>
         )}
@@ -444,6 +471,7 @@ export function ConnectHostSection(props: {
           // and a Done that empties it — as the only thing on the page.
           <HostApprovalForm
             autoLoadFromUrl
+            billingBlock={billingBlock}
             onStartOver={startOver}
             onApproved={(hostName) => {
               setLocallyApproved(true);
@@ -600,6 +628,67 @@ function PairingFailure({ failure }: { failure: keyof typeof PAIRING_FAILURE_COP
 }
 
 /**
+ * The plan will not admit another machine (docs/BILLING.md §5.4).
+ *
+ * Every other terminal failure here is about identity, and the honest answer
+ * is "nothing was trusted, go and look at the machine". This one is about
+ * money, the reader has done nothing wrong, and there are exactly two ways
+ * out — so it is the only failure on this surface that renders controls.
+ *
+ * It says the numbers rather than gesturing at them: the server's 402 carries
+ * the tier and both counts precisely so no client has to guess, and "you have
+ * reached your limit" without saying what the limit is would send someone to
+ * the Subscription panel to find out.
+ *
+ * `Upgrade` opens Settings → Subscription rather than linking to the pricing
+ * page: this can be running inside the desktop window, which has no address
+ * bar, so anything that leaves the product is a room with no door.
+ */
+function HostLimitBlock({ facts }: { facts: LimitFacts | null }): JSX.Element {
+  const { account } = useBilling();
+  const plan = {
+    host_limit: facts?.host_limit ?? account?.host_limit ?? null,
+    host_count: facts?.host_count ?? account?.host_count ?? 0,
+  };
+
+  return (
+    <div
+      className="space-y-3 rounded-lg border border-warning/50 bg-warning/5 p-3"
+      data-testid="possess-host-limit"
+      role="alert"
+    >
+      <p className="text-sm font-medium text-foreground">
+        This machine was not added: your plan is full
+      </p>
+      {/* The numbers on a line of their own, in the app's own face. Weight and
+       * tabular figures carry the emphasis; the poster type stays on
+       * marketing surfaces. */}
+      <p className="text-sm font-medium tabular-nums text-foreground">
+        {account?.tier_name ?? "Your plan"} · {hostsUsedLabel(plan)}
+      </p>
+      <p className="text-sm leading-relaxed text-muted-foreground">
+        Nothing on the machine was changed, and everything you already have keeps running. Move to a
+        plan with more room, or release a machine, then run{" "}
+        <code className="font-mono">spawnd possess</code> there again.
+      </p>
+      <div className="flex flex-col-reverse gap-2 @sm/settings:flex-row">
+        <Button type="button" variant="secondary" asChild>
+          <Link href="/legion">Manage hosts</Link>
+        </Button>
+        <Button
+          type="button"
+          className="flex-1"
+          data-testid="possess-host-limit-upgrade"
+          onClick={() => openSettings("subscription")}
+        >
+          Upgrade
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
  * The one thing worth saying when a ceremony fails for a reason this page
  * cannot see.
  *
@@ -626,6 +715,7 @@ export function HostApprovalForm({
   onApproved,
   autoLoadFromUrl = false,
   onStartOver,
+  billingBlock = true,
 }: {
   onApproved?: (hostName: string) => void;
   /**
@@ -641,6 +731,8 @@ export function HostApprovalForm({
    * rather than left showing an empty approval surface.
    */
   onStartOver?: () => void;
+  /** See {@link ConnectHostSection}: off in onboarding, on everywhere else. */
+  billingBlock?: boolean;
 } = {}) {
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -659,6 +751,13 @@ export function HostApprovalForm({
   const [localPinCommitted, setLocalPinCommitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [failure, setFailure] = useState<keyof typeof PAIRING_FAILURE_COPY | null>(null);
+  /**
+   * The three numbers the 402 carries when a plan will not admit this machine
+   * (`billing.limit_error_detail`). Kept beside the code because the prompt
+   * has to say what the limit *is*, and the account's own block can be a
+   * refetch behind by the time it is drawn.
+   */
+  const [limitFacts, setLimitFacts] = useState<LimitFacts | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submittingSince, setSubmittingSince] = useState<number | null>(null);
   const [submittingNow, setSubmittingNow] = useState(() => Date.now());
@@ -716,6 +815,7 @@ export function HostApprovalForm({
     setLocalPinCommitted(false);
     setStopped(false);
     setError(null);
+    setLimitFacts(null);
     setFailure(null);
     setIdentifier(null);
     setHostName(null);
@@ -769,6 +869,7 @@ export function HostApprovalForm({
       if (!operationIsCurrent(operation) || signal.aborted) return;
       const knownFailure = pairingFailureCode(caught);
       if (knownFailure) {
+        setLimitFacts(hostLimitFacts(caught));
         setFailure(knownFailure);
         return;
       }
@@ -950,6 +1051,7 @@ export function HostApprovalForm({
       if (!operationIsCurrent(operation) || signal.aborted) return;
       const knownFailure = pairingFailureCode(caught);
       if (knownFailure) {
+        setLimitFacts(hostLimitFacts(caught));
         setFailure(knownFailure);
         return;
       }
@@ -1066,6 +1168,17 @@ export function HostApprovalForm({
   const handedCeremonyLoading =
     !pending && !hostName && error === null && (attemptOutstanding || submitting);
 
+  // The one refusal that is not about identity, and the only one with
+  // something to offer: the plan will not admit another machine. It needs a
+  // button, and `PairingFailure` renders plain text — so it gets its own
+  // branch, shaped like the terminal-refusal card above.
+  //
+  // Onboarding opts out (`billingBlock={false}`, docs/BILLING.md §5.8): the
+  // first host is free on every tier, so a paywall there would be a wall a
+  // person cannot have hit, in front of the first machine they ever possess.
+  if (failure === "host_limit" && billingBlock) {
+    return <HostLimitBlock facts={limitFacts} />;
+  }
   if (failure) return <PairingFailure failure={failure} />;
   if (!pending && !hostName && !handedCeremonyLoading && error === null) return null;
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -11,7 +12,7 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, rate_limit, schemas
+from .. import auth, billing, billing_email, rate_limit, schemas
 from ..config import get_settings
 from ..db import get_session
 from ..host_identity import host_key_fingerprint
@@ -20,6 +21,8 @@ from ..host_pair_approval import verify_host_pair_approval_proof
 from ..host_pair_possession import verify_host_pair_possession_proof
 from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
 from ..pin_liveness import live_browser_device_id_set
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth/device", tags=["device"])
 
@@ -42,6 +45,52 @@ def _aware(dt: datetime | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt
+
+
+async def _mail_host_limit(
+    session: AsyncSession, owner: User, decision: billing.Decision
+) -> None:
+    """Tell the account what the refusal it just received actually means.
+
+    The refusal itself is machine codes and numbers, and the copy a client
+    builds from them may carry no price, no link and no verb — the mobile app
+    renders server strings verbatim inside a binary that shipped through App
+    Review. This message is outside the app, which is the case Apple's 3.1.3
+    preamble expressly permits, so it carries the tiers, the prices and the
+    link the app cannot (docs/BILLING.md §6.3).
+
+    Two conditions on calling it, both about not making a refusal worse:
+
+    - only after the surrounding code has committed or rolled back. The
+      delivery log writes on its own session, so a caller still holding a
+      write lock would be waiting on itself.
+    - nothing it does may reach the client. `billing_email` already promises
+      never to raise; a pairing refusal is not where anyone should discover
+      that promise was broken, so the promise is kept twice.
+    """
+
+    limit = decision.host_limit
+    if limit is None:
+        # Unreachable: an account with no limit is never refused, and there
+        # would be no number to write about if it were.
+        return
+    if decision.entitlement.reason == "comped":
+        # A comped account never sees billing at all (docs/BILLING.md §4.8).
+        # Its ceiling is an operator's decision about our own product, so the
+        # answer to hitting it is a conversation with that operator — not a
+        # price list from us.
+        return
+    tier = billing.TIERS.get(decision.tier, billing.TIERS[billing.TIER_FREE])
+    try:
+        await billing_email.send_host_limit_reached(
+            session,
+            owner,
+            tier_name=tier.name,
+            host_limit=limit,
+            host_count=decision.host_count,
+        )
+    except Exception as exc:  # pragma: no cover - the sender swallows its own
+        log.warning("could not send the host-limit email: %s", exc)
 
 
 def _gen_user_code() -> str:
@@ -370,7 +419,7 @@ async def device_poll(
             await session.rollback()
             return {"error": "expired_token"}
 
-        if snapshot["status"] in {"denied", "pin_conflict", "pin_limit"}:
+        if snapshot["status"] in {"denied", "pin_conflict", "pin_limit", "host_limit"}:
             terminal_error = snapshot["status"]
             await session.execute(
                 update(DeviceCode)
@@ -507,6 +556,44 @@ async def device_poll(
             return {"error": "key_conflict"}
 
     if host is None:
+        # Layer 2 — the backstop. Only this branch brings a Host row into
+        # existence; the `else:` below is a re-pair of a machine this account
+        # already has and must never be billed as a new one.
+        #
+        # Approve and poll are decoupled: an approved DeviceCode lives 30
+        # minutes, so somebody could approve several ceremonies while under
+        # their limit and let the daemons poll afterwards. Layer 1 cannot see
+        # that; this can.
+        #
+        # The settings check is deliberately duplicated from `billing`: with
+        # billing off, `may_add_host` would still take a row lock and a count
+        # to arrive at "unlimited", and a self-hosted pairing must issue
+        # exactly the queries it always did.
+        if get_settings().billing_enabled:
+            # Loaded rather than carried: poll authenticates by device code, so
+            # this request has no signed-in user of its own. The row is
+            # guaranteed by the DeviceCode's foreign key, and a gate that
+            # failed open on a missing one would be worse than a 500.
+            owner = await session.get(User, user_id)
+            assert owner is not None
+            decision = await billing.may_add_host(session, owner, lock=True)
+            if not decision.allowed:
+                # The `pin_limit` shape exactly (the 32-browsers-per-host cap
+                # below): persist the refusal on the DeviceCode so a repeat
+                # poll re-reports it, and hand the daemon a bare machine code.
+                # An un-updated daemon prints an unknown code raw, which is why
+                # the readable refusal is layer 1's.
+                await session.execute(
+                    update(DeviceCode)
+                    .where(DeviceCode.device_code == body.device_code)
+                    .values(status="host_limit")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+                # After the commit, never before: the delivery log writes on
+                # its own session and must not wait on this one's write lock.
+                await _mail_host_limit(session, owner, decision)
+                return {"error": "host_limit"}
         candidate = Host(
             owner_user_id=user_id,
             name=claimed["host_name"] or "host",
@@ -876,6 +963,49 @@ async def device_approve(
         await session.execute(delete(DeviceCode).where(DeviceCode.device_code == device_code))
         await session.commit()
         raise HTTPException(status_code=409, detail="host key is already paired")
+
+    # Layer 1 — the primary gate, and the only one a person ever reads. This
+    # route runs `Depends(auth.verified_user)`, already documented as the seam
+    # where an account first consumes operator-funded resources, so there is a
+    # signed-in person in a browser who can act on the answer.
+    #
+    # The lookup just above is the whole test for "is this a new machine":
+    # `pinned_host is not None` means this account already owns the row (the
+    # other owner's case raised a moment ago), so re-approving a machine
+    # somebody already has is never refused — at any limit, and including an
+    # account already sitting over one.
+    #
+    # As at layer 2, the settings check is duplicated so that a deployment with
+    # billing off issues no extra query.
+    if pinned_host is None and get_settings().billing_enabled:
+        # The `session.rollback()` further up expired every instance in this
+        # session, this request's `user` among them. Re-read it explicitly
+        # inside the live transaction: an attribute access would otherwise
+        # trigger a lazy load from sync context and fail as a 500.
+        await session.refresh(user)
+        decision = await billing.may_add_host(session, user, lock=True)
+        if not decision.allowed:
+            # 402, where every other capacity error in this codebase is a 409
+            # with a prose detail ("too many host introductions", "passkey
+            # capacity is exhausted"). Payment Required is the honest status
+            # for this one, and it lets a frontend tell "you are out of room"
+            # from "you must pay for more room" without matching on a string.
+            #
+            # The body is machine codes and numbers only. The mobile app
+            # renders `ApiError.message` verbatim inside a binary that ships
+            # through app review, so prose here would be purchase copy sent
+            # from the server; every word a person reads is the client's.
+            #
+            # The ceremony is left pending rather than deleted: the daemon goes
+            # on reporting authorization_pending, and the user can free a slot
+            # and approve the very same code.
+            await session.rollback()
+            # That rollback expired every instance again, `user` among them,
+            # and the sender reads the address off it. Re-read before handing
+            # it over rather than letting a lazy load fire from sync context.
+            await session.refresh(user)
+            await _mail_host_limit(session, user, decision)
+            raise HTTPException(status_code=402, detail=billing.limit_error_detail(decision))
 
     approved = await session.execute(
         update(DeviceCode)

@@ -52,11 +52,22 @@ export type PairingFailureKind =
   | "host-not-ready"
   | "approval-incomplete"
   | "endorsement-invalid"
+  | "host-limit"
   | "pairing-rejected";
 
 export interface PairingFailure {
   kind: PairingFailureKind;
   detail?: string;
+  /**
+   * How many hosts the plan admits, from the server's 402 body — a number, and
+   * never the words around it.
+   *
+   * `TrustFailureState` renders `detail` verbatim, which is exactly why the
+   * billing refusal carries a machine code and figures instead: the sentence a
+   * person reads is built in `data/selectors/billing.ts`. See docs/BILLING.md
+   * §6.1.
+   */
+  hostLimit?: number | null;
 }
 
 export type PairingProtocolError =
@@ -104,6 +115,26 @@ export function pairingFailureForProtocolError(error: PairingProtocolError): Pai
   return pairingFailure("pin-limit");
 }
 
+/**
+ * The host-limit refusal, read as figures rather than as prose.
+ *
+ * The server answers an over-limit approval with 402 and a body of machine
+ * codes and numbers — `{code: "host_limit", tier, host_limit, host_count}` —
+ * precisely so no purchase copy can arrive from the server side and be rendered
+ * verbatim in a binary that ships through app review. Returns null for anything
+ * that is not that refusal.
+ */
+function hostLimitFromApiError(error: ApiError): PairingFailure | null {
+  if (error.status !== 402) return null;
+  const detail = error.detail;
+  if (typeof detail !== "object" || detail === null) return null;
+  const body = detail as { code?: unknown; host_limit?: unknown };
+  if (body.code !== "host_limit") return null;
+  return typeof body.host_limit === "number"
+    ? { kind: "host-limit", hostLimit: body.host_limit }
+    : { kind: "host-limit" };
+}
+
 function protocolErrorFromApiError(error: ApiError): PairingProtocolError | null {
   const detailCandidates =
     typeof error.detail === "object" && error.detail !== null
@@ -139,6 +170,10 @@ export function toPairingFailure(error: unknown): PairingFailure {
       : pairingFailure("pairing-rejected", error.message);
   }
   if (error instanceof ApiError) {
+    // Ahead of everything else, so the billing refusal can never fall through
+    // to the branch that carries a server sentence onto the screen.
+    const hostLimit = hostLimitFromApiError(error);
+    if (hostLimit !== null) return hostLimit;
     const protocolError = protocolErrorFromApiError(error);
     if (protocolError !== null) return pairingFailureForProtocolError(protocolError);
     if (error.status === 404) return pairingFailure("approval-not-found");

@@ -158,4 +158,7 @@ async def get_profile(
         ],
         history_days=HISTORY_DAYS,
         today=today,
+        # The same block `/api/me` carries, so the dialog that lists the fleet
+        # also knows what the fleet is allowed to be. None when billing is off.
+        billing=await schemas.account_billing_out(session, user),
     )

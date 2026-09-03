@@ -13,6 +13,7 @@ import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
 import { WorkspaceSplit } from "@/components/workspace/workspace-split";
 import { hosts, workspaces } from "@/lib/api";
 import { useAuth, useAuthConfig } from "@/lib/auth";
+import { carryBillingParam } from "@/lib/billing-return";
 
 /**
  * The door into the product: every route that means "take me to my work" —
@@ -92,7 +93,9 @@ export default function AppEntryPage() {
         orderedWorkspaces.find((workspace) => workspace.id === savedId) ?? orderedWorkspaces[0];
       if (target) {
         window.localStorage.setItem("spawn.workspaces.last", target.id);
-        router.replace(`/w/${target.id}`);
+        // Back from Stripe: the flag rides along, and the workspace's shell
+        // turns it into "where you were, with the plan panel open".
+        router.replace(carryBillingParam(`/w/${target.id}`, window.location.search));
       }
       return;
     }

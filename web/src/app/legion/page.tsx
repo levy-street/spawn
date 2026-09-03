@@ -4,20 +4,15 @@ import { useQuery } from "@tanstack/react-query";
 import { Plus, Radio, RadioTower } from "lucide-react";
 import { useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
-import { ConnectHostSection } from "@/components/hosts/connect-host";
+import { openAddMachine } from "@/components/hosts/add-machine-dialog-store";
 import { LegionHostCard } from "@/components/legion/LegionHostCard";
 import { Stat } from "@/components/legion/legion-parts";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useBilling } from "@/hooks/useBilling";
 import { hosts, sessions } from "@/lib/api";
+import { atCapacity, hostLimitLabel, hostsUsedLabel } from "@/lib/billing";
 import { formatBytes, summarizeLegion, summaryLine } from "@/lib/legion";
 
 /**
@@ -42,7 +37,6 @@ export default function LegionPage() {
 
 function LegionBody() {
   const [liveMetrics, setLiveMetrics] = useState(false);
-  const [addMachineOpen, setAddMachineOpen] = useState(false);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, refetchInterval: 15_000 });
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -53,6 +47,18 @@ function LegionBody() {
   const summary = summarizeLegion(hostsQ.data ?? [], sessionsQ.data ?? []);
   const memory = formatBytes(summary.memoryBytes);
   const loading = hostsQ.isLoading;
+  // Soft state only (docs/BILLING.md §5.5). The page already knows the host
+  // count; the plan is the other half of the same sentence, and saying it here
+  // is cheaper than letting somebody find out at the end of a ceremony.
+  const { enabled: billingEnabled, account } = useBilling();
+  // The limit from the plan block, the count from the fleet on this very
+  // page: `/api/me` is cached and its count does not move when a machine is
+  // added or released, and "0/1" beside a card for one machine is a lie.
+  const plan =
+    billingEnabled && account !== null
+      ? { ...account, host_count: hostsQ.data?.length ?? account.host_count }
+      : null;
+  const full = plan !== null && atCapacity(plan);
 
   return (
     // The shell's <main> is `overflow-hidden` on desktop, so a page taller than
@@ -66,9 +72,18 @@ function LegionBody() {
             <p className="mt-0.5 text-sm text-muted-foreground">
               {loading ? "Counting your machines…" : summaryLine(summary)}
             </p>
+            {/* The button below stays live. A disabled control with no
+             * explanation is worse than a click that explains itself — and
+             * this says the thing that control would have had to. */}
+            {full && plan !== null && (
+              <p className="mt-1 text-sm" data-testid="legion-at-capacity">
+                <span className="font-medium tabular-nums">{hostsUsedLabel(plan)}</span> —{" "}
+                {plan.tier_name} is full. Adding another needs a released machine or a bigger plan.
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" size="sm" onClick={() => setAddMachineOpen(true)}>
+            <Button type="button" size="sm" onClick={openAddMachine}>
               <Plus className="size-4" aria-hidden />
               Add a machine
             </Button>
@@ -94,6 +109,17 @@ function LegionBody() {
           className="grid grid-cols-2 gap-4 rounded-xl border border-border bg-card p-4 sm:grid-cols-3 lg:grid-cols-5"
         >
           <Stat value={`${summary.hostsOnline}/${summary.hosts}`} label="hosts online" />
+          {plan !== null && (
+            <Stat
+              value={
+                plan.host_limit === null
+                  ? String(plan.host_count)
+                  : `${plan.host_count}/${plan.host_limit}`
+              }
+              label="hosts on plan"
+              accent={full}
+            />
+          )}
           {summary.cores > 0 && <Stat value={summary.cores} label="cores possessed" />}
           {memory && <Stat value={memory} label="memory" />}
           <Stat value={summary.sessions} label="live sessions" />
@@ -118,13 +144,18 @@ function LegionBody() {
           </div>
         ) : summary.rows.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border px-5 py-10 text-center">
-            <p className="text-sm text-muted-foreground">No hosts possessed yet.</p>
+            <p className="text-sm text-muted-foreground">
+              No hosts possessed yet.
+              {full && plan !== null
+                ? ` Your plan admits ${hostLimitLabel(plan.host_limit)}, and every slot is already spoken for.`
+                : ""}
+            </p>
             <Button
               type="button"
               variant="outline"
               size="sm"
               className="mt-4"
-              onClick={() => setAddMachineOpen(true)}
+              onClick={openAddMachine}
             >
               <Plus className="size-4" aria-hidden />
               Add a machine
@@ -140,7 +171,7 @@ function LegionBody() {
              * looking at, so the surface that shows it should ask for one more. */}
             <button
               type="button"
-              onClick={() => setAddMachineOpen(true)}
+              onClick={openAddMachine}
               className="group/slot flex min-h-28 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
             >
               <Plus
@@ -148,23 +179,12 @@ function LegionBody() {
                 aria-hidden
               />
               <span className="text-sm">Add a machine</span>
+              {/* Still a live slot at capacity — it opens the same dialog,
+               * which says what the limit is and offers the way past it. */}
+              {full && <span className="text-xs">Your plan is full</span>}
             </button>
           </div>
         )}
-        <Dialog open={addMachineOpen} onOpenChange={setAddMachineOpen}>
-          <DialogContent size="lg">
-            <DialogHeader>
-              <DialogTitle>Add a machine</DialogTitle>
-              <DialogDescription>
-                Install SPAWN D, approve the machine, and keep this window open until it comes
-                online.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="overflow-y-auto px-4 pb-4">
-              <ConnectHostSection frameless />
-            </div>
-          </DialogContent>
-        </Dialog>
       </div>
     </div>
   );

@@ -248,12 +248,58 @@ const PREVIEW_PNG = Buffer.from(
 
 type JsonRecord = Record<string, unknown>;
 
+export interface BillingTierMock {
+  key: string;
+  name: string;
+  price_cents: number;
+  host_limit: number | null;
+}
+
+/** The tiers this product sells, exactly as `routes/auth_config.py` lists them
+ *  — cheapest first. */
+export const BILLING_TIERS: BillingTierMock[] = [
+  { key: "free", name: "Free", price_cents: 0, host_limit: 1 },
+  { key: "coven", name: "Coven", price_cents: 500, host_limit: 3 },
+  { key: "legion", name: "Legion", price_cents: 2000, host_limit: 20 },
+  { key: "pandemonium", name: "Pandemonium", price_cents: 5000, host_limit: null },
+];
+
+/**
+ * A billing deployment, from the client's side of the wire.
+ *
+ * `host_count` and `over_limit` are DERIVED from the mocked host list unless a
+ * spec pins them, so releasing a host through `DELETE /api/hosts/{id}` moves
+ * the account back inside its limit exactly as the real server would — which
+ * is the whole behaviour the reconciliation modal turns on.
+ */
+export interface BillingMock {
+  tier?: string;
+  tier_name?: string;
+  /** null = unlimited. Defaults to the Free tier's one host. */
+  host_limit?: number | null;
+  host_count?: number;
+  over_limit?: boolean;
+  status?: string | null;
+  current_period_end?: string | null;
+  cancel_at_period_end?: boolean;
+  has_subscription?: boolean;
+  tiers?: BillingTierMock[];
+}
+
 export interface AppMockStore {
   user: JsonRecord | null;
   config: {
     providers: Array<{ id: "google" | "microsoft" | "github"; name: string }>;
     email_verification_required: boolean;
     invite_only: boolean;
+    /** What `/api/auth/config` advertises. Off unless a spec asks for it, so
+     *  every existing spec keeps running against a self-hosted server. */
+    billing: {
+      enabled: boolean;
+      free_host_limit: number;
+      tiers: BillingTierMock[];
+      mobile_upgrade_link: boolean;
+    };
   };
   hosts: JsonRecord[];
   sessions: JsonRecord[];
@@ -271,6 +317,8 @@ export interface AppMockStore {
     workspacePatches: Array<{ id: string; body: JsonRecord }>;
     workspaceArchives: Array<{ id: string; restoring: boolean }>;
     agents: JsonRecord[];
+    /** Every `/api/billing/*` write, so a spec can assert the tier that was sent. */
+    billing: JsonRecord[];
   };
   setWorkspaceFull(value: boolean): void;
   failNextWorkspacePatch(status?: number, detail?: string): void;
@@ -349,6 +397,15 @@ export interface AppMockOptions {
   pairings?: Array<Record<string, unknown>>;
   /** Seeded durable host-introduction rows (continuous gossip store). */
   hostIntroductions?: Array<Record<string, unknown>>;
+  /**
+   * Turn billing on for this deployment. Absent (the default) models a
+   * self-hosted server: `/api/auth/config` advertises `enabled: false`,
+   * `/api/me` carries no plan block, and every `/api/billing/*` route 404s —
+   * which is what the real server does and what every pre-billing spec needs.
+   */
+  billing?: BillingMock;
+  /** Refuse the next `POST /api/billing/change-plan` with this exact body. */
+  changePlanError?: { status: number; detail?: unknown };
 }
 
 export async function mockApp(page: Page, options: AppMockOptions = {}): Promise<AppMockStore> {
@@ -360,6 +417,12 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       providers: [],
       email_verification_required: false,
       invite_only: false,
+      billing: {
+        enabled: options.billing !== undefined,
+        free_host_limit: 1,
+        tiers: options.billing !== undefined ? (options.billing.tiers ?? BILLING_TIERS) : [],
+        mobile_upgrade_link: false,
+      },
       ...options.config,
     },
     hosts: (options.hosts ?? [host]).map((item) => ({ ...(item as JsonRecord) })),
@@ -392,6 +455,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       workspacePatches: [],
       workspaceArchives: [],
       agents: [],
+      billing: [],
     },
     setWorkspaceFull(value) {
       workspaceFull = value;
@@ -863,6 +927,42 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
   const json = (route: Route, value: unknown, status = 200) =>
     route.fulfill({ status, contentType: "application/json", json: value });
 
+  // ---- billing ----------------------------------------------------------
+  // A deployment's plan state, held here rather than recomputed per route so a
+  // change-plan actually moves the account — and so `host_count` tracks the
+  // mocked host list, which is what lets a release close the over-limit modal.
+  const billingOptions = options.billing;
+  const tierList = billingOptions?.tiers ?? BILLING_TIERS;
+  let planTier = billingOptions?.tier ?? "free";
+  let planLimit = billingOptions?.host_limit === undefined ? 1 : billingOptions.host_limit;
+  let planSubscribed =
+    billingOptions?.has_subscription ??
+    (billingOptions?.status !== undefined && billingOptions.status !== null);
+
+  const billingSnapshot = () => {
+    if (billingOptions === undefined) return null;
+    const hostCount = billingOptions.host_count ?? store.hosts.length;
+    const row = tierList.find((tier) => tier.key === planTier);
+    return {
+      enabled: true,
+      tier: planTier,
+      tier_name: row?.name ?? billingOptions.tier_name ?? planTier,
+      host_limit: planLimit,
+      host_count: hostCount,
+      over_limit: billingOptions.over_limit ?? (planLimit !== null && hostCount > planLimit),
+      status: billingOptions.status ?? (planSubscribed ? "active" : null),
+      current_period_end: billingOptions.current_period_end ?? null,
+      cancel_at_period_end: billingOptions.cancel_at_period_end ?? false,
+    };
+  };
+
+  const billingStateBody = () => ({
+    ...billingSnapshot(),
+    has_subscription: planSubscribed,
+    reason: planSubscribed ? "subscription" : "free",
+    tiers: tierList,
+  });
+
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -875,6 +975,75 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       await json(route, store.config);
       return;
     }
+    if (path.startsWith("/api/billing/")) {
+      // Every one of these 404s where billing is off, exactly as the server
+      // does: a self-hosted install has no discoverable billing API.
+      if (billingSnapshot() === null) {
+        await json(route, { detail: "not found" }, 404);
+        return;
+      }
+      if (path === "/api/billing/state" && method === "GET") {
+        await json(route, billingStateBody());
+        return;
+      }
+      if (path === "/api/billing/checkout" && method === "POST") {
+        const body = await readBody();
+        store.requests.billing.push({ path, ...body });
+        await json(route, { url: `/legion?checkout=${String(body.tier)}` });
+        return;
+      }
+      if (path === "/api/billing/portal" && method === "POST") {
+        store.requests.billing.push({ path });
+        await json(route, { url: "/legion?portal=1" });
+        return;
+      }
+      if (path === "/api/billing/upgrade" && method === "POST") {
+        const body = await readBody();
+        store.requests.billing.push({ path, ...body });
+        await json(route, { url: `/legion?upgrade=${String(body.tier)}` });
+        return;
+      }
+      if (path === "/api/billing/change-plan" && method === "POST") {
+        const body = await readBody();
+        store.requests.billing.push({ path, ...body });
+        if (options.changePlanError) {
+          await json(
+            route,
+            { detail: options.changePlanError.detail },
+            options.changePlanError.status,
+          );
+          return;
+        }
+        const target = tierList.find((tier) => tier.key === body.tier);
+        if (target === undefined) {
+          await json(route, { detail: { code: "unknown_tier" } }, 400);
+          return;
+        }
+        // The server never releases a host on a billing signal: it asks which
+        // ones to keep and refuses until the client has released them itself.
+        const count = store.hosts.length;
+        if (target.host_limit !== null && count > target.host_limit) {
+          await json(
+            route,
+            {
+              detail: {
+                code: "host_selection_required",
+                tier: target.key,
+                host_limit: target.host_limit,
+                host_count: count,
+              },
+            },
+            409,
+          );
+          return;
+        }
+        planTier = target.key;
+        planLimit = target.host_limit;
+        planSubscribed = true;
+        await json(route, billingStateBody());
+        return;
+      }
+    }
     if (path === "/api/me" && method === "GET") {
       const sequence = options.meSequence;
       const selected = sequence?.length
@@ -884,7 +1053,9 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         await json(route, { detail: "not authenticated" }, 401);
       } else {
         store.user = { ...selected };
-        await json(route, { user: selected });
+        // The plan block rides on every shape that returns a user, and is
+        // absent entirely on a deployment without billing.
+        await json(route, { user: { ...selected, billing: billingSnapshot() } });
       }
       return;
     }
@@ -1832,7 +2003,8 @@ export async function openSettings(
     | "agents"
     | "skills"
     | "templates"
-    | "access" = "account",
+    | "access"
+    | "subscription" = "account",
   workspaceId = WORKSPACE_ID,
   /**
    * Where to open Settings from. Defaults to a workspace, which is what a real
@@ -1852,6 +2024,9 @@ export async function openSettings(
 
 const SETTINGS_TAB_LABELS = {
   account: "Account",
+  // Only on a deployment with billing; `mockApp` leaves billing off by
+  // default, so a spec asking for this tab has to turn it on first.
+  subscription: "Subscription",
   appearance: "Appearance",
   notifications: "Notifications",
   hosts: "Hosts",

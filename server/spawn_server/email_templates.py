@@ -35,7 +35,11 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass
+from datetime import datetime
 
+#: The product's name, set exactly as the repo requires it: capitals, one
+#: space, no trailing period. `spawn` is the folder and `spawnd` is the
+#: daemon; neither is what a person reading a message is looking at.
 BRAND = "SPAWN D"
 
 # --- spawn tokens, transcribed ----------------------------------------------
@@ -87,8 +91,8 @@ class RenderedEmail:
 def _header(*, eyebrow: str, accent: Accent) -> str:
     """The app's own header: wordmark left, bordered chip right.
 
-    Same lockup as the admin dashboard (`spawn` beside an `admin` chip), and
-    the chip is the Badge component.
+    Same lockup as the admin dashboard (the wordmark beside an `admin` chip),
+    and the chip is the Badge component.
 
     The mark is the app's icon rebuilt from markup rather than fetched: lucide
     square-terminal is a rounded frame around a chevron and an underscore, so
@@ -403,5 +407,281 @@ def test_email(*, site_url: str) -> RenderedEmail:
             "delivery is configured correctly and account emails will reach your users.",
         ],
         footnote="Sent from the admin dashboard.",
+        site_url=site_url,
+    )
+
+
+# --- billing ----------------------------------------------------------------
+# These six are the one billing surface allowed to name a price. Apple's 3.1.3
+# preamble is explicit that a developer may write to their user base about
+# purchasing methods outside the app, and the app itself says nothing: the 402
+# body is machine codes and numbers (`billing.limit_error_detail`) and the
+# mobile copy is pure account state. So the tiers, the prices and the link live
+# here, in a message no App Store binary renders.
+#
+# The register stays plainer than the rest of the product on purpose. These
+# messages are also the pre-contract disclosure a subscription legally owes its
+# buyer, and copy that gets clever about money reads as copy with something to
+# hide.
+
+
+@dataclass(frozen=True)
+class PlanOption:
+    """One row of the tier comparison an email may carry.
+
+    Deliberately not `billing.Tier`: this module renders words and knows
+    nothing about entitlement, and a template that imported the entitlement
+    module would be one import away from deciding what somebody is owed.
+    """
+
+    name: str
+    price_cents: int
+    #: None = unlimited.
+    host_limit: int | None
+
+
+def _money(cents: int) -> str:
+    """`500` → `$5.00 / month`.
+
+    Display only. Stripe charges what its own price object says, and this
+    number never reaches a payment — see `billing.Tier.price_cents`.
+    """
+
+    return f"${cents / 100:,.2f} / month"
+
+
+def _hosts(count: int | None) -> str:
+    """`None` = unlimited, here as everywhere else in this codebase."""
+
+    if count is None:
+        return "unlimited hosts"
+    return "1 host" if count == 1 else f"{count} hosts"
+
+
+def _date(when: datetime) -> str:
+    """`24 September 2026`. Spelled out, because 09/10/2026 is two dates."""
+
+    return f"{when.day} {when:%B %Y}"
+
+
+def subscription_started(
+    *,
+    tier_name: str,
+    price_cents: int,
+    renewal_date: datetime | None,
+    manage_url: str,
+    site_url: str,
+) -> RenderedEmail:
+    """What was bought, what it costs, when it renews, and how to stop it.
+
+    Stripe emails a receipt and it is not this. A receipt records a payment;
+    EU and UK distance-selling rules want the terms of the thing bought, in a
+    durable medium, from the seller — which is us. The cancellation sentence
+    is the part that is legally load-bearing, so it is never trimmed for
+    length.
+    """
+
+    renews = (
+        f"It renews on {_date(renewal_date)}, and monthly from then on, until you cancel."
+        if renewal_date is not None
+        else "It renews monthly until you cancel."
+    )
+    return _render(
+        subject=f"Your {BRAND} subscription is active",
+        preheader=f"{tier_name}, {_money(price_cents)}. What it includes, and how to cancel.",
+        eyebrow="Subscription",
+        accent=EMERALD,
+        heading="Your subscription is active",
+        paragraphs=[
+            f"This account is now on {tier_name}, at {_money(price_cents)}.",
+            renews,
+            "You can cancel whenever you like, from Settings → Subscription in "
+            f"{BRAND}. Cancelling stops the next payment and leaves the plan "
+            "running until the period you have already paid for runs out — "
+            "nothing is cut short.",
+            "Whatever happens to the plan afterwards, machines you have already "
+            "possessed keep running. The limit only ever governs adding a new one.",
+        ],
+        action=("Manage subscription", manage_url),
+        footnote="Keep this for your records. The payment receipt comes separately, from Stripe.",
+        site_url=site_url,
+    )
+
+
+def payment_failed(*, portal_url: str, site_url: str) -> RenderedEmail:
+    """A card declined, and deliberately not a revocation notice.
+
+    Stripe's dunning runs for weeks and `past_due` still entitles
+    (`billing.ENTITLING_STATUSES`), so at the moment this is sent nothing has
+    been lost. Saying so is the whole job: an email that reads like a
+    disconnection notice makes people panic about hosts that are still running
+    perfectly well.
+    """
+
+    return _render(
+        subject="We couldn't take payment",
+        preheader="The card was declined. Nothing has been lost — your plan is still running.",
+        eyebrow="Payment",
+        accent=AMBER,
+        heading="We couldn't take payment",
+        paragraphs=[
+            f"The card on file was declined for this month's payment on your {BRAND} subscription.",
+            "Nothing has been lost. Your plan is still active, your hosts are "
+            "still connected, and nothing has been revoked or deleted.",
+            "We'll try the card again over the next few days. Updating it now "
+            "settles the matter before then — the link below opens the billing "
+            "portal, where you can change the card and see the outstanding invoice.",
+        ],
+        action=("Update payment method", portal_url),
+        footnote="If you've already updated the card, there's nothing to do — the next attempt will use it.",
+        site_url=site_url,
+    )
+
+
+def payment_action_required(*, invoice_url: str, site_url: str) -> RenderedEmail:
+    """3-D Secure: the bank wants the cardholder, and only they can answer."""
+
+    return _render(
+        subject="Your bank needs to confirm a payment",
+        preheader="One confirmation step and this month's payment goes through.",
+        eyebrow="Payment",
+        accent=AMBER,
+        heading="Your bank needs to confirm a payment",
+        paragraphs=[
+            "Your bank has asked for an extra confirmation — 3-D Secure — before "
+            f"this month's payment on your {BRAND} subscription can be taken.",
+            "Opening the invoice below takes you straight to it. The confirmation "
+            "happens on your bank's own page and takes a moment.",
+            "Until it's done the payment stays pending. Your plan is still active "
+            "in the meantime, and nothing has been revoked.",
+        ],
+        action=("Confirm this payment", invoice_url),
+        footnote="Nothing is charged until the confirmation completes.",
+        site_url=site_url,
+    )
+
+
+def plan_changed(
+    *,
+    from_tier_name: str,
+    to_tier_name: str,
+    host_limit: int | None,
+    manage_url: str,
+    site_url: str,
+) -> RenderedEmail:
+    """A plan moved, in either direction, and it moved now.
+
+    Both directions land here and the wording has to survive both, so it says
+    what changed rather than congratulating anybody. Immediacy is the fact
+    worth stating: a downgrade that took effect at the end of the period would
+    be a different product, and people reasonably assume that is what happened.
+    """
+
+    return _render(
+        subject="Your plan has changed",
+        preheader=f"{from_tier_name} → {to_tier_name}, effective immediately.",
+        eyebrow="Subscription",
+        accent=SKY,
+        heading="Your plan has changed",
+        paragraphs=[
+            f"This account has moved from {from_tier_name} to {to_tier_name}. The "
+            "change took effect immediately — there's no waiting for the end of a "
+            "billing period.",
+            f"The account can now hold {_hosts(host_limit)}.",
+            "Any difference in price is settled on your next invoice.",
+            "Machines you have already possessed are unaffected either way. They "
+            "keep running, and the limit only governs adding a new one.",
+        ],
+        action=("Manage subscription", manage_url),
+        footnote="Sent whenever the plan on this account changes.",
+        site_url=site_url,
+    )
+
+
+def subscription_ended(
+    *,
+    host_limit: int | None,
+    host_count: int,
+    plans_url: str,
+    site_url: str,
+) -> RenderedEmail:
+    """The end of a plan, and the promise that it costs them nothing yet.
+
+    The fear this message has to answer is "which of my machines did you just
+    kill". None of them: there is no suspend state and we are not building one
+    (docs/BILLING.md §11.2), so an account over its limit simply sits there
+    until the person picks what to keep. Both halves of that — the machines
+    keep running, and nothing goes without an explicit choice — are load-
+    bearing, and neither is conditional on the numbers.
+    """
+
+    return _render(
+        subject="Your subscription has ended",
+        preheader="Your machines keep running, and nothing has been deleted.",
+        eyebrow="Subscription",
+        accent=SKY,
+        heading="Your subscription has ended",
+        paragraphs=[
+            "The subscription on this account has ended, and the account is back "
+            f"to {_hosts(host_limit)}.",
+            "Your machines keep running. Nothing was disconnected, nothing was "
+            "stopped, and nothing has been deleted — the account is still holding "
+            f"{_hosts(host_count)}, exactly as you left them.",
+            "The limit only ever governs adding a new host. If the account is "
+            f"holding more than the plan allows, the next time you open {BRAND} "
+            "it will ask which hosts to keep — or to keep none. Nothing is removed "
+            "until you choose.",
+        ],
+        action=("View plans", plans_url),
+        footnote="You can start a plan again whenever you like; nothing about the account changes in the meantime.",
+        site_url=site_url,
+    )
+
+
+def host_limit_reached(
+    *,
+    tier_name: str,
+    host_limit: int,
+    host_count: int,
+    plans: list[PlanOption],
+    upgrade_url: str,
+    site_url: str,
+) -> RenderedEmail:
+    """A machine was turned away — the one message that may sell.
+
+    The app that produced this refusal is allowed to say only "Host limit
+    reached · Your plan includes 3 hosts. Disconnect one to connect another."
+    — no price, no venue, no verb pointed off-platform. This message is
+    outside the app, which is exactly the case Apple's 3.1.3 preamble
+    permits, so it carries the comparison and the link the app cannot.
+
+    The in-app action comes first anyway. Somebody who wanted to swap a dead
+    laptop for a new one is not shopping, and leading with the plans would
+    answer a question they did not ask.
+    """
+
+    return _render(
+        subject="You've reached your host limit",
+        preheader="A machine was turned away. Here's how to make room for it.",
+        eyebrow="Host limit",
+        accent=AMBER,
+        heading="You've reached your host limit",
+        paragraphs=[
+            "A machine tried to join this account and was turned away: the account "
+            f"is on {tier_name}, which includes {_hosts(host_limit)}, and is already "
+            f"holding {_hosts(host_count)}.",
+            "Nothing already connected is affected. Every host you have keeps "
+            "running, and this changes none of them.",
+            "You can free a slot by disconnecting a host you no longer use — Hosts "
+            f"in {BRAND}, then Disconnect. The machine that was turned away can then "
+            "be possessed again with no further setup.",
+            "Or take more room:",
+            *(
+                f"{plan.name} — {_money(plan.price_cents)}, {_hosts(plan.host_limit)}"
+                for plan in plans
+            ),
+        ],
+        action=("Upgrade", upgrade_url),
+        footnote="Sent at most once a day, and only when a machine is actually turned away.",
         site_url=site_url,
     )

@@ -182,7 +182,63 @@ on a host it no longer owns.
 | Host desktop launches (`desktop.reveal`, `desktop.open`) | current: `spawn.host.ctl` only; the daemon records the operation name locally in `activity.rs` and never the path | never server-visible |
 | Cross-host file transfer | former server source-read/forward path | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source is browser-mediated across two host channels |
 | Agent check/install commands, paths, installed/latest versions, output, and detailed errors | current: REST plus `host.agents.*`; policy errors can persist in Postgres | server-readable path remains; endpoint-only replacement is not implemented |
+| Stripe customer/subscription ids, plan tier, host limit, status, renewal date | current, hosted instance only: persisted in `subscriptions`; read through `/api/billing/state`, `/api/profile` and `UserOut` | absent entirely when `SPAWN_BILLING_ENABLED` is false; no card, address or payment method is ever held — see "Billing" below |
+| Applied Stripe webhook event ids | current, hosted instance only: `stripe_events` (id and type, no payload) | idempotency only; absent when billing is off |
+| Comp override on an account | current: `users.host_limit_override`, set only by an admin | a deliberate separate column from `is_admin`; absent in effect when billing is off |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
+
+### Billing (2026-08-31)
+
+Subscriptions add durable per-account data, and this document's whole claim
+rests on the inventory above being honest about that rather than quiet about
+it. **None of it exists on a self-hosted deployment.** `SPAWN_BILLING_ENABLED`
+defaults to false, and off means no limit, no billing UI, no Stripe call, and
+no row in either new table — a self-hoster does nothing and gets unlimited
+hosts. Everything below describes the hosted instance only.
+
+**What the server durably holds, when billing is on:**
+
+| Held | Where | Why |
+|---|---|---|
+| A Stripe customer id | `subscriptions.stripe_customer_id` | So a resubscribe reaches the same Customer. A second one would split a person's invoice history and break their portal. |
+| A Stripe subscription id | `subscriptions.stripe_subscription_id` | The object the plan is read back from. |
+| Plan tier and host limit | `subscriptions.tier`, `.host_limit` | **Our** reading of Stripe's price id, through a map in `spawn_server/billing.py` that is reviewed in git — never a value a webhook asserted, and never Stripe's editable price metadata. |
+| Subscription status and renewal date | `subscriptions.status`, `.current_period_end`, `.cancel_at_period_end` | Stripe's status verbatim, so a support question is answerable without opening a dashboard. |
+| Applied webhook event ids | `stripe_events.id` | Idempotency, nothing else. An id and a type, no payload. |
+| A comp override | `users.host_limit_override` | How an internal or comped account pays nothing, without touching Stripe. Its own column rather than an overload of `is_admin`, so granting the admin surface never silently grants free hosts. |
+
+**What it is not.** No card number, no expiry, no last four digits, no billing
+address, no name on the card, no invoice line items, and no payment method of
+any kind ever reaches this server or this database. Checkout and the Customer
+Portal are Stripe-hosted pages the browser is redirected to; no Stripe
+JavaScript runs in our pages and no Stripe key reaches a browser. What we hold
+is an opaque customer id and the plan it is on.
+
+**It does not widen what the control plane can see.** Billing touches no
+terminal byte, no file, no path, no session, and no DataChannel. The one place
+it meets the product is a count — `count(*) from hosts where owner_user_id = …`
+— which is a number the server already had.
+
+**The limit governs admitting a new host, never using an existing one.** There
+is no suspend state, no `Host.suspended_at`, and no quota refusal anywhere in
+the connection path. A machine already possessed keeps working through a
+downgrade, a failed payment and a cancellation. When an account ends up over
+its limit, the excess is resolved by the person choosing which hosts to keep —
+or to keep none — and **no host is ever released except by an explicit human
+selection.** That keeps billing out of the one code path in this product that
+destroys something someone depends on.
+
+**Stripe is a processor.** Email address and payment details go to Stripe under
+its own terms; that is disclosed in `/privacy`, which must not overclaim beyond
+what this document actually stakes.
+
+**Deletion.** `POST /api/auth/account/delete` cancels the Stripe subscription
+and detaches the Customer *before* the user row goes, explicitly, in the same
+function — the `subscriptions` row is `ondelete="CASCADE"`, so leaving it to the
+cascade would make the row vanish locally while Stripe kept billing the card. If
+Stripe is unreachable the deletion still proceeds, because a person's right to
+delete their account cannot be blocked by our payment processor, and the
+orphaned subscription is logged loudly enough for someone to cancel by hand.
 
 ### Host capacity (2026-08-21)
 

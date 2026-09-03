@@ -48,6 +48,7 @@ const FAILURE_TITLES = {
   "host-not-ready": "Host proof is still pending",
   "approval-incomplete": "Server approval did not complete",
   "endorsement-invalid": "Endorsement could not be verified",
+  "host-limit": "Host limit reached",
   "pairing-rejected": "Host approval was blocked",
 } as const satisfies Record<PairingFailureKind, string>;
 
@@ -199,7 +200,7 @@ describe("onboarding security states", () => {
     ).toBeOnTheScreen();
     expect(
       screen.getByText(
-        "Already running SPAWN D for another account on that machine? Run spawnd possess --new-account instead.",
+        "Already running SPAWN D for another account on that machine? Run spawnd possess --new-account instead, and it joins as a second, separate host.",
       ),
     ).toBeOnTheScreen();
     expect(

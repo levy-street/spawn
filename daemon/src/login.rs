@@ -329,6 +329,10 @@ pub async fn run_with_ui(
                 ui.fail(1, "approval failed");
                 return Err(user_error("This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again."));
             }
+            Some("host_limit") => {
+                ui.fail(1, "approval failed");
+                return Err(user_error(host_limit_copy(&server)));
+            }
             Some(other) => {
                 ui.fail(1, "approval failed");
                 return Err(anyhow!("device/poll returned error: {other}"));
@@ -667,6 +671,37 @@ fn key_conflict_copy() -> &'static str {
      spawn:   • To hand it to THIS account: remove the host from the old account's\n\
      spawn:     Hosts page first, then run  spawnd possess  again.\n\
      spawn:   • To keep both accounts on this machine:  spawnd possess --new-account"
+}
+
+/// What the server means by `host_limit`, in a terminal.
+///
+/// The refusal is the account's, not this machine's: a plan admits a fixed
+/// number of hosts and this one would have been over it. So the honest content
+/// is exactly three things — that nothing was registered, that the machines
+/// already possessed are untouched, and where the plan is changed.
+///
+/// No `prompt_choice` menu, and that is not an oversight. "Offer the action, do
+/// not print the command" holds wherever the daemon could *do* the thing; at
+/// somebody else's billing limit it can do nothing at all locally, and a row
+/// that only opened a browser would be a menu with one entry pretending to be a
+/// choice. Naming the URL is right here and nowhere else: this is a terminal on
+/// the reader's own machine, not a binary that ships through app review.
+///
+/// The server sends the bare code and no numbers, deliberately — the numbers
+/// belong to the account, and the poll is authenticated by a device code rather
+/// than by a person. So this says what happened without claiming a figure it
+/// was not told.
+fn host_limit_copy(server: &url::Url) -> String {
+    format!(
+        "This account is at its host limit, so this machine was not registered\n\
+         spawn: and nothing here was changed.\n\
+         spawn:   • Every machine you already possess keeps working — the limit\n\
+         spawn:     only governs adding one.\n\
+         spawn:   • To make room: release a host you no longer use, then run\n\
+         spawn:     spawnd possess  again.\n\
+         spawn:   • To raise it: change your plan at  {origin}/pricing",
+        origin = server_origin(server),
+    )
 }
 
 pub(crate) fn user_error(message: impl Into<String>) -> anyhow::Error {
@@ -1642,6 +1677,26 @@ mod tests {
         assert!(copy.contains("To hand it to THIS account"));
         assert!(copy.contains("spawnd possess --new-account"));
         assert!(copy.contains("Nothing was changed."));
+    }
+
+    #[test]
+    fn host_limit_says_nothing_was_registered_and_where_the_plan_lives() {
+        let copy = host_limit_copy(&url::Url::parse("https://spawn.example/some/path").unwrap());
+        assert!(copy.contains("was not registered"));
+        assert!(copy.contains("keeps working"));
+        // The chosen server's own plan page, not a hard-coded one: a
+        // self-hosted daemon that somehow met this must not be sent to
+        // spawnd.dev, and a dev deployment must not be either.
+        assert!(
+            copy.contains("https://spawn.example/pricing"),
+            "unexpected copy: {copy}"
+        );
+        assert!(!copy.contains("/some/path"));
+        // Continuation lines carry their own prefix: `main.rs` prints
+        // `spawn: ✗ {error}` and only prefixes the first.
+        for line in copy.lines().skip(1) {
+            assert!(line.starts_with("spawn:"), "unprefixed line: {line}");
+        }
     }
 
     #[tokio::test]

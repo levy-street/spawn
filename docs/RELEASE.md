@@ -1184,6 +1184,60 @@ ship in this order:
    never point at an unsigned/missing daemon pair or a missing signed desktop
    installer.
 
+### Billing, and the flag that makes it a no-op
+
+Billing ships **dark**. `SPAWN_BILLING_ENABLED` defaults to false, and false
+means the `/api/billing/*` routes answer 404, no host limit is enforced,
+`/api/auth/config` advertises `billing.enabled: false`, and both frontends
+render exactly what they render today. That is what makes the first several
+steps below deployable and verifiable in production before any money exists.
+
+1. **Migration `0070` first.** Additive only — two tables and one nullable
+   column — so old code tolerates it and it runs while the previous processes
+   drain. Confirm `alembic heads` is a single head after any merge.
+2. **Server with `SPAWN_BILLING_ENABLED=false`.** A genuine no-op deploy:
+   verify it in production, before anything else changes.
+3. **`web/` and `mobile/` together**, in the same commit as any shared-endpoint
+   change — the root `CLAUDE.md` requires it, and `/api/auth/config` and
+   `UserOut` are both shared. Still dark.
+4. **Desktop.** Its product face is `web/`, so most of it arrives with step 3;
+   only the wizard's host gate needs a desktop release.
+5. **Stripe test mode, end to end, against staging**: subscribe, upgrade,
+   downgrade with host selection, cancel, fail a payment, replay a webhook.
+   `stripe listen --forward-to …/api/billing/webhook` prints a local `whsec_`;
+   `stripe trigger <event>` fires individual events; **test clocks** (Dashboard
+   → Simulations) are the only honest way to exercise renewal, dunning and a
+   period boundary without waiting a month. `pm_card_chargeCustomerFail` drives
+   the dunning path.
+6. **Live mode**: create the live catalogue, portal configuration and webhook
+   endpoint (the ids differ from test mode), put the live keys on the box, then
+   flip `SPAWN_BILLING_ENABLED=true`.
+7. Watch `invoice.finalization_failed` and the reconciliation job's first runs.
+   That event is the one nobody remembers: the subscription stays active but the
+   invoice cannot be collected, so it is **silent revenue loss with no
+   user-visible symptom**.
+
+**Two things the deploy refuses, on purpose.** `SPAWN_BILLING_ENABLED=true`
+with an empty `SPAWN_STRIPE_WEBHOOK_SECRET` **will not boot** — a webhook
+endpoint that cannot verify a signature is an unauthenticated
+"make me a paid subscriber" API. The same refusal covers a missing secret key or
+any of the three price ids, because a half-configured catalogue is a tier that
+cannot be bought and an upgrade button that 500s.
+
+**A 3xx is a failure to Stripe.** The webhook is registered at exactly
+`/api/billing/webhook` with no trailing-slash redirect; check any nginx change
+does not start normalising that path, or every event silently breaks.
+
+**Rollback is flipping the flag back to `false`.** The limit disappears, the UI
+disappears, and nothing in the schema needs reverting. That is the main reason
+the flag exists in this shape.
+
+`scripts/stripe-provision.sh` creates the catalogue, the Customer Portal
+configuration and the webhook endpoint idempotently, and **refuses to run
+against anything but a test-mode key** — live mode is set up deliberately, by
+hand. `docs/BILLING_SETUP.md` is the operator's side of it;
+`docs/BILLING.md` is the design.
+
 Server config lives in the environment on the production host, not in this repo
 and not in EAS. EAS environment variables are build inputs for the app;
 `EXPO_PUBLIC_API_URL` is committed in `eas.json` for **builds**, while the

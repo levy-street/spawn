@@ -12,6 +12,9 @@ const USER = {
   created_at: "2026-08-22T00:00:00Z",
   email_verified_at: "2026-08-22T00:00:00Z",
   is_admin: false,
+  // Carried on the token response as well as on `/api/me`, so what these
+  // mutations seed into the me-cache is never behind the first refetch.
+  billing: null,
 };
 
 function createQueryClient() {

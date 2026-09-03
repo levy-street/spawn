@@ -16,9 +16,11 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import grid
+from . import billing, grid
 from .browser_registration import ED25519_SIGNATURE_B64URL_LENGTH
+from .config import get_settings
 from .host_identity import (
     decode_ed25519_public_key,
     decode_host_public_key,
@@ -27,6 +29,7 @@ from .host_identity import (
 )
 from .host_pair_approval import APPROVAL_NONCE_B64URL_LENGTH, decode_approval_nonce
 from .host_pair_possession import DEVICE_CODE_B64URL_LENGTH, decode_device_code
+from .models import User
 from .web_push import valid_subscription_key
 
 # ---------- auth ----------
@@ -44,6 +47,31 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class UserBillingOut(BaseModel):
+    """Plan state, carried on every shape that returns a user.
+
+    Every field is defaulted and the whole block is nullable on its carriers,
+    because `/api/me` gates the mobile app's launch: `useAuthBootstrap` holds a
+    full-screen overlay until it resolves, so a tightened shape here breaks
+    launch rather than a screen.
+
+    `enabled` is false and the block absent on a self-hosted deployment. It is
+    facts only — no prose, no price, no link; see `billing.limit_error_detail`.
+    """
+
+    enabled: bool = False
+    tier: str = "free"
+    tier_name: str = "Free"
+    #: None = unlimited.
+    host_limit: int | None = None
+    host_count: int = 0
+    over_limit: bool = False
+    #: Stripe's own subscription status, verbatim, or None for no subscription.
+    status: str | None = None
+    current_period_end: datetime | None = None
+    cancel_at_period_end: bool = False
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -51,6 +79,10 @@ class UserOut(BaseModel):
     created_at: datetime
     email_verified_at: datetime | None = None
     is_admin: bool = False
+    # None when billing is disabled: a self-hosted deployment pays no query
+    # cost for a plan it does not have, and its clients see no billing at all.
+    # Built by `user_out()` below, never by `model_validate(user)` alone.
+    billing: UserBillingOut | None = None
 
 
 class TokenResponse(BaseModel):
@@ -60,6 +92,47 @@ class TokenResponse(BaseModel):
 
 class MeResponse(BaseModel):
     user: UserOut
+
+
+async def account_billing_out(session: AsyncSession, user: User) -> UserBillingOut | None:
+    """The plan block for one account, or None when this deployment has no billing.
+
+    The disabled branch returns before touching the database, so a self-hosted
+    install answers `/api/me` with exactly the queries it always did.
+    """
+    if not get_settings().billing_enabled:
+        return None
+    state = await billing.billing_state(session, user)
+    # Named field by field rather than splatted: `billing_state` also carries
+    # `reason` and `has_subscription` for server-side callers, and the wire
+    # shape should change only when someone means to change it.
+    return UserBillingOut(
+        enabled=True,
+        tier=state["tier"],
+        tier_name=state["tier_name"],
+        host_limit=state["host_limit"],
+        host_count=state["host_count"],
+        over_limit=state["over_limit"],
+        status=state["status"],
+        current_period_end=state["current_period_end"],
+        cancel_at_period_end=state["cancel_at_period_end"],
+    )
+
+
+async def user_out(session: AsyncSession, user: User) -> UserOut:
+    """`UserOut` with its plan block filled in. The only way to build one.
+
+    Both mobile sign-in paths seed their me-cache from the token response, so
+    login, signup, OAuth exchange, Apple native sign-in, password reset and
+    email verification must all carry what `/api/me` carries — otherwise a
+    stale seeded value survives until the first refetch.
+
+    It lives here, beside the shape it builds, because the seven call sites are
+    spread over three route modules that already import each other.
+    """
+    out = UserOut.model_validate(user)
+    out.billing = await account_billing_out(session, user)
+    return out
 
 
 class EmptyRequest(BaseModel):
@@ -214,6 +287,28 @@ class AdminUserOut(BaseModel):
     host_count: int = 0
     session_count: int = 0
     browser_device_count: int = 0
+    #: `User.host_limit_override`, verbatim: None = no override, 0 = unlimited.
+    host_limit_override: int | None = None
+    #: The subscription row's tier, or "free" when there is no row. What the
+    #: account is *sold*, which a comped account can differ from.
+    billing_tier: str = "free"
+    #: What is actually enforced for this account. None = unlimited.
+    effective_host_limit: int | None = None
+
+
+class AdminUserPatch(BaseModel):
+    """The comping control. Omitting a field leaves it alone; null clears it.
+
+    `host_limit_override` is a column of its own rather than a meaning layered
+    onto `is_admin`, because they answer different questions: granting somebody
+    the admin surface would otherwise silently grant them unlimited hosts, and
+    comping a customer would hand them the admin surface.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: 0 = unlimited, any other integer = that many hosts, null = no override.
+    host_limit_override: int | None = Field(default=None, ge=0)
 
 
 class AdminInviteCreate(BaseModel):
@@ -384,6 +479,29 @@ class WebPushSubscriptionOut(BaseModel):
     last_seen_at: datetime
 
 
+class BillingTierOut(BaseModel):
+    """One plan as a pricing page lists it. Display only — nothing charges from here."""
+
+    key: str
+    #: Display name, as the person reads it ("Coven", "Legion", "Pandemonium").
+    name: str
+    #: Monthly, USD, in cents.
+    price_cents: int
+    #: None = unlimited.
+    host_limit: int | None = None
+
+
+class BillingConfigOut(BaseModel):
+    """False here means the frontends render no billing UI at all."""
+
+    enabled: bool = False
+    free_host_limit: int = 1
+    tiers: list[BillingTierOut] = Field(default_factory=list)
+    # Whether the mobile apps may show an off-platform upgrade link. Off at
+    # launch; server-driven so it flips without an App Store submission.
+    mobile_upgrade_link: bool = False
+
+
 class AuthConfigOut(BaseModel):
     """Everything the login/signup/onboarding surfaces need in one request.
 
@@ -394,6 +512,10 @@ class AuthConfigOut(BaseModel):
     providers: list[AuthProviderOut] = Field(default_factory=list)
     email_verification_required: bool = False
     invite_only: bool = False
+    # Same rule: `billing.enabled` mirrors the exact condition
+    # `routes/device.py` enforces, so a client never draws a gate the server
+    # will not apply — nor hides one it will.
+    billing: BillingConfigOut = Field(default_factory=BillingConfigOut)
 
 
 # ---------- device code ----------
@@ -514,6 +636,9 @@ class DevicePollPending(BaseModel):
         "key_conflict",
         "pin_conflict",
         "pin_limit",
+        # The backstop gate. An old daemon prints this code raw, which is why
+        # the readable refusal comes from the 402 at /device/approve instead.
+        "host_limit",
     ]
 
 
@@ -1041,6 +1166,9 @@ class ProfileOut(BaseModel):
     # without having to agree with the server about "today" independently.
     history_days: int
     today: str
+    # None when billing is disabled, exactly as on `UserOut`. This dialog
+    # already loads the account's hosts, so the plan costs no round trip.
+    billing: UserBillingOut | None = None
 
 
 class HostPatch(BaseModel):

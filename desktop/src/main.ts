@@ -65,6 +65,38 @@ interface AccountState {
   email_verified: boolean;
 }
 
+interface BillingTier {
+  key: string;
+  name: string;
+  /** Monthly, USD, in cents. */
+  price_cents: number;
+  /** `null` is unlimited. */
+  host_limit: number | null;
+}
+
+/**
+ * What the account's plan admits, as `subscription_state` answers it.
+ *
+ * `billing_enabled` is false on a server that sells nothing — every self-hosted
+ * deployment — and equally when the server would not say. Both mean the same
+ * thing here: draw no billing UI, refuse nothing. The Rust side makes that
+ * decision once so this file never has to.
+ *
+ * Unlike the phone, this app is under no platform billing rule: distribution is
+ * direct, Developer ID on macOS and Authenticode on Windows, so it may name a
+ * price and offer a plan.
+ */
+interface SubscriptionState {
+  billing_enabled: boolean;
+  tier: string;
+  tier_name: string;
+  host_limit: number | null;
+  host_count: number;
+  may_add_host: boolean;
+  over_limit: boolean;
+  upgrade: BillingTier | null;
+}
+
 type DeviceProgress =
   | { state: "waiting" }
   | { state: "show_number"; pairing_id: string; number: string }
@@ -210,6 +242,25 @@ let autoApproved = false;
  */
 let hostRunStarted = false;
 /**
+ * The account's plan, once something has asked for it. Null while nothing has.
+ *
+ * Read rather than remembered: it is asked for at the host gate and in
+ * settings, and both are moments where a stale number would be worse than a
+ * short wait.
+ */
+let subscription: SubscriptionState | null = null;
+/**
+ * Whether the host gate asked the plan for room and was told there is none.
+ *
+ * A flag rather than a re-read of `subscription`, because the same numbers are
+ * true while a repair reinstalls an *existing* host — which is not a new
+ * registration and must not be refused. This is set only where a new one was
+ * about to be made, and `resetPossession()` clears it.
+ */
+let hostLimitReached = false;
+/** Which possession the refusal panel's "Check again" would retry. */
+let hostLimitNewAccount = false;
+/**
  * The permissions gate's own error, kept out of `error` on purpose.
  *
  * The possession poll clears `error` on every successful tick, so a message
@@ -272,6 +323,11 @@ const PAIRING_FAILURES: Record<string, string> = {
     "The browser that approved this machine doesn't match its earlier approval. Approve again from a browser you've used with this host before — or remove the host on the web and start fresh.",
   pin_limit:
     "This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again.",
+  // The last resort only. This refusal has its own screen — one that can name
+  // the plan, the numbers and the price, and offer the browser — and this is
+  // what is left if the plan itself could not be read to draw it.
+  host_limit:
+    "Your plan has no room for another host, so this machine was not registered and nothing on it was changed. Change your plan in the browser, or release a host you no longer use, then try again.",
 };
 const VERIFICATION_REFUSAL = "This host could not be verified.";
 
@@ -314,6 +370,17 @@ const RESUMED: Record<string, { title: string; body: string; action: string }> =
       '<button class="btn btn-ghost" data-action="possess-new-account">Add this account separately</button>',
   },
 };
+/**
+ * What "another account" costs, said where it is offered.
+ *
+ * A host is a registration, not a machine: `spawnd possess --new-account`
+ * legitimately puts a second host on this one computer, and a plan counts hosts.
+ * It is the only affordance in this app that raises that number, and its copy
+ * read as a neutral convenience — a free extra, which it is not. Shown only
+ * where the server actually sells plans; a self-hoster never sees it.
+ */
+const SECOND_ACCOUNT_COST = `A second account is a second host on ${OS_COPY.thisComputer} — plans count hosts, not machines.`;
+
 const REFUSAL_MISMATCH =
   "This host's identity could not be verified: the server presented a different identity key than the one in your host's link. Nothing was trusted and no access was granted. This can mean the connection is being tampered with — start over on a network you trust.";
 const STALLED_HINT = "Having trouble? Try again — it's safe to repeat.";
@@ -811,7 +878,64 @@ function hostChecklist(stopped: boolean): string {
     </ol>`;
 }
 
+/** `$5`, `$12.50` — a monthly price, said the way a price page says it. */
+function monthlyPrice(cents: number): string {
+  const dollars = cents / 100;
+  return `$${dollars % 1 === 0 ? String(dollars) : dollars.toFixed(2)}`;
+}
+
+function hostWord(count: number | null): string {
+  return count === 1 ? "host" : "hosts";
+}
+
+/**
+ * The host gate when the account's plan has no room for this machine.
+ *
+ * It stands in place of the whole gate — no checklist, no terminal panel. The
+ * checklist would describe a run that is not happening, and the terminal panel
+ * would hand over an install one-liner whose ceremony fails in the same way,
+ * fifteen minutes later, somewhere nobody is watching.
+ *
+ * It may name the price and open Checkout, worldwide: this app is not
+ * distributed through either app store, so no platform rule touches it. That
+ * is the opposite of the phone's posture and it is correct.
+ */
+function hostLimitView(plan: SubscriptionState): string {
+  const limit = plan.host_limit;
+  const upgrade = plan.upgrade;
+  const raised =
+    upgrade === null
+      ? ""
+      : upgrade.host_limit === null
+        ? `<p>Moving to ${escapeHtml(upgrade.name)} lifts the limit entirely, at ${monthlyPrice(upgrade.price_cents)} a month.</p>`
+        : `<p>Moving to ${escapeHtml(upgrade.name)} raises that to ${upgrade.host_limit} ${hostWord(upgrade.host_limit)}, at ${monthlyPrice(upgrade.price_cents)} a month.</p>`;
+  const body = `
+    <div class="stack">
+      <div class="inset">
+        <p><strong>${plan.host_count} of ${limit ?? plan.host_count} ${hostWord(limit)}</strong> on ${escapeHtml(plan.tier_name)}.</p>
+        <p class="muted">${OS_COPY.thisComputerCapitalized} was not possessed and nothing on it was changed. Every machine you already possess keeps working — the limit only governs adding one.</p>
+      </div>
+      ${raised}
+      <div class="actions">
+        <button class="btn btn-primary" data-action="open-upgrade" ${busy ? "disabled" : ""}>${upgrade === null ? "See plans" : "Upgrade"}</button>
+        <button class="btn btn-ghost" data-action="recheck-plan" ${busy ? "disabled" : ""}>Check again</button>
+      </div>
+      ${errorLine()}
+      <p class="note">Plans open in your browser. You can also make room by releasing a host you no longer use, then checking again.</p>
+    </div>`;
+  return sheet(
+    hatchAccount(),
+    split(
+      "host",
+      `No room for ${OS_COPY.thisComputer}`,
+      "Your plan sets how many machines this account may possess, and it is full.",
+      body,
+    ),
+  );
+}
+
 function hostView(): string {
+  if (hostLimitReached && subscription) return hostLimitView(subscription);
   const review = possession?.review ?? null;
   const failed = possession?.status === "failed";
   const failure = error ?? (failed ? possession?.error : null) ?? null;
@@ -830,9 +954,16 @@ function hostView(): string {
       <div class="actions"><button class="btn btn-outline" data-action="try-again">Start over</button></div>`;
   } else if (failure && RESUMED[failure]) {
     const resumed = RESUMED[failure];
+    // Every one of these offers a second account on this same computer, which
+    // is a second host on the plan. Say so where it is offered — but only on a
+    // server that sells plans, so a self-hoster reads what they read today.
+    const cost = subscription?.billing_enabled
+      ? `<p class="note">${escapeHtml(SECOND_ACCOUNT_COST)}</p>`
+      : "";
     action = `
       <div class="inset" role="status"><p><strong>${escapeHtml(resumed.title)}</strong></p><p class="muted">${escapeHtml(resumed.body)}</p></div>
-      <div class="actions">${resumed.action}</div>`;
+      <div class="actions">${resumed.action}</div>
+      ${cost}`;
   } else if (failure) {
     // `begin_possession` downloads, installs and starts the daemon before a
     // run exists, so a failure with no run — or one that never completed a
@@ -983,6 +1114,27 @@ function doneView(): string {
   );
 }
 
+/**
+ * The plan, where someone would go looking for it.
+ *
+ * Absent entirely unless the server sells plans, which is the whole of the
+ * feature's invisibility to a self-hoster: not a disabled row, not an empty
+ * one — nothing. The button opens the browser rather than a panel in here,
+ * because changing a plan is Stripe's hosted page and that wants the session
+ * the person already has.
+ */
+function planRow(): string {
+  const plan = subscription;
+  if (!plan?.billing_enabled) return "";
+  const used =
+    plan.host_limit === null
+      ? `${plan.host_count} ${hostWord(plan.host_count)}`
+      : plan.over_limit
+        ? `${plan.host_count} ${hostWord(plan.host_count)} on a plan for ${plan.host_limit}`
+        : `${plan.host_count} of ${plan.host_limit} ${hostWord(plan.host_limit)}`;
+  return `<button data-action="open-upgrade"><span><strong>Manage plan…</strong><small>${escapeHtml(plan.tier_name)} · ${used}</small></span><b>↗</b></button>`;
+}
+
 function settingsView(): string {
   const instances = status?.status.instances;
   const instance = Array.isArray(instances) ? instances[0] : null;
@@ -994,6 +1146,7 @@ function settingsView(): string {
         <button data-action="open-app"><span><strong>Open SPAWN D</strong><small>Your workspaces and terminals, in this app</small></span><b>↗</b></button>
         <button data-action="show-repair"><span><strong>Repair…</strong><small>Run the daemon’s own recovery path</small></span><b>›</b></button>
         <button data-action="check-update"><span><strong>Update SPAWN D…</strong><small>${appUpdate?.available ? `Version ${escapeHtml(appUpdate.version)} is ready` : "Check the signed app channel"}</small></span><b>${appUpdate?.available ? "↓" : "↻"}</b></button>
+        ${planRow()}
         <button class="danger" data-action="confirm-stop"><span><strong>Stop possessing ${OS_COPY.thisComputer}…</strong><small>Removes the daemon service and ${OS_COPY.thisComputer}’s registration</small></span><b>—</b></button>
       </div>
       ${errorLine()}
@@ -1150,13 +1303,29 @@ async function act(action: string): Promise<void> {
       await guarded(() => invoke("ask_for_device_approval"));
       break;
     // "Try again" and "Start over" mean what they say: the gate runs again,
-    // because a press is the only thing that restarts it.
+    // because a press is the only thing that restarts it — and it asks the plan
+    // for room first, exactly as arriving at the gate does.
     case "try-again":
+      await possessOrOffer();
+      break;
+    // The refusal panel's own retry, which resumes whichever possession was
+    // refused — a plain one, or the second account that was being added.
+    case "recheck-plan":
+      await possessOrOffer(hostLimitNewAccount);
+      break;
+    // Not gated, and this is the one that must not be: a verified reinstall
+    // repairs the host this computer already has. Re-pairing an existing
+    // registration is never a new one, so a plan that is full does not refuse
+    // it — and refusing it would take a working machine away over billing.
     case "repair-reinstall":
       await startPossession();
       break;
+    // The one affordance in this app that genuinely raises the host count.
     case "possess-new-account":
-      await startPossession(true);
+      await possessOrOffer(true);
+      break;
+    case "open-upgrade":
+      await guarded(() => invoke("open_upgrade"));
       break;
     case "approve-host":
       await approveHost();
@@ -1185,6 +1354,7 @@ async function act(action: string): Promise<void> {
       break;
     case "settings":
       setScreen("settings");
+      void loadSubscription();
       await refreshStatus(false);
       break;
     case "show-repair":
@@ -1413,7 +1583,11 @@ async function advance(): Promise<void> {
   // install itself, and it verifies the daemon's key against the link its own
   // daemon printed — a button here was a question with one answer. Once per
   // arrival, so a failure stays a failure until someone answers it.
-  if (!hostRunStarted) void startPossession();
+  //
+  // It does ask the *server* one thing first: whether the plan has room for
+  // this machine. That is not a question for the reader either, which is why it
+  // is still not a button.
+  if (!hostRunStarted) void possessOrOffer();
 }
 
 async function signOut(): Promise<void> {
@@ -1512,10 +1686,79 @@ function startDevicePoll(): void {
 
 /* ── Host ─────────────────────────────────────────────────────────────── */
 
+/**
+ * Ask the plan for room, then possess — or say why not.
+ *
+ * The gate has nothing to ask, so it possesses on arrival; a user at their
+ * limit would otherwise watch a spinner, then a daemon download, then an opaque
+ * failure minutes later. This is the one question worth asking first, and it is
+ * asked wherever a *new* host registration is about to be made: the gate itself,
+ * "Try again", and "Add another account". Never in front of a repair, which
+ * re-pairs a host that already exists.
+ *
+ * It is a mirror, not the enforcement. `POST /api/auth/device/approve` asks the
+ * same question under a row lock and is the authority; if this one cannot be
+ * answered — billing off, an unreachable server, a token that has expired —
+ * `subscription_state` says so by allowing it, and possession goes ahead. A gate
+ * nobody can pass is an outage, not a control.
+ */
+async function possessOrOffer(newAccount = false): Promise<void> {
+  resetPossession();
+  hostRunStarted = true;
+  setScreen("host");
+  const plan = await invoke<SubscriptionState>("subscription_state").catch((cause) => {
+    console.warn("subscription state unavailable:", describe(cause));
+    return null;
+  });
+  subscription = plan;
+  if (plan?.billing_enabled && !plan.may_add_host) {
+    hostLimitReached = true;
+    hostLimitNewAccount = newAccount;
+    render();
+    return;
+  }
+  await startPossession(newAccount);
+}
+
+/**
+ * The plan refused this machine after the run had already started.
+ *
+ * Reaching here means the answer changed underneath it: another machine paired
+ * while this one installed, or an approval opened earlier was spent first. The
+ * server is the authority on that and refuses at approval; this shows the same
+ * screen the gate would have shown in front, rather than a bare code on a card
+ * whose only button would run the whole ceremony again.
+ */
+async function showHostLimit(newAccount = false): Promise<void> {
+  possessionPoll = clearTimer(possessionPoll);
+  ticker = clearTimer(ticker);
+  const plan = await invoke<SubscriptionState>("subscription_state").catch(() => null);
+  // No numbers to draw the panel from — the server would not answer, answers
+  // that it sells nothing while refusing on a limit anyway, or reads back room
+  // this machine was just refused. A screen saying "no room" over "1 of 3
+  // hosts" would be worse than the prose in `PAIRING_FAILURES`, which says the
+  // same refusal without claiming a figure that disagrees with it.
+  if (!plan?.billing_enabled || plan.may_add_host) return;
+  subscription = plan;
+  hostLimitReached = true;
+  hostLimitNewAccount = newAccount;
+  error = null;
+  render();
+}
+
+async function loadSubscription(): Promise<void> {
+  subscription = await invoke<SubscriptionState>("subscription_state").catch((cause) => {
+    console.warn("subscription state unavailable:", describe(cause));
+    return null;
+  });
+  render();
+}
+
 function resetPossession(): void {
   terminalOpen = null;
   autoApproved = false;
   permissionsError = null;
+  hostLimitReached = false;
   possessionPoll = clearTimer(possessionPoll);
   ticker = clearTimer(ticker);
   runId = null;
@@ -1606,6 +1849,10 @@ function startPossessionPoll(): void {
       if (possession.status === "failed") {
         possessionPoll = clearTimer(possessionPoll);
         ticker = clearTimer(ticker);
+        // The plan filled up under the run. Say what the gate would have said
+        // in front of it — when the plan can still be read to say it; the
+        // failure card carries the same refusal in prose when it cannot.
+        if (possession.error === "host_limit") await showHostLimit();
       }
       render();
     } catch (cause) {
@@ -1655,7 +1902,12 @@ async function answerPermissions(prime: boolean): Promise<void> {
 async function approveHost(): Promise<void> {
   if (!runId) return;
   const result = await guarded(() => invoke<string>("approve_possession", { runId }));
-  if (result === null) return;
+  if (result === null) {
+    // The plan filled up between the gate's question and this answer. Say what
+    // the gate would have, rather than waiting a tick for the poll to notice.
+    if (error === "host_limit") await showHostLimit();
+    return;
+  }
   completedSteps.add(APPROVAL_STEP);
   waitStartedAt = Date.now();
   // Approved is the moment, and this is the only place that knows it: the
@@ -1735,6 +1987,9 @@ async function initialize(): Promise<void> {
       return;
     }
     setScreen(surface === "repair" ? "repair" : surface === "quit" ? "quit" : "settings");
+    // The plan line is settings' alone, so it is read where it is shown and
+    // nowhere else — repair and quit ask the server nothing about billing.
+    if (screen === "settings") void loadSubscription();
     void refreshStatus(surface === "repair");
   });
   await onOpenUrl((urls) => {
@@ -1750,6 +2005,7 @@ async function initialize(): Promise<void> {
     if (screen === "update") {
       await checkUpdate();
     } else {
+      if (screen === "settings") void loadSubscription();
       await refreshStatus(screen === "repair");
       void checkUpdate();
     }

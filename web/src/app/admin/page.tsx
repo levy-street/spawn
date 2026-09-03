@@ -2,12 +2,22 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy } from "lucide-react";
-import { type FormEvent, Fragment, useState } from "react";
+import { type FormEvent, Fragment, type ReactNode, useState } from "react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import { type AdminEmail, type AdminInvite, ApiError, admin } from "@/lib/api";
+import { type AdminEmail, type AdminInvite, type AdminUser, ApiError, admin } from "@/lib/api";
+import { useAuthConfig } from "@/lib/auth";
+import { hostLimitOverrideLabel } from "@/lib/billing";
 
 const STATE_STYLE: Record<AdminInvite["state"], string> = {
   pending: "border-success/50 text-success",
@@ -173,8 +183,149 @@ function Emails() {
   );
 }
 
+/**
+ * The comp control (docs/BILLING.md §4.8): how internal accounts, friends of
+ * the house and support cases never pay.
+ *
+ * Every label here spells the value out, because the stored one is a trap:
+ * **0 means unlimited**, not zero hosts, and an operator who reads it as
+ * "none" would believe they had cut an account off at the moment they gave it
+ * everything. The number appears on this screen exactly once, inside the field
+ * that sets a specific count.
+ */
+function CompDialog({ user, onClose }: { user: AdminUser; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [mode, setMode] = useState<"none" | "unlimited" | "exact">(
+    user.host_limit_override === null
+      ? "none"
+      : user.host_limit_override === 0
+        ? "unlimited"
+        : "exact",
+  );
+  const [count, setCount] = useState(
+    user.host_limit_override && user.host_limit_override > 0
+      ? String(user.host_limit_override)
+      : "5",
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  const parsed = Number.parseInt(count, 10);
+  const exactValid = Number.isFinite(parsed) && parsed > 0;
+  const value = mode === "none" ? null : mode === "unlimited" ? 0 : parsed;
+
+  const save = useMutation({
+    mutationFn: () => admin.setHostLimitOverride(user.id, value),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["admin", "users"] });
+      onClose();
+    },
+    onError: (cause) =>
+      setError(cause instanceof ApiError ? cause.message : "Could not save the override"),
+  });
+
+  const choice = (
+    key: "none" | "unlimited" | "exact",
+    title: string,
+    detail: string,
+    extra?: ReactNode,
+  ) => (
+    <label
+      className={`flex gap-3 rounded-md border p-3 ${
+        mode === key ? "border-foreground/40 bg-accent/40" : "border-border"
+      }`}
+    >
+      <input
+        type="radio"
+        name="comp-mode"
+        className="mt-0.5"
+        checked={mode === key}
+        onChange={() => setMode(key)}
+        disabled={save.isPending}
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium">{title}</span>
+        <span className="mt-0.5 block text-xs text-muted-foreground">{detail}</span>
+        {extra}
+      </span>
+    </label>
+  );
+
+  return (
+    <Dialog open onOpenChange={(open) => (open ? undefined : onClose())}>
+      <DialogContent size="md" data-testid="comp-dialog">
+        <DialogHeader>
+          <DialogTitle>Host limit for {user.email}</DialogTitle>
+          <DialogDescription>
+            This account is sold <span className="font-medium">{user.billing_tier}</span> and is
+            enforced right now at{" "}
+            <span className="font-medium tabular-nums">
+              {user.effective_host_limit === null ? "unlimited" : user.effective_host_limit}
+            </span>
+            . An override outranks the subscription entirely and needs no Stripe call, so it works
+            on a lapsed card and never has to be cancelled in a dashboard.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-2 overflow-y-auto px-4">
+          {choice(
+            "none",
+            "No override",
+            "The subscription decides. This is the ordinary state for a paying account.",
+          )}
+          {choice(
+            "unlimited",
+            "Unlimited hosts",
+            "Stored as 0, which means no ceiling — not zero. This is a full comp.",
+          )}
+          {choice(
+            "exact",
+            "A specific number of hosts",
+            "Enforced whatever the account is paying for.",
+            <span className="mt-2 flex items-center gap-2">
+              <Input
+                type="number"
+                min={1}
+                max={10_000}
+                className="w-28"
+                value={count}
+                aria-label="Hosts allowed"
+                onFocus={() => setMode("exact")}
+                onChange={(event) => setCount(event.target.value)}
+                disabled={save.isPending}
+              />
+              <span className="text-xs text-muted-foreground">hosts</span>
+            </span>,
+          )}
+          {error !== null && (
+            <p className="text-sm text-destructive" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose} disabled={save.isPending}>
+            Cancel
+          </Button>
+          <Button
+            disabled={save.isPending || (mode === "exact" && !exactValid)}
+            onClick={() => save.mutate()}
+          >
+            {save.isPending ? "Saving…" : "Save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function Users() {
   const users = useQuery({ queryKey: ["admin", "users"], queryFn: admin.users });
+  // The deployment's billing, not this admin's own plan: an operator on a
+  // self-hosted install has no comps to grant, because nothing is metered.
+  const { config } = useAuthConfig();
+  const billingEnabled = config?.billing.enabled ?? false;
+  const [comping, setComping] = useState<string | null>(null);
+  const columns = billingEnabled ? 8 : 6;
+  const compTarget = (users.data ?? []).find((row) => row.id === comping) ?? null;
 
   return (
     <section className="space-y-3">
@@ -199,10 +350,12 @@ function Users() {
               <th className="px-3 py-2 text-right font-medium">Hosts</th>
               <th className="px-3 py-2 text-right font-medium">Sessions</th>
               <th className="px-3 py-2 text-right font-medium">Devices</th>
+              {billingEnabled && <th className="px-3 py-2 font-medium">Plan</th>}
+              {billingEnabled && <th className="px-3 py-2 font-medium">Host limit</th>}
             </tr>
           </thead>
           <tbody className="divide-y divide-border" data-testid="admin-users">
-            {users.isLoading && <LoadingRow colSpan={6} label="Loading users" />}
+            {users.isLoading && <LoadingRow colSpan={columns} label="Loading users" />}
             {(users.data ?? []).map((user) => (
               <tr key={user.id}>
                 <td className="px-3 py-2">
@@ -227,11 +380,39 @@ function Users() {
                 <td className="px-3 py-2 text-right tabular-nums">{user.host_count}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{user.session_count}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{user.browser_device_count}</td>
+                {billingEnabled && (
+                  <td className="px-3 py-2 text-muted-foreground">{user.billing_tier}</td>
+                )}
+                {billingEnabled && (
+                  <td className="px-3 py-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="tabular-nums">
+                        {user.effective_host_limit === null
+                          ? "unlimited"
+                          : user.effective_host_limit}
+                      </span>
+                      {user.host_limit_override !== null && (
+                        <span className="rounded border border-success/50 px-1.5 py-0.5 text-[11px] text-success">
+                          comped: {hostLimitOverrideLabel(user.host_limit_override)}
+                        </span>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => setComping(user.id)}
+                        aria-label={`Set host limit for ${user.email}`}
+                      >
+                        Comp
+                      </Button>
+                    </div>
+                  </td>
+                )}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      {compTarget !== null && <CompDialog user={compTarget} onClose={() => setComping(null)} />}
     </section>
   );
 }

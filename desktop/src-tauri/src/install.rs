@@ -594,10 +594,18 @@ fn sanitize_account(account: &str) -> String {
     }
 }
 
+/// Refusals the wizard has a card for, so the run ends on that card rather than
+/// on a bare error line.
+///
+/// `host_limit` is the account's plan refusing one more host. The gate checks
+/// for it before it starts, so reaching it here means the answer changed under
+/// the run — another machine paired while this one installed, or an approval
+/// held open from earlier was spent. The server is the authority on that and
+/// says so at approval time; this is where the window hears it.
 fn known_possession_failure(detail: &str) -> bool {
     matches!(
         detail,
-        "expired" | "denied" | "key_conflict" | "pin_conflict" | "pin_limit"
+        "expired" | "denied" | "key_conflict" | "pin_conflict" | "pin_limit" | "host_limit"
     )
 }
 

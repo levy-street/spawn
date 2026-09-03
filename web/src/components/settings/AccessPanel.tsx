@@ -3,10 +3,10 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Laptop, MonitorCog, MoreHorizontal, Plus, Smartphone, X } from "lucide-react";
-import Link from "next/link";
 import { useEffect, useState } from "react";
 import { requestApproval } from "@/components/access/ceremony-store";
 import { type OrphanVM, RemoveDeviceDialog } from "@/components/access/remove-device";
+import { openAddMachine } from "@/components/hosts/add-machine-dialog-store";
 import { closeSettings } from "@/components/settings/settings-dialog-store";
 import { EndorseDevicePanel, useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { IntroductionPanel } from "@/components/trust/introduction-panel";
@@ -460,13 +460,16 @@ export function AccessPanel() {
                 {passkey.unlock.isPending ? "Checking…" : "Use passkey"}
               </Button>
             )}
-            <Link
+            <button
+              type="button"
               className="text-xs text-muted-foreground underline"
-              href="/device"
-              onClick={() => closeSettings()}
+              onClick={() => {
+                closeSettings();
+                openAddMachine();
+              }}
             >
               No other device? Possess a host directly
-            </Link>
+            </button>
           </div>
         </div>
       )}
@@ -615,14 +618,17 @@ export function AccessPanel() {
           <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
             Your hosts
           </h3>
-          <Link
-            href="/device"
-            onClick={() => closeSettings()}
+          <button
+            type="button"
+            onClick={() => {
+              closeSettings();
+              openAddMachine();
+            }}
             className="flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           >
             <Plus className="size-3.5" />
             Possess a host
-          </Link>
+          </button>
         </div>
         <div className="divide-y divide-border rounded-xl border border-border">
           {view.hosts.map((host) => (

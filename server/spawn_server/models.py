@@ -53,6 +53,14 @@ class User(Base):
     # Grants the admin surface. Bootstrapped from SPAWN_ADMIN_EMAILS (or the
     # first account on a fresh install) rather than hardcoded anywhere.
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # How many hosts this account may hold regardless of what it pays. NULL =
+    # no override, 0 = unlimited, any other integer = that many hosts. Set only
+    # by an admin: never by Stripe, never by a webhook, never by the account
+    # itself. It is a separate column from `is_admin` on purpose — welding the
+    # two together would mean granting someone the admin UI silently granted
+    # them unlimited hosts, and comping a customer handed them the admin
+    # surface. They are different questions.
+    host_limit_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     hosts: Mapped[list[Host]] = relationship(back_populates="owner")
     sessions: Mapped[list[Session]] = relationship(back_populates="owner")
@@ -61,6 +69,10 @@ class User(Base):
     auth_provider_states: Mapped[list[AuthProviderState]] = relationship(back_populates="user")
     browser_devices: Mapped[list[BrowserDevice]] = relationship(back_populates="owner")
     host_key_claims: Mapped[list[HostKeyClaim]] = relationship(back_populates="owner")
+    # At most one, and absent for every account that has never paid.
+    subscription: Mapped[Subscription | None] = relationship(
+        back_populates="user", uselist=False
+    )
 
 
 class BrowserDevice(Base):
@@ -1339,5 +1351,103 @@ class EmailLog(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     body_redacted: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class Subscription(Base):
+    """What an account is entitled to, and the Stripe object that says so.
+
+    One row per account that has ever had a paid plan; absent means Free. The
+    row survives cancellation so the Stripe customer id is stable across a
+    resubscribe — a second Customer for the same person would split their
+    invoice history and break the portal.
+
+    `tier` and `host_limit` are OUR reading of Stripe's price id, never a value
+    Stripe sent us: price metadata is editable in a dashboard by anyone with
+    access and is not an authority. `status` mirrors Stripe's subscription
+    status verbatim, so a support question can be answered without opening the
+    dashboard, and so that a status we have never seen before is stored rather
+    than discarded.
+
+    `host_limit` NULL means unlimited, here and everywhere else in this
+    codebase. A limit is read from this row at enforcement time and never from
+    Stripe, which is what keeps an existing customer pairing hosts while
+    Stripe is unreachable (docs/BILLING.md).
+    """
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    stripe_customer_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # NULL between creating the Customer and the subscription existing — a
+    # Checkout session that was opened and abandoned leaves exactly that.
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tier: Mapped[str] = mapped_column(String(16), nullable=False, default="free")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="incomplete")
+    # NULL = unlimited.
+    host_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_at_period_end: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    # Ordering guard. Stripe does not promise ordered delivery, so an event
+    # describing a subscription older than the one already applied here is
+    # dropped rather than allowed to reinstate a stale plan.
+    last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="subscription")
+
+    __table_args__ = (
+        CheckConstraint(
+            "tier IN ('free', 'coven', 'legion', 'pandemonium')",
+            name="ck_subscriptions_tier",
+        ),
+        CheckConstraint(
+            "host_limit IS NULL OR host_limit >= 0",
+            name="ck_subscriptions_host_limit",
+        ),
+        # Unique indexes rather than unique columns, so the names are ours and
+        # match the ones the migration creates. One row per account; one row
+        # per Stripe object.
+        Index("ix_subscriptions_user_id", "user_id", unique=True),
+        Index("ix_subscriptions_stripe_customer_id", "stripe_customer_id", unique=True),
+        Index(
+            "ix_subscriptions_stripe_subscription_id",
+            "stripe_subscription_id",
+            unique=True,
+        ),
+    )
+
+
+class StripeEvent(Base):
+    """Every webhook id we have already applied, so a redelivery is a no-op.
+
+    Stripe retries for up to three days and can deliver the same event more
+    than once. The unique primary key IS the idempotency mechanism: the
+    handler inserts first and treats an IntegrityError as "already done",
+    which is atomic in a way that a read-then-decide check is not.
+
+    Deliberately not keyed on the event's `created` timestamp. Stripe records
+    that in whole seconds and distinct events routinely share one.
+    """
+
+    __tablename__ = "stripe_events"
+
+    # Stripe's own `evt_…` id.
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    type: Mapped[str] = mapped_column(String(64), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

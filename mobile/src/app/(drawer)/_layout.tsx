@@ -2,6 +2,7 @@ import { Stack, usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
 
 import { AdminAccessBoundary, resolveAdminAccess } from "@/components/admin/admin-access";
+import { OverLimitReconciliation } from "@/components/hosts/over-limit-reconciliation";
 import { AppHeaderLeadingProvider } from "@/components/layout/app-header";
 import { BottomChromeProvider } from "@/components/layout/bottom-chrome";
 import { PersistentBottomNav } from "@/components/nav/bottom-nav";
@@ -33,6 +34,7 @@ export const APP_ROUTE_MAP = {
   "/device-approval": "device-approval",
   "/settings": "settings/index",
   "/settings/account": "settings/account",
+  "/settings/subscription": "settings/subscription",
   "/settings/appearance": "settings/appearance",
   "/settings/notifications": "settings/notifications",
   "/settings/agents": "settings/agents",
@@ -116,6 +118,11 @@ export default function AppStackLayout(): React.JSX.Element | null {
             operator happens to be, not on one screen. */}
           <PersistentBottomNav />
           <DeviceApprovalPrompt />
+          {/* One mount for the whole signed-in app, like the knock above: an
+              account over its host limit has to resolve that wherever it is
+              looking, and the choice is not a screen you can navigate away
+              from. Renders nothing until the plan block says it is owed. */}
+          <OverLimitReconciliation />
         </BottomChromeProvider>
       </AppHeaderLeadingProvider>
     </AdminRouteBoundary>

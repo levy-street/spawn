@@ -90,7 +90,12 @@ it("reads a session from a server that predates the window's recorded type", () 
 });
 
 it("round-trips auth/account response JSON", () => {
-  const fixture = { access_token: "short-token", user };
+  // The plan block rides on `UserOut` itself, so the token responses carry
+  // exactly what `/api/me` carries — which is what stops a stale seeded value
+  // surviving in the me-cache after sign-in. Null is what a deployment with
+  // billing off sends; the shape that omits it entirely is covered in
+  // `billing-schema.test.ts`, because that path gates app launch.
+  const fixture = { access_token: "short-token", user: { ...user, billing: null } };
   expect(TokenResponseSchema.parse(fixture)).toEqual(fixture);
 });
 

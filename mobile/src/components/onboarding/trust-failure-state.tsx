@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Text } from "@/components/ui/text";
 import type { PairingFailure, PairingFailureKind } from "@/data/queries/pairing";
+import { HOST_LIMIT_TITLE, hostLimitDescription } from "@/data/selectors/billing";
 import { spacing } from "@/theme";
 
 interface FailureCopy {
@@ -109,6 +110,15 @@ export const FAILURE_COPY: Record<PairingFailureKind, FailureCopy> = {
     description: "The trusted-device introduction was invalid or changed. No host key was saved.",
     action: "Refresh endorsements",
   },
+  // The plan's capacity is in use. `description` here is the fallback for a
+  // refusal that arrived without a figure; the usual case rebuilds it from
+  // `failure.hostLimit` below. Nothing on this path says a price, names a
+  // venue, or points a verb off-platform — see docs/BILLING.md §6.3.
+  "host-limit": {
+    title: HOST_LIMIT_TITLE,
+    description: hostLimitDescription(null),
+    action: "Back to pairing",
+  },
   "pairing-rejected": {
     title: "Host approval was blocked",
     description: "The reviewed host could not be approved. Check the machine and try again.",
@@ -137,16 +147,25 @@ export function TrustFailureState({
   onSkip,
 }: TrustFailureStateProps) {
   const copy = FAILURE_COPY[failure.kind];
+  // The plan refusal states the limit it was refused against, rebuilt from the
+  // figure the server sent. Everything else keeps the fixed sentence.
+  const body =
+    failure.kind === "host-limit" ? hostLimitDescription(failure.hostLimit) : copy.description;
+  // This component renders `failure.detail` verbatim, and `detail` is a server
+  // string. A billing path must never reach that branch: a sentence chosen on
+  // the server would put copy the app never wrote inside a binary that ships
+  // through app review. docs/BILLING.md §6.1.
+  const detail = failure.kind === "host-limit" ? undefined : failure.detail;
   const description =
-    failure.detail === undefined ? (
-      copy.description
+    detail === undefined ? (
+      body
     ) : (
       <View style={styles.copy}>
         <Text color="mutedForeground" style={styles.centered}>
-          {copy.description}
+          {body}
         </Text>
         <Text color="destructive" style={styles.centered} variant="caption">
-          {failure.detail}
+          {detail}
         </Text>
       </View>
     );

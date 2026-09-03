@@ -20,6 +20,14 @@ dependencies = [
     "httpx>=0.27",
     "cryptography>=44.0",
     "http-ece>=1.2",
+    # The only dependency here that is not already a transitive one, and the
+    # only one that ships a second HTTP client into a server standardised on
+    # `httpx`. `web_push.py:29-32` records rejecting a library for exactly
+    # that; this one earns its place by owning webhook signature verification,
+    # API versioning and retry semantics against a payment processor, which we
+    # would otherwise reimplement badly. It is confined to
+    # `spawn_server/billing_stripe.py`, the only module allowed to import it.
+    "stripe>=15,<16",
 ]
 
 [project.optional-dependencies]
