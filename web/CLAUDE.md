@@ -12,21 +12,27 @@ ceremony, a download page) says so in the commit message.
 ```
 src/
   app/            one directory per route (App Router)
-                  admin/ app/ desktop-build/ device/ download/
-                  forgot-password/ hosts/ legion/ login/ onboarding/
-                  reset-password/ security/ sessions/ signup/
-                  verify-email/ w/
+                  [slug]/ admin/ app/ claude-plan-calculator/ desktop-build/
+                  device/ docs/ download/ forgot-password/ hosts/ legion/
+                  llms.txt/ login/ onboarding/ reset-password/ security/
+                  sessions/ signup/ tmux-cheatsheet/ verify-email/ w/
+                  ([slug]/ renders the SEO page catalogue — see "SEO pages";
+                  claude-plan-calculator/ and tmux-cheatsheet/ are its two
+                  hand-built tool pages; docs/ renders design documents from
+                  ../docs on-site; llms.txt/ serves the AI-crawler summary)
   components/     UI grouped by product area
-                  access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/ release/
-                  onboarding/ profile/ session/ settings/ terminal/ trust/
-                  ui/ workspace/
+                  access/ auth/ brand/ files/ grimoire/ hosts/ icons/ legion/
+                  nav/ release/ onboarding/ profile/ session/ settings/
+                  terminal/ trust/ ui/ workspace/
+                  (grimoire/ is the frame and templates of the SEO pages)
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files
   middleware.ts   request middleware (+ its test beside it)
 tests/e2e/        Playwright end-to-end specs
 scripts/          build wrappers (next-with-proxy-target.mjs) and helpers
-public/           static assets
+                  (og-shots.mjs renders SEO pages' OG images from a dev server)
+public/           static assets (og/ holds the per-page OG images)
 ```
 
 The retired production mockup paths `src/trust-ux/` and
@@ -57,6 +63,23 @@ area and must not be reintroduced through a public demo route.
   contract with the server, not a version — a server that requires a different
   one refuses the socket, and the refusal is what raises the hard reload
   prompt. Read "The wire protocols" in `docs/RELEASE.md` before changing one.
+
+## SEO pages
+
+The landing pages prescribed by the keyword grimoire (`spawnd-seo-grimoire.html`
+at the repo root; `docs/SEO.md` is the short guide). Pages are data, not JSX:
+one entry per page in `src/lib/grimoire/` — `articles/*.ts` (one file per
+keyword cluster, each headed by the vendor pages its facts were checked
+against), `hubs.ts`, `comparisons.ts` — catalogued by `src/lib/grimoire/catalogue.ts`
+and rendered by `app/[slug]/` through `src/components/grimoire/` (the frame in
+the pressroom's ink, and the article, hub, and comparison templates).
+`catalogue.test.ts` holds the invariants: a slug never shadows a static route
+or a public asset, every link inline or related resolves, titles and
+descriptions stay inside snippet budgets, a guide has steps. Paragraph strings
+accept the inline markup of `src/lib/grimoire/inline.ts` (`code` spans and
+`[text](href)` links). The sitemap, the `/guides` rack, and `/llms.txt` follow
+from the catalogue. Every claim about spawnd survives a diff against
+`docs/TRUST.md`.
 
 ## Conventions
 
