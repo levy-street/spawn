@@ -34,6 +34,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -135,7 +136,7 @@ class BillingTierOut(BaseModel):
     """One plan as a pricing surface lists it. Display only; nothing charges from here."""
 
     key: str
-    #: The Legion tier is spelled "the Legion plan", here as everywhere.
+    #: Display name, as the person reads it ("Coven", "Legion", "Pandemonium").
     name: str
     #: Monthly, USD, in cents.
     price_cents: int
@@ -298,6 +299,66 @@ async def start_portal(
     except billing_stripe.StripeUnavailable as exc:
         log.warning("portal session for %s could not be created: %s", user.id, exc)
         await session.rollback()
+        raise _unavailable() from exc
+    await session.commit()
+    return RedirectOut(url=url)
+
+
+@router.post("/upgrade", response_model=RedirectOut)
+async def upgrade(
+    body: TierIn,
+    user: User = Depends(auth.verified_user),
+    session: AsyncSession = Depends(get_session),
+) -> RedirectOut:
+    """A move to another tier, confirmed and paid for on a Stripe-hosted page.
+
+    The client sends anyone moving *up* here and anyone moving *down* to
+    `change-plan`, because a downgrade has to run the host-selection step
+    first and never costs anything, while an upgrade costs money the person
+    should see before it is taken. The same precondition guards both all the
+    same: a target that would not hold what the account has is refused with
+    `host_selection_required`, so this can never be a back door around it.
+    """
+    await rate_limit.enforce_identifier(user.id, CHANGE_PLAN)
+
+    existing = await _subscription_row(session, user.id)
+    if (
+        existing is None
+        or not existing.stripe_subscription_id
+        or existing.status not in billing.ENTITLING_STATUSES
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "subscription_required"},
+        )
+
+    target_limit = billing.host_limit_for_tier(body.tier)
+    count = await billing.host_count(session, user.id)
+    if target_limit is not None and count > target_limit:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "host_selection_required",
+                "tier": body.tier,
+                "host_limit": target_limit,
+                "host_count": count,
+            },
+        )
+
+    try:
+        url = await billing_stripe.create_plan_change_confirmation(
+            session, user, tier=body.tier
+        )
+    except billing_stripe.SubscriptionMissing as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "subscription_required"},
+        ) from exc
+    except billing_stripe.StripeNotConfigured as exc:
+        log.error("plan change for %s cannot be offered: %s", user.id, exc)
+        raise _unavailable() from exc
+    except billing_stripe.StripeUnavailable as exc:
+        log.warning("plan change page for %s could not be created: %s", user.id, exc)
         raise _unavailable() from exc
     await session.commit()
     return RedirectOut(url=url)
@@ -521,7 +582,12 @@ async def stripe_webhook(
         return Response(status_code=status.HTTP_200_OK)
 
     try:
-        await _handle(session, event_type=event_type, obj=event["data"]["object"])
+        await _handle(
+            session,
+            event_type=event_type,
+            obj=event["data"]["object"],
+            observed_at=billing_stripe.event_observed_at(event),
+        )
     except billing_stripe.StripeResourceMissing as exc:
         # Not an outage, so not a retry. The object this event names is not
         # there and will not be there in three days either — an event delivered
@@ -561,8 +627,19 @@ async def stripe_webhook(
     return Response(status_code=status.HTTP_200_OK)
 
 
-async def _handle(session: AsyncSession, *, event_type: str, obj: Any) -> None:
-    """One handled event. Everything that grants or removes entitlement is here."""
+async def _handle(
+    session: AsyncSession,
+    *,
+    event_type: str,
+    obj: Any,
+    observed_at: datetime | None = None,
+) -> None:
+    """One handled event. Everything that grants or removes entitlement is here.
+
+    `observed_at` is the event's own clock, handed to the apply step so the
+    state it re-fetches counts as at least that fresh (see
+    `billing_stripe.event_observed_at`).
+    """
     if event_type == "invoice.finalization_failed":
         # Nobody sees this one. The subscription stays active and the invoice
         # simply cannot be collected, so it is silent revenue loss with no
@@ -602,12 +679,33 @@ async def _handle(session: AsyncSession, *, event_type: str, obj: Any) -> None:
     before = _PlanSnapshot.of(previous)
 
     row = await billing_stripe.fetch_and_apply_subscription(
-        session, subscription_id=subscription_id
+        session, subscription_id=subscription_id, observed_at=observed_at
     )
     if row is None:
         return
     after = _PlanSnapshot.of(row)
     user_id = row.user_id
+
+    if (
+        before.entitling
+        and billing.tier_rank(after.tier) > billing.tier_rank(before.tier)
+        and row.cancel_at_period_end
+    ):
+        # Policy, not a Stripe default: moving UP a plan turns auto-renew back
+        # on. Somebody who scheduled a cancellation on Coven and then paid to
+        # move to Legion has plainly changed their mind about leaving, and a
+        # plan that quietly ended anyway a month later is the surprise every
+        # other subscription product avoids. Done here, on the observation,
+        # so it holds whichever page the upgrade came through. `before` has
+        # to have been a paid plan: a subscription first seen while already
+        # ending did not move up, it merely arrived.
+        log.info("subscription %s moved up while scheduled to end; resuming it", subscription_id)
+        resumed = await billing_stripe.resume_scheduled_cancellation(
+            session, subscription_id=subscription_id, observed_at=observed_at
+        )
+        if resumed is not None:
+            row = resumed
+            after = _PlanSnapshot.of(row)
 
     if event_type == "invoice.payment_action_required":
         invoice_url = billing_stripe.hosted_invoice_url(obj)

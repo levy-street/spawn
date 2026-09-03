@@ -314,25 +314,38 @@ def _state_timestamp(subscription: Any) -> datetime | None:
 
     Stripe subscriptions carry no "updated at", so this is the latest of the
     timestamps that only ever move forward: when it was created and started,
-    when the current period began, and when it was cancelled or ended. Two
-    fetches inside one billing period tie, which is why the guard drops only
-    *strictly* older state; a fetch from before a renewal or from before a
-    cancellation loses, which is exactly the stale plan that must not be
-    reinstated.
+    and when the current period began. Two fetches inside one billing period
+    tie, which is why the guard drops only *strictly* older state; a fetch
+    from before a renewal loses, which is exactly the stale plan that must not
+    be reinstated.
 
-    `cancel_at` is deliberately absent: on a cancel-at-period-end it is a
-    *future* timestamp, and letting it in here would push the guard past the
-    real cancellation and then drop it when it arrives.
+    `canceled_at` and `ended_at` are deliberately NOT here, although they look
+    like clocks. A cancellation that is later resumed from the Portal clears
+    them, so the resumed state derived an *older* stamp than the cancelled one
+    and was dropped as stale — an account that had un-cancelled kept reading
+    "ends on…" for ever. What makes a cancellation fresh is the event that
+    delivered it, and that is `observed_at` on `_apply`. `cancel_at` is absent
+    for the older reason: on a cancel-at-period-end it is a *future* time.
     """
     candidates = [
         _timestamp(_field(subscription, "created")),
         _timestamp(_field(subscription, "start_date")),
-        _timestamp(_field(subscription, "canceled_at")),
-        _timestamp(_field(subscription, "ended_at")),
         *(_timestamp(_field(item, "current_period_start")) for item in _items(subscription)),
     ]
     known = [value for value in candidates if value is not None]
     return max(known) if known else None
+
+
+def event_observed_at(event: Any) -> datetime | None:
+    """When Stripe says an event happened — the clock the ordering guard trusts.
+
+    A webhook's handler re-fetches the subscription *after* the event was
+    created, so the state it reads is at least that fresh, whatever the
+    object's own timestamps say. Passing this as `observed_at` is what lets a
+    resumed cancellation (which clears every stamp the object carried) still
+    read as newer than the cancellation it undoes.
+    """
+    return _timestamp(_field(event, "created"))
 
 
 def _customer_id(subscription: Any) -> str | None:
@@ -569,8 +582,12 @@ async def create_checkout_session(
             # Both of these are pages, and a page grants nothing. Entitlement
             # is written by the webhook and nowhere else; a browser arriving
             # here proves only that a browser arrived here.
-            "success_url": f"{base}/?billing=complete",
-            "cancel_url": f"{base}/?billing=cancelled",
+            #
+            # `/app`, not `/`: the root is the marketing page, and somebody who
+            # just paid was inside the product. The app reads the flag, puts
+            # them back on the page they left from and opens the plan panel.
+            "success_url": f"{base}/app?billing=complete",
+            "cancel_url": f"{base}/app?billing=cancelled",
         },
     )
     url = _field(created, "url")
@@ -592,17 +609,123 @@ async def create_portal_session(
     settings = get_settings()
     api = client if client is not None else _client(settings)
     customer_id = await ensure_customer(session, user, client=api)
+    params: dict[str, Any] = {
+        "customer": customer_id,
+        "return_url": f"{settings.billing_return_base}/app?billing=portal",
+    }
+    if settings.stripe_portal_configuration:
+        params["configuration"] = settings.stripe_portal_configuration
+    created = await _call(api.v1.billing_portal.sessions.create, params)
+    url = _field(created, "url")
+    if not isinstance(url, str) or not url:
+        raise StripeUnavailable("Stripe returned a portal session with no url")
+    return url
+
+
+async def create_plan_change_confirmation(
+    session: AsyncSession, user: User, *, tier: str, client: Any = None
+) -> str:
+    """The Stripe-hosted page that confirms a move to `tier` — and takes the money.
+
+    A `subscription_update_confirm` portal flow: Stripe shows the prorated
+    charge for the rest of the period, asks for confirmation, collects the
+    payment (3-D Secure included), and only then changes the subscription.
+    We hear about it the way we hear about everything, through the webhook.
+    Nothing here writes a row.
+
+    Created under the *upgrade* configuration — the one with plan switching
+    on — because Stripe refuses this flow under the configuration "Manage
+    billing" opens. The flow page carries no navigation into the rest of the
+    portal, so that configuration's switching is never reachable except
+    through a link this function built for a tier the caller already vetted.
+
+    The caller has run the host-selection precondition; this does not.
+    """
+    settings = get_settings()
+    price_id = billing.price_id_for_tier(tier, settings)
+    if not price_id:
+        raise StripeNotConfigured(f"no price is configured for tier {tier!r}")
+    if not settings.stripe_portal_upgrade_configuration:
+        raise StripeNotConfigured("no portal configuration is set for plan changes")
+
+    row = await _row_for_user(session, user.id)
+    if row is None or not row.stripe_subscription_id:
+        raise SubscriptionMissing("this account has no Stripe subscription to change")
+    subscription_id = row.stripe_subscription_id
+
+    api = client if client is not None else _client(settings)
+    current = await _call(api.v1.subscriptions.retrieve, subscription_id)
+    item_id = _field(_first_item(current), "id")
+    if not isinstance(item_id, str) or not item_id:
+        raise StripeUnavailable("the subscription has no item to move to another price")
+
+    base = settings.billing_return_base
     created = await _call(
         api.v1.billing_portal.sessions.create,
         {
-            "customer": customer_id,
-            "return_url": f"{settings.billing_return_base}/?billing=portal",
+            "customer": row.stripe_customer_id,
+            "configuration": settings.stripe_portal_upgrade_configuration,
+            # Where the "back to SPAWN D" link goes if they think better of it.
+            "return_url": f"{base}/app?billing=cancelled",
+            "flow_data": {
+                "type": "subscription_update_confirm",
+                "subscription_update_confirm": {
+                    "subscription": subscription_id,
+                    "items": [{"id": item_id, "price": price_id, "quantity": 1}],
+                },
+                "after_completion": {
+                    "type": "redirect",
+                    "redirect": {"return_url": f"{base}/app?billing=complete"},
+                },
+            },
         },
     )
     url = _field(created, "url")
     if not isinstance(url, str) or not url:
         raise StripeUnavailable("Stripe returned a portal session with no url")
     return url
+
+
+def _resume_params(subscription: Any) -> dict[str, Any]:
+    """What un-schedules a cancellation on this object, or nothing.
+
+    Two spellings, as in `_apply`: a `cancel_at` timestamp is cleared with an
+    empty string, the older boolean with false. Stripe rejects both in one
+    call, so it is one or the other.
+    """
+    if _timestamp(_field(subscription, "cancel_at")) is not None:
+        return {"cancel_at": ""}
+    if bool(_field(subscription, "cancel_at_period_end", False)):
+        return {"cancel_at_period_end": False}
+    return {}
+
+
+async def resume_scheduled_cancellation(
+    session: AsyncSession,
+    *,
+    subscription_id: str,
+    observed_at: datetime | None = None,
+    client: Any = None,
+) -> Subscription | None:
+    """Turn auto-renew back on for a subscription scheduled to end, then re-read it.
+
+    The policy behind it lives in the webhook handler: moving *up* a plan
+    means somebody has changed their mind about leaving. Returns the row as
+    re-read, or None when the subscription belongs to nobody here. The
+    re-read counts as at least as fresh as `observed_at` — the clock of the
+    event that prompted this — or as now, when nothing prompted it.
+    """
+    api = client if client is not None else _client()
+    current = await _call(api.v1.subscriptions.retrieve, subscription_id)
+    params = _resume_params(current)
+    if params:
+        await _call(api.v1.subscriptions.update, subscription_id, params)
+    return await fetch_and_apply_subscription(
+        session,
+        subscription_id=subscription_id,
+        client=api,
+        observed_at=observed_at if observed_at is not None else datetime.now(UTC),
+    )
 
 
 async def change_plan(
@@ -640,16 +763,24 @@ async def change_plan(
     if not isinstance(item_id, str) or not item_id:
         raise StripeUnavailable("the subscription has no item to move to another price")
 
-    await _call(
-        api.v1.subscriptions.update,
-        subscription_id,
-        {
-            "items": [{"id": item_id, "price": price_id}],
-            "proration_behavior": "create_prorations",
-        },
-    )
+    params: dict[str, Any] = {
+        "items": [{"id": item_id, "price": price_id}],
+        "proration_behavior": "create_prorations",
+    }
+    if billing.tier_rank(tier) > billing.tier_rank(row.tier):
+        # Moving up turns auto-renew back on — see the webhook handler for the
+        # policy. Here it rides on the same call rather than costing a second.
+        params.update(_resume_params(current))
+    await _call(api.v1.subscriptions.update, subscription_id, params)
+    # A write we just made: the read that follows is as fresh as reads get.
+    # Without saying so, an evented cancellation minutes earlier would leave
+    # our row carrying a later stamp than this object derives, and the guard
+    # would drop the very change the caller is about to render.
     await fetch_and_apply_subscription(
-        session, subscription_id=subscription_id, client=api
+        session,
+        subscription_id=subscription_id,
+        client=api,
+        observed_at=datetime.now(UTC),
     )
 
 
@@ -686,7 +817,11 @@ async def cancel_subscription_for_user(
 
 
 async def fetch_and_apply_subscription(
-    session: AsyncSession, *, subscription_id: str, client: Any = None
+    session: AsyncSession,
+    *,
+    subscription_id: str,
+    client: Any = None,
+    observed_at: datetime | None = None,
 ) -> Subscription | None:
     """Re-read one subscription from Stripe and write our whole state from it.
 
@@ -708,17 +843,27 @@ async def fetch_and_apply_subscription(
     Returns None when the subscription belongs to no account we know, which is
     a loud log line and not an error: it is what a test-mode event against a
     live key, or a leftover from another deployment, looks like.
+
+    `observed_at` is how fresh the caller knows this read to be — a webhook
+    passes its event's clock, reconciliation passes now — and it only ever
+    makes the state count as *newer*; the object's own stamps still apply.
     """
     api = client if client is not None else _client()
     # Taken before the fetch, so fetch-then-write is atomic against another
     # process doing the same thing to the same subscription.
     await _lock_subscription(session, subscription_id)
     fetched = await _call(api.v1.subscriptions.retrieve, subscription_id)
-    return await _apply(session, fetched, subscription_id=subscription_id)
+    return await _apply(
+        session, fetched, subscription_id=subscription_id, observed_at=observed_at
+    )
 
 
 async def _apply(
-    session: AsyncSession, fetched: Any, *, subscription_id: str
+    session: AsyncSession,
+    fetched: Any,
+    *,
+    subscription_id: str,
+    observed_at: datetime | None = None,
 ) -> Subscription | None:
     """Write one fetched subscription onto our row. Call under the lock."""
     customer_id = _customer_id(fetched)
@@ -757,6 +902,9 @@ async def _apply(
         session.add(row)
 
     state_at = _state_timestamp(fetched)
+    if observed_at is not None:
+        observed_at = _aware(observed_at)
+        state_at = observed_at if state_at is None else max(state_at, observed_at)
     stored_at = _aware(row.last_event_at)
     if state_at is not None and stored_at is not None and state_at < stored_at:
         log.info(
@@ -779,8 +927,20 @@ async def _apply(
     # seen before is worth storing rather than discarding, and `billing.py`
     # decides which ones entitle.
     row.status = str(_field(fetched, "status") or "incomplete")[:24]
-    row.current_period_end = _period_end(fetched)
-    row.cancel_at_period_end = bool(_field(fetched, "cancel_at_period_end", False))
+    # A scheduled cancellation is spelled two ways. Older payloads say
+    # `cancel_at_period_end: true`; on the pinned API version the Customer
+    # Portal (and `cancel_at`-style API calls) leave that flag FALSE and set
+    # `cancel_at` to the moment access ends instead. Either one means "still
+    # entitled, and ending", and the date the person sees is whichever comes
+    # first — the period end, or an earlier `cancel_at` somebody chose.
+    period_end = _period_end(fetched)
+    cancel_at = _timestamp(_field(fetched, "cancel_at"))
+    if cancel_at is not None and (period_end is None or cancel_at < period_end):
+        period_end = cancel_at
+    row.current_period_end = period_end
+    row.cancel_at_period_end = (
+        bool(_field(fetched, "cancel_at_period_end", False)) or cancel_at is not None
+    )
     if state_at is not None:
         row.last_event_at = state_at
     await session.flush()
@@ -828,8 +988,13 @@ async def reconcile_all(session: AsyncSession, *, client: Any = None) -> int:
     read = 0
     for subscription_id in subscription_ids:
         try:
+            # A sweep reads the truth as of now, so it is never the stale side
+            # of the ordering guard — a resume whose webhook was missed lands.
             applied = await fetch_and_apply_subscription(
-                session, subscription_id=subscription_id, client=api
+                session,
+                subscription_id=subscription_id,
+                client=api,
+                observed_at=datetime.now(UTC),
             )
         except StripeResourceMissing as exc:
             # Stripe answered and said it is gone. Louder than an outage,

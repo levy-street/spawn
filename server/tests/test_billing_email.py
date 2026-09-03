@@ -46,6 +46,7 @@ STRIPE_ENV = {
     "SPAWN_STRIPE_PRICE_COVEN": "price_test_coven",
     "SPAWN_STRIPE_PRICE_LEGION": "price_test_legion",
     "SPAWN_STRIPE_PRICE_PANDEMONIUM": "price_test_pandemonium",
+    "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION": "bpc_test_upgrade",
 }
 
 PERIOD_END = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
@@ -73,7 +74,7 @@ SENDERS = {
         session,
         user,
         from_tier_name="Coven",
-        to_tier_name="the Legion plan",
+        to_tier_name="Legion",
         host_limit=20,
     ),
     billing_email.KIND_ENDED: lambda session, user: billing_email.send_subscription_ended(
@@ -272,9 +273,8 @@ async def test_every_message_names_the_product_and_the_plan_correctly(
     `spawnd` is the daemon, and neither is what somebody reading an email is
     looking at.
 
-    The tier is always "the Legion plan" and never bare "Legion", because
-    `/legion` is already the fleet page: "Legion" alone in a billing sentence
-    reads as that page rather than as a plan.
+    The Legion tier is written "Legion" — the same word as the fleet page, on
+    purpose — so the sentence around it has to carry "plan".
     """
 
     user = await _account()
@@ -284,7 +284,6 @@ async def test_every_message_names_the_product_and_the_plan_correctly(
     for part in (captured[0]["body"], captured[0]["html"]):
         assert "SPAWN D" in part
         assert re.search(r"\bspawn\b", _prose(part)) is None, part
-        assert part.count("Legion") == part.count("the Legion plan"), part
 
 
 async def test_the_host_limit_message_is_the_one_that_may_sell(

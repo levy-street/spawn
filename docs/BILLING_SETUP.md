@@ -37,8 +37,16 @@ afterwards and the Portal refuses a switch between prices whose values differ.
   if Stripe cannot get a success response to it, finalising every
   automatic-collection invoice is delayed for up to 72 hours, so subscribing
   would turn a bug in our handler into a fleet-wide billing outage.
-- The five values are on this machine at `~/.spawn-stripe.env`, mode 600,
-  outside the repo. They are test-mode only.
+- **Upgrade-confirmation Portal** `bpc_1UBNxxS93qMgpg7zVoi8Lbsb` — a second
+  configuration with plan switching **on**, used for one thing: the deep-linked
+  `subscription_update_confirm` flow, the Stripe-hosted page that shows the
+  prorated charge and takes the payment when somebody moves up a plan. Stripe
+  refuses that flow under the configuration above, and the flow page carries no
+  navigation into the rest of the portal, so switching stays unreachable from
+  "Manage billing". `SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION` names it and the
+  server refuses to boot with billing on and this unset.
+- The values are on this machine at `~/.spawn-stripe.env`, mode 600, outside
+  the repo. They are test-mode only.
 
 The whole flow has been exercised against that account end to end: subscribe,
 upgrade, downgrade refused while over the limit, hosts released, downgrade
@@ -112,6 +120,8 @@ SPAWN_STRIPE_WEBHOOK_SECRET=whsec_…
 SPAWN_STRIPE_PRICE_COVEN=price_…
 SPAWN_STRIPE_PRICE_LEGION=price_…
 SPAWN_STRIPE_PRICE_PANDEMONIUM=price_…
+SPAWN_STRIPE_PORTAL_CONFIGURATION=bpc_…          # "Manage billing": switching off
+SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION=bpc_…  # the upgrade-confirm flow: switching on
 ```
 
 - The secret key: **Developers → API keys → Secret key**.

@@ -26,6 +26,7 @@ is ever built.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
@@ -80,6 +81,7 @@ EVERY_ROUTE = (
     ("POST", "/api/billing/checkout"),
     ("POST", "/api/billing/portal"),
     ("POST", "/api/billing/change-plan"),
+    ("POST", "/api/billing/upgrade"),
     ("POST", "/api/billing/webhook"),
     ("POST", "/api/billing/webhook/"),
 )
@@ -106,6 +108,14 @@ async def _entitlement(user_id: str):
         user = await session.get(User, user_id)
         assert user is not None
         return await billing.entitlement(session, user)
+
+
+async def _row_in(session, user_id: str) -> Subscription:
+    row = (
+        await session.execute(select(Subscription).where(Subscription.user_id == user_id))
+    ).scalar_one_or_none()
+    assert row is not None
+    return row
 
 
 async def _row(user_id: str) -> Subscription | None:
@@ -245,7 +255,7 @@ class TestState:
 
         body = (await client.get("/api/billing/state", headers=auth)).json()
         assert body["tier"] == "legion"
-        assert body["tier_name"] == "the Legion plan"
+        assert body["tier_name"] == "Legion"
         assert body["host_limit"] == 20
         assert body["host_count"] == 2
         assert body["has_subscription"] is True
@@ -260,7 +270,7 @@ class TestState:
         _, auth = await _signup(client, "state-name@example.com")
         body = (await client.get("/api/billing/state", headers=auth)).json()
         names = {tier["key"]: tier["name"] for tier in body["tiers"]}
-        assert names["legion"] == "the Legion plan"
+        assert names["legion"] == "Legion"
 
 
 # ---------- /checkout ----------
@@ -284,6 +294,10 @@ class TestCheckout:
         # Subscription, so later events carry it without a Session lookup.
         assert created["client_reference_id"] == user_id
         assert created["subscription_data"]["metadata"]["spawn_user_id"] == user_id
+        # Back into the product, never the marketing root, with a flag the app
+        # turns into "where you were, with the plan panel open".
+        assert created["success_url"].endswith("/app?billing=complete")
+        assert created["cancel_url"].endswith("/app?billing=cancelled")
 
     @pytest.mark.parametrize(
         "body",
@@ -377,6 +391,69 @@ class TestCheckout:
 # ---------- /portal ----------
 
 
+class TestUpgrade:
+    async def test_it_returns_the_stripe_page_that_confirms_and_charges(
+        self, client, billing_on, fake_stripe
+    ):
+        """A move up is confirmed and paid on Stripe's own page: nothing
+        changes on our side until the webhook says it did."""
+        user_id, auth = await _signup(client, "upgrade@example.com")
+        await _subscribe(user_id, tier=billing.TIER_COVEN)
+        fake_stripe.subscriptions["sub_routes"] = _stripe_subscription(
+            user_id, price=PRICE_COVEN
+        )
+
+        response = await client.post(
+            "/api/billing/upgrade", json={"tier": "legion"}, headers=auth
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"url": fake_stripe.portal_url}
+
+        created = fake_stripe.named("billing_portal.sessions.create")[0]
+        assert created["customer"] == "cus_routes"
+        assert created["configuration"] == "bpc_test_upgrade"
+        flow = created["flow_data"]
+        assert flow["type"] == "subscription_update_confirm"
+        assert flow["subscription_update_confirm"]["subscription"] == "sub_routes"
+        assert flow["subscription_update_confirm"]["items"] == [
+            {"id": "si_test", "price": PRICE_LEGION, "quantity": 1}
+        ]
+        assert flow["after_completion"]["redirect"]["return_url"].endswith(
+            "/app?billing=complete"
+        )
+        assert created["return_url"].endswith("/app?billing=cancelled")
+        # Nothing moved: the row is what it was, and no update was sent.
+        assert fake_stripe.named("subscriptions.update") == []
+        assert (await _entitlement(user_id)).tier == billing.TIER_COVEN
+
+    async def test_it_runs_the_same_host_precondition_as_change_plan(
+        self, client, billing_on, fake_stripe
+    ):
+        """Not a way around the host-selection step: a target that would not
+        hold what the account has is refused here too."""
+        user_id, auth = await _signup(client, "upgrade-over@example.com")
+        await _subscribe(user_id, tier=billing.TIER_PANDEMONIUM)
+        fake_stripe.subscriptions["sub_routes"] = _stripe_subscription(
+            user_id, price=PRICE_PANDEMONIUM
+        )
+        await _give_hosts(user_id, 25)
+
+        response = await client.post(
+            "/api/billing/upgrade", json={"tier": "legion"}, headers=auth
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "host_selection_required"
+        assert fake_stripe.named("billing_portal.sessions.create") == []
+
+    async def test_it_needs_a_subscription_to_move(self, client, billing_on, fake_stripe):
+        _, auth = await _signup(client, "upgrade-none@example.com")
+        response = await client.post(
+            "/api/billing/upgrade", json={"tier": "legion"}, headers=auth
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == {"code": "subscription_required"}
+
+
 class TestPortal:
     async def test_it_returns_a_portal_url(self, client, billing_on, fake_stripe):
         user_id, auth = await _signup(client, "portal@example.com")
@@ -387,6 +464,7 @@ class TestPortal:
         assert response.json() == {"url": fake_stripe.portal_url}
         created = fake_stripe.named("billing_portal.sessions.create")[0]
         assert created["customer"] == "cus_routes"
+        assert created["return_url"].endswith("/app?billing=portal")
 
     async def test_it_needs_a_session(self, client, billing_on, fake_stripe):
         response = await client.post(
@@ -448,6 +526,30 @@ class TestChangePlan:
         assert fake_stripe.named("subscriptions.update") == []
         assert (await _entitlement(user_id)).host_limit == 20
         _assert_no_purchase_copy(response.text)
+
+    async def test_it_applies_right_after_an_evented_cancellation(
+        self, client, billing_on, fake_stripe
+    ):
+        """The row was last written by a webhook, whose clock is later than any
+        stamp the subscription object carries. A change we make ourselves is
+        as fresh as reads get, and must not lose to that clock — the client
+        renders the response, and the response has to be the new plan."""
+        user_id, auth = await _signup(client, "fresh-change@example.com")
+        await _subscribe(user_id, tier=billing.TIER_LEGION)
+        async with get_sessionmaker()() as session:
+            row = await _row_in(session, user_id)
+            row.last_event_at = datetime.now(UTC)
+            await session.commit()
+        fake_stripe.subscriptions["sub_routes"] = _stripe_subscription(
+            user_id, price=PRICE_LEGION
+        )
+
+        response = await client.post(
+            "/api/billing/change-plan", json={"tier": "coven"}, headers=auth
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["tier"] == "coven"
+        assert (await _entitlement(user_id)).tier == billing.TIER_COVEN
 
     async def test_it_succeeds_once_the_user_has_released_hosts(
         self, client, billing_on, fake_stripe
@@ -676,6 +778,7 @@ class TestPerUserRateLimits:
             "SPAWN_STRIPE_PRICE_COVEN": PRICE_COVEN,
             "SPAWN_STRIPE_PRICE_LEGION": PRICE_LEGION,
             "SPAWN_STRIPE_PRICE_PANDEMONIUM": PRICE_PANDEMONIUM,
+            "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION": "bpc_test_upgrade",
             "SPAWN_RATE_LIMIT_ENABLED": "true",
         }.items():
             monkeypatch.setenv(name, value)

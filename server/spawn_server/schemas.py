@@ -483,7 +483,7 @@ class BillingTierOut(BaseModel):
     """One plan as a pricing page lists it. Display only — nothing charges from here."""
 
     key: str
-    #: Display name. The Legion tier is spelled "the Legion plan".
+    #: Display name, as the person reads it ("Coven", "Legion", "Pandemonium").
     name: str
     #: Monthly, USD, in cents.
     price_cents: int

@@ -61,6 +61,7 @@ STRIPE_ENV = {
     "SPAWN_STRIPE_PRICE_COVEN": PRICE_COVEN,
     "SPAWN_STRIPE_PRICE_LEGION": PRICE_LEGION,
     "SPAWN_STRIPE_PRICE_PANDEMONIUM": PRICE_PANDEMONIUM,
+    "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION": "bpc_test_upgrade",
 }
 
 WEBHOOK = "/api/billing/webhook"
@@ -109,9 +110,17 @@ class _Subscriptions(_Resource):
     def update(self, subscription_id, params=None, options=None):
         self._api.record("subscriptions.update", (subscription_id, params))
         obj = self._api.subscriptions[subscription_id]
-        price = (params or {}).get("items", [{}])[0].get("price")
+        params = params or {}
+        price = params.get("items", [{}])[0].get("price")
         if price:
             obj["items"]["data"][0]["price"]["id"] = price
+        # The two spellings of "stop ending": an empty string clears
+        # `cancel_at`, false clears the older boolean. Both clear `canceled_at`
+        # too, as Stripe does when a scheduled cancellation is withdrawn.
+        if params.get("cancel_at") == "" or params.get("cancel_at_period_end") is False:
+            obj["cancel_at"] = None
+            obj["cancel_at_period_end"] = False
+            obj["canceled_at"] = None
         return obj
 
     def cancel(self, subscription_id, params=None, options=None):
@@ -238,6 +247,7 @@ def _subscription_object(
     canceled_at: int | None = None,
     ended_at: int | None = None,
     cancel_at_period_end: bool = False,
+    cancel_at: int | None = None,
     price_metadata: dict | None = None,
 ) -> dict:
     return {
@@ -250,6 +260,7 @@ def _subscription_object(
         "canceled_at": canceled_at,
         "ended_at": ended_at,
         "cancel_at_period_end": cancel_at_period_end,
+        "cancel_at": cancel_at,
         "metadata": {"spawn_user_id": spawn_user_id} if spawn_user_id else {},
         "items": {
             "object": "list",
@@ -483,6 +494,231 @@ class TestARedeliveryChangesNothing:
         )
         assert response.status_code == 200, response.text
         assert (await _entitlement(user_id)).host_limit == 20
+
+
+class TestAScheduledCancellationIsRecordedHoweverStripeSpellsIt:
+    async def test_the_portal_sets_cancel_at_and_leaves_the_old_flag_false(
+        self, client, billing_on, fake_stripe
+    ):
+        """On the pinned API version a Customer Portal cancellation leaves
+        `cancel_at_period_end` FALSE and sets `cancel_at` to the period end.
+        That is still "entitled until then, and ending" — the panel has to say
+        so, and nothing may be taken away before the date."""
+        user_id, _ = await _signup(client, "cancel-at@example.com")
+        await _seed_customer(user_id)
+        ending = _subscription_object(
+            spawn_user_id=user_id,
+            status="active",
+            period_start=JAN,
+            period_end=FEB,
+            canceled_at=JAN + 3600,
+            cancel_at=FEB,
+        )
+        fake_stripe.subscriptions["sub_test"] = ending
+
+        response = await _post(
+            client, _event_bytes("customer.subscription.updated", ending)
+        )
+        assert response.status_code == 200, response.text
+
+        row = await _row(user_id)
+        assert row is not None
+        assert row.status == "active"
+        assert row.cancel_at_period_end is True
+        assert billing_stripe._aware(row.current_period_end) == datetime.fromtimestamp(
+            FEB, tz=UTC
+        )
+        assert (await _entitlement(user_id)).host_limit == 3
+
+    async def test_an_earlier_cancel_at_is_the_date_the_person_sees(
+        self, client, billing_on, fake_stripe
+    ):
+        """`cancel_at` can be any moment, not only the period end. The stored
+        end is whichever comes first, because that is when access stops."""
+        user_id, _ = await _signup(client, "cancel-at-early@example.com")
+        await _seed_customer(user_id)
+        mid = JAN + 15 * 86_400
+        ending = _subscription_object(
+            spawn_user_id=user_id,
+            status="active",
+            period_start=JAN,
+            period_end=FEB,
+            canceled_at=JAN + 3600,
+            cancel_at=mid,
+        )
+        fake_stripe.subscriptions["sub_test"] = ending
+
+        response = await _post(
+            client, _event_bytes("customer.subscription.updated", ending)
+        )
+        assert response.status_code == 200, response.text
+
+        row = await _row(user_id)
+        assert row is not None
+        assert row.cancel_at_period_end is True
+        assert billing_stripe._aware(row.current_period_end) == datetime.fromtimestamp(
+            mid, tz=UTC
+        )
+
+
+    async def test_resuming_from_the_portal_takes_the_cancellation_back(
+        self, client, billing_on, fake_stripe
+    ):
+        """A resume clears `canceled_at` and `cancel_at`, so the object now
+        carries an *older* set of stamps than the cancellation did. The event's
+        own clock is what says it is newer, and the row has to follow it —
+        otherwise an account that un-cancelled reads "ends on…" for ever."""
+        user_id, _ = await _signup(client, "resume@example.com")
+        await _seed_customer(user_id)
+        ending = _subscription_object(
+            spawn_user_id=user_id,
+            status="active",
+            period_start=JAN,
+            period_end=FEB,
+            canceled_at=JAN + 3600,
+            cancel_at=FEB,
+        )
+        fake_stripe.subscriptions["sub_test"] = ending
+        cancelled = await _post(
+            client,
+            _event_bytes(
+                "customer.subscription.updated", ending, event_id="evt_c", created=JAN + 3600
+            ),
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        row = await _row(user_id)
+        assert row is not None and row.cancel_at_period_end is True
+
+        resumed = _subscription_object(
+            spawn_user_id=user_id, status="active", period_start=JAN, period_end=FEB
+        )
+        fake_stripe.subscriptions["sub_test"] = resumed
+        response = await _post(
+            client,
+            _event_bytes(
+                "customer.subscription.updated", resumed, event_id="evt_r", created=JAN + 7200
+            ),
+        )
+        assert response.status_code == 200, response.text
+
+        row = await _row(user_id)
+        assert row is not None
+        assert row.cancel_at_period_end is False
+        assert billing_stripe._aware(row.current_period_end) == datetime.fromtimestamp(
+            FEB, tz=UTC
+        )
+
+    async def test_reconciliation_lands_a_resume_whose_webhook_was_missed(
+        self, client, billing_on, fake_stripe
+    ):
+        """The sweep reads the truth as of now, so it is never the stale side
+        of the guard: a resume nobody told us about still arrives."""
+        user_id, _ = await _signup(client, "resume-sweep@example.com")
+        await _seed_customer(user_id)
+        ending = _subscription_object(
+            spawn_user_id=user_id,
+            status="active",
+            period_start=JAN,
+            period_end=FEB,
+            canceled_at=JAN + 3600,
+            cancel_at=FEB,
+        )
+        fake_stripe.subscriptions["sub_test"] = ending
+        cancelled = await _post(
+            client,
+            _event_bytes(
+                "customer.subscription.updated", ending, event_id="evt_c2", created=JAN + 3600
+            ),
+        )
+        assert cancelled.status_code == 200, cancelled.text
+
+        fake_stripe.subscriptions["sub_test"] = _subscription_object(
+            spawn_user_id=user_id, status="active", period_start=JAN, period_end=FEB
+        )
+        assert await billing_stripe.run_reconciliation_once() == 1
+
+        row = await _row(user_id)
+        assert row is not None
+        assert row.cancel_at_period_end is False
+
+
+class TestMovingUpTurnsAutoRenewBackOn:
+    async def test_an_upgrade_while_scheduled_to_end_withdraws_the_cancellation(
+        self, client, billing_on, fake_stripe
+    ):
+        """Policy, not a Stripe default: somebody who scheduled a cancellation
+        on Coven and then paid to move to Legion has changed their mind about
+        leaving. The handler notices the tier went up while the subscription
+        was still ending, withdraws the cancellation, and re-reads."""
+        user_id, _ = await _signup(client, "upgrade-resume@example.com")
+        await _seed_customer(user_id)
+        ending = _subscription_object(
+            spawn_user_id=user_id,
+            price=PRICE_COVEN,
+            status="active",
+            period_start=JAN,
+            period_end=FEB,
+            canceled_at=JAN + 3600,
+            cancel_at=FEB,
+        )
+        fake_stripe.subscriptions["sub_test"] = ending
+        cancelled = await _post(
+            client,
+            _event_bytes(
+                "customer.subscription.updated", ending, event_id="evt_c3", created=JAN + 3600
+            ),
+        )
+        assert cancelled.status_code == 200, cancelled.text
+
+        # Stripe's confirm page moved the price and left the cancellation as
+        # it was — that is what the object says when the webhook arrives.
+        ending["items"]["data"][0]["price"]["id"] = PRICE_LEGION
+        response = await _post(
+            client,
+            _event_bytes(
+                "customer.subscription.updated", ending, event_id="evt_u3", created=JAN + 7200
+            ),
+        )
+        assert response.status_code == 200, response.text
+
+        assert ("sub_test", {"cancel_at": ""}) in fake_stripe.named("subscriptions.update")
+        row = await _row(user_id)
+        assert row is not None
+        assert row.tier == billing.TIER_LEGION
+        assert row.cancel_at_period_end is False
+
+    async def test_a_downgrade_leaves_a_scheduled_cancellation_alone(
+        self, client, billing_on, fake_stripe
+    ):
+        user_id, _ = await _signup(client, "downgrade-keep@example.com")
+        await _seed_customer(user_id)
+        ending = _subscription_object(
+            spawn_user_id=user_id,
+            price=PRICE_LEGION,
+            status="active",
+            period_start=JAN,
+            period_end=FEB,
+            canceled_at=JAN + 3600,
+            cancel_at=FEB,
+        )
+        fake_stripe.subscriptions["sub_test"] = ending
+        await _post(
+            client,
+            _event_bytes(
+                "customer.subscription.updated", ending, event_id="evt_c4", created=JAN + 3600
+            ),
+        )
+        ending["items"]["data"][0]["price"]["id"] = PRICE_COVEN
+        response = await _post(
+            client,
+            _event_bytes(
+                "customer.subscription.updated", ending, event_id="evt_d4", created=JAN + 7200
+            ),
+        )
+        assert response.status_code == 200, response.text
+        assert fake_stripe.named("subscriptions.update") == []
+        row = await _row(user_id)
+        assert row is not None and row.cancel_at_period_end is True
 
 
 class TestOutOfOrderDeliveryConverges:
@@ -979,7 +1215,7 @@ class TestTheMailFollowsTheEntitlement:
         assert [name for name, _ in sent_mail] == ["send_subscription_started"]
         _, kwargs = sent_mail[0]
         assert kwargs["user_id"] == user_id
-        assert kwargs["tier_name"] == "the Legion plan"
+        assert kwargs["tier_name"] == "Legion"
         assert kwargs["price_cents"] == 2000
 
     async def test_a_second_event_for_the_same_plan_sends_nothing(
@@ -1027,7 +1263,7 @@ class TestTheMailFollowsTheEntitlement:
             "send_plan_changed",
         ]
         assert sent_mail[1][1]["from_tier_name"] == "Coven"
-        assert sent_mail[1][1]["to_tier_name"] == "the Legion plan"
+        assert sent_mail[1][1]["to_tier_name"] == "Legion"
         assert sent_mail[1][1]["host_limit"] == 20
 
     async def test_a_cancellation_says_what_they_hold_and_what_they_may(
