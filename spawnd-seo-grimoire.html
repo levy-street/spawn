@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPAWN D Keyword Grimoire</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --ground:#0c0f0d; --surface:#121613; --raise:#181d1a; --line:#242b26; --line-soft:#1b211d;
+    --text:#dee7e0; --muted:#8fa096; --faint:#5f6f64;
+    --accent:#43d97d; --accent-dim:#2b8f55; --accent-ink:#0c0f0d;
+    --ember:#e0662e;
+    --kd0:#43d97d; --kd1:#a8d943; --kd2:#d9a943; --kd3:#d96043;
+    --code-bg:#161b17;
+    color-scheme:dark;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --ground:#f2f5f2; --surface:#fbfcfb; --raise:#ffffff; --line:#d8e0d9; --line-soft:#e4eae4;
+      --text:#1b221d; --muted:#59685d; --faint:#8a978d;
+      --accent:#0e7a43; --accent-dim:#4aa876; --accent-ink:#ffffff;
+      --ember:#b04a15;
+      --kd0:#0e7a43; --kd1:#5d7d10; --kd2:#96690a; --kd3:#b3401f;
+      --code-bg:#e9efe9;
+      color-scheme:light;
+    }
+  }
+  :root[data-theme="light"]{
+    --ground:#f2f5f2; --surface:#fbfcfb; --raise:#ffffff; --line:#d8e0d9; --line-soft:#e4eae4;
+    --text:#1b221d; --muted:#59685d; --faint:#8a978d;
+    --accent:#0e7a43; --accent-dim:#4aa876; --accent-ink:#ffffff;
+    --ember:#b04a15;
+    --kd0:#0e7a43; --kd1:#5d7d10; --kd2:#96690a; --kd3:#b3401f;
+    --code-bg:#e9efe9;
+    color-scheme:light;
+  }
+  *{box-sizing:border-box}
+  body{
+    background:var(--ground); color:var(--text);
+    font-family:"IBM Plex Sans",-apple-system,"Segoe UI",sans-serif;
+    font-size:16px; line-height:1.62; margin:0;
+  }
+  .wrap{max-width:980px; margin:0 auto; padding:0 28px 120px}
+  .mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace}
+
+  /* ---- hero ---- */
+  header{border-bottom:1px solid var(--line); padding:64px 0 44px; margin-bottom:56px}
+  .eyebrow{font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--accent); margin:0 0 18px}
+  h1{
+    font-family:"Cormorant Garamond",Georgia,serif; font-weight:600;
+    font-size:clamp(42px,6.4vw,64px); line-height:1.02; margin:0 0 20px; text-wrap:balance;
+  }
+  .standfirst{max-width:64ch; color:var(--muted); font-size:17.5px; margin:0 0 36px}
+  .standfirst strong{color:var(--text); font-weight:600}
+  .readout{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:1px;
+    background:var(--line); border:1px solid var(--line); border-radius:6px; overflow:hidden;
+  }
+  .readout > div{background:var(--surface); padding:16px 18px 14px}
+  .readout .k{font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--faint); margin-bottom:6px}
+  .readout .v{font-family:"IBM Plex Mono",monospace; font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; line-height:1.1}
+  .readout .v em{font-style:normal; font-size:14px; color:var(--muted); font-weight:400}
+  .readout .good{color:var(--accent)}
+  .readout .bad{color:var(--ember)}
+
+  /* ---- structure ---- */
+  section{margin-bottom:72px}
+  .sec-label{font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--accent); margin:0 0 10px}
+  h2{
+    font-family:"Cormorant Garamond",Georgia,serif; font-weight:600;
+    font-size:clamp(30px,4vw,40px); line-height:1.08; margin:0 0 18px; text-wrap:balance;
+  }
+  h3{font-size:19px; font-weight:600; margin:36px 0 10px}
+  p{max-width:70ch; margin:0 0 16px}
+  p.wide{max-width:none}
+  ul,ol{max-width:70ch; padding-left:22px; margin:0 0 16px}
+  li{margin-bottom:8px}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
+  code{font-family:"IBM Plex Mono",monospace; font-size:.88em; background:var(--code-bg); border:1px solid var(--line-soft); border-radius:4px; padding:1px 6px}
+  .muted{color:var(--muted)}
+
+  /* ---- callouts ---- */
+  .call{border:1px solid var(--line); border-left:3px solid var(--accent); background:var(--surface); border-radius:0 6px 6px 0; padding:18px 22px; margin:24px 0; max-width:76ch}
+  .call.warn{border-left-color:var(--ember)}
+  .call .t{font-family:"IBM Plex Mono",monospace; font-size:11.5px; letter-spacing:.14em; text-transform:uppercase; margin-bottom:8px; color:var(--accent)}
+  .call.warn .t{color:var(--ember)}
+  .call p{margin-bottom:8px}
+  .call p:last-child{margin-bottom:0}
+
+  /* ---- tables ---- */
+  .tbl-wrap{overflow-x:auto; border:1px solid var(--line); border-radius:6px; margin:22px 0 8px}
+  table{border-collapse:collapse; width:100%; font-size:14px; min-width:660px}
+  th{
+    font-family:"IBM Plex Mono",monospace; font-size:10.5px; letter-spacing:.13em; text-transform:uppercase;
+    color:var(--faint); text-align:left; font-weight:500;
+    padding:10px 14px; border-bottom:1px solid var(--line); background:var(--surface);
+    white-space:nowrap;
+  }
+  td{padding:9px 14px; border-bottom:1px solid var(--line-soft); vertical-align:top; background:var(--raise)}
+  tr:last-child td{border-bottom:none}
+  td.kw{font-family:"IBM Plex Mono",monospace; font-size:13.5px; white-space:nowrap}
+  td.num{font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap}
+  th.num{text-align:right}
+  .cap{font-size:13px; color:var(--faint); margin:6px 2px 0; max-width:none}
+
+  .kd{
+    display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:12px; font-weight:600;
+    padding:1px 8px; border-radius:99px; border:1px solid; font-variant-numeric:tabular-nums;
+  }
+  .kd-0{color:var(--kd0); border-color:color-mix(in srgb,var(--kd0) 45%,transparent)}
+  .kd-1{color:var(--kd1); border-color:color-mix(in srgb,var(--kd1) 45%,transparent)}
+  .kd-2{color:var(--kd2); border-color:color-mix(in srgb,var(--kd2) 45%,transparent)}
+  .kd-3{color:var(--kd3); border-color:color-mix(in srgb,var(--kd3) 45%,transparent)}
+
+  /* ---- play cards ---- */
+  .play{border:1px solid var(--line); border-radius:8px; background:var(--surface); padding:28px 30px; margin:28px 0}
+  .play-head{display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; margin-bottom:6px}
+  .play-no{font-family:"Cormorant Garamond",serif; font-size:44px; font-weight:600; color:var(--accent); line-height:1}
+  .play h3{font-size:23px; margin:0}
+  .play-stats{font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--muted); margin:2px 0 14px}
+  .play-stats b{color:var(--accent); font-weight:600}
+
+  .verdict{
+    font-family:"Cormorant Garamond",Georgia,serif; font-size:clamp(22px,3vw,28px); line-height:1.35;
+    border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+    padding:26px 4px; margin:30px 0; max-width:none; text-wrap:balance;
+  }
+  .verdict b{color:var(--accent); font-weight:700}
+
+  .foot{border-top:1px solid var(--line); margin-top:80px; padding-top:22px; font-size:13px; color:var(--faint); max-width:none}
+  .toc{display:flex; flex-wrap:wrap; gap:8px 20px; margin:28px 0 0; padding:0; list-style:none; max-width:none}
+  .toc li{margin:0}
+  .toc a{font-family:"IBM Plex Mono",monospace; font-size:12.5px; border-bottom:none; color:var(--muted)}
+  .toc a:hover{color:var(--accent)}
+  .toc .n{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <p class="eyebrow">spawnd.dev · organic search · sourced from Semrush, US db, Aug 31 2026</p>
+  <h1>The Keyword Grimoire</h1>
+  <p class="standfirst">
+    37 keyword universes pulled from the Keyword Magic Tool, <strong>3,086 keywords scored</strong>,
+    and one conclusion: the search demand around CLI coding agents is young enough that a
+    domain with an Authority Score of 2 can take real positions <strong>before the Halloween launch</strong> —
+    if the pages exist before the backlinks arrive.
+  </p>
+  <div class="readout">
+    <div><div class="k">spawnd.dev authority</div><div class="v bad">2</div></div>
+    <div><div class="k">spawnd.dev organic traffic</div><div class="v bad">0<em> /mo</em></div></div>
+    <div><div class="k">happy.engineering (rival)</div><div class="v">27 <em>AS · 3.5K/mo</em></div></div>
+    <div><div class="k">addressable vol, KD≤50</div><div class="v good">~178K<em> /mo</em></div></div>
+    <div><div class="k">pages prescribed</div><div class="v good">34</div></div>
+  </div>
+  <ul class="toc">
+    <li><a href="#standing"><span class="n">i</span> where we stand</a></li>
+    <li><a href="#method"><span class="n">ii</span> method</a></li>
+    <li><a href="#plays"><span class="n">iii</span> the five plays</a></li>
+    <li><a href="#shoulder"><span class="n">iv</span> shoulder clusters</a></li>
+    <li><a href="#instant"><span class="n">v</span> instant rank</a></li>
+    <li><a href="#false"><span class="n">vi</span> false friends</a></li>
+    <li><a href="#blueprint"><span class="n">vii</span> page blueprint</a></li>
+    <li><a href="#foundation"><span class="n">viii</span> foundation</a></li>
+  </ul>
+</header>
+
+<section id="standing">
+  <p class="sec-label">i</p>
+  <h2>Where we stand, and why timing is the whole game</h2>
+  <p>
+    spawnd.dev today: Authority Score <strong>2</strong>, zero organic traffic, 16 ranked keywords,
+    37 backlinks from 32 referring domains. The marketing site has four indexable pages
+    (landing, /security, /download, /legion), no sitemap, no robots file, no blog, and the docs
+    live only in the GitHub repo. As an SEO asset the domain does not exist yet.
+  </p>
+  <p>
+    The nearest rival, Happy (happy.engineering), sits at Authority Score <strong>27</strong> with
+    ~3,500 organic visits/mo across 433 keywords and 556 referring domains — respectable, and
+    entirely catchable. That is roughly the profile spawnd.dev should expect
+    <em>after</em> a successful Show HN: a front-page HN launch typically lands 200–600 referring
+    domains within weeks, which is exactly the jump from AS 2 to AS ~25–30.
+  </p>
+  <div class="call">
+    <div class="t">The one structural insight</div>
+    <p>
+      The Halloween launch is not just a distribution event — it is the domain's <strong>link event</strong>.
+      Link equity flows to whatever pages exist when the links arrive, and it compounds from that day.
+      Every page in this document that exists on October 31 starts ranking in November.
+      Every page built in November waits months longer for the same position.
+    </p>
+    <p><strong>Ship the SEO surface before the launch, not after it.</strong> Ten weeks is enough for all of Tier 0–2.</p>
+  </div>
+  <p>
+    Calibration for everything below — what Keyword Difficulty actually means for this domain:
+  </p>
+  <div class="tbl-wrap"><table>
+    <tr><th>KD band</th><th>Semrush label</th><th>What it means for spawnd.dev</th></tr>
+    <tr><td class="num"><span class="kd kd-0">0–14</span></td><td>Very easy</td><td>Rankable <strong>now</strong>, at AS 2, with a good page and internal links alone.</td></tr>
+    <tr><td class="num"><span class="kd kd-1">15–29</span></td><td>Easy</td><td>Rankable now if the page is genuinely the best result; certain within weeks of launch.</td></tr>
+    <tr><td class="num"><span class="kd kd-2">30–49</span></td><td>Possible</td><td>The post-launch band. Build pre-launch, expect positions Nov–Feb as authority lands.</td></tr>
+    <tr><td class="num"><span class="kd kd-3">50+</span></td><td>Difficult</td><td>Head terms. Win their mid-tail instead; the head follows in year two or never.</td></tr>
+  </table></div>
+</section>
+
+<section id="method">
+  <p class="sec-label">ii</p>
+  <h2>Method</h2>
+  <p>
+    Semrush Keyword Magic Tool (logged-in session, US database, broad match, all-keywords mode),
+    37 seed queries spanning the product's demand space: the agent-CLI ecosystem
+    (<code>claude code</code>, <code>codex cli</code>, <code>opencode</code>, <code>aider</code>,
+    <code>claude max</code>), remote terminal access (<code>ssh from browser</code>, <code>web terminal</code>,
+    <code>remote terminal</code>, per-device SSH), the phone-coding surface (<code>mobile ide</code>,
+    <code>coding on ipad</code>), the DIY stack SPAWN D productizes (<code>tmux</code>, <code>mosh</code>,
+    <code>tailscale</code>, <code>vscode remote ssh</code>), competitors (<code>termius</code>,
+    <code>happy coder</code>, <code>omnara</code>), and category terms (<code>ai coding agent</code>,
+    <code>background agents</code>, <code>self hosted ai</code>, <code>agent orchestration</code>).
+  </p>
+  <p>
+    For each seed: the top 100 rows by volume with volume, KD, CPC, intent, and competitive density —
+    3,086 unique keywords carrying search volume after dedupe. Cluster sizing sums only keywords at
+    KD≤50 with ≥50 searches/mo, so every aggregate below is a floor, not a projection: the full
+    seed universes run to hundreds of thousands of long-tail variants the top-100 sample never touches
+    (the <code>remote access</code> universe alone is 455K keywords).
+  </p>
+</section>
+
+<section id="plays">
+  <p class="sec-label">iii</p>
+  <h2>The five plays, ranked by expected yield</h2>
+
+  <div class="play">
+    <div class="play-head"><span class="play-no">1</span><h3>The Claude Code mid-tail — squat on the ecosystem</h3></div>
+    <p class="play-stats">89 keywords · <b>62,680/mo</b> addressable at KD≤45 · median KD 36 · CPCs $5–$17</p>
+    <p>
+      <code>claude code</code> itself is 368,000 searches/mo at KD 86 — untouchable, ignore it.
+      But the universe around it is enormous (~60K keywords, 10.4M total volume) and the mid-tail is
+      <em>soft</em>, because the ecosystem is eighteen months old and the SERPs are Reddit threads,
+      GitHub issues, and thin AI-generated listicles. These searchers are literally the ICP:
+      people already paying for Claude Code who want to run it in more places.
+    </p>
+    <div class="tbl-wrap"><table>
+      <tr><th>keyword</th><th class="num">vol/mo</th><th class="num">kd</th><th class="num">cpc</th><th>the page that wins it</th></tr>
+      <tr><td class="kw">claude code web</td><td class="num">3,600</td><td class="num"><span class="kd kd-2">41</span></td><td class="num">$5.94</td><td>Use case: Claude Code in any browser tab — the product page</td></tr>
+      <tr><td class="kw">is claude code free</td><td class="num">3,600</td><td class="num"><span class="kd kd-2">46</span></td><td class="num">$31.03</td><td>Pricing explainer (subscription vs API) → plan calculator</td></tr>
+      <tr><td class="kw">claude code max</td><td class="num">2,400</td><td class="num"><span class="kd kd-1">29</span></td><td class="num">$9.54</td><td>“Claude Code on the Max plan” — maximalist guide</td></tr>
+      <tr><td class="kw">claude code tutorial</td><td class="num">2,400</td><td class="num"><span class="kd kd-2">45</span></td><td class="num">$3.35</td><td>Canonical getting-started guide (docs hub)</td></tr>
+      <tr><td class="kw">claude code remote</td><td class="num">1,600</td><td class="num"><span class="kd kd-1">29</span></td><td class="num">$14.41</td><td><strong>The flagship. This query IS the product.</strong></td></tr>
+      <tr><td class="kw">claude code commands</td><td class="num">1,600</td><td class="num"><span class="kd kd-2">35</span></td><td class="num">$9.79</td><td>Command / slash-command reference</td></tr>
+      <tr><td class="kw">claude code teams</td><td class="num">1,000</td><td class="num"><span class="kd kd-1">25</span></td><td class="num">$9.68</td><td>Multi-seat / shared-workspace guide (workspaces angle)</td></tr>
+      <tr><td class="kw">claude vs claude code</td><td class="num">1,000</td><td class="num"><span class="kd kd-1">28</span></td><td class="num">$11.61</td><td>Explainer (+ its twin “claude code vs claude”, 590 · KD 21)</td></tr>
+      <tr><td class="kw">claude code settings</td><td class="num">880</td><td class="num"><span class="kd kd-1">23</span></td><td class="num">$12.24</td><td>settings.json reference guide</td></tr>
+      <tr><td class="kw">claude code open source</td><td class="num">720</td><td class="num"><span class="kd kd-0">12</span></td><td class="num">$15.57</td><td>“The open-source Claude Code stack” — spawnd is the answer</td></tr>
+      <tr><td class="kw">claude code on iphone</td><td class="num">480</td><td class="num"><span class="kd kd-1">27</span></td><td class="num">$8.63</td><td>Use case: Claude Code from your phone</td></tr>
+      <tr><td class="kw">how to run claude code</td><td class="num">480</td><td class="num"><span class="kd kd-1">26</span></td><td class="num">$10.70</td><td>Getting-started guide (same hub as tutorial)</td></tr>
+      <tr><td class="kw">how to use claude code in terminal</td><td class="num">390</td><td class="num"><span class="kd kd-1">24</span></td><td class="num">$9.34</td><td>Terminal-first workflow guide</td></tr>
+    </table></div>
+    <p class="cap">Sample of 89 qualifying keywords. Misspellings (claudecode 12,100 · KD 45, claud code, calude code) resolve to the same pages.</p>
+    <p>
+      The prescription is a <strong>Claude Code hub</strong>: one pillar (“Run Claude Code anywhere”)
+      with the use-case pages as money pages and the reference/tutorial content as the authority spokes
+      that earn the links. Honest, genuinely-best-on-the-internet reference content here does double duty —
+      it ranks, and it seeds the exact community (r/ClaudeAI) the GTM plan targets.
+    </p>
+  </div>
+
+  <div class="play">
+    <div class="play-head"><span class="play-no">2</span><h3>The Codex CLI arbitrage — the crowd looked the other way</h3></div>
+    <p class="play-stats">40 keywords · <b>34,110/mo</b> addressable at KD≤50 · median KD 36 · advertisers bid <b>$223 CPC</b> on the head term</p>
+    <p>
+      <code>codex cli</code>: <strong>22,200 searches/mo at KD 36</strong> — the single largest
+      volume-to-difficulty arbitrage in the entire dataset. Every content team in the space chased
+      Claude Code (KD 86); almost nobody built for Codex, so its SERP is still official docs plus
+      forum scraps. A $223 CPC on an informational query means commercial intent the organic results
+      don't yet serve.
+    </p>
+    <div class="tbl-wrap"><table>
+      <tr><th>keyword</th><th class="num">vol/mo</th><th class="num">kd</th><th>the page that wins it</th></tr>
+      <tr><td class="kw">codex cli</td><td class="num">22,200</td><td class="num"><span class="kd kd-2">36</span></td><td>The definitive Codex CLI guide (pillar)</td></tr>
+      <tr><td class="kw">openai codex cli</td><td class="num">5,400</td><td class="num"><span class="kd kd-2">49</span></td><td>Same pillar</td></tr>
+      <tr><td class="kw">install codex cli</td><td class="num">1,600</td><td class="num"><span class="kd kd-2">30</span></td><td>Install guide per platform</td></tr>
+      <tr><td class="kw">codex cli save chat</td><td class="num">390</td><td class="num"><span class="kd kd-1">28</span></td><td>Sessions & persistence guide — replay is a product feature</td></tr>
+    </table></div>
+    <p>
+      This is also the strategic wedge: both named competitors are Claude/Codex-locked or
+      Claude-first, while SPAWN D runs <em>any</em> CLI. Owning Codex search traffic positions
+      spawnd as the neutral infrastructure while rivals fight over one harness's brand. The same
+      motion extends to <code>opencode</code> (49,500/mo head at KD 63, with
+      <code>opencode skills</code> 1,600 · KD 26, <code>oh my opencode</code> 4,400 · KD 42,
+      <code>is opencode free</code> 170 · KD 20) and <code>aider</code> — one “agents” section,
+      one page per CLI the daemon can possess.
+    </p>
+  </div>
+
+  <div class="play">
+    <div class="play-head"><span class="play-no">3</span><h3>Claude plan economics — the subscription maximalist's question</h3></div>
+    <p class="play-stats">37 keywords · <b>12,760/mo</b> addressable at KD≤45 · median KD 30 · CPCs to <b>$33.50</b></p>
+    <p>
+      The GTM doc names the “subscription maximalist” as a core persona. They are visible in the data,
+      asking one question in twenty phrasings, and the SERP for it is astonishingly weak:
+    </p>
+    <div class="tbl-wrap"><table>
+      <tr><th>keyword</th><th class="num">vol/mo</th><th class="num">kd</th><th class="num">cpc</th></tr>
+      <tr><td class="kw">claude max</td><td class="num">8,100</td><td class="num"><span class="kd kd-2">39</span></td><td class="num">$8.80</td></tr>
+      <tr><td class="kw">is extra usage for paid claude plans worth it</td><td class="num">720</td><td class="num"><span class="kd kd-1">29</span></td><td class="num">—</td></tr>
+      <tr><td class="kw">claude pro max plan</td><td class="num">260</td><td class="num"><span class="kd kd-1">29</span></td><td class="num">$9.34</td></tr>
+      <tr><td class="kw">claude pro vs. max</td><td class="num">170</td><td class="num"><span class="kd kd-0">14</span></td><td class="num">$9.20</td></tr>
+      <tr><td class="kw">claude pro or max</td><td class="num">90</td><td class="num"><span class="kd kd-0">10</span></td><td class="num">$8.16</td></tr>
+      <tr><td class="kw">pro vs max claude</td><td class="num">90</td><td class="num"><span class="kd kd-0">11</span></td><td class="num">$33.50</td></tr>
+      <tr><td class="kw">claude 5x vs 20x</td><td class="num">90</td><td class="num"><span class="kd kd-1">20</span></td><td class="num">$9.24</td></tr>
+    </table></div>
+    <p>
+      Build one interactive page: <strong>a Claude plan calculator</strong> — Pro vs Max 5x vs Max 20x
+      vs API pricing, by hours of agent use per day. Tools earn links passively, AI assistants cite them,
+      and the natural closing line is the product thesis: <em>whichever plan you pick, spawnd lets every
+      machine you own share it — the CLI logs in on the host, no API-key markup.</em>
+      The KD 10–14 micro-cluster ranks at AS 2, and the 8,100/mo head term is the post-launch prize
+      the calculator climbs toward.
+    </p>
+  </div>
+
+  <div class="play">
+    <div class="play-head"><span class="play-no">4</span><h3>The phone &amp; browser terminal — queries the product answers by existing</h3></div>
+    <p class="play-stats">~64 keywords · <b>15,400/mo</b> addressable across three sub-clusters · median KD ~30</p>
+    <p>
+      Nobody searching <code>ssh from iphone</code> wants an essay — they want a terminal on their phone.
+      SPAWN D <em>is</em> the answer, which makes these pages product pages wearing how-to clothes.
+      Three sub-clusters:
+    </p>
+    <div class="tbl-wrap"><table>
+      <tr><th>cluster</th><th class="num">addressable</th><th>anchor keywords</th><th>page</th></tr>
+      <tr>
+        <td>iPad / iPhone coding</td><td class="num">7,320/mo</td>
+        <td class="kw" style="white-space:normal">coding on ipad pro 1,000·29 · coding on ipad 1,600·41 · programming on ipad 1,300·37</td>
+        <td>“Real development from an iPad” hub — the honest answer is a terminal to a real machine, i.e. the product</td>
+      </tr>
+      <tr>
+        <td>SSH from a phone</td><td class="num">3,340/mo</td>
+        <td class="kw" style="white-space:normal">ipad ssh 1,000·31 · iphone ssh 170·22 · ios ssh client 110·19 · ssh on ipad 110·20</td>
+        <td>Per-device guides: SSH from iPhone / iPad / Android — “or skip SSH entirely”</td>
+      </tr>
+      <tr>
+        <td>Terminal in the browser</td><td class="num">4,760/mo</td>
+        <td class="kw" style="white-space:normal">online terminal 480·26 · terminal online 880·44 · web ssh cluster ~1,200/mo at KD 26–44</td>
+        <td><strong>A live tool: free in-browser terminal demo</strong> — xterm.js already ships in the repo; a sandboxed demo session is the landing page that ranks</td>
+      </tr>
+    </table></div>
+    <p>
+      The browser-terminal tool page is the extreme move worth making: an actual terminal you can type
+      into, on the page, zero signup. It converts the query into a product demonstration and collects
+      links the way calculators do. (See §vi for the <code>terminal browser</code> intent trap in this cluster.)
+    </p>
+  </div>
+
+  <div class="play">
+    <div class="play-head"><span class="play-no">5</span><h3>Rival congregations — comparison pages while they're cheap</h3></div>
+    <p class="play-stats">47 keywords · <b>25,770/mo</b> addressable at KD≤45 · median KD 29</p>
+    <div class="tbl-wrap"><table>
+      <tr><th>keyword</th><th class="num">vol/mo</th><th class="num">kd</th><th>page</th></tr>
+      <tr><td class="kw">termius</td><td class="num">8,100</td><td class="num"><span class="kd kd-2">39</span></td><td>“Termius alternative” + spawnd vs Termius (mobile-SSH buyers)</td></tr>
+      <tr><td class="kw">happy coder</td><td class="num">880</td><td class="num"><span class="kd kd-1">22</span></td><td>spawnd vs Happy — the architecture comparison (E2E relay vs no relay)</td></tr>
+      <tr><td class="kw">opencode vs aider</td><td class="num">210</td><td class="num"><span class="kd kd-0">14</span></td><td>Neutral CLI-agent comparison series — spawnd runs both</td></tr>
+      <tr><td class="kw">best ai coding tools 2026</td><td class="num">260</td><td class="num"><span class="kd kd-1">29</span></td><td rowspan="2">“Best AI coding agents” roundup, updated quarterly</td></tr>
+      <tr><td class="kw">best ai coding agents (variants)</td><td class="num">~900</td><td class="num"><span class="kd kd-2">30–36</span></td></tr>
+    </table></div>
+    <p>
+      The comparison register is already written — the GTM doc's competitive frame maps line-for-line
+      onto these pages (“no middlemen, not even encrypted ones”). The neutral <em>agent-vs-agent</em>
+      comparisons (opencode vs aider at KD 14) are the sleeper: spawnd is the only party that can write
+      them without a horse in the race, because it runs whichever wins.
+    </p>
+  </div>
+</section>
+
+<section id="shoulder">
+  <p class="sec-label">iv</p>
+  <h2>Shoulder clusters — the DIY flywheel</h2>
+  <p>
+    The GTM doc names the true incumbent: <strong>ssh + tmux + Tailscale, hand-rolled</strong>.
+    Those people search constantly, the queries are cheap, and every article ends one sentence from
+    the product (“this is that, productized”). Aggregate: ~19,000/mo at median KD ≤ 30.
+  </p>
+  <div class="tbl-wrap"><table>
+    <tr><th>cluster</th><th class="num">addressable</th><th class="num">med. kd</th><th>what to build</th></tr>
+    <tr><td>Remote access, Mac</td><td class="num">10,430/mo</td><td class="num"><span class="kd kd-1">27</span></td><td>One hub (“Remote access to your Mac, every method compared”) + spokes: remote login mac 320·27 · how to remote into a mac 320·26 · access mac remotely 260·25 — 64 qualifying variants</td></tr>
+    <tr><td>vscode remote ssh</td><td class="num">2,030/mo</td><td class="num"><span class="kd kd-2">30</span></td><td>Setup + troubleshooting guides (vscode ssh 720·27) — the exact developer one step from wanting sessions that survive the laptop lid</td></tr>
+    <tr><td>tmux</td><td class="num">1,010/mo<span class="muted"> (sampled)</span></td><td class="num"><span class="kd kd-1">21</span></td><td>Interactive tmux cheatsheet (tmux kill all sessions 260·13, exit/attach/list variants KD 20–28; universe is 207K keywords) — link magnet for the exact ICP</td></tr>
+    <tr><td>mosh</td><td class="num">3,680/mo</td><td class="num"><span class="kd kd-2">37</span></td><td>“mosh vs ssh” + modern alternatives essay (mosh 12,100·60 head; universe avg KD 28)</td></tr>
+    <tr><td>Tailscale support gaps</td><td class="num">~500/mo</td><td class="num"><span class="kd kd-0">≤13</span></td><td>Targeted fixes: tailscale stuck on starting 90·<b>3</b> · tailscale admin panel 90·13 — trivial wins that pull the tailnet crowd</td></tr>
+    <tr><td>Category coinage</td><td class="num">5,510/mo</td><td class="num"><span class="kd kd-1">29</span></td><td>agentic orchestration 720·<b>16</b> · cloud development environment 320·<b>19</b> · background agent 260·23 · self hosted ai cluster ~1,200/mo at KD 27–31 · ai agent orchestration 1,000·44 — own the definitions while they're unowned</td></tr>
+  </table></div>
+  <p>
+    The category-coinage row deserves emphasis: <code>agentic orchestration</code> at KD 16 and
+    <code>background agent</code> at KD 23 are the vocabulary this industry will use in two years,
+    currently rankable by anyone with a coherent definition page. Definitional pages are also what
+    LLMs cite — spawnd.dev currently has <strong>zero AI-search visibility</strong> (no ChatGPT,
+    AI Overview, or Gemini citations), and this is the cheapest correction.
+  </p>
+</section>
+
+<section id="instant">
+  <p class="sec-label">v</p>
+  <h2>The instant-rank list — winnable at Authority Score 2</h2>
+  <p>Every keyword here is KD ≤ 20 with real volume and true relevance. These are the pages to ship first; several are afternoon-sized.</p>
+  <div class="tbl-wrap"><table>
+    <tr><th>keyword</th><th class="num">vol/mo</th><th class="num">kd</th><th class="num">cpc</th><th>page</th></tr>
+    <tr><td class="kw">claude code open source</td><td class="num">720</td><td class="num"><span class="kd kd-0">12</span></td><td class="num">$15.57</td><td>The open-source Claude Code stack</td></tr>
+    <tr><td class="kw">agentic orchestration</td><td class="num">720</td><td class="num"><span class="kd kd-0">16</span></td><td class="num">$10.46</td><td>Definition pillar → “orchestrate agents across your machines”</td></tr>
+    <tr><td class="kw">claude code might not be available in your country.</td><td class="num">320</td><td class="num"><span class="kd kd-0">12</span></td><td class="num">$18.62</td><td>Error-message fix page (support content ranks instantly)</td></tr>
+    <tr><td class="kw">best ssh client for windows</td><td class="num">320</td><td class="num"><span class="kd kd-1">20</span></td><td class="num">$6.21</td><td>SSH client roundup (honest; spawnd as the browser answer)</td></tr>
+    <tr><td class="kw">cloud development environment</td><td class="num">320</td><td class="num"><span class="kd kd-1">19</span></td><td class="num">$8.98</td><td>CDE definition + “the self-hosted CDE” angle</td></tr>
+    <tr><td class="kw">opencode vs aider</td><td class="num">210</td><td class="num"><span class="kd kd-0">14</span></td><td class="num">—</td><td>Comparison (first of the agent-vs-agent series)</td></tr>
+    <tr><td class="kw">claude pro vs. max (+ 3 variants)</td><td class="num">~440</td><td class="num"><span class="kd kd-0">10–14</span></td><td class="num">to $33.50</td><td>Plan calculator (Play 3)</td></tr>
+    <tr><td class="kw">is opencode free</td><td class="num">170</td><td class="num"><span class="kd kd-1">20</span></td><td class="num">—</td><td>opencode pricing explainer (agents section)</td></tr>
+    <tr><td class="kw">ios ssh client</td><td class="num">110</td><td class="num"><span class="kd kd-0">19</span></td><td class="num">—</td><td>SSH from iPhone guide (Play 4)</td></tr>
+    <tr><td class="kw">vibe coding vs traditional coding</td><td class="num">90</td><td class="num"><span class="kd kd-0">9</span></td><td class="num">$2.00</td><td>Essay; feeds the 90,500/mo vibe-coding universe long-game</td></tr>
+    <tr><td class="kw">tailscale stuck on starting</td><td class="num">90</td><td class="num"><span class="kd kd-0">3</span></td><td class="num">—</td><td>Troubleshooting page (DIY flywheel)</td></tr>
+    <tr><td class="kw">claude 5x vs 20x</td><td class="num">90</td><td class="num"><span class="kd kd-1">20</span></td><td class="num">$9.24</td><td>Folded into the plan calculator</td></tr>
+  </table></div>
+  <p class="cap">~3,600 searches/mo of directly winnable demand before a single launch backlink lands.</p>
+</section>
+
+<section id="false">
+  <p class="sec-label">vi</p>
+  <h2>False friends — tempting numbers that belong to someone else</h2>
+  <div class="call warn">
+    <div class="t">Do not chase these</div>
+    <p class="wide" style="max-width:70ch">
+      <strong>remote terminal unit</strong> (2,900/mo · KD 19) and everything RTU — SCADA hardware for
+      electrical substations, not terminals. This poisons the seed's own head:
+      <strong>what is remote terminal</strong> (1,000 · KD 18) mostly means RTU too — verify the SERP before writing it.
+      <strong>happy code escola</strong> (590 · KD 9) — a Brazilian kids' coding school, not the competitor.
+      <strong>terminal browser</strong> / <strong>browser in terminal</strong> cluster (~1,000/mo, KD 21–41) —
+      reversed intent: people who want lynx/w3m, a web browser <em>inside</em> a terminal. Adjacent crowd, wrong product.
+      <strong>remote coding careers / jobs</strong> — employment queries.
+      <strong>homey self hosted</strong> — smart-home platform.
+      <strong>vibe coding keyboard</strong> (90 · KD 9) — a physical product.
+    </p>
+  </div>
+</section>
+
+<section id="blueprint">
+  <p class="sec-label">vii</p>
+  <h2>The page blueprint — 34 pages in four tiers</h2>
+  <p>
+    Sequenced by the authority curve: Tier 0–1 rank at AS 2 and must exist before October 31;
+    Tier 2 is built pre-launch to catch the link event; Tier 3 compounds after it.
+  </p>
+
+  <h3>Tier 0 — this week, afternoon-sized (7 pages)</h3>
+  <ul>
+    <li>Claude plan calculator (<span class="mono">claude pro vs max</span> cluster, KD 10–20)</li>
+    <li>The open-source Claude Code stack (<span class="mono">claude code open source</span>, 720 · 12)</li>
+    <li>Agentic orchestration, defined (720 · 16)</li>
+    <li>“Claude Code might not be available in your country” fix (320 · 12)</li>
+    <li>opencode vs aider (210 · 14)</li>
+    <li>Cloud development environment, defined — the self-hosted kind (320 · 19)</li>
+    <li>Tailscale stuck on starting (90 · 3)</li>
+  </ul>
+
+  <h3>Tier 1 — pre-launch money pages (9)</h3>
+  <ul>
+    <li><strong>Claude Code, remote</strong> — the flagship use-case page (1,600 · 29 + <span class="mono">claude code on iphone</span> 480 · 27)</li>
+    <li>Claude Code on the Max plan (2,400 · 29)</li>
+    <li>Claude Code settings reference (880 · 23) · commands reference (1,600 · 35)</li>
+    <li>Claude Code for teams (1,000 · 25)</li>
+    <li>claude vs claude code explainer (1,590 combined · 21–28)</li>
+    <li>How to run Claude Code — canonical tutorial (480 · 26 + 2,400 · 45)</li>
+    <li>SSH from iPhone / iPad / Android — three per-device guides (~1,700/mo combined, KD 19–31)</li>
+    <li>spawnd vs Happy (880 · 22) · Termius alternatives (8,100 · 39 brand universe)</li>
+    <li>Remote access to your Mac — hub + first three spokes (10,430/mo cluster · med KD 27)</li>
+  </ul>
+
+  <h3>Tier 2 — the two big bets, live before launch (4)</h3>
+  <ul>
+    <li><strong>The Codex CLI compendium</strong> — pillar + install + sessions pages (34,110/mo cluster)</li>
+    <li><strong>Live browser-terminal demo tool</strong> (online/web terminal + web ssh, ~4,760/mo)</li>
+    <li>Interactive tmux cheatsheet (207K-keyword universe, med KD 21 sampled)</li>
+    <li>Coding on an iPad, honestly — hub (7,320/mo · med KD 29)</li>
+  </ul>
+
+  <h3>Tier 3 — post-launch compounding (14)</h3>
+  <ul>
+    <li>claude code web (3,600 · 41) · is claude code free (3,600 · 46) — build after AS jump</li>
+    <li>Per-agent pages: run <em>claude / codex / opencode / aider / gemini-cli</em> from your phone — programmatic template, five pages, extensible to every CLI the daemon supports</li>
+    <li>Best AI coding agents roundup, quarterly (~1,600/mo across variants · KD 29–49)</li>
+    <li>mosh vs ssh + modern remote-shell essay (3,680/mo)</li>
+    <li>vscode remote ssh setup + troubleshooting pair (2,030/mo)</li>
+    <li>self-hosted AI infrastructure pillar (~1,200/mo · KD 27–31)</li>
+    <li>background agents, defined (260 · 23 — pre-category-boom insurance)</li>
+    <li>best terminal for mac / windows roundups (~2,300/mo · KD 25–39)</li>
+  </ul>
+
+  <div class="verdict">
+    Realistic yield: the ~178K/mo addressable pool at a mature 10–15% capture is
+    <b>18,000–27,000 organic visits/mo</b> within 6–9 months of launch — five to eight times
+    Happy's entire current organic channel — from roughly 34 pages, most of which double as
+    launch-week ammunition for HN and Reddit.
+  </div>
+</section>
+
+<section id="foundation">
+  <p class="sec-label">viii</p>
+  <h2>Foundation — make the domain crawlable before making it famous</h2>
+  <ol>
+    <li><strong>Sitemap + robots.</strong> Neither exists. <code>app/sitemap.ts</code> and <code>app/robots.ts</code> in the Next.js app; an afternoon.</li>
+    <li><strong>Docs on-site, not only in the repo.</strong> TRUST.md, SESSIOND.md, and the exorcism doc rendered under spawnd.dev/docs. “Designing a control plane that can't read your data” is a linkable essay the GTM plan already intends to post — every link it earns should land on spawnd.dev, not github.com.</li>
+    <li><strong>A blog that matches the register.</strong> The grimoire voice is a durable differentiator in a sea of AI-written SEO sludge — deadpan, mechanism-first, quotable. Every page above ends with the same honest turn: here's the DIY way in full, and here's the one-line possession.</li>
+    <li><strong>Structured data + llms.txt.</strong> FAQ/HowTo schema on guides; an <code>llms.txt</code> naming what spawnd is in one paragraph. AI-search visibility is currently zero across every engine Semrush tracks, and definitional pages plus calculators are precisely what assistants cite.</li>
+    <li><strong>Internal linking discipline.</strong> Hubs link spokes, spokes link the product page for their use case, every tool page links its explainer. At AS 2, internal links are most of the link graph — spend them deliberately.</li>
+  </ol>
+  <p class="foot">
+    Sources: Semrush Keyword Magic Tool + Domain Overview (US database, session of Aug 31 2026) ·
+    37 seed universes, top 100 rows by volume each, 3,086 unique keywords with volume after dedupe ·
+    spawnd.dev and happy.engineering domain metrics as of Aug 30 2026 ·
+    KD = Semrush Keyword Difficulty (0–100) · vol = US monthly searches. Cluster sums count KD≤50, vol≥50 only — floors, not forecasts.
+  </p>
+</section>
+</div>
+</body>
+</html>
