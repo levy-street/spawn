@@ -240,7 +240,7 @@ pub struct BillingState {
 #[serde(default)]
 pub struct BillingTier {
     pub key: String,
-    /// What a person reads. The Legion tier is spelled "the Legion plan".
+    /// What a person reads ("Coven", "Legion", "Pandemonium").
     pub name: String,
     /// Monthly, USD, in cents.
     pub price_cents: i64,
@@ -336,7 +336,7 @@ mod billing_tests {
         vec![
             tier("free", "Free", 0, Some(1)),
             tier("coven", "Coven", 500, Some(3)),
-            tier("legion", "the Legion plan", 2_000, Some(20)),
+            tier("legion", "Legion", 2_000, Some(20)),
             tier("pandemonium", "Pandemonium", 5_000, None),
         ]
     }

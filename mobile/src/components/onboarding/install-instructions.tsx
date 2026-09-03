@@ -108,105 +108,113 @@ export function InstallInstructions({
         </View>
       ) : null}
 
-      <View style={styles.heading}>
-        <Text accessibilityRole="header" variant="title">
-          Connect your first computer
-        </Text>
-        <Text color="mutedForeground">
-          A host is a computer SPAWN D opens terminals on — usually your own Mac, Linux, or Windows
-          machine.
-        </Text>
-      </View>
+      {/* At the limit there is nothing to install: the daemon would only be
+          turned away at the end of the ceremony. The notice above is the
+          whole screen, plus the way on below. */}
+      {atHostLimit(billing) ? null : (
+        <>
+          <View style={styles.heading}>
+            <Text accessibilityRole="header" variant="title">
+              Connect your first computer
+            </Text>
+            <Text color="mutedForeground">
+              A host is a computer SPAWN D opens terminals on — usually your own Mac, Linux, or
+              Windows machine.
+            </Text>
+          </View>
 
-      <View style={styles.targetChoice}>
-        <Text color="mutedForeground">Choose the computer you're installing on.</Text>
-        <SegmentedControl<InstallTargetId>
-          accessibilityLabel="Host operating system"
-          onChange={(targetId) => {
-            setActiveTargetId(targetId);
-            setCopied(false);
-          }}
-          options={targets.map((target) => ({ label: target.label, value: target.id }))}
-          testID="install-target"
-          value={activeTarget.id}
-        />
-      </View>
+          <View style={styles.targetChoice}>
+            <Text color="mutedForeground">Choose the computer you're installing on.</Text>
+            <SegmentedControl<InstallTargetId>
+              accessibilityLabel="Host operating system"
+              onChange={(targetId) => {
+                setActiveTargetId(targetId);
+                setCopied(false);
+              }}
+              options={targets.map((target) => ({ label: target.label, value: target.id }))}
+              testID="install-target"
+              value={activeTarget.id}
+            />
+          </View>
 
-      <View style={styles.instruction}>
-        <View
-          style={[
-            styles.number,
-            { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
-          ]}
-        >
-          <Text color="background" variant="label">
-            1
-          </Text>
-        </View>
-        <View style={styles.instructionCopy}>
-          <Text weight="medium">On that computer, paste this into a terminal</Text>
-          <Text color="mutedForeground">
-            This installs SPAWN D and starts the computer-side service.
-          </Text>
-        </View>
-      </View>
+          <View style={styles.instruction}>
+            <View
+              style={[
+                styles.number,
+                { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
+              ]}
+            >
+              <Text color="background" variant="label">
+                1
+              </Text>
+            </View>
+            <View style={styles.instructionCopy}>
+              <Text weight="medium">On that computer, paste this into a terminal</Text>
+              <Text color="mutedForeground">
+                This installs SPAWN D and starts the computer-side service.
+              </Text>
+            </View>
+          </View>
 
-      <Card style={styles.commandWell} variant="flat">
-        <View
-          accessibilityLabel={activeTarget.commandAccessibilityLabel}
-          style={styles.commandLine}
-        >
-          <Text color="mutedForeground" variant="mono">
-            {activeTarget.prompt}
+          <Card style={styles.commandWell} variant="flat">
+            <View
+              accessibilityLabel={activeTarget.commandAccessibilityLabel}
+              style={styles.commandLine}
+            >
+              <Text color="mutedForeground" variant="mono">
+                {activeTarget.prompt}
+              </Text>
+              <Text selectable style={styles.command} variant="mono">
+                {activeTarget.command}
+              </Text>
+            </View>
+            <View style={styles.commandActions}>
+              <Button
+                accessibilityLabel={copied ? "Install command copied" : "Copy install command"}
+                onPress={() => void copyCommand()}
+                size="sm"
+                variant="outline"
+              >
+                <Icon color="foreground" name={copied ? "Check" : "Copy"} size={spacing[4]} />
+                {copied ? "Copied" : "Copy command"}
+              </Button>
+              <Button
+                accessibilityLabel="Share install command"
+                onPress={() => void shareCommand()}
+                size="sm"
+                variant="outline"
+              >
+                <Icon color="foreground" name="Send" size={spacing[4]} />
+                Share
+              </Button>
+            </View>
+          </Card>
+          <Text color="mutedForeground" variant="caption">
+            Already running SPAWN D for another account on that machine? Run spawnd possess
+            --new-account instead, and it joins as a second, separate host.
           </Text>
-          <Text selectable style={styles.command} variant="mono">
-            {activeTarget.command}
-          </Text>
-        </View>
-        <View style={styles.commandActions}>
-          <Button
-            accessibilityLabel={copied ? "Install command copied" : "Copy install command"}
-            onPress={() => void copyCommand()}
-            size="sm"
-            variant="outline"
-          >
-            <Icon color="foreground" name={copied ? "Check" : "Copy"} size={spacing[4]} />
-            {copied ? "Copied" : "Copy command"}
-          </Button>
-          <Button
-            accessibilityLabel="Share install command"
-            onPress={() => void shareCommand()}
-            size="sm"
-            variant="outline"
-          >
-            <Icon color="foreground" name="Send" size={spacing[4]} />
-            Share
-          </Button>
-        </View>
-      </Card>
-      <Text color="mutedForeground" variant="caption">
-        Already running SPAWN D for another account on that machine? Run spawnd possess
-        --new-account instead.
-      </Text>
 
-      <View style={styles.instruction}>
-        <View
-          style={[
-            styles.number,
-            { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
-          ]}
-        >
-          <Text color="background" variant="label">
-            2
-          </Text>
-        </View>
-        <View style={styles.instructionCopy}>
-          <Text weight="medium">Approve it from this phone</Text>
-          <Text color="mutedForeground">
-            When the install finishes it prints a link. Open it on this phone or scan the QR code.
-          </Text>
-        </View>
-      </View>
+          <View style={styles.instruction}>
+            <View
+              style={[
+                styles.number,
+                { backgroundColor: theme.colors.foreground, borderRadius: theme.radii.pill },
+              ]}
+            >
+              <Text color="background" variant="label">
+                2
+              </Text>
+            </View>
+            <View style={styles.instructionCopy}>
+              <Text weight="medium">Approve it from this phone</Text>
+              <Text color="mutedForeground">
+                When the install finishes it prints a link. Open it on this phone or scan the QR
+                code.
+              </Text>
+            </View>
+          </View>
+        </>
+      )}
 
       {onSkip !== undefined ? (
         <View style={styles.actions}>

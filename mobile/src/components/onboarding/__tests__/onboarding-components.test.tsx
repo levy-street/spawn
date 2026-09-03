@@ -200,7 +200,7 @@ describe("onboarding security states", () => {
     ).toBeOnTheScreen();
     expect(
       screen.getByText(
-        "Already running SPAWN D for another account on that machine? Run spawnd possess --new-account instead.",
+        "Already running SPAWN D for another account on that machine? Run spawnd possess --new-account instead, and it joins as a second, separate host.",
       ),
     ).toBeOnTheScreen();
     expect(
