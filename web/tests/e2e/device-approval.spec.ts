@@ -222,7 +222,7 @@ test("the bare page keeps installation instructions and has no code entry", asyn
 
   // The install command is the instruction; it leads, unfolded.
   await expect(page.getByText(/curl -fsSL .*install\.sh \| sh$/)).toBeVisible();
-  await expect(page.getByText("After installation, run")).toContainText("spawnd possess");
+  await expect(page.getByText("When it finishes, run")).toContainText("spawnd possess");
   await expect(page.getByText("Already running SPAWN D for another account")).toContainText(
     "--new-account",
   );

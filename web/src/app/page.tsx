@@ -334,14 +334,16 @@ export default function LandingPage() {
           >
             <source src="/brand/ink/hero-ink.mp4" type="video/mp4" />
           </video>
-          <Image
+          {/* The still, for anyone who asked for reduced motion. A plain img
+           * rather than next/image: it is display:none for everyone else, and
+           * next/image measures a hidden element as zero-wide and warns about
+           * the sizes hint on every load. */}
+          {/* biome-ignore lint/performance/noImgElement: reduced-motion fallback for the video, hidden otherwise */}
+          <img
             src="/brand/ink/hero-ink.png"
             alt=""
             aria-hidden
-            fill
-            priority
-            sizes="100vw"
-            className="pointer-events-none hidden object-cover motion-reduce:block"
+            className="pointer-events-none absolute inset-0 hidden size-full object-cover motion-reduce:block"
           />
         </div>
         {/* Registration marks: the corners of the press bed. */}

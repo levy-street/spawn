@@ -14,6 +14,7 @@ import {
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
+import { openAddMachine } from "@/components/hosts/add-machine-dialog-store";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { LegionStrip } from "@/components/legion/LegionStrip";
 import { DownloadMenu } from "@/components/nav/download-menu";
@@ -514,7 +515,7 @@ export function Sidebar({
           ? undefined
           : () => {
               onNavigate?.();
-              router.push("/device");
+              openAddMachine();
             }
       }
       className={cn(sidebarRowClass(false), "group/new")}
@@ -786,22 +787,23 @@ export function Sidebar({
       />
 
       <div className="border-y border-border px-2.5 py-2">
+        {/* A plain row, dressed exactly like Legion and View hosts above it —
+         * not a Button, whose own weight and padding made this one footer
+         * row read heavier than the rest. */}
         <RailTooltip label="Settings" disabled={!collapsed}>
-          <Button
+          <button
             type="button"
-            variant="ghost"
-            size="sm"
             onClick={() => {
               onNavigate?.();
               openSettings("account");
             }}
-            className={cn(sidebarRowClass(false), "justify-start px-0")}
+            className={sidebarRowClass(false)}
           >
             <SidebarIconSlot>
               <Settings className="size-4" aria-hidden />
             </SidebarIconSlot>
             <SidebarRowLabel collapsed={collapsed}>Settings</SidebarRowLabel>
-          </Button>
+          </button>
         </RailTooltip>
 
         {/* One row, two controls: the account menu, and the apps beside it.
@@ -816,15 +818,12 @@ export function Sidebar({
             className="block min-w-0 flex-1"
             renderTrigger={(props) => (
               <RailTooltip label={user?.email ?? "Account"} disabled={!collapsed}>
-                <Button
+                <button
                   {...props}
                   type="button"
-                  variant="ghost"
-                  size="sm"
                   aria-label="Account menu"
                   className={cn(
                     sidebarRowClass(false),
-                    "h-11 justify-start px-0",
                     // The row's own ground is the pill around both controls;
                     // a second one here would double the tint.
                     "hover:bg-transparent",
@@ -835,10 +834,10 @@ export function Sidebar({
                       {(user?.email ?? "?").slice(0, 1)}
                     </span>
                   </SidebarIconSlot>
-                  {/* No size override: the address reads at the same size as
-                      the Settings row above it — footer rows are one rhythm. */}
+                  {/* Same row class, same height, same face as every row
+                      above it — footer rows are one rhythm. */}
                   <SidebarRowLabel collapsed={collapsed}>{user?.email ?? "—"}</SidebarRowLabel>
-                </Button>
+                </button>
               </RailTooltip>
             )}
           >

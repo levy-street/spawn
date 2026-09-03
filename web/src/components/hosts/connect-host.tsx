@@ -423,12 +423,23 @@ export function ConnectHostSection(props: {
                 )}
               </Button>
             </div>
-            <p className="text-xs leading-5 text-muted-foreground">
-              After installation, run <code>spawnd possess</code> on that machine.
-            </p>
+            <ol className="space-y-1.5 text-xs leading-5 text-muted-foreground">
+              <li className="flex gap-2">
+                <span className="w-3 shrink-0 font-mono text-foreground">1</span>
+                <span>Run that command in a terminal on the machine you are adding.</span>
+              </li>
+              <li className="flex gap-2">
+                <span className="w-3 shrink-0 font-mono text-foreground">2</span>
+                <span>
+                  When it finishes, run <code>spawnd possess</code> there. It opens a link for you
+                  to approve the machine from this account.
+                </span>
+              </li>
+            </ol>
             <p className="text-xs leading-5 text-muted-foreground">
               Already running SPAWN D for another account on that machine? Run{" "}
-              <code>spawnd possess --new-account</code> instead.
+              <code>spawnd possess --new-account</code> instead, and it joins as a second, separate
+              host.
             </p>
           </section>
         )}

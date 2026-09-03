@@ -57,7 +57,7 @@ test("the host gate notices a newly online host and moves on", async ({ page }) 
   await expect(page.getByRole("heading", { name: "Connect your first host" })).toBeVisible();
   const command = page.getByText(/curl -fsSL .*install\.sh \| sh$/);
   await expect(command).toBeVisible();
-  await expect(page.getByText("After installation, run")).toContainText("spawnd possess");
+  await expect(page.getByText("When it finishes, run")).toContainText("spawnd possess");
   await expect(page.getByText("Already running SPAWN D for another account")).toContainText(
     "--new-account",
   );

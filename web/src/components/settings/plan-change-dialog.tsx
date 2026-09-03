@@ -1,7 +1,9 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Check } from "lucide-react";
 import { useState } from "react";
+import { priceLabel as dollarsLabel, TIER_BLURB } from "@/app/pricing/tiers";
 import {
   HostKeepPicker,
   keepCountLabel,
@@ -16,11 +18,12 @@ import {
   hostLimitLabel,
   hostSelectionRequired,
   type LimitFacts,
+  planArt,
   planDirection,
-  priceLabel,
   serverMessage,
   subscriptionRequired,
 } from "@/lib/billing";
+import { leaveForBilling } from "@/lib/billing-return";
 import { cn } from "@/lib/utils";
 
 /**
@@ -97,6 +100,14 @@ export function PlanChangeDialog({
     mutationFn: async (tier: string) => {
       if (hasSubscription) {
         try {
+          // Up costs money, so it is confirmed and paid on Stripe's page and
+          // we hear the result through the webhook. Down never costs
+          // anything and has to run the host-selection step first, so it
+          // stays our own call.
+          if (planDirection(currentTier, tier, choices) === "upgrade") {
+            const { url } = await billing.upgrade(tier);
+            return { kind: "checkout", url } as const;
+          }
           await billing.changePlan(tier);
           return { kind: "changed" } as const;
         } catch (cause) {
@@ -113,7 +124,7 @@ export function PlanChangeDialog({
     onMutate: () => setError(null),
     onSuccess: (result) => {
       if (result.kind === "checkout") {
-        window.location.assign(result.url);
+        leaveForBilling(result.url);
         return;
       }
       settle();
@@ -134,7 +145,7 @@ export function PlanChangeDialog({
 
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(true) : close())}>
-      <DialogContent size="lg" data-testid="plan-change-dialog">
+      <DialogContent size={selection === null ? "xl" : "lg"} data-testid="plan-change-dialog">
         {selection === null ? (
           <ChooseStep
             choices={choices}
@@ -202,59 +213,29 @@ function ChooseStep({
         </DialogDescription>
       </div>
 
-      <fieldset className="min-h-0 flex-1 space-y-2 overflow-y-auto px-4">
+      <fieldset className="min-h-0 flex-1 overflow-y-auto px-4 py-2">
         <legend className="sr-only">Plans</legend>
-        {choices.map((tier) => {
-          const current = tier.key === currentTier;
-          const checked = target === tier.key;
-          return (
-            <label
+        <div className="grid gap-3 sm:grid-cols-3">
+          {choices.map((tier) => (
+            <PlanCard
               key={tier.key}
-              className={cn(
-                "flex items-center gap-3 rounded-md border p-3 transition-colors",
-                current
-                  ? "cursor-default border-border bg-muted/40"
-                  : checked
-                    ? "cursor-pointer border-brand-accent/60 bg-accent/40"
-                    : "cursor-pointer border-border hover:bg-accent/20",
-              )}
-            >
-              <input
-                type="radio"
-                name="plan-tier"
-                value={tier.key}
-                checked={checked}
-                disabled={current || busy}
-                onChange={() => onTarget(tier.key)}
-              />
-              <span className="min-w-0 flex-1">
-                <span className="flex flex-wrap items-baseline gap-x-2">
-                  <span className="text-sm font-medium">{tier.name}</span>
-                  {current && (
-                    <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                      current plan
-                    </span>
-                  )}
-                </span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  {/* Weight and tabular figures carry the emphasis; the poster
-                   * face stays on marketing surfaces. */}
-                  <span className="font-medium tabular-nums text-foreground">
-                    {priceLabel(tier.price_cents)}
-                  </span>{" "}
-                  · {hostLimitLabel(tier.host_limit)} {tier.host_limit === 1 ? "host" : "hosts"}
-                </span>
-              </span>
-            </label>
-          );
-        })}
+              tier={tier}
+              current={tier.key === currentTier}
+              checked={target === tier.key}
+              disabled={busy}
+              onChoose={() => onTarget(tier.key)}
+            />
+          ))}
+        </div>
       </fieldset>
 
       <div className="shrink-0 space-y-3 border-t border-border p-4">
         {direction !== "same" && (
           <p className="text-xs leading-5 text-muted-foreground">
             {direction === "upgrade"
-              ? "Applies immediately. You are charged the difference for the rest of this month."
+              ? hasSubscription
+                ? "Next, Stripe shows the prorated charge for the rest of this month and asks you to confirm. Nothing is charged until you do, and a cancellation you had scheduled is withdrawn."
+                : "Next, Stripe takes your card details and confirms the plan."
               : "Applies immediately, not at the end of the month. The unused part of what you have paid is credited against your next invoice, and if this plan holds fewer machines than you have, you choose which to keep next."}
           </p>
         )}
@@ -279,11 +260,113 @@ function ChooseStep({
             data-testid="plan-change-confirm"
           >
             {/* Standard verbs, chosen by what the click actually does. */}
-            {busy ? "Working…" : direction === "downgrade" ? "Change plan" : "Upgrade"}
+            {busy ? "Working…" : direction === "downgrade" ? "Change plan" : "Continue"}
           </Button>
         </div>
       </div>
     </>
+  );
+}
+
+/**
+ * One plan, as a card: its plate from the landing page's ink, the name, the
+ * price, what it admits, and one breath on who it is for. The radio is a real
+ * radio — the whole card is its label, so a click anywhere chooses it and a
+ * screen reader hears the tier by name.
+ */
+function PlanCard({
+  tier,
+  current,
+  checked,
+  disabled,
+  onChoose,
+}: {
+  tier: BillingTier;
+  current: boolean;
+  checked: boolean;
+  disabled: boolean;
+  onChoose: () => void;
+}) {
+  const art = planArt(tier.key);
+  return (
+    <label
+      data-testid={`plan-card-${tier.key}`}
+      data-state={current ? "current" : checked ? "checked" : "idle"}
+      className={cn(
+        "group relative flex min-w-0 flex-col overflow-hidden rounded-xl border bg-card transition-[border-color,box-shadow,transform] duration-200",
+        current
+          ? "cursor-default border-border"
+          : checked
+            ? "cursor-pointer border-brand-accent shadow-[0_0_0_1px_var(--brand-accent),0_18px_40px_-16px_var(--brand-accent)]"
+            : "cursor-pointer border-border hover:-translate-y-0.5 hover:border-foreground/30",
+      )}
+    >
+      {/* The plate: red ink on a transparent ground, so it prints on the
+       * card's own paper in either theme, and fades into the card at the
+       * foot where the copy begins. */}
+      <span className="relative block aspect-[3/1] overflow-hidden bg-muted/40 sm:aspect-[3/2]">
+        {art !== null && (
+          // biome-ignore lint/performance/noImgElement: static brand art, no optimisation needed
+          <img
+            src={art}
+            alt=""
+            className={cn(
+              "size-full object-cover transition-[opacity,transform] duration-300",
+              current
+                ? "opacity-50"
+                : checked
+                  ? "scale-[1.04] opacity-100"
+                  : "opacity-75 group-hover:scale-[1.02] group-hover:opacity-100",
+            )}
+          />
+        )}
+        <span
+          aria-hidden
+          className="absolute inset-x-0 bottom-0 h-2/5 bg-gradient-to-t from-card to-transparent"
+        />
+        <input
+          type="radio"
+          name="plan-tier"
+          value={tier.key}
+          checked={checked}
+          disabled={current || disabled}
+          onChange={onChoose}
+          className="absolute top-2.5 right-2.5 size-4 cursor-pointer accent-brand-accent disabled:cursor-default"
+        />
+        {current && (
+          <span className="absolute top-2 left-2 rounded-full border border-border bg-background/80 px-2 py-0.5 text-[11px] font-medium backdrop-blur">
+            Current plan
+          </span>
+        )}
+        {checked && !current && (
+          <span className="absolute top-2 left-2 flex items-center gap-1 rounded-full bg-brand-accent px-2 py-0.5 text-[11px] font-medium text-white">
+            <Check className="size-3" aria-hidden />
+            Selected
+          </span>
+        )}
+      </span>
+
+      <span className="flex flex-1 flex-col gap-1 px-3.5 pt-1 pb-3.5">
+        <span className={cn("text-sm font-semibold", current && "text-muted-foreground")}>
+          {tier.name}
+        </span>
+        {/* App chrome, so the app's own face — weight, size and tabular
+         * figures carry the emphasis; the poster face stays on marketing
+         * surfaces. */}
+        <span className="flex items-baseline gap-1.5">
+          <span className="text-2xl font-semibold tracking-tight tabular-nums">
+            {dollarsLabel(tier.price_cents)}
+          </span>
+          <span className="text-xs text-muted-foreground">/ month</span>
+        </span>
+        <span className="font-mono text-[11px] tracking-[0.18em] text-brand-accent uppercase">
+          {hostLimitLabel(tier.host_limit)} {tier.host_limit === 1 ? "host" : "hosts"}
+        </span>
+        <span className="mt-1.5 text-xs leading-5 text-muted-foreground">
+          {TIER_BLURB[tier.key] ?? ""}
+        </span>
+      </span>
+    </label>
   );
 }
 

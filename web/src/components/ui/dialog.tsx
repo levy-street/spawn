@@ -43,6 +43,13 @@ const contentVariants = cva(
           "max-h-[calc(var(--vv-height)-2rem)] rounded-xl border border-border shadow-2xl shadow-black/20 dark:shadow-black/50",
           "data-[state=open]:zoom-in-95",
         ),
+        // Three cards abreast — the plan picker. Wider than `lg` because three
+        // columns of art and copy need the room, still a centred panel.
+        xl: cn(
+          "left-1/2 top-1/2 w-[calc(100vw-2rem)] max-w-4xl -translate-x-1/2 -translate-y-1/2",
+          "max-h-[calc(var(--vv-height)-2rem)] rounded-xl border border-border shadow-2xl shadow-black/20 dark:shadow-black/50",
+          "data-[state=open]:zoom-in-95",
+        ),
         // Full screen on mobile, a large centered panel from md: up — the
         // SettingsDialog treatment, shared by the folder picker.
         "full-mobile": cn(

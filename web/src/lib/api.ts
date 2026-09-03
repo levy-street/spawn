@@ -535,7 +535,7 @@ export type AuthProvider = z.infer<typeof AuthProviderSchema>;
 /** One plan as a pricing surface lists it. Display only; nothing charges from here. */
 export const BillingTierSchema = z.object({
   key: z.string(),
-  /** The Legion tier is spelled "the Legion plan", here as everywhere. */
+  /** Display name, as the person reads it ("Coven", "Legion", "Pandemonium"). */
   name: z.string(),
   /** Monthly, USD, in cents. */
   price_cents: z.number().int().default(0),
@@ -1008,9 +1008,18 @@ export const billing = {
       method: "POST",
       schema: z.object({ url: z.string() }),
     }),
-  /** Our own plan change. Answers 409 `host_selection_required` when the
-   *  account holds more hosts than the target tier admits — release them
-   *  through `hosts.remove` first, then call this again. The server never
+  /** A move UP a plan: the Stripe-hosted page that shows the prorated
+   *  charge, takes the payment, and sends the browser back. Same
+   *  `host_selection_required` precondition as `changePlan`. */
+  upgrade: (tier: string) =>
+    api("/api/billing/upgrade", {
+      method: "POST",
+      body: JSON.stringify({ tier }),
+      schema: z.object({ url: z.string() }),
+    }),
+  /** Our own plan change — the way DOWN. Answers 409 `host_selection_required`
+   *  when the account holds more hosts than the target tier admits — release
+   *  them through `hosts.remove` first, then call this again. The server never
    *  releases a host on a billing signal. */
   changePlan: (tier: string) =>
     api("/api/billing/change-plan", {
