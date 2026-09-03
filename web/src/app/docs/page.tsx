@@ -26,6 +26,7 @@ export const metadata: Metadata = {
     url: "/docs",
     siteName: "spawnd",
     type: "website",
+    images: [{ url: "/og.jpg", width: 2400, height: 1260, alt: TITLE }],
   },
 };
 
