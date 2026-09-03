@@ -67,8 +67,15 @@ export default async function DocPage({ params }: { params: Promise<{ slug: stri
   const doc = findDoc(slug);
   if (!doc) notFound();
   const source = await readFile(join(REPO_ROOT, doc.file), "utf8");
-  // The document's own H1 is the page's hero; drop it from the body.
-  const body = source.replace(/^# .*\n/, "");
+  // The document's own H1 is the page's hero; drop it from the body. Links
+  // to sibling documents resolve to their on-site pages when they have one
+  // and become plain text when they don't — never a 404 or a private repo.
+  const body = source
+    .replace(/^# .*\n/, "")
+    .replace(/\[([^\]]+)\]\(([A-Za-z0-9_./-]+\.md)(#[^)]*)?\)/g, (_match, text, file, hash) => {
+      const target = DOCS.find((doc) => doc.file.endsWith(file.replace(/^\.\//, "")));
+      return target ? `[${text}](/docs/${target.slug}${hash ?? ""})` : text;
+    });
   return (
     <Frame
       crumb={{ name: "Docs", href: "/docs" }}
