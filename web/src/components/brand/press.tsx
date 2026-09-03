@@ -224,6 +224,12 @@ export function Colophon() {
             <Link href="/download" className="transition-colors hover:text-bone">
               Install
             </Link>
+            <Link href="/guides" className="transition-colors hover:text-bone">
+              Guides
+            </Link>
+            <Link href="/docs" className="transition-colors hover:text-bone">
+              Docs
+            </Link>
             <Link href="/login" className="transition-colors hover:text-bone">
               Log in
             </Link>

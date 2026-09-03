@@ -24,7 +24,12 @@ The permanent tmux-removal boundary is unchanged. Production tmux execution,
 backend selection, session protocol fields, and compatibility fallback remain
 literal forbidden surfaces under `scripts/check-worker-only-daemon.sh`. A tmux
 bug is translated into the equivalent worker-only behavior; restoring tmux
-requires a new ADR and explicit trust-boundary review.
+requires a new ADR and explicit trust-boundary review. The guard exempts the
+SEO content paths (`web/src/lib/grimoire/`, `web/src/app/tmux-cheatsheet/`,
+`web/src/app/llms.txt/`, and the `web/CLAUDE.md` that names those routes):
+pages that teach third-party tools name tmux as a tool the reader already
+uses, which is copy, not a backend. Product code under `web/src` outside those
+paths is still scanned.
 
 `scripts/check-durable-data-decision.sh` follows this policy: it checks exact
 DATA/P3 ledger statuses, canonical DATA declarations, required documentation,
