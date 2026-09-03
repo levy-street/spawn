@@ -18,7 +18,7 @@ spawnd runs coding agents (Claude Code, Codex, OpenCode, Aider, or any CLI) as p
 - [Home](${SITE}/): what it is and the one-line install
 - [Security](${SITE}/security): the trust model, plainly
 - [Download](${SITE}/download): the daemon, per platform
-- [Docs](${SITE}/docs): the threat model and the session architecture, rendered on-site
+- [Docs](${SITE}/docs): design documents rendered on-site, starting with the session architecture
 
 ## Guides and references
 
