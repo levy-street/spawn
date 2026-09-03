@@ -269,6 +269,18 @@ class Settings(BaseSettings):
     # Where Checkout and the Customer Portal return the browser. Falls back to
     # `web_url`, then `public_url`, like every other link the server builds.
     billing_return_url: str | None = None
+    # The Customer Portal configuration "Manage billing" opens: ours, with plan
+    # switching OFF (docs/BILLING.md §2.2). Absent, Stripe uses the account's
+    # default configuration, which is whatever the dashboard happens to say.
+    stripe_portal_configuration: str | None = None
+    # A second configuration with plan switching ON, used for one thing only:
+    # deep-linked `subscription_update_confirm` flows — the Stripe-hosted page
+    # that shows the prorated charge and takes the payment when somebody moves
+    # up a plan. Stripe refuses that flow under a configuration with updates
+    # disabled, and the flow page hides every route into the rest of the
+    # portal, so switching never becomes reachable from "Manage billing".
+    # Required when billing is on: without it no paid account can upgrade.
+    stripe_portal_upgrade_configuration: str | None = None
 
     # Whether the mobile apps may show a link out to somewhere a plan can be
     # changed. False at launch, and deliberately server-driven: a binary that
@@ -332,6 +344,13 @@ class Settings(BaseSettings):
                     f"{name} is empty, so that tier has no price to attach a subscription "
                     "to and the server cannot map a subscription back to it."
                 )
+        if not self.stripe_portal_upgrade_configuration:
+            problems.append(
+                "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION is empty, so no paid account "
+                "can move up a plan: the Stripe page that confirms an upgrade needs a "
+                "portal configuration with subscription updates enabled. "
+                "scripts/stripe-provision.sh creates it."
+            )
         if not problems:
             return self
 

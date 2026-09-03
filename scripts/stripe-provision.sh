@@ -231,7 +231,53 @@ SPAWN_STRIPE_PRICE_COVEN=$PRICE_COVEN
 SPAWN_STRIPE_PRICE_LEGION=$PRICE_LEGION
 SPAWN_STRIPE_PRICE_PANDEMONIUM=$PRICE_PANDE
 
+# ------------------------------------------------------------ upgrade portal --
+# UPGRADE PORTAL: a second configuration, plan switching ON, used for exactly
+# one thing — the deep-linked `subscription_update_confirm` flow, the
+# Stripe-hosted page that shows the prorated charge and takes the payment when
+# somebody moves up a plan. Stripe refuses that flow under a configuration with
+# updates disabled, and the flow page carries no navigation into the rest of
+# the portal, so switching stays unreachable from "Manage billing" (which uses
+# the configuration above). Cancellation and invoices are off here on purpose:
+# nothing but the one page is ever meant to render under it.
+echo "==> Customer Portal configuration for plan-change confirmation"
+UPGRADE_PORTAL_ID=$(api get /v1/billing_portal/configurations -d "limit=100" 2>/dev/null \
+  | python3 -c '
+import sys, json
+for c in json.load(sys.stdin).get("data", []):
+    if c.get("metadata", {}).get("spawn_role") == "upgrade-confirm":
+        print(c["id"]); break
+' || true)
+
+if [[ -n "${UPGRADE_PORTAL_ID:-}" ]]; then
+  echo "  already exists: $UPGRADE_PORTAL_ID"
+else
+  # The products behind the three prices: the portal lists updates by product.
+  COVEN_PRODUCT=$(api get /v1/prices/$PRICE_COVEN | jqf product)
+  LEGION_PRODUCT=$(api get /v1/prices/$PRICE_LEGION | jqf product)
+  PANDEMONIUM_PRODUCT=$(api get /v1/prices/$PRICE_PANDE | jqf product)
+  UPGRADE_PORTAL_ID=$(api post /v1/billing_portal/configurations \
+    -d "metadata[spawn_role]=upgrade-confirm" \
+    -d "business_profile[headline]=SPAWN D" \
+    -d "features[invoice_history][enabled]=false" \
+    -d "features[payment_method_update][enabled]=true" \
+    -d "features[customer_update][enabled]=false" \
+    -d "features[subscription_cancel][enabled]=false" \
+    -d "features[subscription_update][enabled]=true" \
+    -d "features[subscription_update][default_allowed_updates][0]=price" \
+    -d "features[subscription_update][proration_behavior]=create_prorations" \
+    -d "features[subscription_update][products][0][product]=$COVEN_PRODUCT" \
+    -d "features[subscription_update][products][0][prices][0]=$PRICE_COVEN" \
+    -d "features[subscription_update][products][1][product]=$LEGION_PRODUCT" \
+    -d "features[subscription_update][products][1][prices][0]=$PRICE_LEGION" \
+    -d "features[subscription_update][products][2][product]=$PANDEMONIUM_PRODUCT" \
+    -d "features[subscription_update][products][2][prices][0]=$PRICE_PANDE" | jqf id)
+  echo "  created $UPGRADE_PORTAL_ID"
+fi
+
+
 Customer Portal configuration: $PORTAL_ID
+SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION=$UPGRADE_PORTAL_ID
 
 SPAWN_BILLING_ENABLED stays false until the whole flow has been exercised
 end to end. Everything above is inert while it is.

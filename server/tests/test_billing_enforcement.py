@@ -51,6 +51,7 @@ STRIPE_ENV = {
     "SPAWN_STRIPE_PRICE_COVEN": "price_test_coven",
     "SPAWN_STRIPE_PRICE_LEGION": "price_test_legion",
     "SPAWN_STRIPE_PRICE_PANDEMONIUM": "price_test_pandemonium",
+    "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION": "bpc_test_upgrade",
 }
 
 # Words that must never reach a client from this server on a billing path.
@@ -391,9 +392,7 @@ async def test_the_config_block_lists_the_tiers_cheapest_first(client, billing_o
     assert block["tiers"] == [
         {"key": "free", "name": "Free", "price_cents": 0, "host_limit": 1},
         {"key": "coven", "name": "Coven", "price_cents": 500, "host_limit": 3},
-        # Spelled out: `/legion` is already the fleet page, so bare "Legion"
-        # in a billing sentence reads as that page rather than as a plan.
-        {"key": "legion", "name": "the Legion plan", "price_cents": 2000, "host_limit": 20},
+        {"key": "legion", "name": "Legion", "price_cents": 2000, "host_limit": 20},
         {
             "key": "pandemonium",
             "name": "Pandemonium",

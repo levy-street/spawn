@@ -41,6 +41,7 @@ STRIPE_ENV = {
     "SPAWN_STRIPE_PRICE_COVEN": PRICE_COVEN,
     "SPAWN_STRIPE_PRICE_LEGION": PRICE_LEGION,
     "SPAWN_STRIPE_PRICE_PANDEMONIUM": PRICE_PANDEMONIUM,
+    "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION": "bpc_test_upgrade",
 }
 
 
@@ -76,6 +77,7 @@ def _settings(**overrides) -> Settings:
             "stripe_price_coven": PRICE_COVEN,
             "stripe_price_legion": PRICE_LEGION,
             "stripe_price_pandemonium": PRICE_PANDEMONIUM,
+            "stripe_portal_upgrade_configuration": "bpc_test_upgrade",
             **overrides,
         },
     )
@@ -208,10 +210,12 @@ class TestCompedAccounts:
 
 
 class TestTierCatalogue:
-    def test_the_legion_plan_is_never_written_bare(self):
-        """`/legion` is already the fleet page. A billing string that says just
-        "Legion" reads as that page rather than as a plan, and is a bug."""
-        assert billing.TIERS[billing.TIER_LEGION].name == "the Legion plan"
+    def test_the_legion_plan_is_just_legion(self):
+        """The plan shares its noun with the `/legion` fleet page on purpose
+        (decided 2026-09-03; "the Legion plan" was a mouthful everywhere it
+        appeared). Sentences that carry the name say "plan" or "admits" beside
+        it, so the page and the plan never collide in one line."""
+        assert billing.TIERS[billing.TIER_LEGION].name == "Legion"
 
     def test_every_tier_key_matches_its_entry_and_the_order(self):
         assert tuple(billing.TIERS) == billing.TIER_ORDER
@@ -425,7 +429,7 @@ class TestBillingState:
             state = await billing.billing_state(session, user)
 
         assert state["tier"] == "legion"
-        assert state["tier_name"] == "the Legion plan"
+        assert state["tier_name"] == "Legion"
         assert state["host_limit"] == 20
         assert state["status"] == "past_due"
         assert state["cancel_at_period_end"] is True
@@ -536,6 +540,10 @@ class TestRefusingToBootHalfConfigured:
             ("stripe_price_coven", "SPAWN_STRIPE_PRICE_COVEN"),
             ("stripe_price_legion", "SPAWN_STRIPE_PRICE_LEGION"),
             ("stripe_price_pandemonium", "SPAWN_STRIPE_PRICE_PANDEMONIUM"),
+            (
+                "stripe_portal_upgrade_configuration",
+                "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION",
+            ),
         ],
     )
     @pytest.mark.parametrize("missing", [None, ""])
@@ -553,6 +561,7 @@ class TestRefusingToBootHalfConfigured:
                 stripe_price_coven=None,
                 stripe_price_legion=None,
                 stripe_price_pandemonium=None,
+                stripe_portal_upgrade_configuration=None,
             )
         message = str(raised.value)
         for variable in (
@@ -561,6 +570,7 @@ class TestRefusingToBootHalfConfigured:
             "SPAWN_STRIPE_PRICE_COVEN",
             "SPAWN_STRIPE_PRICE_LEGION",
             "SPAWN_STRIPE_PRICE_PANDEMONIUM",
+            "SPAWN_STRIPE_PORTAL_UPGRADE_CONFIGURATION",
         ):
             assert variable in message
 

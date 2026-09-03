@@ -24,12 +24,13 @@ calls, and no new columns consulted. See §3.1.
 
 Monthly only. USD only. No annual, no trials, no seats, no metered usage.
 
-> **Naming collision, handled deliberately.** `/legion` is already the fleet
-> page and `components/legion/` is already a component family. The tier is
-> therefore **always written "the Legion plan"** — never bare "Legion" — in every
-> string a person reads, and the code name for it is `TIER_LEGION` with the
-> plan-tier enum value `"legion"`. The fleet page keeps its noun untouched. A
-> string that says just "Legion" in a billing context is a bug.
+> **Naming collision, accepted.** `/legion` is already the fleet page and
+> `components/legion/` is already a component family, and the tier is written
+> **"Legion"** all the same (decided 2026-09-03 — the earlier "the Legion plan"
+> was a mouthful everywhere it appeared). Every sentence that carries the tier
+> name says "plan" or "admits" beside it, so the page and the plan never meet
+> bare in one line. The code name stays `TIER_LEGION` with the plan-tier enum
+> value `"legion"`.
 
 ### 1.2 The rules
 
@@ -272,6 +273,11 @@ class Subscription(Base):
     host_limit:             Integer NULL      # NULL = unlimited
     current_period_end:     DateTime(tz) NULL
     cancel_at_period_end:   Boolean NOT NULL default False
+                            -- true when Stripe says either `cancel_at_period_end`
+                            -- OR a `cancel_at` timestamp: on the pinned API
+                            -- version the Portal sets only the latter, and
+                            -- `current_period_end` is then the earlier of the
+                            -- two dates, i.e. when access actually ends
     # Ordering guard. Stripe does not promise ordered delivery; an event whose
     # subscription was updated before the one we already applied is dropped.
     last_event_at:          DateTime(tz) NULL
@@ -515,7 +521,8 @@ should not have a discoverable billing API at all.
 | `GET /api/billing/state` | `current_user` | tier, host_limit, host_count, status, renewal date, cancel_at_period_end, and the booleans the UI needs. The one read every surface uses. |
 | `POST /api/billing/checkout` | `verified_user` | Creates a Checkout Session for a requested **tier name** and returns its URL. |
 | `POST /api/billing/portal` | `current_user` | Creates a Customer Portal session, returns its URL. |
-| `POST /api/billing/change-plan` | `verified_user` | Our own plan change. Runs the host-reconciliation precondition. §5.6. |
+| `POST /api/billing/upgrade` | `verified_user` | A move **up**: returns the URL of a Stripe-hosted `subscription_update_confirm` page that shows the prorated charge, takes the payment (3-D Secure included) and redirects back to `/app?billing=complete`. Same host-selection precondition as `change-plan`, so it is never a way around it. Created under the *upgrade* portal configuration (§2.2). |
+| `POST /api/billing/change-plan` | `verified_user` | Our own plan change, the way **down**. Runs the host-reconciliation precondition. §5.6. |
 | `POST /api/billing/webhook` | **none** — signature | §4.6.2. |
 
 **`POST /api/billing/checkout` — the security-critical details.**
@@ -534,8 +541,14 @@ should not have a discoverable billing API at all.
   support incident and a double charge.
 - Rate-limit per user via `rate_limit.enforce_identifier` (`rate_limit.py:98`),
   which exists for exactly this "trusted caller id rather than IP" case.
-- `success_url` and `cancel_url` point back at the web app. **The success page
-  grants nothing** — see §4.6.2.
+- `success_url` and `cancel_url` point back at the web app — at
+  `/app?billing=complete` and `/app?billing=cancelled`, and the portal's
+  `return_url` at `/app?billing=portal`. `/app`, never `/`: the root is the
+  marketing page. The app (`lib/billing-return.ts`) notes the page it left from
+  in sessionStorage on the way out, and on the way back strips the flag, puts
+  the person back on that page, opens Settings → Subscription, and re-reads the
+  plan a few times over the next seconds while the webhook lands. **The success
+  page grants nothing** — see §4.6.2.
 
 #### 4.6.1 Webhook events
 
@@ -732,7 +745,7 @@ exact template — the only other public server-rendered marketing page.
   (`web/CLAUDE.md:69-79`). A pricing link inherits that automatically — which is
   correct, and it is why desktop needs its own upgrade affordance (§7).
 
-**Content.** Four columns: Free, Coven, the Legion plan, Pandemonium. Each shows
+**Content.** Four columns: Free, Coven, Legion, Pandemonium. Each shows
 price, host count, and what a host is. It must state plainly:
 
 - billing is monthly in USD, renewing until cancelled;
@@ -879,7 +892,17 @@ which would leave an account over its limit with no chance to choose. Owning the
 plan-change UI is what makes your rule — *"allow them to downgrade, they just
 have to select the ones they want to keep"* — implementable.
 
-**Upgrades** apply immediately with a proration. The user pays the difference and
+**Moving up turns auto-renew back on.** Somebody who scheduled a cancellation
+on Coven and then paid to move to Legion has changed their mind about leaving;
+the webhook handler notices a tier that went up while the subscription was
+still scheduled to end and withdraws the cancellation (`cancel_at: ""`, or
+`cancel_at_period_end: false` on the older spelling). Done on the observation
+rather than in any one page, so it holds whichever way the upgrade arrived.
+
+**Upgrades** are confirmed and paid on a Stripe-hosted page
+(`POST /api/billing/upgrade` → a `subscription_update_confirm` portal flow):
+Stripe shows the prorated charge, collects it, and the change reaches us through
+the webhook like everything else. **Upgrades** apply immediately with a proration. The user pays the difference and
 gets the higher limit at once.
 
 **Downgrades** run this sequence:

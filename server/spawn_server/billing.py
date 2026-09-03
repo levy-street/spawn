@@ -49,9 +49,9 @@ class Tier:
     """One plan: what it is called, how many hosts it admits, what it costs."""
 
     key: str
-    #: What a person reads. "the Legion plan" is spelled out because `/legion`
-    #: is already the fleet page and `Legion` alone in a billing sentence reads
-    #: as that page rather than as a plan.
+    #: What a person reads. "Legion" shares its noun with the `/legion` fleet
+    #: page on purpose: the plan is named for the fleet, and every sentence
+    #: that carries the name says "plan" or "admits" beside it.
     name: str
     #: None = unlimited.
     host_limit: int | None
@@ -64,7 +64,7 @@ TIERS: dict[str, Tier] = {
     TIER_FREE: Tier(key=TIER_FREE, name="Free", host_limit=1, price_cents=0),
     TIER_COVEN: Tier(key=TIER_COVEN, name="Coven", host_limit=3, price_cents=500),
     TIER_LEGION: Tier(
-        key=TIER_LEGION, name="the Legion plan", host_limit=20, price_cents=2000
+        key=TIER_LEGION, name="Legion", host_limit=20, price_cents=2000
     ),
     TIER_PANDEMONIUM: Tier(
         key=TIER_PANDEMONIUM, name="Pandemonium", host_limit=None, price_cents=5000
@@ -147,6 +147,19 @@ def price_id_for_tier(tier: str, settings: Settings | None = None) -> str | None
         TIER_LEGION: settings.stripe_price_legion,
         TIER_PANDEMONIUM: settings.stripe_price_pandemonium,
     }.get(tier) or None
+
+
+def tier_rank(tier: str) -> int:
+    """Where a tier sits in the ladder, so "moved up" is one comparison.
+
+    Unknown tiers rank below Free rather than raising: a webhook naming a
+    tier this build has never heard of must still be handled, and "not an
+    upgrade" is the safe reading of it.
+    """
+    try:
+        return TIER_ORDER.index(tier)
+    except ValueError:
+        return -1
 
 
 def host_limit_for_tier(tier: str) -> int | None:
