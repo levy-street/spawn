@@ -24,6 +24,13 @@ That is the bar, not the ceiling.
 None of the technical work below rescues a page that isn't worth ranking.
 The flagship earns its position with the content, in this order:
 
+**Search intent first.** Before the page exists, read the SERP for its
+query. The keyword grimoire (`spawnd-seo-grimoire.html`, repo root) gives
+volume and difficulty; it does not give intent, and several of its richest
+queries navigate to a vendor's own feature (Claude Code's Remote Control,
+Anthropic's Team plan). A page for such a query concedes and teaches the
+vendor's thing first, or it is the wrong page.
+
 **Teach first.** The page is written for someone who has never heard of
 spawnd and doesn't need it yet. It opens by teaching the thing they actually
 searched for — running several Claude Code sessions at once — and teaches it
@@ -144,14 +151,15 @@ that HTTPS passes.
   Self-referencing absolute canonical.
 - **Per-page OG image**: a screenshot of the page's own hero (hide the
   masthead, force the hero to 630px, capture 1200×630 at 2× — see the
-  flagship's `public/og/`). Declared with width/height/alt in `openGraph`
-  *and* `twitter.images`. No page ships `summary_large_image` without an
-  image.
+  flagship's `public/og/`). `web/scripts/og-shots.mjs slug…` does exactly
+  that against a running dev server. Declared with width/height/alt in
+  `openGraph` *and* `twitter.images`. No page ships `summary_large_image`
+  without an image.
 - JSON-LD by template (schema column in SEO_TREE's template table):
   `BreadcrumbList` on everything; `FAQPage` where there's a Q&A section;
   `Article` with honest `datePublished`/`dateModified` on dated editorial
   pages (jobs, comparisons, guides — the `article` prop on `JobPage`);
-  `HowTo` on guides;
+  `HowTo` on guides (the article template emits it from a guide's steps);
   `Organization` + `SoftwareApplication` on `/` and the hubs only
   (`SiteStructuredData.tsx`); **no `Review`** on comparisons.
 - Dates are kept honest or not shown. `og:type=article` pages carry matching

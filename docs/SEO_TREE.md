@@ -135,10 +135,24 @@ the registry test enforces a denylist.
 
 ## The tree
 
-Tier 0 (hand-built): `/` · `/security` · `/download`
+**Demand data:** `spawnd-seo-grimoire.html` at the repo root (Semrush, US
+database, 2026-08-31; 37 seed universes, 3,086 keywords) is the keyword
+source behind every cluster below. Its five plays — the Claude Code
+mid-tail, the Codex CLI arbitrage, Claude plan economics, the phone and
+browser terminal, rival comparisons — plus the DIY shoulder clusters map
+onto the rows here. Intent traps its review found, applied to every page:
+"claude code remote" and "claude code web" mostly navigate to Anthropic's
+own Remote Control and hosted product (concede and teach them first);
+"claude code teams" mostly means Anthropic's Team plan; reference queries
+(settings, commands) belong to the vendor's docs, so those pages compete for
+the second position with genuinely better reference content, not for the
+first.
 
-**Hubs:** `/use-cases` · `/agents` · `/comparisons` · `/guides` — real content
-pages targeting category head terms, each racking its spokes.
+Tier 0 (hand-built): `/` · `/security` · `/download` · `/llms.txt`
+
+**Hubs:** `/use-cases` · `/agents` · `/comparisons` · `/guides` (live) — real
+content pages targeting category head terms, each racking its spokes. The
+agent pillars `/claude-code` and `/codex` are hubs too (live).
 
 ### Device row — primary ICP: power user (hub also serves vibe coders)
 
@@ -148,6 +162,9 @@ pages targeting category head terms, each racking its spokes.
 - `/code-on-an-ipad`
 - `/code-on-a-chromebook` · `/code-on-an-android-tablet` (fold into iPad if
   not distinct)
+- SSH-from-a-phone guides (grimoire play 4; the SSH route taught in full,
+  then the console pattern): `/ssh-from-iphone` · `/ssh-from-ipad` ·
+  `/ssh-from-android`
 - quarry: phone page per quarry agent
 
 ### Vibe row — primary ICP: vibe coder
@@ -158,6 +175,8 @@ pages targeting category head terms, each racking its spokes.
   every device becomes a window)
 - `/your-first-coding-agent` (the on-ramp: what an agent is, pick one, give it
   a machine, talk to it from anywhere)
+- `/vibe-coding-vs-traditional-coding` (the essay that feeds the 90K/mo
+  vibe-coding universe; KD 9)
 - quarry: `/vibe-coding-with-{agent}` per quarry agent where searched
 
 ### Machine row — primary ICP: homelab / self-hoster
@@ -165,6 +184,10 @@ pages targeting category head terms, each racking its spokes.
 - `/web-terminal-for-your-home-server` · `/ai-agents-on-your-own-gpu`
 - `/raspberry-pi-without-port-forwarding` · `/headless-mac-mini`
 - `/vps-web-terminal` · `/old-laptop-as-an-agent-box` · `/wsl2` (GATED)
+- the DIY flywheel (grimoire §iv — the incumbent is ssh + tmux + Tailscale,
+  hand-rolled): `/remote-access-to-your-mac` (10K/mo cluster hub) ·
+  `/mac-remote-login` · `/vscode-remote-ssh` · `/mosh-vs-ssh` ·
+  `/tmux-cheatsheet` (tool)
 - quarry: mini-PC (N100/NUC) · gaming PC · Proxmox VM · Docker/LXC · Jetson ·
   homelab hub · per-distro row (GATED per distro)
 
@@ -180,6 +203,15 @@ pages targeting category head terms, each racking its spokes.
 ### Agent pillars — primary ICP: power user
 
 - `/claude-code` · `/codex` · `/aider` · `/opencode`
+- Claude Code cluster (grimoire play 1, racked by `/claude-code`):
+  `/claude-code-remote` · `/claude-code-max-plan` · `/is-claude-code-free` ·
+  `/claude-code-teams` · `/claude-code-open-source` ·
+  `/claude-vs-claude-code` · `/how-to-run-claude-code` ·
+  `/claude-code-settings` · `/claude-code-commands` ·
+  `/claude-plan-calculator` (tool; play 3)
+- Codex cluster (grimoire play 2, racked by `/codex`): `/install-codex-cli` ·
+  `/codex-cli-sessions`
+- open agents: `/opencode-vs-aider` · `/is-opencode-free`
 - quarry (~20–30 with emerging): `/gemini-cli` · `/amp` · `/goose` · `/cline`
   · `/qwen-code` · `/cursor-cli` · `/copilot-cli` · `/crush` · `/plandex` ·
   `/ra-aid` · `/droid` · `/grok-cli`. Minting an agent = pillar + phone page
@@ -192,13 +224,16 @@ pages targeting category head terms, each racking its spokes.
 - `/spawnd-vs-mosh` · `/spawnd-vs-mobile-ssh-apps` ·
   `/spawnd-vs-self-hosted-web-terminals` · `/spawnd-vs-github-codespaces` ·
   `/spawnd-vs-cloudflare-tunnel` · `/spawnd-vs-remote-desktop`
+- `/spawnd-vs-happy` (the nearest rival; grimoire play 5)
 - quarry: tunnels (ngrok · frp · tailscale-funnel), mesh (zerotier · netbird ·
   nebula · headscale), terminals (ttyd · wetty), persistence (zellij · screen ·
   eternal-terminal), gateways (apache-guacamole · teleport), cloud IDEs
   (gitpod · replit · project-idx), desktop (rustdesk · chrome-remote-desktop),
   mobile SSH (blink-shell · termius)
-- listicles: `/tmate-alternatives` · `/ngrok-alternatives-for-ssh` ·
-  `/codespaces-alternatives` · `/port-forwarding-alternatives` · ~6 more
+- listicles: `/termius-alternatives` · `/best-ai-coding-agents` ·
+  `/best-ssh-client-for-windows` · `/tmate-alternatives` ·
+  `/ngrok-alternatives-for-ssh` · `/codespaces-alternatives` ·
+  `/port-forwarding-alternatives` · ~6 more
 
 ### Guides — ICP split: power user (agent guides) and vibe coder (starter guides)
 
@@ -216,11 +251,28 @@ pages targeting category head terms, each racking its spokes.
 
 ### Fix pages — ICP: whoever has the symptom (template TBD)
 
-- `/claude-code-stops-when-laptop-sleeps` ·
+- `/claude-code-not-available-in-your-country` · `/tailscale-stuck-on-starting`
+  (the grimoire's instant-rank fixes) ·
+  `/claude-code-stops-when-laptop-sleeps` ·
   `/ssh-connection-drops-keep-session-alive` ·
   `/tmux-session-lost-after-reboot` · `/codex-timed-out-overnight` · ~30–50
   total. Template: diagnosis → general fixes → the structural fix. Lead with
   the honest cause, not the pitch.
+
+### Definitions — ICP: everyone; the pages AI assistants cite
+
+- `/agentic-orchestration` · `/cloud-development-environment` ·
+  `/background-agents` — the vocabulary the industry is settling on, defined
+  while the terms are unowned (KD 16–23). Definition first, quotable;
+  spawnd only where the defined thing meets a machine you own.
+
+### Tools — pages that earn links by being useful
+
+- `/claude-plan-calculator` (Pro vs Max 5x vs Max 20x vs API, by hours of
+  agent use) · `/tmux-cheatsheet` (searchable, every command verified
+  against the man page)
+- quarry: a live in-browser terminal demo (GATED: needs a sandboxed host
+  and an abuse story before it exists)
 
 ## Templates
 
@@ -247,9 +299,11 @@ shared rail and hairline borders. Reference implementation:
 | job | job pages | workspace-grid vignette (the parallel fleet, live) | Breadcrumb, FAQ, Article (honest dates) | flagship built (`/run-agents-in-parallel`) |
 | pillar | agent pillars | agent fact card + spoke rack | Breadcrumb, FAQ | new |
 | comparison | /spawnd-vs-* | ledger table + honest verdict | Breadcrumb, FAQ, Article (honest dates), **no Review** | rebuilt on flat slugs: 5 live (tier-1 quarry pending) |
-| listicle | /{x}-alternatives | ranked options w/ mini-ledgers, real tools listed honestly | Breadcrumb, FAQ | new |
-| guide | /how-to-* | numbered steps, code blocks, troubleshooting | HowTo, Article (honest dates), Breadcrumb | new |
-| fix | symptom pages | diagnosis → general fixes → structural fix | Breadcrumb, FAQ | new |
+| article | guides, fix pages, explainers, references, roundups, definitions | typed blocks — prose, numbered steps, reference table, points, at most one capture; inline `code` and links | Breadcrumb, FAQ, Article (honest dates), HowTo on guides | built (`ArticlePage.tsx`; entries in `lib/seo/articles/*.ts`, one file per cluster) |
+| listicle | /{x}-alternatives | served by the article template (`kind: roundup`) | Breadcrumb, FAQ, Article | live via article |
+| guide | /how-to-* | served by the article template (`kind: guide`) | HowTo, Article (honest dates), Breadcrumb | live via article |
+| fix | symptom pages | served by the article template (`kind: fix`) | Breadcrumb, FAQ, Article | live via article |
+| tool | calculator, cheatsheet | one small client island on the job frame; the copy around it teaches | Breadcrumb, FAQ, Article | hand-built routes |
 
 Shared parts under all ten: the flat `[slug]` router + denylist, the
 signature-section components (phone vignette, network diagram, grid vignette),
