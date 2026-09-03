@@ -49,6 +49,7 @@ export async function generateMetadata({
       url: path,
       siteName: "spawnd",
       type: "article",
+      images: [{ url: "/og.jpg", width: 2400, height: 1260, alt: doc.title }],
     },
   };
 }
