@@ -54,6 +54,10 @@ run_guard() {
         # Filtered HERE because rg only applies --glob during directory
         # traversal — explicitly listed files are searched unconditionally.
         scripts/check-worker-only-daemon.sh | web/src/trust-ux/presentation.html) ;;
+        # Marketing pages that teach third-party tools name tmux as a tool the
+        # reader already uses (a tmux cheatsheet, SSH-and-tmux guides) — copy,
+        # never a backend. The boundary is product code, which stays scanned.
+        web/src/lib/grimoire/* | web/src/app/tmux-cheatsheet/* | web/src/app/llms.txt/* | web/CLAUDE.md | web/AGENTS.md) ;;
         *) filtered_paths+=("$scan_path") ;;
       esac
     done
@@ -84,7 +88,12 @@ run_guard() {
     --glob '!test-results/**' \
     --glob '!web/test-results/**' \
     --glob '!check-worker-only-daemon.sh' \
-    --glob '!web/src/trust-ux/presentation.html' || true)"
+    --glob '!web/src/trust-ux/presentation.html' \
+    --glob '!web/src/lib/grimoire/**' \
+    --glob '!web/src/app/tmux-cheatsheet/**' \
+    --glob '!web/src/app/llms.txt/**' \
+    --glob '!web/CLAUDE.md' \
+    --glob '!web/AGENTS.md' || true)"
   if [[ -n "$matches" ]]; then
     printf '%s\n' "worker-only guard: retired backend surface found:" >&2
     printf '%s\n' "$matches" >&2
