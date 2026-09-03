@@ -873,8 +873,11 @@ export function Sidebar({
             </DropdownMenuItem>
           </DropdownMenu>
           {/* On the rail the row is an avatar alone; the extra control waits
-              for the panel where it has room to explain itself on hover. */}
-          {!collapsed && <DownloadMenu />}
+              for the panel where it has room to explain itself on hover. And
+              inside the desktop app there is nothing to get: every row of that
+              menu offers the installed build back to the person already
+              running it, or walks this doorless window onto /download. */}
+          {!collapsed && !inShell && <DownloadMenu />}
         </div>
       </div>
     </div>

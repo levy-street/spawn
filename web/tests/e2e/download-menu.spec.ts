@@ -121,6 +121,28 @@ test("the download button says what it is on hover", async ({ page }) => {
   await expect(page.getByRole("tooltip")).toHaveText("Get SPAWN D");
 });
 
+/** The shell's own agent — the one signal `isDesktopShell` reads. */
+const DESKTOP_SHELL_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15 SpawnDesktop/0.1.2";
+
+test("the installed desktop app is offered nothing to install", async ({ page }) => {
+  await page.addInitScript((agent) => {
+    Object.defineProperty(navigator, "userAgent", { get: () => agent });
+  }, DESKTOP_SHELL_USER_AGENT);
+  await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ layout: { version: 3, tiles: [] } })],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+
+  // The account row is what the button hangs off, so its being on screen is
+  // what makes the absence an answer rather than a page that has not finished
+  // rendering. The agent is read in an effect — the button is in the first
+  // paint and gone a frame later — which `toHaveCount(0)` waits out.
+  await expect(page.getByRole("button", { name: "Account menu" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Get SPAWN D" })).toHaveCount(0);
+});
+
 // A real Ed25519 key: the roster serves no fingerprint, so the UI derives one
 // from the key and an arbitrary 32 bytes would be rejected as off-curve.
 const KNOCKING_KEY = (() => {
