@@ -1,6 +1,8 @@
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
 import { SiteStructuredData } from "@/components/seo/SiteStructuredData";
+import { dateLine } from "@/components/seo/templates/ArticlePage";
+import { Inline } from "@/components/seo/templates/Inline";
 import { JobH2, JobPage, JobProse, JobSection, JobStart } from "@/components/seo/templates/JobPage";
 import type { HubEntry } from "@/lib/seo/flat-types";
 
@@ -22,7 +24,7 @@ export function HubPage({ entry }: { entry: HubEntry }) {
         hero={{
           title: { plain: entry.hero.plain, accent: entry.hero.accent },
           sub: entry.hero.sub,
-          date: "spawnd · August 2026",
+          date: dateLine(entry.datePublished),
           ink: { video: "/brand/ink/grid-ink.mp4", still: "/brand/ink/grid-ink-still.webp" },
         }}
         faq={entry.faq}
@@ -45,7 +47,9 @@ export function HubPage({ entry }: { entry: HubEntry }) {
               <JobH2>{section.heading}</JobH2>
               <div className="mt-8 space-y-5">
                 {section.paragraphs.map((paragraph) => (
-                  <p key={paragraph.slice(0, 40)}>{paragraph}</p>
+                  <p key={paragraph.slice(0, 40)}>
+                    <Inline text={paragraph} />
+                  </p>
                 ))}
               </div>
             </JobProse>
@@ -54,7 +58,9 @@ export function HubPage({ entry }: { entry: HubEntry }) {
 
         <JobSection refId="rack">
           <div className="mx-auto w-full max-w-4xl">
-            <JobH2 className="mx-auto text-center">The pages, per device and agent.</JobH2>
+            <JobH2 className="mx-auto text-center">
+              {entry.rackHeading ?? "The pages, per device and agent."}
+            </JobH2>
             <div className="mt-12 grid gap-6 sm:grid-cols-2">
               {entry.spokes.map((spoke) => (
                 <Link

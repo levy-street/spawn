@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { notFound } from "next/navigation";
+import { ArticlePage } from "@/components/seo/templates/ArticlePage";
 import { ComparisonPage } from "@/components/seo/templates/ComparisonPage";
 import { DevicePage } from "@/components/seo/templates/DevicePage";
 import { HubPage } from "@/components/seo/templates/HubPage";
@@ -74,5 +75,7 @@ export default async function FlatSlugPage({ params }: { params: Promise<{ slug:
       return <DevicePage entry={page.device} />;
     case "hub":
       return <HubPage entry={page.hub} />;
+    case "article":
+      return <ArticlePage entry={page.article} />;
   }
 }

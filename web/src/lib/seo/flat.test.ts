@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { FLAT_PAGES, findFlatPage, flatPageContent, flatPageHref } from "./flat";
+import { inlineLinks } from "./inline";
 
 /*
  * Invariants for the flat-slug catalogue — most importantly the denylist:
@@ -98,6 +99,47 @@ describe("flat-slug page catalogue", () => {
           existsSync(join(PUBLIC_DIR, vignette.src)),
           `${page.slug}: capture missing on disk: ${vignette.src}`,
         ).toBe(true);
+      }
+    }
+  });
+
+  it("gives every article a body, a resolvable hub, and links that resolve", () => {
+    const reserved = reservedNames();
+    const resolves = (href: string) => {
+      if (!href.startsWith("/")) return /^https:\/\//.test(href);
+      const segment = href.slice(1).split(/[#?]/)[0];
+      if (segment.includes("/")) return true;
+      return findFlatPage(segment) !== undefined || reserved.has(segment);
+    };
+    for (const page of FLAT_PAGES) {
+      if (page.template !== "article") continue;
+      const a = page.article;
+      expect(a.body.length, page.slug).toBeGreaterThanOrEqual(3);
+      expect(resolves(a.hub.href), `${page.slug} hub ${a.hub.href}`).toBe(true);
+      expect(
+        a.body.filter((block) => block.kind === "capture").length,
+        page.slug,
+      ).toBeLessThanOrEqual(1);
+      if (a.kind === "guide") {
+        expect(
+          a.body.some((block) => block.kind === "steps"),
+          `${page.slug} guide has no steps`,
+        ).toBe(true);
+      }
+      const texts: string[] = [a.hero.sub, ...a.faq.map((item) => item.a)];
+      for (const block of a.body) {
+        if (block.kind === "prose") texts.push(...block.paragraphs);
+        if (block.kind === "steps") texts.push(block.lead ?? "", ...block.steps.map((s) => s.body));
+        if (block.kind === "points")
+          texts.push(block.lead ?? "", ...block.items.map((i) => i.body));
+        if (block.kind === "table")
+          texts.push(block.lead ?? "", block.note ?? "", ...block.rows.flat());
+      }
+      for (const text of texts) {
+        for (const href of inlineLinks(text)) {
+          expect(resolves(href), `${page.slug} → ${href} resolves to nothing`).toBe(true);
+          expect(href, `${page.slug} links to itself`).not.toBe(flatPageHref(page));
+        }
       }
     }
   });

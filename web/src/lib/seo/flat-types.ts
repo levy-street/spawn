@@ -57,6 +57,8 @@ export interface HubEntry {
   essay: FlatProse[];
   /** The spoke rack: the pages this hub exists to route. */
   spokes: FlatRelatedLink[];
+  /** The rack's heading; the template's default when absent. */
+  rackHeading?: string;
   faq: FlatFaq[];
   related: FlatRelatedLink[];
   cardTitle: string;
@@ -135,7 +137,69 @@ export interface ComparisonEntry {
   cardBlurb: string;
 }
 
+/** A code figure inside an article: one quiet caption, the lines verbatim. */
+export interface ArticleCode {
+  caption?: string;
+  lines: string[];
+}
+
+export interface ArticleStep {
+  title: string;
+  body: string;
+  code?: ArticleCode;
+}
+
+/**
+ * The blocks an article is built from. Paragraph strings accept the inline
+ * markup of lib/seo/inline.ts: `code` spans and [text](href) links, nothing
+ * else — enough to cite a doc or name a flag, not enough to smuggle layout
+ * into data.
+ */
+export type ArticleBlock =
+  | { kind: "prose"; heading: string; paragraphs: string[]; code?: ArticleCode }
+  | { kind: "steps"; heading: string; lead?: string; steps: ArticleStep[] }
+  | {
+      kind: "table";
+      heading: string;
+      lead?: string;
+      columns: string[];
+      rows: string[][];
+      note?: string;
+    }
+  | { kind: "points"; heading: string; lead?: string; items: { title: string; body: string }[] }
+  /** The one product capture, placed by the author where the product enters. */
+  | { kind: "capture"; caption: string };
+
+export type ArticleKind = "guide" | "fix" | "explainer" | "reference" | "roundup" | "definition";
+
+/**
+ * One article page (the article template): the editorial frame around a
+ * sequence of blocks. It serves the guide, fix, explainer, reference,
+ * roundup, and definition rows of docs/SEO_TREE.md — pages whose signature
+ * is the writing itself, not a capture. `kind` selects the schema (guides
+ * emit HowTo from their steps) and the crumb; the hub racks the page.
+ */
+export interface ArticleEntry {
+  slug: string;
+  kind: ArticleKind;
+  /** The hub that crumbs and racks this page — a flat hub or a static route. */
+  hub: { name: string; href: string };
+  title: string;
+  description: string;
+  datePublished: string;
+  dateModified: string;
+  hero: { plain: string; accent: string; sub: string };
+  body: ArticleBlock[];
+  /** The CTA moment's heading; the frame's default when absent. */
+  start?: string;
+  faq: FlatFaq[];
+  related: FlatRelatedLink[];
+  cardTitle: string;
+  cardBlurb: string;
+}
+
 export type FlatPage =
   | { template: "comparison"; slug: string; comparison: ComparisonEntry }
   | { template: "device"; slug: string; device: DeviceEntry }
-  | { template: "hub"; slug: string; hub: HubEntry };
+  | { template: "hub"; slug: string; hub: HubEntry }
+  | { template: "article"; slug: string; article: ArticleEntry };

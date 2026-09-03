@@ -12,15 +12,19 @@ ceremony, a download page) says so in the commit message.
 ```
 src/
   app/            one directory per route (App Router)
-                  [slug]/ admin/ app/ device/ download/ for/ forgot-password/
-                  hosts/ legion/ login/ onboarding/ reset-password/
-                  run-agents-in-parallel/ security/ sessions/ signup/
-                  trust-ux-demo/ use/ verify-email/ vs/ w/
+                  [slug]/ admin/ app/ claude-plan-calculator/ device/
+                  download/ for/ forgot-password/ hosts/ legion/ llms.txt/
+                  login/ onboarding/ reset-password/ run-agents-in-parallel/
+                  security/ sessions/ signup/ tmux-cheatsheet/ trust-ux-demo/
+                  use/ verify-email/ vs/ w/
                   ([slug]/ is the flat-URL landing-page router — see "SEO
                   landing pages"; for/ and use/ are the legacy registry
                   families; vs/ is the comparisons hub, its spokes now flat;
                   run-agents-in-parallel/ is the hand-built flagship from
-                  docs/SEO_TREE.md)
+                  docs/SEO_TREE.md; claude-plan-calculator/ and
+                  tmux-cheatsheet/ are the hand-built tool pages, each with
+                  its client island beside its page; llms.txt/ serves the
+                  AI-crawler summary)
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/
                   onboarding/ profile/ seo/ session/ settings/ terminal/
@@ -32,6 +36,8 @@ src/
   middleware.ts   request middleware (+ its test beside it)
 tests/e2e/        Playwright end-to-end specs
 scripts/          build wrappers (next-with-proxy-target.mjs) and helpers
+                  (og-shots.mjs renders landing-page OG images from a dev
+                  server: `node scripts/og-shots.mjs slug…` → public/og/)
 public/           static assets
 ```
 
@@ -64,13 +70,21 @@ rework (`docs/SEO_TREE.md` is the page catalogue, `docs/SEO_RUNBOOK.md` the
 process):
 
 - **Flat slugs (current)**: one entry per page in `src/lib/seo/` template
-  files (`comparisons.ts`, `devices.ts`), catalogued by `src/lib/seo/flat.ts` and
+  files (`comparisons.ts`, `devices.ts`, `hubs.ts`, and the article
+  clusters in `articles/*.ts` — one file per keyword cluster, aggregated
+  by `articles/index.ts`), catalogued by `src/lib/seo/flat.ts` and
   rendered by `app/[slug]/` through the templates in
-  `src/components/seo/templates/` (job frame, comparison, the live fleet
-  capture in `public/product/`). `src/lib/seo/flat.test.ts` holds the
-  invariants, including the denylist that keeps flat slugs off static
-  routes. `app/run-agents-in-parallel/` is the hand-built flagship on the
-  job template.
+  `src/components/seo/templates/` (job frame, comparison, device, hub,
+  article; the live fleet capture in `public/product/`). The article
+  template serves guides, fix pages, explainers, references, roundups, and
+  definitions from typed blocks; its paragraphs accept the inline markup
+  of `src/lib/seo/inline.ts` (`code` spans and [text](href) links).
+  `src/lib/seo/flat.test.ts` holds the invariants, including the denylist
+  that keeps flat slugs off static routes and the check that every inline
+  link resolves. `app/run-agents-in-parallel/` is the hand-built flagship
+  on the job template; the tool pages are hand-built the same way. The
+  demand data behind the clusters is the keyword grimoire at the repo root
+  (`spawnd-seo-grimoire.html`).
 - **Legacy registry**: `/use/*` and `/for/*` entries in
   `src/lib/seo/{use-cases,agents}.ts`, rendered by
   `src/components/seo/SeoLandingPage.tsx`; `registry.test.ts` holds their

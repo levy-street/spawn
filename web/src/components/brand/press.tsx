@@ -199,6 +199,9 @@ export function Colophon() {
           <Link href="/download" className="transition-colors hover:text-bone">
             Install
           </Link>
+          <Link href="/guides" className="transition-colors hover:text-bone">
+            Guides
+          </Link>
           <Link href="/run-agents-in-parallel" className="transition-colors hover:text-bone">
             Parallel&nbsp;agents
           </Link>

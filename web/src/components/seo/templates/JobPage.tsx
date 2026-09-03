@@ -5,6 +5,8 @@ import { Colophon, GITHUB_URL } from "@/components/brand/press";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { InstallOneLiner } from "@/components/seo/InstallOneLiner";
 import { HeroInkVideo } from "@/components/seo/templates/HeroInkVideo";
+import { Inline } from "@/components/seo/templates/Inline";
+import { stripInline } from "@/lib/seo/inline";
 import { cn } from "@/lib/utils";
 
 /*
@@ -80,9 +82,7 @@ export interface JobHeroInk {
 const H2_CLASS =
   "max-w-[26ch] text-[clamp(24px,3vw,32px)] leading-[1.15] font-semibold tracking-[-0.015em] text-bone [text-wrap:balance]";
 
-/** An inline link: ember (the AA-safe hellfire) with a quiet underline. */
-export const JOB_LINK =
-  "text-ember underline decoration-ember/40 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-hellfire";
+export { JOB_LINK } from "@/components/seo/templates/link";
 
 /** BreadcrumbList + FAQPage, serialized and escaped at build time. */
 function StructuredData({
@@ -125,8 +125,8 @@ function StructuredData({
       "@type": "FAQPage",
       mainEntity: faq.map((item) => ({
         "@type": "Question",
-        name: item.q,
-        acceptedAnswer: { "@type": "Answer", text: item.a },
+        name: stripInline(item.q),
+        acceptedAnswer: { "@type": "Answer", text: stripInline(item.a) },
       })),
     });
   }
@@ -355,7 +355,9 @@ function FaqQuiet({ faq }: { faq: JobFaqItem[] }) {
                 ) : null}
                 {item.q}
               </dt>
-              <dd className="text-[15px] leading-7">{item.a}</dd>
+              <dd className="text-[15px] leading-7">
+                <Inline text={item.a} />
+              </dd>
             </div>
           ))}
         </dl>

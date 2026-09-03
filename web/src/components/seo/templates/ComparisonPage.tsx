@@ -1,4 +1,6 @@
+import { dateLine } from "@/components/seo/templates/ArticlePage";
 import { FleetCapture } from "@/components/seo/templates/FleetCapture";
+import { Inline } from "@/components/seo/templates/Inline";
 import { JobH2, JobPage, JobProse, JobSection, JobStart } from "@/components/seo/templates/JobPage";
 import type { ComparisonEntry } from "@/lib/seo/flat-types";
 
@@ -56,7 +58,9 @@ function Verdict({ entry }: { entry: ComparisonEntry }) {
         <JobH2>{entry.verdict.heading}</JobH2>
         <div className="mt-8 space-y-5">
           {entry.verdict.paragraphs.map((paragraph) => (
-            <p key={paragraph.slice(0, 40)}>{paragraph}</p>
+            <p key={paragraph.slice(0, 40)}>
+              <Inline text={paragraph} />
+            </p>
           ))}
         </div>
       </JobProse>
@@ -105,7 +109,7 @@ export function ComparisonPage({ entry }: { entry: ComparisonEntry }) {
       hero={{
         title: { plain: entry.hero.plain, accent: entry.hero.accent },
         sub: entry.hero.sub,
-        date: "spawnd · August 2026",
+        date: dateLine(entry.datePublished),
         ink: { video: "/brand/ink/grid-ink.mp4", still: "/brand/ink/grid-ink-still.webp" },
       }}
       faq={entry.faq}
@@ -123,7 +127,9 @@ export function ComparisonPage({ entry }: { entry: ComparisonEntry }) {
           <JobH2>{entry.intro.heading}</JobH2>
           <div className="mt-8 space-y-5">
             {entry.intro.paragraphs.map((paragraph) => (
-              <p key={paragraph.slice(0, 40)}>{paragraph}</p>
+              <p key={paragraph.slice(0, 40)}>
+                <Inline text={paragraph} />
+              </p>
             ))}
           </div>
         </JobProse>
@@ -134,7 +140,9 @@ export function ComparisonPage({ entry }: { entry: ComparisonEntry }) {
           <JobH2>{entry.framing.heading}</JobH2>
           <div className="mt-8 space-y-5">
             {entry.framing.paragraphs.map((paragraph) => (
-              <p key={paragraph.slice(0, 40)}>{paragraph}</p>
+              <p key={paragraph.slice(0, 40)}>
+                <Inline text={paragraph} />
+              </p>
             ))}
           </div>
         </JobProse>

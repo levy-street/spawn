@@ -21,6 +21,19 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "monthly",
       priority: 0.9,
     },
+    // Hand-built tool pages (a client island each; see their route directories).
+    {
+      url: `${ORIGIN}/claude-plan-calculator`,
+      lastModified: new Date("2026-09-03"),
+      changeFrequency: "monthly",
+      priority: 0.8,
+    },
+    {
+      url: `${ORIGIN}/tmux-cheatsheet`,
+      lastModified: new Date("2026-09-03"),
+      changeFrequency: "monthly",
+      priority: 0.8,
+    },
     { url: `${ORIGIN}/use`, changeFrequency: "weekly", priority: 0.6 },
     { url: `${ORIGIN}/for`, changeFrequency: "weekly", priority: 0.6 },
     { url: `${ORIGIN}/vs`, changeFrequency: "weekly", priority: 0.6 },

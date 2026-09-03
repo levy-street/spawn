@@ -1,4 +1,6 @@
 import Image from "next/image";
+import { dateLine } from "@/components/seo/templates/ArticlePage";
+import { Inline } from "@/components/seo/templates/Inline";
 import {
   JobH2,
   JobPage,
@@ -59,7 +61,9 @@ function Prose({ heading, paragraphs }: { heading: string; paragraphs: string[] 
       <JobH2>{heading}</JobH2>
       <div className="mt-8 space-y-5">
         {paragraphs.map((paragraph) => (
-          <p key={paragraph.slice(0, 40)}>{paragraph}</p>
+          <p key={paragraph.slice(0, 40)}>
+            <Inline text={paragraph} />
+          </p>
         ))}
       </div>
     </JobProse>
@@ -75,7 +79,7 @@ export function DevicePage({ entry }: { entry: DeviceEntry }) {
       hero={{
         title: { plain: entry.hero.plain, accent: entry.hero.accent },
         sub: entry.hero.sub,
-        date: "spawnd · August 2026",
+        date: dateLine(entry.datePublished),
         ink: { video: "/brand/ink/grid-ink.mp4", still: "/brand/ink/grid-ink-still.webp" },
       }}
       faq={entry.faq}
@@ -107,7 +111,9 @@ export function DevicePage({ entry }: { entry: DeviceEntry }) {
           <JobH2>{entry.shape.heading}</JobH2>
           <div className="mt-8 space-y-5">
             {entry.shape.paragraphs.map((paragraph) => (
-              <p key={paragraph.slice(0, 40)}>{paragraph}</p>
+              <p key={paragraph.slice(0, 40)}>
+                <Inline text={paragraph} />
+              </p>
             ))}
           </div>
         </JobSplit>

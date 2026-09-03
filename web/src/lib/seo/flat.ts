@@ -1,3 +1,4 @@
+import { ARTICLE_HUBS, ARTICLES } from "./articles";
 import { COMPARISONS } from "./comparisons";
 import { DEVICES } from "./devices";
 import type { FlatFaq, FlatPage, FlatRelatedLink } from "./flat-types";
@@ -8,7 +9,8 @@ import { HUBS } from "./hubs";
  * enumerates it, hubs and related racks resolve cards from it, and
  * flat.test.ts holds the invariants — including the denylist that keeps
  * flat slugs off the static app routes. Adding a flat page is one entry in
- * a template file (comparisons.ts, devices.ts); everything else follows.
+ * a template file (comparisons.ts, devices.ts, hubs.ts, articles/*.ts);
+ * everything else follows.
  */
 
 export const FLAT_PAGES: FlatPage[] = [
@@ -22,10 +24,15 @@ export const FLAT_PAGES: FlatPage[] = [
     slug: device.slug,
     device,
   })),
-  ...HUBS.map((hub) => ({
+  ...[...HUBS, ...ARTICLE_HUBS].map((hub) => ({
     template: "hub" as const,
     slug: hub.slug,
     hub,
+  })),
+  ...ARTICLES.map((article) => ({
+    template: "article" as const,
+    slug: article.slug,
+    article,
   })),
 ];
 
@@ -42,6 +49,7 @@ export const FLAT_FAMILY_TITLES: Record<FlatPage["template"], string> = {
   comparison: "Compared",
   device: "Devices",
   hub: "Hubs",
+  article: "Guides",
 };
 
 export interface FlatPageContent {
@@ -62,7 +70,9 @@ export function flatPageContent(page: FlatPage): FlatPageContent {
       ? page.comparison
       : page.template === "device"
         ? page.device
-        : page.hub;
+        : page.template === "hub"
+          ? page.hub
+          : page.article;
   return {
     title: entry.title,
     description: entry.description,
