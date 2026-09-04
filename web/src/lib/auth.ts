@@ -1,26 +1,41 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { closeAlertSocket } from "@/lib/alert-socket";
 import { ApiError, type AuthConfig, AuthConfigSchema, auth, type User } from "@/lib/api";
+import { readSignedInHint, writeSignedInHint } from "@/lib/auth-hint";
 import { DESKTOP_SIGNED_OUT_MARKER, isDesktopShell } from "@/lib/platform";
 
 /**
  * `useAuth()` resolves the current user from `/api/me`. The server uses
  * HTTP-only session cookies, so this is just a fetch with `credentials:
  * "include"`.
+ *
+ * `probe: "hinted"` is for surfaces that only prefer to know — the public
+ * masthead. They ask only when this browser has answered yes before (see
+ * auth-hint.ts), so a stranger reading a landing page never triggers the
+ * 401 the browser would log as an error. App surfaces keep the default and
+ * always ask.
  */
-export function useAuth() {
+export function useAuth({ probe = "always" }: { probe?: "always" | "hinted" } = {}) {
+  const [hinted] = useState(() => readSignedInHint());
   const q = useQuery<{ user: User } | null>({
     queryKey: ["me"],
     queryFn: async () => {
       try {
-        return await auth.me();
+        const me = await auth.me();
+        writeSignedInHint(true);
+        return me;
       } catch (err) {
-        if (err instanceof ApiError && err.status === 401) return null;
+        if (err instanceof ApiError && err.status === 401) {
+          writeSignedInHint(false);
+          return null;
+        }
         throw err;
       }
     },
+    enabled: probe === "always" || hinted,
     retry: false,
     staleTime: 30_000,
   });
