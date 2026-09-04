@@ -134,7 +134,9 @@ function useMastheadScrub(): {
  */
 export function Masthead({ current }: { current?: "security" | "download" }) {
   const { navRef, brandRef, markRef, wordRef } = useMastheadScrub();
-  const { user } = useAuth();
+  // The public masthead only prefers to know: it asks once this browser has
+  // held a session, and never on a stranger's first visit.
+  const { user } = useAuth({ probe: "hinted" });
   // Inside the app every zone but the brand leads somewhere the window cannot
   // come back from, and the brand itself has to lead the other way: whoever is
   // reading this in there wants the product, not more of the site.
