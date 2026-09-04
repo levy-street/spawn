@@ -15,14 +15,17 @@ test("signed out, / is the lander with both doors in", async ({ page }) => {
   await page.goto("/");
   await expect(masthead(page).getByRole("link", { name: "Log in" })).toBeVisible();
   await expect(masthead(page).getByRole("link", { name: /Sign up/ })).toBeVisible();
-  await expect(masthead(page).getByRole("link", { name: "Open spawnd" })).toHaveCount(0);
+  await expect(masthead(page).getByRole("link", { name: "Open SPAWN D" })).toHaveCount(0);
 });
 
 test("signed in, / stays on the lander and swaps the CTAs for Enter", async ({ page }) => {
   await mockApp(page);
+  // The lander's masthead asks /api/me only once this browser has held a
+  // session (lib/auth-hint.ts); a returning user's browser carries the hint.
+  await page.addInitScript(() => window.localStorage.setItem("spawn.signed-in.v1", "1"));
   await page.goto("/");
   await expect(page).toHaveURL(/\/$/u);
-  const enter = masthead(page).getByRole("link", { name: "Open spawnd" });
+  const enter = masthead(page).getByRole("link", { name: "Open SPAWN D" });
   await expect(enter).toBeVisible();
   await expect(masthead(page).getByRole("link", { name: "Log in" })).toHaveCount(0);
   await expect(masthead(page).getByRole("link", { name: /Sign up/ })).toHaveCount(0);
@@ -33,9 +36,9 @@ test("signed in, / stays on the lander and swaps the CTAs for Enter", async ({ p
 test("the brand mark in the app chrome goes back to the lander", async ({ page }) => {
   await mockApp(page);
   await page.goto(`/w/${WORKSPACE_ID}`);
-  await page.getByRole("link", { name: "spawnd home" }).click();
+  await page.getByRole("link", { name: "SPAWN D home" }).click();
   await expect(page).toHaveURL(/\/$/u);
-  await expect(masthead(page).getByRole("link", { name: "Open spawnd" })).toBeVisible();
+  await expect(masthead(page).getByRole("link", { name: "Open SPAWN D" })).toBeVisible();
 });
 
 test("signing out lands on the lander, not the login form", async ({ page }) => {
