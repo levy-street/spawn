@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react-native";
-import type { ReactNode } from "react";
-import { View } from "react-native";
+import type { PropsWithChildren } from "react";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import type { Release } from "@/data/api/schemas/release";
 import { ReleaseWatcher } from "@/lib/release-watcher";
 import type { MobileUpdatesClient } from "@/lib/updates";
@@ -9,29 +9,16 @@ import { ThemeProvider } from "@/theme";
 const mockReleaseRefetch = jest.fn();
 let mockProtocolListener: (() => void) | null = null;
 
-function mockDialog({
-  children,
-  footer,
-  title,
-  visible,
-}: {
-  children?: ReactNode;
-  footer?: ReactNode;
-  title?: string;
-  visible: boolean;
-}) {
-  if (!visible) return null;
-  const NativeText = require("react-native").Text;
-  return (
-    <View>
-      <NativeText>{title}</NativeText>
-      {children}
-      {footer}
-    </View>
-  );
-}
-
-jest.mock("@/components/ui/dialog", () => ({ Dialog: mockDialog }));
+// The overlay presents into a window-level container that has no test
+// renderer behind it; everything else about it renders for real.
+jest.mock("react-native-screens", () => {
+  const ReactModule = jest.requireActual("react") as typeof import("react");
+  const Native = jest.requireActual("react-native") as typeof import("react-native");
+  return {
+    FullWindowOverlay: ({ children }: PropsWithChildren) =>
+      ReactModule.createElement(Native.View, { testID: "update-window-overlay" }, children),
+  };
+});
 
 jest.mock("@/data/queries/release", () => ({
   useRelease: () => ({ refetch: mockReleaseRefetch }),
@@ -61,6 +48,19 @@ jest.mock("expo-updates", () => ({
   reloadAsync: jest.fn(),
 }));
 
+const METRICS = {
+  frame: { x: 0, y: 0, width: 390, height: 844 },
+  insets: { top: 47, right: 0, bottom: 34, left: 0 },
+};
+
+function Providers({ children }: PropsWithChildren): React.JSX.Element {
+  return (
+    <SafeAreaProvider initialMetrics={METRICS}>
+      <ThemeProvider>{children}</ThemeProvider>
+    </SafeAreaProvider>
+  );
+}
+
 function release(overrides: Partial<Release["mobile"]> = {}): Release {
   return {
     server: { commit: "commit", dirty: false },
@@ -87,30 +87,37 @@ describe("ReleaseWatcher", () => {
     mockProtocolListener = null;
   });
 
-  it("downloads an advertised OTA and offers the exact restart prompt", async () => {
+  it("downloads an advertised OTA and offers to take it in place", async () => {
     const updates = fakeUpdates(true);
     mockReleaseRefetch.mockResolvedValue({ data: release({ tree: "server-tree" }) });
     await render(
-      <ThemeProvider>
+      <Providers>
         <ReleaseWatcher updates={updates} />
-      </ThemeProvider>,
+      </Providers>,
     );
 
-    await waitFor(() => expect(screen.getByText("SPAWN D has been updated")).toBeOnTheScreen());
-    expect(screen.getByText("Restart to pick up the new version.")).toBeOnTheScreen();
+    await waitFor(() => expect(screen.getByText("A new SPAWN D is ready")).toBeOnTheScreen());
+    expect(
+      screen.getByText(
+        "It is already downloaded. Updating takes a moment, and your sessions keep running.",
+      ),
+    ).toBeOnTheScreen();
     expect(updates.fetchUpdateAsync).toHaveBeenCalledTimes(1);
 
-    await fireEvent.press(screen.getByText("Restart now"));
+    // Optional, so it keeps a way out — and the way in takes the update
+    // without anyone leaving the app.
+    expect(screen.getByText("Later")).toBeOnTheScreen();
+    await fireEvent.press(screen.getByText("Update now"));
     expect(updates.reloadAsync).toHaveBeenCalledTimes(1);
   });
 
-  it("tells a stranded phone what to do and lets it out of the dialog", async () => {
+  it("tells a stranded phone what to do and lets it off the screen", async () => {
     const updates = fakeUpdates(false);
     mockReleaseRefetch.mockResolvedValue({ data: release() });
     await render(
-      <ThemeProvider>
+      <Providers>
         <ReleaseWatcher updates={updates} />
-      </ThemeProvider>,
+      </Providers>,
     );
     await waitFor(() => expect(mockReleaseRefetch).toHaveBeenCalledTimes(1));
 

@@ -9,6 +9,7 @@ import { useCameraOpen } from "@/components/media/camera-host";
 import { landOnRoot } from "@/components/nav/navigation-reset";
 import { dismissNavigationOverlays } from "@/components/nav/overlay-dismiss";
 import { switchToTab } from "@/components/nav/tab-switcher";
+import { useUpdateOverlayOpen } from "@/components/release/update-overlay";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { dismissAllSheets } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
@@ -157,10 +158,13 @@ export function BottomNav(): React.JSX.Element {
 export function PersistentBottomNav(): React.JSX.Element | null {
   // The window-level bar would sit across the camera's viewfinder, which is
   // presented as a modal underneath it — and across the foot of the system
-  // share sheet, presented the same way. It steps aside while either is up.
+  // share sheet, presented the same way. It steps aside while either is up,
+  // and while a pending app update has taken the screen: there is nothing to
+  // navigate to from a build that is about to be replaced.
   const cameraOpen = useCameraOpen();
   const shareSheetOpen = useShareSheetOpen();
-  if (cameraOpen || shareSheetOpen) return null;
+  const updateOverlayOpen = useUpdateOverlayOpen();
+  if (cameraOpen || shareSheetOpen || updateOverlayOpen) return null;
   return (
     <FullWindowOverlay unstable_accessibilityContainerViewIsModal={false}>
       <View pointerEvents="box-none" style={styles.portal}>

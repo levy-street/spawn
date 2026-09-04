@@ -221,9 +221,9 @@ export function ReleaseWatcher() {
         onPointerDownOutside={(event) => event.preventDefault()}
       >
         <DialogHeader>
-          <DialogTitle>SPAWN D has been updated</DialogTitle>
+          <DialogTitle>A new SPAWN D is ready</DialogTitle>
           <DialogDescription>
-            Reload to pick up the new version. Open terminals reconnect on their own.
+            Updating takes a moment, and open terminals reconnect on their own.
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
@@ -231,7 +231,7 @@ export function ReleaseWatcher() {
             Later
           </Button>
           <Button type="button" size="sm" onClick={() => void reloadClient()}>
-            Reload
+            Update now
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -295,7 +295,7 @@ function ForcedUpdateOverlay({ seconds, stalled }: { seconds: number; stalled: b
           </p>
         )}
         <Button type="button" size="sm" className="mt-5" onClick={() => void reloadClient()}>
-          {stalled ? "Try again" : "Reload now"}
+          {stalled ? "Try again" : "Update now"}
         </Button>
       </div>
     </div>

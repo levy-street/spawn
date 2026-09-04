@@ -88,6 +88,20 @@ export const sizing = {
     /** Air above the plate, so it never hugs the rule or copy it follows. */
     topGap: 16,
   },
+  /**
+   * The full-page notice a pending app update takes over the screen with. It
+   * is a whole screen rather than a card, so its measurements are its own:
+   * the mark stands larger than any plate in a list, and the copy is held to a
+   * readable column however wide the device is.
+   */
+  updateOverlay: {
+    /** The plate the brand mark is centred on, above the copy. */
+    plate: 72,
+    /** The mark drawn inside it. */
+    mark: 32,
+    /** Keeps the copy and the actions to one measure on a wide screen. */
+    contentMaxWidth: 360,
+  },
   /** A bottom drawer's action rows: roomier than a plain list row, since a drawer
    *  is a deliberate stop rather than something you scan past. */
   actionSheet: {

@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AppState, Linking, StyleSheet, View } from "react-native";
-import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui/dialog";
-import { Text } from "@/components/ui/text";
-import { ToastProgressBar } from "@/components/ui/toast";
+import { AppState, Linking } from "react-native";
+import { UpdateOverlay } from "@/components/release/update-overlay";
 import type { Release } from "@/data/api/schemas/release";
 import { useRelease } from "@/data/queries/release";
 import { subscribeProtocolRequired } from "@/data/realtime/socket";
@@ -13,7 +10,6 @@ import {
   type MobileUpdatesClient,
   mobileUpdates,
 } from "@/lib/updates";
-import { layer, spacing, useTheme } from "@/theme";
 
 const RELEASE_CHECK_MS = 15 * 60 * 1_000;
 const SOFT_SNOOZE_MS = 30 * 60 * 1_000;
@@ -22,13 +18,15 @@ const SOFT_SNOOZE_MS = 30 * 60 * 1_000;
  *
  * Null until then, exactly as the browser has it
  * (`web/src/lib/platform.ts`): neither store resolves yet, and a button to
- * `apps.apple.com/` is a button to the storefront's front page — which, in a
- * dialog the person cannot dismiss, is a trap rather than a way out. Filling
+ * `apps.apple.com/` is a button to the storefront's front page — which, on a
+ * screen the person cannot leave, is a trap rather than a way out. Filling
  * this in is the only change needed to turn the words back into a button.
  */
 const APP_STORE_URL: string | null = null;
 
-type UpdatePrompt = { kind: "restart" | "store"; hard: boolean };
+// "apply" is a bundle already on the phone, waiting to be swapped in; "store"
+// is a build only a reinstall can move off.
+type UpdatePrompt = { kind: "apply" | "store"; hard: boolean };
 
 export interface ReleaseWatcherProps {
   updates?: MobileUpdatesClient;
@@ -51,10 +49,17 @@ export function ReleaseWatcher({
    *
    * Without this the hard path fetched a bundle in silence — seconds of
    * nothing on a screen whose sockets had just been refused — and only spoke
-   * once it was ready to restart. The work is not optional, so it takes the
+   * once it was ready to swap. The work is not optional, so it takes the
    * screen while it happens.
    */
   const [forcedBusy, setForcedBusy] = useState(false);
+  /**
+   * The swap itself, from the moment Update now is pressed until the new
+   * bundle takes over. It is usually instant — the bundle is already on the
+   * phone by then — but a phone that has just woken can take a beat, and a
+   * button that answers a press with nothing invites a second one.
+   */
+  const [applying, setApplying] = useState(false);
   refetchRef.current = release.refetch;
 
   const present = useCallback((next: UpdatePrompt) => {
@@ -108,7 +113,7 @@ export function ReleaseWatcher({
           return;
         }
         await updates.fetchUpdateAsync();
-        present({ kind: "restart", hard: becameHard });
+        present({ kind: "apply", hard: becameHard });
       } catch {
         const becameHard = hard || pendingHardRef.current;
         pendingHardRef.current = false;
@@ -137,13 +142,36 @@ export function ReleaseWatcher({
     };
   }, [check]);
 
+  /**
+   * Takes the update in place.
+   *
+   * `reloadAsync` swaps the running bundle for the one already downloaded, so
+   * nobody has to leave the app, kill it, and come back — which is what "please
+   * restart" used to be asking for. If it fails the button comes back rather
+   * than sitting spinning: the bundle is still on the phone, and pressing again
+   * is the right next move.
+   */
+  const applyUpdate = useCallback(() => {
+    if (applying) return;
+    setApplying(true);
+    void updates.reloadAsync().catch(() => {
+      if (mountedRef.current) setApplying(false);
+    });
+  }, [applying, updates]);
+
   if (!updates.isEnabled) return null;
 
   // A required update in flight owns the screen. Everything else in the app is
   // already unusable — the server refused this build at the handshake — so a
   // dismissible notice over it would be a lie about what still works.
   if (forcedBusy) {
-    return <ForcedUpdateOverlay />;
+    return (
+      <UpdateOverlay
+        body="This version can no longer talk to the server. Getting the new one now."
+        busy
+        title="SPAWN D needs to update"
+      />
+    );
   }
 
   const later = () => {
@@ -154,135 +182,44 @@ export function ReleaseWatcher({
   if (prompt?.kind === "store") {
     // A hard prompt is normally undismissable, because the app really cannot
     // go on. That only holds while there is somewhere to send the person: with
-    // no listing to update from, refusing to close the dialog leaves them
-    // holding a phone that can do nothing at all. Say what happened, and let
-    // them out.
+    // no listing to update from, refusing to let them off this screen leaves
+    // them holding a phone that can do nothing at all. Say what happened, and
+    // let them out.
     const storeUrl = APP_STORE_URL;
     const stranded = storeUrl === null;
     return (
-      <Dialog
-        footer={
-          <>
-            {storeUrl === null ? null : (
-              <Button onPress={() => void Linking.openURL(storeUrl)}>Open App Store</Button>
-            )}
-            {stranded ? (
-              <Button onPress={later}>Close</Button>
-            ) : prompt.hard ? null : (
-              <Button onPress={later} variant="outline">
-                Later
-              </Button>
-            )}
-          </>
+      <UpdateOverlay
+        body={
+          stranded
+            ? "This version of SPAWN D no longer works with the server. It cannot update itself yet — SPAWN D is not in the App Store — so reinstall it from wherever you installed it."
+            : "This version of SPAWN D no longer works with the server. Update it from the App Store."
         }
-        onDismiss={() => undefined}
-        showCloseButton={false}
+        {...(stranded
+          ? { primary: { label: "Close", onPress: later } }
+          : {
+              primary: { label: "Open App Store", onPress: () => void Linking.openURL(storeUrl) },
+              ...(prompt.hard ? {} : { secondary: { label: "Later", onPress: later } }),
+            })}
         title="Update SPAWN D"
-        visible
-      >
-        <View style={styles.content}>
-          <Text color="mutedForeground">
-            {stranded
-              ? "This version of SPAWN D no longer works with the server. It cannot update itself yet — SPAWN D is not in the App Store — so reinstall it from wherever you installed it."
-              : "This version of SPAWN D no longer works with the server. Update it from the App Store."}
-          </Text>
-        </View>
-      </Dialog>
+      />
     );
   }
 
-  if (prompt?.kind === "restart" && prompt.hard) {
-    return <ForcedUpdateOverlay onRestart={() => void updates.reloadAsync()} />;
-  }
+  if (prompt?.kind !== "apply") return null;
 
+  // Hard and soft differ in what they say and whether Later exists, not in
+  // what the button does: the bundle is already on the phone either way, and
+  // pressing Update now swaps to it without anyone leaving the app.
   return (
-    <Dialog
-      footer={
-        <>
-          <Button onPress={() => void updates.reloadAsync()}>Restart now</Button>
-          {prompt?.hard ? null : (
-            <Button onPress={later} variant="outline">
-              Later
-            </Button>
-          )}
-        </>
+    <UpdateOverlay
+      body={
+        prompt.hard
+          ? "This version can no longer talk to the server. The new one is downloaded and ready."
+          : "It is already downloaded. Updating takes a moment, and your sessions keep running."
       }
-      onDismiss={() => undefined}
-      showCloseButton={false}
-      title="SPAWN D has been updated"
-      visible={prompt?.kind === "restart"}
-    >
-      <View style={styles.content}>
-        <Text color="mutedForeground">Restart to pick up the new version.</Text>
-      </View>
-    </Dialog>
+      primary={{ label: "Update now", loading: applying, onPress: applyUpdate }}
+      {...(prompt.hard ? {} : { secondary: { label: "Later", onPress: later } })}
+      title={prompt.hard ? "SPAWN D needs to update" : "A new SPAWN D is ready"}
+    />
   );
 }
-
-/**
- * The whole screen, while a required update is taken.
- *
- * Reached only from a protocol refusal: the server has closed the socket
- * saying it will not speak this build's version, so there is nothing behind
- * this to go back to — which is why it is a plain overlay and not a Dialog.
- *
- * The bar is indeterminate because `expo-updates` reports no progress at all.
- * It says "still going", which is the whole of what is known; a percentage
- * here would be a number nobody measured.
- */
-function ForcedUpdateOverlay({ onRestart }: { onRestart?: () => void }): React.JSX.Element {
-  const theme = useTheme();
-  return (
-    <View
-      accessibilityLiveRegion="polite"
-      accessibilityRole="alert"
-      style={[
-        styles.overlay,
-        { backgroundColor: theme.colors.background, padding: theme.space(6), zIndex: layer.modal },
-      ]}
-    >
-      <View style={styles.overlayBody}>
-        <Text style={styles.centered} variant="uiBase" weight="medium">
-          SPAWN D needs to update
-        </Text>
-        <Text
-          color="mutedForeground"
-          style={[styles.centered, { marginTop: theme.space(2) }]}
-          variant="caption"
-        >
-          {onRestart
-            ? "The update is ready. Restarting picks it up; your sessions keep running."
-            : "This version can no longer talk to the server. Getting the new one now."}
-        </Text>
-        {onRestart ? null : <ToastProgressBar progress="indeterminate" />}
-        {onRestart ? (
-          <Button onPress={onRestart} style={{ marginTop: theme.space(5) }}>
-            Restart now
-          </Button>
-        ) : null}
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  centered: {
-    textAlign: "center",
-  },
-  content: {
-    padding: spacing[4],
-  },
-  overlay: {
-    alignItems: "center",
-    bottom: 0,
-    justifyContent: "center",
-    left: 0,
-    position: "absolute",
-    right: 0,
-    top: 0,
-  },
-  overlayBody: {
-    maxWidth: 360,
-    width: "100%",
-  },
-});

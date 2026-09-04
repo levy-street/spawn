@@ -119,7 +119,7 @@ test.fixme("old web + new server 4003 shows the hard countdown and never reconne
   sockets[0]?.close({ code: 4003, reason: "required protocol not offered" });
 
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByRole("heading", { name: "SPAWN D has been updated" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "A new SPAWN D is ready" })).toBeVisible();
   await expect(dialog.getByRole("status")).toHaveText(/Reloading in 10 s/);
   await expect(dialog.getByRole("button", { name: "Later" })).toHaveCount(0);
   await expect(page.getByText(/Reconnecting/i)).toHaveCount(0);
@@ -138,7 +138,7 @@ test("a soft old-web/new-server mismatch can be snoozed", async ({ page }) => {
 
   await page.goto(`${oldWebUrl}/`);
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByRole("heading", { name: "SPAWN D has been updated" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "A new SPAWN D is ready" })).toBeVisible();
   await expect(dialog.getByRole("status")).toHaveCount(0);
   await dialog.getByRole("button", { name: "Later" }).click();
   await expect(dialog).toHaveCount(0);
