@@ -1482,8 +1482,11 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     const term = state.term;
     const buffer = term.buffer.active;
     let occupied = 0;
+    // The rows to flush are the screen's, which start at baseY. viewportY is
+    // where the reader is looking, and on a reseed while scrolled up the two
+    // differ: measuring from there counts the top of the history instead.
     for (let row = 0; row < term.rows; row += 1) {
-      const line = buffer.getLine(buffer.viewportY + row);
+      const line = buffer.getLine(buffer.baseY + row);
       if (line && line.translateToString(true).length > 0) occupied = row + 1;
     }
     return occupied > 0 ? `\x1b[${term.rows};1H${"\n".repeat(occupied)}` : "";

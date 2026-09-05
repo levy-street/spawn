@@ -3885,8 +3885,11 @@ function parseHistoryReplay(
 function flushViewportIntoScrollback(term: XTerm): string {
   const buffer = term.buffer.active;
   let occupied = 0;
+  // The rows to flush are the screen's, which start at baseY; viewportY is
+  // where the reader is looking. The reseed gate keeps them equal here, but
+  // the phone's worker has no such gate, and the two must measure alike.
   for (let row = 0; row < term.rows; row += 1) {
-    const line = buffer.getLine(buffer.viewportY + row);
+    const line = buffer.getLine(buffer.baseY + row);
     if (line && line.translateToString(true).length > 0) occupied = row + 1;
   }
   if (occupied <= 0) return "";
