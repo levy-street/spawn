@@ -102,6 +102,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[features]
+# The diagnostics variant: the same daemon with debug logging on by default,
+# symbols kept for backtraces, and `.diagnostics` in its version so a status
+# line always says which one is running. It is what dream runs permanently,
+# so an attach failure or a held lock is attributed the first time it happens
+# rather than reconstructed from an info-level log afterwards.
+diagnostics = []
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.42", features = ["test-util"] }
@@ -115,3 +123,11 @@ webrtc-sctp = { path = "vendor/sctp" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Release codegen with line tables kept, so a panic in the diagnostics
+# variant carries a readable backtrace. Build with
+# `--profile diagnostics --features diagnostics`.
+[profile.diagnostics]
+inherits = "release"
+strip = false
+debug = 1
