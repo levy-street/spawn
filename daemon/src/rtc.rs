@@ -1546,6 +1546,19 @@ impl RtcSessions {
         status: &str,
         message: Option<&str>,
     ) -> bool {
+        if status == "failed" {
+            // A failed attach was silent at info level: the browser saw only
+            // a pane that never opened. Name the reason where the operator
+            // looks first.
+            tracing::warn!(
+                %session_id,
+                signal_id,
+                reason = message.unwrap_or("unspecified"),
+                "session peer attach failed"
+            );
+        } else {
+            tracing::debug!(%session_id, signal_id, status, "session peer status");
+        }
         let (current, close) = {
             let peers = self.peers.lock().await;
             let current = peers.get(signal_id).filter(|current| {
@@ -1997,7 +2010,9 @@ async fn wait_for_data_channel_capacity(
 ) -> bool {
     let ready_dc = Arc::clone(dc);
     let amount_dc = Arc::clone(dc);
+    let stall_dc = Arc::clone(dc);
     let wait_notify = Arc::clone(buffered_low);
+    let mut waits: u32 = 0;
     wait_for_pacing_capacity(
         move || ready_dc.ready_state() == RTCDataChannelState::Open,
         move || {
@@ -2006,10 +2021,25 @@ async fn wait_for_data_channel_capacity(
         },
         move || {
             let notify = Arc::clone(&wait_notify);
+            let dc = Arc::clone(&stall_dc);
+            waits += 1;
+            let waited = waits;
             async move {
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                // Each wait is at most a second. A viewer that has not drained
+                // for five of them is the peer every later attach on this
+                // session would queue behind; say so while it is happening.
+                if waited.is_multiple_of(5) {
+                    let buffered = dc.buffered_amount().await;
+                    tracing::debug!(
+                        label = dc.label(),
+                        buffered,
+                        waited_secs = waited,
+                        "data channel has not drained below the pacing threshold"
+                    );
                 }
             }
         },
@@ -2432,10 +2462,25 @@ fn install_data_channel_handler(
                         return;
                     };
                     let watermark = replay.watermark();
+                    tracing::debug!(
+                        %session_id,
+                        signal_id = %signal_id,
+                        watermark,
+                        source_offset = control.source_offset(),
+                        "session replay captured; waiting for the live-stream barrier"
+                    );
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
                         || !registry.is_current(session)
                     {
+                        tracing::debug!(
+                            %session_id,
+                            signal_id = %signal_id,
+                            effect_valid = effect.valid(),
+                            active = active.load(Ordering::Acquire),
+                            current = registry.is_current(session),
+                            "pty attach abandoned after replay"
+                        );
                         let _ = dc.close().await;
                         return;
                     }
@@ -2958,8 +3003,17 @@ fn install_control_data_channel(
             };
             let _callback = fence.read().await;
             if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(session) {
+                tracing::debug!(
+                    %session_id,
+                    viewer_id = %viewer_id,
+                    effect_valid = effect.valid(),
+                    active = active.load(Ordering::Acquire),
+                    current = registry.is_current(session),
+                    "control attach abandoned before registration"
+                );
                 return;
             }
+            tracing::debug!(%session_id, viewer_id = %viewer_id, "control channel open; registering viewer");
             controls
                 .register(session_id, viewer_id.clone(), display_sender)
                 .await;
@@ -2968,15 +3022,26 @@ fn install_control_data_channel(
                 .pause_effect(&signal_id, TestEffectPoint::Ready)
                 .await;
             if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(session) {
+                tracing::debug!(
+                    %session_id,
+                    viewer_id = %viewer_id,
+                    effect_valid = effect.valid(),
+                    active = active.load(Ordering::Acquire),
+                    current = registry.is_current(session),
+                    "control attach abandoned after registration"
+                );
                 return;
             }
             if session_ctl::send_ready(&sender, upload_capability, session.generation())
                 .await
                 .is_err()
             {
+                tracing::warn!(%session_id, viewer_id = %viewer_id, "control ready could not be queued; closing peer");
                 channels.stop();
                 active.store(false, Ordering::Release);
                 sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
+            } else {
+                tracing::debug!(%session_id, viewer_id = %viewer_id, "control ready sent");
             }
         })
     }));
@@ -3032,6 +3097,7 @@ struct ControlRequestContext<'a> {
 async fn handle_control_request(context: ControlRequestContext<'_>, request: ControlRequest) {
     let ControlRequestContext {
         session,
+        viewer_id,
         controls,
         sender,
         effect,
@@ -3039,8 +3105,12 @@ async fn handle_control_request(context: ControlRequestContext<'_>, request: Con
     } = context;
     let session_id = session.session_id();
     let request_id = request.request_id;
-    let transaction = controls.transaction(session_id).await;
-    let _guard = transaction.lock().await;
+    let _guard = controls
+        .lock_transaction(
+            session_id,
+            format!("request {} viewer={viewer_id}", request.operation_name()),
+        )
+        .await;
     if !effect.valid() {
         return;
     }

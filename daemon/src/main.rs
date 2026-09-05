@@ -158,6 +158,13 @@ fn init_tracing(verbose: u8) {
 
     // -v => debug for spawnd, info elsewhere
     // -vv => trace for spawnd, debug elsewhere
+    // The diagnostics variant starts at -v: its whole point is that the log
+    // already holds the answer when something goes wrong.
+    let verbose = if crate::version::DIAGNOSTICS_BUILD {
+        verbose.max(1)
+    } else {
+        verbose
+    };
     let default = match verbose {
         0 => "info,webrtc=warn,webrtc_sctp=warn,webrtc_ice=warn",
         1 => "info,spawnd=debug,webrtc=warn,webrtc_sctp=warn,webrtc_ice=warn",

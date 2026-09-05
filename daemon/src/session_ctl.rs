@@ -6,7 +6,9 @@
 //! confused and no single SCTP message needs to hold an entire replay.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Mutex};
@@ -707,7 +709,47 @@ pub fn decode_upload_chunk(bytes: &[u8]) -> Result<UploadChunk, ProtocolError> {
 pub struct SessionControlHub {
     inner: Arc<Mutex<HashMap<Uuid, DisplayState>>>,
     transactions: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    /// Who holds each session's transaction right now, and since when. A
+    /// viewer that waits on a held transaction names the holder in its
+    /// warning, which is the one fact a silent attach failure needs.
+    holders: Arc<std::sync::Mutex<HashMap<Uuid, TransactionHolder>>>,
 }
+
+#[derive(Clone)]
+struct TransactionHolder {
+    label: String,
+    since: Instant,
+    token: u64,
+}
+
+/// One session's control transaction, held until dropped. Dropping it
+/// releases the transaction and clears the holder record.
+pub struct TransactionGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    holders: Arc<std::sync::Mutex<HashMap<Uuid, TransactionHolder>>>,
+    session_id: Uuid,
+    token: u64,
+}
+
+impl Drop for TransactionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut holders) = self.holders.lock() {
+            if holders
+                .get(&self.session_id)
+                .is_some_and(|holder| holder.token == self.token)
+            {
+                holders.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// A wait longer than this is reported, naming the holder; the report repeats
+/// at the second interval while the wait continues. A healthy transaction is
+/// held for milliseconds; the longest legitimate hold is a replay's 10 s cap.
+const TRANSACTION_WAIT_WARN_AFTER: Duration = Duration::from_secs(2);
+const TRANSACTION_WAIT_WARN_EVERY: Duration = Duration::from_secs(10);
+static TRANSACTION_TOKENS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct DisplayState {
@@ -732,9 +774,81 @@ impl SessionControlHub {
             .clone()
     }
 
-    pub async fn register(&self, session_id: Uuid, viewer_id: String, display: DisplaySender) {
+    /// Take one session's transaction, naming the taker. Every path that
+    /// serialises on a session goes through here so a wait can say who it is
+    /// waiting for.
+    pub async fn lock_transaction(
+        &self,
+        session_id: Uuid,
+        label: impl Into<String>,
+    ) -> TransactionGuard {
         let transaction = self.transaction(session_id).await;
-        let _guard = transaction.lock().await;
+        self.lock_existing(session_id, label.into(), transaction)
+            .await
+    }
+
+    async fn lock_existing(
+        &self,
+        session_id: Uuid,
+        label: String,
+        transaction: Arc<Mutex<()>>,
+    ) -> TransactionGuard {
+        let started = Instant::now();
+        let mut next_warning = TRANSACTION_WAIT_WARN_AFTER;
+        let lock = transaction.lock_owned();
+        tokio::pin!(lock);
+        let guard = loop {
+            tokio::select! {
+                guard = &mut lock => break guard,
+                _ = tokio::time::sleep(next_warning.saturating_sub(started.elapsed())) => {
+                    let holder = self
+                        .holders
+                        .lock()
+                        .ok()
+                        .and_then(|holders| holders.get(&session_id).cloned());
+                    tracing::warn!(
+                        %session_id,
+                        waiting = %label,
+                        waited_secs = started.elapsed().as_secs(),
+                        holder = holder.as_ref().map_or("none recorded", |holder| holder.label.as_str()),
+                        held_secs = holder.as_ref().map_or(0, |holder| holder.since.elapsed().as_secs()),
+                        "session control transaction is held; a viewer is waiting on it"
+                    );
+                    next_warning += TRANSACTION_WAIT_WARN_EVERY;
+                }
+            }
+        };
+        let token = TRANSACTION_TOKENS.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut holders) = self.holders.lock() {
+            holders.insert(
+                session_id,
+                TransactionHolder {
+                    label,
+                    since: Instant::now(),
+                    token,
+                },
+            );
+        }
+        TransactionGuard {
+            _guard: guard,
+            holders: Arc::clone(&self.holders),
+            session_id,
+            token,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_holder(&self, session_id: Uuid) -> Option<String> {
+        self.holders
+            .lock()
+            .ok()
+            .and_then(|holders| holders.get(&session_id).map(|holder| holder.label.clone()))
+    }
+
+    pub async fn register(&self, session_id: Uuid, viewer_id: String, display: DisplaySender) {
+        let _guard = self
+            .lock_transaction(session_id, format!("register viewer={viewer_id}"))
+            .await;
         {
             let mut states = self.inner.lock().await;
             let state = states.entry(session_id).or_default();
@@ -759,7 +873,13 @@ impl SessionControlHub {
     pub async fn unregister(&self, session_id: Uuid, viewer_id: &str) {
         let transaction = self.transaction(session_id).await;
         {
-            let _guard = transaction.lock().await;
+            let _guard = self
+                .lock_existing(
+                    session_id,
+                    format!("unregister viewer={viewer_id}"),
+                    Arc::clone(&transaction),
+                )
+                .await;
             self.unregister_in_transaction(session_id, viewer_id).await;
         }
         self.evict_transaction_if_idle(session_id, &transaction)
@@ -793,7 +913,13 @@ impl SessionControlHub {
     pub async fn remove_session(&self, session_id: Uuid) {
         let transaction = self.transaction(session_id).await;
         {
-            let _guard = transaction.lock().await;
+            let _guard = self
+                .lock_existing(
+                    session_id,
+                    "remove_session".to_string(),
+                    Arc::clone(&transaction),
+                )
+                .await;
             self.inner.lock().await.remove(&session_id);
         }
         self.evict_transaction_if_idle(session_id, &transaction)
@@ -1183,6 +1309,29 @@ mod tests {
             .borrow()
             .as_ref()
             .is_some_and(|text| text.contains("\"owner\":true") && text.contains("\"viewers\":1")));
+    }
+
+    #[tokio::test]
+    async fn transaction_guard_names_its_holder_and_clears_on_drop() {
+        let hub = SessionControlHub::default();
+        let session_id = Uuid::new_v4();
+        let guard = hub
+            .lock_transaction(session_id, "request history viewer=a")
+            .await;
+        assert_eq!(
+            hub.current_holder(session_id).as_deref(),
+            Some("request history viewer=a")
+        );
+        drop(guard);
+        assert_eq!(hub.current_holder(session_id), None);
+
+        // Registration and its release go through the same record, and an
+        // emptied session still evicts its transaction as before.
+        let (tx, _rx) = watch::channel(None);
+        hub.register(session_id, "first".into(), tx).await;
+        assert_eq!(hub.current_holder(session_id), None);
+        hub.unregister(session_id, "first").await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
     }
 
     #[tokio::test]
