@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   chunkPtyInput,
   decodeSpctFrame,
@@ -9,6 +11,7 @@ import {
   parseSessionCtlText,
   ReplayAssembler,
   SESSION_CTL_CHUNK_PAYLOAD_BYTES,
+  SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES,
   slicePtyChunkAfterAnchor,
 } from "@/terminal/transport/ctl-codec";
 
@@ -218,6 +221,94 @@ describe("PTY chunking and replay merge", () => {
     if (result.kind === "complete") {
       expect(result.bytes.byteLength).toBe(total);
       expect(Array.from(result.bytes.slice(-2))).toEqual([2, 3]);
+    }
+  });
+});
+
+describe("replay framing vector", () => {
+  const vectors = JSON.parse(
+    readFileSync(
+      resolve(__dirname, "../../../../../proto/session-ctl-replay-framing-v1-vectors.json"),
+      "utf8",
+    ),
+  ) as {
+    daemon_chunk_payload_bytes: number;
+    max_chunk_payload_bytes: number;
+    min_chunk_payload_bytes: number;
+    cases: Array<{ name: string; total_bytes: number; chunks: number; last_chunk_bytes: number }>;
+    rejected_headers: Array<{ name: string; total_bytes: number; chunks: number }>;
+    rejected_on_first_chunk: Array<{
+      name: string;
+      total_bytes: number;
+      chunks: number;
+      first_chunk_bytes: number;
+    }>;
+  };
+  const header = (totalBytes: number, chunks: number) => ({
+    version: 1 as const,
+    kind: "response" as const,
+    request_id: REQUEST_ID,
+    operation: "history" as const,
+    ok: true,
+    total_bytes: totalBytes,
+    chunks,
+    pty_offset: 0,
+    plain: false,
+  });
+
+  test("assembles every case framed the daemon's way", () => {
+    const payloadBytes = vectors.daemon_chunk_payload_bytes;
+    expect(payloadBytes).toBe(16 * 1024 - 28);
+    expect(vectors.max_chunk_payload_bytes).toBe(SESSION_CTL_CHUNK_PAYLOAD_BYTES);
+    expect(vectors.min_chunk_payload_bytes).toBe(SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES);
+    for (const c of vectors.cases) {
+      if (c.chunks === 0) continue;
+      const assembler = new ReplayAssembler(header(c.total_bytes, c.chunks));
+      let result: ReturnType<ReplayAssembler["accept"]> = { kind: "pending" };
+      for (let sequence = 0; sequence < c.chunks; sequence += 1) {
+        const last = sequence + 1 === c.chunks;
+        result = assembler.accept({
+          kind: "replay",
+          requestId: REQUEST_ID,
+          sequence,
+          last,
+          payload: new Uint8Array(last ? c.last_chunk_bytes : payloadBytes).fill(sequence & 0xff),
+        });
+        if (!last) expect(result).toEqual({ kind: "pending" });
+      }
+      expect(result.kind).toBe("complete");
+      if (result.kind === "complete") {
+        expect(result.bytes.byteLength).toBe(c.total_bytes);
+        for (let sequence = 0; sequence < c.chunks; sequence += 1) {
+          expect(result.bytes[sequence * payloadBytes]).toBe(sequence & 0xff);
+        }
+      }
+    }
+  });
+
+  test("rejects headers and first chunks no daemon framing can explain", () => {
+    for (const r of vectors.rejected_headers) {
+      if (r.chunks === 0) continue;
+      const assembler = new ReplayAssembler(header(r.total_bytes, r.chunks));
+      const result = assembler.accept({
+        kind: "replay",
+        requestId: REQUEST_ID,
+        sequence: 0,
+        last: r.chunks === 1,
+        payload: new Uint8Array(1),
+      });
+      expect(result.kind).toBe("invalid");
+    }
+    for (const r of vectors.rejected_on_first_chunk) {
+      const assembler = new ReplayAssembler(header(r.total_bytes, r.chunks));
+      const result = assembler.accept({
+        kind: "replay",
+        requestId: REQUEST_ID,
+        sequence: 0,
+        last: r.chunks === 1,
+        payload: new Uint8Array(r.first_chunk_bytes),
+      });
+      expect(result.kind).toBe("invalid");
     }
   });
 });
