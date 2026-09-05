@@ -11,7 +11,9 @@ Checks:
   - /api/release server.commit matches the ref's commit
   - /api/release daemon.tree matches the ref's daemon/ tree
   - /api/install/manifest.json has a valid daemon-pinned signature
-  - the signed manifest counter matches the ref commit's committer timestamp
+  - the signed manifest counter matches the committer timestamp of the commit
+    the daemon release was built at (the ref's, unless the ref left daemon/
+    untouched and the manifest names the earlier commit it kept)
   - every advertised daemon binary hashes to its advertised sha256
   - the production Expo manifest carries the ref's mobile/ tree
   - /desktop/latest.json, every artifact signature, and /api/release.desktop match
@@ -115,8 +117,6 @@ if [[ "$skip_desktop" != "1" ]]; then
     python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" ||
     die "cannot read the desktop version at $git_ref"
 fi
-expected_release_counter="$(release_counter_for_commit "$expected_commit")" ||
-  die "cannot derive the release counter for $expected_commit"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -368,11 +368,24 @@ fi
 
 manifest_key_id=""
 manifest_daemon_tree=""
+manifest_commit=""
 actual_release_counter=""
 if [[ "$manifest_available" == "1" ]]; then
   manifest_key_id="$(json_get "$manifest_file" signing_key_id 2>/dev/null || true)"
   manifest_daemon_tree="$(json_get "$manifest_file" tree 2>/dev/null || true)"
+  manifest_commit="$(json_get "$manifest_file" commit 2>/dev/null || true)"
   actual_release_counter="$(json_get "$manifest_file" release_counter 2>/dev/null || true)"
+fi
+# A daemon release is its tree: a ref that left daemon/ alone keeps the
+# release built at another commit, whose counter is that commit's.
+expected_release_counter="$(release_counter_expected_for_deploy \
+  "$expected_commit" "$expected_daemon_tree" "$manifest_commit")" ||
+  die "cannot derive the release counter for ${manifest_commit:-$expected_commit}"
+if [[ -n "$manifest_commit" ]] && ! git cat-file -e "$manifest_commit^{commit}" 2>/dev/null; then
+  # The script never fetches, so the counter row below expects the ref's
+  # counter and fails if the release was kept from a commit this clone lacks.
+  print_row "daemon release commit" "in this clone" \
+    "$manifest_commit is not in this clone (fetch, then re-run)" "NOTE"
 fi
 
 signature_ok=0
