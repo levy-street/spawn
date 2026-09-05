@@ -2,7 +2,14 @@ export const SESSION_CTL_VERSION = 1;
 export const SESSION_CTL_MAX_TEXT_BYTES = 16 * 1024;
 export const SESSION_CTL_MAX_REPLAY_BYTES = 12 * 1024 * 1024;
 export const SESSION_CTL_MAX_PENDING_PTY_BYTES = 12 * 1024 * 1024;
+/** The largest chunk payload accepted, and the size of this client's own
+ *  upload chunks. The daemon frames a replay as 16 KiB SCTP messages, 28 of
+ *  them header (`proto/session-ctl-replay-framing-v1-vectors.json`); the
+ *  size is learned from the first non-final chunk, never assumed. */
 export const SESSION_CTL_CHUNK_PAYLOAD_BYTES = 48 * 1024;
+/** A non-final replay chunk smaller than this is no framing the daemon
+ *  produces; refusing it bounds how many chunks one replay may cost. */
+export const SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES = 1024;
 export const SESSION_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 export const SESSION_CTL_MAX_OUTSTANDING_REQUESTS = 128;
 export const PTY_INPUT_MAX_BYTES = 64 * 1024;
@@ -353,10 +360,28 @@ export function slicePtyChunkAfterAnchor(
   return { bytes: start < anchor ? bytes.subarray(anchor - start) : bytes, anchor: null };
 }
 
+/**
+ * Whether `chunks` can carry `totalBytes` under some chunk size in the
+ * accepted range: every non-final chunk between the minimum and the ceiling,
+ * the final one at least a byte. The header cannot pin the exact size; the
+ * first non-final chunk does.
+ */
+export function replayChunkCountIsPlausible(totalBytes: number, chunks: number): boolean {
+  if (chunks === 0) return totalBytes === 0;
+  if (totalBytes === 0) return false;
+  if (chunks === 1) return totalBytes <= SESSION_CTL_CHUNK_PAYLOAD_BYTES;
+  return (
+    (chunks - 1) * SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES < totalBytes &&
+    totalBytes <= chunks * SESSION_CTL_CHUNK_PAYLOAD_BYTES
+  );
+}
+
 export class ReplayAssembler {
   readonly #chunks = new Map<number, Uint8Array>();
   readonly #response: SessionCtlResponse;
   #bufferedBytes = 0;
+  /** Learned from the first non-final chunk; every later one must match. */
+  #chunkPayloadBytes: number | null = null;
 
   constructor(response: SessionCtlResponse) {
     this.#response = response;
@@ -370,26 +395,51 @@ export class ReplayAssembler {
       frame.requestId !== this.#response.request_id ||
       typeof totalBytes !== "number" ||
       typeof expectedChunks !== "number" ||
+      !Number.isSafeInteger(totalBytes) ||
+      !Number.isSafeInteger(expectedChunks) ||
       totalBytes < 0 ||
       totalBytes > SESSION_CTL_MAX_REPLAY_BYTES ||
-      expectedChunks !== Math.ceil(totalBytes / SESSION_CTL_CHUNK_PAYLOAD_BYTES) ||
+      !replayChunkCountIsPlausible(totalBytes, expectedChunks) ||
       frame.sequence >= expectedChunks ||
       this.#chunks.has(frame.sequence)
     ) {
       return { kind: "invalid", reason: "Replay metadata or sequence mismatch." };
     }
     const finalSequence = expectedChunks - 1;
-    const expectedPayload =
-      frame.sequence === finalSequence
-        ? totalBytes - finalSequence * SESSION_CTL_CHUNK_PAYLOAD_BYTES
-        : SESSION_CTL_CHUNK_PAYLOAD_BYTES;
-    if (
-      frame.last !== (frame.sequence === finalSequence) ||
-      frame.payload.byteLength !== expectedPayload
-    ) {
-      return { kind: "invalid", reason: "Replay chunk length or final flag mismatch." };
+    const isFinal = frame.sequence === finalSequence;
+    const length = frame.payload.byteLength;
+    if (frame.last !== isFinal || length === 0 || length > SESSION_CTL_CHUNK_PAYLOAD_BYTES) {
+      return { kind: "invalid", reason: "Replay chunk flag or length is out of range." };
     }
-    this.#bufferedBytes += frame.payload.byteLength;
+    if (isFinal) {
+      const expected =
+        this.#chunkPayloadBytes === null
+          ? expectedChunks === 1
+            ? totalBytes
+            : null
+          : totalBytes - this.#chunkPayloadBytes * finalSequence;
+      if (expected !== null && length !== expected) {
+        return { kind: "invalid", reason: "Final replay chunk does not complete the total." };
+      }
+    } else if (this.#chunkPayloadBytes === null) {
+      // The first non-final chunk fixes the framing for the rest; the
+      // daemon's size is never assumed, only required to carry the total.
+      if (
+        length < SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES ||
+        length * finalSequence >= totalBytes ||
+        length * expectedChunks < totalBytes
+      ) {
+        return { kind: "invalid", reason: "Replay chunk size cannot carry the total." };
+      }
+      const held = this.#chunks.get(finalSequence);
+      if (held && held.byteLength !== totalBytes - length * finalSequence) {
+        return { kind: "invalid", reason: "Final replay chunk does not complete the total." };
+      }
+      this.#chunkPayloadBytes = length;
+    } else if (length !== this.#chunkPayloadBytes) {
+      return { kind: "invalid", reason: "Replay chunks are not one size." };
+    }
+    this.#bufferedBytes += length;
     if (this.#bufferedBytes > SESSION_CTL_MAX_REPLAY_BYTES) {
       return { kind: "invalid", reason: "Replay exceeds the aggregate byte limit." };
     }
@@ -399,7 +449,9 @@ export class ReplayAssembler {
     let offset = 0;
     for (let sequence = 0; sequence < expectedChunks; sequence += 1) {
       const chunk = this.#chunks.get(sequence);
-      if (!chunk) return { kind: "invalid", reason: "Replay has a missing chunk." };
+      if (!chunk || offset + chunk.byteLength > totalBytes) {
+        return { kind: "invalid", reason: "Replay has a missing or oversized chunk." };
+      }
       bytes.set(chunk, offset);
       offset += chunk.byteLength;
     }

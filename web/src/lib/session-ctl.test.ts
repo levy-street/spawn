@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   combineSessionCtlChunks,
   decodeSessionCtlChunk,
@@ -14,6 +15,7 @@ import {
   SESSION_CTL_MAX_OUTSTANDING_REQUESTS,
   SESSION_CTL_MAX_REPLAY_BYTES,
   SESSION_CTL_MAX_UPLOAD_BYTES,
+  SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES,
   SESSION_CTL_UPLOAD_CHUNK_BYTES,
   SESSION_PTY_INPUT_CHUNK_BYTES,
   SessionCtlRequestTracker,
@@ -297,13 +299,35 @@ describe("spawn.ctl browser protocol", () => {
       }),
       null,
     );
-    // A non-final flag on the final chunk is rejected without completing.
-    assert.equal(
+    // A non-final flag on the final chunk is a framing this client will not
+    // assemble: the request is dropped and the consumer told why, never left
+    // pending in silence.
+    assert.deepEqual(
       tracker.acceptChunk({
         requestId: snapshotId,
         sequence: 0,
         last: false,
         payload: new Uint8Array([1, 2, 3]),
+      }),
+      {
+        kind: "rejected",
+        requestId: snapshotId,
+        operation: "snapshot",
+        reason: "replay chunk flag or length is out of range",
+      },
+    );
+    assert.equal(tracker.size, 0);
+    assert.ok(tracker.register(snapshotId, "snapshot"));
+    assert.equal(
+      tracker.acceptResponse({
+        version: 1,
+        kind: "response",
+        request_id: snapshotId,
+        operation: "snapshot",
+        ok: true,
+        plain: false,
+        total_bytes: 3,
+        chunks: 1,
       }),
       null,
     );
@@ -434,4 +458,101 @@ describe("spawn.ctl browser protocol", () => {
       null,
     );
   });
+});
+
+const REPLAY_FRAMING_VECTORS = JSON.parse(
+  readFileSync(
+    new URL("../../../proto/session-ctl-replay-framing-v1-vectors.json", import.meta.url),
+    "utf8",
+  ),
+) as {
+  daemon_chunk_payload_bytes: number;
+  max_chunk_payload_bytes: number;
+  min_chunk_payload_bytes: number;
+  cases: Array<{ name: string; total_bytes: number; chunks: number; last_chunk_bytes: number }>;
+  rejected_headers: Array<{ name: string; total_bytes: number; chunks: number }>;
+  rejected_on_first_chunk: Array<{
+    name: string;
+    total_bytes: number;
+    chunks: number;
+    first_chunk_bytes: number;
+  }>;
+};
+
+function replayHeader(id: string, totalBytes: number, chunks: number) {
+  return {
+    version: 1,
+    kind: "response" as const,
+    request_id: id,
+    operation: "history" as const,
+    ok: true,
+    plain: false,
+    pty_offset: 0,
+    total_bytes: totalBytes,
+    chunks,
+  };
+}
+
+test("assembles replays framed the daemon's way, per the shared vector", () => {
+  const payloadBytes = REPLAY_FRAMING_VECTORS.daemon_chunk_payload_bytes;
+  assert.equal(payloadBytes, 16 * 1024 - 28);
+  assert.equal(REPLAY_FRAMING_VECTORS.max_chunk_payload_bytes, SESSION_CTL_CHUNK_PAYLOAD_BYTES);
+  assert.equal(
+    REPLAY_FRAMING_VECTORS.min_chunk_payload_bytes,
+    SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES,
+  );
+  for (const c of REPLAY_FRAMING_VECTORS.cases) {
+    const tracker = new SessionCtlRequestTracker();
+    const id = requestId(7);
+    assert.ok(tracker.register(id, "history"), c.name);
+    const header = tracker.acceptResponse(replayHeader(id, c.total_bytes, c.chunks));
+    if (c.chunks === 0) {
+      assert.equal(header?.kind, "replay", c.name);
+      continue;
+    }
+    assert.equal(header, null, c.name);
+    let result: ReturnType<SessionCtlRequestTracker["acceptChunk"]> = null;
+    for (let sequence = 0; sequence < c.chunks; sequence += 1) {
+      const last = sequence + 1 === c.chunks;
+      const length = last ? c.last_chunk_bytes : payloadBytes;
+      result = tracker.acceptChunk({
+        requestId: id,
+        sequence,
+        last,
+        payload: new Uint8Array(length).fill(sequence & 0xff),
+      });
+      if (!last) assert.equal(result, null, `${c.name} chunk ${sequence}`);
+    }
+    assert.equal(result?.kind, "replay", c.name);
+    if (result?.kind === "replay") {
+      assert.equal(result.bytes.byteLength, c.total_bytes, c.name);
+      // Every chunk lands at its own offset, in sequence order.
+      for (let sequence = 0; sequence < c.chunks; sequence += 1) {
+        assert.equal(result.bytes[sequence * payloadBytes], sequence & 0xff, `${c.name} order`);
+      }
+    }
+    assert.equal(tracker.size, 0, c.name);
+  }
+  for (const r of REPLAY_FRAMING_VECTORS.rejected_headers) {
+    const tracker = new SessionCtlRequestTracker();
+    const id = requestId(8);
+    tracker.register(id, "history");
+    const rejected = tracker.acceptResponse(replayHeader(id, r.total_bytes, r.chunks));
+    assert.equal(rejected?.kind, "rejected", r.name);
+    assert.equal(tracker.size, 0, r.name);
+  }
+  for (const r of REPLAY_FRAMING_VECTORS.rejected_on_first_chunk) {
+    const tracker = new SessionCtlRequestTracker();
+    const id = requestId(9);
+    tracker.register(id, "history");
+    assert.equal(tracker.acceptResponse(replayHeader(id, r.total_bytes, r.chunks)), null, r.name);
+    const rejected = tracker.acceptChunk({
+      requestId: id,
+      sequence: 0,
+      last: r.chunks === 1,
+      payload: new Uint8Array(r.first_chunk_bytes),
+    });
+    assert.equal(rejected?.kind, "rejected", r.name);
+    assert.equal(tracker.size, 0, r.name);
+  }
 });
