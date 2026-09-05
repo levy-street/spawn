@@ -75,7 +75,7 @@ describe("offline terminal worker", () => {
   test("rebuilds history cleanly and recovers both history and PTY gaps", () => {
     expect(TERMINAL_WORKER_HTML).toContain("session.bootstrapCount > 0 && alternate");
     expect(TERMINAL_WORKER_HTML).toContain(
-      'state.term.write("\\x1b[0m\\x1b[H\\x1b[2J\\x1b[3J", writeReplay)',
+      'state.term.write("\\x1b[0m\\x1b[r\\x1b[?6l\\x1b[?7h\\x1b[H\\x1b[2J\\x1b[3J", writeReplay)',
     );
     expect(TERMINAL_WORKER_HTML).toContain('message.event === "history_gap"');
     expect(TERMINAL_WORKER_HTML).toContain('message.event === "pty_gap"');

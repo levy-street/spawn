@@ -1593,3 +1593,28 @@ test("a replay longer than one daemon chunk still seeds the terminal", async ({ 
   await page.mouse.wheel(0, -1_000_000);
   await expect(liveTerminalRows(page)).toContainText("history line 0000");
 });
+
+test("a reconnect reseed keeps its history when the previous screen set a scroll region", async ({
+  page,
+}) => {
+  // The first screen's tail sets DECSTBM rows 2–5, as an agent TUI does.
+  // 2J/3J do not undo it, so without restoring the margins the reseed's
+  // history scrolls inside those four rows and never reaches scrollback (#58).
+  const seed = (lines: string[], screen: string) =>
+    `\x1b[8;36;83t\x1b_sp:h1\x1b\\${lines.map((line) => `${line}\r\n`).join("")}\x1b[8;36;83t${screen}`;
+  const { sockets } = await openTerminalWithMockSocket(page, {
+    reconnect: true,
+    history: seed(["old 1", "old 2"], "\x1b[1;1Hbefore-reconnect\x1b[2;5r"),
+    secondHistory: seed(
+      Array.from({ length: 60 }, (_, index) => `new ${String(index + 1).padStart(2, "0")}`),
+      "\x1b[1;1Hafter-reconnect",
+    ),
+  });
+  await expect(liveTerminalRows(page)).toContainText("before-reconnect");
+  await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
+  await expect(liveTerminalRows(page)).toContainText("after-reconnect");
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -1_000_000);
+  await expect(liveTerminalRows(page)).toContainText("new 01");
+  await expect(liveTerminalRows(page)).not.toContainText("old 1");
+});
