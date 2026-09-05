@@ -352,7 +352,11 @@
       !history ||
       message.request_id !== history.requestId ||
       message.operation !== history.operation ||
-      message.ok !== true ||
+      message.ok !== true
+    ) {
+      return false;
+    }
+    if (
       message.plain !== false ||
       !Number.isSafeInteger(message.total_bytes) ||
       message.total_bytes < 0 ||
@@ -365,6 +369,9 @@
         (Number.isSafeInteger(message.pty_offset) && message.pty_offset >= 0)
       )
     ) {
+      // A reply this client will not assemble is a wire disagreement, not
+      // silence: the pane must not wait on it until the connect timeout.
+      api.error("replay_metadata", "Replay metadata is not a framing this client accepts.", true);
       return false;
     }
     history.metadata = message;

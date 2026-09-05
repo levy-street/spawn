@@ -921,16 +921,17 @@ zero or more request-bound binary chunks and caps the complete response at
 12 MiB:
 
 ```json
-{"version":1,"kind":"response","request_id":"uuid","operation":"snapshot","ok":true,"plain":false,"pty_offset":42,"total_bytes":90000,"chunks":2}
+{"version":1,"kind":"response","request_id":"uuid","operation":"snapshot","ok":true,"plain":false,"pty_offset":42,"total_bytes":90000,"chunks":6}
 ```
 
 The daemon frames every chunk as one 16 KiB SCTP message: the 28-byte header
 and up to 16,356 bytes of payload. A client must not assume that size. It
 learns the payload size from the first non-final chunk it receives, requires
 every non-final chunk to match it, accepts any size from 1 KiB to 48 KiB, and
-derives the final chunk's size from `total_bytes`. The daemon's encoder and
-both clients' assemblers assert
-`proto/session-ctl-replay-framing-v1-vectors.json`, because on 2026-09-05
+derives the final chunk's size from `total_bytes`; a header no size in that
+range could produce is refused outright. The daemon's encoder, the web
+client's request tracker and the mobile terminal worker's assembler all
+assert `proto/session-ctl-replay-framing-v1-vectors.json`, because on 2026-09-05
 the clients assumed 48 KiB and silently discarded every replay longer than
 one daemon chunk — every Codex session that had scrolled 16 KiB of history
 looped on its connect timer while every fullscreen TUI, which commits no

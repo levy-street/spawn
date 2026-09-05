@@ -1571,7 +1571,11 @@ test("a replay longer than one daemon chunk still seeds the terminal", async ({ 
   // which commits no history — must assemble every chunk and open. A client
   // that assumed the chunk size discarded the reply in silence and aborted at
   // its connect timer, forever (2026-09-05).
-  const lines = Array.from({ length: 3000 }, (_, index) => `history line ${index}\r\n`).join("");
+  // 19 bytes a line, so line 860 straddles the first chunk boundary at 16,356.
+  const lines = Array.from(
+    { length: 3000 },
+    (_, index) => `history line ${String(index).padStart(4, "0")}\r\n`,
+  ).join("");
   const history = `\x1b[8;36;83t\x1b_sp:h1\x1b\\${lines}\x1b[8;36;83tlong-history-ready\r\n$ `;
   expect(Buffer.byteLength(history)).toBeGreaterThan(3 * (16 * 1024 - 28));
   const { messages } = await openTerminalWithMockSocket(page, {
@@ -1583,4 +1587,9 @@ test("a replay longer than one daemon chunk still seeds the terminal", async ({ 
   await page.getByLabel("Session terminal").click();
   await page.keyboard.type("ok");
   await expect.poll(() => binaryText(messages)).toContain("ok");
+  // The first chunk is the top of the scrollback, so the history arrived in
+  // order and not merely in full.
+  await liveTerminal(page).hover();
+  await page.mouse.wheel(0, -1_000_000);
+  await expect(liveTerminalRows(page)).toContainText("history line 0000");
 });

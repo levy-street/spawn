@@ -1102,6 +1102,9 @@ export function useSessionSocket({
           // still opens; the live stream fills it from here.
           console.warn(`SPAWN D: spawn.ctl ${result.operation} reply rejected: ${result.reason}`);
           if (result.requestId === initialHistoryRequestId) finishBootstrap(new Uint8Array(), 0);
+          else if (result.operation === "snapshot") {
+            currentHandlers()?.onSnapshotError?.(`rejected: ${result.reason}`);
+          }
           return;
         }
         const requestId = result.response.request_id;

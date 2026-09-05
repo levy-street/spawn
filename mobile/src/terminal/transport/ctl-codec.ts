@@ -395,6 +395,8 @@ export class ReplayAssembler {
       frame.requestId !== this.#response.request_id ||
       typeof totalBytes !== "number" ||
       typeof expectedChunks !== "number" ||
+      !Number.isSafeInteger(totalBytes) ||
+      !Number.isSafeInteger(expectedChunks) ||
       totalBytes < 0 ||
       totalBytes > SESSION_CTL_MAX_REPLAY_BYTES ||
       !replayChunkCountIsPlausible(totalBytes, expectedChunks) ||
