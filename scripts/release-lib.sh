@@ -70,6 +70,27 @@ release_counter_for_commit() {
   printf '%s\n' "$counter"
 }
 
+# The counter a deployed daemon manifest should carry. A daemon release is
+# identified by its daemon/ tree, so a deploy that changed nothing under
+# daemon/ keeps the release built at an earlier commit, and that commit's
+# committer timestamp is the counter — not the ref's. Given the ref's commit
+# and daemon tree and the commit the manifest names, this prints the counter
+# of the manifest's commit when that commit's daemon/ is the ref's tree, and
+# the ref's counter otherwise (where the tree row fails alongside).
+release_counter_expected_for_deploy() {
+  local ref_commit="$1"
+  local ref_daemon_tree="$2"
+  local manifest_commit="$3"
+  local manifest_tree
+  if [[ -n "$manifest_commit" ]] &&
+    manifest_tree="$(git rev-parse "$manifest_commit:daemon" 2>/dev/null)" &&
+    [[ "$manifest_tree" == "$ref_daemon_tree" ]]; then
+    release_counter_for_commit "$manifest_commit"
+    return
+  fi
+  release_counter_for_commit "$ref_commit"
+}
+
 release_signing_key_path() {
   printf '%s\n' "${SPAWN_RELEASE_SIGNING_KEY:-$HOME/.config/spawn/release-signing.key}"
 }
@@ -553,6 +574,37 @@ PY
   release_matches_expected "$release" "$commit" "$tree" || return 1
   ! release_matches_expected "$release" "$tree" "$tree" 2>/dev/null || return 1
   ! release_matches_expected "$release" "$commit" "$commit" 2>/dev/null || return 1
+
+  # The expected counter follows the daemon release, not the ref: three
+  # commits, the second touching nothing under daemon/, the third changing it.
+  local repo="$tmp/repo" built_at moved_on changed_daemon
+  git init -q "$repo" || return 1
+  git -C "$repo" -c user.name=t -c user.email=t@t config commit.gpgsign false
+  mkdir -p "$repo/daemon" && printf 'a\n' > "$repo/daemon/a" && printf 'r\n' > "$repo/README"
+  GIT_COMMITTER_DATE='2026-01-01T00:00:00Z' git -C "$repo" -c user.name=t -c user.email=t@t \
+    add -A >/dev/null && GIT_COMMITTER_DATE='2026-01-01T00:00:00Z' \
+    git -C "$repo" -c user.name=t -c user.email=t@t commit -q -m one || return 1
+  built_at="$(git -C "$repo" rev-parse HEAD)"
+  printf 'r2\n' > "$repo/README"
+  GIT_COMMITTER_DATE='2026-01-02T00:00:00Z' git -C "$repo" -c user.name=t -c user.email=t@t \
+    commit -q -am two || return 1
+  moved_on="$(git -C "$repo" rev-parse HEAD)"
+  printf 'b\n' > "$repo/daemon/a"
+  GIT_COMMITTER_DATE='2026-01-03T00:00:00Z' git -C "$repo" -c user.name=t -c user.email=t@t \
+    commit -q -am three || return 1
+  changed_daemon="$(git -C "$repo" rev-parse HEAD)"
+  (
+    cd "$repo" || exit 1
+    # A deploy of the second commit keeps the daemon built at the first.
+    [[ "$(release_counter_expected_for_deploy "$moved_on" "$(git rev-parse "$moved_on:daemon")" "$built_at")" == \
+      "$(git show -s --format=%ct "$built_at")" ]] || exit 1
+    # A deploy of the third, with a manifest still naming the first, is stale: expect the ref's.
+    [[ "$(release_counter_expected_for_deploy "$changed_daemon" "$(git rev-parse "$changed_daemon:daemon")" "$built_at")" == \
+      "$(git show -s --format=%ct "$changed_daemon")" ]] || exit 1
+    # No manifest commit at all falls back to the ref.
+    [[ "$(release_counter_expected_for_deploy "$moved_on" "$(git rev-parse "$moved_on:daemon")" "")" == \
+      "$(git show -s --format=%ct "$moved_on")" ]] || exit 1
+  ) || return 1
 )
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
