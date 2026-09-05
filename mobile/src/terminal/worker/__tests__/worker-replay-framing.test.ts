@@ -300,3 +300,38 @@ describe("session worker replay flush", () => {
     expect((await flushFor(harness([7])))[1]).toBe(`\x1b[30;1H${"\n".repeat(8)}`);
   });
 });
+
+describe("session worker reseed", () => {
+  test("restores margins, origin mode and autowrap before clearing for a reseed", async () => {
+    const history = "h\r\n";
+    const screen = "\x1b[1;1Hs";
+    const replay = new TextEncoder().encode(
+      `\x1b[8;36;83t\x1b_sp:h1\x1b\\${history}\x1b[8;36;83t${screen}`,
+    );
+    await runWorker(harness([0]), async (worker) => {
+      const first = startBootstrap(worker);
+      worker.receiveSessionCtl?.(header(first, replay.byteLength, 1));
+      await worker.receiveSessionCtl?.(spctFrame(first, 0, true, replay));
+      await settle();
+      worker.state.term.write.mockClear();
+      // A reconnect: the generation resets and every gate reopens.
+      (worker as unknown as { resetSessionGeneration: () => void }).resetSessionGeneration();
+      worker.state.ctl.send.mockClear();
+      const second = startBootstrap(worker);
+      expect(second).not.toBe(first);
+      worker.receiveSessionCtl?.(header(second, replay.byteLength, 1));
+      await worker.receiveSessionCtl?.(spctFrame(second, 0, true, replay));
+      await settle();
+      const writes = worker.state.term.write.mock.calls.map(([data]: [unknown]) => data);
+      // The previous screen may have left a scroll region, origin mode or
+      // no-autowrap in force; the clear must undo them or the history that
+      // follows scrolls inside the region and never reaches scrollback (#58).
+      expect(writes).toEqual([
+        "\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J",
+        history,
+        "\x1b[30;1H\n",
+        screen,
+      ]);
+    });
+  });
+});
