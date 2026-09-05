@@ -11,6 +11,7 @@ import {
   parseSessionCtlText,
   ReplayAssembler,
   SESSION_CTL_CHUNK_PAYLOAD_BYTES,
+  SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES,
   slicePtyChunkAfterAnchor,
 } from "@/terminal/transport/ctl-codec";
 
@@ -232,6 +233,8 @@ describe("replay framing vector", () => {
     ),
   ) as {
     daemon_chunk_payload_bytes: number;
+    max_chunk_payload_bytes: number;
+    min_chunk_payload_bytes: number;
     cases: Array<{ name: string; total_bytes: number; chunks: number; last_chunk_bytes: number }>;
     rejected_headers: Array<{ name: string; total_bytes: number; chunks: number }>;
     rejected_on_first_chunk: Array<{
@@ -256,6 +259,8 @@ describe("replay framing vector", () => {
   test("assembles every case framed the daemon's way", () => {
     const payloadBytes = vectors.daemon_chunk_payload_bytes;
     expect(payloadBytes).toBe(16 * 1024 - 28);
+    expect(vectors.max_chunk_payload_bytes).toBe(SESSION_CTL_CHUNK_PAYLOAD_BYTES);
+    expect(vectors.min_chunk_payload_bytes).toBe(SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES);
     for (const c of vectors.cases) {
       if (c.chunks === 0) continue;
       const assembler = new ReplayAssembler(header(c.total_bytes, c.chunks));
@@ -272,7 +277,12 @@ describe("replay framing vector", () => {
         if (!last) expect(result).toEqual({ kind: "pending" });
       }
       expect(result.kind).toBe("complete");
-      if (result.kind === "complete") expect(result.bytes.byteLength).toBe(c.total_bytes);
+      if (result.kind === "complete") {
+        expect(result.bytes.byteLength).toBe(c.total_bytes);
+        for (let sequence = 0; sequence < c.chunks; sequence += 1) {
+          expect(result.bytes[sequence * payloadBytes]).toBe(sequence & 0xff);
+        }
+      }
     }
   });
 

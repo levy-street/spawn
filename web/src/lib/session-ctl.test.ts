@@ -15,6 +15,7 @@ import {
   SESSION_CTL_MAX_OUTSTANDING_REQUESTS,
   SESSION_CTL_MAX_REPLAY_BYTES,
   SESSION_CTL_MAX_UPLOAD_BYTES,
+  SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES,
   SESSION_CTL_UPLOAD_CHUNK_BYTES,
   SESSION_PTY_INPUT_CHUNK_BYTES,
   SessionCtlRequestTracker,
@@ -466,6 +467,8 @@ const REPLAY_FRAMING_VECTORS = JSON.parse(
   ),
 ) as {
   daemon_chunk_payload_bytes: number;
+  max_chunk_payload_bytes: number;
+  min_chunk_payload_bytes: number;
   cases: Array<{ name: string; total_bytes: number; chunks: number; last_chunk_bytes: number }>;
   rejected_headers: Array<{ name: string; total_bytes: number; chunks: number }>;
   rejected_on_first_chunk: Array<{
@@ -493,6 +496,11 @@ function replayHeader(id: string, totalBytes: number, chunks: number) {
 test("assembles replays framed the daemon's way, per the shared vector", () => {
   const payloadBytes = REPLAY_FRAMING_VECTORS.daemon_chunk_payload_bytes;
   assert.equal(payloadBytes, 16 * 1024 - 28);
+  assert.equal(REPLAY_FRAMING_VECTORS.max_chunk_payload_bytes, SESSION_CTL_CHUNK_PAYLOAD_BYTES);
+  assert.equal(
+    REPLAY_FRAMING_VECTORS.min_chunk_payload_bytes,
+    SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES,
+  );
   for (const c of REPLAY_FRAMING_VECTORS.cases) {
     const tracker = new SessionCtlRequestTracker();
     const id = requestId(7);
@@ -516,7 +524,13 @@ test("assembles replays framed the daemon's way, per the shared vector", () => {
       if (!last) assert.equal(result, null, `${c.name} chunk ${sequence}`);
     }
     assert.equal(result?.kind, "replay", c.name);
-    if (result?.kind === "replay") assert.equal(result.bytes.byteLength, c.total_bytes, c.name);
+    if (result?.kind === "replay") {
+      assert.equal(result.bytes.byteLength, c.total_bytes, c.name);
+      // Every chunk lands at its own offset, in sequence order.
+      for (let sequence = 0; sequence < c.chunks; sequence += 1) {
+        assert.equal(result.bytes[sequence * payloadBytes], sequence & 0xff, `${c.name} order`);
+      }
+    }
     assert.equal(tracker.size, 0, c.name);
   }
   for (const r of REPLAY_FRAMING_VECTORS.rejected_headers) {

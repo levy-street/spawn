@@ -1122,6 +1122,9 @@ mod tests {
             vectors["daemon_chunk_payload_bytes"].as_u64().unwrap() as usize,
             CHUNK_PAYLOAD_BYTES
         );
+        let min = vectors["min_chunk_payload_bytes"].as_u64().unwrap() as usize;
+        let max = vectors["max_chunk_payload_bytes"].as_u64().unwrap() as usize;
+        assert!(min <= CHUNK_PAYLOAD_BYTES && CHUNK_PAYLOAD_BYTES <= max);
         for case in vectors["cases"].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
             let total = case["total_bytes"].as_u64().unwrap() as usize;
