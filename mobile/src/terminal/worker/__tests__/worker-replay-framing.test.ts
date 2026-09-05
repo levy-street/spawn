@@ -34,6 +34,7 @@ interface FakeTerm {
   scrollToBottom: jest.Mock;
   buffer: {
     active: {
+      baseY: number;
       viewportY: number;
       getLine: (row: number) => { translateToString: (trim: boolean) => string } | undefined;
     };
@@ -72,7 +73,9 @@ function sessionWorkerSource(): string {
   return TERMINAL_WORKER_HTML.slice(start, end);
 }
 
-function harness(occupiedRows = 0): Harness {
+/** `occupied` names the absolute buffer rows that hold text; the screen
+ *  starts at `baseY`, the reader looks from `viewportY`. */
+function harness(occupied: number[] = [], baseY = 0, viewportY = baseY): Harness {
   const term: FakeTerm = {
     cols: 53,
     rows: 30,
@@ -81,9 +84,10 @@ function harness(occupiedRows = 0): Harness {
     scrollToBottom: jest.fn(),
     buffer: {
       active: {
-        viewportY: 0,
+        baseY,
+        viewportY,
         getLine: (row: number) =>
-          row < occupiedRows ? { translateToString: () => `row ${row}` } : undefined,
+          occupied.includes(row) ? { translateToString: () => `row ${row}` } : undefined,
       },
       alternate: {},
     },
@@ -237,7 +241,7 @@ describe("session worker replay rendering", () => {
     const replay = new TextEncoder().encode(
       `\x1b[8;36;83t\x1b_sp:h1\x1b\\${history}\x1b[8;36;83t${screen}`,
     );
-    await runWorker(harness(3), async (worker) => {
+    await runWorker(harness([0, 1, 2]), async (worker) => {
       const requestId = startBootstrap(worker);
       worker.receiveSessionCtl?.(header(requestId, replay.byteLength, 1));
       await worker.receiveSessionCtl?.(spctFrame(requestId, 0, true, replay));
@@ -260,5 +264,39 @@ describe("session worker replay rendering", () => {
       expect(writes).toHaveLength(1);
       expect(writes[0]).toBeInstanceOf(Uint8Array);
     });
+  });
+});
+
+describe("session worker replay flush", () => {
+  const history = "h\r\n";
+  const screen = "\x1b[1;1Hs";
+  const replay = new TextEncoder().encode(
+    `\x1b[8;36;83t\x1b_sp:h1\x1b\\${history}\x1b[8;36;83t${screen}`,
+  );
+  async function flushFor(instance: Harness): Promise<unknown[]> {
+    let writes: unknown[] = [];
+    await runWorker(instance, async (worker) => {
+      const requestId = startBootstrap(worker);
+      worker.receiveSessionCtl?.(header(requestId, replay.byteLength, 1));
+      await worker.receiveSessionCtl?.(spctFrame(requestId, 0, true, replay));
+      await settle();
+      writes = worker.state.term.write.mock.calls.map(([data]: [unknown]) => data);
+    });
+    return writes;
+  }
+
+  test("measures the screen rows from baseY, not from where the reader is looking", async () => {
+    // A reseed while the reader is scrolled up: the viewport sits on the top of
+    // the history (two non-blank rows there) while the screen rows starting at
+    // baseY hold five. The flush must scroll five, or the repaint erases three.
+    const writes = await flushFor(harness([0, 1, 40, 41, 42, 43, 44], 40, 0));
+    expect(writes).toEqual([history, `\x1b[30;1H${"\n".repeat(5)}`, screen]);
+  });
+
+  test("scrolls nothing for a blank screen, and by the last non-blank row otherwise", async () => {
+    expect(await flushFor(harness([]))).toEqual([history, "", screen]);
+    // Row 7 holds text under blank rows: the flush scrolls eight, so interior
+    // blanks stay where they were and only trailing padding is skipped.
+    expect((await flushFor(harness([7])))[1]).toBe(`\x1b[30;1H${"\n".repeat(8)}`);
   });
 });
