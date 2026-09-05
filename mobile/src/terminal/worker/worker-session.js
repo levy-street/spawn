@@ -3,7 +3,12 @@
   "use strict";
   const api = globalThis.spawnWorker;
   const state = api.state;
+  // The largest replay chunk payload accepted. The daemon frames a replay as
+  // 16 KiB SCTP messages, 28 of them header; the size is learned from the
+  // first non-final chunk, never assumed
+  // (proto/session-ctl-replay-framing-v1-vectors.json).
   const CHUNK_BYTES = 48 * 1024;
+  const MIN_REPLAY_CHUNK_BYTES = 1024;
   const MAX_REPLAY_BYTES = 12 * 1024 * 1024;
   const MAX_PREBOOT_BYTES = 12 * 1024 * 1024;
   const MAX_WRITE_BYTES = 4 * 1024 * 1024;
@@ -130,6 +135,7 @@
       operation: "history",
       metadata: null,
       chunks: new Map(),
+      chunkBytes: null,
       bytes: 0,
       rendering: false,
     };
@@ -331,6 +337,15 @@
     startBootstrap();
   }
 
+  // Whether `chunks` can carry `totalBytes` under some chunk size in the
+  // accepted range; the first non-final chunk fixes the exact size.
+  function replayChunkCountIsPlausible(totalBytes, chunks) {
+    if (chunks === 0) return totalBytes === 0;
+    if (totalBytes === 0) return false;
+    if (chunks === 1) return totalBytes <= CHUNK_BYTES;
+    return (chunks - 1) * MIN_REPLAY_CHUNK_BYTES < totalBytes && totalBytes <= chunks * CHUNK_BYTES;
+  }
+
   function acceptReplayMetadata(message) {
     const history = session.history;
     if (
@@ -343,7 +358,7 @@
       message.total_bytes < 0 ||
       message.total_bytes > MAX_REPLAY_BYTES ||
       !Number.isSafeInteger(message.chunks) ||
-      message.chunks !== Math.ceil(message.total_bytes / CHUNK_BYTES) ||
+      !replayChunkCountIsPlausible(message.total_bytes, message.chunks) ||
       !(
         message.pty_offset === undefined ||
         message.pty_offset === null ||
@@ -362,20 +377,55 @@
     const metadata = history?.metadata;
     if (!history || !metadata || frame.kind !== 1 || frame.requestId !== history.requestId) return;
     const final = metadata.chunks - 1;
-    const expected =
-      frame.sequence === final ? metadata.total_bytes - final * CHUNK_BYTES : CHUNK_BYTES;
-    if (
-      frame.sequence >= metadata.chunks ||
-      history.chunks.has(frame.sequence) ||
-      frame.last !== (frame.sequence === final) ||
-      frame.payload.byteLength !== expected ||
-      history.bytes + frame.payload.byteLength > MAX_REPLAY_BYTES
-    ) {
-      api.error("replay_frame", "Malformed or duplicate replay chunk.", true);
+    const isFinal = frame.sequence === final;
+    const length = frame.payload.byteLength;
+    const reject = (reason) => api.error("replay_frame", reason, true);
+    if (frame.sequence >= metadata.chunks || history.chunks.has(frame.sequence)) {
+      reject("Malformed or duplicate replay chunk.");
+      return;
+    }
+    if (frame.last !== isFinal || length === 0 || length > CHUNK_BYTES) {
+      reject("Replay chunk flag or length is out of range.");
+      return;
+    }
+    if (isFinal) {
+      const expected =
+        history.chunkBytes == null
+          ? metadata.chunks === 1
+            ? metadata.total_bytes
+            : null
+          : metadata.total_bytes - history.chunkBytes * final;
+      if (expected !== null && length !== expected) {
+        reject("Final replay chunk does not complete the total.");
+        return;
+      }
+    } else if (history.chunkBytes == null) {
+      // The first non-final chunk fixes the framing for the rest; the
+      // daemon's size is never assumed, only required to carry the total.
+      if (
+        length < MIN_REPLAY_CHUNK_BYTES ||
+        length * final >= metadata.total_bytes ||
+        length * metadata.chunks < metadata.total_bytes
+      ) {
+        reject("Replay chunk size cannot carry the total.");
+        return;
+      }
+      const held = history.chunks.get(final);
+      if (held && held.byteLength !== metadata.total_bytes - length * final) {
+        reject("Final replay chunk does not complete the total.");
+        return;
+      }
+      history.chunkBytes = length;
+    } else if (length !== history.chunkBytes) {
+      reject("Replay chunks are not one size.");
+      return;
+    }
+    if (history.bytes + length > MAX_REPLAY_BYTES) {
+      reject("Replay exceeds the aggregate byte limit.");
       return;
     }
     history.chunks.set(frame.sequence, frame.payload);
-    history.bytes += frame.payload.byteLength;
+    history.bytes += length;
     finishReplay();
   }
 
@@ -596,6 +646,7 @@
       operation: "snapshot",
       metadata: null,
       chunks: new Map(),
+      chunkBytes: null,
       bytes: 0,
       rendering: false,
     };

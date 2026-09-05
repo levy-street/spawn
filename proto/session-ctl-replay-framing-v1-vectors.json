@@ -1,0 +1,25 @@
+{
+  "description": "How a spawn.ctl replay (history or snapshot) is split into SPCT chunks, asserted by the daemon (encoder), the web client and the mobile client (assemblers). The daemon frames every chunk as one 16 KiB SCTP message: a 28-byte header and up to 16,356 bytes of payload. A client never assumes that size; it learns the payload size from the first non-final chunk it receives, requires every non-final chunk to match it, accepts any size from min_chunk_payload_bytes to max_chunk_payload_bytes, and derives the final chunk's size from total_bytes. On 2026-09-05 the two clients assumed 48 KiB and silently discarded every replay longer than one daemon chunk; this file exists so the three runtimes cannot drift apart again.",
+  "daemon_chunk_payload_bytes": 16356,
+  "max_chunk_payload_bytes": 49152,
+  "min_chunk_payload_bytes": 1024,
+  "cases": [
+    { "name": "an empty replay", "total_bytes": 0, "chunks": 0, "last_chunk_bytes": 0 },
+    { "name": "one byte", "total_bytes": 1, "chunks": 1, "last_chunk_bytes": 1 },
+    { "name": "exactly one daemon chunk", "total_bytes": 16356, "chunks": 1, "last_chunk_bytes": 16356 },
+    { "name": "one byte past one chunk", "total_bytes": 16357, "chunks": 2, "last_chunk_bytes": 1 },
+    { "name": "the Codex history of 2026-09-05", "total_bytes": 76665, "chunks": 5, "last_chunk_bytes": 11241 },
+    { "name": "the 12 MiB replay cap", "total_bytes": 12582912, "chunks": 770, "last_chunk_bytes": 5148 }
+  ],
+  "rejected_headers": [
+    { "name": "chunks for an empty replay", "total_bytes": 0, "chunks": 1 },
+    { "name": "no chunks for a non-empty replay", "total_bytes": 5, "chunks": 0 },
+    { "name": "more chunks than a kilobyte each can carry", "total_bytes": 2048, "chunks": 3 },
+    { "name": "fewer chunks than the ceiling allows", "total_bytes": 98305, "chunks": 2 }
+  ],
+  "rejected_on_first_chunk": [
+    { "name": "a chunk count from a 48 KiB assumption", "total_bytes": 76665, "chunks": 2, "first_chunk_bytes": 16356 },
+    { "name": "a first chunk too small to be the daemon's", "total_bytes": 4000, "chunks": 2, "first_chunk_bytes": 512 },
+    { "name": "a single chunk that is not the whole replay", "total_bytes": 300, "chunks": 1, "first_chunk_bytes": 299 }
+  ]
+}

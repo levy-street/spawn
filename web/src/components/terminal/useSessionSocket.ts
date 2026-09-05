@@ -1095,6 +1095,15 @@ export function useSessionSocket({
 
       const acceptTrackedResult = (result: SessionCtlTrackedResult | null) => {
         if (!result || !isCurrentRtcGeneration()) return;
+        if (result.kind === "rejected") {
+          // A reply this client will not assemble is a wire disagreement, not
+          // silence: say so, and never leave the pane waiting on it. The
+          // connect-time history falls back to an empty seed so the terminal
+          // still opens; the live stream fills it from here.
+          console.warn(`SPAWN D: spawn.ctl ${result.operation} reply rejected: ${result.reason}`);
+          if (result.requestId === initialHistoryRequestId) finishBootstrap(new Uint8Array(), 0);
+          return;
+        }
         const requestId = result.response.request_id;
         if (result.kind === "response") {
           if (!result.response.ok && requestId === initialHistoryRequestId) {
