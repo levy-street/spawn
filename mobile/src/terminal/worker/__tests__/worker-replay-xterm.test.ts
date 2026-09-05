@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
+import { runWorker, spctFrame } from "./worker-harness";
 
 /**
  * The bundled session worker against a real xterm.js, headless in Node — the
@@ -11,6 +11,10 @@ import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
 
 const XTERM_PATH = resolve(__dirname, "../../../../../web/node_modules/@xterm/xterm/lib/xterm.js");
 const xtermPresent = existsSync(XTERM_PATH);
+if (!xtermPresent && process.env["CI"]) {
+  // Skipping here would drop the only real-terminal proof without a red run.
+  throw new Error(`The web workspace's xterm is not installed at ${XTERM_PATH}.`);
+}
 
 interface XTerm {
   rows: number;
@@ -45,16 +49,6 @@ interface Harness {
   receiveSessionCtl?: (value: unknown) => void | Promise<void>;
 }
 
-function sessionWorkerSource(): string {
-  const marker = "const MAX_PREBOOT_BYTES = 12 * 1024 * 1024";
-  const markerIndex = TERMINAL_WORKER_HTML.indexOf(marker);
-  const start = TERMINAL_WORKER_HTML.lastIndexOf("(() => {", markerIndex);
-  const end = TERMINAL_WORKER_HTML.indexOf("\n})();", markerIndex) + "\n})();".length;
-  if (markerIndex < 0 || start < 0 || end < start)
-    throw new Error("Session worker source is missing.");
-  return TERMINAL_WORKER_HTML.slice(start, end);
-}
-
 function realTerminal(rows: number, cols: number): XTerm {
   // biome-ignore lint/suspicious/noExplicitAny: the vendored bundle has no types here
   const { Terminal } = require(XTERM_PATH) as { Terminal: new (options: unknown) => any };
@@ -83,33 +77,6 @@ function harness(term: XTerm): Harness {
     decodeBase64: jest.fn(() => Uint8Array.of()),
     encodeBase64: jest.fn(() => ""),
   };
-}
-
-async function runWorker(instance: Harness, body: (worker: Harness) => Promise<void>) {
-  const root = globalThis as unknown as { spawnWorker?: Harness };
-  const previous = root.spawnWorker;
-  root.spawnWorker = instance;
-  try {
-    new Function(sessionWorkerSource())();
-    await body(instance);
-  } finally {
-    if (previous) root.spawnWorker = previous;
-    else delete root.spawnWorker;
-  }
-}
-
-function spctFrame(requestId: string, payload: Uint8Array) {
-  const frame = new Uint8Array(28 + payload.byteLength);
-  frame.set([0x53, 0x50, 0x43, 0x54, 1, 1]);
-  const view = new DataView(frame.buffer);
-  view.setUint16(6, 1, true);
-  const hex = requestId.replaceAll("-", "");
-  for (let index = 0; index < 16; index += 1) {
-    frame[8 + index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-  }
-  view.setUint32(24, 0, true);
-  frame.set(payload, 28);
-  return frame;
 }
 
 function openGates(worker: Harness): string {
@@ -145,7 +112,7 @@ async function replay(worker: Harness, requestId: string, bytes: Uint8Array) {
       chunks: 1,
     }),
   );
-  await worker.receiveSessionCtl?.(spctFrame(requestId, bytes));
+  await worker.receiveSessionCtl?.(spctFrame(requestId, 0, true, bytes));
   for (let turn = 0; turn < 50; turn += 1) {
     await new Promise((done) => setTimeout(done, 0));
     if (worker.post.mock.calls.some(([m]: [{ state?: string }]) => m?.state === "ready")) return;

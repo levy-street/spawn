@@ -692,15 +692,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // cursor keys) that the app still believes are active, garbling
       // input until the next full repaint. The 3J matters: without wiping
       // local scrollback, the seed's replayed output would duplicate lines
-      // the buffer already scrolled in. The margins, origin mode and
-      // autowrap are restored first: the previous screen's tail sets the
-      // app's scroll region, and 2J/3J leave it in force, so the history
-      // written next would scroll inside that region and never reach
-      // scrollback (#58). This is the daemon's own baseline, minus SGR and
-      // cursor, which the screen chunk restores itself.
+      // the buffer already scrolled in. The character sets, margins, origin
+      // mode and autowrap are restored first: the previous screen's tail
+      // sets the app's scroll region and may leave a line-drawing set
+      // active, and 2J/3J leave both in force, so the history written next
+      // would scroll inside that region, or map to box glyphs, and never
+      // reach scrollback intact (#58). The daemon's own baseline, minus SGR
+      // and cursor, which the screen chunk restores itself.
       predictorRef.current.clear();
       const ops: SequencedWrite[] = [
-        { data: "\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J" },
+        { data: "\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J" },
         ...liveSeedWriteOps(text),
       ];
       writeSequenced(term, [...ops, ...replaySlices.map((slice) => ({ data: slice }))], () => {

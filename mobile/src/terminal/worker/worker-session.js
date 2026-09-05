@@ -328,12 +328,16 @@
           )
       : () => state.term.write(replay, finish);
     if (history.operation === "history" && session.bootstrapCount > 0) {
-      // Restore margins, origin mode and autowrap before clearing: the
-      // previous screen's tail sets the app's scroll region and 2J/3J leave
-      // it in force, so the history written next would scroll inside that
-      // region and never reach scrollback (#58). The daemon's own baseline,
-      // minus SGR and cursor, which the screen chunk restores itself.
-      state.term.write("\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J", writeReplay);
+      // Restore the character sets, margins, origin mode and autowrap before
+      // clearing: the previous screen's tail sets the app's scroll region and
+      // may leave a line-drawing set active, and 2J/3J leave both in force,
+      // so the history written next would scroll inside that region, or map
+      // to box glyphs (#58). The daemon's own baseline, minus SGR and cursor,
+      // which the screen chunk restores itself.
+      state.term.write(
+        "\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J",
+        writeReplay,
+      );
     } else {
       writeReplay();
     }

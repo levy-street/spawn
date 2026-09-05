@@ -377,10 +377,16 @@ if [[ "$manifest_available" == "1" ]]; then
   actual_release_counter="$(json_get "$manifest_file" release_counter 2>/dev/null || true)"
 fi
 # A daemon release is its tree: a ref that left daemon/ alone keeps the
-# release built at an earlier commit, whose counter is that commit's.
+# release built at another commit, whose counter is that commit's.
 expected_release_counter="$(release_counter_expected_for_deploy \
   "$expected_commit" "$expected_daemon_tree" "$manifest_commit")" ||
-  die "cannot derive the release counter for $expected_commit"
+  die "cannot derive the release counter for ${manifest_commit:-$expected_commit}"
+if [[ -n "$manifest_commit" ]] && ! git cat-file -e "$manifest_commit^{commit}" 2>/dev/null; then
+  # The script never fetches, so the counter row below expects the ref's
+  # counter and fails if the release was kept from a commit this clone lacks.
+  print_row "daemon release commit" "in this clone" \
+    "$manifest_commit is not in this clone (fetch, then re-run)" "NOTE"
+fi
 
 signature_ok=0
 verified_key_id=""
