@@ -1564,3 +1564,23 @@ test.describe("OSC 52 clipboard", () => {
       .toBe("hello clipboard");
   });
 });
+
+test("a replay longer than one daemon chunk still seeds the terminal", async ({ page }) => {
+  // The daemon frames a replay in 16 KiB chunks. A pane whose history does not
+  // fit in one — a Codex session that scrolls inline, unlike a fullscreen TUI,
+  // which commits no history — must assemble every chunk and open. A client
+  // that assumed the chunk size discarded the reply in silence and aborted at
+  // its connect timer, forever (2026-09-05).
+  const lines = Array.from({ length: 3000 }, (_, index) => `history line ${index}\r\n`).join("");
+  const history = `\x1b[8;36;83t\x1b_sp:h1\x1b\\${lines}\x1b[8;36;83tlong-history-ready\r\n$ `;
+  expect(Buffer.byteLength(history)).toBeGreaterThan(3 * (16 * 1024 - 28));
+  const { messages } = await openTerminalWithMockSocket(page, {
+    history,
+    historyEpoch: "1788604290762026535",
+    historyOffset: 74053,
+  });
+  await expect(liveTerminalRows(page)).toContainText("long-history-ready");
+  await page.getByLabel("Session terminal").click();
+  await page.keyboard.type("ok");
+  await expect.poll(() => binaryText(messages)).toContain("ok");
+});

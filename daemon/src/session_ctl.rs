@@ -1109,6 +1109,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_framing_matches_the_shared_vector() {
+        // proto/session-ctl-replay-framing-v1-vectors.json is asserted by the
+        // daemon, the web client and the mobile client alike. The chunk size
+        // is the daemon's to choose; a client that assumed a different one
+        // discarded every replay longer than one chunk (2026-09-05).
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../proto/session-ctl-replay-framing-v1-vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            vectors["daemon_chunk_payload_bytes"].as_u64().unwrap() as usize,
+            CHUNK_PAYLOAD_BYTES
+        );
+        for case in vectors["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let total = case["total_bytes"].as_u64().unwrap() as usize;
+            let chunks = case["chunks"].as_u64().unwrap() as usize;
+            let last = case["last_chunk_bytes"].as_u64().unwrap() as usize;
+            let id = Uuid::new_v4();
+            let (tx, mut rx) = mpsc::channel(1024);
+            let replay = crate::pty::WorkerReplay::new(0, vec![0x41; total]);
+            send_replay(&tx, id, "history", false, Some(0), &replay)
+                .await
+                .unwrap();
+            let metadata_message = rx.recv().await.unwrap();
+            let ControlOutbound::Text(metadata) = &metadata_message else {
+                panic!("{name}: expected metadata")
+            };
+            let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap();
+            assert_eq!(
+                metadata["total_bytes"].as_u64().unwrap() as usize,
+                total,
+                "{name}"
+            );
+            assert_eq!(
+                metadata["chunks"].as_u64().unwrap() as usize,
+                chunks,
+                "{name}"
+            );
+            for sequence in 0..chunks {
+                let frame_message = rx.recv().await.unwrap();
+                let ControlOutbound::Binary(frame) = &frame_message else {
+                    panic!("{name}: expected chunk {sequence}")
+                };
+                let expected = if sequence + 1 == chunks {
+                    last
+                } else {
+                    CHUNK_PAYLOAD_BYTES
+                };
+                assert_eq!(
+                    frame.len() - CHUNK_HEADER_LEN,
+                    expected,
+                    "{name} chunk {sequence}"
+                );
+                assert!(frame.len() <= 16 * 1024, "{name} chunk {sequence}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pty_gap_uses_the_cross_client_wire_shape() {
         let (tx, mut rx) = mpsc::channel(1);
         send_pty_gap(&tx, 42).await.unwrap();
