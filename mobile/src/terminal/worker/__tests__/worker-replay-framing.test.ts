@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
+import { runWorker, settle, spctFrame } from "./worker-harness";
 
 /**
  * The assembler the phone actually runs is the session worker inside the
@@ -63,16 +63,6 @@ interface Harness {
   receiveSessionCtl?: (value: unknown) => void | Promise<void>;
 }
 
-function sessionWorkerSource(): string {
-  const marker = "const MAX_PREBOOT_BYTES = 12 * 1024 * 1024";
-  const markerIndex = TERMINAL_WORKER_HTML.indexOf(marker);
-  const start = TERMINAL_WORKER_HTML.lastIndexOf("(() => {", markerIndex);
-  const end = TERMINAL_WORKER_HTML.indexOf("\n})();", markerIndex) + "\n})();".length;
-  if (markerIndex < 0 || start < 0 || end < start)
-    throw new Error("Session worker source is missing.");
-  return TERMINAL_WORKER_HTML.slice(start, end);
-}
-
 /** `occupied` names the absolute buffer rows that hold text; the screen
  *  starts at `baseY`, the reader looks from `viewportY`. */
 function harness(occupied: number[] = [], baseY = 0, viewportY = baseY): Harness {
@@ -115,33 +105,6 @@ function harness(occupied: number[] = [], baseY = 0, viewportY = baseY): Harness
   };
 }
 
-async function runWorker(instance: Harness, body: (worker: Harness) => Promise<void>) {
-  const root = globalThis as unknown as { spawnWorker?: Harness };
-  const previous = root.spawnWorker;
-  root.spawnWorker = instance;
-  try {
-    new Function(sessionWorkerSource())();
-    await body(instance);
-  } finally {
-    if (previous) root.spawnWorker = previous;
-    else delete root.spawnWorker;
-  }
-}
-
-function spctFrame(requestId: string, sequence: number, last: boolean, payload: Uint8Array) {
-  const frame = new Uint8Array(28 + payload.byteLength);
-  frame.set([0x53, 0x50, 0x43, 0x54, 1, 1]);
-  const view = new DataView(frame.buffer);
-  view.setUint16(6, last ? 1 : 0, true);
-  const hex = requestId.replaceAll("-", "");
-  for (let index = 0; index < 16; index += 1) {
-    frame[8 + index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-  }
-  view.setUint32(24, sequence, true);
-  frame.set(payload, 28);
-  return frame;
-}
-
 /** Open every gate the bootstrap waits on and return the history request id. */
 function startBootstrap(worker: Harness): string {
   for (const gate of ["bindingAccepted", "ptyOpen", "ctlOpen", "daemonReady"]) {
@@ -166,14 +129,6 @@ function header(requestId: string, totalBytes: number, chunks: number) {
     total_bytes: totalBytes,
     chunks,
   });
-}
-
-/** The worker chains control messages on a promise tail; a few macrotask
- *  turns let a replay of any chunk count drain through it. */
-async function settle() {
-  for (let index = 0; index < 4; index += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
 }
 
 describe("session worker replay framing", () => {
@@ -327,7 +282,7 @@ describe("session worker reseed", () => {
       // no-autowrap in force; the clear must undo them or the history that
       // follows scrolls inside the region and never reaches scrollback (#58).
       expect(writes).toEqual([
-        "\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J",
+        "\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J",
         history,
         "\x1b[30;1H\n",
         screen,
