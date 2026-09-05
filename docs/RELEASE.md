@@ -368,7 +368,9 @@ curl -fsSL https://spawnd.dev/install.sh | sh
 `scripts/verify-release.sh https://spawnd.dev` fetches the manifest and
 signature through the public origin, verifies them against the public-key list
 compiled into the expected daemon source, and proves `release_counter` equals
-`git show -s --format=%ct` for the expected commit. It also continues to prove
+`git show -s --format=%ct` for the commit the daemon release was built at —
+the expected commit, unless the expected commit left `daemon/` untouched and
+the manifest names the earlier commit whose release it kept. It also continues to prove
 the server/web identity, daemon tree and served binary hashes, and mobile
 identity. A failed signature or counter row is a failed release.
 
