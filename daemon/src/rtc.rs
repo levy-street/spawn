@@ -3105,6 +3105,12 @@ async fn handle_control_request(context: ControlRequestContext<'_>, request: Con
     } = context;
     let session_id = session.session_id();
     let request_id = request.request_id;
+    tracing::debug!(
+        %session_id,
+        viewer_id,
+        operation = request.operation_name(),
+        "control request"
+    );
     let _guard = controls
         .lock_transaction(
             session_id,
@@ -3535,6 +3541,33 @@ async fn send_session_replay(
                 "spawn.pty disconnected while replay was captured",
             )
         })?;
+    tracing::debug!(
+        session_id = %session.session_id(),
+        viewer_id = spec.viewer_id,
+        operation = spec.operation,
+        replay_bytes = replay.bytes().len(),
+        utf8_error = ?std::str::from_utf8(replay.bytes()).err(),
+        pty_offset,
+        watermark = source_boundary,
+        history_anchor = ?replay.history_anchor(),
+        "sending session replay"
+    );
+    #[cfg(feature = "diagnostics")]
+    if let Some(dir) = std::env::var_os("SPAWND_DIAG_REPLAY_DUMP_DIR") {
+        // Diagnostics only, opt-in by environment: keep the exact bytes a
+        // viewer was sent so a client that fails on them can be reproduced
+        // offline. This is terminal plaintext on the host's own disk, under
+        // the host user, and nowhere else.
+        let path = std::path::Path::new(&dir).join(format!(
+            "{}-{}.replay",
+            session.session_id(),
+            spec.request_id
+        ));
+        match tokio::fs::write(&path, replay.bytes()).await {
+            Ok(()) => tracing::debug!(path = %path.display(), "replay dumped for diagnostics"),
+            Err(error) => tracing::warn!(%error, path = %path.display(), "replay dump failed"),
+        }
+    }
     session_ctl::send_replay(
         sender,
         spec.request_id,
