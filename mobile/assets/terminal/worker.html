@@ -1424,12 +1424,69 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       finish();
       return;
     }
-    const writeReplay = () => state.term.write(replay, finish);
+    // A committed-line replay ends in a screen repaint at absolute positions.
+    // Written straight through, that repaint lands on the rows the newest
+    // history occupies and erases them; the last thing the session printed
+    // is exactly what goes missing. History first, then scroll what it
+    // occupies up into scrollback, then the screen on a clean viewport.
+    const storied = parseStoriedReplay(replay);
+    const writeReplay = storied
+      ? () =>
+          state.term.write(storied.history, () =>
+            state.term.write(flushViewportIntoScrollback(), () =>
+              state.term.write(storied.screen, finish),
+            ),
+          )
+      : () => state.term.write(replay, finish);
     if (history.operation === "history" && session.bootstrapCount > 0) {
       state.term.write("\x1b[0m\x1b[H\x1b[2J\x1b[3J", writeReplay);
     } else {
       writeReplay();
     }
+  }
+
+  const REPLAY_HISTORY_SENTINEL = "\x1b_sp:h1\x1b\\";
+
+  // A worker replay is `CSI 8;rows;cols t`, then either the history sentinel
+  // and the committed history as flowing lines, then a second marker and the
+  // live screen — or, from an older worker, raw bytes. Only the first shape
+  // is split; anything else is written as it came.
+  function parseStoriedReplay(bytes) {
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return null;
+    }
+    if (!text.startsWith("\x1b[8;")) return null;
+    const marker = new RegExp("\\x1b\\[8;(\\d{1,5});(\\d{1,5})t", "g");
+    const first = marker.exec(text);
+    if (!first || first.index !== 0) return null;
+    const chunks = [];
+    let current = first;
+    while (current) {
+      const start = marker.lastIndex;
+      const next = marker.exec(text);
+      chunks.push(text.slice(start, next ? next.index : undefined));
+      current = next;
+    }
+    if (chunks.length !== 2 || !chunks[0].startsWith(REPLAY_HISTORY_SENTINEL)) return null;
+    return { history: chunks[0].slice(REPLAY_HISTORY_SENTINEL.length), screen: chunks[1] };
+  }
+
+  // Scroll the viewport rows the history occupies up into scrollback, by the
+  // last non-blank row rather than the cursor row: trailing blank rows are
+  // frame padding, and scrolling to the cursor would push a screenful of
+  // blanks into scrollback as a gap at the history/screen seam.
+  function flushViewportIntoScrollback() {
+    const term = state.term;
+    const buffer = term.buffer.active;
+    let occupied = 0;
+    for (let row = 0; row < term.rows; row += 1) {
+      const line = buffer.getLine(buffer.viewportY + row);
+      if (line && line.translateToString(true).length > 0) occupied = row + 1;
+    }
+    return occupied > 0 ? `\x1b[${term.rows};1H${"\n".repeat(occupied)}` : "";
   }
 
   function recoverFromGap(offset) {

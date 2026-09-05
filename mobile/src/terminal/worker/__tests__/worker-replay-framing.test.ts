@@ -32,7 +32,13 @@ interface FakeTerm {
   write: jest.Mock;
   reset: jest.Mock;
   scrollToBottom: jest.Mock;
-  buffer: { active: object; alternate: object };
+  buffer: {
+    active: {
+      viewportY: number;
+      getLine: (row: number) => { translateToString: (trim: boolean) => string } | undefined;
+    };
+    alternate: object;
+  };
 }
 
 interface Harness {
@@ -66,14 +72,21 @@ function sessionWorkerSource(): string {
   return TERMINAL_WORKER_HTML.slice(start, end);
 }
 
-function harness(): Harness {
+function harness(occupiedRows = 0): Harness {
   const term: FakeTerm = {
     cols: 53,
     rows: 30,
     write: jest.fn((_data: unknown, done?: () => void) => done?.()),
     reset: jest.fn(),
     scrollToBottom: jest.fn(),
-    buffer: { active: {}, alternate: {} },
+    buffer: {
+      active: {
+        viewportY: 0,
+        getLine: (row: number) =>
+          row < occupiedRows ? { translateToString: () => `row ${row}` } : undefined,
+      },
+      alternate: {},
+    },
   };
   return {
     state: {
@@ -212,5 +225,40 @@ describe("session worker replay framing", () => {
         expect(worker.state.term.write).not.toHaveBeenCalled();
       });
     }
+  });
+});
+
+describe("session worker replay rendering", () => {
+  test("writes history, scrolls it into scrollback, then paints the screen", async () => {
+    // The seed the daemon sends: geometry, the history sentinel, committed
+    // lines, geometry again, then a screen repaint at absolute positions.
+    const history = "line one\r\nline two\r\nlast line printed\r\n";
+    const screen = "\x1b[1;1Hprompt\x1b[3;1H$ ";
+    const replay = new TextEncoder().encode(
+      `\x1b[8;36;83t\x1b_sp:h1\x1b\\${history}\x1b[8;36;83t${screen}`,
+    );
+    await runWorker(harness(3), async (worker) => {
+      const requestId = startBootstrap(worker);
+      worker.receiveSessionCtl?.(header(requestId, replay.byteLength, 1));
+      await worker.receiveSessionCtl?.(spctFrame(requestId, 0, true, replay));
+      await settle();
+      expect(worker.error).not.toHaveBeenCalled();
+      const writes = worker.state.term.write.mock.calls.map(([data]: [unknown]) => data);
+      // Never the raw bytes: the repaint would erase "last line printed".
+      expect(writes).toEqual([history, "\x1b[30;1H\n\n\n", screen]);
+    });
+  });
+
+  test("writes a replay without the sentinel as it came", async () => {
+    const raw = new TextEncoder().encode("plain\r\n$ ");
+    await runWorker(harness(), async (worker) => {
+      const requestId = startBootstrap(worker);
+      worker.receiveSessionCtl?.(header(requestId, raw.byteLength, 1));
+      await worker.receiveSessionCtl?.(spctFrame(requestId, 0, true, raw));
+      await settle();
+      const writes = worker.state.term.write.mock.calls.map(([data]: [unknown]) => data);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).toBeInstanceOf(Uint8Array);
+    });
   });
 });
