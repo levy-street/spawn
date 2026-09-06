@@ -2,9 +2,17 @@ export const SESSION_CTL_VERSION = 1;
 export const SESSION_CTL_MAX_REQUEST_BYTES = 16 * 1024;
 export const SESSION_CTL_MAX_REPLAY_BYTES = 12 * 1024 * 1024;
 export const SESSION_CTL_MAX_PENDING_PTY_BYTES = 12 * 1024 * 1024;
+/** The largest chunk payload this client accepts, and the size of its own
+ *  upload chunks. The daemon frames a replay as 16 KiB SCTP messages, 28 of
+ *  them header (`proto/session-ctl-replay-framing-v1-vectors.json`); a
+ *  client never assumes that size, it learns it from the first non-final
+ *  chunk. This is only the ceiling for what it learns. */
 export const SESSION_CTL_CHUNK_PAYLOAD_BYTES = 48 * 1024;
+/** A non-final replay chunk smaller than this is no framing the daemon
+ *  produces; refusing it bounds how many chunks one replay may cost. */
+export const SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES = 1024;
 export const SESSION_CTL_MAX_REPLAY_CHUNKS = Math.ceil(
-  SESSION_CTL_MAX_REPLAY_BYTES / SESSION_CTL_CHUNK_PAYLOAD_BYTES,
+  SESSION_CTL_MAX_REPLAY_BYTES / SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES,
 );
 export const SESSION_CTL_MAX_OUTSTANDING_REQUESTS = 128;
 export const SESSION_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
@@ -197,13 +205,35 @@ export function writeSessionPtyInput(channel: RTCDataChannel, bytes: Uint8Array)
 
 export type SessionCtlTrackedResult =
   | { kind: "response"; response: SessionCtlResponse }
-  | { kind: "replay"; response: SessionCtlResponse; bytes: Uint8Array };
+  | { kind: "replay"; response: SessionCtlResponse; bytes: Uint8Array }
+  /** A reply to a known request that this client will not assemble: the
+   *  request is dropped and the consumer is told why, so a wire disagreement
+   *  is a warning and a fallback rather than a pane that never opens. */
+  | { kind: "rejected"; requestId: string; operation: SessionCtlOperation; reason: string };
 
 type PendingSessionCtlRequest = {
   operation: SessionCtlOperation;
   metadata: SessionCtlResponse | null;
   chunks: Map<number, Uint8Array>;
+  /** Learned from the first non-final chunk; every later one must match. */
+  chunkPayloadBytes: number | null;
 };
+
+/**
+ * Whether `chunks` can carry `totalBytes` under some chunk size in the
+ * accepted range: every non-final chunk between the minimum and the ceiling,
+ * the final one at least a byte. The header cannot pin the exact size; the
+ * first non-final chunk does.
+ */
+export function replayChunkCountIsPlausible(totalBytes: number, chunks: number): boolean {
+  if (chunks === 0) return totalBytes === 0;
+  if (totalBytes === 0) return false;
+  if (chunks === 1) return totalBytes <= SESSION_CTL_CHUNK_PAYLOAD_BYTES;
+  return (
+    (chunks - 1) * SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES < totalBytes &&
+    totalBytes <= chunks * SESSION_CTL_CHUNK_PAYLOAD_BYTES
+  );
+}
 
 /**
  * Correlates replies with requests actually emitted by this RTC generation.
@@ -226,7 +256,12 @@ export class SessionCtlRequestTracker {
     ) {
       return false;
     }
-    this.#pending.set(requestId, { operation, metadata: null, chunks: new Map() });
+    this.#pending.set(requestId, {
+      operation,
+      metadata: null,
+      chunks: new Map(),
+      chunkPayloadBytes: null,
+    });
     return true;
   }
 
@@ -269,13 +304,17 @@ export class SessionCtlRequestTracker {
       !Number.isSafeInteger(chunks) ||
       chunks < 0 ||
       chunks > SESSION_CTL_MAX_REPLAY_CHUNKS ||
-      chunks !== Math.ceil(totalBytes / SESSION_CTL_CHUNK_PAYLOAD_BYTES) ||
+      !replayChunkCountIsPlausible(totalBytes, chunks) ||
       typeof response.plain !== "boolean" ||
       (ptyOffset !== null &&
         ptyOffset !== undefined &&
         (typeof ptyOffset !== "number" || !Number.isSafeInteger(ptyOffset) || ptyOffset < 0))
     ) {
-      return null;
+      return this.#reject(
+        requestId,
+        pending,
+        "replay metadata is not a framing this client accepts",
+      );
     }
     pending.metadata = response;
     if (chunks !== 0) return null;
@@ -297,25 +336,70 @@ export class SessionCtlRequestTracker {
       return null;
     }
     const finalSequence = expectedChunks - 1;
-    const expectedPayloadBytes =
-      chunk.sequence === finalSequence
-        ? expectedBytes - SESSION_CTL_CHUNK_PAYLOAD_BYTES * finalSequence
-        : SESSION_CTL_CHUNK_PAYLOAD_BYTES;
-    if (
-      chunk.last !== (chunk.sequence === finalSequence) ||
-      chunk.payload.byteLength !== expectedPayloadBytes ||
-      this.#bufferedBytes + chunk.payload.byteLength > SESSION_CTL_MAX_REPLAY_BYTES
-    ) {
-      return null;
+    const isFinal = chunk.sequence === finalSequence;
+    const length = chunk.payload.byteLength;
+    if (chunk.last !== isFinal || length === 0 || length > SESSION_CTL_CHUNK_PAYLOAD_BYTES) {
+      return this.#reject(chunk.requestId, pending, "replay chunk flag or length is out of range");
+    }
+    if (isFinal) {
+      const expected =
+        pending.chunkPayloadBytes === null
+          ? expectedChunks === 1
+            ? expectedBytes
+            : null
+          : expectedBytes - pending.chunkPayloadBytes * finalSequence;
+      if (expected !== null && length !== expected) {
+        return this.#reject(
+          chunk.requestId,
+          pending,
+          "final replay chunk does not complete the total",
+        );
+      }
+    } else if (pending.chunkPayloadBytes === null) {
+      // The first non-final chunk fixes the framing for the rest. The
+      // daemon's size is never assumed: it must simply be able to carry the
+      // announced total in the announced number of chunks.
+      if (
+        length < SESSION_CTL_MIN_REPLAY_CHUNK_PAYLOAD_BYTES ||
+        length * finalSequence >= expectedBytes ||
+        length * expectedChunks < expectedBytes
+      ) {
+        return this.#reject(chunk.requestId, pending, "replay chunk size cannot carry the total");
+      }
+      const held = pending.chunks.get(finalSequence);
+      if (held && held.byteLength !== expectedBytes - length * finalSequence) {
+        return this.#reject(
+          chunk.requestId,
+          pending,
+          "final replay chunk does not complete the total",
+        );
+      }
+      pending.chunkPayloadBytes = length;
+    } else if (length !== pending.chunkPayloadBytes) {
+      return this.#reject(chunk.requestId, pending, "replay chunks are not one size");
+    }
+    if (this.#bufferedBytes + length > SESSION_CTL_MAX_REPLAY_BYTES) {
+      return this.#reject(chunk.requestId, pending, "replay exceeds the 12 MiB limit");
     }
     pending.chunks.set(chunk.sequence, chunk.payload);
-    this.#bufferedBytes += chunk.payload.byteLength;
+    this.#bufferedBytes += length;
     if (pending.chunks.size !== expectedChunks) return null;
 
     const bytes = combineSessionCtlChunks(pending.chunks, expectedChunks, expectedBytes);
-    if (!bytes) return null;
+    if (!bytes) {
+      return this.#reject(chunk.requestId, pending, "replay chunks do not assemble to the total");
+    }
     this.#remove(chunk.requestId);
     return { kind: "replay", response: metadata, bytes };
+  }
+
+  #reject(
+    requestId: string,
+    pending: PendingSessionCtlRequest,
+    reason: string,
+  ): SessionCtlTrackedResult {
+    this.#remove(requestId);
+    return { kind: "rejected", requestId, operation: pending.operation, reason };
   }
 
   #remove(requestId: string): void {

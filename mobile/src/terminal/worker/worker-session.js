@@ -3,7 +3,12 @@
   "use strict";
   const api = globalThis.spawnWorker;
   const state = api.state;
+  // The largest replay chunk payload accepted. The daemon frames a replay as
+  // 16 KiB SCTP messages, 28 of them header; the size is learned from the
+  // first non-final chunk, never assumed
+  // (proto/session-ctl-replay-framing-v1-vectors.json).
   const CHUNK_BYTES = 48 * 1024;
+  const MIN_REPLAY_CHUNK_BYTES = 1024;
   const MAX_REPLAY_BYTES = 12 * 1024 * 1024;
   const MAX_PREBOOT_BYTES = 12 * 1024 * 1024;
   const MAX_WRITE_BYTES = 4 * 1024 * 1024;
@@ -130,6 +135,7 @@
       operation: "history",
       metadata: null,
       chunks: new Map(),
+      chunkBytes: null,
       bytes: 0,
       rendering: false,
     };
@@ -307,12 +313,82 @@
       finish();
       return;
     }
-    const writeReplay = () => state.term.write(replay, finish);
+    // A committed-line replay ends in a screen repaint at absolute positions.
+    // Written straight through, that repaint lands on the rows the newest
+    // history occupies and erases them; the last thing the session printed
+    // is exactly what goes missing. History first, then scroll what it
+    // occupies up into scrollback, then the screen on a clean viewport.
+    const storied = parseStoriedReplay(replay);
+    const writeReplay = storied
+      ? () =>
+          state.term.write(storied.history, () =>
+            state.term.write(flushViewportIntoScrollback(), () =>
+              state.term.write(storied.screen, finish),
+            ),
+          )
+      : () => state.term.write(replay, finish);
     if (history.operation === "history" && session.bootstrapCount > 0) {
-      state.term.write("\x1b[0m\x1b[H\x1b[2J\x1b[3J", writeReplay);
+      // Restore the character sets, margins, origin mode and autowrap before
+      // clearing: the previous screen's tail sets the app's scroll region and
+      // may leave a line-drawing set active, and 2J/3J leave both in force,
+      // so the history written next would scroll inside that region, or map
+      // to box glyphs (#58). The daemon's own baseline, minus SGR and cursor,
+      // which the screen chunk restores itself, and minus the G2/G3 return,
+      // which the replay head carries (#61).
+      state.term.write(
+        "\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J",
+        writeReplay,
+      );
     } else {
       writeReplay();
     }
+  }
+
+  const REPLAY_HISTORY_SENTINEL = "\x1b_sp:h1\x1b\\";
+
+  // A worker replay is `CSI 8;rows;cols t`, then either the history sentinel
+  // and the committed history as flowing lines, then a second marker and the
+  // live screen — or, from an older worker, raw bytes. Only the first shape
+  // is split; anything else is written as it came.
+  function parseStoriedReplay(bytes) {
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return null;
+    }
+    if (!text.startsWith("\x1b[8;")) return null;
+    const marker = new RegExp("\\x1b\\[8;(\\d{1,5});(\\d{1,5})t", "g");
+    const first = marker.exec(text);
+    if (!first || first.index !== 0) return null;
+    const chunks = [];
+    let current = first;
+    while (current) {
+      const start = marker.lastIndex;
+      const next = marker.exec(text);
+      chunks.push(text.slice(start, next ? next.index : undefined));
+      current = next;
+    }
+    if (chunks.length !== 2 || !chunks[0].startsWith(REPLAY_HISTORY_SENTINEL)) return null;
+    return { history: chunks[0].slice(REPLAY_HISTORY_SENTINEL.length), screen: chunks[1] };
+  }
+
+  // Scroll the viewport rows the history occupies up into scrollback, by the
+  // last non-blank row rather than the cursor row: trailing blank rows are
+  // frame padding, and scrolling to the cursor would push a screenful of
+  // blanks into scrollback as a gap at the history/screen seam.
+  function flushViewportIntoScrollback() {
+    const term = state.term;
+    const buffer = term.buffer.active;
+    let occupied = 0;
+    // The rows to flush are the screen's, which start at baseY. viewportY is
+    // where the reader is looking, and on a reseed while scrolled up the two
+    // differ: measuring from there counts the top of the history instead.
+    for (let row = 0; row < term.rows; row += 1) {
+      const line = buffer.getLine(buffer.baseY + row);
+      if (line && line.translateToString(true).length > 0) occupied = row + 1;
+    }
+    return occupied > 0 ? `\x1b[${term.rows};1H${"\n".repeat(occupied)}` : "";
   }
 
   function recoverFromGap(offset) {
@@ -331,25 +407,41 @@
     startBootstrap();
   }
 
+  // Whether `chunks` can carry `totalBytes` under some chunk size in the
+  // accepted range; the first non-final chunk fixes the exact size.
+  function replayChunkCountIsPlausible(totalBytes, chunks) {
+    if (chunks === 0) return totalBytes === 0;
+    if (totalBytes === 0) return false;
+    if (chunks === 1) return totalBytes <= CHUNK_BYTES;
+    return (chunks - 1) * MIN_REPLAY_CHUNK_BYTES < totalBytes && totalBytes <= chunks * CHUNK_BYTES;
+  }
+
   function acceptReplayMetadata(message) {
     const history = session.history;
     if (
       !history ||
       message.request_id !== history.requestId ||
       message.operation !== history.operation ||
-      message.ok !== true ||
+      message.ok !== true
+    ) {
+      return false;
+    }
+    if (
       message.plain !== false ||
       !Number.isSafeInteger(message.total_bytes) ||
       message.total_bytes < 0 ||
       message.total_bytes > MAX_REPLAY_BYTES ||
       !Number.isSafeInteger(message.chunks) ||
-      message.chunks !== Math.ceil(message.total_bytes / CHUNK_BYTES) ||
+      !replayChunkCountIsPlausible(message.total_bytes, message.chunks) ||
       !(
         message.pty_offset === undefined ||
         message.pty_offset === null ||
         (Number.isSafeInteger(message.pty_offset) && message.pty_offset >= 0)
       )
     ) {
+      // A reply this client will not assemble is a wire disagreement, not
+      // silence: the pane must not wait on it until the connect timeout.
+      api.error("replay_metadata", "Replay metadata is not a framing this client accepts.", true);
       return false;
     }
     history.metadata = message;
@@ -362,20 +454,55 @@
     const metadata = history?.metadata;
     if (!history || !metadata || frame.kind !== 1 || frame.requestId !== history.requestId) return;
     const final = metadata.chunks - 1;
-    const expected =
-      frame.sequence === final ? metadata.total_bytes - final * CHUNK_BYTES : CHUNK_BYTES;
-    if (
-      frame.sequence >= metadata.chunks ||
-      history.chunks.has(frame.sequence) ||
-      frame.last !== (frame.sequence === final) ||
-      frame.payload.byteLength !== expected ||
-      history.bytes + frame.payload.byteLength > MAX_REPLAY_BYTES
-    ) {
-      api.error("replay_frame", "Malformed or duplicate replay chunk.", true);
+    const isFinal = frame.sequence === final;
+    const length = frame.payload.byteLength;
+    const reject = (reason) => api.error("replay_frame", reason, true);
+    if (frame.sequence >= metadata.chunks || history.chunks.has(frame.sequence)) {
+      reject("Malformed or duplicate replay chunk.");
+      return;
+    }
+    if (frame.last !== isFinal || length === 0 || length > CHUNK_BYTES) {
+      reject("Replay chunk flag or length is out of range.");
+      return;
+    }
+    if (isFinal) {
+      const expected =
+        history.chunkBytes == null
+          ? metadata.chunks === 1
+            ? metadata.total_bytes
+            : null
+          : metadata.total_bytes - history.chunkBytes * final;
+      if (expected !== null && length !== expected) {
+        reject("Final replay chunk does not complete the total.");
+        return;
+      }
+    } else if (history.chunkBytes == null) {
+      // The first non-final chunk fixes the framing for the rest; the
+      // daemon's size is never assumed, only required to carry the total.
+      if (
+        length < MIN_REPLAY_CHUNK_BYTES ||
+        length * final >= metadata.total_bytes ||
+        length * metadata.chunks < metadata.total_bytes
+      ) {
+        reject("Replay chunk size cannot carry the total.");
+        return;
+      }
+      const held = history.chunks.get(final);
+      if (held && held.byteLength !== metadata.total_bytes - length * final) {
+        reject("Final replay chunk does not complete the total.");
+        return;
+      }
+      history.chunkBytes = length;
+    } else if (length !== history.chunkBytes) {
+      reject("Replay chunks are not one size.");
+      return;
+    }
+    if (history.bytes + length > MAX_REPLAY_BYTES) {
+      reject("Replay exceeds the aggregate byte limit.");
       return;
     }
     history.chunks.set(frame.sequence, frame.payload);
-    history.bytes += frame.payload.byteLength;
+    history.bytes += length;
     finishReplay();
   }
 
@@ -596,6 +723,7 @@
       operation: "snapshot",
       metadata: null,
       chunks: new Map(),
+      chunkBytes: null,
       bytes: 0,
       rendering: false,
     };

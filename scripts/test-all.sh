@@ -64,6 +64,10 @@ scripts/check-claude-md.sh --self-test
 scripts/check-claude-md.sh
 
 printf '%s\n' "== daemon tests =="
+# The emulator's real-terminal proof drives the web workspace's xterm.js.
+# Naming it makes the proof required here, where the workspace is installed,
+# instead of skipped as it is wherever `cargo test` runs without one.
+export SPAWN_XTERM_JS="$repo_root/web/node_modules/@xterm/xterm/lib/xterm.js"
 (cd daemon && cargo test --locked)
 
 printf '%s\n' "== daemon tests, diagnostics variant =="
