@@ -157,6 +157,19 @@ no TURN secret. Missing Python 3 produces a warning because the dependency-free
 probe cannot run; an endpoint that is actually configured but does not answer
 is a health failure.
 
+A relay that answers STUN can still be refusing every allocation, so the same
+run reads the last hour of `journalctl -u coturn` and counts its two failure
+signatures. Any `create_relay_ioa_sockets: no available ports` is a failure:
+the relay pool is full and a new relayed connection just failed. `check_stun_auth:
+Cannot find credentials of user` is coturn refusing an expired credential;
+up to `SPAWN_HEALTH_TURN_REJECTIONS_MAX` an hour (default 30) is a client that
+reconnected with a credential the relay had just expired, and more is a client
+presenting expired credentials on every reconnect, the loop that produced
+around 9,000 in a day on 2026-09-05. A host where the journal is not readable
+gets a warning, not a failure; a host without coturn in its unit list skips
+the row. `scripts/health-check.sh --self-test` exercises the counting and the
+thresholds against fixtures.
+
 ## TURN TLS on 443
 
 `turns:` on TCP 443 is recommended for browsers and phones on networks that

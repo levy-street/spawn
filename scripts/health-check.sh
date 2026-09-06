@@ -4,10 +4,10 @@
 #
 # Deliberately answers the questions that stay silent until a user complains:
 # is the API up, is the web app up, does the public WebSocket proxy upgrade,
-# does configured TURN answer, is Redis up, is the disk filling, are backups
-# still being taken. A service that is "active" but returning 502, or a backup
-# timer that has quietly produced nothing for a week, both look fine from
-# `systemctl status` alone.
+# does configured TURN answer and is its relay pool exhausted, is Redis up, is
+# the disk filling, are backups still being taken. A service that is "active"
+# but returning 502, or a backup timer that has quietly produced nothing for a
+# week, both look fine from `systemctl status` alone.
 #
 # Exits non-zero on any failure so the unit shows in `systemctl --failed`,
 # which is the one place an operator looks without being told to.
@@ -28,6 +28,30 @@ units_with_turn() {
     units="$units coturn"
   fi
   printf '%s\n' "$units"
+}
+
+# The relay's two failure signatures, counted over one journal window read
+# from stdin, and the verdict on them: prints "<ok|fail> <exhaustions>
+# <rejections>". Pure — a function over text — so the self-test can feed it
+# fixtures and the real run can feed it journalctl.
+#
+# `create_relay_ioa_sockets: no available ports` means the relay port pool is
+# full and a new relayed connection just failed: any is a failure. `check_stun_auth:
+# Cannot find credentials of user` is coturn refusing an expired credential; a
+# client that reconnects with one the relay expired a moment ago produces a
+# handful an hour, while a client presenting expired credentials on every
+# reconnect — the shape of #71, a loop every 20–50 s — produces well over the
+# threshold. docs/NETWORK.md, "Relay credential and allocation lifetimes".
+coturn_journal_verdict() {
+  local max_rejections="$1"
+  local text exhaustions rejections verdict=ok
+  text="$(cat)"
+  exhaustions="$(printf '%s\n' "$text" | grep -c 'no available ports')" || true
+  rejections="$(printf '%s\n' "$text" | grep -c 'Cannot find credentials')" || true
+  if [[ "$exhaustions" -gt 0 || "$rejections" -gt "$max_rejections" ]]; then
+    verdict=fail
+  fi
+  printf '%s %s %s\n' "$verdict" "$exhaustions" "$rejections"
 }
 
 # Returns 2, rather than failing the deployment, when this host lacks the
@@ -68,6 +92,21 @@ if [[ "${1:-}" == "--self-test" ]]; then
     "spawn-server spawn-web redis-server coturn" ]] || exit 1
   [[ "$(units_with_turn 'spawn-server coturn' 'turn:example:3478')" == \
     "spawn-server coturn" ]] || exit 1
+  exhausted='Sep 06 07:22:01 relay turnserver[812]: 0: : ERROR: create_relay_ioa_sockets: no available ports'
+  rejected='Sep 06 07:22:02 relay turnserver[812]: 0: : check_stun_auth: Cannot find credentials of user <1757000000:user>'
+  benign='Sep 06 07:22:03 relay turnserver[812]: 0: : session 000000000000000001: realm <spawnd.dev> user <1757600000:user>: incoming packet ALLOCATE processed, success'
+  journal_lines() {
+    local line="$1" count="$2"
+    local i
+    for ((i = 0; i < count; i++)); do printf '%s\n' "$line"; done
+  }
+  [[ "$(printf '' | coturn_journal_verdict 30)" == "ok 0 0" ]] || exit 1
+  [[ "$(journal_lines "$benign" 5 | coturn_journal_verdict 30)" == "ok 0 0" ]] || exit 1
+  [[ "$(journal_lines "$exhausted" 1 | coturn_journal_verdict 30)" == "fail 1 0" ]] || exit 1
+  [[ "$(journal_lines "$rejected" 30 | coturn_journal_verdict 30)" == "ok 0 30" ]] || exit 1
+  [[ "$(journal_lines "$rejected" 31 | coturn_journal_verdict 30)" == "fail 0 31" ]] || exit 1
+  [[ "$( (journal_lines "$exhausted" 3; journal_lines "$rejected" 2; journal_lines "$benign" 4) \
+    | coturn_journal_verdict 30)" == "fail 3 2" ]] || exit 1
   note "self-test ok"
   exit 0
 fi
@@ -95,6 +134,9 @@ WEB_URL="${SPAWN_HEALTH_WEB_URL:-http://127.0.0.1:3001/}"
 WEB_API_URL="${SPAWN_HEALTH_WEB_API_URL:-http://127.0.0.1:3001/healthz}"
 PUBLIC_ORIGIN="${SPAWN_HEALTH_PUBLIC_ORIGIN:-https://spawnd.dev}"
 TURN_URLS="${SPAWN_TURN_URLS:-}"
+# Credential rejections in the last hour above this fail the coturn row; any
+# port exhaustion does regardless. See coturn_journal_verdict.
+TURN_REJECTIONS_MAX="${SPAWN_HEALTH_TURN_REJECTIONS_MAX:-30}"
 BACKUP_DIR="${SPAWN_BACKUP_DIR:-/opt/spawn-backups}"
 DISK_PATH="${SPAWN_HEALTH_DISK_PATH:-/}"
 DISK_WARN_PCT="${SPAWN_HEALTH_DISK_WARN_PCT:-85}"
@@ -161,6 +203,25 @@ if [[ -n "$TURN_URLS" ]]; then
   stun_probe_status=$?
   if [[ "$stun_probe_status" -eq 2 ]]; then
     warn "configured TURN path was not verified"
+  fi
+fi
+
+# --- relay pool ---------------------------------------------------------------
+# A relay that answers STUN can still be refusing every allocation. 2026-09-04:
+# 766 `no available ports` in one hour, found the next day from a user report.
+if [[ " $UNITS " == *" coturn "* ]]; then
+  if coturn_journal="$(journalctl -u coturn --since -1h --no-pager 2>/dev/null)"; then
+    read -r coturn_verdict coturn_exhaustions coturn_rejections <<<"$(
+      printf '%s\n' "$coturn_journal" | coturn_journal_verdict "$TURN_REJECTIONS_MAX"
+    )"
+    coturn_summary="coturn last hour: $coturn_exhaustions 'no available ports', $coturn_rejections 'Cannot find credentials' (fails on any exhaustion or more than $TURN_REJECTIONS_MAX rejections)"
+    if [[ "$coturn_verdict" == ok ]]; then
+      note "$coturn_summary"
+    else
+      fail "$coturn_summary — the relay pool is full or a client is presenting expired credentials on a loop; docs/NETWORK.md"
+    fi
+  else
+    warn "coturn journal is not readable here; relay exhaustion was not checked"
   fi
 fi
 
