@@ -339,12 +339,13 @@ async def test_release_endpoint_carries_the_variants(client, tmp_path, monkeypat
 
 @pytest.mark.parametrize(
     "absent",
-    ["missing-key", "empty"],
+    ["missing-key", "empty", "null"],
 )
 def test_a_manifest_without_variants_is_a_release_with_none(tmp_path, absent):
     manifest, prebuilt = _stage_targets(tmp_path, ["linux-x86_64"])
-    if absent == "empty":
-        manifest["variants"] = {}
+    if absent != "missing-key":
+        # The daemon reads both as "no variants"; the server must agree.
+        manifest["variants"] = {} if absent == "empty" else None
         (prebuilt / "manifest.json").write_text(json.dumps(manifest))
 
     read = release.read_prebuilt_manifest(repo_root=tmp_path)

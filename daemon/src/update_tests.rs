@@ -579,6 +579,15 @@ fn variant_selection_defaults_to_the_own_build_and_honours_the_override() {
                 "{bogus:?} must not select a variant"
             );
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                configured_variant_from(Some(OsStr::from_bytes(&[0xff, 0xfe])), own),
+                Err(BlockReason::InvalidVariant),
+                "a value that is not a string must not select a variant"
+            );
+        }
     }
     // The build decides the default, so a diagnostics binary keeps following
     // diagnostics with nothing set, and a release binary never picks it up.
@@ -618,13 +627,10 @@ fn variants_block(target: &str) -> serde_json::Value {
     })
 }
 
-fn release_policy<'a>(public_key: &'a str, variant: ReleaseVariant) -> VerifyPolicy<'a> {
-    // Borrowed through a leaked one-element slice so the policy can outlive
-    // this helper; the tests are the only caller and the leak is bytes.
-    let keys: &'a [&'a str] = Box::leak(Box::new([public_key]));
+fn release_policy<'a>(public_keys: &'a [&'a str], variant: ReleaseVariant) -> VerifyPolicy<'a> {
     VerifyPolicy {
         allow_unsigned: false,
-        public_keys: keys,
+        public_keys,
         build_counter: Some(1_000),
         downgrade_authorized: false,
         variant,
@@ -658,7 +664,7 @@ fn a_manifest_carrying_variants_still_verifies_and_resolves_the_release_pair() {
             Some(signature.as_bytes()),
             &request,
             "darwin-aarch64",
-            &release_policy(&public_key, ReleaseVariant::Release),
+            &release_policy(&[&public_key], ReleaseVariant::Release),
         )
         .unwrap_or_else(|failure| panic!("variants {variants} broke the release path: {failure}"));
         assert_eq!(plan, expected);
@@ -676,7 +682,7 @@ fn the_diagnostics_variant_installs_its_own_pair_from_the_signed_manifest() {
         Some(signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+        &release_policy(&[&public_key], ReleaseVariant::Diagnostics),
     )
     .unwrap();
     assert_eq!(
@@ -708,7 +714,7 @@ fn the_diagnostics_variant_installs_its_own_pair_from_the_signed_manifest() {
         Some(signature.as_bytes()),
         &lying,
         "darwin-aarch64",
-        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+        &release_policy(&[&public_key], ReleaseVariant::Diagnostics),
     )
     .unwrap_err();
     assert_eq!(failure.error, "manifest_mismatch");
@@ -735,7 +741,7 @@ fn the_diagnostics_variant_refuses_a_manifest_without_its_pair() {
             Some(signature.as_bytes()),
             &request,
             "darwin-aarch64",
-            &release_policy(&public_key, ReleaseVariant::Diagnostics),
+            &release_policy(&[&public_key], ReleaseVariant::Diagnostics),
         )
         .unwrap_err();
         assert_eq!(
@@ -761,7 +767,7 @@ fn the_diagnostics_variant_refuses_a_manifest_without_its_pair() {
             Some(signature.as_bytes()),
             &request,
             "darwin-aarch64",
-            &release_policy(&public_key, ReleaseVariant::Diagnostics),
+            &release_policy(&[&public_key], ReleaseVariant::Diagnostics),
         )
         .unwrap_err();
         assert_eq!(
@@ -793,7 +799,7 @@ fn the_signature_covers_the_variant_hashes_and_the_counter_still_applies() {
             Some(signature.as_bytes()),
             &request,
             "darwin-aarch64",
-            &release_policy(&public_key, variant),
+            &release_policy(&[&public_key], variant),
         )
         .unwrap_err();
         assert_eq!(failure.error, "manifest_bad_signature");
@@ -806,7 +812,7 @@ fn the_signature_covers_the_variant_hashes_and_the_counter_still_applies() {
         Some(resigned.as_bytes()),
         &request,
         "darwin-aarch64",
-        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+        &release_policy(&[&public_key], ReleaseVariant::Diagnostics),
     )
     .unwrap();
     assert_eq!(plan.spawnd.sha256, format!("d{}", "e".repeat(63)));
@@ -819,7 +825,7 @@ fn the_signature_covers_the_variant_hashes_and_the_counter_still_applies() {
         Some(older_signature.as_bytes()),
         &request,
         "darwin-aarch64",
-        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+        &release_policy(&[&public_key], ReleaseVariant::Diagnostics),
     )
     .unwrap_err();
     assert_eq!(
@@ -832,7 +838,7 @@ fn the_signature_covers_the_variant_hashes_and_the_counter_still_applies() {
         None,
         &request,
         "darwin-aarch64",
-        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+        &release_policy(&[&public_key], ReleaseVariant::Diagnostics),
     )
     .unwrap_err();
     assert_eq!(failure.error, "manifest_unsigned");

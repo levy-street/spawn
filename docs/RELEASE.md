@@ -1205,17 +1205,39 @@ take care of the rest.
 it was built as: a diagnostics daemon updates to the next release's
 diagnostics pair with nothing configured, and a release daemon updates to the
 release pair and never picks the variant up by accident. To move a host
-across, set `SPAWND_RELEASE_VARIANT=diagnostics` (or `release`) in the
-daemon's environment — a systemd drop-in on Linux — and run `spawnd update`
-or wait for the next release; the daemon switches on the same tree, and once
-it is running the other build the override is no longer needed. An unknown
-value blocks self-update with `invalid_variant`, which the host list shows.
-The server has no say: it pushes the release pair, and the daemon substitutes
-the variant's paths and hashes from the same signed bytes after holding the
-server's claim to the release hashes and tree. Everything else is unchanged —
-the signature, the monotonic counter and the local downgrade consent, the
-probation window and the health revert all apply to a variant update exactly
-as to a release one.
+across on the tree it already runs, run the switch from a shell on the host:
+
+```bash
+SPAWND_RELEASE_VARIANT=diagnostics spawnd update   # or =release, to go back
+```
+
+`spawnd update` reads the variable from its own environment, not from the
+service's, so a systemd drop-in alone does nothing on the current tree — the
+server has nothing to push for a host already on the release's tree, and the
+daemon never initiates a same-tree switch by itself. The CLI installs the
+other pair from the same signed manifest and restarts the service onto it;
+from then on the running build's own variant is what the daemon follows, and
+no override is needed anywhere. Setting the variable in the daemon's
+environment does apply at the next release: a release daemon with
+`SPAWND_RELEASE_VARIANT=diagnostics` in its unit installs the diagnostics pair
+of the next tree. An unknown value blocks self-update with `invalid_variant`,
+which the host list shows. The server has no say in any of this: it pushes
+the release pair, and the daemon substitutes the variant's paths and hashes
+from the same signed bytes after holding the server's claim to the release
+hashes and tree. Everything else is unchanged — the signature, the monotonic
+counter and the local downgrade consent, the probation window and the health
+revert all apply to a variant update exactly as to a release one.
+
+**A diagnostics daemon built before this section existed** — a hand-built
+one copied into `~/.local/bin` behind `SPAWND_NO_SELF_UPDATE=1`, which is how
+dream ran until the variant shipped — has an updater that knows nothing about
+variants and installs whatever pair the server names. Lifting its drop-in is
+therefore not enough: its first update lands it on the release pair, quietly,
+and nothing brings it back on its own. Either install the CI-built
+`.diagnostics` pair by hand once, verified against the signed manifest, or
+lift the drop-in, let the first update land the release pair (a variant-aware
+build), and then run the `spawnd update` switch above. Only from a build that
+carries the variant-aware updater is the choice sticky.
 
 **What happens without it.** A diagnostics daemon whose release carries no
 diagnostics pair for its target refuses the update with

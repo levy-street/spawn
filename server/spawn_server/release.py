@@ -397,7 +397,9 @@ def read_prebuilt_manifest(
     # listed, and must report the release version with its own suffix — the
     # daemon refuses a downloaded binary that says anything else, so a
     # manifest that promised otherwise would only ever produce failed updates.
-    variants_raw = raw.get("variants", {})
+    variants_raw = raw.get("variants")
+    if variants_raw is None:
+        variants_raw = {}
     if not isinstance(variants_raw, dict):
         _log_manifest_error_once(f"{path} has an invalid variants map")
         return None
