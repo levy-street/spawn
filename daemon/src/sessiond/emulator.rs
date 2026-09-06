@@ -56,9 +56,13 @@
 //! shadow); the emulator's own DECRC restores designations but not the shift
 //! (alacritty's register), where xterm.js's restores the table that was
 //! active at DECSC — the two consumers differ natively when an app shifts
-//! between ESC 7 and ESC 8, and a checkpoint reproduces each consumer's own
-//! behaviour rather than reconciling them; and G2/G3 are designated but
-//! never made active, since this profile emits no locking shift to them.
+//! between ESC 7 and ESC 8, so a checkpoint taken between the two rebuilds
+//! the register such that each consumer restores what it natively would,
+//! and one taken after the ESC 8 carries the emulator's outcome to both; an
+//! inactive alternate screen's register is not carried, so a consumer
+//! re-entering it and restoring without saving there first restores ASCII
+//! at home; and G2/G3 are designated but never made active, since this
+//! profile emits no locking shift to them.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Charsets, Cursor, Dimensions};
@@ -1005,8 +1009,9 @@ mod tests {
         );
         assert_eq!(a.shadow.alt, b.shadow.alt, "{context}: alt");
         // The primary register always travels, the alternate one while its
-        // screen is active; an inactive alternate screen's register is not
-        // part of a checkpoint (nor is alacritty's inactive grid compared).
+        // screen is active. An inactive alternate screen's register is not
+        // carried (a limitation the module doc lists), nor is alacritty's
+        // inactive grid compared.
         assert_eq!(
             a.shadow.saved_shift[0], b.shadow.saved_shift[0],
             "{context}: primary register shift"
@@ -1220,18 +1225,33 @@ mod tests {
         // app still believes its sets are armed, and the emulator is what
         // renders its next bytes. Feeding the baseline's return into self
         // before capturing the sets — the alt path mirrors the baseline —
-        // would leave the emulator in ASCII while the app draws boxes.
+        // would leave the emulator in ASCII while the app draws boxes. The
+        // shadow's record of the registers must survive too: the alt path
+        // feeds the tail's own ESC 7 back into self, and one rebuilt under
+        // the wrong shift would rewrite the record before anything compared
+        // it (the app saves under SO here, so the two registers differ).
         for alt in [false, true] {
             let mut e = Emulator::new(20, 4);
             if alt {
                 e.feed(b"\x1b[?1049h\x1b[H");
             }
-            e.feed(b"\x1b(0\x1b)0\x0elqk");
-            let before = (e.term.grid().cursor.charsets, e.shadow.active_charset);
+            e.feed(b"\x1b(0\x1b)0\x0e\x1b7lqk");
+            let state = |e: &Emulator| {
+                (
+                    e.term.grid().cursor.charsets,
+                    e.shadow.active_charset,
+                    e.shadow.saved_shift,
+                    e.shadow.alt,
+                )
+            };
+            let before = state(&e);
             assert_eq!(before.1, CharsetIndex::G1, "precondition");
+            let mut registers = [CharsetIndex::G0; 2];
+            registers[usize::from(alt)] = CharsetIndex::G1;
+            assert_eq!(before.2, registers, "precondition");
             let checkpoint = e.serialize();
             assert_eq!(
-                (e.term.grid().cursor.charsets, e.shadow.active_charset),
+                state(&e),
                 before,
                 "alt={alt}: the checkpoint changed the emulator's own charsets"
             );
@@ -1355,6 +1375,23 @@ mod tests {
         }
         assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
         assert_eq!(b.screen_text()[0], "┌─┐", "{:?}", b.screen_text());
+
+        // On the alternate screen, saved under SO with G1 line drawing and
+        // returned to ASCII since: the alt register is rebuilt under its own
+        // recorded shift, not the primary's, and the mirror that feeds the
+        // tail back into self must leave the shadow's record as it was.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x1b)Btext");
+        assert_eq!(
+            a.shadow.saved_shift,
+            [CharsetIndex::G0, CharsetIndex::G1],
+            "alt register shift after the checkpoint"
+        );
+        assert_same_state(&a, &b, "decsc charsets, alt screen SO form");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8lqk");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "┌─┐t", "{:?}", b.screen_text());
     }
 
     #[test]
@@ -1469,14 +1506,20 @@ mod tests {
         // xterm.js keeps the active table in its DECSC register and the
         // primary's at `?1049h`, where alacritty keeps designations. The
         // rebuilt register and the carried primary sets must restore line
-        // drawing on it all the same: DECSC in the G0 form, the SO form and
-        // saved under SI then shifted out, and leaving the alternate screen
-        // entered under SI and under SO.
+        // drawing on it all the same: DECSC in the G0 form, the SO form,
+        // saved under SI then shifted out, and saved on the alternate screen
+        // under SO; and leaving the alternate screen entered under SI and
+        // under SO.
         let Some(xterm) = xterm_js() else { return };
-        let cases: [(&[u8], &[u8], &str); 5] = [
+        let cases: [(&[u8], &[u8], &str); 6] = [
             (b"\x1b(0\x1b7\x1b(Btext", b"\x1b8lqk", "┌─┐t"),
             (b"\x1b)0\x0e\x1b7lqk", b"\x1b8xxx", "│││"),
             (b"\x1b(0\x1b7\x1b(B\x1b)0\x0e", b"\x0f\x1b8lqk", "┌─┐"),
+            (
+                b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x1b)Btext",
+                b"\x1b8lqk",
+                "┌─┐t",
+            ),
             (
                 b"\x1b(0\x1b[?1049h\x1b[H\x1b(Balt",
                 b"\x1b[?1049llqk",
