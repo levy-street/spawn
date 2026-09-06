@@ -33,6 +33,13 @@ SUPPORTED_DAEMON_TARGETS = (
     "linux-aarch64",
     "windows-x86_64",
 )
+#: Alternative builds of a daemon release, cut from the same tree at the same
+#: counter and listed in the manifest under `variants`. Their binaries live
+#: under `prebuilt/<target>/<variant>/` and are served from
+#: `/api/install/<kind>/<target>/<variant>`. The daemon picks one by the build
+#: it already is, so the server only has to publish and prove them. Kept in
+#: step with `PREBUILT_VARIANTS` in scripts/release-lib.sh.
+SUPPORTED_DAEMON_VARIANTS = ("diagnostics",)
 DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64", "windows-x86_64")
 
 #: What an unreadable desktop directory may still claim. Failing open is
@@ -284,6 +291,55 @@ def _daemon_binary_filename(kind: str, target: str) -> str:
     return f"{kind}{suffix}"
 
 
+def variant_version(version: str, variant: str) -> str:
+    """The version a variant binary reports: the release version with the
+    variant as one more build-metadata segment, as daemon/build.rs stamps it
+    and scripts/release-lib.sh renders it."""
+    return f"{version}.{variant}"
+
+
+def _verified_target_pair(
+    prebuilt_root: Path,
+    target: str,
+    target_raw: object,
+    *,
+    path: Path,
+    label: str,
+    variant: str | None = None,
+) -> schemas.DaemonTargetOut | None:
+    """One target's pair, proven: two lower-hex hashes in the manifest and two
+    files on disk that hash to them. `None` names the reason once and means
+    the whole manifest is refused, for a variant exactly as for the release —
+    a manifest that lists bytes this server cannot hand out is not a release."""
+    if target not in SUPPORTED_DAEMON_TARGETS or not isinstance(target_raw, dict):
+        _log_manifest_error_once(f"{path} has invalid {label} target {target!r}")
+        return None
+    spawnd_sha = target_raw.get("spawnd_sha256")
+    worker_sha = target_raw.get("spawn_worker_sha256")
+    if not isinstance(spawnd_sha, str) or not isinstance(worker_sha, str):
+        _log_manifest_error_once(f"{path} has missing {label} hashes for {target}")
+        return None
+    spawnd_sha = spawnd_sha.lower()
+    worker_sha = worker_sha.lower()
+    if not _HEX_64.fullmatch(spawnd_sha) or not _HEX_64.fullmatch(worker_sha):
+        _log_manifest_error_once(f"{path} has invalid {label} hashes for {target}")
+        return None
+
+    directory = prebuilt_root / target
+    if variant is not None:
+        directory = directory / variant
+    binaries = (
+        (directory / _daemon_binary_filename("spawnd", target), spawnd_sha),
+        (directory / _daemon_binary_filename("spawn-worker", target), worker_sha),
+    )
+    for binary, expected in binaries:
+        actual = _sha256_file(binary)
+        if actual != expected:
+            _log_manifest_error_once(f"sha256 mismatch for {binary}")
+            return None
+    return schemas.DaemonTargetOut(spawnd_sha256=spawnd_sha, spawn_worker_sha256=worker_sha)
+
+
 def read_prebuilt_manifest(
     *,
     repo_root: Path | None = None,
@@ -330,38 +386,48 @@ def read_prebuilt_manifest(
     prebuilt_root = path.parent
     targets: dict[str, schemas.DaemonTargetOut] = {}
     for target, target_raw in targets_raw.items():
-        if target not in SUPPORTED_DAEMON_TARGETS or not isinstance(target_raw, dict):
-            _log_manifest_error_once(f"{path} has invalid target {target!r}")
+        pair = _verified_target_pair(prebuilt_root, target, target_raw, path=path, label="release")
+        if pair is None:
             return None
-        spawnd_sha = target_raw.get("spawnd_sha256")
-        worker_sha = target_raw.get("spawn_worker_sha256")
-        if not isinstance(spawnd_sha, str) or not isinstance(worker_sha, str):
-            _log_manifest_error_once(f"{path} has missing hashes for {target}")
-            return None
-        spawnd_sha = spawnd_sha.lower()
-        worker_sha = worker_sha.lower()
-        if not _HEX_64.fullmatch(spawnd_sha) or not _HEX_64.fullmatch(worker_sha):
-            _log_manifest_error_once(f"{path} has invalid hashes for {target}")
-            return None
+        targets[target] = pair
 
-        binaries = (
-            (
-                prebuilt_root / target / _daemon_binary_filename("spawnd", target),
-                spawnd_sha,
-            ),
-            (
-                prebuilt_root / target / _daemon_binary_filename("spawn-worker", target),
-                worker_sha,
-            ),
-        )
-        for binary, expected in binaries:
-            actual = _sha256_file(binary)
-            if actual != expected:
-                _log_manifest_error_once(f"sha256 mismatch for {binary}")
+    # The variants, held to the same proof. Absent or empty is the ordinary
+    # case for a release with no variant builds; a manifest older than the
+    # key has none. A variant may only cover a target whose release pair is
+    # listed, and must report the release version with its own suffix — the
+    # daemon refuses a downloaded binary that says anything else, so a
+    # manifest that promised otherwise would only ever produce failed updates.
+    variants_raw = raw.get("variants", {})
+    if not isinstance(variants_raw, dict):
+        _log_manifest_error_once(f"{path} has an invalid variants map")
+        return None
+    variants: dict[str, schemas.DaemonVariantOut] = {}
+    for variant, variant_raw in variants_raw.items():
+        if variant not in SUPPORTED_DAEMON_VARIANTS or not isinstance(variant_raw, dict):
+            _log_manifest_error_once(f"{path} has invalid variant {variant!r}")
+            return None
+        expected_version = variant_version(version.strip(), variant)
+        variant_targets_raw = variant_raw.get("targets")
+        if variant_raw.get("version") != expected_version or not isinstance(
+            variant_targets_raw, dict
+        ):
+            _log_manifest_error_once(f"{path} has invalid release fields for variant {variant}")
+            return None
+        variant_targets: dict[str, schemas.DaemonTargetOut] = {}
+        for target, target_raw in variant_targets_raw.items():
+            if target not in targets:
+                _log_manifest_error_once(
+                    f"{path} lists variant {variant} for {target!r} without its release pair"
+                )
                 return None
-        targets[target] = schemas.DaemonTargetOut(
-            spawnd_sha256=spawnd_sha,
-            spawn_worker_sha256=worker_sha,
+            pair = _verified_target_pair(
+                prebuilt_root, target, target_raw, path=path, label=variant, variant=variant
+            )
+            if pair is None:
+                return None
+            variant_targets[target] = pair
+        variants[variant] = schemas.DaemonVariantOut(
+            version=expected_version, targets=variant_targets
         )
 
     return schemas.DaemonReleaseOut(
@@ -371,6 +437,7 @@ def read_prebuilt_manifest(
         release_counter=release_counter,
         signed=Path(f"{path}.sig").is_file(),
         targets=targets,
+        variants=variants,
     )
 
 
@@ -566,6 +633,7 @@ def humanize_self_update_blocked(reason: str | None) -> str:
         "unwritable": "The daemon install directory is not writable",
         "unsupported_target": "This daemon target is unsupported",
         "worker_missing": "The SPAWN D worker binary is missing",
+        "invalid_variant": "SPAWND_RELEASE_VARIANT names a release variant that does not exist",
         "task_breakaway_unconfirmed": (
             "Task Scheduler has not confirmed that session workers survive updates"
         ),

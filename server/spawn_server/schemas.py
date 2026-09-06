@@ -937,6 +937,16 @@ class DaemonTargetOut(BaseModel):
     spawn_worker_sha256: str
 
 
+class DaemonVariantOut(BaseModel):
+    """An alternative build of the same daemon release — the same tree and
+    counter, its own version suffix and hashes — served from
+    `/api/install/<kind>/<target>/<variant>`. A daemon follows the variant it
+    was built as; see "The diagnostics variant" in docs/RELEASE.md."""
+
+    version: str
+    targets: dict[str, DaemonTargetOut]
+
+
 class DaemonReleaseOut(BaseModel):
     version: str
     commit: str
@@ -944,6 +954,7 @@ class DaemonReleaseOut(BaseModel):
     release_counter: int | None = None
     signed: bool = False
     targets: dict[str, DaemonTargetOut]
+    variants: dict[str, DaemonVariantOut] = Field(default_factory=dict)
 
 
 class MobileReleaseOut(BaseModel):
