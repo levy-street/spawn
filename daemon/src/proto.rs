@@ -299,7 +299,7 @@ pub struct InboundBrowserPin {
     pub endorsement_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonUpdateArtifact {
     pub path: String,
     pub sha256: String,

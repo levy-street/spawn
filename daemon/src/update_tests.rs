@@ -38,12 +38,22 @@ fn signed_manifest(
     signing_key: &ed25519_dalek::SigningKey,
     counter: u64,
 ) -> (Vec<u8>, String, String) {
+    signed_manifest_with(signing_key, counter, None)
+}
+
+/// A signed manifest for tree `b…` at `counter`; `variants`, when given, is
+/// written verbatim under the `variants` key so a test can shape it freely.
+fn signed_manifest_with(
+    signing_key: &ed25519_dalek::SigningKey,
+    counter: u64,
+    variants: Option<serde_json::Value>,
+) -> (Vec<u8>, String, String) {
     use ed25519_dalek::Signer;
 
     let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
     let key_id =
         digest_hex(&Sha256::digest(signing_key.verifying_key().to_bytes()))[..8].to_string();
-    let bytes = serde_json::to_vec(&serde_json::json!({
+    let mut manifest = serde_json::json!({
         "commit": "a".repeat(40),
         "tree": "b".repeat(40),
         "version": "0.1.0+gnew",
@@ -55,8 +65,11 @@ fn signed_manifest(
                 "spawn_worker_sha256": "d".repeat(64)
             }
         }
-    }))
-    .unwrap();
+    });
+    if let Some(variants) = variants {
+        manifest["variants"] = variants;
+    }
+    let bytes = serde_json::to_vec(&manifest).unwrap();
     let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&bytes).to_bytes());
     (bytes, signature, public_key)
 }
@@ -79,6 +92,7 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap();
@@ -93,6 +107,7 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap_err();
@@ -113,6 +128,7 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap_err();
@@ -130,6 +146,7 @@ fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatur
             public_keys: &[&wrong_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap_err();
@@ -151,6 +168,7 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap_err();
@@ -174,6 +192,7 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap_err();
@@ -193,6 +212,7 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: true,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap();
@@ -209,6 +229,7 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap();
@@ -223,6 +244,7 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
             public_keys: &[],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap();
@@ -238,6 +260,7 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap_err();
@@ -248,10 +271,33 @@ fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
 }
 
 #[test]
-fn worker_mismatch_bypasses_only_same_tree_idempotence() {
-    assert!(same_tree_is_current("tree", "tree", false));
-    assert!(!same_tree_is_current("tree", "tree", true));
-    assert!(!same_tree_is_current("new", "old", false));
+fn worker_mismatch_and_a_variant_switch_bypass_same_tree_idempotence() {
+    use ReleaseVariant::{Diagnostics, Release};
+    assert!(release_is_current("tree", "tree", false, Release, Release));
+    assert!(release_is_current(
+        "tree",
+        "tree",
+        false,
+        Diagnostics,
+        Diagnostics
+    ));
+    assert!(!release_is_current("tree", "tree", true, Release, Release));
+    assert!(!release_is_current("new", "old", false, Release, Release));
+    // Told to follow the other variant, the same tree is an update to do.
+    assert!(!release_is_current(
+        "tree",
+        "tree",
+        false,
+        Release,
+        Diagnostics
+    ));
+    assert!(!release_is_current(
+        "tree",
+        "tree",
+        false,
+        Diagnostics,
+        Release
+    ));
 }
 
 #[test]
@@ -413,6 +459,7 @@ fn precondition_reasons_are_short_stable_classes() {
             Some(daemon.clone()),
             Some(worker.clone()),
             Some("darwin-aarch64"),
+            Ok(ReleaseVariant::Release),
             writable,
         )
         .unwrap_err(),
@@ -424,6 +471,7 @@ fn precondition_reasons_are_short_stable_classes() {
             None,
             Some(worker.clone()),
             Some("darwin-aarch64"),
+            Ok(ReleaseVariant::Release),
             writable,
         )
         .unwrap_err(),
@@ -435,6 +483,7 @@ fn precondition_reasons_are_short_stable_classes() {
             Some(daemon.clone()),
             None,
             Some("darwin-aarch64"),
+            Ok(ReleaseVariant::Release),
             writable,
         )
         .unwrap_err(),
@@ -446,6 +495,7 @@ fn precondition_reasons_are_short_stable_classes() {
             Some(daemon.clone()),
             Some(worker.clone()),
             None,
+            Ok(ReleaseVariant::Release),
             writable,
         )
         .unwrap_err(),
@@ -454,9 +504,35 @@ fn precondition_reasons_are_short_stable_classes() {
     assert_eq!(
         classify_preconditions(
             false,
+            Some(daemon.clone()),
+            Some(worker.clone()),
+            Some("darwin-aarch64"),
+            Err(BlockReason::InvalidVariant),
+            writable,
+        )
+        .unwrap_err(),
+        BlockReason::InvalidVariant
+    );
+    assert_eq!(
+        classify_preconditions(
+            false,
+            Some(daemon.clone()),
+            Some(worker.clone()),
+            Some("darwin-aarch64"),
+            Ok(ReleaseVariant::Diagnostics),
+            writable,
+        )
+        .unwrap()
+        .variant,
+        ReleaseVariant::Diagnostics
+    );
+    assert_eq!(
+        classify_preconditions(
+            false,
             Some(daemon),
             Some(worker),
             Some("darwin-aarch64"),
+            Ok(ReleaseVariant::Release),
             |_| false,
         )
         .unwrap_err(),
@@ -469,6 +545,297 @@ fn precondition_reasons_are_short_stable_classes() {
         "unsupported_target"
     );
     assert_eq!(BlockReason::WorkerMissing.as_str(), "worker_missing");
+    assert_eq!(BlockReason::InvalidVariant.as_str(), "invalid_variant");
+}
+
+#[test]
+fn variant_selection_defaults_to_the_own_build_and_honours_the_override() {
+    use ReleaseVariant::{Diagnostics, Release};
+    for own in [Release, Diagnostics] {
+        assert_eq!(configured_variant_from(None, own), Ok(own));
+        assert_eq!(configured_variant_from(Some(OsStr::new("")), own), Ok(own));
+        assert_eq!(
+            configured_variant_from(Some(OsStr::new("  ")), own),
+            Ok(own)
+        );
+        assert_eq!(
+            configured_variant_from(Some(OsStr::new("release")), own),
+            Ok(Release)
+        );
+        assert_eq!(
+            configured_variant_from(Some(OsStr::new(" diagnostics\n")), own),
+            Ok(Diagnostics)
+        );
+        for bogus in [
+            "debug",
+            "Diagnostics",
+            "DIAGNOSTICS",
+            "diagnostic",
+            "release,diagnostics",
+        ] {
+            assert_eq!(
+                configured_variant_from(Some(OsStr::new(bogus)), own),
+                Err(BlockReason::InvalidVariant),
+                "{bogus:?} must not select a variant"
+            );
+        }
+    }
+    // The build decides the default, so a diagnostics binary keeps following
+    // diagnostics with nothing set, and a release binary never picks it up.
+    assert_eq!(
+        ReleaseVariant::own(),
+        if crate::version::DIAGNOSTICS_BUILD {
+            Diagnostics
+        } else {
+            Release
+        }
+    );
+    assert_eq!(Release.as_str(), "release");
+    assert_eq!(Diagnostics.as_str(), "diagnostics");
+    assert_eq!(
+        variant_install_path("spawnd", "linux-x86_64", Diagnostics),
+        "/api/install/spawnd/linux-x86_64/diagnostics"
+    );
+    let server = Url::parse("https://example.test/").unwrap();
+    assert!(join_install_url(
+        &server,
+        &variant_install_path("spawn-worker", "linux-x86_64", Diagnostics)
+    )
+    .is_ok());
+}
+
+fn variants_block(target: &str) -> serde_json::Value {
+    serde_json::json!({
+        "diagnostics": {
+            "version": "0.1.0+gnew.diagnostics",
+            "targets": {
+                target: {
+                    "spawnd_sha256": "e".repeat(64),
+                    "spawn_worker_sha256": "f".repeat(64)
+                }
+            }
+        }
+    })
+}
+
+fn release_policy<'a>(public_key: &'a str, variant: ReleaseVariant) -> VerifyPolicy<'a> {
+    // Borrowed through a leaked one-element slice so the policy can outlive
+    // this helper; the tests are the only caller and the leak is bytes.
+    let keys: &'a [&'a str] = Box::leak(Box::new([public_key]));
+    VerifyPolicy {
+        allow_unsigned: false,
+        public_keys: keys,
+        build_counter: Some(1_000),
+        downgrade_authorized: false,
+        variant,
+    }
+}
+
+#[test]
+fn a_manifest_carrying_variants_still_verifies_and_resolves_the_release_pair() {
+    // What every release daemon in the field sees the moment the first
+    // manifest with a `variants` map is published: it must verify and it
+    // must resolve to exactly the release artifacts the server named.
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let request = manifest_request();
+    let expected = UpdatePlan {
+        version: request.version.clone(),
+        spawnd: request.spawnd.clone(),
+        spawn_worker: request.spawn_worker.clone(),
+    };
+    for variants in [
+        variants_block("darwin-aarch64"),
+        serde_json::json!({}),
+        serde_json::Value::Null,
+        serde_json::json!("not even an object"),
+        serde_json::json!({"diagnostics": "malformed"}),
+        serde_json::json!({"future-variant": {"shape": ["unknown"]}}),
+    ] {
+        let (manifest, signature, public_key) =
+            signed_manifest_with(&key, 2_000, Some(variants.clone()));
+        let plan = verify_manifest_bytes(
+            &manifest,
+            Some(signature.as_bytes()),
+            &request,
+            "darwin-aarch64",
+            &release_policy(&public_key, ReleaseVariant::Release),
+        )
+        .unwrap_or_else(|failure| panic!("variants {variants} broke the release path: {failure}"));
+        assert_eq!(plan, expected);
+    }
+}
+
+#[test]
+fn the_diagnostics_variant_installs_its_own_pair_from_the_signed_manifest() {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let request = manifest_request();
+    let (manifest, signature, public_key) =
+        signed_manifest_with(&key, 2_000, Some(variants_block("darwin-aarch64")));
+    let plan = verify_manifest_bytes(
+        &manifest,
+        Some(signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+    )
+    .unwrap();
+    assert_eq!(
+        plan,
+        UpdatePlan {
+            version: "0.1.0+gnew.diagnostics".into(),
+            spawnd: DaemonUpdateArtifact {
+                path: "/api/install/spawnd/darwin-aarch64/diagnostics".into(),
+                sha256: "e".repeat(64),
+            },
+            spawn_worker: DaemonUpdateArtifact {
+                path: "/api/install/spawn-worker/darwin-aarch64/diagnostics".into(),
+                sha256: "f".repeat(64),
+            },
+        }
+    );
+    // The release pair the server named is never what a diagnostics daemon
+    // installs, even though it had to match the manifest to get this far.
+    assert_ne!(plan.spawnd.sha256, request.spawnd.sha256);
+    assert_ne!(plan.spawn_worker.sha256, request.spawn_worker.sha256);
+
+    // The server's claim is still held to the signed release: a tree or a
+    // release hash that disagrees with the manifest is refused before any
+    // variant is looked at.
+    let mut lying = request.clone();
+    lying.spawnd.sha256 = "1".repeat(64);
+    let failure = verify_manifest_bytes(
+        &manifest,
+        Some(signature.as_bytes()),
+        &lying,
+        "darwin-aarch64",
+        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, "manifest_mismatch");
+}
+
+#[test]
+fn the_diagnostics_variant_refuses_a_manifest_without_its_pair() {
+    // A diagnostics host whose release has no diagnostics build for its
+    // target keeps the build it has. Falling back to the release pair here
+    // would silently turn it back into a release host.
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let request = manifest_request();
+    let unavailable = [
+        None,
+        Some(serde_json::json!({})),
+        Some(serde_json::Value::Null),
+        Some(variants_block("linux-x86_64")),
+        Some(serde_json::json!({"release": {"version": "x", "targets": {}}})),
+    ];
+    for variants in unavailable {
+        let (manifest, signature, public_key) = signed_manifest_with(&key, 2_000, variants.clone());
+        let failure = verify_manifest_bytes(
+            &manifest,
+            Some(signature.as_bytes()),
+            &request,
+            "darwin-aarch64",
+            &release_policy(&public_key, ReleaseVariant::Diagnostics),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (failure.stage, failure.error),
+            (UpdateStage::Verify, "variant_unavailable"),
+            "variants {variants:?}"
+        );
+    }
+    let malformed = [
+        serde_json::json!({"diagnostics": "malformed"}),
+        serde_json::json!({"diagnostics": {"targets": {"darwin-aarch64": {
+            "spawnd_sha256": "e".repeat(64), "spawn_worker_sha256": "f".repeat(64)}}}}),
+        serde_json::json!({"diagnostics": {"version": "", "targets": {"darwin-aarch64": {
+            "spawnd_sha256": "e".repeat(64), "spawn_worker_sha256": "f".repeat(64)}}}}),
+        serde_json::json!({"diagnostics": {"version": "0.1.0+gnew.diagnostics", "targets": {
+            "darwin-aarch64": {"spawnd_sha256": "short", "spawn_worker_sha256": "f".repeat(64)}}}}),
+    ];
+    for variants in malformed {
+        let (manifest, signature, public_key) =
+            signed_manifest_with(&key, 2_000, Some(variants.clone()));
+        let failure = verify_manifest_bytes(
+            &manifest,
+            Some(signature.as_bytes()),
+            &request,
+            "darwin-aarch64",
+            &release_policy(&public_key, ReleaseVariant::Diagnostics),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (failure.stage, failure.error),
+            (UpdateStage::Verify, "manifest_mismatch"),
+            "variants {variants}"
+        );
+    }
+}
+
+#[test]
+fn the_signature_covers_the_variant_hashes_and_the_counter_still_applies() {
+    use ed25519_dalek::Signer;
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let request = manifest_request();
+    let (manifest, signature, public_key) =
+        signed_manifest_with(&key, 2_000, Some(variants_block("darwin-aarch64")));
+
+    // Alter one byte of the diagnostics spawnd hash after signing: the
+    // signature no longer verifies, for either variant, so a variant hash is
+    // no less protected than a release one.
+    let text = std::str::from_utf8(&manifest).unwrap();
+    let tampered = text.replacen(&"e".repeat(64), &format!("d{}", "e".repeat(63)), 1);
+    assert_ne!(tampered, text);
+    for variant in [ReleaseVariant::Release, ReleaseVariant::Diagnostics] {
+        let failure = verify_manifest_bytes(
+            tampered.as_bytes(),
+            Some(signature.as_bytes()),
+            &request,
+            "darwin-aarch64",
+            &release_policy(&public_key, variant),
+        )
+        .unwrap_err();
+        assert_eq!(failure.error, "manifest_bad_signature");
+    }
+    // Re-signed by the release key, the altered hash is what gets installed:
+    // the variant pair is exactly as trusted as the signature, no more.
+    let resigned = URL_SAFE_NO_PAD.encode(key.sign(tampered.as_bytes()).to_bytes());
+    let plan = verify_manifest_bytes(
+        tampered.as_bytes(),
+        Some(resigned.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+    )
+    .unwrap();
+    assert_eq!(plan.spawnd.sha256, format!("d{}", "e".repeat(63)));
+
+    // The monotonic counter guards the variant path unchanged.
+    let (older, older_signature, _) =
+        signed_manifest_with(&key, 500, Some(variants_block("darwin-aarch64")));
+    let failure = verify_manifest_bytes(
+        &older,
+        Some(older_signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (failure.stage, failure.error),
+        (UpdateStage::Precondition, "downgrade")
+    );
+    // And an unsigned manifest is refused before its variants are read.
+    let failure = verify_manifest_bytes(
+        &manifest,
+        None,
+        &request,
+        "darwin-aarch64",
+        &release_policy(&public_key, ReleaseVariant::Diagnostics),
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, "manifest_unsigned");
 }
 
 #[test]
@@ -559,6 +926,7 @@ fn signed_manifest_accepts_the_windows_target_and_rejects_target_substitution() 
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap();
@@ -572,6 +940,7 @@ fn signed_manifest_accepts_the_windows_target_and_rejects_target_substitution() 
             public_keys: &[&public_key],
             build_counter: Some(1_000),
             downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
         },
     )
     .unwrap_err();
