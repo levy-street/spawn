@@ -21,6 +21,22 @@ PREBUILT_TARGETS=(
 # launches; that is what makes the promise real rather than aspirational.
 PREBUILT_REQUIRED_TARGETS=()
 
+# Alternative builds of the same release: cut from the same tree at the same
+# counter, published beside the release pair under a suffixed asset name
+# (`spawnd-<triple>.<variant>`, `.exe` last on Windows), served from
+# `prebuilt/<target>/<variant>/`, and listed in the signed manifest under
+# `variants`. A daemon follows the variant it was built as, so a host that
+# runs one keeps running it across updates. Today there is one, `diagnostics`:
+# release codegen with symbols kept and debug logging on by default. See
+# "The diagnostics variant" in docs/RELEASE.md.
+PREBUILT_VARIANTS=(diagnostics)
+
+# variant:public-target pairs a release may never silently lose. dream runs
+# the diagnostics variant permanently, and a release without its build for
+# that target would strand it on whatever it last installed — loudly, since
+# the daemon refuses the release pair with `variant_unavailable`, but stranded.
+PREBUILT_REQUIRED_VARIANT_TARGETS=("diagnostics:linux-x86_64")
+
 prebuilt_binary_suffix() { # public-target
   if [[ "$1" == windows-* ]]; then
     printf '%s\n' ".exe"
@@ -33,8 +49,38 @@ prebuilt_asset_name() { # public-target, rust-triple, kind
   printf '%s-%s%s\n' "$3" "$2" "$(prebuilt_binary_suffix "$1")"
 }
 
+prebuilt_variant_asset_name() { # public-target, rust-triple, kind, variant
+  printf '%s-%s.%s%s\n' "$3" "$2" "$4" "$(prebuilt_binary_suffix "$1")"
+}
+
 prebuilt_installed_name() { # public-target, kind
   printf '%s%s\n' "$2" "$(prebuilt_binary_suffix "$1")"
+}
+
+prebuilt_variant_is_known() { # variant
+  local known
+  for known in "${PREBUILT_VARIANTS[@]}"; do
+    [[ "$1" == "$known" ]] && return 0
+  done
+  return 1
+}
+
+prebuilt_variant_target_is_required() { # variant, public-target
+  local required
+  [[ "${#PREBUILT_REQUIRED_VARIANT_TARGETS[@]}" -eq 0 ]] && return 1
+  for required in "${PREBUILT_REQUIRED_VARIANT_TARGETS[@]}"; do
+    [[ "$1:$2" == "$required" ]] && return 0
+  done
+  return 1
+}
+
+# The version a variant binary reports: the release version with the variant
+# as one more build-metadata segment, exactly as daemon/build.rs stamps it.
+# The manifest carries it and the updater refuses a binary that says
+# anything else, so the workflow proves the built binary agrees before it is
+# published.
+prebuilt_variant_version() { # release-version, variant
+  printf '%s.%s\n' "$1" "$2"
 }
 
 prebuilt_file_mode() { # public-target; payloads are read by the Linux API host
@@ -252,7 +298,21 @@ print("\n".join(found))
 PY
 }
 
-# Each remaining argument is target:spawnd_sha256:spawn_worker_sha256.
+prebuilt_target_is_known() { # public-target
+  case "$1" in
+    darwin-aarch64|darwin-x86_64|linux-x86_64|linux-aarch64|windows-x86_64) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Each remaining argument is one pair: target:spawnd_sha256:spawn_worker_sha256
+# for the release, or variant:target:spawnd_sha256:spawn_worker_sha256 for a
+# variant build. The variant entries land under `variants`, keyed by variant,
+# each with the version that build reports and its own per-target hashes. A
+# variant may only name a target whose release pair is also listed — they are
+# one tree and one counter, and the daemon holds the server's claim to the
+# release hashes before it reads a variant. At least one release pair is
+# required; `variants` is always present, empty when nothing was built.
 render_prebuilt_manifest() {
   local commit="$1"
   local tree="$2"
@@ -269,6 +329,48 @@ render_prebuilt_manifest() {
   is_lower_hex "$signing_key_id" 8 || return 1
   [[ "$#" -gt 0 ]] || return 1
 
+  # Validate everything before printing anything, so a bad entry produces no
+  # partial manifest on stdout.
+  local entry first second third fourth
+  local release_targets=() release_lines=()
+  local variant_names=() variant_lines=()
+  local target spawnd_sha worker_sha variant
+  for entry in "$@"; do
+    IFS=: read -r first second third fourth <<< "$entry"
+    if [[ -z "$fourth" ]]; then
+      target="$first"
+      spawnd_sha="$second"
+      worker_sha="$third"
+      prebuilt_target_is_known "$target" || return 1
+      is_lower_hex "$spawnd_sha" 64 || return 1
+      is_lower_hex "$worker_sha" 64 || return 1
+      release_targets+=("$target")
+      release_lines+=("$(printf '"%s": {"spawnd_sha256": "%s", "spawn_worker_sha256": "%s"}' \
+        "$target" "$spawnd_sha" "$worker_sha")")
+    fi
+  done
+  [[ "${#release_targets[@]}" -gt 0 ]] || return 1
+  for entry in "$@"; do
+    IFS=: read -r first second third fourth <<< "$entry"
+    [[ -n "$fourth" ]] || continue
+    variant="$first"
+    target="$second"
+    spawnd_sha="$third"
+    worker_sha="$fourth"
+    prebuilt_variant_is_known "$variant" || return 1
+    prebuilt_target_is_known "$target" || return 1
+    is_lower_hex "$spawnd_sha" 64 || return 1
+    is_lower_hex "$worker_sha" 64 || return 1
+    local has_release=0 listed
+    for listed in "${release_targets[@]}"; do
+      [[ "$listed" == "$target" ]] && has_release=1
+    done
+    [[ "$has_release" == "1" ]] || return 1
+    variant_names+=("$variant")
+    variant_lines+=("$(printf '%s|"%s": {"spawnd_sha256": "%s", "spawn_worker_sha256": "%s"}' \
+      "$variant" "$target" "$spawnd_sha" "$worker_sha")")
+  done
+
   printf '{\n'
   printf '  "commit": "%s",\n' "$commit"
   printf '  "tree": "%s",\n' "$tree"
@@ -276,21 +378,39 @@ render_prebuilt_manifest() {
   printf '  "release_counter": %s,\n' "$release_counter"
   printf '  "signing_key_id": "%s",\n' "$signing_key_id"
   printf '  "targets": {\n'
-
-  local entry target spawnd_sha worker_sha separator=""
-  for entry in "$@"; do
-    IFS=: read -r target spawnd_sha worker_sha <<< "$entry"
-    case "$target" in
-      darwin-aarch64|darwin-x86_64|linux-x86_64|linux-aarch64|windows-x86_64) ;;
-      *) return 1 ;;
-    esac
-    is_lower_hex "$spawnd_sha" 64 || return 1
-    is_lower_hex "$worker_sha" 64 || return 1
-    printf '%s    "%s": {"spawnd_sha256": "%s", "spawn_worker_sha256": "%s"}' \
-      "$separator" "$target" "$spawnd_sha" "$worker_sha"
+  local line separator=""
+  for line in "${release_lines[@]}"; do
+    printf '%s    %s' "$separator" "$line"
     separator=$',\n'
   done
-  printf '\n  }\n'
+  printf '\n  },\n'
+  printf '  "variants": {'
+  if [[ "${#variant_names[@]}" -eq 0 ]]; then
+    printf '}\n'
+  else
+    printf '\n'
+    local variant_separator=""
+    for variant in "${PREBUILT_VARIANTS[@]}"; do
+      local present=0 name
+      for name in "${variant_names[@]}"; do
+        [[ "$name" == "$variant" ]] && present=1
+      done
+      [[ "$present" == "1" ]] || continue
+      printf '%s    "%s": {\n' "$variant_separator" "$variant"
+      printf '      "version": "%s",\n' "$(prebuilt_variant_version "$version" "$variant")"
+      printf '      "targets": {\n'
+      separator=""
+      for line in "${variant_lines[@]}"; do
+        [[ "${line%%|*}" == "$variant" ]] || continue
+        printf '%s        %s' "$separator" "${line#*|}"
+        separator=$',\n'
+      done
+      printf '\n      }\n'
+      printf '    }'
+      variant_separator=$',\n'
+    done
+    printf '\n  }\n'
+  fi
   printf '}\n'
 }
 
@@ -468,6 +588,41 @@ prepare_prebuilt_release() {
     return
   fi
 
+  # The variant pairs, gathered the same way. A variant is only ever cut
+  # beside its release pair, so one without it means a release assembled by
+  # hand from mismatched runs, and that is refused rather than published.
+  local variant listed has_release
+  for variant in "${PREBUILT_VARIANTS[@]}"; do
+    for pair in "${PREBUILT_TARGETS[@]}"; do
+      target="${pair%%:*}"
+      triple="${pair##*:}"
+      spawnd_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawnd "$variant")"
+      worker_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawn-worker "$variant")"
+      if [[ ! -f "$prebuilt_tmp/$spawnd_asset" || ! -f "$prebuilt_tmp/$worker_asset" ]]; then
+        if prebuilt_variant_target_is_required "$variant" "$target"; then
+          prebuilt_reason="prebuilt-latest lacks the required $variant variant pair for $target"
+          return
+        fi
+        continue
+      fi
+      has_release=0
+      for listed in "${prebuilt_entries[@]}"; do
+        [[ "${listed%%:*}" == "$target" ]] && has_release=1
+      done
+      if [[ "$has_release" != "1" ]]; then
+        prebuilt_reason="prebuilt-latest has a $variant variant pair for $target but no release pair"
+        return
+      fi
+      spawnd_sha="$(checksum_for_asset "$prebuilt_tmp" "$spawnd_asset")"
+      worker_sha="$(checksum_for_asset "$prebuilt_tmp" "$worker_asset")"
+      if ! is_lower_hex "$spawnd_sha" 64 || ! is_lower_hex "$worker_sha" 64; then
+        prebuilt_reason="SHA256SUMS lacks a valid checksum for the $variant variant of $target"
+        return
+      fi
+      prebuilt_variant_entries+=("$variant:$target:$spawnd_sha:$worker_sha")
+    done
+  done
+
   prebuilt_ready=1
   prebuilt_reason="verified"
 }
@@ -511,11 +666,85 @@ PY
   grep -q "\"signing_key_id\": \"$key_id\"" <<< "$manifest" || return 1
   grep -q '"spawn_worker_sha256": "bbbbbbbb' <<< "$manifest" || return 1
   grep -q '"windows-x86_64"' <<< "$manifest" || return 1
+  # `variants` is always present, and empty when nothing was built.
+  python3 - "$manifest_file" <<'PY' || return 1
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+assert manifest["variants"] == {}, manifest["variants"]
+assert set(manifest["targets"]) == {"darwin-aarch64", "windows-x86_64"}
+PY
+
+  # The variant entries: the version the diagnostics binary reports, its own
+  # hashes under its own targets, and the release pair untouched beside it.
+  local diag_spawnd="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  local diag_worker="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  local variant_manifest_file="$tmp/manifest-variants.json"
+  render_prebuilt_manifest \
+    "$commit" "$tree" "0.1.0+g111111111111" 1700000000 "$key_id" \
+    "linux-x86_64:$spawnd_sha:$worker_sha" \
+    "darwin-aarch64:$spawnd_sha:$worker_sha" \
+    "diagnostics:linux-x86_64:$diag_spawnd:$diag_worker" > "$variant_manifest_file" || return 1
+  python3 - "$variant_manifest_file" "$spawnd_sha" "$worker_sha" "$diag_spawnd" "$diag_worker" \
+    <<'PY' || return 1
+import json
+import sys
+
+path, spawnd_sha, worker_sha, diag_spawnd, diag_worker = sys.argv[1:]
+manifest = json.load(open(path, encoding="utf-8"))
+assert list(manifest) == [
+    "commit", "tree", "version", "release_counter", "signing_key_id", "targets", "variants"
+], list(manifest)
+assert manifest["targets"] == {
+    "linux-x86_64": {"spawnd_sha256": spawnd_sha, "spawn_worker_sha256": worker_sha},
+    "darwin-aarch64": {"spawnd_sha256": spawnd_sha, "spawn_worker_sha256": worker_sha},
+}, manifest["targets"]
+assert manifest["variants"] == {
+    "diagnostics": {
+        "version": "0.1.0+g111111111111.diagnostics",
+        "targets": {
+            "linux-x86_64": {"spawnd_sha256": diag_spawnd, "spawn_worker_sha256": diag_worker}
+        },
+    }
+}, manifest["variants"]
+PY
+  # A variant needs its release pair, a known name, and valid hashes; a
+  # refusal prints nothing rather than half a manifest.
+  local refused
+  for refused in \
+    "diagnostics:darwin-x86_64:$diag_spawnd:$diag_worker" \
+    "debug:linux-x86_64:$diag_spawnd:$diag_worker" \
+    "diagnostics:linux-x86_64:short:$diag_worker" \
+    "diagnostics:linux-x86_64:$diag_spawnd:$diag_worker:extra"; do
+    if render_prebuilt_manifest \
+      "$commit" "$tree" "0.1.0+g111111111111" 1700000000 "$key_id" \
+      "linux-x86_64:$spawnd_sha:$worker_sha" "$refused" > "$tmp/refused.json" 2>/dev/null; then
+      return 1
+    fi
+    [[ ! -s "$tmp/refused.json" ]] || return 1
+  done
+  # Variants alone are not a release.
+  ! render_prebuilt_manifest \
+    "$commit" "$tree" "0.1.0+g111111111111" 1700000000 "$key_id" \
+    "diagnostics:linux-x86_64:$diag_spawnd:$diag_worker" > /dev/null 2>&1 || return 1
 
   [[ "$(prebuilt_asset_name windows-x86_64 x86_64-pc-windows-msvc spawnd)" == \
     "spawnd-x86_64-pc-windows-msvc.exe" ]] || return 1
   [[ "$(prebuilt_asset_name linux-x86_64 x86_64-unknown-linux-gnu spawn-worker)" == \
     "spawn-worker-x86_64-unknown-linux-gnu" ]] || return 1
+  [[ "$(prebuilt_variant_asset_name linux-x86_64 x86_64-unknown-linux-gnu spawnd diagnostics)" == \
+    "spawnd-x86_64-unknown-linux-gnu.diagnostics" ]] || return 1
+  [[ "$(prebuilt_variant_asset_name windows-x86_64 x86_64-pc-windows-msvc spawn-worker diagnostics)" == \
+    "spawn-worker-x86_64-pc-windows-msvc.diagnostics.exe" ]] || return 1
+  [[ "$(prebuilt_variant_version 0.1.0+g111111111111 diagnostics)" == \
+    "0.1.0+g111111111111.diagnostics" ]] || return 1
+  prebuilt_variant_is_known diagnostics || return 1
+  ! prebuilt_variant_is_known release || return 1
+  ! prebuilt_variant_is_known debug || return 1
+  prebuilt_variant_target_is_required diagnostics linux-x86_64 || return 1
+  ! prebuilt_variant_target_is_required diagnostics darwin-aarch64 || return 1
+  ! prebuilt_variant_target_is_required debug linux-x86_64 || return 1
   [[ "$(prebuilt_installed_name windows-x86_64 spawn-worker)" == \
     "spawn-worker.exe" ]] || return 1
   [[ "$(prebuilt_file_mode windows-x86_64)" == "0644" ]] || return 1
@@ -528,6 +757,15 @@ PY
   sign_prebuilt_manifest "$manifest_file" "$signature_file" "$key" || return 1
   verify_prebuilt_manifest_signature \
     "$manifest_file" "$signature_file" "$public_key" || return 1
+  # The signature covers the variant hashes like everything else: sign the
+  # manifest that carries them, then alter one variant hash byte.
+  sign_prebuilt_manifest "$variant_manifest_file" "$tmp/variants.sig" "$key" || return 1
+  verify_prebuilt_manifest_signature \
+    "$variant_manifest_file" "$tmp/variants.sig" "$public_key" || return 1
+  sed 's/cccccccccccccccc/ccccccccccccccce/' "$variant_manifest_file" > "$tmp/variants-flipped.json"
+  ! cmp -s "$variant_manifest_file" "$tmp/variants-flipped.json" || return 1
+  ! verify_prebuilt_manifest_signature \
+    "$tmp/variants-flipped.json" "$tmp/variants.sig" "$public_key" || return 1
   flipped_file="$tmp/manifest-flipped.json"
   python3 - "$manifest_file" "$flipped_file" <<'PY' || return 1
 import sys
