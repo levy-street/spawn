@@ -5049,6 +5049,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let first_ufrag = ice_ufrag(&client.pc.local_description().await.unwrap().sdp).unwrap();
+        let daemon_first_ufrag =
+            ice_ufrag(&daemon_pc.local_description().await.unwrap().sdp).unwrap();
 
         let offer = client
             .pc
@@ -5087,6 +5089,9 @@ mod tests {
             )
             .await;
 
+        // A candidate the daemon re-gathers may reach the wire before its
+        // answer does; hold those until the answer is applied.
+        let mut early_candidates = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let outbound = tokio::time::timeout_at(deadline, out_rx.recv())
@@ -5097,12 +5102,28 @@ mod tests {
             match value["type"].as_str() {
                 Some("rtc.answer") => {
                     let sdp = value["sdp"].as_str().expect("answer SDP").to_string();
+                    // The answerer restarted its own agent, not merely accepted
+                    // new remote credentials: its ufrag is fresh too.
+                    assert_ne!(
+                        ice_ufrag(&sdp).unwrap(),
+                        daemon_first_ufrag,
+                        "the daemon answered the restart with its old ufrag"
+                    );
                     client
                         .pc
                         .set_remote_description(RTCSessionDescription::answer(sdp).unwrap())
                         .await
                         .unwrap();
+                    for candidate in early_candidates.drain(..) {
+                        let _ = client.pc.add_ice_candidate(candidate).await;
+                    }
                     break;
+                }
+                Some("rtc.candidate") => {
+                    early_candidates.push(
+                        serde_json::from_value::<RTCIceCandidateInit>(value["candidate"].clone())
+                            .unwrap(),
+                    );
                 }
                 Some("rtc.status") if value["status"] == "failed" => {
                     panic!("the daemon refused the restart offer: {value}");

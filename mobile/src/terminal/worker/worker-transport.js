@@ -147,7 +147,9 @@
           "ICE restart",
           cause === "network changed"
             ? "The network changed and the terminal connection could not be restored."
-            : "The host connection was lost and could not be restored.",
+            : cause === "credential refresh"
+              ? "The relay credentials were refreshed and the terminal connection could not be restored."
+              : "The host connection was lost and could not be restored.",
         );
         return;
       }

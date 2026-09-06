@@ -97,8 +97,11 @@ credential loses its relay allocation at the cliff and every relayed pane on
 it drops. Browsers and phones now refresh the terminal's credential an hour
 before expiry with a non-disruptive ICE restart on the same peer connection
 (the host control channel — files, the launcher — still refreshes only when
-it restarts for another reason, and drops at its cliff; that is a
-follow-up). The daemon cannot —
+it rebuilds for another reason, and drops at its cliff; that is a
+follow-up). The restart is only accepted from a signed offer: the daemon
+pins a peer to the key that offered it and refuses a restart without one, so
+on a deployment that still allows raw, unpinned signalling the refresh falls
+back to the rebuild the failure paths already do. The daemon cannot —
 webrtc-rs builds its ICE agent once, from the servers in the first offer,
 and a restart re-gathers with those same credentials — so its own relay
 allocation still dies at its cliff: a pair that runs through the browser's
