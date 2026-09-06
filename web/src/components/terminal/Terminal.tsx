@@ -698,7 +698,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // active, and 2J/3J leave both in force, so the history written next
       // would scroll inside that region, or map to box glyphs, and never
       // reach scrollback intact (#58). The daemon's own baseline, minus SGR
-      // and cursor, which the screen chunk restores itself.
+      // and cursor, which the screen chunk restores itself, and minus the
+      // G2/G3 return, which the replay head carries (#61).
       predictorRef.current.clear();
       const ops: SequencedWrite[] = [
         { data: "\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?7h\x1b[H\x1b[2J\x1b[3J" },

@@ -1309,8 +1309,42 @@ mod tests {
         assert_eq!(e.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G1]);
         e.feed(b"\x1b[?1049l");
         assert!(!e.shadow.alt);
+        // Leaving touches neither register: the alt one is kept for a return
+        // (alacritty's alt grid and xterm.js's alt buffer both keep theirs),
+        // and the primary's still holds the shift saved at entry.
+        assert_eq!(e.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G1]);
         e.feed(b"\x1bc"); // RIS
         assert_eq!(e.shadow, Shadow::new(4));
+    }
+
+    #[test]
+    fn registers_survive_leaving_the_alt_screen() {
+        // The alt register saved under SO, kept across leaving and
+        // re-entering; and the primary register `?1049h` saved under SO,
+        // restored after the app left. Leaving the alternate screen must
+        // rewrite neither shift, or the checkpoint rebuilds the register
+        // under the wrong one for a consumer whose register holds the table.
+        let (mut a, mut b) = round_trip(
+            20,
+            4,
+            b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x0f\x1b[?1049l\x1b[?1049h\x1b[H",
+        );
+        assert_eq!(a.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G1]);
+        assert_same_state(&a, &b, "alt register kept across a leave and return");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "x", "{:?}", b.screen_text());
+
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b)0\x0e\x1b[?1049h\x1b[H\x0fx\x1b[?1049l");
+        assert_eq!(a.shadow.saved_shift, [CharsetIndex::G1, CharsetIndex::G0]);
+        assert_same_state(&a, &b, "primary register saved by the alt entry");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "x", "{:?}", b.screen_text());
     }
 
     #[test]
@@ -1558,6 +1592,43 @@ mod tests {
             assert_eq!(a.screen_text()[0], expected, "emulator: {app:?}");
             let rows = real_xterm_rows(&xterm, 20, 4, &[&checkpoint, after]);
             assert_eq!(rows[1][0], expected, "xterm after {app:?}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn real_xterm_restores_its_own_register_where_the_emulator_differs() {
+        // Where the two DECRC models diverge natively — xterm.js restores the
+        // table active at DECSC, alacritty restores designations under the
+        // current shift — the checkpoint gives xterm.js what its own register
+        // held: the alt register saved under SO and kept across leaving and
+        // re-entering, and the primary register `?1049h` saved under SO and
+        // restored after the app left. The emulator renders these its own
+        // way; the consumer must render them native xterm.js's way.
+        let Some(xterm) = xterm_js() else { return };
+        let cases: [(&[u8], &[u8]); 2] = [
+            (
+                b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x0f\x1b[?1049l\x1b[?1049h\x1b[H",
+                b"\x1b8x",
+            ),
+            (b"\x1b)0\x0e\x1b[?1049h\x1b[H\x0fx\x1b[?1049l", b"\x1b8x"),
+        ];
+        for (app, after) in cases {
+            let mut a = Emulator::new(20, 4);
+            a.feed(app);
+            let checkpoint = a.serialize();
+            a.feed(after);
+            assert_eq!(
+                a.screen_text()[0],
+                "x",
+                "emulator, alacritty's DECRC: {app:?}"
+            );
+            let native = real_xterm_rows(&xterm, 20, 4, &[app, after]);
+            let replayed = real_xterm_rows(&xterm, 20, 4, &[&checkpoint, after]);
+            assert_eq!(native[1][0], "│", "native xterm.js: {app:?}: {native:?}");
+            assert_eq!(
+                replayed[1][0], native[1][0],
+                "consumer differs from native xterm.js after {app:?}: {replayed:?}"
+            );
         }
     }
 
