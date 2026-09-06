@@ -261,11 +261,55 @@ is not avoidable. Three rules keep it from reading as an app grabbing at things:
 `docs/RELEASE.md` has the release half: which dialogs notarization removes, and
 what it takes for a grant to survive a self-update.
 
+## The diagnostics variant
+
+The same daemon, built with `--features diagnostics` under the
+`[profile.diagnostics]` in `Cargo.toml` (release codegen, symbols kept):
+
+```bash
+cargo build --locked --profile diagnostics --features diagnostics
+```
+
+What the feature changes: `version::DIAGNOSTICS_BUILD` is true, so the
+version gains a `.diagnostics` build-metadata segment
+(`0.1.0+g<commit>.diagnostics`, reported by `--version`, `status`, and the
+register frame), logging starts at `-v` (`spawnd=debug`) with nothing set,
+every attach failure is attributed at warning level, `session_ctl.rs` runs a
+watchdog that names whoever holds a session's control transaction and for how
+long, and `rtc.rs` logs the attach and bootstrap exchange at debug. Setting
+`SPAWND_DIAG_REPLAY_DUMP_DIR` in this variant only also writes the exact
+replay bytes each viewer was sent to that directory — terminal plaintext on
+the host's own disk, opt-in by environment and nowhere else. `RUST_BACKTRACE=1`
+in the unit is what the kept symbols are for.
+
+Delivery is a release variant, not a fork: `.github/workflows/prebuilt.yml`
+builds it beside the release pair for `linux-x86_64`, the signed manifest
+lists it under `variants.diagnostics`, and the server serves it from
+`/api/install/<kind>/<target>/diagnostics`. `update.rs` follows the variant
+the running binary was built as (`ReleaseVariant::own()`), so a diagnostics
+host stays diagnostics across updates with nothing configured and a release
+host never picks it up by accident; `SPAWND_RELEASE_VARIANT=release|diagnostics`
+overrides that in either direction, and any other value blocks self-update
+with `invalid_variant`. A diagnostics daemon whose release carries no
+diagnostics pair for its target refuses the update with `variant_unavailable`
+and keeps running what it has — it never falls back to the release pair.
+"The diagnostics variant" in `docs/RELEASE.md` has the operator's side.
+
 ## Before calling a change done
 
 ```bash
 cargo build --locked
 cargo test --locked --bin spawnd <module>::
+```
+
+Both feature sets are gated, because the variant is a real release build:
+
+```bash
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --features diagnostics -- -D warnings
+cargo test --locked
+cargo test --locked --features diagnostics
+cargo build --locked --profile diagnostics --features diagnostics
 ```
 
 Native Windows CI additionally gates every binary, test/example target, and
@@ -325,6 +369,10 @@ harness builds may set `SPAWND_DAEMON_TREE_OVERRIDE`,
 `SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE`. `SPAWND_ALLOW_UNSIGNED_UPDATE=1` is a
 local-development-only escape hatch that skips the signature and counter
 checks, emits one warning, and must never be used by production tooling.
+Which build of a release is installed — the release pair or a variant such as
+diagnostics — is decided by the daemon from its own build and
+`SPAWND_RELEASE_VARIANT`, never by the server; see "The diagnostics variant"
+above.
 
 The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
 `status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,
