@@ -47,7 +47,7 @@ use zeroize::Zeroize;
 
 use super::emulator::{Emulator, HistoryEvent};
 use super::endpoint;
-use super::scrollback::{geometry_marker, ScrollbackLog, REPLAY_HISTORY_SENTINEL};
+use super::scrollback::{geometry_marker, replay_head, ScrollbackLog};
 use super::secret::{self, SecretBytes};
 use super::wire;
 
@@ -961,18 +961,18 @@ async fn handle_frame(
                 .as_mut()
                 .context("worker replay is unavailable before start")?;
             // Self-describing v2 stream: geometry marker + history sentinel +
-            // committed lines, then geometry marker + synthesized live screen.
-            // The final chunk alone still seeds a live terminal, exactly like
-            // the checkpoint-based format it replaces.
+            // a return to ASCII + committed lines, then geometry marker +
+            // synthesized live screen. The final chunk alone still seeds a
+            // live terminal, exactly like the checkpoint-based format it
+            // replaces.
             let history = active_log.replay(max_bytes as u64)?;
             let screen = emu.serialize();
             let (cols, rows) = emu.geometry();
+            let head = replay_head(cols, rows);
             let marker = geometry_marker(cols, rows);
-            let mut replay = Vec::with_capacity(
-                2 * marker.len() + REPLAY_HISTORY_SENTINEL.len() + history.len() + screen.len(),
-            );
-            replay.extend_from_slice(&marker);
-            replay.extend_from_slice(REPLAY_HISTORY_SENTINEL);
+            let mut replay =
+                Vec::with_capacity(head.len() + history.len() + marker.len() + screen.len());
+            replay.extend_from_slice(&head);
             replay.extend_from_slice(&history);
             replay.extend_from_slice(&marker);
             replay.extend_from_slice(&screen);

@@ -50,7 +50,11 @@ src/
                  commit into it (0.1.0+g<commit>)
 Info.plist       the sentences macOS prints in its consent dialogs; build.rs
                  links it into both binaries' `__TEXT,__info_plist` section
-tests/           integration tests (worker_e2e.rs)
+tests/           integration tests (worker_e2e.rs), and
+                 xterm_checkpoint_proof.js, the headless xterm.js driver the
+                 emulator's unit tests run against the web workspace's
+                 `@xterm/xterm` (`SPAWN_XTERM_JS` overrides the path; it is
+                 skipped where none is installed, and fails under CI)
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
