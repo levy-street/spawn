@@ -337,7 +337,7 @@ certificate table, whatever the file is called.
 
 - [ ] **Firewall + ICE**
   - **Do:** On Private/Public profiles, admin/standard user, accept/deny/dismiss first-listen prompt. As admin run the exact New-NetFirewallRule/Remove-NetFirewallRule commands in docs/RELEASE.md.
-  - **Expect:** No silent installer rule or any-program/Public rule; program-scoped Private UDP 50000–50100 enables direct ICE; removing/blocking still connects through outbound UDP TURN; record actual rules.
+  - **Expect:** No silent installer rule or any-program/Public rule; program-scoped Private UDP 50000–50999 enables direct ICE; removing/blocking still connects through outbound UDP TURN; record actual rules.
   - **Source:** I-dist.md, I-glue.md, RELEASE.md
 
 - [ ] **Managed standard user**

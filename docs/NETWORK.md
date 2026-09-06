@@ -53,16 +53,25 @@ Allow both listener traffic and relay allocations in the host/cloud firewall:
 - The coturn UDP relay range. The default is 49152–65535; if production pins
   `min-port`/`max-port`, open that exact range and keep config and firewall in
   lockstep.
-- UDP 50000–50100 inbound on each daemon machine where LAN/direct WebRTC is
+- UDP 50000–50999 inbound on each daemon machine where LAN/direct WebRTC is
   expected. This is the daemon's ephemeral candidate range, not coturn's relay
   range. Host firewalls may restrict it to trusted LANs when off-LAN traffic
-  can fall back to TURN.
+  can fall back to TURN. The range is also the daemon's session budget: every
+  peer connection binds three sockets for STUN and TURN plus one per
+  interface that carries a host candidate — LAN links and VPN interfaces
+  alike, since a peer on the same VPN reaches the daemon through them — and
+  a peer that finds no free port gathers no candidate at all. A Mac with
+  Wi-Fi and its usual four or five `utun` interfaces spends about eight ports
+  a session. Releases before 2026-09-07 pinned 50000–50100, about a dozen
+  sessions on such a Mac; a firewall rule for the old range still admits the
+  first 101 ports, and peers on the rest fall back to reflexive or relay
+  paths until the rule is widened.
 
 For example, a daemon host using UFW can admit direct candidates from a
 `192.168.1.0/24` LAN with:
 
 ```bash
-sudo ufw allow from 192.168.1.0/24 to any port 50000:50100 proto udp
+sudo ufw allow from 192.168.1.0/24 to any port 50000:50999 proto udp
 ```
 
 Add the equivalent inbound rule to any host or cloud firewall in front of that
@@ -72,7 +81,7 @@ intended.
 ## Windows Firewall
 
 On native Windows, `spawnd.exe` is the only SPAWN D program that binds the
-direct WebRTC candidate range, UDP 50000–50100. The per-user installer neither
+direct WebRTC candidate range, UDP 50000–50999. The per-user installer neither
 elevates nor silently creates a firewall rule. When inbound direct ICE is
 blocked, the daemon can still use ordinary outbound UDP to the configured TURN
 service.
@@ -84,7 +93,7 @@ may add this program-scoped rule for the installed daemon:
 $spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'
 New-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)' `
   -Direction Inbound -Action Allow -Profile Private -Program $spawnd `
-  -Protocol UDP -LocalPort 50000-50100
+  -Protocol UDP -LocalPort 50000-50999
 
 # Uninstall or rollback:
 Remove-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)'

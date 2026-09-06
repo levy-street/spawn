@@ -103,8 +103,19 @@ const MDNS_CANDIDATE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
 const DATA_CHANNEL_MESSAGE_BYTES: usize = 16 * 1024;
 const DATA_CHANNEL_BUFFER_LOW: usize = 64 * 1024;
 const DATA_CHANNEL_BUFFER_HIGH: usize = 512 * 1024;
+/// The UDP range every ICE socket is pinned to, so a host firewall can admit
+/// direct candidates with one rule. It is also the daemon's session budget:
+/// each peer connection binds three wildcard sockets (the STUN and TURN
+/// clients) plus one host-candidate socket per interface
+/// [`interface_is_allowed`] admits — and VPN interfaces are admitted on
+/// purpose, since a peer on the same VPN reaches the daemon through them
+/// without the relay. A peer that finds every port taken gathers nothing at
+/// all — no host, no reflexive, no relay — and never starts ICE. At 101
+/// ports a laptop with Wi-Fi and its four or five tunnel interfaces held
+/// about a dozen sessions before the rest sat at "Connecting" forever
+/// (#80). A thousand ports holds a hundred and more on the same laptop.
 const RTC_UDP_PORT_MIN: u16 = 50_000;
-const RTC_UDP_PORT_MAX: u16 = 50_100;
+const RTC_UDP_PORT_MAX: u16 = 50_999;
 static RTC_NETWORK_POLICY_LOGGED: AtomicBool = AtomicBool::new(false);
 static TURN_UDP_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -3861,6 +3872,13 @@ fn setting_engine() -> Result<SettingEngine> {
     Ok(settings)
 }
 
+/// Which interfaces earn a host candidate, and so a socket per peer from the
+/// pinned range. Container and virtual-machine bridges and Apple's private
+/// link interfaces never carry a peer. VPN interfaces (`utun`, WireGuard,
+/// Tailscale) do: a peer on the same VPN reaches the daemon through them
+/// directly, and `network_policy_drops_link_local_and_virtual_noise_but_keeps_vpns`
+/// pins that. They cost a port per peer each, which is what the range above
+/// is sized for.
 fn interface_is_allowed(name: &str) -> bool {
     ![
         "docker", "br-", "veth", "awdl", "llw", "anpi", "bridge", "vmnet", "virbr", "zt",
@@ -4193,6 +4211,22 @@ mod tests {
         pc.close().await.unwrap();
         drop(pc);
         assert_ports_released(&addrs, "closed and dropped peer").await;
+    }
+
+    /// The range is the session budget (#80): three wildcard sockets per peer
+    /// plus one per admitted interface, and a Mac admits Wi-Fi and four or
+    /// five `utun`s, so about eight ports a session there. The range must
+    /// hold a hundred of those, with room for a second device on the host.
+    #[test]
+    fn the_pinned_range_holds_a_laptop_of_sessions() {
+        let ports = u32::from(RTC_UDP_PORT_MAX - RTC_UDP_PORT_MIN) + 1;
+        assert_eq!(ports, 1_000, "the documented range is 50000–50999");
+        let per_session_on_a_mac = 3 + 5;
+        assert!(
+            ports / per_session_on_a_mac >= 100,
+            "{ports} ports hold {} sessions",
+            ports / per_session_on_a_mac
+        );
     }
 
     async fn assert_ports_released(addrs: &[std::net::SocketAddr], what: &str) {
