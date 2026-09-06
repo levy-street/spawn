@@ -66,6 +66,11 @@ scripts/check-claude-md.sh
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 
+printf '%s\n' "== daemon tests, diagnostics variant =="
+# The variant dream runs is a real release build of the same tree, so a
+# test that only fails with the feature on must not merge green.
+(cd daemon && cargo test --locked --features diagnostics)
+
 printf '%s\n' "== daemon updater end-to-end =="
 scripts/test-update-e2e.sh
 

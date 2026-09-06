@@ -150,6 +150,10 @@ verify_served_binary() { # target, triple, kind, variant ("" for the release pai
       printf '%-34s %-14s %s\n' "$label" "$kind" \
         "FAIL (required asset $asset is not in SHA256SUMS)"
       fail=1
+    elif [[ -n "$variant" ]]; then
+      # A variant is cut for the targets that need it; its absence elsewhere
+      # is the ordinary state, not a row worth printing.
+      :
     else
       printf '%-34s %-14s %s\n' "$label" "$kind" "SKIP (not in release)"
     fi
