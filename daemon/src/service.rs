@@ -596,6 +596,8 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
 }
 
 pub fn user_linger_enabled() -> Option<bool> {
+    // Each cfg block is the whole body on its platform, so neither needs a
+    // `return`; clippy 1.97 flags one as needless.
     #[cfg(target_os = "linux")]
     {
         let user = std::env::var("USER").ok()?;
@@ -603,10 +605,10 @@ pub fn user_linger_enabled() -> Option<bool> {
             .args(["show-user", &user, "-p", "Linger", "--value"])
             .output()
             .ok()?;
-        return output
+        output
             .status
             .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim() == "yes");
+            .then(|| String::from_utf8_lossy(&output.stdout).trim() == "yes")
     }
     #[cfg(not(target_os = "linux"))]
     {
