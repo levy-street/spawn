@@ -178,7 +178,12 @@ fn configured_variant_from(
     let Some(value) = override_value else {
         return Ok(own);
     };
-    let name = value.to_str().map(str::trim).unwrap_or("");
+    // A value that is not even a string is a configuration error, not an
+    // absence: it blocks like any other unknown name rather than quietly
+    // selecting the build's own variant.
+    let Some(name) = value.to_str().map(str::trim) else {
+        return Err(BlockReason::InvalidVariant);
+    };
     if name.is_empty() {
         return Ok(own);
     }

@@ -294,6 +294,9 @@ kill -0 "$UPDATE_DAEMON_PID" 2>/dev/null \
 python3 -c 'import json,sys; h=json.load(sys.stdin); assert h["status"] == "online"' \
   <<<"$(update_test_host_json)"
 # The server pushed the release pair; the daemon must not have fetched it.
+# The manifest fetch proves the access log is there to be searched.
+grep -q "GET /api/install/manifest.json " "$UPDATE_SERVER_LOG" \
+  || update_test_die "the server access log does not show the manifest fetch"
 ! grep -q "GET /api/install/spawnd/$UPDATE_TARGET " "$UPDATE_SERVER_LOG" \
   || update_test_die "the diagnostics daemon downloaded the release pair"
 printf '%s\n' "test-update-e2e: PASS diagnostics daemon refuses the release variant"
@@ -336,6 +339,52 @@ update_test_wait_host "$UPDATE_TREE_A" unsupported "SPAWND_RELEASE_VARIANT" 30 >
 cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
   || update_test_die "an unknown variant name changed the installed daemon"
 printf '%s\n' "test-update-e2e: PASS unsupported: invalid variant"
+update_test_cleanup_fixture
+
+# The switch an operator makes on a host that is already on the current
+# tree: the server has nothing to push (same tree is "current"), so it is
+# `spawnd update` that moves the pair, reading SPAWND_RELEASE_VARIANT from
+# its own environment — not from the unit's. This is the one step a host
+# whose daemon predates the variant-aware updater needs after its first
+# update lands it on the release pair.
+printf '%s\n' "test-update-e2e: the same-tree variant switch through spawnd update"
+update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+update_test_new_fixture variant-same-tree new
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon
+update_test_wait_host "$UPDATE_TREE_B" current "" 30 >/dev/null
+# Without the variable the CLI is current on this tree and touches nothing,
+# whatever the daemon's own environment says.
+update_test_run_update_cli
+grep -q "SPAWN D daemon update not applied (current)." "$UPDATE_DAEMON_LOG" \
+  || update_test_die "spawnd update without a variant did not report current"
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+  || update_test_die "spawnd update without a variant changed the installed daemon"
+update_test_run_update_cli SPAWND_RELEASE_VARIANT=diagnostics
+grep -q "SPAWN D daemon updated. Restart the daemon to run it" "$UPDATE_DAEMON_LOG" \
+  || update_test_die "spawnd update with the variant did not report the swap"
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new-diagnostics/spawnd" \
+  || update_test_die "the same-tree switch did not install the diagnostics daemon"
+cmp -s "$UPDATE_BIN_DIR/spawn-worker" "$UPDATE_ARTIFACTS/new-diagnostics/spawn-worker" \
+  || update_test_die "the same-tree switch did not install the diagnostics worker"
+[[ -e "$UPDATE_BIN_DIR/spawnd.updating" ]] \
+  || update_test_die "the same-tree switch left no probation marker for the restart"
+# No service manager here, so the restart the CLI asks for is ours; the new
+# daemon then registers on the same tree and clears its probation.
+update_test_stop_daemon
+update_test_start_daemon
+update_test_wait_online "$UPDATE_TREE_B"
+[[ "$(installed_version)" == "$UPDATE_VARIANT_VERSION" ]] \
+  || update_test_die "the switched daemon does not report the diagnostics version"
+deadline=$((SECONDS + 30))
+while [[ -e "$UPDATE_BIN_DIR/spawnd.updating" ]] && ((SECONDS < deadline)); do sleep 0.2; done
+[[ ! -e "$UPDATE_BIN_DIR/spawnd.updating" ]] \
+  || update_test_die "probation marker survived the switched daemon's registration"
+[[ ! -e "$UPDATE_BIN_DIR/spawnd.prev" && ! -e "$UPDATE_BIN_DIR/spawn-worker.prev" ]] \
+  || update_test_die "previous pair survived the switched daemon's registration"
+printf '%s\n' "test-update-e2e: PASS same-tree switch via spawnd update"
 update_test_cleanup_fixture
 
 printf 'test-update-e2e: passed in %ss (1 explicit SKIP)\n' "$((SECONDS - started_at))"

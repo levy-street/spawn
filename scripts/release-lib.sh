@@ -741,6 +741,27 @@ PY
     "0.1.0+g111111111111.diagnostics" ]] || return 1
   prebuilt_variant_is_known diagnostics || return 1
   ! prebuilt_variant_is_known release || return 1
+  # The variant names live in three places — this list, the server's
+  # SUPPORTED_DAEMON_VARIANTS, and the daemon's ReleaseVariant::from_name —
+  # and a name the server does not know voids every manifest that carries
+  # it, so a release with a new variant is refused here before it can be
+  # published ahead of the server that would have to serve it.
+  python3 - "$(dirname "${BASH_SOURCE[0]}")/.." "${PREBUILT_VARIANTS[@]}" <<'PY' || return 1
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+lib = set(sys.argv[2:])
+server_source = (root / "server" / "spawn_server" / "release.py").read_text(encoding="utf-8")
+server_match = re.search(r"SUPPORTED_DAEMON_VARIANTS = \((.*?)\)", server_source, re.S)
+server = set(re.findall(r'"([a-z0-9-]+)"', server_match.group(1))) if server_match else set()
+daemon_source = (root / "daemon" / "src" / "update.rs").read_text(encoding="utf-8")
+daemon = set(re.findall(r'"([a-z0-9-]+)" => Some\(Self::', daemon_source)) - {"release"}
+if not (lib == server == daemon):
+    print(f"variant lists disagree: lib={sorted(lib)} server={sorted(server)} daemon={sorted(daemon)}", file=sys.stderr)
+    raise SystemExit(1)
+PY
   ! prebuilt_variant_is_known debug || return 1
   prebuilt_variant_target_is_required diagnostics linux-x86_64 || return 1
   ! prebuilt_variant_target_is_required diagnostics darwin-aarch64 || return 1

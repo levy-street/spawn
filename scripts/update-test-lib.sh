@@ -706,11 +706,25 @@ update_test_start_daemon() {
   shift || true
   [[ -z "$UPDATE_DAEMON_PID" ]] || update_test_die "daemon is already running"
   update_test_require_local_url "$daemon_origin"
+  # From the fixture, never the repo root: the daemon probes `$SHELL -ic`
+  # from its own cwd, and the fake shell writes `.update-shell-ready` there.
   (
-    update_test_exec_daemon_env "$@" \
-      "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
+    cd "$UPDATE_FIXTURE" \
+      && update_test_exec_daemon_env "$@" \
+        "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
   ) >>"$UPDATE_DAEMON_LOG" 2>&1 &
   UPDATE_DAEMON_PID=$!
+}
+
+# Run `spawnd update` against the installed pair as an operator would: the
+# instance's environment plus whatever variables the caller sets, the
+# stored server origin, no service manager. Output lands in the daemon log.
+update_test_run_update_cli() {
+  (
+    cd "$UPDATE_FIXTURE" \
+      && update_test_exec_daemon_env "$@" \
+        "$UPDATE_BIN_DIR/spawnd" update
+  ) >>"$UPDATE_DAEMON_LOG" 2>&1
 }
 
 update_test_start_supervised_daemon() {
@@ -721,8 +735,9 @@ update_test_start_supervised_daemon() {
     trap 'if [[ -s "$UPDATE_DAEMON_CHILD_PID_FILE" ]]; then kill "$(<"$UPDATE_DAEMON_CHILD_PID_FILE")" >/dev/null 2>&1 || true; fi; exit 0' TERM INT
     while :; do
       (
-        update_test_exec_daemon_env \
-          "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
+        cd "$UPDATE_FIXTURE" \
+          && update_test_exec_daemon_env \
+            "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
       ) >>"$UPDATE_DAEMON_LOG" 2>&1 &
       child=$!
       printf '%s\n' "$child" >"$UPDATE_DAEMON_CHILD_PID_FILE"

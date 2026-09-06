@@ -14,8 +14,9 @@ Checks:
   - the signed manifest counter matches the ref commit's committer timestamp
   - every advertised daemon binary hashes to its advertised sha256
   - every variant pair the signed manifest carries is served under
-    /api/install/<kind>/<target>/<variant> with the advertised sha256,
-    reports the variant's version, and the required variant pairs are present
+    /api/install/<kind>/<target>/<variant> with the advertised sha256, is
+    declared with the release version plus its own suffix, and the required
+    variant pairs are present
   - the production Expo manifest carries the ref's mobile/ tree
   - /desktop/latest.json, every artifact signature, and /api/release.desktop match
 

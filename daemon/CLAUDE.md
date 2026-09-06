@@ -290,10 +290,16 @@ the running binary was built as (`ReleaseVariant::own()`), so a diagnostics
 host stays diagnostics across updates with nothing configured and a release
 host never picks it up by accident; `SPAWND_RELEASE_VARIANT=release|diagnostics`
 overrides that in either direction, and any other value blocks self-update
-with `invalid_variant`. A diagnostics daemon whose release carries no
-diagnostics pair for its target refuses the update with `variant_unavailable`
-and keeps running what it has — it never falls back to the release pair.
-"The diagnostics variant" in `docs/RELEASE.md` has the operator's side.
+with `invalid_variant`. The variable is read by whichever process updates:
+the service, for the next release the server pushes, or `spawnd update`, from
+its own shell environment — the daemon never initiates a same-tree switch on
+its own, so moving a host across on the tree it already runs is
+`SPAWND_RELEASE_VARIANT=diagnostics spawnd update`. A diagnostics daemon whose
+release carries no diagnostics pair for its target refuses the update with
+`variant_unavailable` and keeps running what it has — it never falls back to
+the release pair. "The diagnostics variant" in `docs/RELEASE.md` has the
+operator's side, including the one-time step for a daemon built before the
+updater knew about variants.
 
 ## Before calling a change done
 
