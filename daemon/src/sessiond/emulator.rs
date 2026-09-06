@@ -61,8 +61,12 @@
 //! and one taken after the ESC 8 carries the emulator's outcome to both; an
 //! inactive alternate screen's register is not carried, so a consumer
 //! re-entering it and restoring without saving there first restores ASCII
-//! at home; and G2/G3 are designated but never made active, since this
-//! profile emits no locking shift to them.
+//! at home; xterm.js keeps one set of designations across `?1049l` where
+//! alacritty keeps one per screen, so an alternate-screen DECRC that was
+//! never paired with a DECSC there leaves an xterm.js consumer with the
+//! default register's ASCII sets after the app leaves; and G2/G3 are
+//! designated but never made active, since vte delivers no LS2/LS3 to the
+//! emulator (xterm.js does implement them, a native divergence).
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Charsets, Cursor, Dimensions};
@@ -462,7 +466,8 @@ impl Emulator {
             paint_screen(&self.term, &mut out);
             // Primary's DECSC register: its saved cursor is clobbered in
             // self by the swap below, and a consumer's `?1049h` saves the
-            // cursor again anyway, so what this carries is the primary pen.
+            // cursor again anyway, so what this carries is the primary pen;
+            // the shift it is rebuilt under is moot for the same reason.
             emit_saved_cursor(&mut out, &self.term.grid().saved_cursor, saved_shift[0]);
             emit_cup(&mut out, cursor_point(&self.term));
             // The primary's own character sets and shift, as they were when
@@ -600,8 +605,8 @@ impl Emulator {
         match active_charset {
             CharsetIndex::G0 => {}
             CharsetIndex::G1 => out.push(0x0e), // SO
-            // G2/G3 have no simple locking shift in this profile; apps that
-            // use them repaint constantly anyway.
+            // Unreachable: vte 0.15 delivers no LS2/LS3, so the shift is
+            // only ever G0 or G1.
             _ => {}
         }
 
@@ -1376,6 +1381,18 @@ mod tests {
         assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
         assert_eq!(b.screen_text()[0], "┌─┐", "{:?}", b.screen_text());
 
+        // Saved under SO and shifted in since (tmux-style smacs, DECSC,
+        // rmacs): the register is rebuilt under SO, and the SI after its
+        // ESC 7 is what puts the consumer back where the app is — the tail's
+        // own shift only does so while the app is still shifted out.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b)0\x0e\x1b7\x0fab");
+        assert_same_state(&a, &b, "decsc charsets, shifted in since");
+        for e in [&mut a, &mut b] {
+            e.feed(b"x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-checkpoint drift");
+        assert_eq!(b.screen_text()[0], "abx", "{:?}", b.screen_text());
+
         // On the alternate screen, saved under SO with G1 line drawing and
         // returned to ASCII since: the alt register is rebuilt under its own
         // recorded shift, not the primary's, and the mirror that feeds the
@@ -1507,13 +1524,15 @@ mod tests {
         // primary's at `?1049h`, where alacritty keeps designations. The
         // rebuilt register and the carried primary sets must restore line
         // drawing on it all the same: DECSC in the G0 form, the SO form,
-        // saved under SI then shifted out, and saved on the alternate screen
-        // under SO; and leaving the alternate screen entered under SI and
-        // under SO.
+        // saved under SO then shifted in (where the register's rebuild must
+        // not leave the consumer shifted out), saved under SI then shifted
+        // out, and saved on the alternate screen under SO; and leaving the
+        // alternate screen entered under SI and under SO.
         let Some(xterm) = xterm_js() else { return };
-        let cases: [(&[u8], &[u8], &str); 6] = [
+        let cases: [(&[u8], &[u8], &str); 7] = [
             (b"\x1b(0\x1b7\x1b(Btext", b"\x1b8lqk", "┌─┐t"),
             (b"\x1b)0\x0e\x1b7lqk", b"\x1b8xxx", "│││"),
+            (b"\x1b)0\x0e\x1b7\x0fab", b"x", "abx"),
             (b"\x1b(0\x1b7\x1b(B\x1b)0\x0e", b"\x0f\x1b8lqk", "┌─┐"),
             (
                 b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x1b)Btext",
