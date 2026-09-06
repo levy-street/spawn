@@ -133,6 +133,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
   journal_access_denied 'Hint: You are currently not seeing messages from other users and the system.
   Users in groups '"'"'adm'"'"', '"'"'systemd-journal'"'"' can see all messages.' || exit 1
   journal_access_denied 'No journal files were opened due to insufficient permissions.' || exit 1
+  journal_access_denied 'No journal files were found.' || exit 1
+  journal_access_denied 'Failed to open journal: Permission denied' || exit 1
   ! journal_access_denied '' || exit 1
   ! journal_access_denied '-- No entries --' || exit 1
   relay_row_applies 'spawn-server spawn-web redis-server coturn' no || exit 1

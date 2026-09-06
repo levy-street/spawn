@@ -94,8 +94,11 @@ signed with the shared secret, minted into every `rtc.config` and every session
 offer. coturn checks the expiry on every allocation refresh and permission
 request, not only at allocation, so a peer connection that outlives its
 credential loses its relay allocation at the cliff and every relayed pane on
-it drops. Browsers and phones now refresh an hour before expiry with a
-non-disruptive ICE restart on the same peer connection. The daemon cannot —
+it drops. Browsers and phones now refresh the terminal's credential an hour
+before expiry with a non-disruptive ICE restart on the same peer connection
+(the host control channel — files, the launcher — still refreshes only when
+it restarts for another reason, and drops at its cliff; that is a
+follow-up). The daemon cannot —
 webrtc-rs builds its ICE agent once, from the servers in the first offer,
 and a restart re-gathers with those same credentials — so its own relay
 allocation still dies at its cliff: a pair that runs through the browser's

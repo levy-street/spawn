@@ -423,11 +423,17 @@ test("a pane refreshes its relay credentials before they expire and keeps its ch
   await expect(liveTerminalRows(page)).toContainText("ready");
   await sendPty(page, "before the refresh\r\n");
   await expect(liveTerminalRows(page)).toContainText("before the refresh");
+  // Everything the client sent before this point belongs to connecting; the
+  // scheduled refresh is what comes after. (A client that treats a credential
+  // this short as stale at startup asks for a config on its way in, which
+  // must not count as the refresh.)
+  const connected = messages.length;
+  const sinceConnected = () => jsonMessages(messages.slice(connected));
 
   const configRequests = () =>
-    jsonMessages(messages).filter((message) => message?.type === "rtc.config.request").length;
+    sinceConnected().filter((message) => message?.type === "rtc.config.request").length;
   const restartOffers = () =>
-    jsonMessages(messages).filter(
+    sinceConnected().filter(
       (message) => message?.type === "rtc.offer" && message.ice_restart === true,
     ).length;
   await expect.poll(configRequests, { timeout: 10_000 }).toBe(1);
