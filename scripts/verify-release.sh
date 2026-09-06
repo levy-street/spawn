@@ -13,6 +13,9 @@ Checks:
   - /api/install/manifest.json has a valid daemon-pinned signature
   - the signed manifest counter matches the ref commit's committer timestamp
   - every advertised daemon binary hashes to its advertised sha256
+  - every variant pair the signed manifest carries is served under
+    /api/install/<kind>/<target>/<variant> with the advertised sha256,
+    reports the variant's version, and the required variant pairs are present
   - the production Expo manifest carries the ref's mobile/ tree
   - /desktop/latest.json, every artifact signature, and /api/release.desktop match
 
@@ -458,6 +461,77 @@ if [[ "$advertised_targets" -eq 0 ]]; then
   print_row "daemon.targets" ">=1" "0" "FAIL"
   fail=1
 fi
+
+# The variant pairs, proven like the release ones: every variant the signed
+# manifest carries must be one this checkout knows, must report the release
+# version plus its own suffix, must be advertised by /api/release with the
+# same hashes, and must be served under its own path with those exact bytes.
+# The pairs a release may not lose (dream's diagnostics build) must be there.
+manifest_version=""
+if [[ "$manifest_available" == "1" ]]; then
+  manifest_version="$(json_get "$manifest_file" version 2>/dev/null || true)"
+  while IFS= read -r variant; do
+    [[ -n "$variant" ]] || continue
+    if ! prebuilt_variant_is_known "$variant"; then
+      print_row "daemon.variants.$variant" "a known variant" "unknown variant" "FAIL"
+      fail=1
+      continue
+    fi
+    check_row "daemon.variants.$variant.version" \
+      "$(prebuilt_variant_version "$manifest_version" "$variant")" \
+      "$(json_get "$manifest_file" "variants.$variant.version" 2>/dev/null || true)"
+    while IFS= read -r target; do
+      [[ -n "$target" ]] || continue
+      if ! supported_target "$target"; then
+        print_row "daemon.variants.$variant.$target" "supported target" "unexpected target" "FAIL"
+        fail=1
+        continue
+      fi
+      for kind in spawnd spawn-worker; do
+        if [[ "$kind" == "spawnd" ]]; then
+          hash_field="spawnd_sha256"
+        else
+          hash_field="spawn_worker_sha256"
+        fi
+        piece="daemon.variants.$variant.$target.$kind"
+        expected_hash="$(json_get "$manifest_file" \
+          "variants.$variant.targets.$target.$hash_field" 2>/dev/null || true)"
+        advertised_hash=""
+        if [[ "$release_available" == "1" ]]; then
+          advertised_hash="$(json_get "$release_file" \
+            "daemon.variants.$variant.targets.$target.$hash_field" 2>/dev/null || true)"
+        fi
+        binary_file="$tmp_dir/$target-$variant-$kind"
+        if [[ -z "$expected_hash" ]]; then
+          print_row "$piece" "signed manifest sha256" "<null>" "FAIL"
+          fail=1
+          continue
+        elif [[ "$advertised_hash" != "$expected_hash" ]]; then
+          print_row "$piece metadata" "$expected_hash" "${advertised_hash:-<null>}" "FAIL"
+          fail=1
+        fi
+        if curl -fsS --max-time 60 "$server/api/install/$kind/$target/$variant" -o "$binary_file"; then
+          actual_hash="$(sha256_file "$binary_file")"
+          check_row "$piece" "$expected_hash" "$actual_hash"
+        else
+          print_row "$piece" "$expected_hash" "<fetch failed>" "FAIL"
+          fail=1
+        fi
+      done
+    done < <(json_keys "$manifest_file" "variants.$variant.targets" 2>/dev/null || true)
+  done < <(json_keys "$manifest_file" variants 2>/dev/null || true)
+fi
+for required_variant_target in "${PREBUILT_REQUIRED_VARIANT_TARGETS[@]}"; do
+  required_variant="${required_variant_target%%:*}"
+  required_target="${required_variant_target##*:}"
+  if [[ "$manifest_available" == "1" ]] && json_get "$manifest_file" \
+    "variants.$required_variant.targets.$required_target.spawnd_sha256" >/dev/null 2>&1; then
+    continue
+  fi
+  print_row "daemon.variants.$required_variant.$required_target" "published" \
+    "not in this release" "FAIL"
+  fail=1
+done
 
 if [[ "$skip_desktop" == "1" ]]; then
   print_row "desktop.tree" "git desktop tree" "<skipped>" "SKIP"
