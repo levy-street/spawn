@@ -1,38 +1,16 @@
-import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Confirm } from "@/components/ui/confirm";
 import { ListBlock } from "@/components/ui/list-group";
 import { Monogram } from "@/components/ui/monogram";
-import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
-import type { HostAgentInstallResult, HostAgentStatus } from "@/data/api/schemas/hosts";
-import { spacing, useTheme } from "@/theme";
+import type { HostAgentStatus } from "@/data/api/schemas/hosts";
+import { spacing } from "@/theme";
 
 export interface HostAgentRowProps {
   agent: HostAgentStatus;
-  hostName: string;
-  installing: boolean;
-  policySaving: boolean;
-  result?: HostAgentInstallResult | null;
-  onInstall(): void;
-  onPolicyChange(value: boolean): void;
 }
 
-export function HostAgentRow({
-  agent,
-  hostName,
-  installing,
-  policySaving,
-  result,
-  onInstall,
-  onPolicyChange,
-}: HostAgentRowProps) {
-  const theme = useTheme();
-  const [confirmVisible, setConfirmVisible] = useState(false);
-  const action = agent.installed ? "Update" : "Install";
-  const canInstall = Boolean(agent.install?.trim());
+export function HostAgentRow({ agent }: HostAgentRowProps) {
   return (
     <ListBlock bleed={false} testID={`host-agent-${agent.agent_id}`}>
       <View style={styles.heading}>
@@ -66,82 +44,11 @@ export function HostAgentRow({
           ? (agent.path ?? agent.command)
           : (agent.install ?? "No install command is available.")}
       </Text>
-      {/* One quiet line of controls: the policy and the one action, sized as
-          the row's accessories rather than a form of their own. */}
-      <View style={styles.controls}>
-        <View style={styles.policy}>
-          <Switch
-            accessibilityLabel={`Auto update ${agent.agent_name}`}
-            disabled={!canInstall || policySaving}
-            onValueChange={onPolicyChange}
-            value={agent.auto_update}
-          />
-          <View style={styles.policyCopy}>
-            <Text color="mutedForeground" variant="caption">
-              Auto update
-            </Text>
-            {!canInstall ? (
-              <Text color="mutedForeground" variant="micro">
-                No install command
-              </Text>
-            ) : null}
-          </View>
-        </View>
-        <Button
-          disabled={!canInstall}
-          loading={installing}
-          onPress={() => setConfirmVisible(true)}
-          size="sm"
-          variant={agent.installed ? "outline" : "default"}
-        >
-          {action}
-        </Button>
-      </View>
-      {result ? (
-        <View
-          style={[
-            styles.result,
-            {
-              backgroundColor: result.success
-                ? theme.colors.successSoft
-                : theme.colors.destructiveSoft,
-              borderRadius: theme.radii.md,
-            },
-          ]}
-        >
-          <Text color={result.success ? "success" : "destructive"} variant="caption">
-            {result.agent_name}: {result.success ? "completed" : "failed"}
-            {result.error ? ` · ${result.error}` : ""}
-          </Text>
-          {result.output ? (
-            <Text selectable variant="mono">
-              {result.output}
-            </Text>
-          ) : null}
-        </View>
-      ) : null}
-      <Confirm
-        confirmLabel={action}
-        description={`Runs the install command on ${hostName}.`}
-        onCancel={() => setConfirmVisible(false)}
-        onConfirm={() => {
-          setConfirmVisible(false);
-          onInstall();
-        }}
-        title={`${action} ${agent.agent_name}?`}
-        visible={confirmVisible}
-      />
     </ListBlock>
   );
 }
 
 const styles = StyleSheet.create({
-  controls: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: spacing[3],
-    justifyContent: "space-between",
-  },
   heading: {
     alignItems: "center",
     flexDirection: "row",
@@ -151,19 +58,5 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: spacing[1],
     minWidth: 0,
-  },
-  policy: {
-    alignItems: "center",
-    flex: 1,
-    flexDirection: "row",
-    gap: spacing[2],
-    minWidth: 0,
-  },
-  policyCopy: {
-    flexShrink: 1,
-  },
-  result: {
-    gap: spacing[2],
-    padding: spacing[3],
   },
 });

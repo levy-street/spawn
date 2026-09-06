@@ -299,6 +299,12 @@ ports 50000–50100; allow that inbound range in the host firewall. For temporar
 SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
 
+`host.agents.install` is a refusal-only compatibility frame: server identity
+does not authorize running an installer or self-updater. Never restore its
+execution path to make an old server work. The replacement requires endpoint
+authorization and durable effect handling; `docs/DAEMON_COMMAND_AUTHORITY.md`
+records the remaining command surfaces, including server-selected version probes.
+
 `spawn-worker --version` prints the same build/tree identity stamped into
 `spawnd`. The supervisor checks that pair at startup and before every new
 session; a mismatch is reported as `worker_mismatch` and existing workers keep
