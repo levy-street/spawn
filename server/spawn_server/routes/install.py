@@ -1027,7 +1027,7 @@ INSTALL_SCRIPT = dedent(
     # this cgroup and must survive supervisor updates.
     KillMode=process
     # Headroom against fd exhaustion taking the host offline.
-    LimitNOFILE=65536:524288
+    LimitNOFILE=65536:infinity
     Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
     # Signed signaling is enforced by default: this daemon refuses RTC offers
     # that are not signed by a browser identity it pins. Approve new devices

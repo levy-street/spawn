@@ -214,7 +214,7 @@ fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String 
          Restart=on-failure\n\
          RestartSec=3\n\
          KillMode=process\n\
-         LimitNOFILE=65536:524288\n\
+         LimitNOFILE=65536:infinity\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -912,9 +912,11 @@ mod tests {
 
         // A user service starts at 1024 open files; a laptop of sessions needs
         // more than that before the range of ICE ports runs out (#80). The hard
-        // half stays high: every shell in a SPAWN D terminal inherits it, and
-        // `ulimit -n` must still work there as it does in a native terminal.
-        assert!(unit.contains("LimitNOFILE=65536:524288"));
+        // half is `infinity`, which systemd clamps to the manager's own hard
+        // limit — the one a native shell has — so every shell in a SPAWN D
+        // terminal can still `ulimit -n` as high as it could natively. Any
+        // number here would lower it.
+        assert!(unit.contains("LimitNOFILE=65536:infinity"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 

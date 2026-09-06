@@ -360,8 +360,11 @@ direct paths — one server-reflexive socket per ICE URL per address family
 plus one host socket per address of every interface `interface_is_allowed`
 admits, VPN interfaces included by design; a full range means relay-only
 peers, since the TURN client binds outside it. The open-file limit is the
-ceiling that stops a peer gathering anything: `main.rs` raises it at startup
-and `service.rs` writes `LimitNOFILE` / `NumberOfFiles` into the units. For temporary
+ceiling that stops a peer gathering anything: `run.rs` raises the soft limit
+when the daemon starts to run, and `service.rs` writes soft-only limits into
+the units (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`) —
+never a hard limit, which every shell in a terminal would inherit. For
+temporary
 SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
 

@@ -69,8 +69,12 @@ Allow both listener traffic and relay allocations in the host/cloud firewall:
   random offset within the range, so a firewall rule written for the old one
   admits only about one socket in ten: re-create the rule for the new range
   when the daemon updates. What stops a peer gathering anything at all is the
-  process's open-file limit; the daemon raises its own at startup and the
-  service units it writes set `LimitNOFILE` / `NumberOfFiles`.
+  process's open-file limit; the daemon raises its own soft limit when it
+  starts to run, and the service units it writes set the soft limit only
+  (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`): the daemon's
+  hard limit follows every shell a SPAWN D terminal spawns, so a number there
+  would stop `ulimit -n` reaching what a native shell can. Those shells do
+  inherit the raised soft limit.
 
 For example, a daemon host using UFW can admit direct candidates from a
 `192.168.1.0/24` LAN with:
