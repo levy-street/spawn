@@ -422,15 +422,23 @@ pub fn raise_open_file_limit(target: u64) -> io::Result<super::OpenFileLimit> {
     };
     let wanted = target.min(ceiling);
     let mut after = before;
+    let mut refused = false;
     if wanted > before {
         match raise_to(wanted) {
             Ok(()) => after = wanted,
             Err(error) => {
+                // The kernel refused more than we hold. What we hold is fine
+                // when it is at least OPEN_MAX; below that, ask for OPEN_MAX,
+                // and if even that is refused report the first refusal — it
+                // names the limit the operator has to look at.
+                refused = true;
                 let fallback = OPEN_FILE_LIMIT_FALLBACK.min(ceiling);
-                if fallback > before && fallback < wanted {
-                    raise_to(fallback)?;
+                if before < fallback && fallback < wanted {
+                    if raise_to(fallback).is_err() {
+                        return Err(error.into());
+                    }
                     after = fallback;
-                } else {
+                } else if before < fallback {
                     return Err(error.into());
                 }
             }
@@ -440,5 +448,6 @@ pub fn raise_open_file_limit(target: u64) -> io::Result<super::OpenFileLimit> {
         before,
         after,
         maximum: limit.maximum,
+        refused,
     })
 }

@@ -74,11 +74,6 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
     init_tracing(cli.verbose);
-    // Only the daemon proper answers peers; the CLI subcommands keep the
-    // shell's limit and its clean output.
-    if matches!(cli.command, Command::Run(_) | Command::Login(_)) {
-        raise_open_file_limit();
-    }
 
     let result = match cli.command {
         Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
@@ -157,45 +152,6 @@ fn detach_background_console() {
 
 #[cfg(not(windows))]
 fn detach_background_console() {}
-
-/// The soft limit on open files the daemon asks for at startup. Every peer
-/// connection costs a handful of descriptors, and a peer that cannot bind a
-/// socket gathers no ICE candidate at all; systemd's 1024 and launchd's 256
-/// run out at a laptop's worth of sessions (#80).
-const OPEN_FILE_LIMIT_TARGET: u64 = 65_536;
-
-fn raise_open_file_limit() {
-    let ceiling = |limit: &platform::OpenFileLimit| {
-        limit
-            .maximum
-            .map_or_else(|| "unlimited".to_string(), |maximum| maximum.to_string())
-    };
-    match platform::raise_open_file_limit(OPEN_FILE_LIMIT_TARGET) {
-        Ok(limit) if limit.after > limit.before => tracing::info!(
-            before = limit.before,
-            after = limit.after,
-            hard = %ceiling(&limit),
-            "raised the open-file limit for this daemon"
-        ),
-        Ok(limit) if limit.after < OPEN_FILE_LIMIT_TARGET => tracing::debug!(
-            current = limit.after,
-            hard = %ceiling(&limit),
-            target = OPEN_FILE_LIMIT_TARGET,
-            "the hard limit caps the open-file limit below the target"
-        ),
-        Ok(limit) => tracing::debug!(
-            current = limit.after,
-            hard = %ceiling(&limit),
-            "the open-file limit already meets the target"
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
-        Err(error) => tracing::warn!(
-            %error,
-            target = OPEN_FILE_LIMIT_TARGET,
-            "could not raise the open-file limit; sessions are capped by the inherited one"
-        ),
-    }
-}
 
 fn init_tracing(verbose: u8) {
     use tracing_subscriber::{fmt, EnvFilter};
