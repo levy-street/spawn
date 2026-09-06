@@ -130,11 +130,16 @@ check_tree() {
   require_count "$root" "$adapter" 'const verified = await verifyRtcSignalWire(' 2 || return 1
   require_count "$root" "$session" '.verifyAndApplyAnswer(' 1 || return 1
   require_count "$root" "$host" '.verifyAndApplyAnswer(' 1 || return 1
-  # Two signed construction sites since the connection stream (8d2c960): the
-  # initial offer and the ICE-restart offer, both inside the signed-mode branch
-  # with the same binding tuple; the restart aborts the previous session first.
+  # The session client has two signed construction sites since the connection
+  # stream (8d2c960): the initial offer and the ICE-restart offer, both inside
+  # the signed-mode branch with the same binding tuple; the restart aborts the
+  # previous session first. The host client has one: its restart path is gone
+  # (#71, PR #73) because the daemon accepts no host-scope ICE restart — it
+  # refuses a second offer for a signal id it already holds — so the host
+  # channel rebuilds its peer on the same socket instead, and only the initial
+  # offer is ever signed. A second site reappearing there is a review item.
   require_count "$root" "$session" 'new SignedRtcLiveSession(' 2 || return 1
-  require_count "$root" "$host" 'new SignedRtcLiveSession(' 2 || return 1
+  require_count "$root" "$host" 'new SignedRtcLiveSession(' 1 || return 1
 
   if grep -Fq 'sdp: frame.sdp' "$root/$adapter"; then
     fail 'untrusted outer SDP reached the signed live adapter consumer'
@@ -182,6 +187,16 @@ run_self_test() {
       return 1
     fi
   done
+  cp "$pristine" "$host"
+
+  # A signed construction site returning to the host client — a restart path
+  # re-signing an offer the daemon would refuse — must trip the pin.
+  cp "$pristine" "$host"
+  printf '\n%s\n' 'const stray = new SignedRtcLiveSession(binding, sessionId, capability);' >> "$host"
+  if check_tree "$fixture" >/dev/null 2>&1; then
+    fail 'self-test accepted a second signed construction site in the host client'
+    return 1
+  fi
   cp "$pristine" "$host"
 
   # A newly added .test-named file carrying the RemoteDescription capability
