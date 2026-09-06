@@ -61,12 +61,17 @@
 //! and one taken after the ESC 8 carries the emulator's outcome to both; an
 //! inactive alternate screen's register is not carried, so a consumer
 //! re-entering it and restoring without saving there first restores ASCII
-//! at home; xterm.js keeps one set of designations across `?1049l` where
-//! alacritty keeps one per screen, so an alternate-screen DECRC that was
-//! never paired with a DECSC there leaves an xterm.js consumer with the
-//! default register's ASCII sets after the app leaves; and G2/G3 are
-//! designated but never made active, since vte delivers no LS2/LS3 to the
-//! emulator (xterm.js does implement them, a native divergence).
+//! at home; and G2/G3 are designated but never made active, since vte
+//! delivers no LS2/LS3 to the emulator (xterm.js does implement them).
+//!
+//! Where xterm.js and alacritty differ natively beyond DECRC, the checkpoint
+//! carries the emulator's outcome to the consumer: xterm.js keeps one set of
+//! designations across `?1049l` where alacritty keeps one per screen, so a
+//! set changed on the alternate screen still governs the next SI/SO after
+//! the app leaves on xterm.js and not here; an unpaired `?1049l` on the
+//! primary screen is a DECRC from the normal buffer's register on xterm.js
+//! (cursor home, its table restored) and nothing here; and `?47h`/`?1047h`
+//! switch buffers on xterm.js and nothing here, since vte maps only 1049.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Charsets, Cursor, Dimensions};
