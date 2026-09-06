@@ -100,7 +100,15 @@ new_prebuilt="$UPDATE_SCRATCH/prebuilt-new"
 old_prebuilt="$UPDATE_SCRATCH/prebuilt-old"
 UPDATE_PREBUILT="$new_prebuilt"
 mkdir -p "$UPDATE_PREBUILT/$UPDATE_TARGET"
+# The new release carries the diagnostics variant beside its release pair,
+# as a published one does. The old daemon predates the `variants` key, and
+# the old/new cell is where it is proven to update from such a manifest
+# regardless — the alternative is a fleet that refuses the first release
+# with a variant in it.
+update_test_build_variant_identities
 update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+update_test_manifest_has_variant diagnostics \
+  || update_test_die "the new release manifest does not carry the diagnostics variant"
 
 mkdir -p "$old_prebuilt/$UPDATE_TARGET"
 cp "$UPDATE_ARTIFACTS/skew-old/spawnd" "$old_prebuilt/$UPDATE_TARGET/spawnd"
@@ -166,7 +174,9 @@ run_cell() {
     update_test_start_server 1
     update_test_wait_host "$UPDATE_TREE_B" current "" 60 >/dev/null
     expected_tree="$UPDATE_TREE_B"
-    printf -v "$result_variable" '%s' "PASS (auto-updated)"
+    cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+      || update_test_die "the old daemon did not install the new release pair"
+    printf -v "$result_variable" '%s' "PASS (auto-updated; manifest carried variants)"
   elif [[ "$daemon_generation:$server_generation" == "new:old" ]]; then
     update_test_wait_host "$UPDATE_TREE_B" failed "manifest unsigned" 30 >/dev/null
     stable_pid="$UPDATE_DAEMON_PID"
