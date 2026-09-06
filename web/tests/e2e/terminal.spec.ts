@@ -365,6 +365,112 @@ test("terminal attempts direct WebRTC transport when advertised", async ({ page 
   // instead, where it is actually checkable.
 });
 
+test("a pane refreshes its relay credentials before they expire and keeps its channels", async ({
+  page,
+}) => {
+  // #71: coturn checks a credential's expiry on every allocation refresh, so a
+  // pane older than the credential lifetime lost its relay at the cliff. The
+  // server now says when the credential expires (`now`/`expires_at`), and the
+  // pane restarts ICE on the same peer connection before then. A four-second
+  // lifetime puts that at half-life, two seconds in; the refreshed credential
+  // is good for a week, so exactly one restart is the whole story.
+  const messages: Array<string | Buffer> = [];
+  await installSessionRtcMock(page, messages, { history: "ready\r\n" });
+  await mockApp(page, {
+    sessions: [session()],
+    workspaces: [
+      workspace({
+        layout: {
+          version: 3,
+          tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }],
+        },
+      }),
+    ],
+  });
+  let minted = 0;
+  const rtcConfig = (lifetimeSeconds: number) => {
+    const now = Math.floor(Date.now() / 1000);
+    minted += 1;
+    return JSON.stringify({
+      type: "rtc.config",
+      enabled: true,
+      binding_nonce_required: true,
+      now,
+      expires_at: now + lifetimeSeconds,
+      ice_servers: [
+        {
+          urls: "turn:relay.test:3478?transport=udp",
+          username: `${now + lifetimeSeconds}:user-${minted}`,
+          credential: `secret-${minted}`,
+        },
+      ],
+    });
+  };
+  await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
+    ws.onMessage((message) => {
+      messages.push(message);
+      if (typeof message === "string" && JSON.parse(message)?.type === "rtc.config.request") {
+        ws.send(rtcConfig(7 * 24 * 3600));
+        return;
+      }
+      handleSessionRtcSignal(ws, message);
+    });
+    ws.send(rtcConfig(4));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
+  });
+
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(liveTerminalRows(page)).toContainText("ready");
+  await sendPty(page, "before the refresh\r\n");
+  await expect(liveTerminalRows(page)).toContainText("before the refresh");
+
+  const configRequests = () =>
+    jsonMessages(messages).filter((message) => message?.type === "rtc.config.request").length;
+  const restartOffers = () =>
+    jsonMessages(messages).filter(
+      (message) => message?.type === "rtc.offer" && message.ice_restart === true,
+    ).length;
+  await expect.poll(configRequests, { timeout: 10_000 }).toBe(1);
+  await expect.poll(restartOffers, { timeout: 10_000 }).toBe(1);
+
+  // The same peer connection, with the fresh credential applied to it, and the
+  // same data channels: nothing was rebuilt, and bytes flow both ways after.
+  const snapshot = () =>
+    page.evaluate(() =>
+      (
+        window as unknown as {
+          __spawnRtcTest: {
+            transportSnapshot: () => {
+              connections: number;
+              ptyChannels: number;
+              iceRestarts: number;
+              restartOffers: number;
+              lastIceUsername: string | null;
+            };
+          };
+        }
+      ).__spawnRtcTest.transportSnapshot(),
+    );
+  await expect.poll(snapshot).toEqual({
+    connections: 1,
+    ptyChannels: 1,
+    iceRestarts: 1,
+    restartOffers: 1,
+    lastIceUsername: expect.stringMatching(/:user-2$/),
+  });
+  await sendPty(page, "after the refresh\r\n");
+  await expect(liveTerminalRows(page)).toContainText("after the refresh");
+  await page.getByLabel("Session terminal").click();
+  await page.keyboard.type("typed after");
+  await expect.poll(() => binaryText(messages)).toContain("typed after");
+
+  // One refresh, then a week of quiet: no loop, no second restart.
+  await page.waitForTimeout(3_000);
+  expect(configRequests()).toBe(1);
+  expect(restartOffers()).toBe(1);
+  expect(await snapshot()).toMatchObject({ connections: 1, iceRestarts: 1 });
+});
+
 test("opening a terminal as viewer claims control automatically", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page, {
     control: { owner: false, cols: 156, rows: 38, viewers: 2 },

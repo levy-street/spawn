@@ -14,6 +14,7 @@ from spawn_server.turn import (
     ice_servers_for_session,
     ice_transport_policy,
     mint_turn_credential,
+    rtc_ice_fields,
     validate_and_log_ice_config,
     validate_ice_config,
     validate_ice_url,
@@ -66,6 +67,30 @@ def test_ice_servers_include_minted_turn_only_when_configured():
     assert turn["credential"]
     # The static STUN defaults stay in front of the minted entry.
     assert any("stun:" in u for s in servers for u in s["urls"])
+
+
+def test_rtc_ice_fields_carry_the_credential_window_only_when_turn_is_minted():
+    """`now` and `expires_at` let a client measure the credential's remaining
+    life without trusting its own clock; `expires_at` is the very expiry the
+    minted username starts with, so the two can never disagree."""
+    configured = Settings(
+        turn_urls="turn:relay.example:3478?transport=udp",
+        turn_secret="s3cret",
+        turn_ttl_seconds=600,
+    )
+    before = int(time.time())
+    fields = rtc_ice_fields(configured, label="user-3")
+    after = int(time.time())
+    assert before <= fields["now"] <= after
+    assert fields["expires_at"] == fields["now"] + 600
+    assert fields["ice_servers"][-1]["username"] == f"{fields['expires_at']}:user-3"
+    assert fields["ice_transport_policy"] == "all"
+
+    stun_only = Settings(turn_urls="", turn_secret=None)
+    fields = rtc_ice_fields(stun_only, label="user-3")
+    assert "expires_at" not in fields
+    assert isinstance(fields["now"], int)
+    assert all("turn:" not in u for s in fields["ice_servers"] for u in s["urls"])
 
 
 def test_turn_urls_without_secret_do_not_leak_an_unauthenticated_entry():

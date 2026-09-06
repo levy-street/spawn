@@ -1134,10 +1134,36 @@ def test_session_rtc_config_carries_the_transport_policy(monkeypatch):
     monkeypatch.setenv("SPAWN_WEBRTC_ICE_SERVERS", "[]")
     monkeypatch.setenv("SPAWN_TURN_URLS", "turn:relay.example:3478?transport=udp")
     monkeypatch.setenv("SPAWN_TURN_SECRET", "s3cret")
+    monkeypatch.setenv("SPAWN_TURN_TTL_SECONDS", "3600")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     payload = _rtc_config_payload("user-1")
     assert payload["ice_transport_policy"] == "relay"
     assert payload["ice_servers"][-1]["username"].endswith(":user-1")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+def test_session_rtc_config_carries_the_credential_window(monkeypatch):
+    """A pane refreshes its relay credentials before they expire (#71).
+
+    It learns when from the frame — the server's `now` and the credential's
+    `expires_at` — so the schedule does not depend on the browser's clock
+    agreeing with the relay's. Without TURN there is no window to carry.
+    """
+    from spawn_server.config import get_settings
+    from spawn_server.ws.browser import _rtc_config_payload
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    stun_only = _rtc_config_payload("user-1")
+    assert "expires_at" not in stun_only
+    assert isinstance(stun_only["now"], int)
+
+    monkeypatch.setenv("SPAWN_TURN_URLS", "turn:relay.example:3478?transport=udp")
+    monkeypatch.setenv("SPAWN_TURN_SECRET", "s3cret")
+    monkeypatch.setenv("SPAWN_TURN_TTL_SECONDS", "3600")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    payload = _rtc_config_payload("user-1")
+    assert payload["expires_at"] == payload["now"] + 3600
+    assert payload["ice_servers"][-1]["username"] == f"{payload['expires_at']}:user-1"
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
 

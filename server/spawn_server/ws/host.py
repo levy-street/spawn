@@ -14,7 +14,7 @@ from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Host
 from ..redis import get_backend
-from ..turn import ice_servers_for_session, ice_transport_policy
+from ..turn import ice_servers_for_session, ice_transport_policy, rtc_ice_fields
 from .broker import HostBrowserConn, get_broker
 from .browser import (
     _resolve_user,
@@ -479,12 +479,11 @@ async def host_ws(
     # while the socket lives on — which is how hosts ended up presenting
     # credentials that coturn had already expired.
     def rtc_config_payload() -> dict[str, object]:
-        ice_servers = ice_servers_for_session(get_settings(), label=user.id)
+        settings = get_settings()
         return {
             "type": "rtc.config",
-            "enabled": get_settings().webrtc_enabled,
-            "ice_servers": ice_servers,
-            "ice_transport_policy": ice_transport_policy(ice_servers),
+            "enabled": settings.webrtc_enabled,
+            **rtc_ice_fields(settings, label=user.id),
             "scope_type": "host",
             "scope_id": host_id,
             "protocol": HOST_CONTROL_PROTOCOL,

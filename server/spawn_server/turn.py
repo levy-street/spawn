@@ -35,23 +35,61 @@ _ICE_URL = re.compile(
 )
 
 
-def mint_turn_credential(secret: str, *, label: str, ttl_seconds: int) -> tuple[str, str]:
-    expiry = int(time.time()) + ttl_seconds
+def mint_turn_credential(
+    secret: str, *, label: str, ttl_seconds: int, now: int | None = None
+) -> tuple[str, str]:
+    expiry = (int(time.time()) if now is None else now) + ttl_seconds
     username = f"{expiry}:{label}"
     digest = hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
     return username, base64.b64encode(digest).decode("ascii")
 
 
-def ice_servers_for_session(settings: Settings, *, label: str) -> list[dict[str, Any]]:
+def turn_credentials_configured(settings: Settings) -> bool:
+    """True when every ICE offer carries a minted TURN credential."""
+    return bool(settings.turn_url_list) and bool(settings.turn_secret)
+
+
+def ice_servers_for_session(
+    settings: Settings, *, label: str, now: int | None = None
+) -> list[dict[str, Any]]:
     """Static ICE servers plus, when configured, a freshly minted TURN entry."""
     servers = list(settings.webrtc_ice_server_list)
-    urls = settings.turn_url_list
-    if urls and settings.turn_secret:
+    if turn_credentials_configured(settings):
         username, credential = mint_turn_credential(
-            settings.turn_secret, label=label, ttl_seconds=settings.turn_ttl_seconds
+            settings.turn_secret or "",
+            label=label,
+            ttl_seconds=settings.turn_ttl_seconds,
+            now=now,
         )
-        servers.append({"urls": urls, "username": username, "credential": credential})
+        servers.append(
+            {"urls": settings.turn_url_list, "username": username, "credential": credential}
+        )
     return servers
+
+
+def rtc_ice_fields(settings: Settings, *, label: str) -> dict[str, Any]:
+    """The ICE part of one `rtc.config` frame.
+
+    `ice_servers` and the transport policy every channel already carried,
+    plus the credential's window: `now`, the server's clock at minting, and
+    `expires_at`, the same Unix expiry the minted username starts with. A
+    client subtracts the two to learn how long the credential has left
+    without trusting its own clock, and schedules a refresh before then;
+    parsing the username for it would tie the refresh to clock agreement
+    between the phone and the relay. `expires_at` is only present when a
+    TURN credential was minted — a STUN-only deployment has nothing that
+    expires. Clients that predate the two fields ignore them.
+    """
+    now = int(time.time())
+    servers = ice_servers_for_session(settings, label=label, now=now)
+    fields: dict[str, Any] = {
+        "ice_servers": servers,
+        "ice_transport_policy": ice_transport_policy(servers),
+        "now": now,
+    }
+    if turn_credentials_configured(settings):
+        fields["expires_at"] = now + settings.turn_ttl_seconds
+    return fields
 
 
 def _urls_of(server: dict[str, Any]) -> list[str]:

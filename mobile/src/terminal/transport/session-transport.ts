@@ -42,7 +42,10 @@ import type {
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
 import {
-  iceServersNeedRefresh,
+  type IceCredentialWindow,
+  iceCredentialRefreshDelayMs,
+  iceCredentialWindow,
+  MAX_TIMER_DELAY_MS,
   readTransportPolicy,
   sanitizeIceServers,
 } from "@/terminal/transport/types";
@@ -60,6 +63,14 @@ export const CONNECT_TIMEOUT_MESSAGE =
 export const LOST_CONNECTION_MESSAGE =
   "SPAWN D lost the connection to this host and could not restore it.";
 const RECONNECT_BUDGET_MS = 3 * 60_000;
+/** How long a `rtc.config.request` waits for its reply. */
+const CONFIG_REQUEST_TIMEOUT_MS = 2_000;
+/** A scheduled credential refresh that found the transport busy — a
+ * reconnect in progress — looks again this much later. */
+const CREDENTIAL_REFRESH_RECHECK_MS = 30_000;
+/** Backoff for a scheduled refresh that got no fresher credential. */
+const CREDENTIAL_REFRESH_RETRY_BASE_MS = 5_000;
+const CREDENTIAL_REFRESH_RETRY_CAP_MS = 5 * 60_000;
 let cachedLoopbackCapability: boolean | null = null;
 
 type StateListener = (state: TransportState) => void;
@@ -77,11 +88,15 @@ interface ConfigFrame extends Record<string, unknown> {
   ice_servers?: unknown;
   ice_transport_policy?: unknown;
   binding_nonce_required?: unknown;
+  now?: unknown;
+  expires_at?: unknown;
 }
 
 interface CachedRtcConfig {
   iceServers: Array<Record<string, unknown>>;
   iceTransportPolicy: "all" | "relay";
+  /** When the TURN credential in `iceServers` expires; null without TURN. */
+  credentialWindow: IceCredentialWindow | null;
 }
 
 function frameRecord(value: unknown): ConfigFrame | null {
@@ -128,6 +143,12 @@ class WebViewSessionTransport implements SessionTransport {
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #connectTimer: ReturnType<typeof setTimeout> | null = null;
   #resumeTimer: ReturnType<typeof setTimeout> | null = null;
+  #credentialTimer: ReturnType<typeof setTimeout> | null = null;
+  #credentialRefreshAttempts = 0;
+  /** The window of the servers the worker's live peer connection was built
+   * with or last restarted on — what its relay allocation actually presents,
+   * which the server's hourly `rtc.config` push does not change. */
+  #appliedCredentialWindow: IceCredentialWindow | null = null;
   #opening: Promise<void> | null = null;
   #resolveOpen: (() => void) | null = null;
   #rejectOpen: ((error: Error) => void) | null = null;
@@ -164,16 +185,18 @@ class WebViewSessionTransport implements SessionTransport {
 
   networkChanged(): void {
     if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
-    this.#refreshConfigBefore(() => {
+    this.#requestConfig(false, () => {
       if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
+      const config = this.#cachedConfig;
+      // The worker applies these with its restart — unless one is already in
+      // flight, in which case it drops them. This side cannot tell which, so
+      // the credential schedule keeps the window it knows the peer has; at
+      // worst that is one redundant, non-disruptive restart.
       this.options.bridge.send({
         v: TERMINAL_BRIDGE_VERSION,
         type: "network-changed",
-        ...(this.#cachedConfig
-          ? {
-              iceServers: this.#cachedConfig.iceServers,
-              iceTransportPolicy: this.#cachedConfig.iceTransportPolicy,
-            }
+        ...(config
+          ? { iceServers: config.iceServers, iceTransportPolicy: config.iceTransportPolicy }
           : {}),
       });
     });
@@ -229,6 +252,7 @@ class WebViewSessionTransport implements SessionTransport {
     if (this.#state === "closed") return;
     this.#clearReconnect();
     this.#clearConnectWatchdog();
+    this.#clearCredentialRefresh();
     clearTimeout(this.#resumeTimer ?? undefined);
     this.#resumeTimer = null;
     try {
@@ -403,6 +427,7 @@ class WebViewSessionTransport implements SessionTransport {
       this.#cachedConfig = {
         iceServers,
         iceTransportPolicy: readTransportPolicy(frame.ice_transport_policy),
+        credentialWindow: iceCredentialWindow(frame, iceServers),
       };
       for (const waiter of this.#configWaiters) waiter();
       this.#configWaiters.clear();
@@ -479,6 +504,97 @@ class WebViewSessionTransport implements SessionTransport {
       forceRelay: this.options.forceRelay ?? false,
       ...(forceRebuild ? { forceRebuild: true } : {}),
     });
+    this.#appliedCredentialWindow = config.credentialWindow;
+    this.#armCredentialRefresh();
+  }
+
+  /**
+   * Arm the one timer that keeps a long-lived terminal's relay alive: an hour
+   * before the credential its peer connection presents expires (half-life
+   * when the lifetime is short), `#refreshRelayCredentials` asks for fresh
+   * servers and has the worker restart ICE on the same connection. Re-armed
+   * by every connect and restart, from the window of the servers applied.
+   */
+  #armCredentialRefresh(delayMs?: number): void {
+    this.#clearCredentialTimer();
+    const applied = this.#appliedCredentialWindow;
+    if (!applied) return;
+    const delay = Math.min(MAX_TIMER_DELAY_MS, delayMs ?? iceCredentialRefreshDelayMs(applied));
+    this.#credentialTimer = setTimeout(() => {
+      this.#credentialTimer = null;
+      this.#refreshRelayCredentials();
+    }, delay);
+  }
+
+  #clearCredentialTimer(): void {
+    if (this.#credentialTimer === null) return;
+    clearTimeout(this.#credentialTimer);
+    this.#credentialTimer = null;
+  }
+
+  #clearCredentialRefresh(): void {
+    this.#clearCredentialTimer();
+    this.#credentialRefreshAttempts = 0;
+    this.#appliedCredentialWindow = null;
+  }
+
+  /**
+   * The scheduled half of #71: a terminal older than the credential lifetime
+   * used to die at the cliff, because the relay checks the expiry on every
+   * refresh and nothing on the phone ever changed what the live peer
+   * connection presented. Runs when `#armCredentialRefresh` says so, and
+   * again with backoff until it has handed the worker a fresher credential
+   * or the transport is gone.
+   */
+  #refreshRelayCredentials(): void {
+    const applied = this.#appliedCredentialWindow;
+    if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed" || !applied) {
+      return;
+    }
+    // A timer clamped at setTimeout's ceiling, or one that fired early for
+    // whatever reason, is re-armed rather than acted on.
+    if (iceCredentialRefreshDelayMs(applied) > 0) {
+      this.#armCredentialRefresh();
+      return;
+    }
+    this.#requestConfig(true, (fresh) => {
+      if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
+      if (this.#appliedCredentialWindow !== applied) return;
+      const latest = this.#cachedConfig;
+      if (
+        !fresh ||
+        !latest?.credentialWindow ||
+        latest.credentialWindow.expiresAtMs <= applied.expiresAtMs
+      ) {
+        const delay = Math.min(
+          CREDENTIAL_REFRESH_RETRY_CAP_MS,
+          CREDENTIAL_REFRESH_RETRY_BASE_MS * 2 ** this.#credentialRefreshAttempts,
+        );
+        this.#credentialRefreshAttempts = Math.min(this.#credentialRefreshAttempts + 1, 30);
+        console.warn(
+          `SPAWN D: no fresh relay credentials for session ${this.sessionId} (${
+            fresh ? "the server's credential is no newer" : "rtc.config did not arrive"
+          }); retrying in ${Math.round(delay / 1_000)} s`,
+        );
+        this.#armCredentialRefresh(delay);
+        return;
+      }
+      this.#credentialRefreshAttempts = 0;
+      // A reconnect in progress rebuilds the peer with the fresh config on
+      // its own; the rebuild re-arms this timer. Look again in case it stalls.
+      if (this.#state !== "ready") {
+        this.#armCredentialRefresh(CREDENTIAL_REFRESH_RECHECK_MS);
+        return;
+      }
+      this.options.bridge.send({
+        v: TERMINAL_BRIDGE_VERSION,
+        type: "refresh-ice",
+        iceServers: latest.iceServers,
+        iceTransportPolicy: latest.iceTransportPolicy,
+      });
+      this.#appliedCredentialWindow = latest.credentialWindow;
+      this.#armCredentialRefresh();
+    });
   }
 
   #handleSignalState(state: string): void {
@@ -522,29 +638,36 @@ class WebViewSessionTransport implements SessionTransport {
     this.#fail("signal_failed", message);
   }
 
-  #refreshConfigBefore(callback: () => void): void {
-    if (
-      !this.#cachedConfig ||
-      !iceServersNeedRefresh(this.#cachedConfig.iceServers) ||
-      this.#signal?.state !== "open"
-    ) {
-      callback();
+  /**
+   * Ask the server for a fresh `rtc.config` and call back with whether one
+   * arrived. Without `force`, only when the cached credential is inside its
+   * refresh lead; a signal that is not open cannot be asked at all.
+   */
+  #requestConfig(force: boolean, callback: (fresh: boolean) => void): void {
+    const cached = this.#cachedConfig;
+    const due =
+      cached?.credentialWindow !== null &&
+      cached?.credentialWindow !== undefined &&
+      iceCredentialRefreshDelayMs(cached.credentialWindow) === 0;
+    if (!cached || (!force && !due) || this.#signal?.state !== "open") {
+      callback(false);
       return;
     }
     let settled = false;
-    const finish = () => {
+    const finish = (fresh: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      this.#configWaiters.delete(finish);
-      callback();
+      this.#configWaiters.delete(onConfig);
+      callback(fresh);
     };
-    const timer = setTimeout(finish, 2_000);
-    this.#configWaiters.add(finish);
+    const onConfig = () => finish(true);
+    const timer = setTimeout(() => finish(false), CONFIG_REQUEST_TIMEOUT_MS);
+    this.#configWaiters.add(onConfig);
     try {
       this.#signal.send({ type: "rtc.config.request" });
     } catch {
-      finish();
+      finish(false);
     }
   }
 
@@ -684,6 +807,8 @@ class WebViewSessionTransport implements SessionTransport {
   #scheduleReconnect(): void {
     if (this.#state === "closed" || this.#state === "failed" || this.#reconnectTimer) return;
     this.#clearConnectWatchdog();
+    // The worker tore its peer down; the rebuild re-arms the refresh.
+    this.#clearCredentialRefresh();
     this.#machine = reduceConnection(this.#machine, { type: "disconnect" });
     this.#setState("reconnecting");
     this.#reconnectStartedAt ??= Date.now();
@@ -802,6 +927,7 @@ class WebViewSessionTransport implements SessionTransport {
     if (this.#state === "failed" || this.#state === "closed") return;
     this.#clearConnectWatchdog();
     this.#clearReconnect();
+    this.#clearCredentialRefresh();
     const error = { code, message, retryable: false } satisfies TransportError;
     this.#emitError(error);
     this.#machine = reduceConnection(this.#machine, { type: "fail" });

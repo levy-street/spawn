@@ -338,6 +338,8 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     config = _json_messages(browser_ws)[0]
     assert config["type"] == "rtc.config"
     assert {key: config[key] for key in _metadata(host_id)} == _metadata(host_id)
+    # The host channel carries the same credential window as the session one.
+    assert isinstance(config["now"], int)
 
     for primitive in ("null", "7", '"primitive"'):
         browser_ws.queue_raw_text(primitive)

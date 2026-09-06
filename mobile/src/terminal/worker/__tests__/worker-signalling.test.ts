@@ -396,6 +396,53 @@ describe("session-scoped signalling", () => {
     await harness.handleTransportMessage?.({ type: "close" });
   });
 
+  test("refresh-ice restarts ICE on the live peer, and waits out a restart in flight", async () => {
+    const harness = createHarness("session");
+    await connect(harness);
+    await signOffer(harness);
+    const pc = FakePeerConnection.last;
+    const fresh = (minted: number) => [
+      { urls: "turn:relay.example", username: `9999:user-${minted}`, credential: "pw" },
+    ];
+
+    await harness.handleTransportMessage?.({
+      type: "refresh-ice",
+      iceServers: fresh(1),
+      iceTransportPolicy: "all",
+    });
+    await signOffer(harness);
+    expect(pc?.setConfiguration).toHaveBeenLastCalledWith({
+      iceServers: fresh(1),
+      iceTransportPolicy: "all",
+    });
+    expect(pc?.restartIce).toHaveBeenCalledTimes(1);
+    expect(emittedFrames(harness, "rtc.offer").at(-1)).toMatchObject({ ice_restart: true });
+    // The peer connection and its channels were kept, not rebuilt.
+    expect(FakePeerConnection.last).toBe(pc);
+    for (const channel of pc?.channels ?? []) expect(channel.close).not.toHaveBeenCalled();
+
+    // That restart is still in flight (its ten-second fallback is armed). A
+    // second refresh does not pile a restart on top of it; it runs when the
+    // connection comes back up, so the fresh credential is never dropped.
+    await harness.handleTransportMessage?.({
+      type: "refresh-ice",
+      iceServers: fresh(2),
+      iceTransportPolicy: "all",
+    });
+    expect(pc?.restartIce).toHaveBeenCalledTimes(1);
+    if (pc) {
+      pc.connectionState = "connected";
+      pc.onconnectionstatechange?.();
+    }
+    await Promise.resolve();
+    expect(pc?.restartIce).toHaveBeenCalledTimes(2);
+    expect(pc?.setConfiguration).toHaveBeenLastCalledWith({
+      iceServers: fresh(2),
+      iceTransportPolicy: "all",
+    });
+    await harness.handleTransportMessage?.({ type: "close" });
+  });
+
   test("carries endorsements on the outer offer only", async () => {
     const harness = createHarness("session");
     await connect(harness);

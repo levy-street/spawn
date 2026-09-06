@@ -482,6 +482,193 @@ describe("SessionTransport", () => {
   });
 });
 
+describe("SessionTransport relay credential refresh", () => {
+  const HOUR_MS = 3_600 * 1_000;
+  const SERVER_START = 1_700_000_000;
+
+  function turnConfig(lifetimeSeconds: number, minted: number, serverNow = SERVER_START) {
+    return {
+      type: "rtc.config",
+      enabled: true,
+      binding_nonce_required: true,
+      now: serverNow,
+      expires_at: serverNow + lifetimeSeconds,
+      ice_servers: [
+        {
+          urls: "turn:relay.example:3478?transport=udp",
+          username: `${serverNow + lifetimeSeconds}:user-${minted}`,
+          credential: `secret-${minted}`,
+        },
+      ],
+    };
+  }
+
+  /** `readyTransport` under fake timers: the same steps, no setImmediate. */
+  async function readyWithConfig(config: Record<string, unknown>) {
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const transport = createSessionTransport({
+      sessionId: "00112233-4455-6677-8899-aabbccddeeff",
+      hostIdentityPublicKey: "host-key",
+      initialSize: { cols: 80, rows: 24 },
+      theme: terminalDark,
+      bridge,
+      openSignal: () => signal,
+      loadCarriedEndorsements: async () => [],
+    });
+    const opening = transport.open();
+    await Promise.resolve();
+    await Promise.resolve();
+    signal.emit(config);
+    for (const gate of ["bindingAccepted", "ptyOpen", "ctlOpen", "daemonReady", "historyReady"]) {
+      bridge.emit({ v: 1, type: "state", state: "connecting", gate });
+    }
+    await opening;
+    return { bridge, signal, transport };
+  }
+
+  const configRequests = (signal: FakeSignal) =>
+    signal.sent.filter((frame) => (frame as { type?: string }).type === "rtc.config.request");
+  const refreshes = (bridge: FakeBridge) =>
+    bridge.sent.filter(
+      (message): message is Extract<NativeToWorkerMessage, { type: "refresh-ice" }> =>
+        message.type === "refresh-ice",
+    );
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(SERVER_START * 1_000);
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test("asks for fresh credentials an hour before expiry and hands them to the worker", async () => {
+    const { bridge, signal, transport } = await readyWithConfig(turnConfig(4 * 3_600, 1));
+    jest.advanceTimersByTime(3 * HOUR_MS - 1);
+    expect(configRequests(signal)).toHaveLength(0);
+
+    jest.advanceTimersByTime(1);
+    expect(configRequests(signal)).toHaveLength(1);
+    expect(refreshes(bridge)).toHaveLength(0);
+
+    // The fresh credential is applied on the live peer, not a rebuilt one.
+    signal.emit(turnConfig(4 * 3_600, 2, SERVER_START + 3 * 3_600));
+    expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
+    expect(refreshes(bridge)).toEqual([
+      {
+        v: 1,
+        type: "refresh-ice",
+        iceServers: [expect.objectContaining({ username: expect.stringMatching(/:user-2$/) })],
+        iceTransportPolicy: "all",
+      },
+    ]);
+
+    // And the next refresh is scheduled from the credential just applied.
+    jest.advanceTimersByTime(3 * HOUR_MS - 1);
+    expect(configRequests(signal)).toHaveLength(1);
+    jest.advanceTimersByTime(1);
+    expect(configRequests(signal)).toHaveLength(2);
+    transport.close();
+  });
+
+  test("uses half the lifetime as the lead when the lifetime is short", async () => {
+    const { signal, transport } = await readyWithConfig(turnConfig(600, 1));
+    jest.advanceTimersByTime(300 * 1_000 - 1);
+    expect(configRequests(signal)).toHaveLength(0);
+    jest.advanceTimersByTime(1);
+    expect(configRequests(signal)).toHaveLength(1);
+    transport.close();
+  });
+
+  test("a timer that fires late — the phone slept past expiry — still refreshes", async () => {
+    const { bridge, signal, transport } = await readyWithConfig(turnConfig(4 * 3_600, 1));
+    // The wall clock jumps five hours in one step, as it does on wake; the
+    // timer then fires long after the moment it was armed for.
+    jest.setSystemTime((SERVER_START + 5 * 3_600) * 1_000);
+    jest.advanceTimersByTime(3 * HOUR_MS);
+    expect(configRequests(signal)).toHaveLength(1);
+    signal.emit(turnConfig(4 * 3_600, 2, SERVER_START + 5 * 3_600));
+    expect(refreshes(bridge)).toHaveLength(1);
+    transport.close();
+  });
+
+  test("a timer clamped at setTimeout's ceiling re-arms instead of refreshing early", async () => {
+    const { signal, transport } = await readyWithConfig(turnConfig(40 * 24 * 3_600, 1));
+    jest.advanceTimersByTime(2 ** 31 - 1);
+    expect(configRequests(signal)).toHaveLength(0);
+    jest.advanceTimersByTime(40 * 24 * HOUR_MS - HOUR_MS - (2 ** 31 - 1));
+    expect(configRequests(signal)).toHaveLength(1);
+    transport.close();
+  });
+
+  test("retries with backoff when no fresher credential arrives, and logs it", async () => {
+    const warning = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { bridge, signal, transport } = await readyWithConfig(turnConfig(4 * 3_600, 1));
+      jest.advanceTimersByTime(3 * HOUR_MS);
+      expect(configRequests(signal)).toHaveLength(1);
+
+      // Nothing comes back: the request times out, and the retry waits 5 s.
+      jest.advanceTimersByTime(2_000);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("rtc.config did not arrive"));
+      jest.advanceTimersByTime(5_000 - 1);
+      expect(configRequests(signal)).toHaveLength(1);
+      jest.advanceTimersByTime(1);
+      expect(configRequests(signal)).toHaveLength(2);
+
+      // A credential that dies sooner than the one the peer presents — the
+      // server's lifetime was cut to half an hour — is not a refresh either.
+      signal.emit(turnConfig(1_800, 1, SERVER_START + 3 * 3_600 + 7));
+      expect(refreshes(bridge)).toHaveLength(0);
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining("the server's credential is no newer"),
+      );
+      jest.advanceTimersByTime(10_000);
+      expect(configRequests(signal)).toHaveLength(3);
+
+      // The fresh one lands, the worker gets it, and the backoff resets.
+      signal.emit(turnConfig(4 * 3_600, 2, SERVER_START + 3 * 3_600));
+      expect(refreshes(bridge)).toHaveLength(1);
+      transport.close();
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  test("clears the schedule on close and never refreshes a closed transport", async () => {
+    const { bridge, signal, transport } = await readyWithConfig(turnConfig(4 * 3_600, 1));
+    transport.close();
+    const sentBefore = bridge.sent.length;
+    jest.advanceTimersByTime(5 * HOUR_MS);
+    expect(configRequests(signal)).toHaveLength(0);
+    expect(bridge.sent).toHaveLength(sentBefore);
+  });
+
+  test("schedules nothing for a STUN-only deployment", async () => {
+    const { signal, transport } = await readyWithConfig({
+      type: "rtc.config",
+      enabled: true,
+      binding_nonce_required: true,
+      ice_servers: [{ urls: "stun:stun.example" }],
+      now: SERVER_START,
+    });
+    jest.advanceTimersByTime(30 * 24 * HOUR_MS);
+    expect(configRequests(signal)).toHaveLength(0);
+    transport.close();
+  });
+
+  test("falls back to the username's expiry when the server sends no window", async () => {
+    const { now: _now, expires_at: _expiresAt, ...frame } = turnConfig(4 * 3_600, 1);
+    const { signal, transport } = await readyWithConfig(frame);
+    jest.advanceTimersByTime(3 * HOUR_MS - 1);
+    expect(configRequests(signal)).toHaveLength(0);
+    jest.advanceTimersByTime(1);
+    expect(configRequests(signal)).toHaveLength(1);
+    transport.close();
+  });
+});
+
 describe("SessionTransport connect failures", () => {
   test("surfaces a permanent signalling refusal immediately", async () => {
     const bridge = new FakeBridge();
