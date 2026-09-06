@@ -103,17 +103,20 @@ const MDNS_CANDIDATE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
 const DATA_CHANNEL_MESSAGE_BYTES: usize = 16 * 1024;
 const DATA_CHANNEL_BUFFER_LOW: usize = 64 * 1024;
 const DATA_CHANNEL_BUFFER_HIGH: usize = 512 * 1024;
-/// The UDP range every ICE socket is pinned to, so a host firewall can admit
-/// direct candidates with one rule. It is also the daemon's session budget:
-/// each peer connection binds three wildcard sockets (the STUN and TURN
-/// clients) plus one host-candidate socket per interface
-/// [`interface_is_allowed`] admits — and VPN interfaces are admitted on
-/// purpose, since a peer on the same VPN reaches the daemon through them
-/// without the relay. A peer that finds every port taken gathers nothing at
-/// all — no host, no reflexive, no relay — and never starts ICE. At 101
-/// ports a laptop with Wi-Fi and its four or five tunnel interfaces held
-/// about a dozen sessions before the rest sat at "Connecting" forever
-/// (#80). A thousand ports holds a hundred and more on the same laptop.
+/// The UDP range every host and server-reflexive ICE socket is pinned to, so
+/// a host firewall can admit direct candidates with one rule. It is also the
+/// budget for direct paths: each peer connection binds one server-reflexive
+/// socket per STUN/TURN URL per address family that resolves, plus one host
+/// socket per address of every interface [`interface_is_allowed`] admits —
+/// VPN interfaces on purpose, since a peer on the same VPN reaches the daemon
+/// through them. Measured on a two-interface Linux host: five a peer. The
+/// TURN client binds an OS-ephemeral port outside the range, so a peer that
+/// finds the range full is relay-only rather than dead; the relay then pays
+/// for what direct would have carried (#71, #80). At 101 ports a laptop with
+/// Wi-Fi and its tunnel interfaces went relay-only at about a dozen sessions;
+/// a thousand holds a hundred and more. What makes a peer gather nothing at
+/// all is `bind()` failing outright, which is the open-file limit, raised at
+/// startup in `main.rs`.
 const RTC_UDP_PORT_MIN: u16 = 50_000;
 const RTC_UDP_PORT_MAX: u16 = 50_999;
 static RTC_NETWORK_POLICY_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -2208,7 +2211,7 @@ fn install_data_channel_handler(
     // Handlers a peer owns must never own the peer back. A strong handle in a
     // closure the peer stores is a reference cycle `close()` does not break:
     // the peer is never dropped, and a peer that is never dropped never gives
-    // its ICE sockets back — 101 pinned ports, lost one browser reconnect at
+    // its ICE sockets back — the pinned ports, lost one browser reconnect at
     // a time, until every new session can only reach the TURN relay.
     let handler_pc = Arc::downgrade(pc);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
@@ -3872,13 +3875,14 @@ fn setting_engine() -> Result<SettingEngine> {
     Ok(settings)
 }
 
-/// Which interfaces earn a host candidate, and so a socket per peer from the
-/// pinned range. Container and virtual-machine bridges and Apple's private
-/// link interfaces never carry a peer. VPN interfaces (`utun`, WireGuard,
-/// Tailscale) do: a peer on the same VPN reaches the daemon through them
-/// directly, and `network_policy_drops_link_local_and_virtual_noise_but_keeps_vpns`
-/// pins that. They cost a port per peer each, which is what the range above
-/// is sized for.
+/// Which interfaces earn host candidates, and so a socket per address per
+/// peer from the pinned range. Container and virtual-machine bridges and
+/// Apple's private link interfaces never carry a peer. VPN interfaces
+/// (`utun`, WireGuard, Tailscale) do: a peer on the same VPN reaches the
+/// daemon through them directly, and
+/// `network_policy_drops_link_local_and_virtual_noise_but_keeps_vpns` pins
+/// that. They cost a port per peer each, which is what the range above is
+/// sized for.
 fn interface_is_allowed(name: &str) -> bool {
     ![
         "docker", "br-", "veth", "awdl", "llw", "anpi", "bridge", "vmnet", "virbr", "zt",
@@ -4176,7 +4180,7 @@ mod tests {
             .collect()
     }
 
-    /// Every ICE socket this daemon binds lives in the 101-port range
+    /// Every host and server-reflexive ICE socket this daemon binds lives in
     /// [`RTC_UDP_PORT_MIN`]..=[`RTC_UDP_PORT_MAX`], shared by every peer it
     /// ever answers. A closed peer that keeps its sockets bound exhausts the
     /// range within a few browser reconnects, after which no new peer can
@@ -4211,22 +4215,6 @@ mod tests {
         pc.close().await.unwrap();
         drop(pc);
         assert_ports_released(&addrs, "closed and dropped peer").await;
-    }
-
-    /// The range is the session budget (#80): three wildcard sockets per peer
-    /// plus one per admitted interface, and a Mac admits Wi-Fi and four or
-    /// five `utun`s, so about eight ports a session there. The range must
-    /// hold a hundred of those, with room for a second device on the host.
-    #[test]
-    fn the_pinned_range_holds_a_laptop_of_sessions() {
-        let ports = u32::from(RTC_UDP_PORT_MAX - RTC_UDP_PORT_MIN) + 1;
-        assert_eq!(ports, 1_000, "the documented range is 50000–50999");
-        let per_session_on_a_mac = 3 + 5;
-        assert!(
-            ports / per_session_on_a_mac >= 100,
-            "{ports} ports hold {} sessions",
-            ports / per_session_on_a_mac
-        );
     }
 
     async fn assert_ports_released(addrs: &[std::net::SocketAddr], what: &str) {

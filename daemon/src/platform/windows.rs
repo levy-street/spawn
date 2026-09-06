@@ -1382,3 +1382,12 @@ mod tests {
         );
     }
 }
+
+/// Windows has no per-process soft limit on sockets or handles that a daemon
+/// could exhaust at a laptop's worth of sessions, so there is nothing to raise.
+pub fn raise_open_file_limit(_target: u64) -> io::Result<super::OpenFileLimit> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "open-file limits are not a Windows concept",
+    ))
+}

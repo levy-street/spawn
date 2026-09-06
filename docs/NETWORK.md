@@ -56,16 +56,21 @@ Allow both listener traffic and relay allocations in the host/cloud firewall:
 - UDP 50000–50999 inbound on each daemon machine where LAN/direct WebRTC is
   expected. This is the daemon's ephemeral candidate range, not coturn's relay
   range. Host firewalls may restrict it to trusted LANs when off-LAN traffic
-  can fall back to TURN. The range is also the daemon's session budget: every
-  peer connection binds three sockets for STUN and TURN plus one per
-  interface that carries a host candidate — LAN links and VPN interfaces
-  alike, since a peer on the same VPN reaches the daemon through them — and
-  a peer that finds no free port gathers no candidate at all. A Mac with
-  Wi-Fi and its usual four or five `utun` interfaces spends about eight ports
-  a session. Releases before 2026-09-07 pinned 50000–50100, about a dozen
-  sessions on such a Mac; a firewall rule for the old range still admits the
-  first 101 ports, and peers on the rest fall back to reflexive or relay
-  paths until the rule is widened.
+  can fall back to TURN. The range is also the budget for direct paths: every
+  peer connection binds one server-reflexive socket per STUN/TURN URL per
+  address family, plus one host socket per address of every interface that
+  carries a host candidate — LAN links and VPN interfaces alike, since a peer
+  on the same VPN reaches the daemon through them. Five a peer on a
+  two-interface Linux host; more on a Mac with its `utun`s. A peer that finds
+  the range full still reaches the TURN relay (the TURN client binds outside
+  the range), so a full range means relay-only sessions, and the relay pays
+  for them. Daemons before the 50000–50999 range pinned 50000–50100 and went
+  relay-only at about a dozen sessions on such a Mac. Ports are chosen at a
+  random offset within the range, so a firewall rule written for the old one
+  admits only about one socket in ten: re-create the rule for the new range
+  when the daemon updates. What stops a peer gathering anything at all is the
+  process's open-file limit; the daemon raises its own at startup and the
+  service units it writes set `LimitNOFILE` / `NumberOfFiles`.
 
 For example, a daemon host using UFW can admit direct candidates from a
 `192.168.1.0/24` LAN with:
@@ -87,7 +92,9 @@ blocked, the daemon can still use ordinary outbound UDP to the configured TURN
 service.
 
 An administrator who explicitly wants direct candidates on a Private network
-may add this program-scoped rule for the installed daemon:
+may add this program-scoped rule for the installed daemon. A rule created
+under the earlier 50000–50100 guidance admits about one socket in ten of the
+current range; remove it and create it again for 50000–50999:
 
 ```powershell
 $spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'

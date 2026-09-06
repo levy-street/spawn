@@ -355,9 +355,13 @@ users goes through the rolling prebuilt release — read `docs/RELEASE.md`.
 WebRTC operational notes: `webrtc-ice` 0.17 cannot use TURN over TCP/TLS, so
 the offered ICE list must include a UDP `turn:` URL. Direct LAN ICE uses UDP
 ports 50000–50999 (`RTC_UDP_PORT_MIN..=RTC_UDP_PORT_MAX` in `src/rtc.rs`);
-allow that inbound range in the host firewall. The range is the per-host
-session budget — three sockets per peer plus one per interface
-`interface_is_allowed` admits, VPN interfaces included by design. For temporary
+allow that inbound range in the host firewall. The range is the budget for
+direct paths — one server-reflexive socket per ICE URL per address family
+plus one host socket per address of every interface `interface_is_allowed`
+admits, VPN interfaces included by design; a full range means relay-only
+peers, since the TURN client binds outside it. The open-file limit is the
+ceiling that stops a peer gathering anything: `main.rs` raises it at startup
+and `service.rs` writes `LimitNOFILE` / `NumberOfFiles` into the units. For temporary
 SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
 

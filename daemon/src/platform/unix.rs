@@ -389,3 +389,35 @@ pub fn executable_variant(live: &Path, tag: &str) -> io::Result<PathBuf> {
     variant.push(OsStr::new(tag));
     Ok(live.with_file_name(variant))
 }
+
+/// Raise this process's soft limit on open files to `target`, or to the hard
+/// limit when that is lower, and never lower it. Every peer connection the
+/// daemon answers costs a handful of descriptors — one per ICE socket, and a
+/// peer whose `bind()` fails with EMFILE gathers no candidate of any type and
+/// never starts ICE — while systemd starts a user service at 1024 and launchd
+/// starts an agent at 256. The service units set their own limits for new
+/// installs; this covers every host whose unit predates them.
+pub fn raise_open_file_limit(target: u64) -> io::Result<super::OpenFileLimit> {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    let limit = getrlimit(Resource::Nofile);
+    let before = limit.current.unwrap_or(u64::MAX);
+    let ceiling = limit.maximum.unwrap_or(u64::MAX);
+    let wanted = target.min(ceiling);
+    let after = if wanted > before {
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(wanted),
+                maximum: limit.maximum,
+            },
+        )?;
+        wanted
+    } else {
+        before
+    };
+    Ok(super::OpenFileLimit {
+        before,
+        after,
+        maximum: limit.maximum,
+    })
+}
