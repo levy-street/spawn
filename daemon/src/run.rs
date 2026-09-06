@@ -485,6 +485,8 @@ fn raise_open_file_limit() {
             before = limit.before,
             after = limit.after,
             hard = %ceiling(&limit),
+            target = OPEN_FILE_LIMIT_TARGET,
+            refused = limit.refused,
             "raised the open-file limit for this daemon"
         ),
         Ok(limit) if limit.refused => tracing::debug!(

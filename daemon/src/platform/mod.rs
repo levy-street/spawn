@@ -63,11 +63,24 @@ mod tests {
             getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX),
             soft
         );
-        // Asking for more than the hard limit allows raises to the hard
-        // limit and reports it as the ceiling, not as a refusal.
-        let capped = super::raise_open_file_limit(hard.saturating_add(1)).unwrap();
-        assert_eq!(capped.after, hard.max(soft).min(hard), "{capped:?}");
-        assert!(!capped.refused, "{capped:?}");
+        // Asking for more than a finite hard limit allows raises to the hard
+        // limit and reports it as the ceiling, not as a refusal. An unlimited
+        // hard limit (every Mac by default) has no such ceiling to hit: a
+        // request above RLIM_INFINITY is EINVAL there, so the probe is skipped.
+        if let Some(finite_hard) = current.maximum {
+            let capped = super::raise_open_file_limit(finite_hard + 1).unwrap();
+            assert_eq!(capped.after, finite_hard, "{capped:?}");
+            assert!(!capped.refused, "{capped:?}");
+        }
+        // Leave the process as it was found; the other tests share it.
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(soft),
+                maximum: current.maximum,
+            },
+        )
+        .unwrap();
     }
 
     use std::path::Path;
