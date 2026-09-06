@@ -32,18 +32,32 @@
 //! serialized stream into a fresh emulator yields an identical screen — cells,
 //! attributes, cursor, modes, margins, charsets.
 //!
-//! Design note: alacritty's `Term` keeps scroll region, charsets, and tab
-//! stops private. Rather than a fragile delegation wrapper around its ~90
-//! `Handler` methods, a second `Processor` drives a tiny shadow handler that
-//! records only those states (every other callback is a vte-provided no-op).
-//! Both parsers consume the same bytes, so their views cannot drift.
+//! Design note: alacritty's `Term` keeps the scroll region, the active
+//! charset index (the SI/SO shift state) and tab stops private. Rather than
+//! a fragile delegation wrapper around its ~90 `Handler` methods, a second
+//! `Processor` drives a tiny shadow handler that records only those states
+//! (every other callback is a vte-provided no-op). Both parsers consume the
+//! same bytes, so their views cannot drift. The G0–G3 designations are read
+//! from the grid cursor, where alacritty keeps them per screen and saves and
+//! restores them with DECSC/DECRC, exactly as xterm does.
+//!
+//! Every glyph the emulator paints is already mapped through the app's
+//! character sets, so a checkpoint and the worker's replay head first return
+//! the consumer to ASCII (`ESC ( B ESC ) B SI`, [`RETURN_TO_ASCII`]) and the
+//! checkpoint's tail re-arms the app's designations and shift state at the
+//! end. Without the return, a consumer the app left mid line-drawing mapped
+//! the painted glyphs a second time (#61).
 //!
 //! Known v1 limitations, all self-healing on the app's next full repaint:
 //! custom tab stops are not serialized (would need cursor tracking in the
-//! shadow), and DECSC saved-cursor state restores position but not pen/charset.
+//! shadow); the DECSC register restores position and pen but not character
+//! sets, so a consumer's DECRC returns to ASCII; G2/G3 are designated
+//! but never made active, since this profile emits no locking shift to them;
+//! and while the alternate screen is active the primary screen's own
+//! designations are not carried, so a consumer leaving it returns to ASCII.
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Charsets, Cursor, Dimensions};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
@@ -66,6 +80,25 @@ const HISTORY_DRAIN_CAP: usize = 10_000;
 /// Drain stride within one `feed_output` call: bounds both the resident
 /// history ring and the size of any single committed-lines batch.
 const FEED_DRAIN_STRIDE: usize = 2 * 1024;
+
+/// `ESC ( B ESC ) B SI`: designate ASCII to G0 and G1 and shift in. Every
+/// glyph the emulator paints — the screen chunk and the committed lines alike
+/// — is already mapped, so a consumer the app left in a line-drawing set
+/// would map it a second time. Opens the checkpoint baseline and the worker's
+/// replay head; the clients' reseed clear leads with the same bytes.
+pub const RETURN_TO_ASCII: &[u8] = b"\x1b(B\x1b)B\x0f";
+
+/// Painting baseline: default pen, ASCII character sets, no margins,
+/// absolute addressing, autowrap on (paint_screen relies on natural
+/// wrapping), cursor hidden while it moves. There is deliberately no ED (2J):
+/// paint_screen covers every row (content or EL), which makes the state
+/// stream idempotent when written over an already-populated terminal — it
+/// can never scroll stale content into scrollback, so checkpoints may appear
+/// mid-stream. There is also deliberately no `?1049l`/alt normalization
+/// prefix: the client detects "is an alt app active" from these bytes, and a
+/// spurious 1049 toggle in every checkpoint poisons that detection. The
+/// charset return is [`RETURN_TO_ASCII`] byte for byte (a test pins it).
+const BASELINE: &[u8] = b"\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?7h\x1b[?25l";
 
 /// History effects observed while feeding PTY output, in stream order.
 pub enum HistoryEvent {
@@ -125,7 +158,7 @@ impl WipeScanner {
 struct Shadow {
     /// 1-based (top, bottom) margins when narrower than the full screen.
     margins: Option<(u16, u16)>,
-    charsets: [StandardCharset; 4],
+    /// The shift state: which of G0–G3 the app's bytes currently map through.
     active_charset: CharsetIndex,
     rows: u16,
 }
@@ -134,7 +167,6 @@ impl Shadow {
     fn new(rows: u16) -> Self {
         Self {
             margins: None,
-            charsets: [StandardCharset::Ascii; 4],
             active_charset: CharsetIndex::G0,
             rows,
         }
@@ -160,10 +192,6 @@ impl Handler for Shadow {
         } else {
             Some((top as u16, bottom as u16))
         };
-    }
-
-    fn configure_charset(&mut self, index: CharsetIndex, charset: StandardCharset) {
-        self.charsets[index as usize] = charset;
     }
 
     fn set_active_charset(&mut self, index: CharsetIndex) {
@@ -355,9 +383,13 @@ impl Emulator {
     /// the fidelity contract makes that repair lossless, and
     /// `serialize_is_stable` verifies it.
     pub fn serialize(&mut self) -> Vec<u8> {
-        // Everything the swaps below can disturb is captured up front.
+        // Everything the swaps below can disturb is captured up front. The
+        // character sets in particular: the baseline mirrored into self on the
+        // alt path returns them to ASCII, and the tail must re-arm the app's.
         let mode = *self.term.mode();
         let margins = self.shadow.margins;
+        let charsets = self.term.grid().cursor.charsets;
+        let active_charset = self.shadow.active_charset;
         let cursor = self.term.grid().cursor.point;
         let needs_wrap = self.term.grid().cursor.input_needs_wrap;
         let wrap_cell = self.term.grid()[cursor.line][cursor.column].clone();
@@ -369,26 +401,14 @@ impl Emulator {
         let mut active_paint = Vec::with_capacity(4096);
         paint_screen(&self.term, &mut active_paint);
 
-        // Painting baseline: default pen, no margins, absolute addressing,
-        // autowrap on (paint_screen relies on natural wrapping). There is
-        // deliberately no ED (2J): paint_screen covers every row (content or
-        // EL), which makes the state stream idempotent when written over an
-        // already-populated terminal — it can never scroll stale content into
-        // scrollback, so checkpoints may appear mid-stream. There is also
-        // deliberately no `?1049l`/alt normalization prefix: the client
-        // detects "is an alt app active" from these bytes, and a spurious
-        // 1049 toggle in every checkpoint poisons that detection.
-        const BASELINE: &[u8] = b"\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[?25l";
         let mut out: Vec<u8> = Vec::with_capacity(8192);
         out.extend_from_slice(BASELINE);
 
         let alt_active = mode.contains(TermMode::ALT_SCREEN);
         if alt_active {
-            // Mirror the baseline in self: the primary grid is the source of
-            // the paint, not its target.
-            self.feed(BASELINE);
             // Paint the primary screen first so leaving the alt screen after
-            // reattach reveals the right content.
+            // reattach reveals the right content. The primary grid is the
+            // source of that paint, not its target: nothing here is fed back.
             self.term.swap_alt();
             paint_screen(&self.term, &mut out);
             // Primary's DECSC register (its saved cursor is clobbered in
@@ -396,6 +416,13 @@ impl Emulator {
             emit_saved_cursor(&mut out, &self.term.grid().saved_cursor);
             emit_cup(&mut out, cursor_point(&self.term));
             self.term.swap_alt(); // wipes the alt grid; the tail repairs it
+                                  // Mirror the baseline in self now that the alt grid is the target
+                                  // again. Swapping back copies the primary cursor — pen, character
+                                  // sets, pending wrap — over the alt grid's, so a reset applied
+                                  // before the swaps would not survive them, and the tail, which
+                                  // only re-arms what differs from the baseline, would leave the
+                                  // primary's sets behind in self.
+            self.feed(BASELINE);
             out.extend_from_slice(b"\x1b[?1049h");
         }
 
@@ -437,7 +464,7 @@ impl Emulator {
         let mut pen = Pen::default();
         pen.apply_cell(&mut tail, &template);
 
-        self.finish_tail(out, tail, mode, alt_active)
+        self.finish_tail(out, tail, mode, alt_active, charsets, active_charset)
     }
 
     fn finish_tail(
@@ -446,8 +473,10 @@ impl Emulator {
         mut tail: Vec<u8>,
         mode: TermMode,
         alt_active: bool,
+        charsets: Charsets,
+        active_charset: CharsetIndex,
     ) -> Vec<u8> {
-        self.append_modes(&mut tail, mode);
+        self.append_modes(&mut tail, mode, charsets, active_charset);
         out.extend_from_slice(&tail);
         if alt_active {
             self.feed(&tail);
@@ -455,7 +484,13 @@ impl Emulator {
         out
     }
 
-    fn append_modes(&mut self, out: &mut Vec<u8>, mode: TermMode) {
+    fn append_modes(
+        &mut self,
+        out: &mut Vec<u8>,
+        mode: TermMode,
+        charsets: Charsets,
+        active_charset: CharsetIndex,
+    ) {
         // Modes.
         if !mode.contains(TermMode::LINE_WRAP) {
             out.extend_from_slice(b"\x1b[?7l");
@@ -494,15 +529,13 @@ impl Emulator {
             out.extend_from_slice(b"\x1b[?2004h");
         }
 
-        // Charset designations and the active set (grid cells store already
-        // mapped glyphs, so painting above never needed these).
-        for (i, charset) in self.shadow.charsets.iter().enumerate() {
-            if *charset != StandardCharset::Ascii {
-                let designator = b"()*+"[i];
-                out.extend_from_slice(&[0x1b, designator, b'0']);
-            }
-        }
-        match self.shadow.active_charset {
+        // Charset designations and the shift state, as the app left them and
+        // as captured before the baseline. Grid cells store already-mapped
+        // glyphs, so the paint above ran in ASCII; only now, with nothing
+        // left to paint, are the app's sets re-armed, so its next bytes map
+        // in the consumer exactly as they do here.
+        emit_designations(out, &charsets, b'0');
+        match active_charset {
             CharsetIndex::G0 => {}
             CharsetIndex::G1 => out.push(0x0e), // SO
             // G2/G3 have no simple locking shift in this profile; apps that
@@ -563,11 +596,28 @@ fn cursor_point<T>(term: &Term<T>) -> Point {
 
 /// Reconstruct a DECSC register: position with the saved pen, save, and leave
 /// the pen for the caller to overwrite (every later emission resets it).
-fn emit_saved_cursor(out: &mut Vec<u8>, saved: &alacritty_terminal::grid::Cursor<Cell>) {
+fn emit_saved_cursor(out: &mut Vec<u8>, saved: &Cursor<Cell>) {
     let mut pen = Pen::default();
     pen.apply_cell(out, &saved.template);
     emit_cup(out, saved.point);
     out.extend_from_slice(b"\x1b7");
+}
+
+/// Designate `final_byte` (`0` line drawing, `B` ASCII) to every slot of
+/// `charsets` that is not ASCII. Relative to a terminal at the baseline, `0`
+/// arms exactly the app's sets.
+fn emit_designations(out: &mut Vec<u8>, charsets: &Charsets, final_byte: u8) {
+    const SLOTS: [(CharsetIndex, u8); 4] = [
+        (CharsetIndex::G0, b'('),
+        (CharsetIndex::G1, b')'),
+        (CharsetIndex::G2, b'*'),
+        (CharsetIndex::G3, b'+'),
+    ];
+    for (index, designator) in SLOTS {
+        if charsets[index] != StandardCharset::Ascii {
+            out.extend_from_slice(&[0x1b, designator, final_byte]);
+        }
+    }
 }
 
 fn emit_cup(out: &mut Vec<u8>, point: Point) {
@@ -875,6 +925,10 @@ mod tests {
             "{context}: mode"
         );
         assert_eq!(a.shadow, b.shadow, "{context}: shadow");
+        assert_eq!(
+            ga.cursor.charsets, gb.cursor.charsets,
+            "{context}: charsets"
+        );
         let (ta, tb) = (&ga.cursor.template, &gb.cursor.template);
         assert_eq!(
             (ta.fg, ta.bg, ta.flags & PEN_FLAGS),
@@ -983,9 +1037,244 @@ mod tests {
 
     #[test]
     fn line_drawing_charset_round_trips() {
-        // lqk in DEC special graphics: ─ ─ ┐ ; glyphs are stored mapped.
+        // lqk in DEC special graphics: ┌ ─ ┐ ; glyphs are stored mapped.
         let (a, b) = round_trip(20, 4, b"\x1b(0lqk\x1b(Bplain\x0e");
         assert_same_state(&a, &b, "charset");
+    }
+
+    #[test]
+    fn baseline_opens_with_the_shared_return_to_ascii() {
+        // The screen chunk and the worker's replay head return a consumer to
+        // ASCII with the same bytes; pinning the baseline to the shared
+        // constant is what keeps the two from drifting.
+        assert!(BASELINE.starts_with(b"\x1b[0m"), "{BASELINE:?}");
+        assert!(
+            BASELINE[4..].starts_with(RETURN_TO_ASCII),
+            "the baseline's charset return is not RETURN_TO_ASCII: {BASELINE:?}"
+        );
+        assert_eq!(RETURN_TO_ASCII, b"\x1b(B\x1b)B\x0f");
+    }
+
+    /// A consumer the app left mid line-drawing: G0 and G1 designated to DEC
+    /// special graphics and shifted out — what the previous checkpoint's tail
+    /// or the app's own live bytes leave behind.
+    const CONSUMER_MID_LINE_DRAWING: &[u8] = b"\x1b(0\x1b)0\x0e";
+
+    #[test]
+    fn checkpoint_mid_line_drawing_paints_text_on_a_consumer_left_in_line_drawing() {
+        // #61: ncurses smacs mid-frame — the app designated line drawing, drew
+        // a box top, returned to ASCII for "p1", then designated line drawing
+        // again for the next box edge. The checkpoint lands there.
+        let mut a = Emulator::new(20, 4);
+        a.feed(b"\x1b(0lqk\x1b(Bp1\x1b(0");
+        let checkpoint = a.serialize();
+
+        let mut b = Emulator::new(20, 4);
+        b.feed(CONSUMER_MID_LINE_DRAWING);
+        b.feed(&checkpoint);
+        assert_eq!(
+            b.screen_text()[0],
+            "┌─┐p1",
+            "painted glyphs were mapped a second time: {:?}",
+            b.screen_text()
+        );
+        assert_same_state(&a, &b, "mid line-drawing checkpoint");
+
+        // The app carries on in its line-drawing set; the tail re-armed it in
+        // the consumer, so both draw the same edge.
+        for e in [&mut a, &mut b] {
+            e.feed(b"x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-checkpoint drift");
+        assert_eq!(b.screen_text()[0], "┌─┐p1│");
+
+        // The same over the alternate screen, where the baseline is mirrored
+        // into self and the tail repairs the alt grid.
+        let mut a = Emulator::new(20, 4);
+        a.feed(b"\x1b[?1049h\x1b[H\x1b(0lqk\x1b(Bp1\x1b(0");
+        let checkpoint = a.serialize();
+        let mut b = Emulator::new(20, 4);
+        b.feed(CONSUMER_MID_LINE_DRAWING);
+        b.feed(&checkpoint);
+        assert_eq!(b.screen_text()[0], "┌─┐p1", "{:?}", b.screen_text());
+        assert_same_state(&a, &b, "mid line-drawing checkpoint, alt screen");
+        for e in [&mut a, &mut b] {
+            e.feed(b"x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-checkpoint drift");
+        assert_eq!(b.screen_text()[0], "┌─┐p1│");
+    }
+
+    #[test]
+    fn replay_head_paints_history_as_text_on_a_consumer_left_in_line_drawing() {
+        // The reviewer's reproduction on #60: the previous screen ended in
+        // `ESC ( 0`, and the reseed's history `new abc` came back as glyphs.
+        // The worker's replay head now returns the consumer to ASCII before
+        // the committed lines, whether or not the client's clear did.
+        use super::super::scrollback::replay_head;
+        let mut c = Emulator::new(20, 4);
+        c.feed(CONSUMER_MID_LINE_DRAWING);
+        c.feed(b"\x1b[H\x1b[2J"); // a clear that returns no charset
+        let mut replay = replay_head(20, 4);
+        replay.extend_from_slice(b"\x1b[0mnew abc\r\n\x1b[0m");
+        c.feed(&replay);
+        assert_eq!(c.screen_text()[0], "new abc", "{:?}", c.screen_text());
+    }
+
+    #[test]
+    fn checkpoint_keeps_the_emulators_own_charsets() {
+        // The checkpoint must not move the emulator's own character sets: the
+        // app still believes its sets are armed, and the emulator is what
+        // renders its next bytes. Feeding the baseline's return into self
+        // before capturing the sets — the alt path mirrors the baseline —
+        // would leave the emulator in ASCII while the app draws boxes.
+        for alt in [false, true] {
+            let mut e = Emulator::new(20, 4);
+            if alt {
+                e.feed(b"\x1b[?1049h\x1b[H");
+            }
+            e.feed(b"\x1b(0\x1b)0\x0elqk");
+            let before = (e.term.grid().cursor.charsets, e.shadow.active_charset);
+            assert_eq!(before.1, CharsetIndex::G1, "precondition");
+            let checkpoint = e.serialize();
+            assert_eq!(
+                (e.term.grid().cursor.charsets, e.shadow.active_charset),
+                before,
+                "alt={alt}: the checkpoint changed the emulator's own charsets"
+            );
+
+            let mut b = Emulator::new(20, 4);
+            b.feed(&checkpoint);
+            for t in [&mut e, &mut b] {
+                t.feed(b"x");
+            }
+            assert_eq!(e.screen_text()[0], "┌─┐│", "alt={alt}: emulator");
+            assert_eq!(b.screen_text()[0], "┌─┐│", "alt={alt}: consumer");
+        }
+    }
+
+    #[test]
+    fn alt_screen_checkpoint_does_not_leak_the_primary_charsets_into_self() {
+        // alacritty keeps designations per screen and copies the primary
+        // cursor over the alt cursor when it swaps back. The baseline mirror
+        // must land after that copy, or the primary's line-drawing G1 would
+        // survive in the alt grid where the app had returned it to ASCII.
+        let mut e = Emulator::new(20, 4);
+        e.feed(b"\x1b)0"); // primary: G1 line drawing
+        e.feed(b"\x1b[?1049h\x1b[H\x1b)B\x0e"); // alt: G1 back to ASCII, SO
+        let before = e.term.grid().cursor.charsets;
+        let checkpoint = e.serialize();
+        assert_eq!(e.term.grid().cursor.charsets, before, "leaked");
+        let mut b = Emulator::new(20, 4);
+        b.feed(&checkpoint);
+        for t in [&mut e, &mut b] {
+            t.feed(b"x");
+        }
+        assert_eq!(e.screen_text()[0], "x", "emulator");
+        assert_eq!(b.screen_text()[0], "x", "consumer");
+    }
+
+    #[test]
+    fn serialize_is_stable_mid_line_drawing_on_the_alt_screen() {
+        // Serializing twice mid line-drawing, alt screen active, yields the
+        // same bytes: the mirror-and-repair leaves self exactly as it was.
+        let mut e = Emulator::new(20, 5);
+        e.feed(b"\x1b(0lqk\x1b7\r\nworld\x1b[?1049h\x1b[H\x1b)0\x0ealt");
+        let first = e.serialize();
+        let second = e.serialize();
+        assert_eq!(first, second);
+        let mut b = Emulator::new(20, 5);
+        b.feed(&first);
+        assert_same_state(&e, &b, "alt mid line-drawing");
+    }
+
+    /// Where the web workspace's xterm.js is: `SPAWN_XTERM_JS`, else the
+    /// sibling `web/node_modules`. Under CI a missing xterm fails rather than
+    /// skipping the only real-terminal proof in silence.
+    fn xterm_js() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("SPAWN_XTERM_JS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../web/node_modules/@xterm/xterm/lib/xterm.js")
+            });
+        if path.is_file() {
+            return Some(path);
+        }
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "the web workspace's xterm is not installed at {}",
+            path.display()
+        );
+        eprintln!("skipped: no xterm.js at {}", path.display());
+        None
+    }
+
+    /// Drive a real xterm.js, headless in node, through `writes` in order and
+    /// return the screen rows after each one (`tests/xterm_checkpoint_proof.js`).
+    fn real_xterm_rows(
+        xterm: &std::path::Path,
+        cols: u16,
+        rows: u16,
+        writes: &[&[u8]],
+    ) -> Vec<Vec<String>> {
+        use std::io::Write as _;
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/xterm_checkpoint_proof.js");
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let input = serde_json::json!({
+            "xterm": xterm,
+            "cols": cols,
+            "rows": rows,
+            "writes": writes.iter().map(|w| hex(w)).collect::<Vec<_>>(),
+        });
+        let mut node = std::process::Command::new("node")
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("node on PATH");
+        node.stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = node.wait_with_output().unwrap();
+        assert!(output.status.success(), "node exited {:?}", output.status);
+        serde_json::from_slice(&output.stdout).expect("rows as JSON")
+    }
+
+    #[test]
+    fn real_xterm_renders_a_mid_line_drawing_checkpoint_as_text() {
+        // The same scenario as the alacritty consumer above, against the
+        // xterm.js the browser and the phone's WebView render with.
+        let Some(xterm) = xterm_js() else { return };
+        use super::super::scrollback::replay_head;
+        let mut a = Emulator::new(20, 4);
+        a.feed(b"\x1b(0lqk\x1b(Bp1\x1b(0");
+        let checkpoint = a.serialize();
+        let mut reseed = b"\x1b[H\x1b[2J".to_vec(); // a clear with no charset return
+        reseed.extend_from_slice(&replay_head(20, 4));
+        reseed.extend_from_slice(b"\x1b[0mnew abc\r\n\x1b[0m");
+        let rows = real_xterm_rows(
+            &xterm,
+            20,
+            4,
+            &[CONSUMER_MID_LINE_DRAWING, &checkpoint, b"x", &reseed],
+        );
+        assert_eq!(
+            rows[1][0], "┌─┐p1",
+            "xterm mapped the painted glyphs again: {rows:?}"
+        );
+        assert_eq!(
+            rows[2][0], "┌─┐p1│",
+            "the tail did not re-arm line drawing: {rows:?}"
+        );
+        assert_eq!(
+            rows[3][0], "new abc",
+            "history came back as glyphs: {rows:?}"
+        );
     }
 
     #[test]

@@ -489,7 +489,7 @@ caller's `max_bytes` (failing closed rather than splitting a segment), then
 the worker frames the response as a **self-describing v2 stream**:
 
 ```
-CSI 8 ; rows ; cols t   APC "sp:h1" ST   <committed lines…>
+CSI 8 ; rows ; cols t   APC "sp:h1" ST   ESC ( B  ESC ) B  SI   <committed lines…>
 CSI 8 ; rows ; cols t   <emulator-serialized live screen repaint>
 ```
 
@@ -498,6 +498,15 @@ geometry-free flowing text. The screen repaint is synthesized from the live
 emulator at request time (idempotent: full-row painting, no ED), so the
 final chunk alone reconstructs the current screen — the browser's live
 terminal is still **seeded from the final chunk with zero resize calls**.
+Both sections first return the consumer to ASCII — the head right after
+the sentinel (`scrollback::replay_head`), the repaint in its baseline
+(`emulator::RETURN_TO_ASCII` in both): every glyph the worker paints is
+already mapped through the app's character sets, and a consumer the app's
+live bytes or the previous repaint's tail left in a line-drawing set would
+map it a second time (#61). The repaint's tail then re-arms the app's
+designations and shift state, so its next live bytes render alike in the
+worker and the consumer. The clients' reseed clear leads with the same
+bytes; the stream does not depend on it.
 The scrollback overlay, on recognizing the APC sentinel
 (`parseHistoryReplay` in `Terminal.tsx`), writes the history as flowing text
 at its own width (never geometry-walked, so nothing already rendered ever
@@ -521,7 +530,9 @@ document written once, not a render re-run.
 enabled but used only as a bounded drain window — `feed_output` serializes
 and clears it every stride; deep history lives in the encrypted line log)
 plus a shadow handler on a second vte parser for the states `Term` keeps
-private (margins, charsets). `serialize()` emits an ANSI stream
+private (margins, the SI/SO shift state; the G0–G3 designations are read
+from the grid cursor, where alacritty keeps them per screen and DECSC/DECRC
+save and restore them). `serialize()` emits an ANSI stream
 reconstructing cells, attributes, hyperlinks, wide/combining chars, cursor
 (including pending wrap), margins, modes, charsets, cursor style, and palette
 overrides — for both screens when the alternate screen is active — including

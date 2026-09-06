@@ -666,14 +666,18 @@ printf 'IDLE-DONE\n'
         let (_, bytes) = wire::decode_replay(&replay).unwrap();
         let text = String::from_utf8_lossy(bytes);
 
-        // Opens with the CURRENT geometry (after the resize) and the history
-        // sentinel that tells clients to render flowing lines, not raw bytes.
-        let sentinel =
-            String::from_utf8_lossy(spawnd::sessiond::scrollback::REPLAY_HISTORY_SENTINEL);
-        let head = format!("\x1b[8;40;120t{sentinel}");
+        // Opens with the CURRENT geometry (after the resize), the history
+        // sentinel that tells clients to render flowing lines, not raw bytes,
+        // and the return to ASCII that keeps those lines text (#61).
+        let head = String::from_utf8_lossy(&spawnd::sessiond::scrollback::replay_head(120, 40))
+            .into_owned();
+        assert!(
+            head.starts_with("\x1b[8;40;120t\x1b_sp:h1\x1b\\\x1b(B\x1b)B\x0f"),
+            "head shape: {head:?}"
+        );
         assert!(
             text.starts_with(&head),
-            "replay must open with geometry marker + history sentinel: {:?}",
+            "replay must open with geometry marker + history sentinel + return to ASCII: {:?}",
             &text[..text.len().min(40)]
         );
         // Exactly one more marker separates history from the screen repaint.
