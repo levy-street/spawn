@@ -672,7 +672,7 @@ fn cursor_point<T>(term: &Term<T>) -> Point {
 /// the terminal stays where the baseline put it. alacritty's register holds
 /// the designations and DECRC restores them; xterm.js's holds the table that
 /// was active at ESC 7 and DECRC reinstates it, so the shift matters there:
-/// an app that framed `ESC ) 0 SO … ESC 7` (the tmux/screen `smacs`) gets
+/// an app that framed `ESC ) 0 SO … ESC 7` (GNU screen's `smacs`) gets
 /// line drawing back from its ESC 8 on either consumer, and one that saved
 /// under SI with G0 line drawing and shifted out since is not misread. The
 /// pen is left for the caller to overwrite (every later emission resets it).
@@ -1397,7 +1397,7 @@ mod tests {
         assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
         assert_eq!(b.screen_text()[0], "┌─┐t", "{:?}", b.screen_text());
 
-        // The SO form (tmux/screen `smacs=^N`): G1 designated and shifted
+        // The SO form (GNU screen's `smacs=^N`): G1 designated and shifted
         // out at ESC 7. The register is rebuilt under that shift, so a
         // consumer whose register holds the active table restores it too.
         let (mut a, mut b) = round_trip(20, 4, b"\x1b)0\x0e\x1b7lqk");
@@ -1420,7 +1420,7 @@ mod tests {
         assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
         assert_eq!(b.screen_text()[0], "┌─┐", "{:?}", b.screen_text());
 
-        // Saved under SO and shifted in since (tmux-style smacs, DECSC,
+        // Saved under SO and shifted in since (screen-style smacs, DECSC,
         // rmacs): the register is rebuilt under SO, and the SI after its
         // ESC 7 is what puts the consumer back where the app is — the tail's
         // own shift only does so while the app is still shifted out.
