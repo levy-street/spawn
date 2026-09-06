@@ -1339,7 +1339,7 @@ examples. Two constraints are release blockers:
 `turns:` on 443 is recommended for browser/phone fallback after it has its own
 IP or an SNI/TURN-aware router; it is not enabled in current production.
 
-On Windows, `spawnd.exe` is the program that binds UDP 50000–50100. The
+On Windows, `spawnd.exe` is the program that binds UDP 50000–50999. The
 per-user installer does not elevate or silently create a firewall exception.
 Windows Firewall, Defender/SmartScreen, and Smart App Control are independent
 validation surfaces; Authenticode does not remove the firewall prompt. If
@@ -1352,7 +1352,7 @@ may add a program-scoped rule for the installed binary:
 $spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'
 New-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)' `
   -Direction Inbound -Action Allow -Profile Private -Program $spawnd `
-  -Protocol UDP -LocalPort 50000-50100
+  -Protocol UDP -LocalPort 50000-50999
 
 # Uninstall or rollback:
 Remove-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)'
