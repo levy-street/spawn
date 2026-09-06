@@ -74,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
     init_tracing(cli.verbose);
-    raise_open_file_limit();
+    // Only the daemon proper answers peers; the CLI subcommands keep the
+    // shell's limit and its clean output.
+    if matches!(cli.command, Command::Run(_) | Command::Login(_)) {
+        raise_open_file_limit();
+    }
 
     let result = match cli.command {
         Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
@@ -161,16 +165,27 @@ fn detach_background_console() {}
 const OPEN_FILE_LIMIT_TARGET: u64 = 65_536;
 
 fn raise_open_file_limit() {
+    let ceiling = |limit: &platform::OpenFileLimit| {
+        limit
+            .maximum
+            .map_or_else(|| "unlimited".to_string(), |maximum| maximum.to_string())
+    };
     match platform::raise_open_file_limit(OPEN_FILE_LIMIT_TARGET) {
         Ok(limit) if limit.after > limit.before => tracing::info!(
             before = limit.before,
             after = limit.after,
-            maximum = limit.maximum,
+            hard = %ceiling(&limit),
             "raised the open-file limit for this daemon"
+        ),
+        Ok(limit) if limit.after < OPEN_FILE_LIMIT_TARGET => tracing::debug!(
+            current = limit.after,
+            hard = %ceiling(&limit),
+            target = OPEN_FILE_LIMIT_TARGET,
+            "the hard limit caps the open-file limit below the target"
         ),
         Ok(limit) => tracing::debug!(
             current = limit.after,
-            maximum = limit.maximum,
+            hard = %ceiling(&limit),
             "the open-file limit already meets the target"
         ),
         Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
