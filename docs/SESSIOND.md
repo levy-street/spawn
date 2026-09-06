@@ -506,7 +506,10 @@ live bytes or the previous repaint's tail left in a line-drawing set would
 map it a second time (#61). The repaint's tail then re-arms the app's
 designations and shift state, so its next live bytes render alike in the
 worker and the consumer. The clients' reseed clear leads with the G0, G1
-and SI part of the same return; the stream does not depend on it.
+and SI part of the same return; the stream does not depend on it. Live
+`history_delta` batches carry no return of their own (nothing consumes
+them yet): a client that appends them into a terminal the app is drawing
+on must return it to ASCII first and re-arm the app's sets after.
 The scrollback overlay, on recognizing the APC sentinel
 (`parseHistoryReplay` in `Terminal.tsx`), writes the history as flowing text
 at its own width (never geometry-walked, so nothing already rendered ever
@@ -530,9 +533,12 @@ document written once, not a render re-run.
 enabled but used only as a bounded drain window — `feed_output` serializes
 and clears it every stride; deep history lives in the encrypted line log)
 plus a shadow handler on a second vte parser for the states `Term` keeps
-private (margins, the SI/SO shift state; the G0–G3 designations are read
-from the grid cursor, where alacritty keeps them per screen and DECSC/DECRC
-save and restore them). `serialize()` emits an ANSI stream
+private (margins, the SI/SO shift state, and the shift each screen's DECSC
+register was saved under — alacritty's register has no room for it, and an
+xterm.js consumer's register holds the table that shift selected; the
+G0–G3 designations are read from the grid cursor, where alacritty keeps
+them per screen and DECSC/DECRC save and restore them). `serialize()`
+emits an ANSI stream
 reconstructing cells, attributes, hyperlinks, wide/combining chars, cursor
 (including pending wrap), margins, modes, charsets, cursor style, and palette
 overrides — for both screens when the alternate screen is active — including
