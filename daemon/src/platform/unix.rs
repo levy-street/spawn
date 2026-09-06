@@ -404,7 +404,8 @@ const OPEN_FILE_LIMIT_FALLBACK: u64 = 10_240;
 /// starts an agent at 256. The service units set their own limits for new
 /// installs; this covers every host whose unit predates them. A kernel that
 /// refuses the target (older macOS, with the hard limit unlimited but its own
-/// maximum lower) gets a second ask at [`OPEN_FILE_LIMIT_FALLBACK`]; on macOS
+/// maximum lower) gets a second ask at [`OPEN_FILE_LIMIT_FALLBACK`] when it
+/// holds less than that, and keeps what it holds otherwise; on macOS
 /// 11 and later the kernel accepts any value and enforces its maximum at use.
 pub fn raise_open_file_limit(target: u64) -> io::Result<super::OpenFileLimit> {
     use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};

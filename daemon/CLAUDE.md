@@ -364,8 +364,7 @@ ceiling that stops a peer gathering anything: `run.rs` raises the soft limit
 when the daemon starts to run, and `service.rs` writes soft-only limits into
 the units (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`) —
 never a hard limit, which every shell in a terminal would inherit. For
-temporary
-SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
+temporary SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
 
 `spawn-worker --version` prints the same build/tree identity stamped into

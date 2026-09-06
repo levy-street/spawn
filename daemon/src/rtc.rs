@@ -115,8 +115,8 @@ const DATA_CHANNEL_BUFFER_HIGH: usize = 512 * 1024;
 /// for what direct would have carried (#71, #80). At 101 ports a laptop with
 /// Wi-Fi and its tunnel interfaces went relay-only at about a dozen sessions;
 /// a thousand holds a hundred and more. What makes a peer gather nothing at
-/// all is `bind()` failing outright, which is the open-file limit, raised at
-/// startup in `main.rs`.
+/// all is `bind()` failing outright, which is the open-file limit, raised when
+/// the daemon starts to run, in `run.rs`.
 const RTC_UDP_PORT_MIN: u16 = 50_000;
 const RTC_UDP_PORT_MAX: u16 = 50_999;
 static RTC_NETWORK_POLICY_LOGGED: AtomicBool = AtomicBool::new(false);
