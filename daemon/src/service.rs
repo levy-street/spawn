@@ -603,10 +603,10 @@ pub fn user_linger_enabled() -> Option<bool> {
             .args(["show-user", &user, "-p", "Linger", "--value"])
             .output()
             .ok()?;
-        return output
+        output
             .status
             .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim() == "yes");
+            .then(|| String::from_utf8_lossy(&output.stdout).trim() == "yes")
     }
     #[cfg(not(target_os = "linux"))]
     {

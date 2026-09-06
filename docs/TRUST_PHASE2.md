@@ -51,12 +51,12 @@ not proof that old plaintext has left disks, databases, Redis, or backups.
   master. Current source therefore has no server-visible host filesystem path;
   host paths, entry metadata, file bytes, hashes, and detailed filesystem
   errors remain endpoint-to-endpoint.
-- Merged master still sends tool checks and installs through server↔daemon
-  control frames. Installer `output` and `error` can contain arbitrary
-  commands, paths, and secrets;
-  `HostToolPolicy.last_auto_update_error` persists a detailed error derived
-  from the result. P2-HOST-03A has an E2E implementation candidate under
-  independent review; it is not merged and the legacy route remains.
+- Tool checks still use server↔daemon control frames and execute
+  server-selected binaries. Installation is now refused and server-driven
+  agent auto-update is disabled as containment for #63. Historical install
+  output/errors and policy data can still contain commands, paths, and secrets.
+  P2-HOST-03A has an E2E implementation candidate under independent review;
+  it is not merged. See `DAEMON_COMMAND_AUTHORITY.md`.
 - REST and WebSocket terminal input/snapshot/resize/scroll/redraw/display
   surfaces are removed. P2-TERM-01 is independently reviewed and merged at
   `5d99ebb4`; it also removes both agent-upload
@@ -213,6 +213,13 @@ channels are cleaned up and reconnected. Host RTC status visible to the server
 is restricted to stable content-free values.
 
 ### 5 — host filesystem and interactive tool transport over `spawn.host.ctl`
+
+**Security containment (2026-09-06, #63):** server-driven agent installation
+is now refused by the daemon, its server dispatcher/scheduler are removed,
+and both clients direct installation to a trusted terminal. This supersedes
+the compatibility-retention instruction below for executable installation;
+availability checks remain. It does not complete P2-HOST-03A/B or the durable
+target migration. See `DAEMON_COMMAND_AUTHORITY.md` for the remaining authority.
 
 The filesystem portion is **REVIEWED AND MERGED** in P2-HOST-02 at `4e7c89b`.
 The interactive tool portion is **IMPLEMENTED, REVIEW PENDING** separately as

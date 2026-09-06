@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import shlex
 import time
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from fastapi import (
     APIRouter,
@@ -20,7 +19,7 @@ from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, release, schemas
-from ..db import get_session, get_sessionmaker
+from ..db import get_session
 from ..host_key_claims import lock_host_key_claim
 from ..host_status import derived_host_status, stamp_stale_disconnect
 from ..models import (
@@ -37,27 +36,14 @@ from ..ws.broker import get_broker
 
 router = APIRouter(prefix="/api/hosts", tags=["hosts"])
 log = logging.getLogger("spawn.routes.hosts")
-AUTO_UPDATE_THROTTLE = timedelta(minutes=30)
-AUTO_UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
-AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS = 5.0
 MAX_RECENT_DIRS = 8
-_AUTO_UPDATE_IN_FLIGHT: set[tuple[str, str, str]] = set()
-_AUTO_UPDATE_TASKS: set[asyncio.Task[None]] = set()
-_AUTO_UPDATE_CHECK_TASK: asyncio.Task[None] | None = None
+AGENT_INSTALL_UNAVAILABLE = 'Agent installation and auto update are unavailable here. Install or update agents in a trusted terminal on this host.'
 DAEMON_UPDATE_RATE_SECONDS = 15.0
 _DAEMON_UPDATE_REQUESTED_AT: dict[str, float] = {}
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-def _aware(dt: datetime | None) -> datetime | None:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt
 
 
 def _to_out(host: Host, session_count: int, *, now: datetime | None = None) -> schemas.HostOut:
@@ -217,226 +203,11 @@ async def _policies_for_agents(
 
 
 def _merge_agent_policy(status: schemas.HostAgentStatus, policy: HostAgentPolicy) -> None:
-    status.auto_update = policy.auto_update
+    # Stored policy is historical metadata, never endpoint execution consent.
+    status.auto_update = False
     status.last_checked_at = policy.last_checked_at
     status.last_auto_update_at = policy.last_auto_update_at
     status.last_auto_update_error = policy.last_auto_update_error
-
-
-def _should_auto_update(
-    status: schemas.HostAgentStatus, policy: HostAgentPolicy, now: datetime
-) -> bool:
-    if not policy.auto_update or status.update_available is not True:
-        return False
-    if not (status.install or "").strip():
-        return False
-    key = (policy.owner_user_id, policy.host_id, policy.agent_id)
-    if key in _AUTO_UPDATE_IN_FLIGHT:
-        return False
-    last_attempt = _aware(policy.last_auto_update_at)
-    return last_attempt is None or now - last_attempt >= AUTO_UPDATE_THROTTLE
-
-
-def _auto_update_error_from_result(result: schemas.HostAgentInstallResult | None) -> str | None:
-    if result is None:
-        return "host agent install timed out"
-    if result.success:
-        return None
-    if result.error:
-        return result.error
-    if result.exit_code is not None:
-        return f"install exited with code {result.exit_code}"
-    return "install failed"
-
-
-async def _run_auto_update(*, user_id: str, host_id: str, agent_id: str, target: dict) -> None:
-    try:
-        daemon = get_broker().get_daemon_for_host(host_id)
-        if daemon is None:
-            error = "host daemon is offline"
-        else:
-            raw_result = await get_broker().request_agent_install(daemon, target=target)
-            result = (
-                schemas.HostAgentInstallResult.model_validate(raw_result.get("result", raw_result))
-                if raw_result is not None
-                else None
-            )
-            error = _auto_update_error_from_result(result)
-    except Exception as e:  # noqa: BLE001
-        log.warning("auto update failed host=%s agent=%s: %s", host_id, agent_id, e)
-        error = str(e)
-    sm = get_sessionmaker()
-    async with sm() as session:
-        policy = (
-            await session.execute(
-                select(HostAgentPolicy).where(
-                    HostAgentPolicy.owner_user_id == user_id,
-                    HostAgentPolicy.host_id == host_id,
-                    HostAgentPolicy.agent_id == agent_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if policy is not None:
-            policy.last_auto_update_at = _utcnow()
-            policy.last_auto_update_error = error
-            await session.commit()
-
-
-async def _owned_auto_update(*, user_id: str, host_id: str, agent_id: str, target: dict) -> None:
-    key = (user_id, host_id, agent_id)
-    try:
-        await _run_auto_update(
-            user_id=user_id,
-            host_id=host_id,
-            agent_id=agent_id,
-            target=target,
-        )
-    finally:
-        # This outer ownership boundary covers request cancellation and every
-        # persistence failure, so throttling cannot retain a stuck key.
-        _AUTO_UPDATE_IN_FLIGHT.discard(key)
-
-
-def _auto_update_task_done(task: asyncio.Task[None]) -> None:
-    _AUTO_UPDATE_TASKS.discard(task)
-    if task.cancelled():
-        return
-    error = task.exception()
-    if error is not None:
-        log.error(
-            "owned auto update task failed",
-            exc_info=(type(error), error, error.__traceback__),
-        )
-
-
-def _start_auto_update(*, user_id: str, host_id: str, agent_id: str, target: dict) -> bool:
-    key = (user_id, host_id, agent_id)
-    if key in _AUTO_UPDATE_IN_FLIGHT:
-        return False
-    _AUTO_UPDATE_IN_FLIGHT.add(key)
-    try:
-        task = asyncio.create_task(
-            _owned_auto_update(
-                user_id=user_id,
-                host_id=host_id,
-                agent_id=agent_id,
-                target=target,
-            ),
-            name=f"auto-update:{host_id}:{agent_id}",
-        )
-    except BaseException:
-        _AUTO_UPDATE_IN_FLIGHT.discard(key)
-        raise
-    _AUTO_UPDATE_TASKS.add(task)
-    task.add_done_callback(_auto_update_task_done)
-    return True
-
-
-async def wait_for_auto_update_tasks_idle(*, timeout: float | None = None) -> bool:
-    loop = asyncio.get_running_loop()
-    deadline = None if timeout is None else loop.time() + timeout
-    while _AUTO_UPDATE_TASKS:
-        remaining = None if deadline is None else max(0.0, deadline - loop.time())
-        if remaining == 0.0:
-            return False
-        _, pending = await asyncio.wait(tuple(_AUTO_UPDATE_TASKS), timeout=remaining)
-        if pending and deadline is not None and loop.time() >= deadline:
-            return False
-    return True
-
-
-async def run_auto_update_checks_once() -> None:
-    sm = get_sessionmaker()
-    async with sm() as session:
-        rows = (
-            await session.execute(
-                select(HostAgentPolicy, Agent)
-                .join(Agent, HostAgentPolicy.agent_id == Agent.id)
-                .where(HostAgentPolicy.auto_update.is_(True))
-            )
-        ).all()
-
-    by_host: dict[str, list[tuple[str, str, str, dict]]] = {}
-    for policy, agent in rows:
-        target = _agent_to_target(agent).model_dump()
-        by_host.setdefault(policy.host_id, []).append(
-            (policy.id, policy.owner_user_id, policy.agent_id, target)
-        )
-
-    for host_id, items in by_host.items():
-        daemon = get_broker().get_daemon_for_host(host_id)
-        if daemon is None:
-            continue
-        targets = [target for _, _, _, target in items]
-        result = await get_broker().request_agent_check(daemon, targets=targets)
-        if result is None:
-            continue
-        checked = schemas.HostAgentList.model_validate(result)
-        now = _utcnow()
-        by_agent = {
-            agent_id: (policy_id, user_id, target) for policy_id, user_id, agent_id, target in items
-        }
-
-        async with sm() as session:
-            for agent_status in checked.agents:
-                policy_info = by_agent.get(agent_status.agent_id)
-                if policy_info is None:
-                    continue
-                policy_id, user_id, target = policy_info
-                policy = await session.get(HostAgentPolicy, policy_id)
-                if policy is None or not policy.auto_update:
-                    continue
-                policy.last_checked_at = now
-                if _should_auto_update(agent_status, policy, now):
-                    if _start_auto_update(
-                        user_id=user_id,
-                        host_id=host_id,
-                        agent_id=agent_status.agent_id,
-                        target=target,
-                    ):
-                        policy.last_auto_update_at = now
-                        policy.last_auto_update_error = None
-            await session.commit()
-
-
-async def _auto_update_check_loop() -> None:
-    await asyncio.sleep(60)
-    while True:
-        try:
-            await run_auto_update_checks_once()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            log.warning("auto update check failed: %s", e)
-        await asyncio.sleep(AUTO_UPDATE_CHECK_INTERVAL_SECONDS)
-
-
-def start_auto_update_checker() -> None:
-    global _AUTO_UPDATE_CHECK_TASK
-    if _AUTO_UPDATE_CHECK_TASK is not None and not _AUTO_UPDATE_CHECK_TASK.done():
-        return
-    _AUTO_UPDATE_CHECK_TASK = asyncio.create_task(_auto_update_check_loop())
-
-
-async def stop_auto_update_checker() -> None:
-    global _AUTO_UPDATE_CHECK_TASK
-    task = _AUTO_UPDATE_CHECK_TASK
-    _AUTO_UPDATE_CHECK_TASK = None
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    if await wait_for_auto_update_tasks_idle(timeout=AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS):
-        return
-
-    pending = tuple(_AUTO_UPDATE_TASKS)
-    log.warning("cancelling %d auto update task(s) after shutdown drain", len(pending))
-    for update_task in pending:
-        update_task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
 
 
 @router.get("", response_model=list[schemas.HostOut])
@@ -589,17 +360,6 @@ async def list_host_agents(
             continue
         policy.last_checked_at = now
         _merge_agent_policy(agent_status, policy)
-        if _should_auto_update(agent_status, policy, now):
-            target = targets_by_agent.get(agent_status.agent_id)
-            if target is not None and _start_auto_update(
-                user_id=policy.owner_user_id,
-                host_id=policy.host_id,
-                agent_id=policy.agent_id,
-                target=target.model_dump(),
-            ):
-                policy.last_auto_update_at = now
-                policy.last_auto_update_error = None
-                _merge_agent_policy(agent_status, policy)
     await session.commit()
     return checked
 
@@ -652,21 +412,9 @@ async def install_host_agent(
     user: User = Depends(auth.current_user),
 ) -> schemas.HostAgentInstallResult:
     await _get_owned_host(session, host_id, user)
-    agent = await _get_accessible_agent(session, agent_id, user)
-    target = _agent_to_target(agent)
-
-    if not (target.install or "").strip():
-        raise HTTPException(status_code=400, detail="agent has no install command")
-    await session.commit()
-
-    daemon = get_broker().get_daemon_for_host(host_id)
-    if daemon is None:
-        raise HTTPException(status_code=409, detail="host daemon is offline")
-
-    result = await get_broker().request_agent_install(daemon, target=target.model_dump())
-    if result is None:
-        raise HTTPException(status_code=504, detail="host agent install timed out")
-    return schemas.HostAgentInstallResult.model_validate(result.get("result", result))
+    await _get_accessible_agent(session, agent_id, user)
+    # Refuse before daemon lookup/dispatch, including for old daemon versions.
+    raise HTTPException(status_code=409, detail=AGENT_INSTALL_UNAVAILABLE)
 
 
 @router.patch(
@@ -682,6 +430,8 @@ async def patch_host_agent_policy(
 ) -> schemas.HostAgentPolicyOut:
     await _get_owned_host(session, host_id, user)
     await _get_accessible_agent(session, agent_id, user)
+    if body.auto_update is True:
+        raise HTTPException(status_code=409, detail=AGENT_INSTALL_UNAVAILABLE)
     policy = await _policy_for_agent(session, user=user, host_id=host_id, agent_id=agent_id)
     if body.auto_update is not None:
         policy.auto_update = body.auto_update
@@ -689,7 +439,9 @@ async def patch_host_agent_policy(
             policy.last_auto_update_error = None
     await session.commit()
     await session.refresh(policy)
-    return schemas.HostAgentPolicyOut.model_validate(policy)
+    result = schemas.HostAgentPolicyOut.model_validate(policy)
+    result.auto_update = False
+    return result
 
 
 # Registered before `/{host_id}` so the literal path wins the match.
