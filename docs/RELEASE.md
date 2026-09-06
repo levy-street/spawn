@@ -1119,14 +1119,18 @@ uploading. If Key Vault itself is unavailable, wait for it — never an ad-hoc o
 self-signed production certificate, and never a second certificate obtained in
 a hurry.
 
-The diagnostics variant is part of the same release and is built in the same
-Linux container, from the same checkout, right after the release pair:
+The diagnostics variant is part of the same release: the same container
+image, the same checkout and the same target directory as the amd64 release
+pair, one more build. The pair lands beside the release profile's, and is
+staged into `out/` with the other binaries under the variant asset names:
 
 ```bash
-# inside the linux/amd64 container above, after the release build
-cargo build --profile diagnostics --features diagnostics --locked --bin spawnd --bin spawn-worker
-cp target/diagnostics/spawnd       out/spawnd-x86_64-unknown-linux-gnu.diagnostics
-cp target/diagnostics/spawn-worker out/spawn-worker-x86_64-unknown-linux-gnu.diagnostics
+diagnostics_build="${linux_build/cargo build --release --locked/cargo build --profile diagnostics --features diagnostics --locked}"
+docker run --rm --platform linux/amd64 -v "$(git rev-parse --show-toplevel)":/src \
+  -e CARGO_TARGET_DIR=/src/daemon/target-jammy/amd64 ubuntu:22.04 \
+  bash -c "$diagnostics_build"
+cp daemon/target-jammy/amd64/diagnostics/spawnd       out/spawnd-x86_64-unknown-linux-gnu.diagnostics
+cp daemon/target-jammy/amd64/diagnostics/spawn-worker out/spawn-worker-x86_64-unknown-linux-gnu.diagnostics
 ```
 
 Then assemble the assets the way the workflow's single publish job does — the
@@ -1214,7 +1218,8 @@ SPAWND_RELEASE_VARIANT=diagnostics spawnd update   # or =release, to go back
 `spawnd update` reads the variable from its own environment, not from the
 service's, so a systemd drop-in alone does nothing on the current tree — the
 server has nothing to push for a host already on the release's tree, and the
-daemon never initiates a same-tree switch by itself. The CLI installs the
+daemon only checks for an update on its own when a protocol bump has refused
+it at the handshake (that check would honour the drop-in). The CLI installs the
 other pair from the same signed manifest and restarts the service onto it;
 from then on the running build's own variant is what the daemon follows, and
 no override is needed anywhere. Setting the variable in the daemon's
@@ -1226,7 +1231,11 @@ the release pair, and the daemon substitutes the variant's paths and hashes
 from the same signed bytes after holding the server's claim to the release
 hashes and tree. Everything else is unchanged — the signature, the monotonic
 counter and the local downgrade consent, the probation window and the health
-revert all apply to a variant update exactly as to a release one.
+revert all apply to a variant update exactly as to a release one. One
+difference in what you see: a same-tree switch that fails probation is
+reverted like any other, but the host list reads "current" throughout,
+because the tree never changed — `spawnd status` and the daemon log are
+where a failed switch shows.
 
 **A diagnostics daemon built before this section existed** — a hand-built
 one copied into `~/.local/bin` behind `SPAWND_NO_SELF_UPDATE=1`, which is how

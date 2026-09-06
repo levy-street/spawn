@@ -292,9 +292,10 @@ host never picks it up by accident; `SPAWND_RELEASE_VARIANT=release|diagnostics`
 overrides that in either direction, and any other value blocks self-update
 with `invalid_variant`. The variable is read by whichever process updates:
 the service, for the next release the server pushes, or `spawnd update`, from
-its own shell environment — the daemon never initiates a same-tree switch on
-its own, so moving a host across on the tree it already runs is
-`SPAWND_RELEASE_VARIANT=diagnostics spawnd update`. A diagnostics daemon whose
+its own shell environment — the daemon itself only checks for an update
+when a protocol bump refuses it at the handshake (`run.rs`, the
+protocol-required path), so moving a host across on the tree it already runs
+is `SPAWND_RELEASE_VARIANT=diagnostics spawnd update`. A diagnostics daemon whose
 release carries no diagnostics pair for its target refuses the update with
 `variant_unavailable` and keeps running what it has — it never falls back to
 the release pair. "The diagnostics variant" in `docs/RELEASE.md` has the
@@ -308,7 +309,9 @@ cargo build --locked
 cargo test --locked --bin spawnd <module>::
 ```
 
-Both feature sets are gated, because the variant is a real release build:
+Both feature sets are checked, because the variant is a real release build;
+`scripts/test-all.sh` runs both `cargo test` lines, the clippy and build
+lines are the local checklist:
 
 ```bash
 cargo clippy --locked --all-targets -- -D warnings
