@@ -443,6 +443,51 @@ describe("session-scoped signalling", () => {
     await harness.handleTransportMessage?.({ type: "close" });
   });
 
+  test("a refresh deferred behind a restart that never left connected runs on its fallback", async () => {
+    // The common shape of a successful ICE restart: connectionState stays
+    // "connected" throughout, so there is no transition to hang the deferred
+    // refresh on. The restart's ten-second fallback finds the connection up
+    // and applies it instead — the credential must not be dropped there, or
+    // the phone believes it refreshed and dies at the real expiry.
+    jest.useFakeTimers();
+    try {
+      const harness = createHarness("session");
+      await connect(harness);
+      await signOffer(harness);
+      const pc = FakePeerConnection.last;
+      if (pc) pc.connectionState = "connected";
+      const fresh = (minted: number) => [
+        { urls: "turn:relay.example", username: `9999:user-${minted}`, credential: "pw" },
+      ];
+      await harness.handleTransportMessage?.({
+        type: "network-changed",
+        iceServers: fresh(1),
+        iceTransportPolicy: "all",
+      });
+      await signOffer(harness);
+      expect(pc?.restartIce).toHaveBeenCalledTimes(1);
+
+      await harness.handleTransportMessage?.({
+        type: "refresh-ice",
+        iceServers: fresh(2),
+        iceTransportPolicy: "all",
+      });
+      expect(pc?.restartIce).toHaveBeenCalledTimes(1);
+
+      jest.advanceTimersByTime(10_000);
+      await Promise.resolve();
+      expect(harness.error).not.toHaveBeenCalled();
+      expect(pc?.restartIce).toHaveBeenCalledTimes(2);
+      expect(pc?.setConfiguration).toHaveBeenLastCalledWith({
+        iceServers: fresh(2),
+        iceTransportPolicy: "all",
+      });
+      await harness.handleTransportMessage?.({ type: "close" });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test("carries endorsements on the outer offer only", async () => {
     const harness = createHarness("session");
     await connect(harness);

@@ -7,6 +7,7 @@ import {
   buildHostWsUrl,
   iceServersNeedRefresh,
   notifySocketUnauthorized,
+  RTC_ICE_CANDIDATE_POOL_SIZE,
   RTC_LATCH_TIMEOUT_MS,
   SIGNAL_SILENCE_SUSPECT_MS,
   sanitizeIceServers,
@@ -1325,7 +1326,7 @@ export class HostControlClient {
       pc = new RTCPeerConnection({
         iceServers: sanitizeIceServers(iceServers),
         iceTransportPolicy,
-        iceCandidatePoolSize: 1,
+        iceCandidatePoolSize: RTC_ICE_CANDIDATE_POOL_SIZE,
       });
       channel = pc.createDataChannel(HOST_CONTROL_PROTOCOL, { ordered: true });
     } catch {
@@ -1592,6 +1593,7 @@ export class HostControlClient {
       pc.setConfiguration({
         iceServers: this.latestIceServers,
         iceTransportPolicy: this.latestIceTransportPolicy,
+        iceCandidatePoolSize: RTC_ICE_CANDIDATE_POOL_SIZE,
       });
       this.pendingRemoteCandidates = [];
       this.localCandidateGate?.block();

@@ -429,8 +429,10 @@ export async function installSessionRtcMock(
         onconnectionstatechange: (() => void) | null = null;
         oniceconnectionstatechange: (() => void) | null = null;
         channels: FakeDataChannel[] = [];
+        configuration: RTCConfiguration;
 
-        constructor() {
+        constructor(configuration?: RTCConfiguration) {
+          this.configuration = configuration ?? {};
           state.connections += 1;
         }
 
@@ -450,6 +452,20 @@ export async function installSessionRtcMock(
         }
 
         setConfiguration(configuration: RTCConfiguration) {
+          // The rule real engines enforce (WebRTC "set a configuration", step
+          // 7; Chromium throws exactly this): once a local description is
+          // set, the pool size may not change — and leaving it out asks for 0.
+          if (
+            this.localDescription &&
+            (configuration.iceCandidatePoolSize ?? 0) !==
+              (this.configuration.iceCandidatePoolSize ?? 0)
+          ) {
+            throw new DOMException(
+              "Failed to execute 'setConfiguration' on 'RTCPeerConnection': Attempted to modify the PeerConnection's configuration in an unsupported way.",
+              "InvalidModificationError",
+            );
+          }
+          this.configuration = configuration;
           state.iceConfigurations.push(configuration);
         }
 

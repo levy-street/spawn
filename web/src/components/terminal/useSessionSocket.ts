@@ -46,6 +46,7 @@ import {
   MAX_TIMER_DELAY_MS,
   notifySocketUnauthorized,
   parseInbound,
+  RTC_ICE_CANDIDATE_POOL_SIZE,
   RTC_LATCH_TIMEOUT_MS,
   rtcBindingFrameMatches,
   SIGNAL_SILENCE_SUSPECT_MS,
@@ -649,7 +650,7 @@ export function useSessionSocket({
         pc = new RTCPeerConnection({
           iceServers: sanitizeIceServers(iceServers),
           iceTransportPolicy: forceRelay ? "relay" : lastRtcTransportPolicy,
-          iceCandidatePoolSize: 1,
+          iceCandidatePoolSize: RTC_ICE_CANDIDATE_POOL_SIZE,
         });
         // Omitting both partial-reliability fields is intentional: both session
         // channels are fully reliable as well as ordered, and the daemon rejects
@@ -1554,9 +1555,10 @@ export function useSessionSocket({
       }
     };
 
-    /** Ask the server for a fresh `rtc.config`; true when one arrived before
-     * the timeout (joining a request already in flight counts its reply). */
-    const requestRtcConfig = async (): Promise<boolean> => {
+    /** Ask the server for a fresh `rtc.config`: "fresh" when one arrived
+     * before the timeout (joining a request already in flight counts its
+     * reply), "unsent" when the signalling socket could not carry the ask. */
+    const requestRtcConfig = async (): Promise<"fresh" | "timeout" | "unsent"> => {
       const seen = rtcConfigFramesSeen;
       if (rtcConfigRefreshResolve) {
         await new Promise<void>((resolve) => {
@@ -1566,14 +1568,14 @@ export function useSessionSocket({
             resolve();
           };
         });
-        return rtcConfigFramesSeen > seen;
+        return rtcConfigFramesSeen > seen ? "fresh" : "timeout";
       }
-      if (!sendJsonOverWs({ type: "rtc.config.request" })) return false;
+      if (!sendJsonOverWs({ type: "rtc.config.request" })) return "unsent";
       await new Promise<void>((resolve) => {
         rtcConfigRefreshResolve = resolve;
         rtcConfigRefreshTimer = setTimeout(finishRtcConfigRefresh, RTC_CONFIG_REFRESH_TIMEOUT_MS);
       });
-      return rtcConfigFramesSeen > seen;
+      return rtcConfigFramesSeen > seen ? "fresh" : "timeout";
     };
 
     const refreshRtcConfigIfStale = async () => {
@@ -1607,21 +1609,25 @@ export function useSessionSocket({
         return;
       }
       const expectedRtcGeneration = current.rtcGeneration;
-      const fresh = await requestRtcConfig();
+      const outcome = await requestRtcConfig();
       if (!isActiveSessionGeneration() || rtcRef.current.rtcGeneration !== expectedRtcGeneration) {
         return;
       }
       const latest = lastRtcCredentialWindow;
-      if (!fresh || !latest || latest.expiresAtMs <= applied.expiresAtMs) {
+      if (outcome !== "fresh" || !latest || latest.expiresAtMs <= applied.expiresAtMs) {
         const delay = backoffDelay(rtcCredentialRefreshAttempts, {
           base: RTC_CREDENTIAL_REFRESH_RETRY_BASE_MS,
           cap: RTC_CREDENTIAL_REFRESH_RETRY_CAP_MS,
         });
         rtcCredentialRefreshAttempts = Math.min(rtcCredentialRefreshAttempts + 1, 30);
+        const why =
+          outcome === "unsent"
+            ? "the signalling socket is closed"
+            : outcome === "timeout"
+              ? "rtc.config did not arrive"
+              : "the server's credential is no newer";
         console.warn(
-          `SPAWN D: no fresh relay credentials for session ${sessionId} (${
-            fresh ? "the server's credential is no newer" : "rtc.config did not arrive"
-          }); retrying in ${Math.round(delay / 1000)} s`,
+          `SPAWN D: no fresh relay credentials for session ${sessionId} (${why}); retrying in ${Math.round(delay / 1000)} s`,
         );
         scheduleRelayCredentialRefresh(delay);
         return;
@@ -1683,6 +1689,7 @@ export function useSessionSocket({
         pc.setConfiguration({
           iceServers: lastRtcIceServers,
           iceTransportPolicy: lastRtcTransportPolicy,
+          iceCandidatePoolSize: RTC_ICE_CANDIDATE_POOL_SIZE,
         });
         appliedRtcCredentialWindow = lastRtcCredentialWindow;
         scheduleRelayCredentialRefresh();

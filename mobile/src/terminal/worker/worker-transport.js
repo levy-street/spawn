@@ -149,14 +149,21 @@
             ? "The network changed and the terminal connection could not be restored."
             : "The host connection was lost and could not be restored.",
         );
+        return;
       }
+      // A restart that kept the connection up the whole way never fires a
+      // `connected` transition; this is the other end of that restart.
+      applyPendingIceRefresh();
     }, 10_000);
   }
 
   /** Fresh relay credentials for the live peer connection (#71): apply them
    * and restart ICE, keeping the data channels. A restart already in flight
    * — a network change, a disconnect — gathered with the credentials it had,
-   * so the refresh waits for it and runs the moment it reconnects. */
+   * so the refresh waits and runs as soon as that restart is over: on the
+   * `connected` transition if there is one, else when its fallback timer
+   * finds the connection up. A refresh is never dropped; a restart that
+   * fails tears the peer down, and the rebuild carries the fresh servers. */
   async function refreshIce(message) {
     const pc = state.pc;
     if (!pc || pc.connectionState === "closed") return;
@@ -165,6 +172,13 @@
       return;
     }
     await restartPeer(message, "credential refresh");
+  }
+
+  function applyPendingIceRefresh() {
+    const pending = state.pendingIceRefresh;
+    if (!pending) return;
+    state.pendingIceRefresh = null;
+    void refreshIce(pending);
   }
 
   function configureChannel(channel, kind) {
@@ -232,11 +246,7 @@
         clearTimeout(state.restartTimer);
         state.restartTimer = null;
         scheduleStats();
-        const pendingRefresh = state.pendingIceRefresh;
-        if (pendingRefresh) {
-          state.pendingIceRefresh = null;
-          void refreshIce(pendingRefresh);
-        }
+        applyPendingIceRefresh();
       }
     };
     api.post({ type: "state", state: "connecting" });

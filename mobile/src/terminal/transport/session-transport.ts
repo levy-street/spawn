@@ -557,12 +557,12 @@ class WebViewSessionTransport implements SessionTransport {
       this.#armCredentialRefresh();
       return;
     }
-    this.#requestConfig(true, (fresh) => {
+    this.#requestConfig(true, (outcome) => {
       if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
       if (this.#appliedCredentialWindow !== applied) return;
       const latest = this.#cachedConfig;
       if (
-        !fresh ||
+        outcome !== "fresh" ||
         !latest?.credentialWindow ||
         latest.credentialWindow.expiresAtMs <= applied.expiresAtMs
       ) {
@@ -571,10 +571,14 @@ class WebViewSessionTransport implements SessionTransport {
           CREDENTIAL_REFRESH_RETRY_BASE_MS * 2 ** this.#credentialRefreshAttempts,
         );
         this.#credentialRefreshAttempts = Math.min(this.#credentialRefreshAttempts + 1, 30);
+        const why =
+          outcome === "unsent"
+            ? "the signalling socket is closed"
+            : outcome === "timeout"
+              ? "rtc.config did not arrive"
+              : "the server's credential is no newer";
         console.warn(
-          `SPAWN D: no fresh relay credentials for session ${this.sessionId} (${
-            fresh ? "the server's credential is no newer" : "rtc.config did not arrive"
-          }); retrying in ${Math.round(delay / 1_000)} s`,
+          `SPAWN D: no fresh relay credentials for session ${this.sessionId} (${why}); retrying in ${Math.round(delay / 1_000)} s`,
         );
         this.#armCredentialRefresh(delay);
         return;
@@ -639,35 +643,39 @@ class WebViewSessionTransport implements SessionTransport {
   }
 
   /**
-   * Ask the server for a fresh `rtc.config` and call back with whether one
-   * arrived. Without `force`, only when the cached credential is inside its
-   * refresh lead; a signal that is not open cannot be asked at all.
+   * Ask the server for a fresh `rtc.config` and call back with the outcome:
+   * "fresh" when one arrived, "timeout" when it did not, "unsent" when the
+   * signal was not open to ask (or, without `force`, when the cached
+   * credential is not yet inside its refresh lead and there was no need).
    */
-  #requestConfig(force: boolean, callback: (fresh: boolean) => void): void {
+  #requestConfig(
+    force: boolean,
+    callback: (outcome: "fresh" | "timeout" | "unsent") => void,
+  ): void {
     const cached = this.#cachedConfig;
     const due =
       cached?.credentialWindow !== null &&
       cached?.credentialWindow !== undefined &&
       iceCredentialRefreshDelayMs(cached.credentialWindow) === 0;
     if (!cached || (!force && !due) || this.#signal?.state !== "open") {
-      callback(false);
+      callback("unsent");
       return;
     }
     let settled = false;
-    const finish = (fresh: boolean) => {
+    const finish = (outcome: "fresh" | "timeout" | "unsent") => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       this.#configWaiters.delete(onConfig);
-      callback(fresh);
+      callback(outcome);
     };
-    const onConfig = () => finish(true);
-    const timer = setTimeout(() => finish(false), CONFIG_REQUEST_TIMEOUT_MS);
+    const onConfig = () => finish("fresh");
+    const timer = setTimeout(() => finish("timeout"), CONFIG_REQUEST_TIMEOUT_MS);
     this.#configWaiters.add(onConfig);
     try {
       this.#signal.send({ type: "rtc.config.request" });
     } catch {
-      finish(false);
+      finish("unsent");
     }
   }
 

@@ -95,10 +95,14 @@ offer. coturn checks the expiry on every allocation refresh and permission
 request, not only at allocation, so a peer connection that outlives its
 credential loses its relay allocation at the cliff and every relayed pane on
 it drops. Browsers and phones now refresh an hour before expiry with a
-non-disruptive ICE restart; the daemon cannot — webrtc-rs builds its ICE
-agent once, from the servers in the first offer, and a restart re-gathers
-with those same credentials — so the lifetime is the daemon's only
-protection, and seven days keeps the cliff past any realistic pane. The
+non-disruptive ICE restart on the same peer connection. The daemon cannot —
+webrtc-rs builds its ICE agent once, from the servers in the first offer,
+and a restart re-gathers with those same credentials — so its own relay
+allocation still dies at its cliff: a pair that runs through the browser's
+relay survives on the browser's fresh allocation, while one that runs
+through the daemon's relay (a daemon behind a symmetric NAT, or relay to
+relay) drops there and reconnects. The lifetime is the daemon's only
+protection, and seven days keeps that cliff past any realistic pane. The
 server's default is the same seven days, so the env line documents rather
 than changes. The cost of a long window is that a leaked credential can
 allocate relay for longer; the relay carries only DTLS ciphertext between
@@ -157,18 +161,27 @@ no TURN secret. Missing Python 3 produces a warning because the dependency-free
 probe cannot run; an endpoint that is actually configured but does not answer
 is a health failure.
 
-A relay that answers STUN can still be refusing every allocation, so the same
-run reads the last hour of `journalctl -u coturn` and counts its two failure
-signatures. Any `create_relay_ioa_sockets: no available ports` is a failure:
-the relay pool is full and a new relayed connection just failed. `check_stun_auth:
-Cannot find credentials of user` is coturn refusing an expired credential;
-up to `SPAWN_HEALTH_TURN_REJECTIONS_MAX` an hour (default 30) is a client that
-reconnected with a credential the relay had just expired, and more is a client
-presenting expired credentials on every reconnect, the loop that produced
-around 9,000 in a day on 2026-09-05. A host where the journal is not readable
-gets a warning, not a failure; a host without coturn in its unit list skips
-the row. `scripts/health-check.sh --self-test` exercises the counting and the
-thresholds against fixtures.
+A relay that answers STUN can still be refusing every allocation, so wherever
+coturn is — named in the unit list, or simply installed as `coturn.service`
+on the host — the same run reads the last hour of `journalctl -u coturn` and
+counts its two failure signatures. Any `create_relay_ioa_sockets: no available
+ports` is a failure: the relay pool is full and a new relayed connection just
+failed. `check_stun_auth: Cannot find credentials of user` is coturn refusing
+an expired credential; up to `SPAWN_HEALTH_TURN_REJECTIONS_MAX` an hour
+(default 30) is a client that reconnected with a credential the relay had
+just expired, and more is a client presenting expired credentials on every
+reconnect, the loop that produced around 9,000 in a day on 2026-09-05. A
+host where the journal is not readable — journalctl still exits 0 there and
+only hints on stderr, so the script reads the hint — gets a warning naming
+it, not a failure; a host with no coturn at all skips the row.
+`scripts/health-check.sh --self-test` exercises the counting, the thresholds,
+the access check and the gating against fixtures.
+
+The STUN probe, unlike the relay row, needs `SPAWN_TURN_URLS` in the timer's
+environment, and as read on 2026-09-06 production's `spawn-health.service`
+carries no environment at all, so that probe has never run from the timer
+there. A drop-in with `Environment=SPAWN_TURN_URLS=<the server's value>`
+turns it on; the relay row does not wait for it.
 
 ## TURN TLS on 443
 

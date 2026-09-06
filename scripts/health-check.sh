@@ -54,6 +54,29 @@ coturn_journal_verdict() {
   printf '%s %s %s\n' "$verdict" "$exhaustions" "$rejections"
 }
 
+# journalctl exits 0 whether or not it could see the system journal: a user
+# outside adm/systemd-journal gets its own (empty) journal plus a hint on
+# stderr, and a unit with no entries prints "-- No entries --". So the
+# verdict above is only meaningful when stderr (given here as text) carries
+# none of systemd's access warnings.
+journal_access_denied() {
+  local stderr_text="$1"
+  [[ "$stderr_text" == *"not seeing messages"* ||
+    "$stderr_text" == *"insufficient permissions"* ||
+    "$stderr_text" == *"No journal files"* ||
+    "$stderr_text" == *"Permission denied"* ]]
+}
+
+# The relay-pool row runs wherever coturn is: named in the unit list (which
+# SPAWN_TURN_URLS or SPAWN_HEALTH_UNITS does), or simply installed on this
+# host. A health timer whose environment carries neither still has the
+# journal, and the journal is where the storm shows.
+relay_row_applies() {
+  local units="$1"
+  local coturn_unit_present="$2"
+  [[ " $units " == *" coturn "* || "$coturn_unit_present" == yes ]]
+}
+
 # Returns 2, rather than failing the deployment, when this host lacks the
 # dependency-free Python probe. A real handshake/TLS/protocol failure is 1.
 run_connection_probe() {
@@ -107,6 +130,14 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(journal_lines "$rejected" 31 | coturn_journal_verdict 30)" == "fail 0 31" ]] || exit 1
   [[ "$( (journal_lines "$exhausted" 3; journal_lines "$rejected" 2; journal_lines "$benign" 4) \
     | coturn_journal_verdict 30)" == "fail 3 2" ]] || exit 1
+  journal_access_denied 'Hint: You are currently not seeing messages from other users and the system.
+  Users in groups '"'"'adm'"'"', '"'"'systemd-journal'"'"' can see all messages.' || exit 1
+  journal_access_denied 'No journal files were opened due to insufficient permissions.' || exit 1
+  ! journal_access_denied '' || exit 1
+  ! journal_access_denied '-- No entries --' || exit 1
+  relay_row_applies 'spawn-server spawn-web redis-server coturn' no || exit 1
+  relay_row_applies 'spawn-server spawn-web redis-server' yes || exit 1
+  ! relay_row_applies 'spawn-server spawn-web redis-server' no || exit 1
   note "self-test ok"
   exit 0
 fi
@@ -209,8 +240,19 @@ fi
 # --- relay pool ---------------------------------------------------------------
 # A relay that answers STUN can still be refusing every allocation. 2026-09-04:
 # 766 `no available ports` in one hour, found the next day from a user report.
-if [[ " $UNITS " == *" coturn "* ]]; then
-  if coturn_journal="$(journalctl -u coturn --since -1h --no-pager 2>/dev/null)"; then
+coturn_unit_present=no
+if systemctl cat coturn.service >/dev/null 2>&1; then
+  coturn_unit_present=yes
+fi
+if relay_row_applies "$UNITS" "$coturn_unit_present"; then
+  coturn_stderr_file="$(mktemp)"
+  coturn_journal="$(journalctl -u coturn --since -1h --no-pager 2>"$coturn_stderr_file")"
+  coturn_journal_status=$?
+  coturn_stderr="$(cat "$coturn_stderr_file")"
+  rm -f "$coturn_stderr_file"
+  if [[ "$coturn_journal_status" -ne 0 ]] || journal_access_denied "$coturn_stderr"; then
+    warn "coturn journal is not readable here (${coturn_stderr:-journalctl exited $coturn_journal_status}); relay exhaustion was not checked"
+  else
     read -r coturn_verdict coturn_exhaustions coturn_rejections <<<"$(
       printf '%s\n' "$coturn_journal" | coturn_journal_verdict "$TURN_REJECTIONS_MAX"
     )"
@@ -220,8 +262,6 @@ if [[ " $UNITS " == *" coturn "* ]]; then
     else
       fail "$coturn_summary — the relay pool is full or a client is presenting expired credentials on a loop; docs/NETWORK.md"
     fi
-  else
-    warn "coturn journal is not readable here; relay exhaustion was not checked"
   fi
 fi
 

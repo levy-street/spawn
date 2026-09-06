@@ -147,6 +147,16 @@ export const ICE_CREDENTIAL_REFRESH_LEAD_MS = 60 * 60 * 1000;
 export const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 /**
+ * Every peer connection is built with this pool size, and every
+ * `setConfiguration` on it must repeat it: the WebRTC spec (and Chromium)
+ * throws `InvalidModificationError` when a configuration set after
+ * `setLocalDescription` changes the pool size, and omitting the field is
+ * asking for 0. An ICE restart that omitted it was never a restart — it was
+ * the catch block rebuilding the whole connection.
+ */
+export const RTC_ICE_CANDIDATE_POOL_SIZE = 1;
+
+/**
  * The credential window of one `rtc.config` frame, or null when the frame
  * carries no TURN credential (a STUN-only deployment has nothing to refresh).
  *

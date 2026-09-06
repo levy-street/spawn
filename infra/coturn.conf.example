@@ -3,6 +3,12 @@
 # TLS listener. Keep static-auth-secret identical to SPAWN_TURN_SECRET in the
 # server environment.
 #
+# This file says what runs, not what could. An earlier version also carried
+# server-name, stale-nonce=600, no-tls and no-loopback-peers, and bound
+# listening-ip to the private address; production has none of those, so they
+# are gone here rather than implied. Adding any of them is a change to make on
+# the relay first and record here second.
+#
 # The public/private mapping below is the verified production mapping. Replace
 # both addresses together when installing this example on another host.
 listening-port=3478
