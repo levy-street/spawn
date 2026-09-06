@@ -50,8 +50,8 @@
 //!
 //! Known v1 limitations, all self-healing on the app's next full repaint:
 //! custom tab stops are not serialized (would need cursor tracking in the
-//! shadow); the DECSC register restores position and pen but not character
-//! sets, so a consumer's DECRC returns to ASCII; G2/G3 are designated
+//! shadow); the DECSC register restores position, pen and designations but
+//! not the shift state, which alacritty does not save; G2/G3 are designated
 //! but never made active, since this profile emits no locking shift to them;
 //! and while the alternate screen is active the primary screen's own
 //! designations are not carried, so a consumer leaving it returns to ASCII.
@@ -594,18 +594,23 @@ fn cursor_point<T>(term: &Term<T>) -> Point {
     term.grid().cursor.point
 }
 
-/// Reconstruct a DECSC register: position with the saved pen, save, and leave
-/// the pen for the caller to overwrite (every later emission resets it).
+/// Reconstruct a DECSC register: designate the saved character sets, position
+/// with the saved pen, save, then return those sets to ASCII — the register
+/// keeps them (DECRC restores designations in alacritty and xterm alike) while
+/// the terminal stays where the baseline put it. The pen is left for the
+/// caller to overwrite (every later emission resets it).
 fn emit_saved_cursor(out: &mut Vec<u8>, saved: &Cursor<Cell>) {
+    emit_designations(out, &saved.charsets, b'0');
     let mut pen = Pen::default();
     pen.apply_cell(out, &saved.template);
     emit_cup(out, saved.point);
     out.extend_from_slice(b"\x1b7");
+    emit_designations(out, &saved.charsets, b'B');
 }
 
 /// Designate `final_byte` (`0` line drawing, `B` ASCII) to every slot of
 /// `charsets` that is not ASCII. Relative to a terminal at the baseline, `0`
-/// arms exactly the app's sets.
+/// arms exactly the app's sets and `B` returns exactly those.
 fn emit_designations(out: &mut Vec<u8>, charsets: &Charsets, final_byte: u8) {
     const SLOTS: [(CharsetIndex, u8); 4] = [
         (CharsetIndex::G0, b'('),
@@ -937,6 +942,7 @@ mod tests {
         );
         let (sa, sb) = (&ga.saved_cursor, &gb.saved_cursor);
         assert_eq!(sa.point, sb.point, "{context}: saved cursor point");
+        assert_eq!(sa.charsets, sb.charsets, "{context}: saved cursor charsets");
         assert_eq!(
             (
                 sa.template.fg,
@@ -1172,6 +1178,20 @@ mod tests {
         }
         assert_eq!(e.screen_text()[0], "x", "emulator");
         assert_eq!(b.screen_text()[0], "x", "consumer");
+    }
+
+    #[test]
+    fn saved_cursor_keeps_its_charsets_across_a_checkpoint() {
+        // ESC 7 with line drawing designated, back to ASCII for text, then
+        // the checkpoint. The app's ESC 8 restores line drawing in a real
+        // terminal, so it must in the consumer too.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b(0\x1b7\x1b(Btext");
+        assert_same_state(&a, &b, "decsc charsets");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8lqk");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "┌─┐t", "{:?}", b.screen_text());
     }
 
     #[test]
