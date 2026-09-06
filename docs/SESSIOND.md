@@ -489,7 +489,7 @@ caller's `max_bytes` (failing closed rather than splitting a segment), then
 the worker frames the response as a **self-describing v2 stream**:
 
 ```
-CSI 8 ; rows ; cols t   APC "sp:h1" ST   ESC ( B  ESC ) B  SI   <committed lines…>
+CSI 8 ; rows ; cols t   APC "sp:h1" ST   ESC ( B  ESC ) B  ESC * B  ESC + B  SI   <committed lines…>
 CSI 8 ; rows ; cols t   <emulator-serialized live screen repaint>
 ```
 
@@ -505,8 +505,8 @@ already mapped through the app's character sets, and a consumer the app's
 live bytes or the previous repaint's tail left in a line-drawing set would
 map it a second time (#61). The repaint's tail then re-arms the app's
 designations and shift state, so its next live bytes render alike in the
-worker and the consumer. The clients' reseed clear leads with the same
-bytes; the stream does not depend on it.
+worker and the consumer. The clients' reseed clear leads with the G0, G1
+and SI part of the same return; the stream does not depend on it.
 The scrollback overlay, on recognizing the APC sentinel
 (`parseHistoryReplay` in `Terminal.tsx`), writes the history as flowing text
 at its own width (never geometry-walked, so nothing already rendered ever

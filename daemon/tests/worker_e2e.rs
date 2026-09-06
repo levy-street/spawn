@@ -672,7 +672,7 @@ printf 'IDLE-DONE\n'
         let head = String::from_utf8_lossy(&spawnd::sessiond::scrollback::replay_head(120, 40))
             .into_owned();
         assert!(
-            head.starts_with("\x1b[8;40;120t\x1b_sp:h1\x1b\\\x1b(B\x1b)B\x0f"),
+            head.starts_with("\x1b[8;40;120t\x1b_sp:h1\x1b\\\x1b(B\x1b)B\x1b*B\x1b+B\x0f"),
             "head shape: {head:?}"
         );
         assert!(
