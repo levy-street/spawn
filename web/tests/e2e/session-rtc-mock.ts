@@ -101,13 +101,20 @@ export async function installSessionRtcMock(
         )}-${hex.slice(20)}`;
       }
 
-      function ctlChunk(requestId: string, payload: Uint8Array) {
+      // The daemon's framing: 16 KiB SCTP messages, 28 of them header. The
+      // mock reproduces it exactly, so a replay longer than one chunk
+      // exercises the client's assembly the way production does.
+      const DAEMON_CHUNK_PAYLOAD_BYTES = 16 * 1024 - 28;
+
+      function ctlChunk(requestId: string, sequence: number, last: boolean, payload: Uint8Array) {
         const frame = new Uint8Array(28 + payload.length);
         frame.set(encoder.encode("SPCT"), 0);
         frame[4] = 1;
         frame[5] = 1;
-        frame[6] = 1;
+        const view = new DataView(frame.buffer);
+        view.setUint16(6, last ? 1 : 0, true);
         frame.set(uuidBytes(requestId), 8);
+        view.setUint32(24, sequence, true);
         frame.set(payload, 28);
         return frame.buffer;
       }
@@ -130,13 +137,24 @@ export async function installSessionRtcMock(
             plain: false,
             pty_offset: state.ptyOffset,
             total_bytes: payload.length,
-            chunks: payload.length === 0 ? 0 : 1,
+            chunks: Math.ceil(payload.length / DAEMON_CHUNK_PAYLOAD_BYTES),
             ...(state.historyEpoch
               ? { history_epoch: state.historyEpoch, history_offset: state.historyOffset }
               : {}),
           }),
         );
-        if (payload.length > 0) channel.receive(ctlChunk(requestId, payload));
+        const chunks = Math.ceil(payload.length / DAEMON_CHUNK_PAYLOAD_BYTES);
+        for (let sequence = 0; sequence < chunks; sequence += 1) {
+          const start = sequence * DAEMON_CHUNK_PAYLOAD_BYTES;
+          channel.receive(
+            ctlChunk(
+              requestId,
+              sequence,
+              sequence + 1 === chunks,
+              payload.subarray(start, start + DAEMON_CHUNK_PAYLOAD_BYTES),
+            ),
+          );
+        }
       }
 
       class FakeDataChannel {
