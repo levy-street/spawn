@@ -16,8 +16,40 @@ pub use unix::*;
 #[cfg(windows)]
 pub use windows::*;
 
+/// What [`raise_open_file_limit`] found and left behind: the soft limit on
+/// open files before and after, and the hard ceiling it may not exceed
+/// (`None` when the platform reports no ceiling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFileLimit {
+    pub before: u64,
+    pub after: u64,
+    pub maximum: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_limit_rises_to_the_target_and_never_falls() {
+        use rustix::process::{getrlimit, Resource};
+        let current = getrlimit(Resource::Nofile);
+        let soft = current.current.unwrap_or(u64::MAX);
+        let hard = current.maximum.unwrap_or(u64::MAX);
+        // Asking for less than we already have changes nothing.
+        let unchanged = super::raise_open_file_limit(soft.saturating_sub(1)).unwrap();
+        assert_eq!((unchanged.before, unchanged.after), (soft, soft));
+        // Asking for more raises to the target, or to the hard limit if that
+        // is lower, and reports both.
+        let target = soft.saturating_add(64).min(hard);
+        let raised = super::raise_open_file_limit(target).unwrap();
+        assert_eq!(raised.after, target.max(soft), "{raised:?}");
+        assert!(raised.after >= raised.before, "{raised:?}");
+        assert_eq!(
+            getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX),
+            raised.after
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

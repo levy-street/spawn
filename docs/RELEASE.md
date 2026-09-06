@@ -1346,7 +1346,9 @@ validation surfaces; Authenticode does not remove the firewall prompt. If
 inbound ICE is blocked, ordinary outbound UDP TURN remains the fallback.
 
 An administrator who explicitly wants direct candidates on a Private network
-may add a program-scoped rule for the installed binary:
+may add a program-scoped rule for the installed binary. A rule created under
+the earlier 50000–50100 guidance admits about one socket in ten of the current
+range; remove it and create it again for 50000–50999:
 
 ```powershell
 $spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'
