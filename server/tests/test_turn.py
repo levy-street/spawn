@@ -35,6 +35,16 @@ def test_mint_turn_credential_matches_coturn_convention():
     assert credential == expected
 
 
+def test_default_credential_lifetime_is_seven_days():
+    """What production runs without an env var (docs/NETWORK.md).
+
+    A day was the value that stranded every pane older than a day on
+    2026-09-05: coturn checks the expiry on every refresh, and the daemon's
+    ICE agent cannot take fresh credentials mid-connection.
+    """
+    assert Settings().turn_ttl_seconds == 7 * 24 * 3600
+
+
 def test_ice_servers_include_minted_turn_only_when_configured():
     plain = Settings(turn_urls="", turn_secret=None)
     assert all(
