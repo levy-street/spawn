@@ -28,6 +28,8 @@ pub struct OpenFileLimit {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[cfg(unix)]
     #[test]
     fn the_open_file_limit_rises_to_the_target_and_never_falls() {
@@ -50,7 +52,6 @@ mod tests {
         );
     }
 
-    use super::*;
     use std::path::Path;
 
     #[test]

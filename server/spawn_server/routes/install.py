@@ -982,6 +982,8 @@ INSTALL_SCRIPT = dedent(
       <true/>
       <key>KeepAlive</key>
       <true/>
+      <key>SoftResourceLimits</key>
+      <dict><key>NumberOfFiles</key><integer>16384</integer></dict>
       <key>StandardOutPath</key>
       <string>$OUT_XML</string>
       <key>StandardErrorPath</key>
@@ -1025,7 +1027,7 @@ INSTALL_SCRIPT = dedent(
     # this cgroup and must survive supervisor updates.
     KillMode=process
     # Headroom against fd exhaustion taking the host offline.
-    LimitNOFILE=65536
+    LimitNOFILE=65536:524288
     Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
     # Signed signaling is enforced by default: this daemon refuses RTC offers
     # that are not signed by a browser identity it pins. Approve new devices

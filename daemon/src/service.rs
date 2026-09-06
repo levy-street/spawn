@@ -214,7 +214,7 @@ fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String 
          Restart=on-failure\n\
          RestartSec=3\n\
          KillMode=process\n\
-         LimitNOFILE=65536\n\
+         LimitNOFILE=65536:524288\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -314,7 +314,6 @@ fn launchd_plist(config_dir: &Path, bin: &Path, server: &str, state: &Path) -> S
          \t<key>RunAtLoad</key><true/>\n\
          \t<key>KeepAlive</key><true/>\n\
          \t<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>16384</integer></dict>\n\
-         \t<key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>16384</integer></dict>\n\
          \t<key>StandardOutPath</key><string>{out}</string>\n\
          \t<key>StandardErrorPath</key><string>{err}</string>\n\
          </dict>\n\
@@ -912,8 +911,10 @@ mod tests {
         assert!(unit.contains("KillMode=process")); // workers survive restarts
 
         // A user service starts at 1024 open files; a laptop of sessions needs
-        // more than that before the range of ICE ports runs out (#80).
-        assert!(unit.contains("LimitNOFILE=65536"));
+        // more than that before the range of ICE ports runs out (#80). The hard
+        // half stays high: every shell in a SPAWN D terminal inherits it, and
+        // `ulimit -n` must still work there as it does in a native terminal.
+        assert!(unit.contains("LimitNOFILE=65536:524288"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
@@ -930,13 +931,13 @@ mod tests {
         assert!(plist.contains("&amp;")); // the '&' in the path is escaped
         assert!(!plist.contains(" & ")); // no raw ampersand leaked
         assert!(plist.contains("<key>KeepAlive</key><true/>"));
-        // launchd starts an agent at 256 open files (#80).
+        // launchd starts an agent at 256 open files (#80). Only the soft limit:
+        // a hard limit would follow every shell a terminal spawns and stop
+        // `ulimit -n` there.
         assert!(plist.contains(
             "<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>16384</integer></dict>"
         ));
-        assert!(plist.contains(
-            "<key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>16384</integer></dict>"
-        ));
+        assert!(!plist.contains("HardResourceLimits"));
     }
 
     fn instance_with_server(server: Option<&str>) -> tempfile::TempDir {
