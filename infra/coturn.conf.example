@@ -1,30 +1,44 @@
-# Current SPAWN D production shape: TURN on UDP and TCP 3478, REST-style
-# ephemeral credentials, the spawnd.dev realm, and no TLS listener. Keep
-# static-auth-secret identical to SPAWN_TURN_SECRET in the server environment.
+# SPAWN D production shape as read from the relay on 2026-09-06: TURN on UDP
+# and TCP 3478, REST-style ephemeral credentials, the spawnd.dev realm, and no
+# TLS listener. Keep static-auth-secret identical to SPAWN_TURN_SECRET in the
+# server environment.
 #
 # The public/private mapping below is the verified production mapping. Replace
 # both addresses together when installing this example on another host.
-listening-ip=10.0.0.127
-relay-ip=10.0.0.127
-external-ip=98.83.222.112/10.0.0.127
 listening-port=3478
+listening-ip=0.0.0.0
+external-ip=98.83.222.112/10.0.0.127
+relay-ip=10.0.0.127
 
-realm=spawnd.dev
-server-name=spawnd.dev
+# The relay port range. Every peer connection on both sides holds one port
+# here for as long as its allocation lives, even when the pair that wins is
+# direct, so 200 ports is a ceiling of roughly 100 peer connections. This is
+# the range production pins today; docs/NETWORK.md records the widening to
+# 49152-65535 that waits on the relay's security group, which must admit the
+# same UDP range inbound before the config moves.
+min-port=49160
+max-port=49360
+
+# An allocation a dead client stops refreshing frees its port after this many
+# seconds rather than coturn's default ten minutes. Both browsers and the
+# daemon refresh well inside it: Chrome and WebKit at lifetime minus 60 s,
+# webrtc-rs at half the lifetime. See docs/NETWORK.md.
+max-allocate-lifetime=180
+
 fingerprint
 use-auth-secret
 static-auth-secret=CHANGE_ME_TO_MATCH_SPAWN_TURN_SECRET
-stale-nonce=600
+realm=spawnd.dev
 
 # UDP turn: is mandatory for spawnd. TCP remains enabled for browser/mobile
 # compatibility, but webrtc-rs 0.17 cannot use TURN over TCP or TLS.
 # Production does not currently claim turns: support; see docs/NETWORK.md for
 # the separate-IP or SNI-routing options required before enabling it on 443.
-no-tls
+no-tlsv1
+no-tlsv1_1
 
 # Run under systemd, keep secrets out of process listings, and disable the
 # unauthenticated administrative CLI listener.
 syslog
 no-cli
 no-multicast-peers
-no-loopback-peers

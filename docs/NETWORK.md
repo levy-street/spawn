@@ -13,7 +13,9 @@ As verified on 2026-08-25, nginx terminates the Let's Encrypt certificate for
 upgrade headers. Next proxies `/api/*` and `/ws/*` to the API on
 `127.0.0.1:8001`. coturn listens on UDP and TCP 3478 with `use-auth-secret`,
 realm `spawnd.dev`, and `external-ip=98.83.222.112/10.0.0.127`. There is no
-TURN TLS listener today.
+TURN TLS listener today. As read on 2026-09-06, its relay range is pinned to
+`min-port=49160`/`max-port=49360`; the credential and allocation lifetimes it
+runs with are in "Relay credential and allocation lifetimes" below.
 
 Use a dedicated nginx `/ws/` location with 300-second read and send timeouts.
 The server's 25-second application pings make nginx's 60-second default
@@ -50,9 +52,10 @@ which cannot use TURN over TCP or TLS, so a list containing only
 Allow both listener traffic and relay allocations in the host/cloud firewall:
 
 - UDP 3478 and TCP 3478 to coturn.
-- The coturn UDP relay range. The default is 49152–65535; if production pins
-  `min-port`/`max-port`, open that exact range and keep config and firewall in
-  lockstep.
+- The coturn UDP relay range. coturn's default is 49152–65535; production
+  pins `min-port=49160`/`max-port=49360` today, so that exact range is what
+  the relay's security group admits. Config and firewall move in lockstep:
+  widen the group first, then the config, then restart coturn.
 - UDP 50000–50100 inbound on each daemon machine where LAN/direct WebRTC is
   expected. This is the daemon's ephemeral candidate range, not coturn's relay
   range. Host firewalls may restrict it to trusted LANs when off-LAN traffic
@@ -68,6 +71,57 @@ sudo ufw allow from 192.168.1.0/24 to any port 50000:50100 proto udp
 Add the equivalent inbound rule to any host or cloud firewall in front of that
 machine; use a broader source only when direct Internet candidates are
 intended.
+
+## Relay credential and allocation lifetimes
+
+Two values found on 2026-09-05, when a day of `journalctl -u coturn` on the
+relay held around 9,000 `check_stun_auth: Cannot find credentials of user`
+rejections and thousands of `create_relay_ioa_sockets: no available ports`
+(issue #71):
+
+```dotenv
+# /opt/spawn/server/.env
+SPAWN_TURN_TTL_SECONDS=604800
+```
+
+```
+# /etc/turnserver.conf
+max-allocate-lifetime=180
+```
+
+**The credential lifetime is seven days.** A TURN credential is `expiry:user_id`
+signed with the shared secret, minted into every `rtc.config` and every session
+offer. coturn checks the expiry on every allocation refresh and permission
+request, not only at allocation, so a peer connection that outlives its
+credential loses its relay allocation at the cliff and every relayed pane on
+it drops. Browsers and phones now refresh an hour before expiry with a
+non-disruptive ICE restart; the daemon cannot — webrtc-rs builds its ICE
+agent once, from the servers in the first offer, and a restart re-gathers
+with those same credentials — so the lifetime is the daemon's only
+protection, and seven days keeps the cliff past any realistic pane. The
+server's default is the same seven days, so the env line documents rather
+than changes. The cost of a long window is that a leaked credential can
+allocate relay for longer; the relay carries only DTLS ciphertext between
+peers, so that exposure is bandwidth, never content.
+
+**An allocation lives three minutes.** Every peer connection on both sides
+allocates one relay port for the allocation's lifetime even when the pair
+that wins is direct, and clients ask for ten minutes. A client that dies —
+or whose credential expired — stops refreshing, and its port sat in the
+200-port pool for the rest of those ten minutes while every reconnecting
+pane re-gathered into it; `no available ports` fed the reconnect storm that
+produced it. `max-allocate-lifetime=180` caps what coturn grants; both
+clients refresh well inside it (Chrome and WebKit at lifetime minus 60 s,
+webrtc-rs at half the lifetime), so a live connection notices nothing and a
+dead one frees its port in three minutes. Changing either coturn value
+needs a coturn restart, which drops every relayed pane once; they reconnect
+on their own.
+
+**The range is still 200 ports.** Widening `min-port`/`max-port` to
+49152–65535 waits on the relay's security group (`spawn-turn-access`), which
+the instance role cannot read or change; when that is done the config
+follows, with one more coturn restart, and the firewall bullet above changes
+with it.
 
 ## Windows Firewall
 
