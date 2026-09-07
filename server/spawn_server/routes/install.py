@@ -983,7 +983,10 @@ INSTALL_SCRIPT = dedent(
       <key>KeepAlive</key>
       <true/>
       <key>SoftResourceLimits</key>
-      <dict><key>NumberOfFiles</key><integer>16384</integer></dict>
+      <dict>
+        <key>NumberOfFiles</key>
+        <integer>16384</integer>
+      </dict>
       <key>StandardOutPath</key>
       <string>$OUT_XML</string>
       <key>StandardErrorPath</key>
