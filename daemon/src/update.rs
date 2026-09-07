@@ -5,6 +5,7 @@
 //! existing discovery registry.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,9 @@ const DOWNGRADE_CONSENT_WINDOW: Duration = Duration::from_secs(30 * 60);
 const DOWNGRADE_CONSENT_FILE: &str = "allow-downgrade";
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+/// Names the release variant this daemon follows; empty or unset means its
+/// own build's. Any other value than a known variant blocks self-update.
+const RELEASE_VARIANT_ENV: &str = "SPAWND_RELEASE_VARIANT";
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static WORKER_MISMATCH: AtomicBool = AtomicBool::new(false);
 static UNSIGNED_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -99,6 +103,7 @@ enum BlockReason {
     Unwritable,
     UnsupportedTarget,
     WorkerMissing,
+    InvalidVariant,
     #[cfg(windows)]
     TaskBreakawayUnconfirmed,
 }
@@ -110,10 +115,86 @@ impl BlockReason {
             Self::Unwritable => "unwritable",
             Self::UnsupportedTarget => "unsupported_target",
             Self::WorkerMissing => "worker_missing",
+            Self::InvalidVariant => "invalid_variant",
             #[cfg(windows)]
             Self::TaskBreakawayUnconfirmed => "task_breakaway_unconfirmed",
         }
     }
+}
+
+/// Which build of a release this daemon installs.
+///
+/// One signed manifest describes a release: the release pair for every
+/// target under `targets`, and under `variants` the alternative builds cut
+/// from the same tree at the same counter — today only `diagnostics`, the
+/// build with symbols kept and debug logging on. A daemon follows the variant
+/// it was built as, so a host running diagnostics keeps running diagnostics
+/// across updates with nothing to configure, and a release host never picks
+/// up a variant by accident. `SPAWND_RELEASE_VARIANT` overrides the default
+/// in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseVariant {
+    Release,
+    Diagnostics,
+}
+
+impl ReleaseVariant {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Diagnostics => "diagnostics",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "release" => Some(Self::Release),
+            "diagnostics" => Some(Self::Diagnostics),
+            _ => None,
+        }
+    }
+
+    /// The variant this binary was built as.
+    pub const fn own() -> Self {
+        if crate::version::DIAGNOSTICS_BUILD {
+            Self::Diagnostics
+        } else {
+            Self::Release
+        }
+    }
+}
+
+fn configured_variant() -> Result<ReleaseVariant, BlockReason> {
+    configured_variant_from(
+        std::env::var_os(RELEASE_VARIANT_ENV).as_deref(),
+        ReleaseVariant::own(),
+    )
+}
+
+fn configured_variant_from(
+    override_value: Option<&OsStr>,
+    own: ReleaseVariant,
+) -> Result<ReleaseVariant, BlockReason> {
+    let Some(value) = override_value else {
+        return Ok(own);
+    };
+    // A value that is not even a string is a configuration error, not an
+    // absence: it blocks like any other unknown name rather than quietly
+    // selecting the build's own variant.
+    let Some(name) = value.to_str().map(str::trim) else {
+        return Err(BlockReason::InvalidVariant);
+    };
+    if name.is_empty() {
+        return Ok(own);
+    }
+    ReleaseVariant::from_name(name).ok_or(BlockReason::InvalidVariant)
+}
+
+/// The install path a variant's binary is served from. The release pair keeps
+/// the paths the server named; a variant's are derived, because the server's
+/// `daemon.update` frame only ever describes the release pair.
+fn variant_install_path(kind: &str, target: &str, variant: ReleaseVariant) -> String {
+    format!("/api/install/{kind}/{target}/{}", variant.as_str())
 }
 
 impl From<BlockReason> for UpdateFailure {
@@ -132,6 +213,18 @@ struct Preconditions {
     daemon_path: PathBuf,
     worker_path: PathBuf,
     target: &'static str,
+    variant: ReleaseVariant,
+}
+
+/// What the signed manifest says to install, resolved for the variant this
+/// daemon follows: the paths to download, the hashes the bytes must have,
+/// and the version the new binary must report. Every field comes from the
+/// verified manifest or from a request already proven to match it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdatePlan {
+    version: String,
+    spawnd: DaemonUpdateArtifact,
+    spawn_worker: DaemonUpdateArtifact,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +304,17 @@ struct SignedReleaseManifest {
     #[serde(default)]
     signing_key_id: Option<String>,
     targets: HashMap<String, ReleaseTarget>,
+    /// Kept opaque on purpose: only the variant this daemon follows is ever
+    /// decoded, so a release daemon is unaffected by whatever shape a future
+    /// variant takes, and a daemon older than this field ignores it entirely.
+    #[serde(default)]
+    variants: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestVariant {
+    version: String,
+    targets: HashMap<String, ReleaseTarget>,
 }
 
 async fn fetch_bounded_metadata(
@@ -264,7 +368,8 @@ async fn verify_release_manifest(
     server_origin: &Url,
     request: &UpdateRequest,
     target: &str,
-) -> Result<(), UpdateFailure> {
+    variant: ReleaseVariant,
+) -> Result<UpdatePlan, UpdateFailure> {
     let allow_unsigned = allow_unsigned_update();
     let manifest = fetch_bounded_metadata(
         client,
@@ -300,6 +405,7 @@ async fn verify_release_manifest(
             public_keys: &keys,
             build_counter: crate::version::build_counter(),
             downgrade_authorized,
+            variant,
         },
     )
 }
@@ -348,20 +454,34 @@ struct VerifyPolicy<'a> {
     build_counter: Option<u64>,
     /// The server asked for a downgrade *and* the host consented locally.
     downgrade_authorized: bool,
+    /// The build this daemon follows; see `ReleaseVariant`.
+    variant: ReleaseVariant,
 }
 
+/// Verify a manifest against the request and resolve what to install.
+///
+/// The request is the server's claim and the manifest is the proof: the
+/// server's tree and release hashes must match the signed release for the
+/// target whatever variant is wanted, because that is what stops a server
+/// from steering a daemon to a tree the release key never signed. The
+/// artifacts installed are then the release pair as requested, or the wanted
+/// variant's pair read from the same signed bytes. A variant that the
+/// manifest does not carry for this target is refused outright — never
+/// quietly swapped for the release pair, which would turn a diagnostics host
+/// back into a release host without anyone asking.
 fn verify_manifest_bytes(
     manifest_bytes: &[u8],
     signature_bytes: Option<&[u8]>,
     request: &UpdateRequest,
     target: &str,
     policy: &VerifyPolicy<'_>,
-) -> Result<(), UpdateFailure> {
+) -> Result<UpdatePlan, UpdateFailure> {
     let VerifyPolicy {
         allow_unsigned,
         public_keys,
         build_counter,
         downgrade_authorized,
+        variant,
     } = *policy;
     let manifest: SignedReleaseManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"))?;
@@ -426,11 +546,65 @@ fn verify_manifest_bytes(
     {
         return Err(UpdateFailure::new(UpdateStage::Precondition, "downgrade"));
     }
-    Ok(())
+    match variant {
+        ReleaseVariant::Release => Ok(UpdatePlan {
+            version: request.version.clone(),
+            spawnd: request.spawnd.clone(),
+            spawn_worker: request.spawn_worker.clone(),
+        }),
+        ReleaseVariant::Diagnostics => variant_plan(&manifest, target, variant),
+    }
 }
 
-fn same_tree_is_current(release_tree: &str, own_tree: &str, worker_mismatch: bool) -> bool {
-    release_tree == own_tree && !worker_mismatch
+fn variant_plan(
+    manifest: &SignedReleaseManifest,
+    target: &str,
+    variant: ReleaseVariant,
+) -> Result<UpdatePlan, UpdateFailure> {
+    let Some(entry) = manifest.variants.get(variant.as_str()) else {
+        return Err(UpdateFailure::new(
+            UpdateStage::Verify,
+            "variant_unavailable",
+        ));
+    };
+    let entry: ManifestVariant = serde_json::from_value(entry.clone())
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"))?;
+    let Some(artifacts) = entry.targets.get(target) else {
+        return Err(UpdateFailure::new(
+            UpdateStage::Verify,
+            "variant_unavailable",
+        ));
+    };
+    if entry.version.trim().is_empty()
+        || !valid_sha256(&artifacts.spawnd_sha256)
+        || !valid_sha256(&artifacts.spawn_worker_sha256)
+    {
+        return Err(UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"));
+    }
+    Ok(UpdatePlan {
+        version: entry.version.clone(),
+        spawnd: DaemonUpdateArtifact {
+            path: variant_install_path("spawnd", target, variant),
+            sha256: artifacts.spawnd_sha256.clone(),
+        },
+        spawn_worker: DaemonUpdateArtifact {
+            path: variant_install_path("spawn-worker", target, variant),
+            sha256: artifacts.spawn_worker_sha256.clone(),
+        },
+    })
+}
+
+/// Nothing to do when the release already describes this build: the same
+/// tree, a matching worker, and the variant this daemon follows being the one
+/// it is. A variant switch on the same tree is an update, not a no-op.
+fn release_is_current(
+    release_tree: &str,
+    own_tree: &str,
+    worker_mismatch: bool,
+    own_variant: ReleaseVariant,
+    wanted_variant: ReleaseVariant,
+) -> bool {
+    release_tree == own_tree && !worker_mismatch && own_variant == wanted_variant
 }
 
 pub fn capability() -> Capability {
@@ -485,7 +659,13 @@ pub async fn apply_from_release(server: &Url) -> Result<HttpUpdateOutcome, Updat
     let Some(daemon) = release.daemon.filter(|daemon| clean_tree(&daemon.tree)) else {
         return Ok(HttpUpdateOutcome::NoUpdate("release_unavailable"));
     };
-    if same_tree_is_current(&daemon.tree, own_tree, worker_mismatch()) {
+    if release_is_current(
+        &daemon.tree,
+        own_tree,
+        worker_mismatch(),
+        ReleaseVariant::own(),
+        preconditions.variant,
+    ) {
         return Ok(HttpUpdateOutcome::NoUpdate("current"));
     }
     let Some(target) = daemon.targets.get(preconditions.target) else {
@@ -520,14 +700,31 @@ async fn apply_guarded(
     if request.target != preconditions.target {
         return Err(BlockReason::UnsupportedTarget.into());
     }
-    let daemon_url = join_install_url(server_origin, &request.spawnd.path)?;
-    let worker_url = join_install_url(server_origin, &request.spawn_worker.path)?;
+    join_install_url(server_origin, &request.spawnd.path)?;
+    join_install_url(server_origin, &request.spawn_worker.path)?;
     if !valid_sha256(&request.spawnd.sha256) || !valid_sha256(&request.spawn_worker.sha256) {
         return Err(UpdateFailure::new(UpdateStage::Verify, "invalid_sha256"));
     }
 
     let client = http_client()?;
-    verify_release_manifest(&client, server_origin, request, preconditions.target).await?;
+    let plan = verify_release_manifest(
+        &client,
+        server_origin,
+        request,
+        preconditions.target,
+        preconditions.variant,
+    )
+    .await?;
+    tracing::info!(
+        stage = UpdateStage::Verify.as_str(),
+        variant = preconditions.variant.as_str(),
+        version = %plan.version,
+        "SPAWN D daemon self-update follows this release variant"
+    );
+    // The release pair keeps the URLs already checked above; a variant's are
+    // derived from the target, so they are joined and checked here.
+    let daemon_url = join_install_url(server_origin, &plan.spawnd.path)?;
+    let worker_url = join_install_url(server_origin, &plan.spawn_worker.path)?;
 
     let temporary = TempFiles::new(&preconditions)?;
     log_stage(UpdateStage::Download);
@@ -541,14 +738,14 @@ async fn apply_guarded(
         .map_err(|_| UpdateFailure::new(UpdateStage::Download, "timeout"))??;
 
     log_stage(UpdateStage::Verify);
-    if !daemon_hash.eq_ignore_ascii_case(&request.spawnd.sha256)
-        || !worker_hash.eq_ignore_ascii_case(&request.spawn_worker.sha256)
+    if !daemon_hash.eq_ignore_ascii_case(&plan.spawnd.sha256)
+        || !worker_hash.eq_ignore_ascii_case(&plan.spawn_worker.sha256)
     {
         return Err(UpdateFailure::new(UpdateStage::Verify, "sha256_mismatch"));
     }
     chmod_executable(&temporary.daemon)?;
     chmod_executable(&temporary.worker)?;
-    verify_version(&temporary.daemon, &request.version).await?;
+    verify_version(&temporary.daemon, &plan.version).await?;
 
     // Re-evaluate every filesystem and platform condition immediately before
     // the atomic renames. A changed resolution fails closed rather than
@@ -557,6 +754,7 @@ async fn apply_guarded(
     if current.daemon_path != preconditions.daemon_path
         || current.worker_path != preconditions.worker_path
         || current.target != preconditions.target
+        || current.variant != preconditions.variant
     {
         return Err(UpdateFailure::new(
             UpdateStage::Precondition,
@@ -1204,6 +1402,7 @@ fn evaluate_preconditions() -> Result<Preconditions, BlockReason> {
         daemon_path,
         worker_path,
         target_for(std::env::consts::OS, std::env::consts::ARCH),
+        configured_variant(),
         probe_writable,
     )?;
     #[cfg(windows)]
@@ -1233,6 +1432,7 @@ fn classify_preconditions<F>(
     daemon_path: Option<PathBuf>,
     worker_path: Option<PathBuf>,
     target: Option<&'static str>,
+    variant: Result<ReleaseVariant, BlockReason>,
     writable: F,
 ) -> Result<Preconditions, BlockReason>
 where
@@ -1252,10 +1452,12 @@ where
         return Err(BlockReason::Unwritable);
     }
     let target = target.ok_or(BlockReason::UnsupportedTarget)?;
+    let variant = variant?;
     Ok(Preconditions {
         daemon_path,
         worker_path,
         target,
+        variant,
     })
 }
 

@@ -56,16 +56,34 @@ Allow both listener traffic and relay allocations in the host/cloud firewall:
   pins `min-port=49160`/`max-port=49360` today, so that exact range is what
   the relay's security group admits. Config and firewall move in lockstep:
   widen the group first, then the config, then restart coturn.
-- UDP 50000–50100 inbound on each daemon machine where LAN/direct WebRTC is
+- UDP 50000–50999 inbound on each daemon machine where LAN/direct WebRTC is
   expected. This is the daemon's ephemeral candidate range, not coturn's relay
   range. Host firewalls may restrict it to trusted LANs when off-LAN traffic
-  can fall back to TURN.
+  can fall back to TURN. The range is also the budget for direct paths: every
+  peer connection binds one server-reflexive socket per STUN/TURN URL per
+  address family, plus one host socket per address of every interface that
+  carries a host candidate — LAN links and VPN interfaces alike, since a peer
+  on the same VPN reaches the daemon through them. Five a peer on a
+  two-interface Linux host; more on a Mac with its `utun`s. A peer that finds
+  the range full still reaches the TURN relay (the TURN client binds outside
+  the range), so a full range means relay-only sessions, and the relay pays
+  for them. Daemons before the 50000–50999 range pinned 50000–50100 and went
+  relay-only at about a dozen sessions on such a Mac. Ports are chosen at a
+  random offset within the range, so a firewall rule written for the old one
+  admits only about one socket in ten: re-create the rule for the new range
+  when the daemon updates. What stops a peer gathering anything at all is the
+  process's open-file limit; the daemon raises its own soft limit when it
+  starts to run, and the service units it writes set the soft limit only
+  (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`): the daemon's
+  hard limit follows every shell a SPAWN D terminal spawns, so a number there
+  would stop `ulimit -n` reaching what a native shell can. Those shells do
+  inherit the raised soft limit.
 
 For example, a daemon host using UFW can admit direct candidates from a
 `192.168.1.0/24` LAN with:
 
 ```bash
-sudo ufw allow from 192.168.1.0/24 to any port 50000:50100 proto udp
+sudo ufw allow from 192.168.1.0/24 to any port 50000:50999 proto udp
 ```
 
 Add the equivalent inbound rule to any host or cloud firewall in front of that
@@ -136,19 +154,21 @@ with it.
 ## Windows Firewall
 
 On native Windows, `spawnd.exe` is the only SPAWN D program that binds the
-direct WebRTC candidate range, UDP 50000–50100. The per-user installer neither
+direct WebRTC candidate range, UDP 50000–50999. The per-user installer neither
 elevates nor silently creates a firewall rule. When inbound direct ICE is
 blocked, the daemon can still use ordinary outbound UDP to the configured TURN
 service.
 
 An administrator who explicitly wants direct candidates on a Private network
-may add this program-scoped rule for the installed daemon:
+may add this program-scoped rule for the installed daemon. A rule created
+under the earlier 50000–50100 guidance admits about one socket in ten of the
+current range; remove it and create it again for 50000–50999:
 
 ```powershell
 $spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'
 New-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)' `
   -Direction Inbound -Action Allow -Profile Private -Program $spawnd `
-  -Protocol UDP -LocalPort 50000-50100
+  -Protocol UDP -LocalPort 50000-50999
 
 # Uninstall or rollback:
 Remove-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)'
