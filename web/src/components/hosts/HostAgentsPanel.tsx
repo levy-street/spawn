@@ -1,23 +1,13 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, CheckCircle2, Download, RefreshCw, X } from "lucide-react";
-import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { AlertCircle, CheckCircle2, RefreshCw, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { confirm } from "@/components/ui/confirm";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-  ApiError,
-  type Host,
-  type HostAgentInstallResult,
-  type HostAgentStatus,
-  hosts,
-} from "@/lib/api";
+import { ApiError, type Host, type HostAgentStatus, hosts } from "@/lib/api";
 
 export function HostAgentsPanel({ host }: { host: Host }) {
-  const queryClient = useQueryClient();
-  const [lastResult, setLastResult] = useState<HostAgentInstallResult | null>(null);
   const agentsQ = useQuery({
     queryKey: ["host-agents", host.id],
     queryFn: () => hosts.agents(host.id),
@@ -25,39 +15,18 @@ export function HostAgentsPanel({ host }: { host: Host }) {
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
-  const failureResult = (name: string, error: unknown): HostAgentInstallResult => ({
-    agent_id: "",
-    agent_name: name,
-    agent_kind: "",
-    command: "",
-    success: false,
-    output: "",
-    error: error instanceof ApiError ? error.message : String(error),
-  });
-  const installM = useMutation({
-    mutationFn: (agent: HostAgentStatus) => hosts.installAgent(host.id, agent.agent_id),
-    onSuccess: (result) => {
-      setLastResult(result);
-      queryClient.invalidateQueries({ queryKey: ["host-agents", host.id] });
-    },
-    onError: (error) => setLastResult(failureResult("Install", error)),
-  });
-  const policyM = useMutation({
-    mutationFn: ({ agent, autoUpdate }: { agent: HostAgentStatus; autoUpdate: boolean }) =>
-      hosts.updateAgentPolicy(host.id, agent.agent_id, { auto_update: autoUpdate }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["host-agents", host.id] }),
-    onError: (error) => setLastResult(failureResult("Policy", error)),
-  });
-
   if (host.status !== "online") {
     return (
       <div className="rounded-xl border border-border px-4 py-3 text-sm text-muted-foreground">
-        Agent availability is unavailable while the daemon is offline.
+        <p>Agent availability is unavailable while the daemon is offline.</p>
+        <p className="mt-2">
+          Agent installation and auto update are unavailable here. Install or update agents in a
+          trusted terminal on this host.
+        </p>
       </div>
     );
   }
 
-  const installingId = installM.variables?.agent_id;
   const definitions = agentsQ.data?.agents ?? [];
 
   return (
@@ -81,6 +50,11 @@ export function HostAgentsPanel({ host }: { host: Host }) {
           <RefreshCw className={`size-3.5 ${agentsQ.isFetching ? "animate-spin" : ""}`} />
         </Button>
       </div>
+
+      <p className="border-b border-border px-4 py-3 text-sm text-muted-foreground">
+        Agent installation and auto update are unavailable here. Install or update agents in a
+        trusted terminal on this host.
+      </p>
 
       {agentsQ.isLoading && (
         <div className="space-y-3 p-4">
@@ -129,60 +103,9 @@ export function HostAgentsPanel({ host }: { host: Host }) {
                   )}
                 </div>
               </div>
-              <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
-                <input
-                  type="checkbox"
-                  checked={agent.auto_update}
-                  disabled={!agent.install || policyM.isPending}
-                  onChange={(event) =>
-                    policyM.mutate({ agent, autoUpdate: event.currentTarget.checked })
-                  }
-                />
-                Auto update
-              </label>
-              <Button
-                variant={agent.installed && !agent.update_available ? "outline" : "secondary"}
-                size="sm"
-                className="shrink-0"
-                disabled={!agent.install || installM.isPending}
-                onClick={async () => {
-                  const accepted = await confirm({
-                    title: `${agent.installed ? "Update" : "Install"} ${agent.agent_name}?`,
-                    body: `Runs the install command on ${host.name}.`,
-                    confirmLabel: agent.installed ? "Update" : "Install",
-                  });
-                  if (accepted) {
-                    setLastResult(null);
-                    installM.mutate(agent);
-                  }
-                }}
-              >
-                <Download className="size-3.5" />
-                {installingId === agent.agent_id
-                  ? "Running…"
-                  : agent.installed
-                    ? "Update"
-                    : "Install"}
-              </Button>
             </li>
           ))}
         </ul>
-      )}
-
-      {lastResult && (
-        <div className="border-t border-border px-4 py-3">
-          <div
-            className={`mb-2 text-sm ${lastResult.success ? "text-success" : "text-destructive"}`}
-          >
-            {lastResult.agent_name}: {lastResult.success ? "completed" : "failed"}
-            {lastResult.error ? ` · ${lastResult.error}` : ""}
-          </div>
-          {lastResult.output && (
-            <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-2 text-xs">
-              {lastResult.output}
-            </pre>
-          )}
-        </div>
       )}
     </section>
   );

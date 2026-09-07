@@ -108,6 +108,7 @@ test("persists a non-extractable identity across real browser page sessions", as
   expect(reloaded.version).toBe(1);
   expect(reloaded.recordKeys).toEqual([
     "accountId",
+    "lastUsedAt",
     "privateKey",
     "publicKey",
     "publicKeyWire",

@@ -124,9 +124,12 @@ lifecycle state, exit codes, foreground executable basenames, and activity
 timestamps; agent-definition names, kinds, commands, environment prefixes, and
 install commands; skill names, descriptions, bodies, defaults, and session
 grants; public trust material; connection/signaling timing; and IP addresses.
-Host-agent availability/install flows also expose the definition target,
-installed path/version data, result output/errors, policy, and update
-timestamps. Since 2026-08-21 the server additionally holds a host's static
+Host-agent availability flows expose the definition target, installed
+path/version data, and errors. Historical install output/errors, policy, and
+update timestamps can remain stored. Server-driven installation and agent
+auto-update are now disabled; version checks still execute server-selected
+binaries. See `DAEMON_COMMAND_AUTHORITY.md` for the remaining command authority.
+Since 2026-08-21 the server additionally holds a host's static
 hardware spec, a five-level CPU/memory reading refreshed per heartbeat, and a
 per-owner daily activity rollup — see "Host capacity" below for why those are
 bucketed and coarse rather than exact, and for the switch that turns them off. Activity frames contain no terminal bytes and are throttled, but
@@ -181,7 +184,7 @@ on a host it no longer owns.
 | Host file previews (rendered thumbnails, decoded head slices) | current: `spawn.host.ctl` `fs.preview` / `fs.read.range` only | never server-visible; held in memory for the session, never written to disk, never logged |
 | Host desktop launches (`desktop.reveal`, `desktop.open`) | current: `spawn.host.ctl` only; the daemon records the operation name locally in `activity.rs` and never the path | never server-visible |
 | Cross-host file transfer | former server source-read/forward path | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source is browser-mediated across two host channels |
-| Agent check/install commands, paths, installed/latest versions, output, and detailed errors | current: REST plus `host.agents.*`; policy errors can persist in Postgres | server-readable path remains; endpoint-only replacement is not implemented |
+| Agent commands, paths, installed/latest versions, output, and detailed errors | current checks: REST plus `host.agents.check`; install definitions and historical policy/errors remain stored | installation is refused and automation disabled; checks remain server-readable and execute server-selected binaries; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
 
 ### Host capacity (2026-08-21)
@@ -533,10 +536,11 @@ What moves where, and the regressions we accept:
   signaling/ICE; paths, entry names/sizes/mtimes, file bytes, and operation
   errors stay on the DataChannel. Cross-host transfer is browser-mediated
   between two such channels, so the control plane never buffers the file.
-- **Agent-definition checks and installation** → currently use REST plus the
-  `host.agents.*` daemon frames. Their target, versions, output, and detailed
-  error can reach the control plane. Moving the interactive result and policy
-  target to `spawn.host.ctl` remains Phase 2 work.
+- **Agent-definition checks** → use REST plus `host.agents.check`; targets,
+  versions, and detailed errors can reach the control plane. **Installation**
+  is refused by the daemon, and server-driven agent auto-update is disabled.
+  Moving checks, installation, and durable policy targets to endpoint authority
+  remains Phase 2 work; see `DAEMON_COMMAND_AUTHORITY.md`.
 - **Detailed operational errors** → upload and filesystem detail stays on
   `spawn.ctl` / `spawn.host.ctl`, but free-form daemon errors and host-agent
   check/install results still have server-readable paths. P2-ERROR-01 and the

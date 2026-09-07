@@ -112,6 +112,9 @@ npx bun test src              # unit tests run under bun, not jest
 npm run test:e2e              # Playwright, when the change warrants it
 ```
 
+An end-to-end test that starts another Next server gives it its own disposable
+`SPAWN_NEXT_DIST_DIR`. Sharing `.next` overwrites the running suite's build.
+
 ## Keeping this file true
 
 Agents and people plan work from this file, so a stale version misroutes every

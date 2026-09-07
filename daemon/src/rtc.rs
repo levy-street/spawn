@@ -85,10 +85,10 @@ const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace period for a connected peer that reports `Disconnected` (transient
 /// network blips) before the daemon closes it.
 const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
-#[cfg(not(test))]
+// Exercise the production grace in real-peer tests too: a shorter test-only
+// deadline can reap a partial peer before its negative probes reach the gate
+// on a loaded runner, so the test never exercises the boundary it asserts.
 const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the daemon waits for one obfuscated `<name>.local` candidate to
 /// resolve.
 ///
@@ -5209,7 +5209,7 @@ mod tests {
         let mut answer_set = false;
         let mut pending_candidates = Vec::new();
         let mut probe_checked = probe.is_none();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(REQUIRED_SESSION_CHANNEL_TIMEOUT + Duration::from_secs(10), async {
             loop {
                 if sessions.resident_session_count().await == 0 {
                     break;

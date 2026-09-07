@@ -48,8 +48,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const WS_PING_INTERVAL: Duration = Duration::from_secs(15);
 const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
 const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
-const TOOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const TOOL_OUTPUT_LIMIT: usize = 16 * 1024;
 #[cfg(unix)]
 const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SESSION_COLS: u16 = 120;
@@ -2456,7 +2454,21 @@ async fn handle_host_agents_install(
     target: HostAgentTarget,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    let result = install_host_agent(target).await;
+    // This socket authenticates the server, not the operator's device. Neither
+    // a request ID nor a server-stored auto-update policy grants code execution.
+    // Keep the reply shape for old servers, but never probe or execute the target.
+    let result = HostAgentInstallResult {
+        agent_id: target.agent_id,
+        agent_name: target.agent_name,
+        agent_kind: target.agent_kind,
+        command: target.command,
+        install: target.install,
+        success: false,
+        exit_code: None,
+        output: String::new(),
+        error: Some("device_authorization_required: install or update agents in a trusted terminal on this host".into()),
+        status: None,
+    };
     let frame = Outbound::HostAgentsInstallResult { request_id, result };
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::json(s)).await;
@@ -2521,134 +2533,6 @@ async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
         latest_version,
         update_available,
         error,
-    }
-}
-
-/// Self-update subcommand for tools whose own updater targets the
-/// installation PATH actually resolves — install scripts often manage a
-/// different copy (e.g. `npm install -g` under nvm while PATH serves the
-/// native installer's binary), which "succeeds" without changing anything.
-fn self_update_args(agent_kind: &str) -> Option<&'static [&'static str]> {
-    match agent_kind {
-        "claude-code" => Some(&["update"]),
-        // `--yes` answers the updater's confirmation prompts; without it the
-        // command can block on stdin, and this runs headless.
-        "hermes" => Some(&["update", "--yes"]),
-        _ => None,
-    }
-}
-
-/// Decide the honest outcome of an update attempt: a script can exit 0 while
-/// the version PATH serves never changes (shadowed install). Demote that to
-/// an explicit failure so the auto-update loop surfaces it instead of
-/// silently retrying forever.
-fn update_outcome(
-    version_before: Option<&str>,
-    status: Option<&HostAgentStatus>,
-    script_success: bool,
-    script_error: Option<String>,
-) -> (bool, Option<String>) {
-    if !script_success {
-        return (false, script_error);
-    }
-    let Some(status) = status else {
-        return (true, script_error);
-    };
-    let unchanged = match (version_before, status.version.as_deref()) {
-        (Some(before), Some(after)) => before == after,
-        _ => false,
-    };
-    if unchanged && status.update_available == Some(true) {
-        let path = status.path.as_deref().unwrap_or("?");
-        let version = status.version.as_deref().unwrap_or("?");
-        let latest = status.latest_version.as_deref().unwrap_or("?");
-        return (
-            false,
-            Some(format!(
-                "update ran but PATH still serves {path} at {version} (latest {latest}); \
-                 another installation is shadowing the updated copy"
-            )),
-        );
-    }
-    (true, script_error)
-}
-
-async fn install_host_agent(target: HostAgentTarget) -> HostAgentInstallResult {
-    let install = target.install.as_deref().unwrap_or("").trim().to_string();
-    if install.is_empty() {
-        return HostAgentInstallResult {
-            agent_id: target.agent_id,
-            agent_name: target.agent_name,
-            agent_kind: target.agent_kind,
-            command: target.command,
-            install: target.install,
-            success: false,
-            exit_code: None,
-            output: String::new(),
-            error: Some("agent has no install command".into()),
-            status: None,
-        };
-    }
-
-    let env = resolved_command_env().await;
-    let version_before = read_tool_version(&target.command, &env)
-        .await
-        .ok()
-        .flatten();
-
-    // Already-installed tools with a self-updater get it first: it updates
-    // the installation PATH resolves, which the install script may not.
-    let mut capture = None;
-    if version_before.is_some() {
-        if let Some(args) = self_update_args(&target.agent_kind) {
-            let self_capture = run_program_capture(
-                &target.command,
-                args,
-                TOOL_INSTALL_TIMEOUT,
-                TOOL_OUTPUT_LIMIT,
-                Some(&env),
-            )
-            .await;
-            let after = read_tool_version(&target.command, &env)
-                .await
-                .ok()
-                .flatten();
-            if self_capture.success && after != version_before {
-                capture = Some(self_capture);
-            }
-        }
-    }
-    let capture = match capture {
-        Some(capture) => capture,
-        None => {
-            run_shell_capture(
-                &install,
-                TOOL_INSTALL_TIMEOUT,
-                TOOL_OUTPUT_LIMIT,
-                Some(&env),
-            )
-            .await
-        }
-    };
-
-    let status = Some(check_host_agent(target.clone()).await);
-    let (success, error) = update_outcome(
-        version_before.as_deref(),
-        status.as_ref(),
-        capture.success,
-        capture.error,
-    );
-    HostAgentInstallResult {
-        agent_id: target.agent_id,
-        agent_name: target.agent_name,
-        agent_kind: target.agent_kind,
-        command: target.command,
-        install: target.install,
-        success,
-        exit_code: capture.exit_code,
-        output: capture.output,
-        error,
-        status,
     }
 }
 
@@ -2960,9 +2844,7 @@ fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
 #[derive(Debug)]
 struct CommandCapture {
     success: bool,
-    exit_code: Option<i32>,
     output: String,
-    error: Option<String>,
 }
 
 async fn run_program_capture(
@@ -2983,9 +2865,7 @@ async fn run_program_capture(
     let Some(resolved) = resolve_program_in_env(Path::new(program), resolution_env) else {
         return CommandCapture {
             success: false,
-            exit_code: None,
             output: String::new(),
-            error: Some(format!("{program} was not found on PATH")),
         };
     };
     #[cfg(windows)]
@@ -2994,9 +2874,7 @@ async fn run_program_capture(
     {
         return CommandCapture {
             success: false,
-            exit_code: None,
             output: String::new(),
-            error: Some("refusing non-fixed arguments through a cmd shim".into()),
         };
     }
     #[cfg(unix)]
@@ -3035,12 +2913,10 @@ async fn run_program_capture(
 
     let child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => {
+        Err(_) => {
             return CommandCapture {
                 success: false,
-                exit_code: None,
                 output: String::new(),
-                error: Some(e.to_string()),
             };
         }
     };
@@ -3048,21 +2924,15 @@ async fn run_program_capture(
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => CommandCapture {
             success: output.status.success(),
-            exit_code: output.status.code(),
             output: combined_output(&output.stdout, &output.stderr, output_limit),
-            error: None,
         },
-        Ok(Err(e)) => CommandCapture {
+        Ok(Err(_)) => CommandCapture {
             success: false,
-            exit_code: None,
             output: String::new(),
-            error: Some(e.to_string()),
         },
         Err(_) => CommandCapture {
             success: false,
-            exit_code: None,
             output: String::new(),
-            error: Some(format!("command timed out after {}s", timeout.as_secs())),
         },
     }
 }
@@ -3072,94 +2942,6 @@ fn cmd_shim_command_line(args: &[&str]) -> Option<String> {
     args.iter()
         .all(|arg| matches!(*arg, "--version" | "version" | "-V" | "-v" | "update"))
         .then(|| format!("\"\"%SPAWN_CMD_SHIM%\" {}\"", args.join(" ")))
-}
-
-async fn run_shell_capture(
-    command: &str,
-    timeout: Duration,
-    output_limit: usize,
-    env: Option<&BTreeMap<String, String>>,
-) -> CommandCapture {
-    #[cfg(unix)]
-    let mut shell = Command::new("bash");
-    #[cfg(unix)]
-    shell
-        .arg("-c")
-        .arg(format!("exec 2>&1; {command}"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    let mut shell = {
-        let process_env;
-        let resolution_env = match env {
-            Some(env) => env,
-            None => {
-                process_env = std::env::vars().collect::<BTreeMap<_, _>>();
-                &process_env
-            }
-        };
-        let resolved = ["pwsh.exe", "powershell.exe"]
-            .into_iter()
-            .find_map(|name| resolve_program_in_env(Path::new(name), resolution_env));
-        let Some(resolved) = resolved else {
-            return CommandCapture {
-                success: false,
-                exit_code: None,
-                output: String::new(),
-                error: Some("PowerShell is unavailable".into()),
-            };
-        };
-        let mut shell = Command::new(resolved.path);
-        shell
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        shell
-    };
-    if let Some(env) = env {
-        shell.envs(env);
-    }
-
-    let child = match shell.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return CommandCapture {
-                success: false,
-                exit_code: None,
-                output: String::new(),
-                error: Some(e.to_string()),
-            };
-        }
-    };
-
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => CommandCapture {
-            success: output.status.success(),
-            exit_code: output.status.code(),
-            output: combined_output(&output.stdout, &output.stderr, output_limit),
-            error: None,
-        },
-        Ok(Err(e)) => CommandCapture {
-            success: false,
-            exit_code: None,
-            output: String::new(),
-            error: Some(e.to_string()),
-        },
-        Err(_) => CommandCapture {
-            success: false,
-            exit_code: None,
-            output: String::new(),
-            error: Some(format!(
-                "install command timed out after {}s",
-                timeout.as_secs()
-            )),
-        },
-    }
 }
 
 fn combined_output(stdout: &[u8], stderr: &[u8], limit: usize) -> String {
@@ -6229,57 +6011,6 @@ mod tests {
         server.await.unwrap();
     }
 
-    fn tool_status(
-        version: Option<&str>,
-        latest: Option<&str>,
-        update_available: Option<bool>,
-    ) -> HostAgentStatus {
-        HostAgentStatus {
-            agent_id: "p".into(),
-            agent_name: "claude".into(),
-            agent_kind: "claude-code".into(),
-            command: "claude".into(),
-            install: None,
-            installed: true,
-            path: Some("/home/u/.local/bin/claude".into()),
-            version: version.map(str::to_string),
-            latest_version: latest.map(str::to_string),
-            update_available,
-            error: None,
-        }
-    }
-
-    #[test]
-    fn update_outcome_demotes_shadowed_install_success() {
-        // Script exited 0 but PATH still serves the old version with an
-        // update still available: silent no-op must become a visible error.
-        let status = tool_status(Some("2.1.129"), Some("2.1.209"), Some(true));
-        let (success, error) = update_outcome(Some("2.1.129"), Some(&status), true, None);
-        assert!(!success);
-        let msg = error.expect("explanatory error");
-        assert!(msg.contains("shadowing"), "unexpected error: {msg}");
-        assert!(msg.contains("2.1.129") && msg.contains("2.1.209"));
-    }
-
-    #[test]
-    fn update_outcome_accepts_version_change() {
-        let status = tool_status(Some("2.1.209"), Some("2.1.209"), Some(false));
-        let (success, error) = update_outcome(Some("2.1.129"), Some(&status), true, None);
-        assert!(success);
-        assert!(error.is_none());
-    }
-
-    #[test]
-    fn update_outcome_accepts_fresh_install_and_keeps_script_failures() {
-        let status = tool_status(Some("1.0.0"), None, None);
-        let (success, _) = update_outcome(None, Some(&status), true, None);
-        assert!(success, "fresh install with no prior version");
-        let (success, error) =
-            update_outcome(Some("1.0.0"), Some(&status), false, Some("boom".into()));
-        assert!(!success);
-        assert_eq!(error.as_deref(), Some("boom"));
-    }
-
     #[test]
     fn known_curl_installers_map_to_registry_packages() {
         assert_eq!(
@@ -6298,12 +6029,70 @@ mod tests {
         );
     }
 
-    #[test]
-    fn self_update_args_only_for_known_kinds() {
-        assert_eq!(self_update_args("claude-code"), Some(&["update"][..]));
-        assert_eq!(self_update_args("hermes"), Some(&["update", "--yes"][..]));
-        assert_eq!(self_update_args("codex"), None);
-        assert_eq!(self_update_args("shell"), None);
+    #[tokio::test]
+    async fn server_install_requests_never_execute_or_probe_a_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("unauthorized-install");
+        let probe_marker = temp.path().join("unauthorized-probe");
+        #[cfg(unix)]
+        let probe = temp.path().join("tool");
+        #[cfg(windows)]
+        let probe = temp.path().join("tool.cmd");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(
+                &probe,
+                format!("#!/bin/sh\ntouch '{}'\n", probe_marker.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(windows)]
+        fs::write(
+            &probe,
+            format!("@echo probe>\"{}\"\r\n", probe_marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let install = format!("touch '{}'", marker.display());
+        #[cfg(windows)]
+        let install = format!(
+            "New-Item -ItemType File -LiteralPath '{}'",
+            marker.display()
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        for kind in ["claude-code", "hermes", "codex", "shell"] {
+            let wire = serde_json::json!({
+                "type": "host.agents.install", "request_id": "replayed-request",
+                "target": { "agent_id": "agent", "agent_name": "Agent",
+                    "agent_kind": kind, "command": probe.to_str().unwrap(),
+                    "install": install },
+                "authorized": true, "auto_update": true
+            });
+            let Inbound::HostAgentsInstall { request_id, target } =
+                serde_json::from_value(wire).unwrap()
+            else {
+                panic!("wrong frame")
+            };
+            handle_host_agents_install(request_id, target, &tx).await;
+            let reply = rx.recv().await.unwrap();
+            let value: serde_json::Value = serde_json::from_str(reply.as_str()).unwrap();
+            assert_eq!(value["type"], "host.agents.install_result");
+            assert_eq!(value["request_id"], "replayed-request");
+            let result: HostAgentInstallResult =
+                serde_json::from_value(value["result"].clone()).unwrap();
+            assert!(!result.success);
+            assert_eq!(result.exit_code, None);
+            assert_eq!(result.output, "");
+            assert!(result.status.is_none());
+            assert!(result
+                .error
+                .unwrap()
+                .starts_with("device_authorization_required:"));
+            assert!(!marker.exists(), "server-supplied installer executed");
+            assert!(!probe_marker.exists(), "server-selected tool was probed");
+        }
     }
 
     #[test]
