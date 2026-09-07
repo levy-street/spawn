@@ -151,15 +151,26 @@ PY
   UPDATE_SERVER_ROOT="$UPDATE_REPO_ROOT"
   UPDATE_HTTP_STATUS=""
   UPDATE_HTTP_BODY=""
+  # The diagnostics pair a written manifest lists under `variants`, once
+  # `update_test_build_variant_identities` has built it. Empty means the
+  # manifest carries no variant, which is what the fault and probation
+  # scripts want and what a caller sets to model a release without one.
+  UPDATE_VARIANT_DIR=""
+  UPDATE_VARIANT_VERSION=""
 }
 
 update_test_build_pair() {
   local name="$1"
   local tree="$2"
   local counter="$3"
+  local profile="${4:-release}"
   local cargo_dir="$UPDATE_CARGO_ROOT"
   local started=$SECONDS
-  update_test_log "building release $name daemon identity tree=$tree counter=$counter"
+  local features=()
+  # A variant is built exactly as prebuilt.yml builds it: its own cargo
+  # profile plus the feature of the same name, into that profile's directory.
+  [[ "$profile" == "release" ]] || features=(--features "$profile")
+  update_test_log "building $profile $name daemon identity tree=$tree counter=$counter"
   # The updater consumes stripped release binaries in production. Debug
   # binaries with full debuginfo can exceed its bounded-download guard on
   # Linux, and do not represent the artifacts this end-to-end harness proves.
@@ -170,10 +181,12 @@ update_test_build_pair() {
     SPAWND_DAEMON_TREE_OVERRIDE="$tree" \
     SPAWND_BUILD_COUNTER_OVERRIDE="$counter" \
     SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE="$UPDATE_PUBLIC_KEY" \
-    cargo build --manifest-path "$UPDATE_REPO_ROOT/daemon/Cargo.toml" --locked --release \
+    cargo build --manifest-path "$UPDATE_REPO_ROOT/daemon/Cargo.toml" --locked \
+      --profile "$profile" ${features[@]+"${features[@]}"} \
       --bin spawnd --bin spawn-worker >/dev/null
-  cp "$cargo_dir/release/spawnd" "$UPDATE_ARTIFACTS/$name/spawnd"
-  cp "$cargo_dir/release/spawn-worker" "$UPDATE_ARTIFACTS/$name/spawn-worker"
+  mkdir -p "$UPDATE_ARTIFACTS/$name"
+  cp "$cargo_dir/$profile/spawnd" "$UPDATE_ARTIFACTS/$name/spawnd"
+  cp "$cargo_dir/$profile/spawn-worker" "$UPDATE_ARTIFACTS/$name/spawn-worker"
   chmod 755 "$UPDATE_ARTIFACTS/$name/spawnd" "$UPDATE_ARTIFACTS/$name/spawn-worker"
   update_test_log "built $name identity in $((SECONDS - started))s"
 }
@@ -192,6 +205,33 @@ update_test_build_identities() {
     || update_test_die "new worker identity was not stamped"
 }
 
+# The diagnostics variant of both identities, so a manifest can carry a real
+# `variants.diagnostics` pair and a diagnostics daemon can be run. Must follow
+# update_test_build_identities, whose release version the variant's extends.
+update_test_build_variant_identities() {
+  [[ -n "${UPDATE_VERSION:-}" ]] \
+    || update_test_die "build the release identities before the variant ones"
+  update_test_build_pair old-diagnostics "$UPDATE_TREE_A" "$UPDATE_COUNTER_A" diagnostics
+  update_test_build_pair new-diagnostics "$UPDATE_TREE_B" "$UPDATE_COUNTER_B" diagnostics
+  UPDATE_VARIANT_VERSION="$("$UPDATE_ARTIFACTS/new-diagnostics/spawnd" --version | awk 'NR == 1 {print $2}')"
+  [[ "$UPDATE_VARIANT_VERSION" == "$(prebuilt_variant_version "$UPDATE_VERSION" diagnostics)" ]] \
+    || update_test_die "unexpected diagnostics daemon version: $UPDATE_VARIANT_VERSION"
+  [[ "$("$UPDATE_ARTIFACTS/old-diagnostics/spawnd" --version | awk 'NR == 1 {print $2}')" \
+    == "$UPDATE_VARIANT_VERSION" ]] \
+    || update_test_die "old and new diagnostics identities report different versions"
+  [[ "$("$UPDATE_ARTIFACTS/old-diagnostics/spawn-worker" --version)" == *"tree=$UPDATE_TREE_A" ]] \
+    || update_test_die "old diagnostics worker identity was not stamped"
+  [[ "$("$UPDATE_ARTIFACTS/new-diagnostics/spawn-worker" --version)" == *"tree=$UPDATE_TREE_B" ]] \
+    || update_test_die "new diagnostics worker identity was not stamped"
+  ! cmp -s "$UPDATE_ARTIFACTS/new-diagnostics/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+    || update_test_die "the diagnostics and release identities are the same bytes"
+  UPDATE_VARIANT_DIR="$UPDATE_ARTIFACTS/new-diagnostics"
+}
+
+# Write the served release: the release pair (v-new by default) under the
+# target, and — when UPDATE_VARIANT_DIR names one — the diagnostics pair under
+# `<target>/diagnostics/`, listed in the signed manifest's `variants` map the
+# way deploy-prod.sh publishes it.
 update_test_write_manifest() {
   local tree="$1"
   local counter="$2"
@@ -199,23 +239,47 @@ update_test_write_manifest() {
   local worker_source="${4:-$UPDATE_ARTIFACTS/new/spawn-worker}"
   local target_dir="$UPDATE_PREBUILT/$UPDATE_TARGET"
   local daemon_sha worker_sha
+  local entries=()
   mkdir -p "$target_dir"
   cp "$daemon_source" "$target_dir/spawnd"
   cp "$worker_source" "$target_dir/spawn-worker"
   chmod 755 "$target_dir/spawnd" "$target_dir/spawn-worker"
   daemon_sha="$(update_test_sha256 "$target_dir/spawnd")"
   worker_sha="$(update_test_sha256 "$target_dir/spawn-worker")"
+  entries+=("$UPDATE_TARGET:$daemon_sha:$worker_sha")
+  rm -rf "$target_dir/diagnostics"
+  if [[ -n "$UPDATE_VARIANT_DIR" ]]; then
+    mkdir -p "$target_dir/diagnostics"
+    cp "$UPDATE_VARIANT_DIR/spawnd" "$target_dir/diagnostics/spawnd"
+    cp "$UPDATE_VARIANT_DIR/spawn-worker" "$target_dir/diagnostics/spawn-worker"
+    chmod 755 "$target_dir/diagnostics/spawnd" "$target_dir/diagnostics/spawn-worker"
+    entries+=("diagnostics:$UPDATE_TARGET:$(update_test_sha256 "$target_dir/diagnostics/spawnd"):$(update_test_sha256 "$target_dir/diagnostics/spawn-worker")")
+  fi
   render_prebuilt_manifest \
     "$UPDATE_COMMIT" "$tree" "$UPDATE_VERSION" "$counter" "$UPDATE_KEY_ID" \
-    "$UPDATE_TARGET:$daemon_sha:$worker_sha" >"$UPDATE_PREBUILT/manifest.json"
+    "${entries[@]}" >"$UPDATE_PREBUILT/manifest.json"
   sign_prebuilt_manifest \
     "$UPDATE_PREBUILT/manifest.json" "$UPDATE_PREBUILT/manifest.json.sig" "$UPDATE_KEY_FILE"
   verify_prebuilt_manifest_signature \
     "$UPDATE_PREBUILT/manifest.json" "$UPDATE_PREBUILT/manifest.json.sig" "$UPDATE_PUBLIC_KEY"
 }
 
+update_test_manifest_has_variant() { # variant
+  python3 - "$UPDATE_PREBUILT/manifest.json" "$1" "$UPDATE_TARGET" <<'PY'
+import json
+import sys
+
+path, variant, target = sys.argv[1:]
+manifest = json.load(open(path, encoding="utf-8"))
+raise SystemExit(0 if target in manifest.get("variants", {}).get(variant, {}).get("targets", {}) else 1)
+PY
+}
+
 update_test_new_fixture() {
   local label="$1"
+  # Which built identity starts out installed: `old` (the release pair) unless
+  # a cell wants a diagnostics daemon on the box.
+  local installed="${2:-old}"
   [[ -z "$UPDATE_SERVER_PID$UPDATE_DAEMON_PID$UPDATE_PROXY_PID$UPDATE_WEB_PID$UPDATE_BROWSER_PID" ]] \
     || update_test_die "cannot replace a live updater fixture"
   UPDATE_FIXTURE="$UPDATE_SCRATCH/$label"
@@ -251,8 +315,8 @@ update_test_new_fixture() {
   UPDATE_SESSION_ID=""
   UPDATE_WORKSPACE_ID=""
   mkdir -p "$UPDATE_DAEMON_HOME" "$UPDATE_BIN_DIR" "$UPDATE_SESSION_CWD"
-  cp "$UPDATE_ARTIFACTS/old/spawnd" "$UPDATE_BIN_DIR/spawnd"
-  cp "$UPDATE_ARTIFACTS/old/spawn-worker" "$UPDATE_BIN_DIR/spawn-worker"
+  cp "$UPDATE_ARTIFACTS/$installed/spawnd" "$UPDATE_BIN_DIR/spawnd"
+  cp "$UPDATE_ARTIFACTS/$installed/spawn-worker" "$UPDATE_BIN_DIR/spawn-worker"
   chmod 755 "$UPDATE_BIN_DIR/spawnd" "$UPDATE_BIN_DIR/spawn-worker"
   cat >"$UPDATE_SHELL" <<'SH'
 #!/usr/bin/env sh
@@ -642,11 +706,25 @@ update_test_start_daemon() {
   shift || true
   [[ -z "$UPDATE_DAEMON_PID" ]] || update_test_die "daemon is already running"
   update_test_require_local_url "$daemon_origin"
+  # From the fixture, never the repo root: the daemon probes `$SHELL -ic`
+  # from its own cwd, and the fake shell writes `.update-shell-ready` there.
   (
-    update_test_exec_daemon_env "$@" \
-      "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
+    cd "$UPDATE_FIXTURE" \
+      && update_test_exec_daemon_env "$@" \
+        "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
   ) >>"$UPDATE_DAEMON_LOG" 2>&1 &
   UPDATE_DAEMON_PID=$!
+}
+
+# Run `spawnd update` against the installed pair as an operator would: the
+# instance's environment plus whatever variables the caller sets, the
+# stored server origin, no service manager. Output lands in the daemon log.
+update_test_run_update_cli() {
+  (
+    cd "$UPDATE_FIXTURE" \
+      && update_test_exec_daemon_env "$@" \
+        "$UPDATE_BIN_DIR/spawnd" update
+  ) >>"$UPDATE_DAEMON_LOG" 2>&1
 }
 
 update_test_start_supervised_daemon() {
@@ -657,8 +735,9 @@ update_test_start_supervised_daemon() {
     trap 'if [[ -s "$UPDATE_DAEMON_CHILD_PID_FILE" ]]; then kill "$(<"$UPDATE_DAEMON_CHILD_PID_FILE")" >/dev/null 2>&1 || true; fi; exit 0' TERM INT
     while :; do
       (
-        update_test_exec_daemon_env \
-          "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
+        cd "$UPDATE_FIXTURE" \
+          && update_test_exec_daemon_env \
+            "$UPDATE_BIN_DIR/spawnd" --server "$daemon_origin" run
       ) >>"$UPDATE_DAEMON_LOG" 2>&1 &
       child=$!
       printf '%s\n' "$child" >"$UPDATE_DAEMON_CHILD_PID_FILE"

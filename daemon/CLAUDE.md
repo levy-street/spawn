@@ -50,7 +50,13 @@ src/
                  commit into it (0.1.0+g<commit>)
 Info.plist       the sentences macOS prints in its consent dialogs; build.rs
                  links it into both binaries' `__TEXT,__info_plist` section
-tests/           integration tests (worker_e2e.rs)
+tests/           integration tests (worker_e2e.rs), and
+                 xterm_checkpoint_proof.js, the headless xterm.js driver the
+                 emulator's unit tests run against the web workspace's
+                 `@xterm/xterm`. `SPAWN_XTERM_JS` names the bundle and makes
+                 the proof required (scripts/test-all.sh sets it); unset, the
+                 sibling web/node_modules is used when present and the test
+                 skips otherwise
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
@@ -261,11 +267,64 @@ is not avoidable. Three rules keep it from reading as an app grabbing at things:
 `docs/RELEASE.md` has the release half: which dialogs notarization removes, and
 what it takes for a grant to survive a self-update.
 
+## The diagnostics variant
+
+The same daemon, built with `--features diagnostics` under the
+`[profile.diagnostics]` in `Cargo.toml` (release codegen, symbols kept):
+
+```bash
+cargo build --locked --profile diagnostics --features diagnostics
+```
+
+What the feature changes: `version::DIAGNOSTICS_BUILD` is true, so the
+version gains a `.diagnostics` build-metadata segment
+(`0.1.0+g<commit>.diagnostics`, reported by `--version`, `status`, and the
+register frame), logging starts at `-v` (`spawnd=debug`) with nothing set,
+every attach failure is attributed at warning level, `session_ctl.rs` runs a
+watchdog that names whoever holds a session's control transaction and for how
+long, and `rtc.rs` logs the attach and bootstrap exchange at debug. Setting
+`SPAWND_DIAG_REPLAY_DUMP_DIR` in this variant only also writes the exact
+replay bytes each viewer was sent to that directory — terminal plaintext on
+the host's own disk, opt-in by environment and nowhere else. `RUST_BACKTRACE=1`
+in the unit is what the kept symbols are for.
+
+Delivery is a release variant, not a fork: `.github/workflows/prebuilt.yml`
+builds it beside the release pair for `linux-x86_64`, the signed manifest
+lists it under `variants.diagnostics`, and the server serves it from
+`/api/install/<kind>/<target>/diagnostics`. `update.rs` follows the variant
+the running binary was built as (`ReleaseVariant::own()`), so a diagnostics
+host stays diagnostics across updates with nothing configured and a release
+host never picks it up by accident; `SPAWND_RELEASE_VARIANT=release|diagnostics`
+overrides that in either direction, and any other value blocks self-update
+with `invalid_variant`. The variable is read by whichever process updates:
+the service, for the next release the server pushes, or `spawnd update`, from
+its own shell environment — the daemon itself only checks for an update
+when a protocol bump refuses it at the handshake (`run.rs`, the
+protocol-required path), so moving a host across on the tree it already runs
+is `SPAWND_RELEASE_VARIANT=diagnostics spawnd update`. A diagnostics daemon whose
+release carries no diagnostics pair for its target refuses the update with
+`variant_unavailable` and keeps running what it has — it never falls back to
+the release pair. "The diagnostics variant" in `docs/RELEASE.md` has the
+operator's side, including the one-time step for a daemon built before the
+updater knew about variants.
+
 ## Before calling a change done
 
 ```bash
 cargo build --locked
 cargo test --locked --bin spawnd <module>::
+```
+
+Both feature sets are checked, because the variant is a real release build;
+`scripts/test-all.sh` runs both `cargo test` lines, the clippy and build
+lines are the local checklist:
+
+```bash
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --features diagnostics -- -D warnings
+cargo test --locked
+cargo test --locked --features diagnostics
+cargo build --locked --profile diagnostics --features diagnostics
 ```
 
 Native Windows CI additionally gates every binary, test/example target, and
@@ -295,8 +354,17 @@ users goes through the rolling prebuilt release — read `docs/RELEASE.md`.
 
 WebRTC operational notes: `webrtc-ice` 0.17 cannot use TURN over TCP/TLS, so
 the offered ICE list must include a UDP `turn:` URL. Direct LAN ICE uses UDP
-ports 50000–50100; allow that inbound range in the host firewall. For temporary
-SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
+ports 50000–50999 (`RTC_UDP_PORT_MIN..=RTC_UDP_PORT_MAX` in `src/rtc.rs`);
+allow that inbound range in the host firewall. The range is the budget for
+direct paths — one server-reflexive socket per ICE URL per address family
+plus one host socket per address of every interface `interface_is_allowed`
+admits, VPN interfaces included by design; a full range means relay-only
+peers, since the TURN client binds outside it. The open-file limit is the
+ceiling that stops a peer gathering anything: `run.rs` raises the soft limit
+when the daemon starts to run, and `service.rs` writes soft-only limits into
+the units (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`) —
+never a hard limit, which every shell in a terminal would inherit. For
+temporary SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
 
 `host.agents.install` is a refusal-only compatibility frame: server identity
@@ -331,6 +399,10 @@ harness builds may set `SPAWND_DAEMON_TREE_OVERRIDE`,
 `SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE`. `SPAWND_ALLOW_UNSIGNED_UPDATE=1` is a
 local-development-only escape hatch that skips the signature and counter
 checks, emits one warning, and must never be used by production tooling.
+Which build of a release is installed — the release pair or a variant such as
+diagnostics — is decided by the daemon from its own build and
+`SPAWND_RELEASE_VARIANT`, never by the server; see "The diagnostics variant"
+above.
 
 The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
 `status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,

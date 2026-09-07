@@ -389,3 +389,66 @@ pub fn executable_variant(live: &Path, tag: &str) -> io::Result<PathBuf> {
     variant.push(OsStr::new(tag));
     Ok(live.with_file_name(variant))
 }
+
+/// What getrlimit(2) tells a caller to fall back to when the kernel refuses
+/// a soft limit above its own per-process maximum: macOS before 11 returns
+/// EINVAL for anything over `kern.maxfilesperproc`, and OPEN_MAX (10240) is
+/// always inside it.
+const OPEN_FILE_LIMIT_FALLBACK: u64 = 10_240;
+
+/// Raise this process's soft limit on open files to `target`, or to the hard
+/// limit when that is lower, and never lower it. Every peer connection the
+/// daemon answers costs a handful of descriptors — one per ICE socket, and a
+/// peer whose `bind()` fails with EMFILE gathers no candidate of any type and
+/// never starts ICE — while systemd starts a user service at 1024 and launchd
+/// starts an agent at 256. The service units set their own limits for new
+/// installs; this covers every host whose unit predates them. A kernel that
+/// refuses the target (older macOS, with the hard limit unlimited but its own
+/// maximum lower) gets a second ask at [`OPEN_FILE_LIMIT_FALLBACK`] when it
+/// holds less than that, and keeps what it holds otherwise; on macOS
+/// 11 and later the kernel accepts any value and enforces its maximum at use.
+pub fn raise_open_file_limit(target: u64) -> io::Result<super::OpenFileLimit> {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    let limit = getrlimit(Resource::Nofile);
+    let before = limit.current.unwrap_or(u64::MAX);
+    let ceiling = limit.maximum.unwrap_or(u64::MAX);
+    let raise_to = |current: u64| {
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(current),
+                maximum: limit.maximum,
+            },
+        )
+    };
+    let wanted = target.min(ceiling);
+    let mut after = before;
+    let mut refused = false;
+    if wanted > before {
+        match raise_to(wanted) {
+            Ok(()) => after = wanted,
+            Err(error) => {
+                // The kernel refused more than we hold. What we hold is fine
+                // when it is at least OPEN_MAX; below that, ask for OPEN_MAX,
+                // and if even that is refused report the first refusal — it
+                // names the limit the operator has to look at.
+                refused = true;
+                let fallback = OPEN_FILE_LIMIT_FALLBACK.min(ceiling);
+                if before < fallback && fallback < wanted {
+                    if raise_to(fallback).is_err() {
+                        return Err(error.into());
+                    }
+                    after = fallback;
+                } else if before < fallback {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+    Ok(super::OpenFileLimit {
+        before,
+        after,
+        maximum: limit.maximum,
+        refused,
+    })
+}

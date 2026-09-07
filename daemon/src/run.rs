@@ -466,7 +466,61 @@ async fn wait_for_credential_change_with(
     }
 }
 
+/// The soft limit on open files the daemon asks for when it starts to run.
+/// Every peer connection costs a handful of descriptors, and a peer that
+/// cannot bind a socket gathers no ICE candidate at all; systemd's 1024 and
+/// launchd's 256 run out at a laptop's worth of sessions (#80).
+const OPEN_FILE_LIMIT_TARGET: u64 = 65_536;
+
+fn raise_open_file_limit() {
+    let ceiling = |limit: &crate::platform::OpenFileLimit| {
+        limit
+            .maximum
+            .map_or_else(|| "unlimited".to_string(), |maximum| maximum.to_string())
+    };
+    // `after` is the rlimit, which on macOS 11 and later the kernel accepts
+    // above its own per-process maximum (`kern.maxfilesperproc`, 24576 on
+    // many Intel Macs) and enforces at the lower of the two when a file is
+    // opened; the effective ceiling there can be below the number logged.
+    match crate::platform::raise_open_file_limit(OPEN_FILE_LIMIT_TARGET) {
+        Ok(limit) if limit.after > limit.before => tracing::info!(
+            before = limit.before,
+            after = limit.after,
+            hard = %ceiling(&limit),
+            target = OPEN_FILE_LIMIT_TARGET,
+            refused = limit.refused,
+            "raised the open-file limit for this daemon"
+        ),
+        Ok(limit) if limit.refused => tracing::debug!(
+            current = limit.after,
+            hard = %ceiling(&limit),
+            target = OPEN_FILE_LIMIT_TARGET,
+            "the kernel refused an open-file limit above what this daemon holds"
+        ),
+        Ok(limit) if limit.after < OPEN_FILE_LIMIT_TARGET => tracing::debug!(
+            current = limit.after,
+            hard = %ceiling(&limit),
+            target = OPEN_FILE_LIMIT_TARGET,
+            "the hard limit caps the open-file limit below the target"
+        ),
+        Ok(limit) => tracing::debug!(
+            current = limit.after,
+            hard = %ceiling(&limit),
+            "the open-file limit already meets the target"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(error) => tracing::warn!(
+            %error,
+            target = OPEN_FILE_LIMIT_TARGET,
+            "could not raise the open-file limit; sessions are capped by the inherited one"
+        ),
+    }
+}
+
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
+    // First, before any peer: every session costs descriptors, and the
+    // inherited limit is a laptop's worth of them (#80).
+    raise_open_file_limit();
     install_sighup_handler();
     #[cfg(windows)]
     crate::service::refresh_user_path()?;
