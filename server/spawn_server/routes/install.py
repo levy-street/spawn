@@ -60,16 +60,28 @@ def _binary_filename(kind: Literal["spawnd", "spawn-worker"], target: str) -> st
     return f"{kind}{suffix}"
 
 
-def _binary_candidates(target: str, name: Literal["spawnd", "spawn-worker"]) -> list[Path]:
+def _binary_candidates(
+    target: str, name: Literal["spawnd", "spawn-worker"], variant: str | None = None
+) -> list[Path]:
+    """Where a served binary may come from, in order: what the deploy
+    published, then a cross-built cargo output, then — for this machine's
+    own target — a plain local build. A variant's published copy sits under
+    the target's directory, and its local builds under the cargo profile of
+    the same name, which is what `--profile <variant>` writes."""
     triple = SUPPORTED_TARGETS[target]
     root = _repo_root()
     filename = _binary_filename(name, target)
+    published = release.prebuilt_root(repo_root=root) / target
+    profile = "release"
+    if variant is not None:
+        published = published / variant
+        profile = variant
     candidates = [
-        release.prebuilt_root(repo_root=root) / target / filename,
-        root / "daemon" / "target" / triple / "release" / filename,
+        published / filename,
+        root / "daemon" / "target" / triple / profile / filename,
     ]
     if target == _local_target():
-        candidates.append(root / "daemon" / "target" / "release" / filename)
+        candidates.append(root / "daemon" / "target" / profile / filename)
     return candidates
 
 
@@ -109,44 +121,63 @@ def _prebuilt_sha256_cases() -> str:
     return "\n".join(arms)
 
 
+def _serve_binary(
+    kind: Literal["spawnd", "spawn-worker"], target: str, variant: str | None
+) -> FileResponse:
+    noun = "daemon" if kind == "spawnd" else "worker"
+    if target not in SUPPORTED_TARGETS:
+        raise HTTPException(status_code=404, detail=f"unsupported {noun} target")
+    if variant is not None and variant not in release.SUPPORTED_DAEMON_VARIANTS:
+        raise HTTPException(status_code=404, detail=f"unsupported {noun} variant")
+
+    candidates = (
+        _binary_candidates(target, kind)
+        if variant is None
+        else _binary_candidates(target, kind, variant)
+    )
+    binary = next((path for path in candidates if path.is_file()), None)
+    if binary is None:
+        what = f"{noun} binary" if variant is None else f"{variant} {noun} binary"
+        raise HTTPException(status_code=404, detail=f"{what} is not available for {target}")
+
+    # A variant installs under the plain name: it replaces the daemon, it
+    # does not sit beside it, so the download filename is the same.
+    return FileResponse(
+        binary,
+        media_type="application/octet-stream",
+        filename=_binary_filename(kind, target),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/api/install/spawnd/{target}")
 async def spawnd_binary(target: str) -> FileResponse:
     """Serve the locally-built daemon binary for quick installs."""
 
-    if target not in SUPPORTED_TARGETS:
-        raise HTTPException(status_code=404, detail="unsupported daemon target")
-
-    binary = next((path for path in _binary_candidates(target, "spawnd") if path.is_file()), None)
-    if binary is None:
-        raise HTTPException(status_code=404, detail=f"daemon binary is not available for {target}")
-
-    return FileResponse(
-        binary,
-        media_type="application/octet-stream",
-        filename=_binary_filename("spawnd", target),
-        headers={"Cache-Control": "no-store"},
-    )
+    return _serve_binary("spawnd", target, None)
 
 
 @router.get("/api/install/spawn-worker/{target}")
 async def spawn_worker_binary(target: str) -> FileResponse:
     """Serve the worker paired with the locally-built daemon binary."""
 
-    if target not in SUPPORTED_TARGETS:
-        raise HTTPException(status_code=404, detail="unsupported worker target")
+    return _serve_binary("spawn-worker", target, None)
 
-    binary = next(
-        (path for path in _binary_candidates(target, "spawn-worker") if path.is_file()), None
-    )
-    if binary is None:
-        raise HTTPException(status_code=404, detail=f"worker binary is not available for {target}")
 
-    return FileResponse(
-        binary,
-        media_type="application/octet-stream",
-        filename=_binary_filename("spawn-worker", target),
-        headers={"Cache-Control": "no-store"},
-    )
+@router.get("/api/install/spawnd/{target}/{variant}")
+async def spawnd_variant_binary(target: str, variant: str) -> FileResponse:
+    """Serve a variant build of the daemon — the diagnostics build a host
+    that already runs it updates to. The signed manifest's `variants` map is
+    what authorizes the bytes; this route only hands them over."""
+
+    return _serve_binary("spawnd", target, variant)
+
+
+@router.get("/api/install/spawn-worker/{target}/{variant}")
+async def spawn_worker_variant_binary(target: str, variant: str) -> FileResponse:
+    """Serve the worker paired with a variant build of the daemon."""
+
+    return _serve_binary("spawn-worker", target, variant)
 
 
 @router.get("/api/install/manifest.json")
@@ -951,6 +982,11 @@ INSTALL_SCRIPT = dedent(
       <true/>
       <key>KeepAlive</key>
       <true/>
+      <key>SoftResourceLimits</key>
+      <dict>
+        <key>NumberOfFiles</key>
+        <integer>16384</integer>
+      </dict>
       <key>StandardOutPath</key>
       <string>$OUT_XML</string>
       <key>StandardErrorPath</key>
@@ -994,7 +1030,7 @@ INSTALL_SCRIPT = dedent(
     # this cgroup and must survive supervisor updates.
     KillMode=process
     # Headroom against fd exhaustion taking the host offline.
-    LimitNOFILE=65536
+    LimitNOFILE=65536:infinity
     Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
     # Signed signaling is enforced by default: this daemon refuses RTC offers
     # that are not signed by a browser identity it pins. Approve new devices

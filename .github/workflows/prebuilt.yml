@@ -185,12 +185,39 @@ jobs:
         working-directory: daemon
         run: cargo build --release --locked --bin spawnd --bin spawn-worker
 
+      # The diagnostics variant: the same tree, release codegen with symbols
+      # kept and debug logging on by default, published beside the release
+      # pair under a suffixed asset name so a host that runs it keeps getting
+      # it (the daemon follows its own variant through the signed manifest's
+      # `variants` map). Built in this job, from this checkout, so it can
+      # never be a different tree from the pair next to it; built for this
+      # target first because it is the one dream runs. See "The diagnostics
+      # variant" in docs/RELEASE.md.
+      - name: Build x86_64 diagnostics variant
+        working-directory: daemon
+        run: cargo build --profile diagnostics --features diagnostics --locked --bin spawnd --bin spawn-worker
+
       - name: Stage binaries
         run: |
           set -eu
+          # shellcheck source=scripts/release-lib.sh
+          source scripts/release-lib.sh
           mkdir -p out
           cp daemon/target/release/spawnd       out/spawnd-x86_64-unknown-linux-gnu
           cp daemon/target/release/spawn-worker out/spawn-worker-x86_64-unknown-linux-gnu
+          cp daemon/target/diagnostics/spawnd \
+            "out/$(prebuilt_variant_asset_name linux-x86_64 x86_64-unknown-linux-gnu spawnd diagnostics)"
+          cp daemon/target/diagnostics/spawn-worker \
+            "out/$(prebuilt_variant_asset_name linux-x86_64 x86_64-unknown-linux-gnu spawn-worker diagnostics)"
+          # The variant must say what it is. The manifest will name its
+          # version as the release version plus `.diagnostics`, and the
+          # updater refuses a binary that reports anything else — so prove
+          # here, on the built binaries, that the two agree.
+          version="$(daemon/target/release/spawnd --version | awk '{print $2}')"
+          variant_version="$(daemon/target/diagnostics/spawnd --version | awk '{print $2}')"
+          test -n "$version"
+          test "$variant_version" = "$(prebuilt_variant_version "$version" diagnostics)"
+          test "$(daemon/target/diagnostics/spawn-worker --version | awk '{print $2}')" = "$variant_version"
 
       - name: Upload linux-x86_64 artifacts
         uses: actions/upload-artifact@v4
@@ -438,10 +465,38 @@ jobs:
       - name: Checksum + manifest
         run: |
           set -eu
+          # shellcheck source=scripts/release-lib.sh
+          source scripts/release-lib.sh
           tree="$(git rev-parse HEAD:daemon)"
           chmod +x out/spawnd-x86_64-unknown-linux-gnu
           version="$(out/spawnd-x86_64-unknown-linux-gnu --version | awk '{print $2}')"
           test -n "$version"
+          # Every variant pair this release carries must be complete and must
+          # report the version the manifest will advertise for it. The pairs a
+          # release may never lose are checked for presence, so an assembly
+          # that dropped one fails here instead of at deploy.
+          for variant in "${PREBUILT_VARIANTS[@]}"; do
+            for pair in "${PREBUILT_TARGETS[@]}"; do
+              target="${pair%%:*}"
+              triple="${pair##*:}"
+              spawnd_asset="out/$(prebuilt_variant_asset_name "$target" "$triple" spawnd "$variant")"
+              worker_asset="out/$(prebuilt_variant_asset_name "$target" "$triple" spawn-worker "$variant")"
+              if [ ! -f "$spawnd_asset" ] && [ ! -f "$worker_asset" ]; then
+                if prebuilt_variant_target_is_required "$variant" "$target"; then
+                  echo "::error::the required $variant variant pair for $target is missing" >&2
+                  exit 1
+                fi
+                continue
+              fi
+              test -f "$spawnd_asset"
+              test -f "$worker_asset"
+              if [ "$target" = linux-x86_64 ]; then
+                chmod +x "$spawnd_asset"
+                test "$("$spawnd_asset" --version | awk '{print $2}')" = \
+                  "$(prebuilt_variant_version "$version" "$variant")"
+              fi
+            done
+          done
           cd out
           # Deterministic ordering so the SHA256SUMS diff is stable build-to-build.
           sha256sum $(ls spawnd-* spawn-worker-* | sort) > SHA256SUMS

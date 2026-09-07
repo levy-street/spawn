@@ -867,6 +867,79 @@ def test_binary_candidates_include_local_release_fallback(tmp_path: Path, monkey
     assert tmp_path / "daemon" / "target" / "release" / "spawn-worker" not in remote_paths
 
 
+def test_variant_binary_candidates_follow_the_cargo_profile(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(install_routes, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(install_routes, "_local_target", lambda: "linux-x86_64")
+
+    local = install_routes._binary_candidates("linux-x86_64", "spawnd", "diagnostics")
+    remote = install_routes._binary_candidates("linux-aarch64", "spawnd", "diagnostics")
+
+    assert local == [
+        tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64" / "diagnostics" / "spawnd",
+        tmp_path / "daemon" / "target" / "x86_64-unknown-linux-gnu" / "diagnostics" / "spawnd",
+        tmp_path / "daemon" / "target" / "diagnostics" / "spawnd",
+    ]
+    assert remote == [
+        tmp_path / "daemon" / "target" / "prebuilt" / "linux-aarch64" / "diagnostics" / "spawnd",
+        tmp_path / "daemon" / "target" / "aarch64-unknown-linux-gnu" / "diagnostics" / "spawnd",
+    ]
+    # The release pair's candidates are unchanged by the variant beside them.
+    assert install_routes._binary_candidates("linux-x86_64", "spawnd") == [
+        tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64" / "spawnd",
+        tmp_path / "daemon" / "target" / "x86_64-unknown-linux-gnu" / "release" / "spawnd",
+        tmp_path / "daemon" / "target" / "release" / "spawnd",
+    ]
+
+
+async def test_variant_routes_serve_the_published_pair_under_the_plain_names(
+    client, tmp_path: Path, monkeypatch
+):
+    target = tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64"
+    (target / "diagnostics").mkdir(parents=True)
+    (target / "spawnd").write_bytes(b"release-daemon")
+    (target / "spawn-worker").write_bytes(b"release-worker")
+    (target / "diagnostics" / "spawnd").write_bytes(b"diagnostics-daemon")
+    (target / "diagnostics" / "spawn-worker").write_bytes(b"diagnostics-worker")
+    monkeypatch.setattr(install_routes, "_repo_root", lambda: tmp_path)
+
+    daemon = await client.get("/api/install/spawnd/linux-x86_64/diagnostics")
+    worker = await client.get("/api/install/spawn-worker/linux-x86_64/diagnostics")
+
+    assert daemon.status_code == 200
+    assert daemon.content == b"diagnostics-daemon"
+    assert daemon.headers["content-type"].startswith("application/octet-stream")
+    assert 'filename="spawnd"' in daemon.headers["content-disposition"]
+    assert daemon.headers["cache-control"] == "no-store"
+    assert worker.status_code == 200
+    assert worker.content == b"diagnostics-worker"
+    assert 'filename="spawn-worker"' in worker.headers["content-disposition"]
+    # The release routes still hand out the release pair, not the variant.
+    assert (await client.get("/api/install/spawnd/linux-x86_64")).content == b"release-daemon"
+    assert (
+        await client.get("/api/install/spawn-worker/linux-x86_64")
+    ).content == b"release-worker"
+
+
+async def test_variant_routes_fail_closed(client, tmp_path: Path, monkeypatch):
+    target = tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64"
+    target.mkdir(parents=True)
+    (target / "spawnd").write_bytes(b"release-daemon")
+    monkeypatch.setattr(install_routes, "_repo_root", lambda: tmp_path)
+
+    # A published release pair is never served in place of an absent variant.
+    missing = await client.get("/api/install/spawnd/linux-x86_64/diagnostics")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "diagnostics daemon binary is not available for linux-x86_64"
+
+    unknown = await client.get("/api/install/spawnd/linux-x86_64/debug")
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == "unsupported daemon variant"
+
+    bad_target = await client.get("/api/install/spawn-worker/linux-riscv64/diagnostics")
+    assert bad_target.status_code == 404
+    assert bad_target.json()["detail"] == "unsupported worker target"
+
+
 def test_windows_binary_candidates_keep_exe_and_unix_candidates_do_not(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(install_routes, "_repo_root", lambda: tmp_path)
     monkeypatch.setattr(install_routes, "_local_target", lambda: "windows-x86_64")

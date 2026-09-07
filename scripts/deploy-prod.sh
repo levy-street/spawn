@@ -243,6 +243,7 @@ release_public_key=""
 release_key_id=""
 release_signing_key_file="$(release_signing_key_path)"
 prebuilt_entries=()
+prebuilt_variant_entries=()
 
 target_commit="$(git rev-parse "$remote_ref")"
 target_tree="$(git rev-parse "$remote_ref:daemon")"
@@ -546,6 +547,21 @@ publish_prebuilts() {
       ssh "$host" "chmod '$mode' '$dest/$spawnd_tmp' '$dest/$worker_tmp' && mv '$dest/$spawnd_tmp' '$dest/$spawnd_name' && mv '$dest/$worker_tmp' '$dest/$worker_name'"
       printf 'deploy-prod: published %s prebuilt to %s\n' "$target" "$host"
     fi
+    # The variant pairs live one directory down, under the target they were
+    # cut for, and install under the plain names: a variant replaces the
+    # daemon, it does not sit beside it.
+    local variant
+    for variant in "${PREBUILT_VARIANTS[@]}"; do
+      spawnd_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawnd "$variant")"
+      worker_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawn-worker "$variant")"
+      if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
+        ssh "$host" "mkdir -p '$dest/$variant'"
+        scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$variant/$spawnd_tmp"
+        scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$variant/$worker_tmp"
+        ssh "$host" "chmod '$mode' '$dest/$variant/$spawnd_tmp' '$dest/$variant/$worker_tmp' && mv '$dest/$variant/$spawnd_tmp' '$dest/$variant/$spawnd_name' && mv '$dest/$variant/$worker_tmp' '$dest/$variant/$worker_name'"
+        printf 'deploy-prod: published %s %s variant to %s\n' "$target" "$variant" "$host"
+      fi
+    done
   done
 
   local manifest="$prebuilt_tmp/manifest.json"
@@ -553,7 +569,8 @@ publish_prebuilts() {
   render_prebuilt_manifest \
     "$release_commit" "$release_tree" "$release_version" \
     "$release_counter" "$release_key_id" \
-    "${prebuilt_entries[@]}" > "$manifest" ||
+    "${prebuilt_entries[@]}" \
+    ${prebuilt_variant_entries[@]+"${prebuilt_variant_entries[@]}"} > "$manifest" ||
     die "could not render the verified prebuilt manifest"
   sign_prebuilt_manifest \
     "$manifest" "$signature" "$release_signing_key_file" ||
@@ -564,8 +581,9 @@ publish_prebuilts() {
   scp -q "$signature" "$host:$prebuilt_root/manifest.json.sig.tmp"
   ssh "$host" "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json' && mv '$prebuilt_root/manifest.json.sig.tmp' '$prebuilt_root/manifest.json.sig'"
   prebuilts_published=1
-  printf 'deploy-prod: published signed prebuilt manifest for daemon tree %s (key %s)\n' \
-    "$release_tree" "$release_key_id"
+  printf 'deploy-prod: published signed prebuilt manifest for daemon tree %s (key %s; %d release pair(s), %d variant pair(s))\n' \
+    "$release_tree" "$release_key_id" \
+    "${#prebuilt_entries[@]}" "${#prebuilt_variant_entries[@]}"
 }
 publish_prebuilts
 

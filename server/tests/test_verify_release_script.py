@@ -75,8 +75,18 @@ def _minisign_fixture(artifact: bytes) -> tuple[str, str]:
 
 
 def _run_verifier(
-    tmp_path: Path, *, manifest_counter: int, include_desktop: bool = False
+    tmp_path: Path,
+    *,
+    manifest_counter: int,
+    include_desktop: bool = False,
+    variant: str = "served",
 ) -> subprocess.CompletedProcess[str]:
+    """`variant` shapes the diagnostics pair the fixture publishes for
+    linux-x86_64 — the one pair a release may not lose: "served" is the
+    honest release; "absent" leaves it out of the manifest; "corrupt" serves
+    bytes that do not hash to the signed value; "unadvertised" keeps it out
+    of /api/release; "wrong-version" signs a version the binary would not
+    report."""
     private_key = Ed25519PrivateKey.generate()
     public_raw = private_key.public_key().public_bytes(
         serialization.Encoding.Raw,
@@ -87,11 +97,14 @@ def _run_verifier(
 
     spawnd = b"throwaway spawnd binary\n"
     worker = b"throwaway spawn-worker binary\n"
-    target = "darwin-aarch64"
+    target = "linux-x86_64"
+    diagnostics_spawnd = b"throwaway diagnostics spawnd binary\n"
+    diagnostics_worker = b"throwaway diagnostics spawn-worker binary\n"
+    version = f"0.1.0+g{EXPECTED_COMMIT[:12]}"
     manifest = {
         "commit": EXPECTED_COMMIT,
         "tree": EXPECTED_DAEMON_TREE,
-        "version": f"0.1.0+g{EXPECTED_COMMIT[:12]}",
+        "version": version,
         "release_counter": manifest_counter,
         "signing_key_id": key_id,
         "targets": {
@@ -100,7 +113,18 @@ def _run_verifier(
                 "spawn_worker_sha256": hashlib.sha256(worker).hexdigest(),
             }
         },
+        "variants": {},
     }
+    if variant != "absent":
+        manifest["variants"]["diagnostics"] = {
+            "version": f"{version}.diagnostics" if variant != "wrong-version" else version,
+            "targets": {
+                target: {
+                    "spawnd_sha256": hashlib.sha256(diagnostics_spawnd).hexdigest(),
+                    "spawn_worker_sha256": hashlib.sha256(diagnostics_worker).hexdigest(),
+                }
+            },
+        }
     manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
     signature = (_b64url(private_key.sign(manifest_bytes)) + "\n").encode("ascii")
     release: dict[str, object] = {
@@ -108,6 +132,7 @@ def _run_verifier(
         "daemon": {
             "tree": EXPECTED_DAEMON_TREE,
             "targets": manifest["targets"],
+            "variants": {} if variant == "unadvertised" else manifest["variants"],
         },
     }
     desktop_platforms = ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"]
@@ -125,6 +150,10 @@ def _run_verifier(
         "/api/install/manifest.json.sig": signature,
         f"/api/install/spawnd/{target}": spawnd,
         f"/api/install/spawn-worker/{target}": worker,
+        f"/api/install/spawnd/{target}/diagnostics": (
+            diagnostics_spawnd if variant != "corrupt" else b"not what was signed\n"
+        ),
+        f"/api/install/spawn-worker/{target}/diagnostics": diagnostics_worker,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -227,6 +256,41 @@ def test_verify_release_accepts_throwaway_signed_manifest(tmp_path: Path):
     assert "SPAWN_RELEASE_PUBLIC_KEY fallback" in result.stdout
     assert "daemon release counter" in result.stdout
     assert "valid (key " in result.stdout
+    rows = [line for line in result.stdout.splitlines() if "daemon.variants." in line]
+    assert any("daemon.variants.diagnostics.version" in line and "| OK" in line for line in rows), (
+        rows
+    )
+    assert any(
+        "daemon.variants.diagnostics.linux-x86_64.spawnd " in line and "| OK" in line
+        for line in rows
+    ), rows
+    assert any(
+        "daemon.variants.diagnostics.linux-x86_64.spawn-worker " in line and "| OK" in line
+        for line in rows
+    ), rows
+    assert not any("FAIL" in line for line in rows), rows
+
+
+@pytest.mark.parametrize(
+    ("variant", "failing_piece"),
+    [
+        ("absent", "daemon.variants.diagnostics.linux-x86_64 "),
+        ("corrupt", "daemon.variants.diagnostics.linux-x86_64.spawnd "),
+        ("unadvertised", "daemon.variants.diagnostics.linux-x86_64.spawnd metadata"),
+        ("wrong-version", "daemon.variants.diagnostics.version"),
+    ],
+)
+def test_verify_release_proves_the_variant_pair_like_the_release_one(
+    tmp_path: Path, variant: str, failing_piece: str
+):
+    result = _run_verifier(tmp_path, manifest_counter=EXPECTED_COUNTER, variant=variant)
+
+    assert result.returncode != 0, result.stdout
+    failing_rows = [
+        line for line in result.stdout.splitlines() if failing_piece in line and "FAIL" in line
+    ]
+    assert failing_rows, result.stdout
+    assert "one or more release identities do not match" in result.stderr
 
 
 def test_verify_release_accepts_desktop_minisign_manifest(tmp_path: Path):

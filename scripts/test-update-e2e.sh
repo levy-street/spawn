@@ -46,7 +46,13 @@ cleanup() {
 trap cleanup EXIT
 
 update_test_build_identities
+# Every manifest below carries the diagnostics variant beside the release
+# pair, the way a published release does, so each release-daemon cell also
+# proves that a release daemon ignores the variant next to it.
+update_test_build_variant_identities
 update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+update_test_manifest_has_variant diagnostics \
+  || update_test_die "the written manifest does not carry the diagnostics variant"
 
 printf '%s\n' "test-update-e2e: auto-update, same-PID exec, and worker adoption"
 update_test_new_fixture auto
@@ -129,6 +135,10 @@ cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
   || update_test_die "installed daemon is not v-new"
 cmp -s "$UPDATE_BIN_DIR/spawn-worker" "$UPDATE_ARTIFACTS/new/spawn-worker" \
   || update_test_die "installed worker is not v-new"
+! cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new-diagnostics/spawnd" \
+  || update_test_die "a release daemon installed the diagnostics variant"
+grep -q 'variant="release"' "$UPDATE_DAEMON_LOG" \
+  || update_test_die "the release daemon did not log the variant it follows"
 python3 - "$UPDATE_DAEMON_LOG" <<'PY'
 import sys
 
@@ -228,6 +238,153 @@ update_test_post_update '{"allow_downgrade":true}'
   || update_test_die "consented allow_downgrade returned $UPDATE_HTTP_STATUS: $UPDATE_HTTP_BODY"
 update_test_wait_host "$UPDATE_TREE_B" current "" 60 >/dev/null
 printf '%s\n' "test-update-e2e: PASS downgrade/allow_downgrade with consent"
+update_test_cleanup_fixture
+
+# The variant cells. A diagnostics daemon is installed as the old identity
+# and the served release carries both pairs; what lands on disk afterwards
+# is the whole question.
+installed_version() {
+  "$UPDATE_BIN_DIR/spawnd" --version | awk 'NR == 1 {print $2}'
+}
+
+printf '%s\n' "test-update-e2e: a diagnostics daemon follows the diagnostics variant"
+update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+update_test_new_fixture variant-sticky old-diagnostics
+[[ "$(installed_version)" == "$UPDATE_VARIANT_VERSION" ]] \
+  || update_test_die "the installed daemon is not the diagnostics identity"
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon
+update_test_wait_host "$UPDATE_TREE_B" current "" 60 >/dev/null
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new-diagnostics/spawnd" \
+  || update_test_die "the diagnostics daemon did not install the diagnostics variant"
+cmp -s "$UPDATE_BIN_DIR/spawn-worker" "$UPDATE_ARTIFACTS/new-diagnostics/spawn-worker" \
+  || update_test_die "the diagnostics daemon did not install the diagnostics worker"
+! cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+  || update_test_die "the diagnostics daemon downgraded itself to the release variant"
+[[ "$(installed_version)" == "$UPDATE_VARIANT_VERSION" ]] \
+  || update_test_die "the updated daemon does not report the diagnostics version"
+grep -q 'variant="diagnostics"' "$UPDATE_DAEMON_LOG" \
+  || update_test_die "the diagnostics daemon did not log the variant it follows"
+[[ ! -e "$UPDATE_BIN_DIR/spawnd.updating" ]] \
+  || update_test_die "probation marker survived the variant's healthy registration"
+printf '%s\n' "test-update-e2e: PASS diagnostics daemon -> diagnostics variant"
+update_test_cleanup_fixture
+
+printf '%s\n' "test-update-e2e: a diagnostics daemon refuses a release without its variant"
+variant_dir="$UPDATE_VARIANT_DIR"
+UPDATE_VARIANT_DIR=""
+update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+UPDATE_VARIANT_DIR="$variant_dir"
+! update_test_manifest_has_variant diagnostics \
+  || update_test_die "the variant-less manifest still carries the diagnostics variant"
+update_test_new_fixture variant-missing old-diagnostics
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon
+update_test_wait_host "$UPDATE_TREE_A" failed "variant unavailable" 45 >/dev/null
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old-diagnostics/spawnd" \
+  || update_test_die "a refused variant update changed the installed daemon"
+cmp -s "$UPDATE_BIN_DIR/spawn-worker" "$UPDATE_ARTIFACTS/old-diagnostics/spawn-worker" \
+  || update_test_die "a refused variant update changed the installed worker"
+kill -0 "$UPDATE_DAEMON_PID" 2>/dev/null \
+  || update_test_die "the diagnostics daemon exited after refusing the release pair"
+python3 -c 'import json,sys; h=json.load(sys.stdin); assert h["status"] == "online"' \
+  <<<"$(update_test_host_json)"
+# The server pushed the release pair; the daemon must not have fetched it.
+# The manifest fetch proves the access log is there to be searched.
+grep -q "GET /api/install/manifest.json " "$UPDATE_SERVER_LOG" \
+  || update_test_die "the server access log does not show the manifest fetch"
+! grep -q "GET /api/install/spawnd/$UPDATE_TARGET " "$UPDATE_SERVER_LOG" \
+  || update_test_die "the diagnostics daemon downloaded the release pair"
+printf '%s\n' "test-update-e2e: PASS diagnostics daemon refuses the release variant"
+update_test_cleanup_fixture
+
+printf '%s\n' "test-update-e2e: SPAWND_RELEASE_VARIANT overrides the build's own variant"
+update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+update_test_new_fixture variant-override-up
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon "$UPDATE_DAEMON_URL" SPAWND_RELEASE_VARIANT=diagnostics
+update_test_wait_host "$UPDATE_TREE_B" current "" 60 >/dev/null
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new-diagnostics/spawnd" \
+  || update_test_die "a release daemon told to follow diagnostics did not install it"
+[[ "$(installed_version)" == "$UPDATE_VARIANT_VERSION" ]] \
+  || update_test_die "the overridden daemon does not report the diagnostics version"
+printf '%s\n' "test-update-e2e: PASS release daemon -> diagnostics when told"
+update_test_cleanup_fixture
+
+update_test_new_fixture variant-override-down old-diagnostics
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon "$UPDATE_DAEMON_URL" SPAWND_RELEASE_VARIANT=release
+update_test_wait_host "$UPDATE_TREE_B" current "" 60 >/dev/null
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+  || update_test_die "a diagnostics daemon told to follow release did not install it"
+[[ "$(installed_version)" == "$UPDATE_VERSION" ]] \
+  || update_test_die "the overridden daemon does not report the release version"
+printf '%s\n' "test-update-e2e: PASS diagnostics daemon -> release when told"
+update_test_cleanup_fixture
+
+update_test_new_fixture variant-invalid
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon "$UPDATE_DAEMON_URL" SPAWND_RELEASE_VARIANT=debug
+update_test_wait_host "$UPDATE_TREE_A" unsupported "SPAWND_RELEASE_VARIANT" 30 >/dev/null
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
+  || update_test_die "an unknown variant name changed the installed daemon"
+printf '%s\n' "test-update-e2e: PASS unsupported: invalid variant"
+update_test_cleanup_fixture
+
+# The switch an operator makes on a host that is already on the current
+# tree: the server has nothing to push (same tree is "current"), so it is
+# `spawnd update` that moves the pair, reading SPAWND_RELEASE_VARIANT from
+# its own environment — not from the unit's. This is the one step a host
+# whose daemon predates the variant-aware updater needs after its first
+# update lands it on the release pair.
+printf '%s\n' "test-update-e2e: the same-tree variant switch through spawnd update"
+update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+update_test_new_fixture variant-same-tree new
+update_test_prepare_database
+update_test_start_server 1
+update_test_mint_credentials
+update_test_start_daemon
+update_test_wait_host "$UPDATE_TREE_B" current "" 30 >/dev/null
+# Without the variable the CLI is current on this tree and touches nothing,
+# whatever the daemon's own environment says.
+update_test_run_update_cli
+grep -q "SPAWN D daemon update not applied (current)." "$UPDATE_DAEMON_LOG" \
+  || update_test_die "spawnd update without a variant did not report current"
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+  || update_test_die "spawnd update without a variant changed the installed daemon"
+update_test_run_update_cli SPAWND_RELEASE_VARIANT=diagnostics
+grep -q "SPAWN D daemon updated. Restart the daemon to run it" "$UPDATE_DAEMON_LOG" \
+  || update_test_die "spawnd update with the variant did not report the swap"
+cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new-diagnostics/spawnd" \
+  || update_test_die "the same-tree switch did not install the diagnostics daemon"
+cmp -s "$UPDATE_BIN_DIR/spawn-worker" "$UPDATE_ARTIFACTS/new-diagnostics/spawn-worker" \
+  || update_test_die "the same-tree switch did not install the diagnostics worker"
+[[ -e "$UPDATE_BIN_DIR/spawnd.updating" ]] \
+  || update_test_die "the same-tree switch left no probation marker for the restart"
+# No service manager here, so the restart the CLI asks for is ours; the new
+# daemon then registers on the same tree and clears its probation.
+update_test_stop_daemon
+update_test_start_daemon
+update_test_wait_online "$UPDATE_TREE_B"
+[[ "$(installed_version)" == "$UPDATE_VARIANT_VERSION" ]] \
+  || update_test_die "the switched daemon does not report the diagnostics version"
+deadline=$((SECONDS + 30))
+while [[ -e "$UPDATE_BIN_DIR/spawnd.updating" ]] && ((SECONDS < deadline)); do sleep 0.2; done
+[[ ! -e "$UPDATE_BIN_DIR/spawnd.updating" ]] \
+  || update_test_die "probation marker survived the switched daemon's registration"
+[[ ! -e "$UPDATE_BIN_DIR/spawnd.prev" && ! -e "$UPDATE_BIN_DIR/spawn-worker.prev" ]] \
+  || update_test_die "previous pair survived the switched daemon's registration"
+printf '%s\n' "test-update-e2e: PASS same-tree switch via spawnd update"
 update_test_cleanup_fixture
 
 printf 'test-update-e2e: passed in %ss (1 explicit SKIP)\n' "$((SECONDS - started_at))"

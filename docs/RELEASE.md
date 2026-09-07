@@ -53,13 +53,27 @@ binaries:
       "spawnd_sha256": "64hex",
       "spawn_worker_sha256": "64hex"
     }
+  },
+  "variants": {
+    "diagnostics": {
+      "version": "0.1.0+g<commit12>.diagnostics",
+      "targets": {
+        "linux-x86_64": {
+          "spawnd_sha256": "64hex",
+          "spawn_worker_sha256": "64hex"
+        }
+      }
+    }
   }
 }
 ```
 
 Do not hand-edit this manifest. Its hashes come from the already-verified
 `SHA256SUMS` in `prebuilt-latest`, and it includes only target pairs actually
-copied to the host.
+copied to the host. `variants` is always present and lists the alternative
+builds of the same release that were published beside the release pairs —
+today the diagnostics variant, described under "The diagnostics variant".
+Daemons older than that key ignore it.
 
 ## The wire protocols
 
@@ -149,8 +163,10 @@ is a detached Ed25519 signature, encoded as one line of unpadded base64url,
 over the exact bytes of the first. There is no JSON reformatting or
 canonicalisation between signing and verification. The signed bytes bind the
 release commit and daemon tree, the version, the committer-timestamp
-`release_counter`, the signing key id, and both binary hashes for every
-published target. `deploy-prod.sh` publishes the manifest atomically and then
+`release_counter`, the signing key id, both binary hashes for every
+published target, and — under `variants` — the version and both hashes of
+every variant build published beside them (see "The diagnostics variant").
+`deploy-prod.sh` publishes the manifest atomically and then
 the signature atomically, last; a daemon never installs from an unsigned or
 badly signed manifest.
 
@@ -402,7 +418,12 @@ The repeatable local updater proof has three CI scripts, all run by
 - `scripts/test-update-e2e.sh` builds two signed throwaway daemon identities
   and proves automatic and manual update, same-PID exec, worker-backed PTY
   survival, pair cleanup, idempotence, request throttling, update
-  preconditions, and the downgrade override.
+  preconditions, and the downgrade override. It builds the diagnostics
+  variant of both identities too, publishes every manifest with the variant
+  beside the release pair, and proves that a release daemon installs the
+  release pair, that a diagnostics daemon installs the diagnostics pair and
+  refuses a release that lacks one, and that `SPAWND_RELEASE_VARIANT`
+  switches either way while an unknown value blocks self-update.
 - `scripts/test-update-faults.sh` puts the daemon's complete localhost origin
   behind the standard-library `scripts/fault-proxy.py` and pins download,
   signature, hash, truncation, throttling, and candidate-version failures to
@@ -1100,8 +1121,23 @@ uploading. If Key Vault itself is unavailable, wait for it — never an ad-hoc o
 self-signed production certificate, and never a second certificate obtained in
 a hurry.
 
+The diagnostics variant is part of the same release: the same container
+image, the same checkout and the same target directory as the amd64 release
+pair, one more build. The pair lands beside the release profile's, and is
+staged into `out/` with the other binaries under the variant asset names:
+
+```bash
+diagnostics_build="${linux_build/cargo build --release --locked/cargo build --profile diagnostics --features diagnostics --locked}"
+docker run --rm --platform linux/amd64 -v "$(git rev-parse --show-toplevel)":/src \
+  -e CARGO_TARGET_DIR=/src/daemon/target-jammy/amd64 ubuntu:22.04 \
+  bash -c "$diagnostics_build"
+cp daemon/target-jammy/amd64/diagnostics/spawnd       out/spawnd-x86_64-unknown-linux-gnu.diagnostics
+cp daemon/target-jammy/amd64/diagnostics/spawn-worker out/spawn-worker-x86_64-unknown-linux-gnu.diagnostics
+```
+
 Then assemble the assets the way the workflow's single publish job does — the
 five `spawnd-<triple>[.exe]` plus five `spawn-worker-<triple>[.exe]` binaries,
+the `.diagnostics` pair for `linux-x86_64`,
 `SHA256SUMS`, `COMMIT`, `TREE`, and `VERSION`. From the repository root, after
 placing the already-signed binaries in `out/`:
 
@@ -1128,12 +1164,106 @@ gh release create prebuilt-latest out/* --repo levy-street/spawn \
 matched to its source. `deploy-prod.sh` converts these release files into the
 host manifest, installs Windows payloads on the Linux API host as mode `0644`,
 signs the manifest locally, and refuses to publish a partial required Windows
-pair or to publish without the readable release-signing key. For a focused
+pair, a release missing the required diagnostics pair for `linux-x86_64`, or
+anything at all without the readable release-signing key. For a focused
 diagnostic, compare the served signature and bytes with the rolling release:
 
 ```bash
 scripts/verify-prebuilts.sh https://spawnd.dev
 ```
+
+### The diagnostics variant
+
+**What it is.** The same daemon tree, built with `--features diagnostics`
+under the `diagnostics` cargo profile: release codegen with symbols kept, so
+a panic carries a readable backtrace; debug logging on by default
+(`spawnd=debug`, nothing to set); every attach failure attributed at warning
+level; a watchdog that names who holds a session's control transaction and
+for how long; the attach and bootstrap exchange logged at debug; and, only
+when `SPAWND_DIAG_REPLAY_DUMP_DIR` is set, the exact replay bytes each viewer
+was sent written to that directory. Its version is the release version plus
+`.diagnostics` — `0.1.0+g<commit>.diagnostics` — so `spawnd status`, the
+register frame and the host list never leave it ambiguous which build is
+running. It exists because the 2026-09-05 chunk-framing bug was found within
+an hour of running it, from a log that already held the answer; the release
+build's info-level log could only have reconstructed it afterwards.
+
+**How it is built.** By `.github/workflows/prebuilt.yml`, in the same
+`linux-x86_64` job and from the same checkout as the release pair, so it can
+never be a different tree from the pair next to it. The workflow proves the
+built binary reports `<release version>.diagnostics` before staging it as
+`spawnd-x86_64-unknown-linux-gnu.diagnostics` and
+`spawn-worker-x86_64-unknown-linux-gnu.diagnostics` in `prebuilt-latest`, and
+the publish job refuses a release that lacks the pair. `deploy-prod.sh` copies
+the pair to `prebuilt/linux-x86_64/diagnostics/` on the host and lists it in
+the signed manifest under `variants.diagnostics`, with its version and both
+hashes, beside the untouched release pair. The server proves the variant's
+bytes on disk exactly as it proves the release's before it advertises the
+manifest at all, serves them from `/api/install/{spawnd,spawn-worker}/linux-x86_64/diagnostics`
+under the plain download names, and lists them in `/api/release` under
+`daemon.variants`. `scripts/verify-release.sh` and `scripts/verify-prebuilts.sh`
+verify the served variant bytes against the signed hashes like the release
+ones and fail when the required pair is missing. The other targets can follow
+when a host on them needs it: add the build to their job and the asset names
+take care of the rest.
+
+**How a host opts in.** By already running it. The daemon follows the variant
+it was built as: a diagnostics daemon updates to the next release's
+diagnostics pair with nothing configured, and a release daemon updates to the
+release pair and never picks the variant up by accident. To move a host
+across on the tree it already runs, run the switch from a shell on the host:
+
+```bash
+SPAWND_RELEASE_VARIANT=diagnostics spawnd update   # or =release, to go back
+```
+
+`spawnd update` reads the variable from its own environment, not from the
+service's, so a systemd drop-in alone does nothing on the current tree — the
+server has nothing to push for a host already on the release's tree, and the
+daemon only checks for an update on its own when a protocol bump has refused
+it at the handshake (that check would honour the drop-in). The CLI installs the
+other pair from the same signed manifest and restarts the service onto it;
+from then on the running build's own variant is what the daemon follows, and
+no override is needed anywhere. Setting the variable in the daemon's
+environment does apply at the next release: a release daemon with
+`SPAWND_RELEASE_VARIANT=diagnostics` in its unit installs the diagnostics pair
+of the next tree. An unknown value blocks self-update with `invalid_variant`,
+which the host list shows. The server has no say in any of this: it pushes
+the release pair, and the daemon substitutes the variant's paths and hashes
+from the same signed bytes after holding the server's claim to the release
+hashes and tree. Everything else is unchanged — the signature, the monotonic
+counter and the local downgrade consent, the probation window and the health
+revert all apply to a variant update exactly as to a release one. One
+difference in what you see: a same-tree switch that fails probation is
+reverted like any other, but the host list reads "current" throughout,
+because the tree never changed — `spawnd status` and the daemon log are
+where a failed switch shows.
+
+**A diagnostics daemon built before this section existed** — a hand-built
+one copied into `~/.local/bin` behind `SPAWND_NO_SELF_UPDATE=1`, which is how
+dream ran until the variant shipped — has an updater that knows nothing about
+variants and installs whatever pair the server names. Lifting its drop-in is
+therefore not enough: its first update lands it on the release pair, quietly,
+and nothing brings it back on its own. Either install the CI-built
+`.diagnostics` pair by hand once, verified against the signed manifest, or
+lift the drop-in, let the first update land the release pair (a variant-aware
+build), and then run the `spawnd update` switch above. Only from a build that
+carries the variant-aware updater is the choice sticky.
+
+**What happens without it.** A diagnostics daemon whose release carries no
+diagnostics pair for its target refuses the update with
+`verify: variant unavailable` and keeps running what it has. It never falls
+back to the release pair, because that would silently turn a diagnostics host
+back into a release host. The refusal is visible on the host, and the
+`linux-x86_64` pair is required at publish, deploy and verify time precisely
+so it does not happen.
+
+**What it costs.** Symbols: the diagnostics `spawnd` is about 100 MB against
+about 15 MB stripped, downloaded on every update. Log volume: debug level from
+the start, so the journal grows faster on a busy host; `RUST_LOG` still
+narrows it. The replay dump, when enabled, is terminal plaintext on the host's
+own disk under the host user, so enable it only for the reproduction it is
+for and remove the directory afterwards. Nothing user-facing changes.
 
 ## Pre-release version skew and canaries
 
@@ -1209,20 +1339,22 @@ examples. Two constraints are release blockers:
 `turns:` on 443 is recommended for browser/phone fallback after it has its own
 IP or an SNI/TURN-aware router; it is not enabled in current production.
 
-On Windows, `spawnd.exe` is the program that binds UDP 50000–50100. The
+On Windows, `spawnd.exe` is the program that binds UDP 50000–50999. The
 per-user installer does not elevate or silently create a firewall exception.
 Windows Firewall, Defender/SmartScreen, and Smart App Control are independent
 validation surfaces; Authenticode does not remove the firewall prompt. If
 inbound ICE is blocked, ordinary outbound UDP TURN remains the fallback.
 
 An administrator who explicitly wants direct candidates on a Private network
-may add a program-scoped rule for the installed binary:
+may add a program-scoped rule for the installed binary. A rule created under
+the earlier 50000–50100 guidance admits about one socket in ten of the current
+range; remove it and create it again for 50000–50999:
 
 ```powershell
 $spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'
 New-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)' `
   -Direction Inbound -Action Allow -Profile Private -Program $spawnd `
-  -Protocol UDP -LocalPort 50000-50100
+  -Protocol UDP -LocalPort 50000-50999
 
 # Uninstall or rollback:
 Remove-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)'
@@ -1245,7 +1377,9 @@ standard-user accounts.
    published, confirm the local offline daemon release-signing key is present
    and readable.
 2. Confirm the rolling release contains every target pair it claims — four
-   until Windows launches, five after. When the Windows pair is present, verify
+   until Windows launches, five after — and the `linux-x86_64` diagnostics
+   pair beside them, whose `--version` must be the release version plus
+   `.diagnostics`. When the Windows pair is present, verify
    for both files that `Get-AuthenticodeSignature` is `Valid`, its subject is
    exactly `WINDOWS_SIGNING_SUBJECT`, an RFC 3161 timestamp is present, and
    `signtool verify /pa /all /v` exits zero; then confirm their post-signing
