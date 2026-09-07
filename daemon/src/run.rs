@@ -3126,7 +3126,7 @@ async fn handle_session_create(
     let launched = match worker_backend::launch(spec).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(%session_id, error = %e, "session failed to start");
+            tracing::warn!(%session_id, error = %format_args!("{e:#}"), "session failed to start");
             send_error_code(
                 out_tx,
                 Some(session_id),
