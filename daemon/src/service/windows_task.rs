@@ -398,7 +398,7 @@ pub(super) fn prepare_background_log(config_dir: &Path) -> Result<()> {
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     use windows_sys::Win32::System::Console::{
-        GetConsoleWindow, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        GetConsoleWindow, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
 
     // A foreground `spawnd run` keeps its terminal. Scheduler/watchdog starts
@@ -407,7 +407,7 @@ pub(super) fn prepare_background_log(config_dir: &Path) -> Result<()> {
     if !unsafe { GetConsoleWindow() }.is_null() {
         return Ok(());
     }
-    static DAEMON_LOG: OnceLock<std::fs::File> = OnceLock::new();
+    static DAEMON_LOG: OnceLock<(std::fs::File, std::fs::File)> = OnceLock::new();
     if DAEMON_LOG.get().is_some() {
         return Ok(());
     }
@@ -424,16 +424,21 @@ pub(super) fn prepare_background_log(config_dir: &Path) -> Result<()> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
+    // FreeConsole invalidates the inherited console handles. Child commands
+    // still inherit stdin unless they explicitly replace it, so leaving that
+    // handle behind makes launches fail with ERROR_INVALID_HANDLE.
+    let input = std::fs::File::open("NUL").context("opening service input")?;
     let handle = file.as_raw_handle().cast();
-    // SAFETY: `file` is installed into a process-lifetime OnceLock below, so
-    // both standard-handle references remain live until process exit.
-    if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, handle) } == 0
+    // SAFETY: both files enter a process-lifetime OnceLock below, so all
+    // standard-handle references remain live until process exit.
+    if unsafe { SetStdHandle(STD_INPUT_HANDLE, input.as_raw_handle().cast()) } == 0
+        || unsafe { SetStdHandle(STD_OUTPUT_HANDLE, handle) } == 0
         || unsafe { SetStdHandle(STD_ERROR_HANDLE, handle) } == 0
     {
         return Err(std::io::Error::last_os_error()).context("redirecting service output to log");
     }
     DAEMON_LOG
-        .set(file)
+        .set((file, input))
         .map_err(|_| anyhow::anyhow!("daemon log was initialized concurrently"))?;
     Ok(())
 }
@@ -472,7 +477,11 @@ pub(super) fn probe_breakaway(config_dir: &Path) -> Option<bool> {
         return None;
     }
     let mut command = std::process::Command::new(super::current_bin().ok()?);
-    command.arg("--version");
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW);
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -517,6 +526,57 @@ pub(super) fn probe_breakaway(config_dir: &Path) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn background_service_repairs_stdin_before_launching_children() {
+        let config = tempfile::tempdir().unwrap();
+        let log_dir = super::super::instance_log_path(config.path()).unwrap();
+        // Standard handles and the process-lifetime log are global. Exercise
+        // service startup in an isolated process, never the parallel runner.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::windows_task::tests::background_stdio_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SPAWN_TEST_BACKGROUND_CONFIG", config.path())
+            .output()
+            .unwrap();
+        let log = std::fs::read_to_string(log_dir.join("spawnd.log")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(log_dir);
+        assert!(
+            output.status.success(),
+            "background child failed: {}\n{log}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper for background_service_repairs_stdin_before_launching_children"]
+    fn background_stdio_child() {
+        use windows_sys::Win32::System::Console::{FreeConsole, SetStdHandle, STD_INPUT_HANDLE};
+
+        let config = std::env::var_os("SPAWN_TEST_BACKGROUND_CONFIG")
+            .expect("this helper must be invoked by its parent test");
+        // SAFETY: this is a dedicated subprocess. Deliberately install an
+        // invalid, non-null stdin handle to reproduce a detached console's
+        // stale handle without depending on Windows' handle reuse order.
+        unsafe {
+            FreeConsole();
+            assert_ne!(SetStdHandle(STD_INPUT_HANDLE, 0x12345678_usize as _), 0);
+        }
+        prepare_background_log(Path::new(&config)).unwrap();
+        // Inherited stdin used to make this fail with ERROR_INVALID_HANDLE.
+        // --list runs no tests and does not depend on an external shell.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .status()
+            .expect("a background daemon must be able to launch child commands");
+        assert!(status.success());
+    }
 
     #[test]
     fn task_xml_is_the_canonical_least_privilege_definition() {
