@@ -12,7 +12,7 @@ set -euo pipefail
 #   rtc.status=rebound (MANUAL until the harness has a reusable RTC observer).
 # - Scoped TCP pfctl block for 30 seconds: daemon watchdog reconnects and a
 #   live terminal resumes without reload (MANUAL; never prompts for sudo).
-# - UDP 50000:50100 block: an available UDP TURN relay wins; blocking TURN UDP
+# - UDP 50000:50999 block: an available UDP TURN relay wins; blocking TURN UDP
 #   too produces the explicit cannot-use-TURN-TCP warning (MANUAL).
 # - Network Link Conditioner "Very Bad Network" while `yes` streams produces
 #   pacing/pty_gap recovery, never DataChannel death (MANUAL).
@@ -142,7 +142,7 @@ if [[ "${SPAWN_ALLOW_SUDO:-0}" != "1" ]]; then
   printf '%s\n' \
     "chaos-drills: MANUAL TCP pfctl — refused (set SPAWN_ALLOW_SUDO=1; commands always use sudo -n)"
   printf '%s\n' \
-    "chaos-drills: MANUAL UDP/TURN pfctl — refused (set SPAWN_ALLOW_SUDO=1; scope to UDP 50000:50100 and the local TURN host)"
+    "chaos-drills: MANUAL UDP/TURN pfctl — refused (set SPAWN_ALLOW_SUDO=1; scope to UDP 50000:50999 and the local TURN host)"
 elif ! chaos_sudo_allowed; then
   printf '%s\n' \
     "chaos-drills: MANUAL pfctl — SKIP (sudo -n is unavailable; refusing to prompt for a password)"
@@ -150,7 +150,7 @@ else
   printf '%s\n' \
     "chaos-drills: MANUAL pfctl authorized — apply a named temporary anchor scoped to 127.0.0.1:$UPDATE_SERVER_PORT for 30s, then remove it and observe watchdog reconnect + rtc.resume"
   printf '%s\n' \
-    "chaos-drills: MANUAL UDP authorized — block only UDP 50000:50100, verify TURN; then include TURN UDP and verify the honest no-TURN-TCP warning; remove the anchor immediately"
+    "chaos-drills: MANUAL UDP authorized — block only UDP 50000:50999, verify TURN; then include TURN UDP and verify the honest no-TURN-TCP warning; remove the anchor immediately"
 fi
 printf '%s\n' \
   "chaos-drills: MANUAL NLC — Very Bad Network + yes: expect pacing/pty_gap, no channel death"
