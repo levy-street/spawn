@@ -69,7 +69,8 @@ describe("overlay rendering and dismissal", () => {
     expect(screen.queryByTestId("footer-actions")).toBeNull();
     expect(screen.queryByLabelText("Dismiss dialog")).not.toBeOnTheScreen();
     await fireEvent.press(screen.getByLabelText("Close dialog"));
-    expect(onDismiss).toHaveBeenCalledTimes(1);
+    // Dismissal is reported after the exit animation settles.
+    await waitFor(() => expect(onDismiss).toHaveBeenCalledTimes(1));
   });
 
   test("Dialog clears its owned top inset for nested full-page content", async () => {
