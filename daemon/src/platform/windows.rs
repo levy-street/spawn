@@ -1113,6 +1113,15 @@ pub fn symlink_fixture_unavailable(error: &io::Error) -> bool {
             == Some(windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD as i32)
 }
 
+/// Windows has no per-process soft limit on sockets or handles that a daemon
+/// could exhaust at a laptop's worth of sessions, so there is nothing to raise.
+pub fn raise_open_file_limit(_target: u64) -> io::Result<super::OpenFileLimit> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "open-file limits are not a Windows concept",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,13 +1390,4 @@ mod tests {
             file_identity(&linked).unwrap()
         );
     }
-}
-
-/// Windows has no per-process soft limit on sockets or handles that a daemon
-/// could exhaust at a laptop's worth of sessions, so there is nothing to raise.
-pub fn raise_open_file_limit(_target: u64) -> io::Result<super::OpenFileLimit> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "open-file limits are not a Windows concept",
-    ))
 }
