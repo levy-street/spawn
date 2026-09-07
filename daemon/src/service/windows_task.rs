@@ -568,6 +568,11 @@ mod tests {
             FreeConsole();
             assert_ne!(SetStdHandle(STD_INPUT_HANDLE, 0x12345678_usize as _), 0);
         }
+        let before = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .spawn()
+            .expect_err("the invalid inherited stdin must reproduce the launch failure");
+        assert_eq!(before.raw_os_error(), Some(6));
         prepare_background_log(Path::new(&config)).unwrap();
         // Inherited stdin used to make this fail with ERROR_INVALID_HANDLE.
         // --list runs no tests and does not depend on an external shell.
