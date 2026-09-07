@@ -32,24 +32,56 @@
 //! serialized stream into a fresh emulator yields an identical screen — cells,
 //! attributes, cursor, modes, margins, charsets.
 //!
-//! Design note: alacritty's `Term` keeps scroll region, charsets, and tab
-//! stops private. Rather than a fragile delegation wrapper around its ~90
-//! `Handler` methods, a second `Processor` drives a tiny shadow handler that
-//! records only those states (every other callback is a vte-provided no-op).
-//! Both parsers consume the same bytes, so their views cannot drift.
+//! Design note: alacritty's `Term` keeps the scroll region, the active
+//! charset index (the SI/SO shift state) and tab stops private, and its
+//! DECSC register has no room for the shift at all. Rather than a fragile
+//! delegation wrapper around its ~90 `Handler` methods, a second `Processor`
+//! drives a tiny shadow handler that records only those states — the shift,
+//! and the shift each screen's register was saved under (every other
+//! callback is a vte-provided no-op). Both parsers consume the same bytes,
+//! so their views cannot drift. The G0–G3 designations are read from the
+//! grid cursor, where alacritty keeps them per screen and saves and restores
+//! them with DECSC/DECRC, exactly as xterm does.
+//!
+//! Every glyph the emulator paints is already mapped through the app's
+//! character sets, so a checkpoint and the worker's replay head first return
+//! the consumer to ASCII (`ESC ( B ESC ) B ESC * B ESC + B SI`,
+//! [`RETURN_TO_ASCII`]) and the checkpoint's tail re-arms the app's
+//! designations and shift state at the end. Without the return, a consumer
+//! the app left mid line-drawing mapped the painted glyphs a second time
+//! (#61).
 //!
 //! Known v1 limitations, all self-healing on the app's next full repaint:
 //! custom tab stops are not serialized (would need cursor tracking in the
-//! shadow), and DECSC saved-cursor state restores position but not pen/charset.
+//! shadow); the emulator's own DECRC restores designations but not the shift
+//! (alacritty's register), where xterm.js's restores the table that was
+//! active at DECSC — the two consumers differ natively when an app shifts
+//! between ESC 7 and ESC 8, so a checkpoint taken between the two rebuilds
+//! the register such that each consumer restores what it natively would,
+//! and one taken after the ESC 8 carries the emulator's outcome to both; an
+//! inactive alternate screen's register is not carried, so a consumer
+//! re-entering it and restoring without saving there first restores ASCII
+//! at home; and G2/G3 are designated but never made active, since vte
+//! delivers no LS2/LS3 to the emulator (xterm.js does implement them).
+//!
+//! Where xterm.js and alacritty differ natively beyond DECRC, the checkpoint
+//! carries the emulator's outcome to the consumer: xterm.js keeps one set of
+//! designations across `?1049l` where alacritty keeps one per screen, so a
+//! set changed on the alternate screen still governs the next SI/SO after
+//! the app leaves on xterm.js and not here; an unpaired `?1049l` on the
+//! primary screen is a DECRC from the normal buffer's register on xterm.js
+//! (cursor home, its table restored) and nothing here; and `?47h`/`?1047h`
+//! switch buffers on xterm.js and nothing here, since vte maps only 1049.
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Charsets, Cursor, Dimensions};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
-    CharsetIndex, Color, CursorShape, Handler, NamedColor, Processor, StandardCharset,
+    CharsetIndex, Color, CursorShape, Handler, NamedColor, NamedPrivateMode, PrivateMode,
+    Processor, StandardCharset,
 };
 
 #[derive(Clone)]
@@ -67,12 +99,38 @@ const HISTORY_DRAIN_CAP: usize = 10_000;
 /// history ring and the size of any single committed-lines batch.
 const FEED_DRAIN_STRIDE: usize = 2 * 1024;
 
+/// `ESC ( B ESC ) B ESC * B ESC + B SI`: designate ASCII to G0–G3 and shift
+/// in. Every glyph the emulator paints — the screen chunk and the committed
+/// lines alike — is already mapped, so a consumer the app left in a
+/// line-drawing set would map it a second time. Opens the checkpoint baseline
+/// and the worker's replay head; the clients' reseed clear leads with the G0,
+/// G1 and SI part of it. G2/G3 are returned too so that the emulator's own
+/// mirror of the baseline leaves every slot where the tail expects it.
+pub const RETURN_TO_ASCII: &[u8] = b"\x1b(B\x1b)B\x1b*B\x1b+B\x0f";
+
+/// Painting baseline: default pen, ASCII character sets, no margins,
+/// absolute addressing, autowrap on (paint_screen relies on natural
+/// wrapping), cursor hidden while it moves. There is deliberately no ED (2J):
+/// paint_screen covers every row (content or EL), which makes the state
+/// stream idempotent when written over an already-populated terminal — it
+/// can never scroll stale content into scrollback, so checkpoints may appear
+/// mid-stream. There is also deliberately no `?1049l`/alt normalization
+/// prefix: the client detects "is an alt app active" from these bytes, and a
+/// spurious 1049 toggle in every checkpoint poisons that detection. The
+/// charset return is [`RETURN_TO_ASCII`] byte for byte (a test pins it).
+const BASELINE: &[u8] = b"\x1b[0m\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b[r\x1b[?6l\x1b[?7h\x1b[?25l";
+
 /// History effects observed while feeding PTY output, in stream order.
 pub enum HistoryEvent {
     /// Lines that scrolled off the screen, serialized as a self-contained
     /// styled text stream: SGR runs + glyphs, `\r\n` after each hard line
     /// end; soft-wrapped rows are painted edge-to-edge with no break so the
-    /// logical line re-wraps naturally at the consumer's width.
+    /// logical line re-wraps naturally at the consumer's width. The glyphs
+    /// are already mapped through the app's character sets, so a terminal in
+    /// a line-drawing set would map them again: the replay head returns the
+    /// consumer to ASCII before the history section, and a consumer that
+    /// appends live deltas into a terminal the app is drawing on must do
+    /// the same ([`RETURN_TO_ASCII`]) and re-arm the app's sets after.
     Lines(Vec<u8>),
     /// The app erased its scrollback (`CSI 3 J` / `CSI ? 3 J`): previously
     /// committed lines must be dropped.
@@ -125,8 +183,16 @@ impl WipeScanner {
 struct Shadow {
     /// 1-based (top, bottom) margins when narrower than the full screen.
     margins: Option<(u16, u16)>,
-    charsets: [StandardCharset; 4],
+    /// The shift state: which of G0–G3 the app's bytes currently map through.
     active_charset: CharsetIndex,
+    /// The shift each screen's DECSC register was saved under
+    /// (`[primary, alternate]`). alacritty's register keeps designations and
+    /// no shift; xterm.js's keeps the one table the shift selected. A
+    /// checkpoint rebuilds each register under the shift it was saved under,
+    /// so a consumer of either kind restores what its own DECSC would have.
+    saved_shift: [CharsetIndex; 2],
+    /// Which screen the next DECSC fills.
+    alt: bool,
     rows: u16,
 }
 
@@ -134,8 +200,9 @@ impl Shadow {
     fn new(rows: u16) -> Self {
         Self {
             margins: None,
-            charsets: [StandardCharset::Ascii; 4],
             active_charset: CharsetIndex::G0,
+            saved_shift: [CharsetIndex::G0; 2],
+            alt: false,
             rows,
         }
     }
@@ -162,12 +229,30 @@ impl Handler for Shadow {
         };
     }
 
-    fn configure_charset(&mut self, index: CharsetIndex, charset: StandardCharset) {
-        self.charsets[index as usize] = charset;
-    }
-
     fn set_active_charset(&mut self, index: CharsetIndex) {
         self.active_charset = index;
+    }
+
+    /// `ESC 7` and `CSI s`, on whichever screen is active.
+    fn save_cursor_position(&mut self) {
+        self.saved_shift[usize::from(self.alt)] = self.active_charset;
+    }
+
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        // Entering the alternate screen saves the primary cursor: alacritty
+        // overwrites the primary register with it, and xterm's `?1049h` is a
+        // DECSC. The primary register's shift is the shift at entry.
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) && !self.alt
+        {
+            self.saved_shift[0] = self.active_charset;
+            self.alt = true;
+        }
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
+            self.alt = false;
+        }
     }
 
     fn reset_state(&mut self) {
@@ -355,9 +440,14 @@ impl Emulator {
     /// the fidelity contract makes that repair lossless, and
     /// `serialize_is_stable` verifies it.
     pub fn serialize(&mut self) -> Vec<u8> {
-        // Everything the swaps below can disturb is captured up front.
+        // Everything the swaps below can disturb is captured up front. The
+        // character sets in particular: the baseline mirrored into self on the
+        // alt path returns them to ASCII, and the tail must re-arm the app's.
         let mode = *self.term.mode();
         let margins = self.shadow.margins;
+        let charsets = self.term.grid().cursor.charsets;
+        let active_charset = self.shadow.active_charset;
+        let saved_shift = self.shadow.saved_shift;
         let cursor = self.term.grid().cursor.point;
         let needs_wrap = self.term.grid().cursor.input_needs_wrap;
         let wrap_cell = self.term.grid()[cursor.line][cursor.column].clone();
@@ -369,34 +459,43 @@ impl Emulator {
         let mut active_paint = Vec::with_capacity(4096);
         paint_screen(&self.term, &mut active_paint);
 
-        // Painting baseline: default pen, no margins, absolute addressing,
-        // autowrap on (paint_screen relies on natural wrapping). There is
-        // deliberately no ED (2J): paint_screen covers every row (content or
-        // EL), which makes the state stream idempotent when written over an
-        // already-populated terminal — it can never scroll stale content into
-        // scrollback, so checkpoints may appear mid-stream. There is also
-        // deliberately no `?1049l`/alt normalization prefix: the client
-        // detects "is an alt app active" from these bytes, and a spurious
-        // 1049 toggle in every checkpoint poisons that detection.
-        const BASELINE: &[u8] = b"\x1b[0m\x1b[r\x1b[?6l\x1b[?7h\x1b[?25l";
         let mut out: Vec<u8> = Vec::with_capacity(8192);
         out.extend_from_slice(BASELINE);
 
         let alt_active = mode.contains(TermMode::ALT_SCREEN);
         if alt_active {
-            // Mirror the baseline in self: the primary grid is the source of
-            // the paint, not its target.
-            self.feed(BASELINE);
             // Paint the primary screen first so leaving the alt screen after
-            // reattach reveals the right content.
+            // reattach reveals the right content. The primary grid is the
+            // source of that paint, not its target: nothing here is fed back.
             self.term.swap_alt();
             paint_screen(&self.term, &mut out);
-            // Primary's DECSC register (its saved cursor is clobbered in
-            // self by the swap below; the stream keeps the true value).
-            emit_saved_cursor(&mut out, &self.term.grid().saved_cursor);
+            // Primary's DECSC register: its saved cursor is clobbered in
+            // self by the swap below, and a consumer's `?1049h` saves the
+            // cursor again anyway, so what this carries is the primary pen;
+            // the shift it is rebuilt under is moot for the same reason.
+            emit_saved_cursor(&mut out, &self.term.grid().saved_cursor, saved_shift[0]);
             emit_cup(&mut out, cursor_point(&self.term));
+            // The primary's own character sets and shift, as they were when
+            // the app entered the alternate screen: alacritty keeps the sets
+            // on the primary grid across the swap, and xterm.js saves the
+            // table the shift selects at `?1049h`, so either restores them
+            // when the app leaves. The return after `?1049h` shifts in again.
+            emit_designations(&mut out, &self.term.grid().cursor.charsets, b'0');
+            if saved_shift[0] == CharsetIndex::G1 {
+                out.push(0x0e); // SO
+            }
             self.term.swap_alt(); // wipes the alt grid; the tail repairs it
+
+            // Mirror the baseline in self now that the alt grid is the target
+            // again. Swapping back copies the primary cursor — pen, character
+            // sets, pending wrap — over the alt grid's, so a reset applied
+            // before the swaps would not survive them, and the tail, which
+            // only re-arms what differs from the baseline, would leave the
+            // primary's sets behind in self.
+            self.feed(BASELINE);
             out.extend_from_slice(b"\x1b[?1049h");
+            // The alt screen's paint runs in ASCII like the primary's did.
+            out.extend_from_slice(RETURN_TO_ASCII);
         }
 
         // Reconstruction tail: active screen and every remaining state. Built
@@ -410,7 +509,7 @@ impl Emulator {
         }
         // Re-arm the DECSC register before origin mode and final placement
         // (absolute CUP + ESC 7, then the real cursor state below).
-        emit_saved_cursor(&mut tail, &saved);
+        emit_saved_cursor(&mut tail, &saved, saved_shift[usize::from(alt_active)]);
         if mode.contains(TermMode::ORIGIN) {
             tail.extend_from_slice(b"\x1b[?6h");
         }
@@ -437,7 +536,7 @@ impl Emulator {
         let mut pen = Pen::default();
         pen.apply_cell(&mut tail, &template);
 
-        self.finish_tail(out, tail, mode, alt_active)
+        self.finish_tail(out, tail, mode, alt_active, charsets, active_charset)
     }
 
     fn finish_tail(
@@ -446,8 +545,10 @@ impl Emulator {
         mut tail: Vec<u8>,
         mode: TermMode,
         alt_active: bool,
+        charsets: Charsets,
+        active_charset: CharsetIndex,
     ) -> Vec<u8> {
-        self.append_modes(&mut tail, mode);
+        self.append_modes(&mut tail, mode, charsets, active_charset);
         out.extend_from_slice(&tail);
         if alt_active {
             self.feed(&tail);
@@ -455,7 +556,13 @@ impl Emulator {
         out
     }
 
-    fn append_modes(&mut self, out: &mut Vec<u8>, mode: TermMode) {
+    fn append_modes(
+        &mut self,
+        out: &mut Vec<u8>,
+        mode: TermMode,
+        charsets: Charsets,
+        active_charset: CharsetIndex,
+    ) {
         // Modes.
         if !mode.contains(TermMode::LINE_WRAP) {
             out.extend_from_slice(b"\x1b[?7l");
@@ -494,19 +601,17 @@ impl Emulator {
             out.extend_from_slice(b"\x1b[?2004h");
         }
 
-        // Charset designations and the active set (grid cells store already
-        // mapped glyphs, so painting above never needed these).
-        for (i, charset) in self.shadow.charsets.iter().enumerate() {
-            if *charset != StandardCharset::Ascii {
-                let designator = b"()*+"[i];
-                out.extend_from_slice(&[0x1b, designator, b'0']);
-            }
-        }
-        match self.shadow.active_charset {
+        // Charset designations and the shift state, as the app left them and
+        // as captured before the baseline. Grid cells store already-mapped
+        // glyphs, so the paint above ran in ASCII; only now, with nothing
+        // left to paint, are the app's sets re-armed, so its next bytes map
+        // in the consumer exactly as they do here.
+        emit_designations(out, &charsets, b'0');
+        match active_charset {
             CharsetIndex::G0 => {}
             CharsetIndex::G1 => out.push(0x0e), // SO
-            // G2/G3 have no simple locking shift in this profile; apps that
-            // use them repaint constantly anyway.
+            // Unreachable: vte 0.15 delivers no LS2/LS3, so the shift is
+            // only ever G0 or G1.
             _ => {}
         }
 
@@ -561,13 +666,46 @@ fn cursor_point<T>(term: &Term<T>) -> Point {
     term.grid().cursor.point
 }
 
-/// Reconstruct a DECSC register: position with the saved pen, save, and leave
-/// the pen for the caller to overwrite (every later emission resets it).
-fn emit_saved_cursor(out: &mut Vec<u8>, saved: &alacritty_terminal::grid::Cursor<Cell>) {
+/// Reconstruct a DECSC register: designate the saved character sets, shift
+/// as the app had at its ESC 7, position with the saved pen, save, then
+/// shift in and return those sets to ASCII — the register keeps them while
+/// the terminal stays where the baseline put it. alacritty's register holds
+/// the designations and DECRC restores them; xterm.js's holds the table that
+/// was active at ESC 7 and DECRC reinstates it, so the shift matters there:
+/// an app that framed `ESC ) 0 SO … ESC 7` (GNU screen's `smacs`) gets
+/// line drawing back from its ESC 8 on either consumer, and one that saved
+/// under SI with G0 line drawing and shifted out since is not misread. The
+/// pen is left for the caller to overwrite (every later emission resets it).
+fn emit_saved_cursor(out: &mut Vec<u8>, saved: &Cursor<Cell>, shift: CharsetIndex) {
+    emit_designations(out, &saved.charsets, b'0');
+    if shift == CharsetIndex::G1 {
+        out.push(0x0e); // SO
+    }
     let mut pen = Pen::default();
     pen.apply_cell(out, &saved.template);
     emit_cup(out, saved.point);
     out.extend_from_slice(b"\x1b7");
+    if shift == CharsetIndex::G1 {
+        out.push(0x0f); // SI
+    }
+    emit_designations(out, &saved.charsets, b'B');
+}
+
+/// Designate `final_byte` (`0` line drawing, `B` ASCII) to every slot of
+/// `charsets` that is not ASCII. Relative to a terminal at the baseline, `0`
+/// arms exactly the app's sets and `B` returns exactly those.
+fn emit_designations(out: &mut Vec<u8>, charsets: &Charsets, final_byte: u8) {
+    const SLOTS: [(CharsetIndex, u8); 4] = [
+        (CharsetIndex::G0, b'('),
+        (CharsetIndex::G1, b')'),
+        (CharsetIndex::G2, b'*'),
+        (CharsetIndex::G3, b'+'),
+    ];
+    for (index, designator) in SLOTS {
+        if charsets[index] != StandardCharset::Ascii {
+            out.extend_from_slice(&[0x1b, designator, final_byte]);
+        }
+    }
 }
 
 fn emit_cup(out: &mut Vec<u8>, point: Point) {
@@ -874,7 +1012,30 @@ mod tests {
             *b.term.mode() & mode_mask,
             "{context}: mode"
         );
-        assert_eq!(a.shadow, b.shadow, "{context}: shadow");
+        assert_eq!(a.shadow.margins, b.shadow.margins, "{context}: margins");
+        assert_eq!(
+            a.shadow.active_charset, b.shadow.active_charset,
+            "{context}: shift"
+        );
+        assert_eq!(a.shadow.alt, b.shadow.alt, "{context}: alt");
+        // The primary register always travels, the alternate one while its
+        // screen is active. An inactive alternate screen's register is not
+        // carried (a limitation the module doc lists), nor is alacritty's
+        // inactive grid compared.
+        assert_eq!(
+            a.shadow.saved_shift[0], b.shadow.saved_shift[0],
+            "{context}: primary register shift"
+        );
+        if a.shadow.alt {
+            assert_eq!(
+                a.shadow.saved_shift[1], b.shadow.saved_shift[1],
+                "{context}: alt register shift"
+            );
+        }
+        assert_eq!(
+            ga.cursor.charsets, gb.cursor.charsets,
+            "{context}: charsets"
+        );
         let (ta, tb) = (&ga.cursor.template, &gb.cursor.template);
         assert_eq!(
             (ta.fg, ta.bg, ta.flags & PEN_FLAGS),
@@ -883,6 +1044,7 @@ mod tests {
         );
         let (sa, sb) = (&ga.saved_cursor, &gb.saved_cursor);
         assert_eq!(sa.point, sb.point, "{context}: saved cursor point");
+        assert_eq!(sa.charsets, sb.charsets, "{context}: saved cursor charsets");
         assert_eq!(
             (
                 sa.template.fg,
@@ -983,9 +1145,496 @@ mod tests {
 
     #[test]
     fn line_drawing_charset_round_trips() {
-        // lqk in DEC special graphics: ─ ─ ┐ ; glyphs are stored mapped.
+        // lqk in DEC special graphics: ┌ ─ ┐ ; glyphs are stored mapped.
         let (a, b) = round_trip(20, 4, b"\x1b(0lqk\x1b(Bplain\x0e");
         assert_same_state(&a, &b, "charset");
+    }
+
+    #[test]
+    fn baseline_opens_with_the_shared_return_to_ascii() {
+        // The screen chunk and the worker's replay head return a consumer to
+        // ASCII with the same bytes; pinning the baseline to the shared
+        // constant is what keeps the two from drifting.
+        assert!(BASELINE.starts_with(b"\x1b[0m"), "{BASELINE:?}");
+        assert!(
+            BASELINE[4..].starts_with(RETURN_TO_ASCII),
+            "the baseline's charset return is not RETURN_TO_ASCII: {BASELINE:?}"
+        );
+        assert_eq!(RETURN_TO_ASCII, b"\x1b(B\x1b)B\x1b*B\x1b+B\x0f");
+    }
+
+    /// A consumer the app left mid line-drawing: G0 and G1 designated to DEC
+    /// special graphics and shifted out — what the previous checkpoint's tail
+    /// or the app's own live bytes leave behind.
+    const CONSUMER_MID_LINE_DRAWING: &[u8] = b"\x1b(0\x1b)0\x0e";
+
+    #[test]
+    fn checkpoint_mid_line_drawing_paints_text_on_a_consumer_left_in_line_drawing() {
+        // #61: ncurses smacs mid-frame — the app designated line drawing, drew
+        // a box top, returned to ASCII for "p1", then designated line drawing
+        // again for the next box edge. The checkpoint lands there.
+        let mut a = Emulator::new(20, 4);
+        a.feed(b"\x1b(0lqk\x1b(Bp1\x1b(0");
+        let checkpoint = a.serialize();
+
+        let mut b = Emulator::new(20, 4);
+        b.feed(CONSUMER_MID_LINE_DRAWING);
+        b.feed(&checkpoint);
+        assert_eq!(
+            b.screen_text()[0],
+            "┌─┐p1",
+            "painted glyphs were mapped a second time: {:?}",
+            b.screen_text()
+        );
+        assert_same_state(&a, &b, "mid line-drawing checkpoint");
+
+        // The app carries on in its line-drawing set; the tail re-armed it in
+        // the consumer, so both draw the same edge.
+        for e in [&mut a, &mut b] {
+            e.feed(b"x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-checkpoint drift");
+        assert_eq!(b.screen_text()[0], "┌─┐p1│");
+
+        // The same over the alternate screen, where the baseline is mirrored
+        // into self and the tail repairs the alt grid.
+        let mut a = Emulator::new(20, 4);
+        a.feed(b"\x1b[?1049h\x1b[H\x1b(0lqk\x1b(Bp1\x1b(0");
+        let checkpoint = a.serialize();
+        let mut b = Emulator::new(20, 4);
+        b.feed(CONSUMER_MID_LINE_DRAWING);
+        b.feed(&checkpoint);
+        assert_eq!(b.screen_text()[0], "┌─┐p1", "{:?}", b.screen_text());
+        assert_same_state(&a, &b, "mid line-drawing checkpoint, alt screen");
+        for e in [&mut a, &mut b] {
+            e.feed(b"x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-checkpoint drift");
+        assert_eq!(b.screen_text()[0], "┌─┐p1│");
+    }
+
+    #[test]
+    fn replay_head_paints_history_as_text_on_a_consumer_left_in_line_drawing() {
+        // The reviewer's reproduction on #60: the previous screen ended in
+        // `ESC ( 0`, and the reseed's history `new abc` came back as glyphs.
+        // The worker's replay head now returns the consumer to ASCII before
+        // the committed lines, whether or not the client's clear did.
+        use super::super::scrollback::replay_head;
+        let mut c = Emulator::new(20, 4);
+        c.feed(CONSUMER_MID_LINE_DRAWING);
+        c.feed(b"\x1b[H\x1b[2J"); // a clear that returns no charset
+        let mut replay = replay_head(20, 4);
+        replay.extend_from_slice(b"\x1b[0mnew abc\r\n\x1b[0m");
+        c.feed(&replay);
+        assert_eq!(c.screen_text()[0], "new abc", "{:?}", c.screen_text());
+    }
+
+    #[test]
+    fn checkpoint_keeps_the_emulators_own_charsets() {
+        // The checkpoint must not move the emulator's own character sets: the
+        // app still believes its sets are armed, and the emulator is what
+        // renders its next bytes. Feeding the baseline's return into self
+        // before capturing the sets — the alt path mirrors the baseline —
+        // would leave the emulator in ASCII while the app draws boxes. The
+        // shadow's record of the registers must survive too: the alt path
+        // feeds the tail's own ESC 7 back into self, and one rebuilt under
+        // the wrong shift would rewrite the record before anything compared
+        // it (the app saves under SO here, so the two registers differ).
+        for alt in [false, true] {
+            let mut e = Emulator::new(20, 4);
+            if alt {
+                e.feed(b"\x1b[?1049h\x1b[H");
+            }
+            e.feed(b"\x1b(0\x1b)0\x0e\x1b7lqk");
+            let state = |e: &Emulator| {
+                (
+                    e.term.grid().cursor.charsets,
+                    e.shadow.active_charset,
+                    e.shadow.saved_shift,
+                    e.shadow.alt,
+                )
+            };
+            let before = state(&e);
+            assert_eq!(before.1, CharsetIndex::G1, "precondition");
+            let mut registers = [CharsetIndex::G0; 2];
+            registers[usize::from(alt)] = CharsetIndex::G1;
+            assert_eq!(before.2, registers, "precondition");
+            let checkpoint = e.serialize();
+            assert_eq!(
+                state(&e),
+                before,
+                "alt={alt}: the checkpoint changed the emulator's own charsets"
+            );
+
+            let mut b = Emulator::new(20, 4);
+            b.feed(&checkpoint);
+            for t in [&mut e, &mut b] {
+                t.feed(b"x");
+            }
+            assert_eq!(e.screen_text()[0], "┌─┐│", "alt={alt}: emulator");
+            assert_eq!(b.screen_text()[0], "┌─┐│", "alt={alt}: consumer");
+        }
+    }
+
+    #[test]
+    fn alt_screen_checkpoint_does_not_leak_the_primary_charsets_into_self() {
+        // alacritty keeps designations per screen and copies the primary
+        // cursor over the alt cursor when it swaps back. The baseline mirror
+        // must land after that copy and return every slot, or the primary's
+        // line-drawing G1 and G2 would survive in the alt grid where the app
+        // had returned them to ASCII — and the next checkpoint would differ.
+        let mut e = Emulator::new(20, 4);
+        e.feed(b"\x1b)0\x1b*0"); // primary: G1 and G2 line drawing
+        e.feed(b"\x1b[?1049h\x1b[H\x1b)B\x1b*B\x0e"); // alt: both ASCII again, SO
+        let before = e.term.grid().cursor.charsets;
+        let checkpoint = e.serialize();
+        assert_eq!(e.term.grid().cursor.charsets, before, "leaked");
+        assert_eq!(e.serialize(), checkpoint, "not stable");
+        let mut b = Emulator::new(20, 4);
+        b.feed(&checkpoint);
+        assert_same_state(&e, &b, "alt after primary line drawing");
+        for t in [&mut e, &mut b] {
+            t.feed(b"x");
+        }
+        assert_eq!(e.screen_text()[0], "x", "emulator");
+        assert_eq!(b.screen_text()[0], "x", "consumer");
+    }
+
+    #[test]
+    fn shadow_records_the_shift_each_register_was_saved_under() {
+        let mut e = Emulator::new(20, 4);
+        e.feed(b"\x1b)0\x0e\x1b7"); // primary: saved under SO
+        assert_eq!(e.shadow.saved_shift, [CharsetIndex::G1, CharsetIndex::G0]);
+        e.feed(b"\x0f\x1b[?1049h"); // entering alt saves the primary under SI
+        assert!(e.shadow.alt);
+        assert_eq!(e.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G0]);
+        e.feed(b"\x0e\x1b[s"); // alt: CSI s under SO fills the alt register
+        assert_eq!(e.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G1]);
+        e.feed(b"\x1b[?1049h"); // already there: not another entry
+        assert_eq!(e.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G1]);
+        e.feed(b"\x1b[?1049l");
+        assert!(!e.shadow.alt);
+        // Leaving touches neither register: the alt one is kept for a return
+        // (alacritty's alt grid and xterm.js's alt buffer both keep theirs),
+        // and the primary's still holds the shift saved at entry.
+        assert_eq!(e.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G1]);
+        e.feed(b"\x1bc"); // RIS
+        assert_eq!(e.shadow, Shadow::new(4));
+    }
+
+    #[test]
+    fn registers_survive_leaving_the_alt_screen() {
+        // The alt register saved under SO, kept across leaving and
+        // re-entering; and the primary register `?1049h` saved under SO,
+        // restored after the app left. Leaving the alternate screen must
+        // rewrite neither shift, or the checkpoint rebuilds the register
+        // under the wrong one for a consumer whose register holds the table.
+        let (mut a, mut b) = round_trip(
+            20,
+            4,
+            b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x0f\x1b[?1049l\x1b[?1049h\x1b[H",
+        );
+        assert_eq!(a.shadow.saved_shift, [CharsetIndex::G0, CharsetIndex::G1]);
+        assert_same_state(&a, &b, "alt register kept across a leave and return");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "x", "{:?}", b.screen_text());
+
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b)0\x0e\x1b[?1049h\x1b[H\x0fx\x1b[?1049l");
+        assert_eq!(a.shadow.saved_shift, [CharsetIndex::G1, CharsetIndex::G0]);
+        assert_same_state(&a, &b, "primary register saved by the alt entry");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "x", "{:?}", b.screen_text());
+    }
+
+    #[test]
+    fn leaving_the_alt_screen_keeps_the_primary_charsets() {
+        // The primary had line drawing designated when the app entered the
+        // alternate screen and returned it to ASCII there. Leaving it must
+        // bring the primary's set back in the consumer as in the emulator.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b(0\x1b[?1049h\x1b[H\x1b(Balt");
+        assert_same_state(&a, &b, "alt over primary line drawing");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b[?1049llqk");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-exit drift");
+        assert_eq!(b.screen_text()[0], "┌─┐", "{:?}", b.screen_text());
+        assert_eq!(
+            a.term.grid().cursor.charsets,
+            b.term.grid().cursor.charsets,
+            "primary charsets"
+        );
+
+        // The SO form: the app entered the alternate screen shifted out with
+        // G1 line drawing, and returned G1 to ASCII there. The entry is
+        // rebuilt under that shift, so a consumer whose `?1049h` keeps the
+        // active table gets line drawing back at `?1049l`, as the emulator
+        // does.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b)0\x0e\x1b[?1049h\x1b[H\x1b)Balt");
+        assert_same_state(&a, &b, "alt over primary SO line drawing");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b[?1049lxxx");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-exit drift");
+        assert_eq!(b.screen_text()[0], "│││", "{:?}", b.screen_text());
+    }
+
+    #[test]
+    fn saved_cursor_keeps_its_charsets_across_a_checkpoint() {
+        // ESC 7 with line drawing designated, back to ASCII for text, then
+        // the checkpoint. The app's ESC 8 restores line drawing in a real
+        // terminal, so it must in the consumer too.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b(0\x1b7\x1b(Btext");
+        assert_same_state(&a, &b, "decsc charsets");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8lqk");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "┌─┐t", "{:?}", b.screen_text());
+
+        // The SO form (GNU screen's `smacs=^N`): G1 designated and shifted
+        // out at ESC 7. The register is rebuilt under that shift, so a
+        // consumer whose register holds the active table restores it too.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b)0\x0e\x1b7lqk");
+        assert_same_state(&a, &b, "decsc charsets, SO form");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8xxx");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "│││", "{:?}", b.screen_text());
+
+        // Saved under SI with G0 line drawing, then shifted out before the
+        // checkpoint: the register is rebuilt under the shift at ESC 7, not
+        // the one at the checkpoint, or a consumer keeping the active table
+        // would save G1's ASCII where the app saved G0's line drawing.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b(0\x1b7\x1b(B\x1b)0\x0e");
+        assert_same_state(&a, &b, "decsc charsets, shifted since");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x0f\x1b8lqk");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "┌─┐", "{:?}", b.screen_text());
+
+        // Saved under SO and shifted in since (screen-style smacs, DECSC,
+        // rmacs): the register is rebuilt under SO, and the SI after its
+        // ESC 7 is what puts the consumer back where the app is — the tail's
+        // own shift only does so while the app is still shifted out.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b)0\x0e\x1b7\x0fab");
+        assert_same_state(&a, &b, "decsc charsets, shifted in since");
+        for e in [&mut a, &mut b] {
+            e.feed(b"x");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-checkpoint drift");
+        assert_eq!(b.screen_text()[0], "abx", "{:?}", b.screen_text());
+
+        // On the alternate screen, saved under SO with G1 line drawing and
+        // returned to ASCII since: the alt register is rebuilt under its own
+        // recorded shift, not the primary's, and the mirror that feeds the
+        // tail back into self must leave the shadow's record as it was.
+        let (mut a, mut b) = round_trip(20, 4, b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x1b)Btext");
+        assert_eq!(
+            a.shadow.saved_shift,
+            [CharsetIndex::G0, CharsetIndex::G1],
+            "alt register shift after the checkpoint"
+        );
+        assert_same_state(&a, &b, "decsc charsets, alt screen SO form");
+        for e in [&mut a, &mut b] {
+            e.feed(b"\x1b8lqk");
+        }
+        assert_eq!(a.screen_text(), b.screen_text(), "post-restore drift");
+        assert_eq!(b.screen_text()[0], "┌─┐t", "{:?}", b.screen_text());
+    }
+
+    #[test]
+    fn serialize_is_stable_mid_line_drawing_on_the_alt_screen() {
+        // Serializing twice mid line-drawing, alt screen active, yields the
+        // same bytes: the mirror-and-repair leaves self exactly as it was.
+        let mut e = Emulator::new(20, 5);
+        e.feed(b"\x1b(0lqk\x1b7\r\nworld\x1b[?1049h\x1b[H\x1b)0\x0ealt");
+        let first = e.serialize();
+        let second = e.serialize();
+        assert_eq!(first, second);
+        let mut b = Emulator::new(20, 5);
+        b.feed(&first);
+        assert_same_state(&e, &b, "alt mid line-drawing");
+    }
+
+    /// Where the web workspace's xterm.js is. `SPAWN_XTERM_JS` names it and
+    /// makes the proof required — `scripts/test-all.sh` sets it, so the one
+    /// place that installs the web workspace never skips the only
+    /// real-terminal proof in silence. Unset, the sibling `web/node_modules`
+    /// is used when present and the test skips otherwise: `cargo test` also
+    /// runs where no web workspace exists (the Windows check, the prebuilt
+    /// runners), and a heuristic on `CI` failed exactly there.
+    fn xterm_js() -> Option<std::path::PathBuf> {
+        if let Some(named) = std::env::var_os("SPAWN_XTERM_JS") {
+            let path = std::path::PathBuf::from(named);
+            assert!(
+                path.is_file(),
+                "SPAWN_XTERM_JS names {}, which is not a file",
+                path.display()
+            );
+            return Some(path);
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../web/node_modules/@xterm/xterm/lib/xterm.js");
+        if path.is_file() {
+            return Some(path);
+        }
+        eprintln!("skipped: no xterm.js at {}", path.display());
+        None
+    }
+
+    /// Drive a real xterm.js, headless in node, through `writes` in order and
+    /// return the screen rows after each one (`tests/xterm_checkpoint_proof.js`).
+    fn real_xterm_rows(
+        xterm: &std::path::Path,
+        cols: u16,
+        rows: u16,
+        writes: &[&[u8]],
+    ) -> Vec<Vec<String>> {
+        use std::io::Write as _;
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/xterm_checkpoint_proof.js");
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let input = serde_json::json!({
+            "xterm": xterm,
+            "cols": cols,
+            "rows": rows,
+            "writes": writes.iter().map(|w| hex(w)).collect::<Vec<_>>(),
+        });
+        let mut node = std::process::Command::new("node")
+            .arg(&script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("node on PATH");
+        node.stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = node.wait_with_output().unwrap();
+        assert!(output.status.success(), "node exited {:?}", output.status);
+        serde_json::from_slice(&output.stdout).expect("rows as JSON")
+    }
+
+    #[test]
+    fn real_xterm_renders_a_mid_line_drawing_checkpoint_as_text() {
+        // The same scenario as the alacritty consumer above, against the
+        // xterm.js the browser and the phone's WebView render with.
+        let Some(xterm) = xterm_js() else { return };
+        use super::super::scrollback::replay_head;
+        let mut a = Emulator::new(20, 4);
+        a.feed(b"\x1b(0lqk\x1b(Bp1\x1b(0");
+        let checkpoint = a.serialize();
+        let mut reseed = b"\x1b[H\x1b[2J".to_vec(); // a clear with no charset return
+        reseed.extend_from_slice(&replay_head(20, 4));
+        reseed.extend_from_slice(b"\x1b[0mnew abc\r\n\x1b[0m");
+        let rows = real_xterm_rows(
+            &xterm,
+            20,
+            4,
+            &[CONSUMER_MID_LINE_DRAWING, &checkpoint, b"x", &reseed],
+        );
+        assert_eq!(
+            rows[1][0], "┌─┐p1",
+            "xterm mapped the painted glyphs again: {rows:?}"
+        );
+        assert_eq!(
+            rows[2][0], "┌─┐p1│",
+            "the tail did not re-arm line drawing: {rows:?}"
+        );
+        assert_eq!(
+            rows[3][0], "new abc",
+            "history came back as glyphs: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn real_xterm_restores_line_drawing_after_a_checkpointed_register() {
+        // xterm.js keeps the active table in its DECSC register and the
+        // primary's at `?1049h`, where alacritty keeps designations. The
+        // rebuilt register and the carried primary sets must restore line
+        // drawing on it all the same: DECSC in the G0 form, the SO form,
+        // saved under SO then shifted in (where the register's rebuild must
+        // not leave the consumer shifted out), saved under SI then shifted
+        // out, and saved on the alternate screen under SO; and leaving the
+        // alternate screen entered under SI and under SO.
+        let Some(xterm) = xterm_js() else { return };
+        let cases: [(&[u8], &[u8], &str); 7] = [
+            (b"\x1b(0\x1b7\x1b(Btext", b"\x1b8lqk", "┌─┐t"),
+            (b"\x1b)0\x0e\x1b7lqk", b"\x1b8xxx", "│││"),
+            (b"\x1b)0\x0e\x1b7\x0fab", b"x", "abx"),
+            (b"\x1b(0\x1b7\x1b(B\x1b)0\x0e", b"\x0f\x1b8lqk", "┌─┐"),
+            (
+                b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x1b)Btext",
+                b"\x1b8lqk",
+                "┌─┐t",
+            ),
+            (
+                b"\x1b(0\x1b[?1049h\x1b[H\x1b(Balt",
+                b"\x1b[?1049llqk",
+                "┌─┐",
+            ),
+            (
+                b"\x1b)0\x0e\x1b[?1049h\x1b[H\x1b)Balt",
+                b"\x1b[?1049lxxx",
+                "│││",
+            ),
+        ];
+        for (app, after, expected) in cases {
+            let mut a = Emulator::new(20, 4);
+            a.feed(app);
+            let checkpoint = a.serialize();
+            a.feed(after);
+            assert_eq!(a.screen_text()[0], expected, "emulator: {app:?}");
+            let rows = real_xterm_rows(&xterm, 20, 4, &[&checkpoint, after]);
+            assert_eq!(rows[1][0], expected, "xterm after {app:?}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn real_xterm_restores_its_own_register_where_the_emulator_differs() {
+        // Where the two DECRC models diverge natively — xterm.js restores the
+        // table active at DECSC, alacritty restores designations under the
+        // current shift — the checkpoint gives xterm.js what its own register
+        // held: the alt register saved under SO and kept across leaving and
+        // re-entering, and the primary register `?1049h` saved under SO and
+        // restored after the app left. The emulator renders these its own
+        // way; the consumer must render them native xterm.js's way.
+        let Some(xterm) = xterm_js() else { return };
+        let cases: [(&[u8], &[u8]); 2] = [
+            (
+                b"\x1b[?1049h\x1b[H\x1b)0\x0e\x1b7\x0f\x1b[?1049l\x1b[?1049h\x1b[H",
+                b"\x1b8x",
+            ),
+            (b"\x1b)0\x0e\x1b[?1049h\x1b[H\x0fx\x1b[?1049l", b"\x1b8x"),
+        ];
+        for (app, after) in cases {
+            let mut a = Emulator::new(20, 4);
+            a.feed(app);
+            let checkpoint = a.serialize();
+            a.feed(after);
+            assert_eq!(
+                a.screen_text()[0],
+                "x",
+                "emulator, alacritty's DECRC: {app:?}"
+            );
+            let native = real_xterm_rows(&xterm, 20, 4, &[app, after]);
+            let replayed = real_xterm_rows(&xterm, 20, 4, &[&checkpoint, after]);
+            assert_eq!(native[1][0], "│", "native xterm.js: {app:?}: {native:?}");
+            assert_eq!(
+                replayed[1][0], native[1][0],
+                "consumer differs from native xterm.js after {app:?}: {replayed:?}"
+            );
+        }
     }
 
     #[test]

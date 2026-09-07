@@ -72,6 +72,20 @@ pub fn geometry_marker(cols: u16, rows: u16) -> Vec<u8> {
 /// raw bytes; clients that don't fall back to the legacy chunk walk.
 pub const REPLAY_HISTORY_SENTINEL: &[u8] = b"\x1b_sp:h1\x1b\\";
 
+/// The head of a worker replay: the geometry marker, the history sentinel,
+/// then [`emulator::RETURN_TO_ASCII`](super::emulator::RETURN_TO_ASCII).
+/// Committed lines are painted as already-mapped glyphs, exactly like the
+/// screen chunk, so a consumer the previous screen's tail left in a
+/// line-drawing set is returned to ASCII before it renders them (#61). The
+/// clients' reseed clear leads with the same bytes; this covers a client
+/// that has not learned to, and any terminal the stream is written to.
+pub fn replay_head(cols: u16, rows: u16) -> Vec<u8> {
+    let mut head = geometry_marker(cols, rows);
+    head.extend_from_slice(REPLAY_HISTORY_SENTINEL);
+    head.extend_from_slice(super::emulator::RETURN_TO_ASCII);
+    head
+}
+
 /// Per-record header: `u32 LE ciphertext_len | u8 kind | u64 LE seq`.
 const RECORD_HEADER_LEN: usize = 4 + 1 + 8;
 /// AEAD tag overhead per record.

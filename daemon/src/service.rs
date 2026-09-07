@@ -214,6 +214,7 @@ fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String 
          Restart=on-failure\n\
          RestartSec=3\n\
          KillMode=process\n\
+         LimitNOFILE=65536:infinity\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -312,6 +313,7 @@ fn launchd_plist(config_dir: &Path, bin: &Path, server: &str, state: &Path) -> S
          \t<dict><key>PATH</key><string>{path}</string><key>SPAWN_DISABLE_KEYRING</key><string>1</string></dict>\n\
          \t<key>RunAtLoad</key><true/>\n\
          \t<key>KeepAlive</key><true/>\n\
+         \t<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>16384</integer></dict>\n\
          \t<key>StandardOutPath</key><string>{out}</string>\n\
          \t<key>StandardErrorPath</key><string>{err}</string>\n\
          </dict>\n\
@@ -596,6 +598,8 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
 }
 
 pub fn user_linger_enabled() -> Option<bool> {
+    // Each cfg block is the whole body on its platform, so neither needs a
+    // `return`; clippy 1.97 flags one as needless.
     #[cfg(target_os = "linux")]
     {
         let user = std::env::var("USER").ok()?;
@@ -905,6 +909,14 @@ mod tests {
             "ExecStart=\"/usr/bin/spawnd\" --config-dir \"/srv/spawn/alice\" --server \"https://spawnd.dev\" run"
         ));
         assert!(unit.contains("KillMode=process")); // workers survive restarts
+
+        // A user service starts at 1024 open files; a laptop of sessions needs
+        // more than that before the range of ICE ports runs out (#80). The hard
+        // half is `infinity`, which systemd clamps to the manager's own hard
+        // limit — the one a native shell has — so every shell in a SPAWN D
+        // terminal can still `ulimit -n` as high as it could natively. Any
+        // number here would lower it.
+        assert!(unit.contains("LimitNOFILE=65536:infinity"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
@@ -921,6 +933,13 @@ mod tests {
         assert!(plist.contains("&amp;")); // the '&' in the path is escaped
         assert!(!plist.contains(" & ")); // no raw ampersand leaked
         assert!(plist.contains("<key>KeepAlive</key><true/>"));
+        // launchd starts an agent at 256 open files (#80). Only the soft limit:
+        // a hard limit would follow every shell a terminal spawns and stop
+        // `ulimit -n` there.
+        assert!(plist.contains(
+            "<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>16384</integer></dict>"
+        ));
+        assert!(!plist.contains("HardResourceLimits"));
     }
 
     fn instance_with_server(server: Option<&str>) -> tempfile::TempDir {

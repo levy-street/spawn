@@ -7,6 +7,9 @@
 pub const BUILD_VERSION: &str = env!("SPAWND_BUILD_VERSION");
 pub const DAEMON_TREE: &str = env!("SPAWND_DAEMON_TREE");
 pub const BUILD_COUNTER_RAW: &str = env!("SPAWND_BUILD_COUNTER");
+/// True for the diagnostics variant (`--features diagnostics`): debug logging
+/// by default and a `.diagnostics` build-metadata segment in the version.
+pub const DIAGNOSTICS_BUILD: bool = cfg!(feature = "diagnostics");
 
 pub fn build_version() -> String {
     BUILD_VERSION.to_string()

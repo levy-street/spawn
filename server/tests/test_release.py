@@ -104,7 +104,7 @@ async def test_release_endpoint_is_public_no_store_and_exact_shape(client, tmp_p
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    manifest = {**manifest, "release_counter": None, "signed": False}
+    manifest = {**manifest, "release_counter": None, "signed": False, "variants": {}}
     assert response.json() == {
         "server": {"commit": COMMIT, "dirty": False},
         "web": {"build_id": COMMIT},
@@ -260,6 +260,151 @@ def test_an_unknown_sixth_target_invalidates_the_whole_manifest(tmp_path):
     (prebuilt / "manifest.json").write_text(json.dumps(manifest))
 
     assert release.read_prebuilt_manifest(repo_root=tmp_path) is None
+
+
+def _stage_variant(
+    prebuilt: Path,
+    manifest: dict,
+    target: str,
+    *,
+    variant: str = "diagnostics",
+    version: str | None = None,
+) -> dict:
+    """Add a variant pair for `target` under `prebuilt/<target>/<variant>/`
+    and list it in the manifest, the way deploy-prod.sh publishes one."""
+    directory = prebuilt / target / variant
+    directory.mkdir(parents=True)
+    suffix = ".exe" if target.startswith("windows-") else ""
+    spawnd = f"{variant}-spawnd-{target}".encode()
+    worker = f"{variant}-worker-{target}".encode()
+    (directory / f"spawnd{suffix}").write_bytes(spawnd)
+    (directory / f"spawn-worker{suffix}").write_bytes(worker)
+    entry = manifest.setdefault("variants", {}).setdefault(
+        variant,
+        {"version": version or f"{manifest['version']}.{variant}", "targets": {}},
+    )
+    entry["targets"][target] = {
+        "spawnd_sha256": hashlib.sha256(spawnd).hexdigest(),
+        "spawn_worker_sha256": hashlib.sha256(worker).hexdigest(),
+    }
+    (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+    return manifest
+
+
+def test_variants_are_proven_like_the_release_pairs_and_advertised(tmp_path):
+    manifest, prebuilt = _stage_targets(tmp_path, ["linux-x86_64", "darwin-aarch64"])
+    _stage_variant(prebuilt, manifest, "linux-x86_64")
+
+    read = release.read_prebuilt_manifest(repo_root=tmp_path)
+
+    assert read is not None
+    assert set(read.targets) == {"linux-x86_64", "darwin-aarch64"}
+    assert set(read.variants) == {"diagnostics"}
+    diagnostics = read.variants["diagnostics"]
+    assert diagnostics.version == "0.1.0+g111111111111.diagnostics"
+    assert set(diagnostics.targets) == {"linux-x86_64"}
+    assert (
+        diagnostics.targets["linux-x86_64"].spawnd_sha256
+        == manifest["variants"]["diagnostics"]["targets"]["linux-x86_64"]["spawnd_sha256"]
+    )
+    # The release pair is untouched by the variant beside it, and the update
+    # the server pushes still names the release pair: the daemon decides
+    # which build it follows.
+    assert (
+        read.targets["linux-x86_64"].spawnd_sha256
+        == manifest["targets"]["linux-x86_64"]["spawnd_sha256"]
+    )
+    host = SimpleNamespace(os="linux", arch="x86_64")
+    payload = release.daemon_update_payload(host, read)
+    assert payload is not None
+    assert payload["spawnd"] == {
+        "path": "/api/install/spawnd/linux-x86_64",
+        "sha256": manifest["targets"]["linux-x86_64"]["spawnd_sha256"],
+    }
+    assert payload["version"] == "0.1.0+g111111111111"
+
+
+async def test_release_endpoint_carries_the_variants(client, tmp_path, monkeypatch):
+    _configure_release(monkeypatch, tmp_path)
+    manifest, prebuilt = _stage_targets(tmp_path, ["linux-x86_64"])
+    _stage_variant(prebuilt, manifest, "linux-x86_64")
+    release.refresh()
+
+    response = await client.get("/api/release")
+
+    assert response.status_code == 200
+    assert response.json()["daemon"]["variants"] == manifest["variants"]
+    assert response.json()["daemon"]["targets"] == manifest["targets"]
+
+
+@pytest.mark.parametrize(
+    "absent",
+    ["missing-key", "empty", "null"],
+)
+def test_a_manifest_without_variants_is_a_release_with_none(tmp_path, absent):
+    manifest, prebuilt = _stage_targets(tmp_path, ["linux-x86_64"])
+    if absent != "missing-key":
+        # The daemon reads both as "no variants"; the server must agree.
+        manifest["variants"] = {} if absent == "empty" else None
+        (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+
+    read = release.read_prebuilt_manifest(repo_root=tmp_path)
+
+    assert read is not None
+    assert read.variants == {}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unknown-variant",
+        "not-a-map",
+        "wrong-version",
+        "missing-version",
+        "target-without-release-pair",
+        "unsupported-target",
+        "missing-worker",
+        "worker-hash",
+        "hash-not-hex",
+    ],
+)
+def test_a_broken_variant_invalidates_the_whole_manifest(tmp_path, failure):
+    """A manifest listing variant bytes this server cannot hand out is not
+    a release, exactly as for the release pairs: the daemon would download
+    them, fail the hash or the version check, and report a failed update."""
+    manifest, prebuilt = _stage_targets(tmp_path, ["linux-x86_64"])
+    _stage_variant(prebuilt, manifest, "linux-x86_64")
+    diagnostics = manifest["variants"]["diagnostics"]
+    if failure == "unknown-variant":
+        manifest["variants"]["debug"] = dict(diagnostics)
+    elif failure == "not-a-map":
+        manifest["variants"] = ["diagnostics"]
+    elif failure == "wrong-version":
+        diagnostics["version"] = "0.1.0+g111111111111"
+    elif failure == "missing-version":
+        del diagnostics["version"]
+    elif failure == "target-without-release-pair":
+        # The bytes exist and hash correctly; only the release pair is absent.
+        _stage_variant(prebuilt, manifest, "darwin-aarch64")
+    elif failure == "unsupported-target":
+        diagnostics["targets"]["linux-riscv64"] = dict(diagnostics["targets"]["linux-x86_64"])
+    elif failure == "missing-worker":
+        (prebuilt / "linux-x86_64" / "diagnostics" / "spawn-worker").unlink()
+    elif failure == "worker-hash":
+        diagnostics["targets"]["linux-x86_64"]["spawn_worker_sha256"] = "0" * 64
+    elif failure == "hash-not-hex":
+        diagnostics["targets"]["linux-x86_64"]["spawnd_sha256"] = "zz" * 32
+    (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+
+    assert release.read_prebuilt_manifest(repo_root=tmp_path) is None
+
+
+def test_humanized_blockers_name_the_variant_override():
+    assert "SPAWND_RELEASE_VARIANT" in release.humanize_self_update_blocked("invalid_variant")
+    assert (
+        release.humanize_update_result_error("verify", "variant_unavailable")
+        == "verify: variant unavailable"
+    )
 
 
 def test_windows_host_update_state_and_payload_use_the_windows_target():

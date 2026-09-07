@@ -16,9 +16,73 @@ pub use unix::*;
 #[cfg(windows)]
 pub use windows::*;
 
+/// What [`raise_open_file_limit`] found and left behind: the soft limit on
+/// open files before and after, the hard ceiling it may not exceed (`None`
+/// when the platform reports no ceiling), and whether the platform refused
+/// the ask — a kernel maximum below the target, which is not the hard
+/// limit — so the caller can say why `after` is short of what it wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFileLimit {
+    pub before: u64,
+    pub after: u64,
+    pub maximum: Option<u64>,
+    pub refused: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_limit_rises_to_the_target_and_never_falls() {
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        let current = getrlimit(Resource::Nofile);
+        let soft = current.current.unwrap_or(u64::MAX);
+        let hard = current.maximum.unwrap_or(u64::MAX);
+        // Asking for less than we already have changes nothing.
+        let unchanged = super::raise_open_file_limit(soft.saturating_sub(1)).unwrap();
+        assert_eq!((unchanged.before, unchanged.after), (soft, soft));
+        // Lower our own soft limit a little, then prove the raise brings it
+        // back: this way the setrlimit path runs on every host, including
+        // one whose soft limit already equals its hard limit. The margin is
+        // small enough that the other tests in this process never notice.
+        let lowered = soft.saturating_sub(64);
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(lowered),
+                maximum: current.maximum,
+            },
+        )
+        .unwrap();
+        let raised = super::raise_open_file_limit(soft.min(hard)).unwrap();
+        assert_eq!((raised.before, raised.after), (lowered, soft), "{raised:?}");
+        assert!(!raised.refused, "{raised:?}");
+        assert_eq!(
+            getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX),
+            soft
+        );
+        // Asking for more than a finite hard limit allows raises to the hard
+        // limit and reports it as the ceiling, not as a refusal. An unlimited
+        // hard limit (every Mac by default) has no such ceiling to hit: a
+        // request above RLIM_INFINITY is EINVAL there, so the probe is skipped.
+        if let Some(finite_hard) = current.maximum {
+            let capped = super::raise_open_file_limit(finite_hard + 1).unwrap();
+            assert_eq!(capped.after, finite_hard, "{capped:?}");
+            assert!(!capped.refused, "{capped:?}");
+        }
+        // Leave the process as it was found; the other tests share it.
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(soft),
+                maximum: current.maximum,
+            },
+        )
+        .unwrap();
+    }
+
     use std::path::Path;
 
     #[test]

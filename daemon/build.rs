@@ -23,10 +23,14 @@ fn main() {
         .unwrap_or_default();
     // The suffix is semver build metadata: comparisons ignore it, humans and
     // logs comparing a running daemon against a release no longer have to.
-    let version = if commit.is_empty() {
-        pkg_version
-    } else {
-        format!("{pkg_version}+g{commit}")
+    // The diagnostics variant adds one more metadata segment so a status line
+    // or a register frame never leaves it ambiguous which build is running.
+    let diagnostics = std::env::var_os("CARGO_FEATURE_DIAGNOSTICS").is_some();
+    let version = match (commit.is_empty(), diagnostics) {
+        (true, false) => pkg_version,
+        (true, true) => format!("{pkg_version}+diagnostics"),
+        (false, false) => format!("{pkg_version}+g{commit}"),
+        (false, true) => format!("{pkg_version}+g{commit}.diagnostics"),
     };
     println!("cargo:rustc-env=SPAWND_BUILD_VERSION={version}");
 
