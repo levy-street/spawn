@@ -256,53 +256,6 @@ async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassocia
 
 
 @pytest.mark.asyncio
-async def test_broker_agent_install_request_roundtrip(app):
-    broker = get_broker()
-
-    host_id = "host-tools-install"
-    daemon_ws = FakeWS()
-    daemon = DaemonConn(
-        host_id=host_id,
-        user_id="user-1",
-        websocket=daemon_ws,  # type: ignore[arg-type]
-    )
-    await _accept_owner(broker, daemon)
-
-    target = {
-        "agent_id": "00000000-0000-4000-8000-0000000000ef",
-        "agent_name": "codex",
-        "agent_kind": "codex",
-        "command": "codex",
-        "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
-    }
-    task = asyncio.create_task(broker.request_agent_install(daemon, target=target, timeout=1))
-    await asyncio.sleep(0)
-
-    sent = json.loads(daemon_ws.sent_text[-1])
-    assert sent["type"] == "host.agents.install"
-    assert sent["target"] == target
-
-    payload = {
-        "type": "host.agents.install_result",
-        "request_id": sent["request_id"],
-        "result": {
-            **target,
-            "success": True,
-            "exit_code": 0,
-            "output": "updated",
-            "error": None,
-            "status": None,
-        },
-    }
-    await broker.resolve_agent_install(
-        sent["request_id"], payload, daemon=daemon, expected_host_generation=1
-    )
-    assert await task == payload
-
-    await broker.unregister_daemon(daemon)
-
-
-@pytest.mark.asyncio
 async def test_host_ping_rejects_stale_daemon_and_generation(app):
     broker = Broker()
     old_ws = FakeWS()

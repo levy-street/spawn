@@ -195,6 +195,9 @@ test("the archived drawer restores and deletes forever", async ({ page }) => {
     "aria-expanded",
     "true",
   );
+  // Archiving the active workspace moves to its neighbour. Wait for that
+  // navigation before opening a menu, since route changes dismiss menus.
+  await expect(page).toHaveURL(`/w/${WORKSPACE_ID}`);
   await page.getByRole("button", { name: "Alpha desk archived actions" }).click();
   await page.getByRole("menuitem", { name: "Delete forever" }).click();
   const confirm = page.getByRole("dialog", { name: "Delete Alpha desk forever?" });

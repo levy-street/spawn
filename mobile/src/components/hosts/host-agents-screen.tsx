@@ -1,5 +1,4 @@
 import { useRouter } from "expo-router";
-import { useState } from "react";
 import { RefreshControl, ScrollView, StyleSheet, View } from "react-native";
 import { HostAgentRow } from "@/components/hosts/host-agent-row";
 import { errorMessage } from "@/components/hosts/host-model";
@@ -12,29 +11,17 @@ import { ListGroup } from "@/components/ui/list-group";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
-import { useToast } from "@/components/ui/toast";
-import type { HostAgentInstallResult } from "@/data/api/schemas/hosts";
-import {
-  useHostAgentPolicyMutation,
-  useHostAgentsQuery,
-  useHostQuery,
-  useInstallHostAgentMutation,
-  useSkillsQuery,
-} from "@/data/queries/hosts";
+import { useHostAgentsQuery, useHostQuery, useSkillsQuery } from "@/data/queries/hosts";
 import { spacing, useTheme } from "@/theme";
 
 export function HostAgentsScreen({ hostId }: { hostId: string }) {
   const theme = useTheme();
   const router = useRouter();
-  const toast = useToast();
   const hostQuery = useHostQuery(hostId);
   const host = hostQuery.data;
   const online = host?.status === "online";
   const agentsQuery = useHostAgentsQuery(hostId, online);
   const skillsQuery = useSkillsQuery();
-  const install = useInstallHostAgentMutation(hostId);
-  const policy = useHostAgentPolicyMutation(hostId);
-  const [results, setResults] = useState<Record<string, HostAgentInstallResult>>({});
 
   const refresh = () => {
     void Promise.all([
@@ -99,6 +86,10 @@ export function HostAgentsScreen({ hostId }: { hostId: string }) {
                   ) : undefined
                 }
               />
+              <Text color="mutedForeground" variant="body">
+                Agent installation and auto update are unavailable here. Install or update agents in
+                a trusted terminal on this host.
+              </Text>
               {!online ? (
                 <View
                   style={[
@@ -131,50 +122,7 @@ export function HostAgentsScreen({ hostId }: { hostId: string }) {
               ) : (
                 <ListGroup testID="host-agent-rows">
                   {agentsQuery.data.agents.map((agent) => (
-                    <HostAgentRow
-                      agent={agent}
-                      hostName={host.name}
-                      installing={
-                        install.isPending && install.variables?.agentId === agent.agent_id
-                      }
-                      key={agent.agent_id}
-                      onInstall={() => {
-                        install.mutate(
-                          { agentId: agent.agent_id, hostId },
-                          {
-                            onError: (error) =>
-                              toast.error(`${agent.agent_name}: failed`, { detail: error.message }),
-                            onSuccess: (result) => {
-                              setResults((current) => ({
-                                ...current,
-                                [agent.agent_id]: result,
-                              }));
-                              if (result.success) toast.success(`${agent.agent_name}: completed`);
-                              else
-                                toast.error(
-                                  `${agent.agent_name}: failed`,
-                                  result.error ? { detail: result.error } : {},
-                                );
-                            },
-                          },
-                        );
-                      }}
-                      onPolicyChange={(value) => {
-                        policy.mutate(
-                          { agentId: agent.agent_id, autoUpdate: value, hostId },
-                          {
-                            onError: (error) =>
-                              toast.error("Could not update auto update", {
-                                detail: error.message,
-                              }),
-                          },
-                        );
-                      }}
-                      policySaving={
-                        policy.isPending && policy.variables?.agentId === agent.agent_id
-                      }
-                      result={results[agent.agent_id] ?? null}
-                    />
+                    <HostAgentRow agent={agent} key={agent.agent_id} />
                   ))}
                 </ListGroup>
               )}

@@ -17,6 +17,10 @@ const A_BUILD = {
 
 /** The app with the release manifest held open until `answer()` is called. */
 async function appWithHeldRelease(page: Page, desktop: Record<string, unknown> | null) {
+  // This fixture exercises the desktop download, including on Linux runners.
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "MacIntel" });
+  });
   await mockApp(page, {
     sessions: [],
     workspaces: [workspace({ layout: { version: 3, tiles: [] } })],

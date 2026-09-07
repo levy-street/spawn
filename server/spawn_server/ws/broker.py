@@ -988,26 +988,6 @@ class Broker:
             payload,
         )
 
-    async def request_agent_install(
-        self,
-        daemon: DaemonConn,
-        *,
-        target: dict,
-        timeout: float = 180.0,
-    ) -> dict | None:
-        request_id = str(uuid.uuid4())
-        return await self._request_owner_result(
-            daemon,
-            "host.agents.install_result",
-            request_id,
-            {
-                "type": "host.agents.install",
-                "request_id": request_id,
-                "target": target,
-            },
-            timeout=timeout,
-        )
-
     async def resolve_agent_install(
         self,
         request_id: str,
