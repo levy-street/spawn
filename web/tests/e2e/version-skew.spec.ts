@@ -1,8 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, mkdtempSync, openSync, rmSync } from "node:fs";
+import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { expect, test, type WebSocketRoute } from "@playwright/test";
 import { mockApp } from "./app-mocks";
 
@@ -51,7 +50,9 @@ async function waitForOldWeb(url: string): Promise<void> {
 test.beforeAll(async () => {
   const port = await freePort();
   oldWebUrl = `http://127.0.0.1:${port}`;
-  oldWebScratch = mkdtempSync(join(tmpdir(), "spawn-old-web-"));
+  const scratchRoot = resolve("dist");
+  mkdirSync(scratchRoot, { recursive: true });
+  oldWebScratch = mkdtempSync(join(scratchRoot, "spawn-old-web-"));
   // An fd, not a WriteStream: spawn() needs an already-open descriptor for stdio.
   const log = openSync(join(oldWebScratch, "next.log"), "a");
   oldWeb = spawn(
@@ -64,6 +65,9 @@ test.beforeAll(async () => {
         ...process.env,
         SPAWN_API_PROXY_TARGET: "http://127.0.0.1:9",
         SPAWN_BUILD_ID: OLD_BUILD,
+        // Two dev servers sharing .next overwrite each other's manifests and
+        // compiled routes, leaving the rest of the suite in a refresh loop.
+        SPAWN_NEXT_DIST_DIR: relative(resolve("."), join(oldWebScratch, ".next")),
       },
       stdio: ["ignore", log, log],
     },
