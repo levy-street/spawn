@@ -27,7 +27,10 @@ import {
 } from "react";
 import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
-import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
+import {
+  LiveTerminalWriteBuffer,
+  PostRenderLiveWriteBuffer,
+} from "@/components/terminal/live-write-buffer";
 import { openTerminalLink } from "@/components/terminal/terminal-link";
 import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
 import { UploadProgressBar } from "@/components/terminal/upload-progress-bar";
@@ -83,9 +86,17 @@ const SCROLLBACK_UNANCHORED_CACHE_LINES = 2_000;
 // DataChannels, so a fresh capture can lag chunks already rendered locally;
 // replaying chunks past the capture's stream offset makes re-renders exact.
 const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
+// Match the mobile terminal's live-write cadence for applications that do not
+// bracket redraws with DEC synchronized-output mode. Bracketed redraws are
+// held until CSI ? 2026 l, preventing xterm from painting partial frames.
+const LIVE_WRITE_IDLE_DELAY_MS = 8;
+const LIVE_WRITE_BATCH_BYTES = 32 * 1024;
+const LIVE_WRITE_SYNC_TIMEOUT_MS = 1_000;
+const LIVE_WRITE_SYNC_MAX_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const MAX_UPLOAD_RECONCILIATIONS = 8;
 const UPLOAD_RECONCILIATION_STORAGE_PREFIX = "spawn.upload-reconciliation.v1";
+
 const UPLOAD_RECONCILIATION_EVENT = "spawn:upload-reconciliation";
 const TOUCH_VELOCITY_SAMPLE_MS = 120;
 const TOUCH_MOMENTUM_BOOST = 1.25;
@@ -589,6 +600,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   );
   const liveSeedCoveredOffsetRef = useRef<number | null>(null);
   const flushPendingLiveSeedWritesRef = useRef<() => void>(() => {});
+  const liveTerminalWritesRef = useRef(new LiveTerminalWriteBuffer());
+  const liveTerminalWriteIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const liveTerminalWriteSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const liveTerminalWriteInFlightRef = useRef(false);
+  const liveTerminalWriteFlushPendingRef = useRef(false);
+  const flushLiveTerminalWritesRef = useRef<() => void>(() => {});
+  const scheduleLiveTerminalWritesRef = useRef<() => void>(() => {});
+  const enqueueLiveTerminalWriteRef = useRef<(bytes: Uint8Array, onWritten?: () => void) => void>(
+    () => {},
+  );
   const liveViewportPinFrameRef = useRef<number | null>(null);
   const pinLiveViewportToBottomRef = useRef<() => void>(() => {});
   const requestSnapshotRef = useRef<() => boolean>(() => false);
@@ -1106,6 +1127,104 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }));
   }, [accountEndorsementsQuery.data, signalingAccountId]);
 
+  flushLiveTerminalWritesRef.current = () => {
+    if (liveTerminalWriteIdleTimerRef.current) {
+      clearTimeout(liveTerminalWriteIdleTimerRef.current);
+      liveTerminalWriteIdleTimerRef.current = null;
+    }
+    if (liveTerminalWritesRef.current.synchronized) {
+      liveTerminalWriteFlushPendingRef.current = true;
+      return;
+    }
+    if (liveTerminalWriteSyncTimerRef.current) {
+      clearTimeout(liveTerminalWriteSyncTimerRef.current);
+      liveTerminalWriteSyncTimerRef.current = null;
+    }
+    if (liveTerminalWriteInFlightRef.current) {
+      liveTerminalWriteFlushPendingRef.current = true;
+      return;
+    }
+    liveTerminalWriteFlushPendingRef.current = false;
+    const term = termRef.current;
+    if (!term) {
+      liveTerminalWritesRef.current.clear();
+      return;
+    }
+    const batch = liveTerminalWritesRef.current.take(LIVE_WRITE_BATCH_BYTES);
+    if (!batch) return;
+    liveTerminalWriteInFlightRef.current = true;
+    term.write(batch.bytes, () => {
+      liveTerminalWriteInFlightRef.current = false;
+      try {
+        for (const onWritten of batch.onWritten) onWritten();
+      } finally {
+        if (liveTerminalWritesRef.current.size === 0) {
+          liveTerminalWriteFlushPendingRef.current = false;
+        } else if (liveTerminalWritesRef.current.synchronized) {
+          // The synchronized-output timeout installed by enqueue remains the
+          // recovery path if the application never sends its closing marker.
+        } else if (
+          liveTerminalWriteFlushPendingRef.current ||
+          liveTerminalWritesRef.current.size >= LIVE_WRITE_BATCH_BYTES
+        ) {
+          flushLiveTerminalWritesRef.current();
+        } else {
+          scheduleLiveTerminalWritesRef.current();
+        }
+      }
+    });
+  };
+
+  scheduleLiveTerminalWritesRef.current = () => {
+    if (liveTerminalWritesRef.current.size === 0 || liveTerminalWritesRef.current.synchronized) {
+      return;
+    }
+    if (liveTerminalWriteIdleTimerRef.current) {
+      clearTimeout(liveTerminalWriteIdleTimerRef.current);
+    }
+    liveTerminalWriteIdleTimerRef.current = setTimeout(() => {
+      liveTerminalWriteIdleTimerRef.current = null;
+      flushLiveTerminalWritesRef.current();
+    }, LIVE_WRITE_IDLE_DELAY_MS);
+  };
+
+  enqueueLiveTerminalWriteRef.current = (bytes, onWritten) => {
+    const state = liveTerminalWritesRef.current.enqueue(bytes, onWritten);
+    if (state.synchronized) {
+      if (liveTerminalWriteIdleTimerRef.current) {
+        clearTimeout(liveTerminalWriteIdleTimerRef.current);
+        liveTerminalWriteIdleTimerRef.current = null;
+      }
+      if (!liveTerminalWriteSyncTimerRef.current) {
+        liveTerminalWriteSyncTimerRef.current = setTimeout(() => {
+          liveTerminalWriteSyncTimerRef.current = null;
+          liveTerminalWritesRef.current.releaseSynchronization();
+          flushLiveTerminalWritesRef.current();
+        }, LIVE_WRITE_SYNC_TIMEOUT_MS);
+      }
+      if (liveTerminalWritesRef.current.size >= LIVE_WRITE_SYNC_MAX_BYTES) {
+        clearTimeout(liveTerminalWriteSyncTimerRef.current);
+        liveTerminalWriteSyncTimerRef.current = null;
+        liveTerminalWritesRef.current.releaseSynchronization();
+        flushLiveTerminalWritesRef.current();
+      }
+      return;
+    }
+    if (liveTerminalWriteSyncTimerRef.current) {
+      clearTimeout(liveTerminalWriteSyncTimerRef.current);
+      liveTerminalWriteSyncTimerRef.current = null;
+    }
+    if (state.completedSynchronizedOutput) {
+      flushLiveTerminalWritesRef.current();
+      return;
+    }
+    if (liveTerminalWritesRef.current.size >= LIVE_WRITE_BATCH_BYTES) {
+      flushLiveTerminalWritesRef.current();
+      return;
+    }
+    scheduleLiveTerminalWritesRef.current();
+  };
+
   const socket = useSessionSocket({
     sessionId,
     enabled: socketInitialSize !== null && signalingIdentityKnown,
@@ -1167,7 +1286,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (liveSeedWriteInFlightRef.current) {
         pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
       } else {
-        termRef.current?.write(bytes, () => {
+        enqueueLiveTerminalWriteRef.current(bytes, () => {
           pinLiveViewportToBottomRef.current();
           reconcilePredictionRef.current();
           // Output landed below a reader who is scrolled up (the pin is a
@@ -1197,6 +1316,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // the live buffer at full history depth.
       }
       pendingLiveSeedWritesRef.current.clear();
+      if (liveTerminalWriteIdleTimerRef.current) {
+        clearTimeout(liveTerminalWriteIdleTimerRef.current);
+        liveTerminalWriteIdleTimerRef.current = null;
+      }
+      if (liveTerminalWriteSyncTimerRef.current) {
+        clearTimeout(liveTerminalWriteSyncTimerRef.current);
+        liveTerminalWriteSyncTimerRef.current = null;
+      }
+      liveTerminalWritesRef.current.clear();
+      liveTerminalWriteFlushPendingRef.current = false;
       liveSeedCoveredOffsetRef.current = typeof dcOffset === "number" ? dcOffset : null;
       liveSeedWriteInFlightRef.current = true;
       const exactChunks = parseExactReplay(decodeUtf8(bytes));
@@ -1346,7 +1475,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const banner = `\r\n\x1b[33m[session exited code=${code ?? "?"}${
         sig ? ` signal=${sig}` : ""
       }]\x1b[0m\r\n`;
-      termRef.current?.write(banner);
+      enqueueLiveTerminalWriteRef.current(new TextEncoder().encode(banner));
+      flushLiveTerminalWritesRef.current();
       markPainted();
       setExitBanner(`Session exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
       onExit?.(code, sig);
@@ -1589,7 +1719,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     refreshLiveEdgeRef.current = refreshLiveEdge;
     const scrollDisposable = term.onScroll((ydisp) => {
       const t = termRef.current;
-      setLiveEdge(t ? ydisp >= t.buffer.active.baseY : true);
+      const atBottom = t ? ydisp >= t.buffer.active.baseY : true;
+      setLiveEdge(atBottom);
+      // A pin queued by the preceding live write becomes stale the instant
+      // the reader scrolls away. Without cancelling it, the delayed frame can
+      // override the newer wheel/trackpad gesture and jump back down.
+      if (!atBottom && liveViewportPinFrameRef.current !== null) {
+        cancelAnimationFrame(liveViewportPinFrameRef.current);
+        liveViewportPinFrameRef.current = null;
+      }
     });
     const xtermViewportEl = containerRef.current?.querySelector<HTMLElement>(".xterm-viewport");
     xtermViewportEl?.addEventListener("scroll", refreshLiveEdge, { passive: true });
@@ -1769,10 +1907,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     // xterm advances its buffer viewport when output appends at the bottom,
     // but under a slow render frame its native scroll element can remain one
-    // or two rows behind. Because this UI renders historical navigation in a
-    // separate endpoint-backed overlay, the live terminal must stay pinned to
-    // the current PTY tail. Reconcile after xterm consumes a write and
-    // coalesce streaming chunks to one refresh per animation frame.
+    // or two rows behind. Reconcile after xterm consumes a write and coalesce
+    // streaming chunks to one refresh per animation frame.
     pinLiveViewportToBottomRef.current = () => {
       // The reader may legitimately be scrolled up in this buffer. Pin only
       // from the bottom — the pin exists to heal a slow-frame lag behind
@@ -1784,7 +1920,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (term.buffer.active.viewportY < term.buffer.active.baseY) return;
       if (liveViewportPinFrameRef.current !== null) return;
       liveViewportPinFrameRef.current = requestAnimationFrame(() => {
-        if (termRef.current !== term) {
+        const canReconcile = () =>
+          termRef.current === term &&
+          performance.now() >= resizeQuietUntilRef.current &&
+          term.buffer.active.viewportY >= term.buffer.active.baseY;
+        if (!canReconcile()) {
           liveViewportPinFrameRef.current = null;
           return;
         }
@@ -1801,7 +1941,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // between are coalesced into this same final reconciliation.
         liveViewportPinFrameRef.current = requestAnimationFrame(() => {
           liveViewportPinFrameRef.current = null;
-          if (termRef.current === term) reconcile();
+          // The reader can move between either maintenance frame and the next
+          // one. Re-check at execution time; the original at-bottom decision
+          // is no longer authority to move their viewport.
+          if (canReconcile()) reconcile();
         });
       });
     };
@@ -2526,6 +2669,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         liveViewportPinFrameRef.current = null;
       }
       pendingLiveSeedWritesRef.current.clear();
+      if (liveTerminalWriteIdleTimerRef.current) {
+        clearTimeout(liveTerminalWriteIdleTimerRef.current);
+        liveTerminalWriteIdleTimerRef.current = null;
+      }
+      if (liveTerminalWriteSyncTimerRef.current) {
+        clearTimeout(liveTerminalWriteSyncTimerRef.current);
+        liveTerminalWriteSyncTimerRef.current = null;
+      }
+      liveTerminalWritesRef.current.clear();
+      liveTerminalWriteFlushPendingRef.current = false;
       liveSeedCoveredOffsetRef.current = null;
       liveSeedWriteInFlightRef.current = false;
       latencyHudRef.current?.detach();
@@ -3832,11 +3985,11 @@ function wrapSnapshotForXterm(input: string): string {
 }
 
 /** Renderer preference for the live terminal. GPU (WebGL) by default for
- *  real users; automation contexts (`navigator.webdriver` — Playwright, CI)
- *  keep the DOM renderer, whose `.xterm-rows` text the e2e suites assert on.
- *  `localStorage.spawnRenderer` overrides both ways: "gpu" forces the WebGL
- *  addon under automation, "dom" is the escape hatch for machines where
- *  WebGL glitches. */
+ *  real users; DEC synchronized-output frames keep repaint fragments atomic.
+ *  Automation contexts (`navigator.webdriver` — Playwright, CI) also keep
+ *  the DOM renderer, whose `.xterm-rows` text the e2e suites assert on.
+ *  `localStorage.spawnRenderer` overrides both ways: "gpu" forces WebGL and
+ *  "dom" forces the fallback. */
 function wantsGpuRenderer(): boolean {
   let preference: string | null = null;
   try {

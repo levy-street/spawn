@@ -2902,6 +2902,15 @@ async fn run_program_capture(
             command
         }
     };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        // Agent availability is queried by the browser while spawnd is running
+        // without a console. Without this flag, every native version probe and
+        // every cmd.exe-backed npm shim allocates a transient visible console.
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
