@@ -1,7 +1,16 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync } from "node:fs";
+import {
+  closeSync,
+  copyFileSync,
+  cpSync,
+  mkdtempSync,
+  openSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { createServer } from "node:net";
-import { join, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { expect, test, type WebSocketRoute } from "@playwright/test";
 import { mockApp } from "./app-mocks";
 
@@ -48,18 +57,26 @@ async function waitForOldWeb(url: string): Promise<void> {
 }
 
 test.beforeAll(async () => {
+  test.setTimeout(120_000);
   const port = await freePort();
   oldWebUrl = `http://127.0.0.1:${port}`;
-  const scratchRoot = resolve("dist");
-  mkdirSync(scratchRoot, { recursive: true });
-  oldWebScratch = mkdtempSync(join(scratchRoot, "spawn-old-web-"));
+  oldWebScratch = mkdtempSync(join(tmpdir(), "spawn-old-web-"));
+  // Next also rewrites tsconfig.json and next-env.d.ts in development. Give
+  // this server its own project files as well as its own build directory.
+  for (const name of ["package.json", "next.config.ts", "tsconfig.json", "postcss.config.mjs"]) {
+    copyFileSync(resolve(name), join(oldWebScratch, name));
+  }
+  cpSync(resolve("src"), join(oldWebScratch, "src"), { recursive: true });
+  for (const name of ["public", "node_modules"]) {
+    symlinkSync(resolve(name), join(oldWebScratch, name), "dir");
+  }
   // An fd, not a WriteStream: spawn() needs an already-open descriptor for stdio.
   const log = openSync(join(oldWebScratch, "next.log"), "a");
   oldWeb = spawn(
     process.execPath,
     [resolve("node_modules/next/dist/bin/next"), "dev", "-H", "127.0.0.1", "-p", String(port)],
     {
-      cwd: resolve("."),
+      cwd: oldWebScratch,
       detached: true,
       env: {
         ...process.env,
@@ -67,7 +84,7 @@ test.beforeAll(async () => {
         SPAWN_BUILD_ID: OLD_BUILD,
         // Two dev servers sharing .next overwrite each other's manifests and
         // compiled routes, leaving the rest of the suite in a refresh loop.
-        SPAWN_NEXT_DIST_DIR: relative(resolve("."), join(oldWebScratch, ".next")),
+        SPAWN_NEXT_DIST_DIR: ".next",
       },
       stdio: ["ignore", log, log],
     },
