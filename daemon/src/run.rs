@@ -480,6 +480,10 @@ fn raise_open_file_limit() {
             .maximum
             .map_or_else(|| "unlimited".to_string(), |maximum| maximum.to_string())
     };
+    // `after` is the rlimit, which on macOS 11 and later the kernel accepts
+    // above its own per-process maximum (`kern.maxfilesperproc`, 24576 on
+    // many Intel Macs) and enforces at the lower of the two when a file is
+    // opened; the effective ceiling there can be below the number logged.
     match crate::platform::raise_open_file_limit(OPEN_FILE_LIMIT_TARGET) {
         Ok(limit) if limit.after > limit.before => tracing::info!(
             before = limit.before,
