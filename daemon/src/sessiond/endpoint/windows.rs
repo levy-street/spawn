@@ -1258,10 +1258,12 @@ pub fn spawn_worker(
             &mut process,
         )
     };
+    // Cleanup calls Win32 APIs too; capture the launch error before they can
+    // overwrite the thread's last-error value.
+    let launch_error = (created == 0).then(std::io::Error::last_os_error);
     drop(attribute_guard);
     drop(reset_inherit);
-    if created == 0 {
-        let error = std::io::Error::last_os_error();
+    if let Some(error) = launch_error {
         let context = if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
             "worker breakaway launch was denied"
         } else {
