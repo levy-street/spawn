@@ -349,6 +349,13 @@ persisted manager, and an interactive `possess` offers the safe Run fallback
 after a denied Task Scheduler breakaway probe. Windows CI must run `cargo test --locked --target
 x86_64-pc-windows-msvc` and the standard-user breakaway integration probe.
 
+Windows background logs identify process roles and PIDs. The Run watchdog logs
+each daemon launch, observed exit code, and stop reason, distinguishing removed
+or changed registration from a registry read error. Session restart progress
+records peer closure, TERM/KILL acknowledgement, and replacement launch. Check
+both `spawnd.log` and `spawnd.log.1` when investigating a stopped daemon; the
+watchdog can still hold a log file that a later daemon startup rotated.
+
 Run `cargo clippy` and `cargo fmt` on what you touched. Shipping binaries to
 users goes through the rolling prebuilt release — read `docs/RELEASE.md`.
 

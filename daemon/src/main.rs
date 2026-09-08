@@ -75,6 +75,23 @@ async fn main() -> anyhow::Result<()> {
     }
     init_tracing(cli.verbose);
 
+    #[cfg(windows)]
+    let background_role = match &cli.command {
+        Command::Run(args) if args.background_service => Some("daemon"),
+        Command::Watchdog(_) => Some("watchdog"),
+        Command::UpdateHandoff(_) => Some("update_handoff"),
+        _ => None,
+    };
+    #[cfg(windows)]
+    if let Some(role) = background_role {
+        tracing::info!(
+            role,
+            pid = std::process::id(),
+            version = %version::build_version(),
+            "SPAWN D background process started"
+        );
+    }
+
     let result = match cli.command {
         Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
         Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
@@ -106,6 +123,22 @@ async fn main() -> anyhow::Result<()> {
         Command::Watchdog(args) => service::run_watchdog(&args.instance).await,
         Command::UpdateHandoff(args) => update::relaunch_after_parent_exit(args.parent_pid),
     };
+    #[cfg(windows)]
+    if let Some(role) = background_role {
+        match &result {
+            Ok(()) => tracing::info!(
+                role,
+                pid = std::process::id(),
+                "SPAWN D background process returned successfully"
+            ),
+            Err(error) => tracing::error!(
+                role,
+                pid = std::process::id(),
+                error = %format_args!("{error:#}"),
+                "SPAWN D background process failed"
+            ),
+        }
+    }
     if result
         .as_ref()
         .err()

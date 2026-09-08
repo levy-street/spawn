@@ -6350,7 +6350,8 @@ async fn handle_session_restart(
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let session_id = create.session_id;
-    tracing::info!(%session_id, "session.restart");
+    let daemon_pid = std::process::id();
+    tracing::info!(daemon_pid, %session_id, "session.restart");
 
     // Hold the generation transition across every lifecycle delivery. This
     // lets each TERM/KILL revalidate the exact atomic lifecycle snapshot and
@@ -6360,14 +6361,17 @@ async fn handle_session_restart(
     let current = registry.lifecycle_snapshot(session_id);
     if let Some(snapshot) = &current {
         let binding = snapshot.binding();
+        tracing::info!(daemon_pid, %session_id, phase = "closing_peers", "session restart progress");
         rtc_sessions
             .close_for_session(session_id, binding.generation())
             .await;
+        tracing::info!(daemon_pid, %session_id, phase = "peers_closed", "session restart progress");
         if let Some(control) = registry.control_for_binding(binding) {
             control.clear_sink().await;
         }
         // Lifecycle delivery bypasses the potentially saturated worker input
         // socket. Check each result and deterministically escalate to KILL.
+        tracing::info!(daemon_pid, %session_id, phase = "sending_term", "session restart progress");
         let term_result = if registry.is_current(binding) {
             snapshot
                 .lifecycle()
@@ -6376,6 +6380,10 @@ async fn handle_session_restart(
         } else {
             Err(anyhow!("stale session lifecycle generation"))
         };
+        tracing::info!(
+            daemon_pid, %session_id, phase = "term_completed",
+            acknowledged = term_result.is_ok(), "session restart progress"
+        );
         if let Err(error) = &term_result {
             tracing::warn!(%session_id, %error, "restart TERM delivery failed; escalating now");
         }
@@ -6386,6 +6394,7 @@ async fn handle_session_restart(
             }
             if !kill_attempted && (attempt == 15 || term_result.is_err()) {
                 kill_attempted = true;
+                tracing::info!(daemon_pid, %session_id, phase = "sending_kill", "session restart progress");
                 let kill_result = if registry.is_current(binding) {
                     snapshot
                         .lifecycle()
@@ -6394,6 +6403,10 @@ async fn handle_session_restart(
                 } else {
                     Err(anyhow!("stale session lifecycle generation"))
                 };
+                tracing::info!(
+                    daemon_pid, %session_id, phase = "kill_completed",
+                    acknowledged = kill_result.is_ok(), "session restart progress"
+                );
                 if let Err(error) = kill_result {
                     tracing::error!(%session_id, %error, "restart KILL delivery failed");
                 }
@@ -6406,9 +6419,11 @@ async fn handle_session_restart(
     drop(transition);
 
     if worker_backend::socket_exists(session_id) {
+        tracing::warn!(daemon_pid, %session_id, phase = "worker_exit_timeout", "session restart stopped");
         send_spawn_failed_exit(session_id, out_tx, "restart timeout").await;
         return;
     }
+    tracing::info!(daemon_pid, %session_id, phase = "launching_replacement", "session restart progress");
     handle_session_create(create, registry, rtc_sessions, out_tx).await;
 }
 
