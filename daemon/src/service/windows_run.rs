@@ -273,11 +273,16 @@ pub(super) async fn watchdog(instance: &str) -> Result<()> {
     super::prepare_background_log(&record.config_dir)?;
     let update_ready = record_path.with_file_name("watchdog-update-ready");
     let _ = std::fs::remove_file(&update_ready);
+    let watchdog_pid = std::process::id();
+    tracing::info!(
+        watchdog_pid,
+        instance,
+        "SPAWN D watchdog supervision started"
+    );
 
     let mut delay = Duration::from_secs(1);
     loop {
-        if !watchdog_registration_matches(&record) {
-            tracing::info!("SPAWN D Run registration was removed; watchdog is exiting");
+        if !watchdog_registration_matches(&record, "before_launch") {
             return Ok(());
         }
         let mut command = tokio::process::Command::new(&record.executable);
@@ -292,18 +297,35 @@ pub(super) async fn watchdog(instance: &str) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW);
+        let mut daemon_pid = None;
         let result = match command.spawn() {
             Ok(mut child) => {
+                daemon_pid = child.id();
+                tracing::info!(
+                    watchdog_pid,
+                    ?daemon_pid,
+                    instance,
+                    "SPAWN D watchdog launched daemon"
+                );
                 let mut registration_poll = tokio::time::interval(Duration::from_millis(100));
                 loop {
                     tokio::select! {
                         result = child.wait() => break result,
                         _ = registration_poll.tick() => {
-                            if !watchdog_registration_matches(&record) {
+                            if !watchdog_registration_matches(&record, "child_running") {
                                 // This retained Child handle is the authority:
                                 // never recover a PID from state to stop it.
-                                let _ = child.kill().await;
-                                let _ = child.wait().await;
+                                tracing::info!(
+                                    watchdog_pid, ?daemon_pid, instance,
+                                    "SPAWN D watchdog is stopping its daemon"
+                                );
+                                if let Err(error) = child.kill().await {
+                                    tracing::warn!(
+                                        watchdog_pid, ?daemon_pid, instance, %error,
+                                        "SPAWN D watchdog could not stop its daemon"
+                                    );
+                                }
+                                log_daemon_exit(watchdog_pid, daemon_pid, instance, &child.wait().await);
                                 return Ok(());
                             }
                         }
@@ -312,26 +334,50 @@ pub(super) async fn watchdog(instance: &str) -> Result<()> {
             }
             Err(error) => Err(error),
         };
+        log_daemon_exit(watchdog_pid, daemon_pid, instance, &result);
         match result {
             Ok(status) if status.success() => {
                 // A graceful pipe shutdown exits zero and stops the watchdog.
                 // During self-update the probation marker asks the watchdog to
                 // launch the newly swapped pair instead.
                 if !record.executable.with_file_name("spawnd.updating").exists() {
+                    tracing::info!(
+                        watchdog_pid,
+                        ?daemon_pid,
+                        instance,
+                        reason = "daemon_exit_zero",
+                        "SPAWN D watchdog is exiting"
+                    );
                     return Ok(());
                 }
                 // The helper owns the swap. Do not start either the old or a
                 // half-swapped pair until it calls service::relaunch_after_update.
                 let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                tracing::info!(
+                    watchdog_pid,
+                    instance,
+                    "SPAWN D watchdog is waiting for the update helper"
+                );
                 loop {
-                    if !watchdog_registration_matches(&record) {
+                    if !watchdog_registration_matches(&record, "update_wait") {
                         return Ok(());
                     }
                     if update_ready.exists() {
                         let _ = std::fs::remove_file(&update_ready);
+                        tracing::info!(
+                            watchdog_pid,
+                            instance,
+                            "SPAWN D update helper released watchdog relaunch"
+                        );
                         break;
                     }
                     if tokio::time::Instant::now() >= ready_deadline {
+                        tracing::error!(
+                            watchdog_pid,
+                            instance,
+                            reason = "update_wait_timeout",
+                            "SPAWN D watchdog is exiting"
+                        );
                         bail!("the update helper did not release the Run watchdog relaunch gate");
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -339,13 +385,25 @@ pub(super) async fn watchdog(instance: &str) -> Result<()> {
                 delay = Duration::from_millis(500);
             }
             Ok(status) => {
-                tracing::warn!(?status, "SPAWN D daemon exited; watchdog will restart it")
+                tracing::warn!(
+                    watchdog_pid,
+                    ?daemon_pid,
+                    instance,
+                    ?status,
+                    "SPAWN D daemon exited; watchdog will restart it"
+                )
             }
-            Err(error) => tracing::warn!(%error, "SPAWN D watchdog could not start the daemon"),
+            Err(_) => {}
         }
+        tracing::info!(
+            watchdog_pid,
+            instance,
+            ?delay,
+            "SPAWN D watchdog is waiting to relaunch daemon"
+        );
         let backoff_deadline = tokio::time::Instant::now() + delay;
         while tokio::time::Instant::now() < backoff_deadline {
-            if !watchdog_registration_matches(&record) {
+            if !watchdog_registration_matches(&record, "restart_backoff") {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -355,11 +413,61 @@ pub(super) async fn watchdog(instance: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn watchdog_registration_matches(record: &LaunchRecord) -> bool {
-    registry_get_string(RUN_KEY, &value_name(&record.config_dir))
-        .ok()
-        .flatten()
-        .is_some_and(|actual| actual == watchdog_command(&record.executable, &record.instance))
+fn log_daemon_exit(
+    watchdog_pid: u32,
+    daemon_pid: Option<u32>,
+    instance: &str,
+    result: &std::io::Result<std::process::ExitStatus>,
+) {
+    match result {
+        Ok(status) => tracing::info!(
+            watchdog_pid,
+            ?daemon_pid,
+            instance,
+            exit_code = ?status.code(),
+            success = status.success(),
+            "SPAWN D watchdog observed daemon exit"
+        ),
+        Err(error) => tracing::error!(
+            watchdog_pid,
+            ?daemon_pid,
+            instance,
+            %error,
+            "SPAWN D watchdog daemon launch or wait failed"
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn watchdog_registration_matches(record: &LaunchRecord, phase: &str) -> bool {
+    let watchdog_pid = std::process::id();
+    let instance = record.instance.as_str();
+    // Keep the stop decision unchanged, but distinguish an explicit removal
+    // from a changed value or a registry error. Never log the registry value.
+    let reason = match registry_get_string(RUN_KEY, &value_name(&record.config_dir)) {
+        Ok(Some(actual)) if actual == watchdog_command(&record.executable, &record.instance) => {
+            return true;
+        }
+        Ok(Some(_)) => "registration_changed",
+        Ok(None) => "registration_removed",
+        Err(error) => {
+            tracing::error!(
+                watchdog_pid, instance, phase,
+                reason = "registration_unreadable",
+                error = %format_args!("{error:#}"),
+                "SPAWN D watchdog is stopping"
+            );
+            return false;
+        }
+    };
+    tracing::info!(
+        watchdog_pid,
+        instance,
+        phase,
+        reason,
+        "SPAWN D watchdog is stopping"
+    );
+    false
 }
 
 #[cfg(windows)]
