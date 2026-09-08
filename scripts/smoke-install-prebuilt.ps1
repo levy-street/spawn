@@ -200,7 +200,6 @@ try {
     Assert-Equal (Get-Item -LiteralPath $installedWorker).LastWriteTimeUtc.Ticks `
         $workerTimestamp 'idempotent worker timestamp'
 
-    Write-Host 'smoke-install-prebuilt: passed'
 } catch {
     Write-Host "smoke-install-prebuilt: failed: $_"
     foreach ($log in @($stdoutLog, $stderrLog)) {
@@ -224,3 +223,9 @@ try {
     }
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# GitHub's PowerShell runner propagates the last native command's exit code.
+# A taskkill race handled by Stop-Process above is cleanup, not a failed smoke;
+# assertion failures still throw before reaching this successful completion.
+Write-Host 'smoke-install-prebuilt: passed'
+exit 0

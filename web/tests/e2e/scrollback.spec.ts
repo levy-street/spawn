@@ -181,6 +181,73 @@ test("live output while scrolled back does not yank the reader to the bottom", a
   await expect(live.locator(".xterm-rows")).toContainText("commit-");
 });
 
+test("starting to scroll while an output pin is queued is not pulled back", async ({ page }) => {
+  await openUnifiedTerminal(page);
+  const live = page.getByTestId("terminal-live-host");
+  const viewport = live.locator(".xterm-viewport");
+
+  // Hold animation-frame callbacks after the initial terminal/deep seed has
+  // settled. This widens the real race: a live write has checked "at bottom"
+  // and queued its correction, then the reader starts scrolling before that
+  // correction gets a frame in which to run.
+  await page.waitForTimeout(1_300);
+  await live.locator(".xterm").hover();
+  await page.evaluate(() => {
+    const testWindow = window as typeof window & {
+      __releaseHeldFrames?: () => void;
+      __heldFrameCount?: () => number;
+    };
+    const request = window.requestAnimationFrame.bind(window);
+    const cancel = window.cancelAnimationFrame.bind(window);
+    const held = new Map<number, FrameRequestCallback>();
+    let nextId = 1_000_000;
+    window.requestAnimationFrame = (callback) => {
+      const id = nextId++;
+      held.set(id, callback);
+      return id;
+    };
+    window.cancelAnimationFrame = (id) => {
+      if (!held.delete(id)) cancel(id);
+    };
+    testWindow.__heldFrameCount = () => held.size;
+    testWindow.__releaseHeldFrames = () => {
+      window.requestAnimationFrame = request;
+      window.cancelAnimationFrame = cancel;
+      const callbacks = [...held.values()];
+      held.clear();
+      for (const callback of callbacks) request(callback);
+    };
+  });
+
+  await sendPty(page, "\x1b[12;1Hpin-race\r\n");
+  await page.waitForTimeout(50);
+  expect(
+    await page.evaluate(
+      () =>
+        (window as typeof window & { __heldFrameCount?: () => number }).__heldFrameCount?.() ?? 0,
+    ),
+  ).toBeGreaterThan(0);
+
+  await page.mouse.wheel(0, -1_200);
+  await page.waitForTimeout(50);
+  const distanceBeforeRelease = await viewport.evaluate(
+    (el) => el.scrollHeight - el.clientHeight - el.scrollTop,
+  );
+  expect(distanceBeforeRelease).toBeGreaterThan(100);
+
+  await page.evaluate(() => {
+    (window as typeof window & { __releaseHeldFrames?: () => void }).__releaseHeldFrames?.();
+  });
+  await page.waitForTimeout(100);
+
+  // The queued maintenance frame is stale once the reader moves. It must not
+  // override the newer, explicit scroll position.
+  const distanceAfterRelease = await viewport.evaluate(
+    (el) => el.scrollHeight - el.clientHeight - el.scrollTop,
+  );
+  expect(distanceAfterRelease).toBeGreaterThan(100);
+});
+
 test("the newest history line sits immediately above the live screen", async ({ page }) => {
   await openUnifiedTerminal(page);
   const live = page.getByTestId("terminal-live-host");

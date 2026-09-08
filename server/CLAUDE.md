@@ -52,6 +52,12 @@ tests/          pytest; test_<module>.py mirrors the module it covers
 - Validate at the boundary: request bodies through pydantic, websocket frames
   field by field before use.
 
+Agent installation through REST is refused after ownership checks; the server
+does not dispatch installers or run an agent auto-update scheduler. Historical
+policies remain stored but inactive. Do not restore these effects from a
+server-side flag: `docs/DAEMON_COMMAND_AUTHORITY.md` records the endpoint
+authorization and durable-state requirements for their replacement.
+
 ## Before calling a change done
 
 ```bash

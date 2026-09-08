@@ -95,12 +95,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await seed_builtin_agents(session)
         except Exception as e:  # noqa: BLE001
             log.warning("builtin agent seed skipped: %s", e)
-    hosts_routes.start_auto_update_checker()
 
     try:
         yield
     finally:
-        await hosts_routes.stop_auto_update_checker()
         await get_broker().shutdown()
         await redis_shutdown()
         await dispose_engine()

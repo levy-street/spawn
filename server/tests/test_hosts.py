@@ -534,45 +534,24 @@ async def test_host_agent_check_roundtrip(client):
     assert r.status_code == 200, r.text
     assert r.json()["agents"][0]["version"] == "codex 1.2.3"
 
-    install_task = asyncio.create_task(
-        client.post(f"/api/hosts/{host_id}/agents/{agent_id}/install", headers=auth)
-    )
+    # Old clients receive an immediate refusal, even with an accepted daemon.
     sent_count = len(fake_ws.sent_text)
-    for _ in range(100):
-        if len(fake_ws.sent_text) > sent_count:
-            break
-        if install_task.done():
-            break
-        await asyncio.sleep(0.01)
-    assert len(fake_ws.sent_text) > sent_count, (await install_task).text
-    install_sent = json.loads(fake_ws.sent_text[-1])
-    assert install_sent["type"] == "host.agents.install"
-    assert install_sent["target"]["agent_id"] == agent_id
+    r = await client.post(f"/api/hosts/{host_id}/agents/{agent_id}/install", headers=auth)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == hosts_routes.AGENT_INSTALL_UNAVAILABLE
+    assert len(fake_ws.sent_text) == sent_count
 
-    await broker.resolve_agent_install(
-        install_sent["request_id"],
-        {
-            "type": "host.agents.install_result",
-            "request_id": install_sent["request_id"],
-            "result": {
-                "agent_id": agent_id,
-                "agent_name": "codex",
-                "agent_kind": "codex",
-                "command": "codex",
-                "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
-                "success": True,
-                "exit_code": 0,
-                "output": "updated",
-                "error": None,
-                "status": None,
-            },
-        },
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
+    other_token = await _signup(client, "host-tools-other@example.com")
+    other_auth = {"Authorization": f"Bearer {other_token}"}
+    r = await client.post(f"/api/hosts/{host_id}/agents/{agent_id}/install", headers=other_auth)
+    assert r.status_code == 404
+    r = await client.patch(
+        f"/api/hosts/{host_id}/agents/{agent_id}/policy",
+        json={"auto_update": True},
+        headers=other_auth,
     )
-    r = await install_task
-    assert r.status_code == 200, r.text
-    assert r.json()["output"] == "updated"
+    assert r.status_code == 404
+    assert len(fake_ws.sent_text) == sent_count
 
     await broker.unregister_daemon(daemon)
 
@@ -735,7 +714,7 @@ async def test_host_file_rest_surfaces_are_retired_without_content_forwarding(cl
     await broker.unregister_daemon(daemon)
 
 
-async def test_host_agent_policy_auto_update_schedules_install(client):
+async def test_legacy_auto_update_policy_never_schedules_install(client):
     token = await _signup(client, "host-tools-auto@example.com")
     auth = {"Authorization": f"Bearer {token}"}
 
@@ -765,11 +744,18 @@ async def test_host_agent_policy_auto_update_schedules_install(client):
 
     r = await client.patch(
         f"/api/hosts/{host_id}/agents/{agent_id}/policy",
-        json={"auto_update": True},
-        headers=auth,
+        json={"auto_update": True}, headers=auth,
     )
-    assert r.status_code == 200, r.text
-    assert r.json()["auto_update"] is True
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == hosts_routes.AGENT_INSTALL_UNAVAILABLE
+    assert fake_ws.sent_text == []
+
+    # Existing true policies must not reactivate when a client refreshes status.
+    from spawn_server.models import HostAgentPolicy
+    async with sm() as session:
+        session.add(HostAgentPolicy(owner_user_id=user.id, host_id=host_id,
+                                   agent_id=agent_id, auto_update=True))
+        await session.commit()
 
     check_task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/agents", headers=auth))
     for _ in range(100):
@@ -805,273 +791,18 @@ async def test_host_agent_policy_auto_update_schedules_install(client):
     r = await check_task
     assert r.status_code == 200, r.text
     tool = r.json()["agents"][0]
-    assert tool["auto_update"] is True
+    assert tool["auto_update"] is False
     assert tool["update_available"] is True
 
-    for _ in range(100):
-        if any(json.loads(text)["type"] == "host.agents.install" for text in fake_ws.sent_text):
-            break
-        await asyncio.sleep(0.01)
-    sent_frames = [json.loads(text) for text in fake_ws.sent_text]
-    install_sent = next(frame for frame in sent_frames if frame["type"] == "host.agents.install")
-    assert install_sent["target"]["agent_id"] == agent_id
-
-    await broker.resolve_agent_install(
-        install_sent["request_id"],
-        {
-            "type": "host.agents.install_result",
-            "request_id": install_sent["request_id"],
-            "result": {
-                "agent_id": agent_id,
-                "agent_name": "codex",
-                "agent_kind": "codex",
-                "command": "codex",
-                "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
-                "success": True,
-                "exit_code": 0,
-                "output": "updated",
-                "error": None,
-                "status": None,
-            },
-        },
-        daemon=daemon,
-        expected_host_generation=daemon.host_generation,
+    assert [json.loads(text)["type"] for text in fake_ws.sent_text] == ["host.agents.check"]
+    r = await client.patch(
+        f"/api/hosts/{host_id}/agents/{agent_id}/policy",
+        json={"auto_update": False}, headers=auth,
     )
-    assert await hosts_routes.wait_for_auto_update_tasks_idle(timeout=1.0)
-    assert not hosts_routes._AUTO_UPDATE_TASKS
-    assert not hosts_routes._AUTO_UPDATE_IN_FLIGHT
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_update"] is False
+    assert len(fake_ws.sent_text) == 1
     await broker.unregister_daemon(daemon)
-
-
-async def test_background_auto_update_checker_records_result_and_throttles(client):
-    await _signup(client, "host-tools-background@example.com")
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Agent, Host, HostAgentPolicy, User
-    from spawn_server.routes import hosts as hosts_routes
-    from spawn_server.ws.broker import DaemonConn, get_broker
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(
-                select(User).where(User.email == "host-tools-background@example.com")
-            )
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="background-auto-box", status="online")
-        agent = (await session.execute(select(Agent).where(Agent.name == "codex"))).scalar_one()
-        session.add(host)
-        await session.flush()
-        policy = HostAgentPolicy(
-            owner_user_id=user.id,
-            host_id=host.id,
-            agent_id=agent.id,
-            auto_update=True,
-        )
-        session.add(policy)
-        await session.commit()
-        user_id = user.id
-        host_id = host.id
-        agent_id = agent.id
-        policy_id = policy.id
-
-    broker = get_broker()
-    fake_ws = _FakeWS()
-    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=fake_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(daemon)
-    await _accept_daemon(daemon)
-
-    try:
-        first_start = len(fake_ws.sent_text)
-        first_task = asyncio.create_task(hosts_routes.run_auto_update_checks_once())
-        check = await _wait_for_text_frame(fake_ws, "host.agents.check", start=first_start)
-        assert any(target["agent_id"] == agent_id for target in check["targets"])
-        await broker.resolve_agent_check(
-            check["request_id"],
-            {
-                "type": "host.agents.check_result",
-                "request_id": check["request_id"],
-                "agents": [
-                    {
-                        "agent_id": agent_id,
-                        "agent_name": "codex",
-                        "agent_kind": "codex",
-                        "command": "codex",
-                        "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
-                        "installed": True,
-                        "path": "/usr/local/bin/codex",
-                        "version": "codex 1.2.3",
-                        "latest_version": "1.2.4",
-                        "update_available": True,
-                        "error": None,
-                    }
-                ],
-            },
-            daemon=daemon,
-            expected_host_generation=daemon.host_generation,
-        )
-        await first_task
-
-        install = await _wait_for_text_frame(fake_ws, "host.agents.install", start=first_start)
-        assert install["target"]["agent_id"] == agent_id
-        await broker.resolve_agent_install(
-            install["request_id"],
-            {
-                "type": "host.agents.install_result",
-                "request_id": install["request_id"],
-                "result": {
-                    "agent_id": agent_id,
-                    "agent_name": "codex",
-                    "agent_kind": "codex",
-                    "command": "codex",
-                    "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
-                    "success": False,
-                    "exit_code": 1,
-                    "output": "failed",
-                    "error": "failed install",
-                    "status": None,
-                },
-            },
-            daemon=daemon,
-            expected_host_generation=daemon.host_generation,
-        )
-        assert await hosts_routes.wait_for_auto_update_tasks_idle(timeout=1.0)
-        async with sm() as session:
-            stored = await session.get(HostAgentPolicy, policy_id)
-            assert stored is not None
-            last_auto_update_at = stored.last_auto_update_at
-            last_auto_update_error = stored.last_auto_update_error
-        assert last_auto_update_at is not None
-        assert last_auto_update_error == "failed install"
-
-        second_start = len(fake_ws.sent_text)
-        second_task = asyncio.create_task(hosts_routes.run_auto_update_checks_once())
-        check = await _wait_for_text_frame(fake_ws, "host.agents.check", start=second_start)
-        await broker.resolve_agent_check(
-            check["request_id"],
-            {
-                "type": "host.agents.check_result",
-                "request_id": check["request_id"],
-                "agents": [
-                    {
-                        "agent_id": agent_id,
-                        "agent_name": "codex",
-                        "agent_kind": "codex",
-                        "command": "codex",
-                        "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
-                        "installed": True,
-                        "path": "/usr/local/bin/codex",
-                        "version": "codex 1.2.3",
-                        "latest_version": "1.2.4",
-                        "update_available": True,
-                        "error": None,
-                    }
-                ],
-            },
-            daemon=daemon,
-            expected_host_generation=daemon.host_generation,
-        )
-        await second_task
-        assert not any(
-            json.loads(raw).get("type") == "host.agents.install"
-            for raw in fake_ws.sent_text[second_start:]
-        )
-    finally:
-        hosts_routes._AUTO_UPDATE_IN_FLIGHT.clear()
-        await broker.unregister_daemon(daemon)
-
-
-async def test_auto_update_task_registry_observes_errors_and_clears_inflight(
-    client, monkeypatch, caplog
-):
-    started = asyncio.Event()
-
-    async def fail_update(**_kwargs) -> None:
-        started.set()
-        raise RuntimeError("owned update failed")
-
-    monkeypatch.setattr(hosts_routes, "_run_auto_update", fail_update)
-    caplog.set_level("ERROR", logger="spawn.routes.hosts")
-    key = ("user", "host", "agent")
-
-    assert hosts_routes._start_auto_update(
-        user_id=key[0],
-        host_id=key[1],
-        agent_id=key[2],
-        target={},
-    )
-    await started.wait()
-    assert await hosts_routes.wait_for_auto_update_tasks_idle(timeout=1.0)
-
-    assert key not in hosts_routes._AUTO_UPDATE_IN_FLIGHT
-    assert not hosts_routes._AUTO_UPDATE_TASKS
-    assert "owned auto update task failed" in caplog.text
-    assert "owned update failed" in caplog.text
-
-
-async def test_auto_update_shutdown_drains_owned_tasks(client, monkeypatch):
-    started = asyncio.Event()
-    release = asyncio.Event()
-    cancelled = False
-
-    async def drain_update(**_kwargs) -> None:
-        nonlocal cancelled
-        started.set()
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
-
-    monkeypatch.setattr(hosts_routes, "_run_auto_update", drain_update)
-    key = ("user-drain", "host-drain", "agent-drain")
-    assert hosts_routes._start_auto_update(
-        user_id=key[0],
-        host_id=key[1],
-        agent_id=key[2],
-        target={},
-    )
-    await started.wait()
-
-    stop = asyncio.create_task(hosts_routes.stop_auto_update_checker())
-    await asyncio.sleep(0)
-    assert not stop.done()
-    release.set()
-    await stop
-
-    assert not cancelled
-    assert key not in hosts_routes._AUTO_UPDATE_IN_FLIGHT
-    assert not hosts_routes._AUTO_UPDATE_TASKS
-
-
-async def test_auto_update_shutdown_cancels_after_drain_and_clears_inflight(client, monkeypatch):
-    started = asyncio.Event()
-    cancelled = asyncio.Event()
-
-    async def blocked_update(**_kwargs) -> None:
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    monkeypatch.setattr(hosts_routes, "_run_auto_update", blocked_update)
-    monkeypatch.setattr(hosts_routes, "AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS", 0.01)
-    key = ("user-cancel", "host-cancel", "agent-cancel")
-    assert hosts_routes._start_auto_update(
-        user_id=key[0],
-        host_id=key[1],
-        agent_id=key[2],
-        target={},
-    )
-    await started.wait()
-
-    await hosts_routes.stop_auto_update_checker()
-    assert cancelled.is_set()
-    assert key not in hosts_routes._AUTO_UPDATE_IN_FLIGHT
-    assert not hosts_routes._AUTO_UPDATE_TASKS
 
 
 async def test_daemon_deregisters_its_own_host(client):
