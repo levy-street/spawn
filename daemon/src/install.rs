@@ -850,7 +850,17 @@ pub fn layout_for_instance(config_dir: &Path) -> Result<Layout> {
 
 /// Serialize selection changes from installers and updater processes. The
 /// file is separate from the pointer and closes (unlocking) on every error.
-pub fn lock_instance(layout: &Layout, config_dir: &Path) -> Result<fs::File> {
+pub struct InstanceLock(fs::File);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Explicit unlock also releases a Unix lock whose descriptor was
+        // briefly inherited by another thread's fork before its child execs.
+        let _ = self.0.unlock();
+    }
+}
+
+pub fn lock_instance(layout: &Layout, config_dir: &Path) -> Result<InstanceLock> {
     let instance = layout.instance_dir(config_dir);
     fs::create_dir_all(&instance)?;
     let file = fs::OpenOptions::new()
@@ -861,7 +871,7 @@ pub fn lock_instance(layout: &Layout, config_dir: &Path) -> Result<fs::File> {
         .open(instance.join("selection.lock"))?;
     file.try_lock()
         .context("another process is changing this instance's release")?;
-    Ok(file)
+    Ok(InstanceLock(file))
 }
 
 #[cfg(windows)]

@@ -60,6 +60,12 @@ def main():
                 credentials_before = creds.read_bytes()
                 child = subprocess.Popen([str(binary / "spawnd"), "run"])
                 try:
+                    # No heartbeat or registered config yet: the executable
+                    # alone must protect a foreground daemon's legacy pair.
+                    before_heartbeat = json.loads(subprocess.check_output([
+                        str(installer), "__publish-release", "--install-root", str(case), "--json",
+                    ], env=env, text=True))
+                    assert not before_heartbeat["cli_replaced"], before_heartbeat
                     (config / "state.json").write_text(json.dumps(dict(
                         pid=child.pid, version=version, connected=True, connected_at=None,
                         server=server, last_error=None, sessions=1,

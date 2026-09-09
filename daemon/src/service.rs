@@ -608,9 +608,24 @@ fn windows_registered_binary(config_dir: &Path) -> Option<PathBuf> {
 pub fn legacy_pair_in_use(layout: &crate::install::Layout) -> bool {
     let bin = layout.cli_path("spawnd");
     let bin_text = bin.display().to_string();
+    // A foreground daemon can use a custom config outside the instance
+    // registry, or still be starting before its first heartbeat. Inspect
+    // process images as well as registered definitions and known state files.
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
+    );
+    if system.processes().iter().any(|(pid, process)| {
+        pid.as_u32() != std::process::id()
+            && process.exe().is_some_and(|exe| same_launch_path(exe, &bin))
+    }) {
+        return true;
+    }
     for dir in crate::install::known_config_dirs() {
         if let Ok(Some(state)) = crate::state::read(&dir) {
-            if crate::state::daemon_state_is_live(&dir, &state)
+            if crate::state::pid_is_alive(state.pid)
                 && crate::install::live_exe(state.pid)
                     .map(|(exe, _)| exe)
                     .or_else(|| state.exe.as_deref().map(PathBuf::from))

@@ -430,7 +430,8 @@ the layout that ends this:
   (fetching its signed pair when the installer is another variant), then
   registers and starts it. It never adopts a live pre-store daemon. Legacy
   heartbeats without an executable field are checked against the live process;
-  an unknown image keeps the shared pair intact. `service::install` writes a
+  process images also cover foreground launches before their first heartbeat.
+  An unknown image keeps the shared pair intact. `service::install` writes a
   unit for the instance's launch path; `update` publishes the signed
   pair and repoints one instance. Nothing ever writes a file another instance
   is running.
@@ -485,7 +486,7 @@ the rotation list in `release_key.rs`, matches its tree and both artifact
 hashes, and enforces the build.rs-stamped monotonic release counter. A CLI
 uses the higher counter of the target instance's selected and live builds,
 recorded in `release.json` and its heartbeat; a known instance with missing
-identity blocks updating until possession migrates it. Downloaded build
+  identity blocks updating until possession migrates it. Downloaded build
 metadata must match the signed counter, version, tree, and store capability.
 Nothing the
 server sends can waive that counter: `daemon.update` carries an
