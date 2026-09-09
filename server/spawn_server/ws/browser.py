@@ -214,7 +214,11 @@ def _schedule_browser_orphan_expiry(host_id: str, binding: RtcSessionBinding) ->
         deadline = binding.browser_orphaned_until
         if deadline is None:
             return
-        await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+        # Event-loop timers can wake before the monotonic deadline (uvloop
+        # rounds delays to milliseconds). The broker correctly refuses early
+        # expiry, so wait again instead of abandoning this orphan forever.
+        while (remaining := deadline - time.monotonic()) > 0:
+            await asyncio.sleep(max(remaining, 0.001))
         expired = await get_broker().expire_rtc_orphan(
             binding.session_id,
             binding.nonce,
