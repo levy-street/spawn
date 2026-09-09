@@ -1944,7 +1944,10 @@ def _schedule_daemon_orphan_expiry(binding: RtcSessionBinding) -> None:
         deadline = binding.daemon_orphaned_until
         if deadline is None:
             return
-        await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+        # Match browser-orphan cleanup: a rounded timer is only a wake-up,
+        # not proof that the broker's monotonic expiry deadline has passed.
+        while (remaining := deadline - time.monotonic()) > 0:
+            await asyncio.sleep(max(remaining, 0.001))
         expired = await get_broker().expire_rtc_orphan(
             binding.session_id,
             binding.nonce,
