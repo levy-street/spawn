@@ -24,6 +24,9 @@ pub struct Check {
     status: CheckStatus,
     detail: String,
     fix: Option<String>,
+    /// Which instance a check is about, when the report covers several.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,12 +37,16 @@ pub struct DoctorOutput {
     problems: usize,
 }
 
-pub async fn run(server_cli: Option<String>, args: DoctorArgs) -> anyhow::Result<()> {
+pub async fn run(
+    server_cli: Option<String>,
+    args: DoctorArgs,
+    explicit_config: bool,
+) -> anyhow::Result<()> {
     if !args.json {
         crate::tui::print_logo();
     }
     let spinner = crate::tui::Spinner::start("running health checks");
-    let output = inspect(server_cli).await;
+    let output = inspect_all(server_cli, explicit_config).await?;
     spinner.finish(output.problems == 0, "health checks complete");
     if args.json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -52,15 +59,51 @@ pub async fn run(server_cli: Option<String>, args: DoctorArgs) -> anyhow::Result
     Ok(())
 }
 
-async fn inspect(server_cli: Option<String>) -> DoctorOutput {
+/// Every instance a shell can see, each checked on its own; one report. The
+/// JSON shape `{host, version, checks, problems}` is unchanged — a check
+/// gains an `instance` field when the report covers more than one.
+async fn inspect_all(
+    server_cli: Option<String>,
+    explicit_config: bool,
+) -> anyhow::Result<DoctorOutput> {
     let host = hostname::get()
         .ok()
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| "unknown-host".into());
-    let version = crate::version::build_version();
+    let dirs = crate::lifecycle::selected_dirs(explicit_config)?;
+    let several = dirs.len() > 1;
+    let mut checks = Vec::new();
+    for dir in &dirs {
+        let _guard = crate::lifecycle::ConfigDirGuard::set(dir);
+        let instance = several.then(|| crate::lifecycle::instance_name(dir));
+        checks.extend(
+            inspect(server_cli.clone())
+                .await
+                .into_iter()
+                .map(|mut check| {
+                    check.instance = instance.clone();
+                    check
+                }),
+        );
+    }
+    let problems = checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Fail)
+        .count();
+    Ok(DoctorOutput {
+        host,
+        version: crate::version::build_version(),
+        checks,
+        problems,
+    })
+}
+
+/// The checks for the ambient instance, in their fixed order.
+async fn inspect(server_cli: Option<String>) -> Vec<Check> {
     let config_dir = crate::config::config_dir().ok();
     let credentials = crate::creds::load();
-    let mut checks = Vec::with_capacity(if cfg!(windows) { 15 } else { 14 });
+    let build = config_dir.as_deref().map(crate::status::instance_build);
+    let mut checks = Vec::with_capacity(if cfg!(windows) { 16 } else { 15 });
 
     checks.push(match &credentials {
         Ok(_) => ok(1, "credentials", "readable"),
@@ -222,26 +265,9 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
     );
     checks.push(clock_check(&health));
 
-    checks.push(match crate::update::ensure_worker_pair().await {
-        Ok(()) => ok(10, "worker binary", "spawn-worker matches spawnd"),
-        Err(_) => {
-            let reinstall = server
-                .as_ref()
-                .map(crate::update::reinstall_command)
-                .unwrap_or_else(|| {
-                    if cfg!(windows) {
-                        "irm '<server>/install.ps1' | iex".into()
-                    } else {
-                        "curl -fsSL <server>/install.sh | sh".into()
-                    }
-                });
-            fail(
-                10,
-                "worker binary",
-                "missing or version mismatch",
-                format!("reinstall — {reinstall}"),
-            )
-        }
+    checks.push(match (&config_dir, &build) {
+        (Some(dir), Some(build)) => pair_check(10, dir, build, server.as_ref()).await,
+        _ => skip(10, "worker binary", "config unavailable"),
     });
     let capability = crate::update::capability();
     checks.push(if capability.self_update {
@@ -261,28 +287,232 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
             "reinstall SPAWN D from this server",
         )
     });
-    checks.push(match &server {
-        Some(server) => probe_version(server).await,
-        None => skip(12, "version", "server unavailable"),
+    checks.push(match (&server, &build) {
+        (Some(server), Some(build)) => probe_version(server, build.tree.as_deref()).await,
+        _ => skip(12, "version", "server unavailable"),
     });
     checks.push(match config_dir.as_deref() {
         Some(dir) => permissions_check(dir),
         None => skip(13, "file permissions", "config unavailable"),
     });
     checks.push(probe_udp().await);
+    checks.push(match (&config_dir, &build) {
+        (Some(dir), Some(build)) => layout_check(15, dir, build),
+        _ => skip(15, "install layout", "config unavailable"),
+    });
     #[cfg(windows)]
     checks.push(windows_agent_shell_check());
+    checks
+}
 
-    let problems = checks
-        .iter()
-        .filter(|check| check.status == CheckStatus::Fail)
-        .count();
-    DoctorOutput {
-        host,
-        version,
-        checks,
-        problems,
+/// The pair the instance actually runs. A live daemon is asked what it runs
+/// — its own verdict on its worker, and on Linux the executable the kernel
+/// says it is — and the worker beside *that* executable is probed. Without a
+/// live daemon the release the instance is pointed at is probed, and only
+/// with neither is this command's own pair what is checked.
+async fn pair_check(
+    id: u8,
+    config_dir: &Path,
+    build: &crate::status::InstanceBuild,
+    server: Option<&url::Url>,
+) -> Check {
+    let reinstall = server
+        .map(crate::update::reinstall_command)
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "irm '<server>/install.ps1' | iex".into()
+            } else {
+                "curl -fsSL <server>/install.sh | sh".into()
+            }
+        });
+    let name = "worker binary";
+    if let Some(state) = build.live() {
+        if state.worker_mismatch {
+            return fail(
+                id,
+                name,
+                "the running daemon refuses new sessions: its spawn-worker does not match it",
+                "spawnd reconnect restarts it onto the release it is pointed at; if that does not clear it, spawnd update",
+            );
+        }
+        let exe = match crate::install::live_exe(state.pid) {
+            Some((_, true)) => {
+                return fail(
+                    id,
+                    name,
+                    "the running daemon's binary was replaced on disk; the worker beside it is another build's",
+                    "spawnd reconnect (restarts onto the release it is pointed at)",
+                )
+            }
+            Some((exe, false)) => Some(exe),
+            None => state.exe.as_deref().map(std::path::PathBuf::from),
+        };
+        return match exe {
+            Some(exe) => {
+                let worker = exe.with_file_name(crate::platform::executable_name("spawn-worker"));
+                match crate::install::probe_pair(&exe, &worker) {
+                    Ok(identity) if identity.version == state.version => ok(
+                        id,
+                        name,
+                        format!("spawn-worker matches the running spawnd ({})", identity.version),
+                    ),
+                    Ok(identity) => fail(
+                        id,
+                        name,
+                        format!(
+                            "the pair beside the running daemon is {} but the daemon is {}",
+                            identity.version, state.version
+                        ),
+                        "spawnd reconnect (restarts onto the release it is pointed at)",
+                    ),
+                    Err(error) => fail(
+                        id,
+                        name,
+                        format!("the worker beside the running daemon is missing or mismatched: {error}"),
+                        format!("reinstall — {reinstall}"),
+                    ),
+                }
+            }
+            None => warn(
+                id,
+                name,
+                "the running daemon predates the pair report",
+                "restart it to confirm the pair: spawnd reconnect",
+            ),
+        };
     }
+    if let Some(release) = &build.selected {
+        return match crate::install::probe_pair(&release.spawnd(), &release.spawn_worker()) {
+            Ok(identity) if identity.version == release.meta.version => ok(
+                id,
+                name,
+                format!("release {} is a matching pair", release.id()),
+            ),
+            Ok(_) | Err(_) => fail(
+                id,
+                name,
+                format!("release {} is damaged", release.id()),
+                format!("reinstall — {reinstall}"),
+            ),
+        };
+    }
+    let _ = config_dir;
+    match crate::update::ensure_worker_pair().await {
+        Ok(()) => ok(id, name, "spawn-worker matches this spawnd"),
+        Err(_) => fail(
+            id,
+            name,
+            "missing or version mismatch",
+            format!("reinstall — {reinstall}"),
+        ),
+    }
+}
+
+/// Where the instance launches from, and whether its service agrees.
+fn layout_check(id: u8, config_dir: &Path, build: &crate::status::InstanceBuild) -> Check {
+    let name = "install layout";
+    let running_from = build
+        .live()
+        .and_then(|state| {
+            crate::install::live_exe(state.pid)
+                .map(|(exe, _)| exe)
+                .or_else(|| state.exe.as_deref().map(std::path::PathBuf::from))
+        })
+        .map(|exe| (crate::install::provenance_of(&exe), exe));
+    let report = crate::service::launch_report(config_dir);
+    match &build.selected {
+        Some(release) => {
+            let Ok(layout) = crate::install::layout_for_instance(config_dir) else {
+                return skip(id, name, "install root unavailable");
+            };
+            let launch = crate::install::launch_path(&layout, config_dir);
+            if let Some(binary) = &report.binary {
+                if !same_path(binary, &launch) {
+                    // The daemon redirects itself to the selected release at
+                    // every start, so this is a detour, not an outage — but
+                    // the detour starts a stale binary and hides the store.
+                    let fix = if report.drop_ins.is_empty() {
+                        "spawnd reconnect (rewrites the service for the release store)".to_owned()
+                    } else {
+                        format!(
+                            "a drop-in overrides ExecStart ({}); remove it, then: systemctl --user daemon-reload && spawnd reconnect",
+                            report.drop_ins.join(", ")
+                        )
+                    };
+                    return warn(
+                        id,
+                        name,
+                        format!(
+                            "the service starts {} instead of the selected release {} (the daemon redirects itself at start)",
+                            binary.display(),
+                            release.id()
+                        ),
+                        fix,
+                    );
+                }
+            }
+            if let Some((provenance, exe)) = &running_from {
+                if !matches!(provenance, crate::install::Provenance::Store { .. }) {
+                    return warn(
+                        id,
+                        name,
+                        format!(
+                            "the daemon is running from {} while the instance is pointed at release {}",
+                            exe.display(),
+                            release.id()
+                        ),
+                        "spawnd reconnect (restarts onto the selected release)",
+                    );
+                }
+            }
+            ok(
+                id,
+                name,
+                format!("release store: {} ({})", release.id(), release.meta.variant),
+            )
+        }
+        None => match running_from {
+            Some((crate::install::Provenance::Legacy { .. }, exe)) => {
+                let shared = crate::install::is_shared_legacy_pair(&exe);
+                warn(
+                    id,
+                    name,
+                    if shared {
+                        format!(
+                            "shared binary at {}; every instance installed the old way shares it",
+                            exe.display()
+                        )
+                    } else {
+                        format!("a pair placed by hand at {}", exe.display())
+                    },
+                    "restart moves this instance into the release store: spawnd reconnect",
+                )
+            }
+            Some((crate::install::Provenance::Unmanaged, exe)) => {
+                ok(id, name, format!("unmanaged build at {}", exe.display()))
+            }
+            Some((crate::install::Provenance::Store { release_id, .. }, _)) => warn(
+                id,
+                name,
+                format!("running release {release_id} without a selection"),
+                "spawnd possess (records the selection)",
+            ),
+            None => match report.binary {
+                Some(binary) => warning(
+                    id,
+                    name,
+                    format!("not running; the service would start {}", binary.display()),
+                ),
+                None => skip(id, name, "no daemon running and no service installed"),
+            },
+        },
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
 }
 
 #[cfg(windows)]
@@ -326,7 +556,7 @@ fn windows_agent_shell_check_for(
 ) -> Check {
     if claude && !powershell && !git_bash {
         return fail(
-            15,
+            16,
             "agent shell",
             "Claude Code has neither PowerShell nor Git Bash",
             "install PowerShell or Git for Windows, then run spawnd doctor again",
@@ -334,7 +564,7 @@ fn windows_agent_shell_check_for(
     }
     if !powershell && !comspec {
         return fail(
-            15,
+            16,
             "agent shell",
             "no PowerShell or COMSPEC shell is available",
             "repair Windows PowerShell or install PowerShell 7",
@@ -342,14 +572,14 @@ fn windows_agent_shell_check_for(
     }
     if claude && !git_bash {
         return warn(
-            15,
+            16,
             "agent shell",
             "Claude Code can use PowerShell, but Bash-tool functionality is degraded",
             "install Git for Windows for full Claude Code tool compatibility",
         );
     }
     ok(
-        15,
+        16,
         "agent shell",
         if claude {
             "Claude Code shell dependencies available"
@@ -557,7 +787,10 @@ async fn probe_websocket(server: &url::Url, token: &str) -> Check {
     }
 }
 
-async fn probe_version(server: &url::Url) -> Check {
+async fn probe_version(server: &url::Url, instance_tree: Option<&str>) -> Check {
+    let Some(instance_tree) = instance_tree else {
+        return skip(12, "version", "this daemon does not report its build");
+    };
     let Ok(url) = crate::config::api_url(server, "/api/release") else {
         return skip(12, "version", "invalid release URL");
     };
@@ -570,7 +803,7 @@ async fn probe_version(server: &url::Url) -> Check {
     let latest = body
         .pointer("/daemon/tree")
         .and_then(serde_json::Value::as_str);
-    if latest == crate::version::daemon_tree() {
+    if latest == Some(instance_tree) {
         ok(12, "version", "up to date")
     } else if latest.is_some() {
         warn(
@@ -699,6 +932,7 @@ fn ok(id: u8, name: &'static str, detail: impl Into<String>) -> Check {
         status: CheckStatus::Ok,
         detail: detail.into(),
         fix: None,
+        instance: None,
     }
 }
 fn warn(id: u8, name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Check {
@@ -708,6 +942,7 @@ fn warn(id: u8, name: &'static str, detail: impl Into<String>, fix: impl Into<St
         status: CheckStatus::Warn,
         detail: detail.into(),
         fix: Some(fix.into()),
+        instance: None,
     }
 }
 fn warning(id: u8, name: &'static str, detail: impl Into<String>) -> Check {
@@ -717,6 +952,7 @@ fn warning(id: u8, name: &'static str, detail: impl Into<String>) -> Check {
         status: CheckStatus::Warn,
         detail: detail.into(),
         fix: None,
+        instance: None,
     }
 }
 fn fail(id: u8, name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Check {
@@ -726,6 +962,7 @@ fn fail(id: u8, name: &'static str, detail: impl Into<String>, fix: impl Into<St
         status: CheckStatus::Fail,
         detail: detail.into(),
         fix: Some(fix.into()),
+        instance: None,
     }
 }
 fn skip(id: u8, name: &'static str, detail: impl Into<String>) -> Check {
@@ -735,13 +972,24 @@ fn skip(id: u8, name: &'static str, detail: impl Into<String>) -> Check {
         status: CheckStatus::Skip,
         detail: detail.into(),
         fix: None,
+        instance: None,
     }
 }
 
 fn print_plain(output: &DoctorOutput) {
-    println!("SPAWN D doctor — {}, {}", output.host, output.version);
+    println!(
+        "SPAWN D doctor — {}, this command is spawnd {}",
+        output.host, output.version
+    );
     println!();
+    let mut current_instance: Option<&str> = None;
     for check in &output.checks {
+        if check.instance.as_deref() != current_instance {
+            current_instance = check.instance.as_deref();
+            if let Some(instance) = current_instance {
+                println!("instance {instance}");
+            }
+        }
         let marker = match check.status {
             CheckStatus::Ok => {
                 if crate::tui::styled_stdout() {
@@ -808,6 +1056,8 @@ mod tests {
         assert_eq!(value["version"], "0.1.0");
         assert_eq!(value["checks"][0]["status"], "ok");
         assert_eq!(value["checks"][0]["fix"], serde_json::Value::Null);
+        // One instance: no `instance` field, the shape scripts already parse.
+        assert!(value["checks"][0].get("instance").is_none());
         assert_eq!(value["problems"], 0);
     }
 
@@ -828,6 +1078,7 @@ mod tests {
             "version",
             "file permissions",
             "media path",
+            "install layout",
         ];
         #[cfg(windows)]
         let names = {

@@ -47,27 +47,33 @@ trap cleanup EXIT
 update_test_build_identities
 
 # The downloaded wrapper has the exact candidate version but deliberately
-# fails its real startup. On `run` it replaces its own installed path with the
-# real v-new binary, then gives only that exec an empty credential directory.
-# current_exe() is therefore the installed path: prepare_probation() sees the
-# real marker, increments it, and startup exits 1 while loading credentials.
-# The supervisor's next start restores the normal config, crosses the
-# production two-attempt threshold, and drives the pair-atomic revert.
+# fails its real startup. The store publishes it as a release and points the
+# instance at it, so the daemon re-executes the wrapper, which hands over to
+# the real v-new binary with a `--server` that disagrees with the stored
+# credentials: `run` reads its probation marker from the instance directory
+# first — the same directory whatever binary is running — increments it, and
+# exits 1 validating the origin. The supervisor's next start crosses the
+# production two-attempt threshold and points the instance back at the
+# previous release. Nothing in the release directory is ever modified.
 bad_daemon="$UPDATE_SCRATCH/bad-spawnd"
-bad_config="$UPDATE_SCRATCH/missing-credentials"
-mkdir -p "$bad_config"
 cat >"$bad_daemon" <<SH
 #!/usr/bin/env sh
 set -eu
 if [ "\${1:-}" = "--version" ]; then
   exec "$UPDATE_ARTIFACTS/new/spawnd" --version
 fi
-self="\$0"
-candidate="\${self}.candidate"
-cp "$UPDATE_ARTIFACTS/new/spawnd" "\$candidate"
-chmod 755 "\$candidate"
-mv "\$candidate" "\$self"
-SPAWN_CONFIG_DIR="$bad_config" exec "\$self" "\$@"
+# Replace the --server argument and keep everything else.
+skip=0
+set -- "\$@" --end-of-original
+rewritten=""
+for arg in "\$@"; do
+  shift
+  if [ "\$arg" = "--end-of-original" ]; then break; fi
+  if [ "\$skip" = "1" ]; then skip=0; continue; fi
+  if [ "\$arg" = "--server" ]; then skip=1; continue; fi
+  set -- "\$@" "\$arg"
+done
+exec "$UPDATE_ARTIFACTS/new/spawnd" --server http://127.0.0.1:1 "\$@"
 SH
 chmod 755 "$bad_daemon"
 update_test_write_manifest \
@@ -79,10 +85,11 @@ update_test_start_server 1
 update_test_mint_credentials
 
 marker_seen="$UPDATE_FIXTURE/marker-seen"
+marker_path="$(update_test_probation_marker)"
 (
   deadline=$((SECONDS + 45))
   while ((SECONDS < deadline)); do
-    if [[ -f "$UPDATE_BIN_DIR/spawnd.updating" ]]; then
+    if [[ -f "$marker_path" ]]; then
       printf '%s\n' "seen" >"$marker_seen"
       exit 0
     fi
@@ -98,14 +105,15 @@ update_test_wait_host "$UPDATE_TREE_A" failed 'health: registration failed' 45 >
 wait "$marker_watcher_pid"
 [[ -f "$marker_seen" ]] || update_test_die "probation marker was never observed"
 
-cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
-  || update_test_die "health revert did not restore the old daemon"
-cmp -s "$UPDATE_BIN_DIR/spawn-worker" "$UPDATE_ARTIFACTS/old/spawn-worker" \
-  || update_test_die "health revert did not restore the old worker"
-[[ ! -e "$UPDATE_BIN_DIR/spawnd.prev" && ! -e "$UPDATE_BIN_DIR/spawn-worker.prev" ]] \
-  || update_test_die "health revert left previous-pair backups"
-[[ ! -e "$UPDATE_BIN_DIR/spawnd.updating" ]] \
+update_test_installed_is old \
+  || update_test_die "health revert did not point the instance back at the old release"
+# The failed release is not deleted by the revert: it stays, unselected,
+# through the collector's grace period and is removed on a later pass. The
+# reverted daemon's health report clears the marker.
+[[ ! -e "$marker_path" ]] \
   || update_test_die "health result did not clear the probation marker"
+[[ "$(update_test_release_count)" == "2" ]] \
+  || update_test_die "expected the old release beside the failed one: $(ls "$UPDATE_RELEASES")"
 
 stable_child="$(<"$UPDATE_DAEMON_CHILD_PID_FILE")"
 [[ "$stable_child" =~ ^[1-9][0-9]*$ ]] || update_test_die "supervisor did not record old daemon PID"
@@ -126,7 +134,7 @@ assert h["daemon_tree"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 assert h["update"]["state"] == "failed"
 assert "health" in str(h["update"].get("error") or "").lower()
 ' <<<"$host"
-  [[ ! -e "$UPDATE_BIN_DIR/spawnd.updating" ]] \
+  [[ ! -e "$marker_path" ]] \
     || update_test_die "server re-pushed the failed probation tree"
   [[ "$(<"$UPDATE_DAEMON_CHILD_PID_FILE")" == "$stable_child" ]] \
     || update_test_die "reverted daemon restarted during no-repush observation"

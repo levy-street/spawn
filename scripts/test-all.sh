@@ -38,6 +38,7 @@ scripts/fault-proxy.py --self-test
 scripts/test-update-e2e.sh --self-test
 scripts/test-update-faults.sh --self-test
 scripts/test-update-probation.sh --self-test
+scripts/test-instance-releases.sh --self-test
 scripts/test-version-skew.sh --self-test
 scripts/chaos-drills.sh --self-test
 
@@ -83,6 +84,9 @@ scripts/test-update-faults.sh
 
 printf '%s\n' "== daemon updater probation =="
 scripts/test-update-probation.sh
+
+printf '%s\n' "== two instances, one release store =="
+scripts/test-instance-releases.sh
 
 printf '%s\n' "== pre-release version skew ritual (optional) =="
 if [[ -n "${SPAWN_OLD_REF:-}" ]]; then

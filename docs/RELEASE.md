@@ -417,8 +417,13 @@ The repeatable local updater proof has three CI scripts, all run by
 
 - `scripts/test-update-e2e.sh` builds two signed throwaway daemon identities
   and proves automatic and manual update, same-PID exec, worker-backed PTY
-  survival, pair cleanup, idempotence, request throttling, update
-  preconditions, and the downgrade override. It builds the diagnostics
+  survival, release cleanup, idempotence, request throttling, update
+  preconditions, and the downgrade override. Every cell installs the old pair
+  the legacy way — a bare pair in `bin/` — and proves the first start adopts
+  it into the release store and re-executes from there, that an update
+  publishes a new release and repoints only this instance while the legacy
+  pair in `bin/` is untouched, and that the release moved off is collected
+  only after the new daemon registers. It builds the diagnostics
   variant of both identities too, publishes every manifest with the variant
   beside the release pair, and proves that a release daemon installs the
   release pair, that a diagnostics daemon installs the diagnostics pair and
@@ -430,7 +435,17 @@ The repeatable local updater proof has three CI scripts, all run by
   their reported update stages without corrupting the installed pair.
 - `scripts/test-update-probation.sh` runs the daemon under a launchd/systemd-
   shaped supervisor loop, installs a candidate that fails real startup, and
-  proves pair-atomic health reversion plus the failed-tree no-repush rule.
+  proves the instance is pointed back at its previous release, the failed
+  release is collected, and the failed tree is not pushed again.
+- `scripts/test-instance-releases.sh` is the 2026-09-09 incident as a test:
+  two account instances under one OS user and one release store. It publishes
+  the diagnostics variant as a second account while the first has a live
+  session and proves the first daemon's release, executable, pair, and
+  session are untouched; that the installer leaves `bin/` alone while a unit
+  still names it; that a standard and a diagnostics daemon run side by side;
+  that `status` and `doctor` run from the release build describe the
+  diagnostics instance as what it is; and that each instance updates on its
+  own with the other's release and sessions intact.
 
 Before every release that changes `daemon/`, run the previous/new compatibility
 matrix with the commit currently deployed to production supplied explicitly:
@@ -1054,6 +1069,82 @@ docker run --rm --platform linux/amd64 -v "$(git rev-parse --show-toplevel)":/sr
   bash -c "$linux_build"
 ```
 
+### Where a host keeps its releases
+
+Installing used to mean two files, `~/.local/bin/spawnd` and `spawn-worker`
+(`%LOCALAPPDATA%\spawn\bin` on Windows), and every instance's service unit
+named them. Every path that put a pair there — `install.sh`, `install.ps1`,
+`cargo install`, the self-updater's swap — replaced them under every daemon
+on the machine, and a daemon resolves its worker beside its own executable
+on every session it opens. On 2026-09-09 a second account's install replaced
+dream's diagnostics pair with the standard one: the running daemon kept its
+image, its next worker came from the new files, and it refused every new
+session as `worker_mismatch`. The self-updater's `.prev` backups and
+`spawnd.updating` marker sat beside the shared pair too, so one instance's
+update could block another's and another instance's restart counted as a
+failed attempt against it.
+
+A host now keeps releases the way a package manager would:
+
+```text
+<root>/                          ~/.local on Unix; %LOCALAPPDATA%\spawn on Windows
+  bin/spawnd                     the command on PATH: a link into the store
+  lib/spawn/releases/<version>-<hash>/     one pair, written once, never modified
+  lib/spawn/instances/<tag>/current        each instance's pointer (Unix symlink)
+  lib/spawn/instances/<tag>/spawnd.updating  the instance's update on trial
+```
+
+- **Installers publish.** `install.sh` downloads the pair into scratch,
+  verifies it against the manifest pins as before, and runs
+  `spawnd __publish-release --install-root <root>` from there; the daemon
+  probes both `--version`s, refuses a pair that disagrees, and renames a
+  staging directory into `releases/`. The shell never writes into `bin/`.
+  `bin/spawnd` becomes a link to the release — unless a daemon on the machine
+  still starts from a regular-file pair there, in which case it is left as it
+  is and follows when that daemon restarts. `install.ps1` does the same and
+  no longer stops every instance's daemon to free a file for renaming.
+- **`possess` and `update` select.** A fresh instance is pointed at the
+  release the possessing command runs; its unit's `ExecStart` is the constant
+  path `instances/<tag>/current/spawnd`, so the unit is written once. An
+  update publishes the signed pair as a new release and repoints one
+  instance; the daemon re-executes from the new release with the same PID.
+  Two instances updating to the same release publish it once between them.
+- **A failed update is undone by pointing back.** The previous release stays
+  on disk through probation. Two failed starts or five minutes without
+  registration repoint the instance at it and report the health failure.
+- **Migration is the first start.** A daemon launched from the old shared
+  pair adopts that exact pair into the store as a release, points its
+  instance at it, rewrites its unit for the constant path, and on Unix
+  re-executes from the store before it connects. Sessions, credentials, the
+  host identity, and browser trust are untouched: workers live outside the
+  daemon and are re-adopted, and everything else is in the config directory,
+  which gains one record (`install.json`) naming the install root. A macOS
+  plist is rewritten but launchd keeps its loaded definition until the next
+  `possess` boots the agent in and out; the daemon it launches meanwhile
+  redirects itself. On Windows, where a symlink needs a privilege, an
+  instance's pointer is a hard-linked pair under `instances\<tag>\` swapped
+  only by its own update; a daemon still registered on `bin\spawnd.exe`
+  records its selection at startup and is re-registered by the next
+  `possess` or `update` from a shell, and blocks its own self-update with
+  `legacy_launch` until then.
+- **Collection.** Releases nothing points at — no instance, no probation
+  marker, not the command on PATH, no live heartbeat, not the running
+  process — are removed after a healthy registration and after `spawnd
+  update`, `exorcise`, and `reset`, never within fifteen minutes of being
+  published.
+- **What `status` and `doctor` say.** Both describe the instance: the
+  version and executable its live daemon recorded, whether that daemon's
+  worker matches (its own verdict, and on Linux whether `/proc/<pid>/exe`
+  says the file was replaced under it), the release it is pointed at, and
+  what the service manager will actually start. The command's own build is
+  shown once, as `cli_version`. The 2026-09-09 state — a diagnostics daemon
+  refusing sessions while a standard `spawnd status` said "up to date" — now
+  reads `pair MISMATCH — new sessions are refused; restart: spawnd reconnect`
+  and `doctor` fails the `worker binary` check with the same remedy.
+
+Two variants under one OS user are two instances with two pointers; see "The
+diagnostics variant".
+
 ### The Linux compatibility floor
 
 **glibc 2.35 — Ubuntu 22.04.** Hosts older than that get no prebuilt and fall
@@ -1249,6 +1340,18 @@ and nothing brings it back on its own. Either install the CI-built
 lift the drop-in, let the first update land the release pair (a variant-aware
 build), and then run the `spawnd update` switch above. Only from a build that
 carries the variant-aware updater is the choice sticky.
+
+**Two variants on one machine** is a supported state, not an accident waiting
+to happen: each instance points at its own release in the store ("Where a host
+keeps its releases"), so a standard account and a diagnostics account under
+one OS user update independently and never replace each other's pair. A
+diagnostics daemon that still launches from a hand-placed pair — dream's
+`instances/0fc1d50c/bin/` recovery, with a systemd drop-in overriding
+`ExecStart` — adopts that pair into the store on its first start with this
+build and rewrites the unit file, but the drop-in keeps winning until it is
+removed; `spawnd doctor` names the drop-in and the fix (remove it, `systemctl
+--user daemon-reload`, `spawnd reconnect`). Until then the instance restarts
+onto whatever the drop-in's path holds, not the release it is pointed at.
 
 **What happens without it.** A diagnostics daemon whose release carries no
 diagnostics pair for its target refuses the update with
