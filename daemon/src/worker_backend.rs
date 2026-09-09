@@ -195,16 +195,23 @@ fn windows_log_dir(worker_dir: &std::path::Path, session_id: Uuid) -> Result<Pat
 
 /// Resolve the spawn-worker binary: `$SPAWND_WORKER_BIN` → sibling of the
 /// running spawnd → bare name (PATH).
+///
+/// The sibling is taken beside the *canonical* executable, resolved once for
+/// the life of the process (`install::running_exe`). Inside the release store
+/// that directory is immutable, so the worker found there is the worker built
+/// with this daemon by construction; a pointer that moves while the daemon
+/// runs — another instance updating, an operator repointing this one — does
+/// not move the worker this process resolves. The identity check in
+/// `update::refresh_worker_pair_status` still runs before every session and
+/// remains the tripwire for anything that gets past this.
 pub(crate) fn worker_bin() -> PathBuf {
     if let Some(bin) = std::env::var_os("SPAWND_WORKER_BIN").filter(|v| !v.is_empty()) {
         return PathBuf::from(bin);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join(crate::platform::executable_name("spawn-worker"));
-            if sibling.exists() {
-                return sibling;
-            }
+    if let Some(dir) = crate::install::running_exe_dir() {
+        let sibling = dir.join(crate::platform::executable_name("spawn-worker"));
+        if sibling.exists() {
+            return sibling;
         }
     }
     PathBuf::from(crate::platform::executable_name("spawn-worker"))

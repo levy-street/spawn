@@ -64,7 +64,7 @@ certificate table, whatever the file is called.
 
 - [ ] **PowerShell install**
   - **Do:** As the standard user, run powershell.exe -NoLogo -NoProfile -Command "irm https://<origin>/install.ps1 | iex"; repeat with pwsh -NoLogo -NoProfile -Command "irm https://<origin>/install.ps1 | iex". Complete possession.
-  - **Expect:** Attached TUI accepts input; no UAC; both EXEs land in %LOCALAPPDATA%\spawn\bin; hashes match; rerun changes neither hash nor timestamp; a new shell resolves where.exe spawnd.
+  - **Expect:** Attached TUI accepts input; no UAC; the pair lands in %LOCALAPPDATA%\spawn\releases\<version>-<hash>\ with a release.json, both EXEs in %LOCALAPPDATA%\spawn\bin are hard links or copies of it; hashes match; rerun publishes nothing new and changes neither hash nor timestamp; a new shell resolves where.exe spawnd. (Release-store layout: new since the store landed, unvalidated on Windows.)
   - **Source:** I-dist.md, I-web-frontends.md, RELEASE.md
 
 - [ ] **Installer switches**
@@ -89,7 +89,7 @@ certificate table, whatever the file is called.
 
 - [ ] **Run fallback**
   - **Do:** Force denied/in-job behavior; run spawnd possess and choose Use the Run watchdog. Also test spawnd possess --service-mode run and spawnd possess --service-mode task. Query reg.exe query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "SPAWN D spawnd-<8hex>".
-  - **Expect:** Doctor/status report denial; prompt choices behave safely; data is exactly "<LOCALAPPDATA>\spawn\bin\spawnd.exe" __watchdog --instance <8hex>; the mode persists.
+  - **Expect:** Doctor/status report denial; prompt choices behave safely; data is exactly "<LOCALAPPDATA>\spawn\instances\<8hex>\spawnd.exe" __watchdog --instance <8hex> (the instance's constant launch path; a registration made before the release store names bin\spawnd.exe and is accepted until re-registered); the mode persists.
   - **Source:** I-service.md, I-glue.md, possess.rs
 
 - [ ] **Watchdog lifecycle**
@@ -217,8 +217,8 @@ certificate table, whatever the file is called.
 ## Self-update
 
 - [ ] **Task N→N+1**
-  - **Do:** Install signed N in Task mode, keep a session live, serve signed N+1, run spawnd --server https://<test-origin> update. Record task, supervisor, worker and shell PIDs; list %LOCALAPPDATA%\spawn\bin.
-  - **Expect:** Refuses without a fresh breakaway marker; otherwise no-window handoff waits, swaps the complete pair, /Runs the exact task, preserves worker/session PIDs and completes probation. Names use .prev.exe, .tmp.<pid>.exe, .failed.<pid>.exe.
+  - **Do:** Install signed N in Task mode, keep a session live, serve signed N+1, run spawnd --server https://<test-origin> update. Record task, supervisor, worker and shell PIDs; list %LOCALAPPDATA%\spawn\releases and %LOCALAPPDATA%\spawn\instances\<8hex>.
+  - **Expect:** Refuses without a fresh breakaway marker; otherwise N+1 is published as a second release directory, the instance's linked pair under instances\<8hex>\ is swapped (.prev.exe kept until registration), the task's <Command> is unchanged, the no-window handoff waits and /Runs the exact task, worker/session PIDs are preserved, probation completes, and release N is collected. Names use .prev.exe, .tmp.<pid>.exe, .failed.<pid>.exe. (Release-store layout: unvalidated on Windows.)
   - **Source:** I-core-daemon.md, I-glue.md, I-desktop.md
 
 - [ ] **Run N→N+1**

@@ -29,6 +29,21 @@ pub struct StateFile {
     pub server: String,
     pub last_error: Option<LastError>,
     pub sessions: usize,
+    /// The daemon tree this process was built from; what `status` compares
+    /// against the server's release for *this* instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// The canonical executable this process runs, so a command in a shell
+    /// can tell which build an instance actually is, not which one it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    /// The release-store id when the executable is a published release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+    /// Whether the co-installed worker last failed the identity check — the
+    /// state in which the daemon refuses new sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_mismatch: bool,
 }
 
 pub struct StateStore {
@@ -60,6 +75,14 @@ pub fn active_heartbeat(sessions: usize) {
     }
 }
 
+/// Record the worker identity check's latest verdict. Written only when it
+/// changes, so the check before every session create costs no disk write.
+pub fn active_worker_mismatch(mismatch: bool) {
+    if let Some(store) = ACTIVE_STATE.get() {
+        store.worker_mismatch(mismatch);
+    }
+}
+
 pub fn connection_error_class(class: &str) -> (&'static str, &'static str) {
     match class {
         "dns" => ("dns", "dns"),
@@ -83,6 +106,7 @@ impl StateStore {
         server: &str,
         task_breakaway_denied: Option<bool>,
     ) -> Self {
+        let provenance = crate::install::provenance();
         Self {
             path: state_path(config_dir),
             state: Mutex::new(StateFile {
@@ -95,7 +119,22 @@ impl StateStore {
                 server: server.to_owned(),
                 last_error: None,
                 sessions: 0,
+                tree: crate::version::daemon_tree().map(str::to_owned),
+                exe: crate::install::running_exe().map(|exe| exe.display().to_string()),
+                release: provenance.release_id().map(str::to_owned),
+                worker_mismatch: false,
             }),
+        }
+    }
+
+    pub fn worker_mismatch(&self, mismatch: bool) {
+        let mut state = self.state.lock().expect("state heartbeat lock");
+        if state.worker_mismatch == mismatch {
+            return;
+        }
+        state.worker_mismatch = mismatch;
+        if let Err(error) = write_atomic(&self.path, &state) {
+            tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }
     }
 
@@ -454,8 +493,37 @@ mod tests {
         .unwrap();
         assert_eq!(state.process_started_100ns, None);
         assert_eq!(state.task_breakaway_denied, None);
+        // A heartbeat written before the release store carries no build
+        // identity beyond its version, and says nothing about its worker.
+        assert_eq!(state.tree, None);
+        assert_eq!(state.exe, None);
+        assert_eq!(state.release, None);
+        assert!(!state.worker_mismatch);
         let value = serde_json::to_value(state).unwrap();
         assert!(value.get("process_started_100ns").is_none());
         assert!(value.get("task_breakaway_denied").is_none());
+        assert!(value.get("exe").is_none());
+        assert!(value.get("worker_mismatch").is_none());
+    }
+
+    #[test]
+    fn the_heartbeat_names_the_running_build_and_its_worker_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
+        store.heartbeat(0);
+        let state = read(dir.path()).unwrap().unwrap();
+        assert_eq!(state.tree, crate::version::daemon_tree().map(str::to_owned));
+        assert!(state
+            .exe
+            .as_deref()
+            .is_some_and(|exe| std::path::Path::new(exe).is_absolute()));
+        assert!(!state.worker_mismatch);
+        store.worker_mismatch(true);
+        let state = read(dir.path()).unwrap().unwrap();
+        assert!(state.worker_mismatch);
+        assert_eq!(
+            serde_json::to_value(&state).unwrap()["worker_mismatch"],
+            true
+        );
     }
 }

@@ -53,9 +53,52 @@ fn shared_bin_dir() -> Result<PathBuf> {
         .join("bin"))
 }
 
+/// The legacy shared daemon path every instance used to launch from.
 #[cfg(windows)]
-fn expected_daemon() -> Result<PathBuf> {
+fn legacy_daemon() -> Result<PathBuf> {
     Ok(shared_bin_dir()?.join(format!("spawnd{}", std::env::consts::EXE_SUFFIX)))
+}
+
+/// Whether `executable` is a path this instance may be launched from: its
+/// constant launch path in the release store, or the legacy shared binary a
+/// registration made before the store still names.
+#[cfg(windows)]
+fn acceptable_daemon(config_dir: &Path, executable: &Path) -> Result<bool> {
+    if !executable.is_absolute() {
+        return Ok(false);
+    }
+    if let Ok(layout) = crate::install::layout_for_instance(config_dir) {
+        if same_windows_path(
+            executable,
+            &crate::install::launch_path(&layout, config_dir),
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(same_windows_path(executable, &legacy_daemon()?))
+}
+
+/// The daemon the Run registration's launch record names, when one exists.
+#[cfg(windows)]
+pub(super) fn registered_binary(config_dir: &Path) -> Option<PathBuf> {
+    let record = read_launch_record(&launch_record_path(config_dir).ok()?).ok()?;
+    Some(record.executable)
+}
+
+/// Whether any launch record under this user's state directory names
+/// `binary` — the installer's question before it replaces the legacy pair.
+#[cfg(windows)]
+pub(super) fn any_record_names(binary: &str) -> bool {
+    let Some(state) = dirs::data_local_dir().map(|dir| dir.join("spawn").join("state")) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(state) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        read_launch_record(&entry.path().join("launch.json"))
+            .is_ok_and(|record| same_windows_path(&record.executable, Path::new(binary)))
+    })
 }
 
 #[cfg(windows)]
@@ -116,12 +159,11 @@ pub(super) fn install(config_dir: &Path, server: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-    let executable = super::current_bin()?;
-    let expected = expected_daemon()?;
-    if !executable.is_absolute() || !same_windows_path(&executable, &expected) {
+    let executable = super::launch_bin(config_dir)?;
+    if !acceptable_daemon(config_dir, &executable)? {
         bail!(
-            "the Run watchdog must use the installed absolute binary {}",
-            expected.display()
+            "the Run watchdog must use this instance's launch path, not {}",
+            executable.display()
         );
     }
     let instance = super::instance_name(config_dir);
@@ -249,8 +291,7 @@ fn validate_record(record: &LaunchRecord) -> Result<()> {
     if record.version != 1 || record.instance != super::instance_name(&record.config_dir) {
         bail!("watchdog launch record does not match its config root");
     }
-    let expected = expected_daemon()?;
-    if !record.executable.is_absolute() || !same_windows_path(&record.executable, &expected) {
+    if !acceptable_daemon(&record.config_dir, &record.executable)? {
         bail!("watchdog launch record names an unexpected executable");
     }
     let stored = super::registered_server(&record.config_dir, &record.server);

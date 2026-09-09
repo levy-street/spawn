@@ -68,6 +68,24 @@ fn current_bin() -> Result<PathBuf> {
     std::env::current_exe().context("resolving the running spawnd binary path")
 }
 
+/// The binary a service definition launches for `config_dir`.
+///
+/// An instance in the release store launches through its own pointer
+/// (`install::launch_path`), which never changes across updates, so the unit
+/// is written once. Selecting is part of installing: a fresh instance is
+/// pointed at the release this command runs, and a legacy pair is adopted
+/// into the store first. A binary the store does not manage — a checkout's
+/// `target/`, a download folder — is launched from where it is, as before.
+fn launch_bin(config_dir: &Path) -> Result<PathBuf> {
+    match crate::install::provenance() {
+        crate::install::Provenance::Unmanaged => current_bin(),
+        _ => {
+            let (layout, _release) = crate::install::ensure_selected(config_dir)?;
+            Ok(crate::install::launch_path(&layout, config_dir))
+        }
+    }
+}
+
 /// Local, non-roaming state for one account instance. Windows deliberately
 /// keeps live PIDs, launch records, helpers, and endpoints out of `%APPDATA%`.
 pub fn instance_state_path(config_dir: &Path) -> Result<PathBuf> {
@@ -246,7 +264,7 @@ fn systemctl(args: &[&str]) -> Result<bool> {
 }
 
 fn systemd_install(config_dir: &Path, server: &str) -> Result<()> {
-    let bin = current_bin()?;
+    let bin = launch_bin(config_dir)?;
     let unit_path = systemd_unit_path(config_dir)?;
     let contents = systemd_unit_contents(config_dir, &bin, server);
     std::fs::write(&unit_path, contents)
@@ -348,7 +366,7 @@ fn effective_user_id() -> u32 {
 }
 
 fn launchd_install(config_dir: &Path, server: &str) -> Result<()> {
-    let bin = current_bin()?;
+    let bin = launch_bin(config_dir)?;
     let state = state_dir(&instance_tag(config_dir))?;
     let plist_path = launchd_plist_path(config_dir)?;
     std::fs::write(&plist_path, launchd_plist(config_dir, &bin, server, &state))
@@ -390,6 +408,273 @@ fn launchd_uninstall(config_dir: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&path);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// what a definition launches, and re-pointing one without restarting it
+// ---------------------------------------------------------------------------
+
+/// The binary a definition for `config_dir` *should* name, without selecting
+/// anything: the store launch path when the instance has a selection or this
+/// command runs from the store, else this executable. For diagnostics that
+/// must not publish as a side effect of looking.
+pub fn expected_launch_bin(config_dir: &Path) -> Option<PathBuf> {
+    match crate::install::provenance() {
+        crate::install::Provenance::Unmanaged => current_bin().ok(),
+        _ => {
+            let layout = crate::install::layout_for_instance(config_dir).ok()?;
+            Some(crate::install::launch_path(&layout, config_dir))
+        }
+    }
+}
+
+/// Point an *existing* service definition at the instance's constant launch
+/// path in the release store. Writes nothing when there is no definition,
+/// never creates, enables, or starts one, and on Linux reloads the manager
+/// so the next start uses it. This is the one-time move for an instance that
+/// used to launch from the shared pair; for one already in the store it is a
+/// no-op. Windows registrations name the constant instance path too, but are
+/// re-created by `install`, which only a command from a shell drives — a
+/// daemon rewriting its own Run key would be stopped by its own watchdog.
+pub fn rewrite_launch_path(config_dir: &Path, layout: &crate::install::Layout) -> Result<()> {
+    if service_disabled() {
+        return Ok(());
+    }
+    let bin = crate::install::launch_path(layout, config_dir);
+    #[cfg(target_os = "linux")]
+    {
+        systemd_rewrite(config_dir, &bin)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        launchd_rewrite(config_dir, &bin)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = bin;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_rewrite(config_dir: &Path, bin: &Path) -> Result<()> {
+    let unit_path = systemd_unit_path(config_dir)?;
+    if !unit_path.is_file() {
+        return Ok(());
+    }
+    let server = registered_server(config_dir, "");
+    if server.is_empty() {
+        bail!("this instance has no registered server to write a unit for");
+    }
+    let contents = systemd_unit_contents(config_dir, bin, &server);
+    if std::fs::read_to_string(&unit_path).ok().as_deref() == Some(contents.as_str()) {
+        return Ok(());
+    }
+    std::fs::write(&unit_path, contents)
+        .with_context(|| format!("writing {}", unit_path.display()))?;
+    systemctl(&["daemon-reload"])?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_rewrite(config_dir: &Path, bin: &Path) -> Result<()> {
+    let plist_path = launchd_plist_path(config_dir)?;
+    if !plist_path.is_file() {
+        return Ok(());
+    }
+    let server = registered_server(config_dir, "");
+    if server.is_empty() {
+        bail!("this instance has no registered server to write a plist for");
+    }
+    let state = state_dir(&instance_tag(config_dir))?;
+    let contents = launchd_plist(config_dir, bin, &server, &state);
+    if std::fs::read_to_string(&plist_path).ok().as_deref() == Some(contents.as_str()) {
+        return Ok(());
+    }
+    // launchd reads a plist when the job is bootstrapped; the running job
+    // keeps its old definition until the next `possess` boots it out and in.
+    // The daemon it launches meanwhile redirects itself into the store.
+    std::fs::write(&plist_path, contents)
+        .with_context(|| format!("writing {}", plist_path.display()))
+}
+
+/// What the service manager will actually start for this instance, as it
+/// reports it — the ground truth `doctor` compares against the selected
+/// release, because a drop-in or a hand edit can override the file we wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchReport {
+    pub binary: Option<PathBuf>,
+    pub drop_ins: Vec<String>,
+}
+
+pub fn launch_report(config_dir: &Path) -> LaunchReport {
+    #[cfg(target_os = "linux")]
+    {
+        let name = systemd_unit_name(config_dir);
+        let show = |property: &str| -> Option<String> {
+            let output = Command::new("systemctl")
+                .args(["--user", "show", "-p", property, "--value", &name])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        let binary = show("ExecStart")
+            .as_deref()
+            .and_then(parse_systemd_exec_path)
+            .map(PathBuf::from);
+        let drop_ins = show("DropInPaths")
+            .map(|paths| {
+                paths
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return LaunchReport { binary, drop_ins };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let binary = launchd_plist_path(config_dir)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .as_deref()
+            .and_then(parse_plist_program)
+            .map(PathBuf::from);
+        return LaunchReport {
+            binary,
+            drop_ins: Vec::new(),
+        };
+    }
+    #[cfg(windows)]
+    {
+        return LaunchReport {
+            binary: windows_registered_binary(config_dir),
+            drop_ins: Vec::new(),
+        };
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = config_dir;
+        LaunchReport::default()
+    }
+}
+
+/// `systemctl show -p ExecStart --value` prints
+/// `{ path=/x/spawnd ; argv[]=... ; ignore_errors=no ; ... }`.
+fn parse_systemd_exec_path(value: &str) -> Option<&str> {
+    let start = value.find("path=")? + "path=".len();
+    let rest = &value[start..];
+    let end = rest.find(" ;").unwrap_or(rest.len());
+    let path = rest[..end].trim();
+    (!path.is_empty()).then_some(path)
+}
+
+/// The first `<string>` of `ProgramArguments` in a launchd plist.
+fn parse_plist_program(plist: &str) -> Option<String> {
+    let arguments = plist.find("<key>ProgramArguments</key>")?;
+    let rest = &plist[arguments..];
+    let array = rest.find("<array>")? + "<array>".len();
+    let rest = &rest[array..];
+    let open = rest.find("<string>")? + "<string>".len();
+    let rest = &rest[open..];
+    let close = rest.find("</string>")?;
+    Some(xml_unescape(rest[..close].trim()))
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+#[cfg(windows)]
+fn windows_registered_binary(config_dir: &Path) -> Option<PathBuf> {
+    match preferred_mode(config_dir) {
+        ServiceMode::Task => windows_task::registered_binary(config_dir),
+        ServiceMode::Run => windows_run::registered_binary(config_dir),
+    }
+}
+
+/// Whether any daemon on this machine still starts from the legacy shared
+/// pair in `bin/`. While one does, the installer must not replace that pair:
+/// its worker is the one that daemon resolves beside itself. Looks at every
+/// definition this user has, and at every live heartbeat that names the path.
+pub fn legacy_pair_in_use(layout: &crate::install::Layout) -> bool {
+    let bin = layout.cli_path("spawnd");
+    let bin_text = bin.display().to_string();
+    for dir in crate::install::known_config_dirs() {
+        if let Ok(Some(state)) = crate::state::read(&dir) {
+            if crate::state::daemon_state_is_live(&state)
+                && state
+                    .exe
+                    .as_deref()
+                    .is_some_and(|exe| same_launch_path(Path::new(exe), &bin))
+            {
+                return true;
+            }
+        }
+    }
+    definitions_name(&bin_text)
+}
+
+fn same_launch_path(left: &Path, right: &Path) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(left) == canonical(right)
+}
+
+/// Whether any service definition this user has names `binary`.
+fn definitions_name(binary: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(dir) = dirs::config_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+            .map(|dir| dir.join("systemd").join("user"))
+        else {
+            return false;
+        };
+        return definition_files_name(&dir, "spawn", ".service", binary);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(dir) = dirs::home_dir().map(|h| h.join("Library").join("LaunchAgents")) else {
+            return false;
+        };
+        return definition_files_name(&dir, "app.spawn.spawnd", ".plist", &xml_escape(binary));
+    }
+    #[cfg(windows)]
+    {
+        return windows_run::any_record_names(binary)
+            || crate::install::known_config_dirs().iter().any(|dir| {
+                windows_task::registered_binary(dir)
+                    .is_some_and(|registered| same_launch_path(&registered, Path::new(binary)))
+            });
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = binary;
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn definition_files_name(dir: &Path, prefix: &str, suffix: &str, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(prefix)
+            && name.ends_with(suffix)
+            && std::fs::read_to_string(entry.path()).is_ok_and(|contents| contents.contains(needle))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1290,56 @@ mod tests {
         assert!(!same_origin("http://localhost:3000/", "https://spawnd.dev"));
         // Unparseable inputs defer to `run` rather than guessing.
         assert!(same_origin("not a url", "https://spawnd.dev"));
+    }
+
+    #[test]
+    fn the_manager_report_parses_what_systemctl_and_launchd_print() {
+        assert_eq!(
+            parse_systemd_exec_path(
+                "{ path=/home/oem/.local/lib/spawn/instances/0fc1d50c/current/spawnd ; argv[]=/home/oem/.local/lib/spawn/instances/0fc1d50c/current/spawnd --config-dir /x run ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+            ),
+            Some("/home/oem/.local/lib/spawn/instances/0fc1d50c/current/spawnd")
+        );
+        assert_eq!(parse_systemd_exec_path(""), None);
+        let plist = launchd_plist(
+            Path::new("/srv/spawn/alice & co"),
+            Path::new("/Users/a/.local/lib/spawn/instances/1234abcd/current/spawnd"),
+            "https://spawnd.dev",
+            Path::new("/state"),
+        );
+        assert_eq!(
+            parse_plist_program(&plist).as_deref(),
+            Some("/Users/a/.local/lib/spawn/instances/1234abcd/current/spawnd")
+        );
+        assert_eq!(xml_unescape("a &amp; b &quot;c&quot;"), "a & b \"c\"");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn definitions_are_searched_by_name_pattern_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("spawn-aabbccdd.service"),
+            "ExecStart=\"/home/x/.local/bin/spawnd\" run\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("other.service"),
+            "/home/x/.local/bin/spawnd",
+        )
+        .unwrap();
+        assert!(definition_files_name(
+            dir.path(),
+            "spawn",
+            ".service",
+            "/home/x/.local/bin/spawnd"
+        ));
+        assert!(!definition_files_name(
+            dir.path(),
+            "spawn",
+            ".service",
+            "/home/x/.local/lib/spawn/instances/aabbccdd/current/spawnd"
+        ));
     }
 
     #[test]

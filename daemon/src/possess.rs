@@ -344,7 +344,9 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
                 .await?;
                 return Ok(());
             }
-            ResumeAction::Update => return crate::update::run_cli(server_cli).await,
+            ResumeAction::Update => {
+                return crate::update::run_cli(server_cli, explicit_config_dir()).await
+            }
             // Falls through to the ceremony below.
             ResumeAction::NewAccount => {}
         }
@@ -660,11 +662,25 @@ async fn exorcise_one(explicit: Option<&Url>, dir: &Path) {
     if let Err(error) = service::uninstall(dir) {
         tracing::warn!(%error, "removing the background service");
     }
+    forget_release_selection(dir);
     let _ = creds::logout().await;
     if let Err(error) = service::purge_local_instance_data(dir) {
         tracing::warn!(%error, "removing local SPAWN D runtime state");
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Drop the instance's pointer into the release store and collect releases
+/// nothing points at any more. The releases themselves are shared with every
+/// other instance, so only the pointer is this instance's to remove.
+pub(crate) fn forget_release_selection(dir: &Path) {
+    let Ok(layout) = crate::install::layout_for_instance(dir) else {
+        return;
+    };
+    if let Err(error) = crate::install::clear_selection(&layout, dir) {
+        tracing::warn!(%error, "removing this instance's release selection");
+    }
+    let _ = crate::install::collect_garbage(&layout, &crate::install::known_config_dirs());
 }
 
 /// A daemon revokes its own host registration. 401/404 are treated as success

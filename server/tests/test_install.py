@@ -38,15 +38,44 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+#: Where the fake daemon "publishes" the pair it is run from, relative to the
+#: install root: the real layout's directory, with a fixed release id.
+FAKE_RELEASE = "lib/spawn/releases/fake-1.0-00000000"
+
+
 def _fake_spawnd_body() -> str:
-    return """#!/bin/sh
+    return f"""#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "$SPAWN_FAKE_LOG_DIR/spawnd.log"
-if [ -n "${SPAWN_SETUP_TOKEN:-}" ]; then
+if [ -n "${{SPAWN_SETUP_TOKEN:-}}" ]; then
   printf '%s|%s\\n' "$SPAWN_SETUP_TOKEN" "$*" >> "$SPAWN_FAKE_LOG_DIR/setup-token.log"
 fi
-if [ "${1:-}" = "--version" ]; then
-  printf '%s\\n' "${SPAWN_FAKE_SPAWND_VERSION:-spawnd fake 1.0}"
+if [ "${{1:-}}" = "--version" ]; then
+  printf '%s\\n' "${{SPAWN_FAKE_SPAWND_VERSION:-spawnd fake 1.0}}"
+  exit 0
+fi
+if [ "${{1:-}}" = "__publish-release" ]; then
+  # What the real command does: publish the pair beside this executable as
+  # one release under the install root and point bin/ at it.
+  root=""
+  previous=""
+  for arg in "$@"; do
+    if [ "$previous" = "--install-root" ]; then
+      root="$arg"
+    fi
+    previous="$arg"
+  done
+  [ -n "$root" ] || exit 1
+  here=$(cd "$(dirname "$0")" && pwd)
+  release="$root/{FAKE_RELEASE}"
+  mkdir -p "$release" "$root/bin"
+  cp "$here/spawnd" "$release/spawnd"
+  cp "$here/spawn-worker" "$release/spawn-worker"
+  chmod 755 "$release/spawnd" "$release/spawn-worker"
+  ln -sfn "$release/spawnd" "$root/bin/spawnd"
+  ln -sfn "$release/spawn-worker" "$root/bin/spawn-worker"
+  printf '%s\\n' "spawn: published fake 1.0 (release) to $release"
+  printf '%s\\n' "spawn: $root/bin/spawnd now runs this release"
   exit 0
 fi
 exit 0
@@ -338,10 +367,10 @@ async def test_install_script_is_shell_and_uses_public_url(client):
     assert "/api/install/spawn-worker/$TARGET" in r.text
     assert "darwin-aarch64" in r.text
     assert "linux-x86_64" in r.text
-    assert "start_launchd_service" in r.text
+    assert "__publish-release" in r.text
     assert "https://github.com/levy-street/spawn.git" in r.text
     assert "login --no-run" in r.text
-    assert "spawnd.service" in r.text
+    assert "possess" in r.text
     assert "--prebuilt-only" in r.text
     assert "--setup TOKEN" in r.text
     assert "--new-account" in r.text
@@ -451,8 +480,40 @@ async def test_installer_smoke_uses_real_curl_against_local_http_server(client, 
     assert "spawn-worker" in result.stdout
     assert "installed spawnd fake 1.0" in result.stdout
     assert "skipping login" in result.stdout
-    assert (install_root / "bin" / "spawnd").is_file()
-    assert (install_root / "bin" / "spawn-worker").is_file()
+    _assert_published_layout(install_root)
+
+
+def _assert_published_layout(install_root: Path) -> None:
+    """The contract every install leaves behind: an immutable release
+    directory holding the pair, and `bin/` pointing into it. The shell never
+    writes a binary into `bin/` itself."""
+    release = install_root / FAKE_RELEASE
+    assert (release / "spawnd").is_file()
+    assert (release / "spawn-worker").is_file()
+    for name in ("spawnd", "spawn-worker"):
+        link = install_root / "bin" / name
+        assert link.is_symlink(), f"{link} must be a link into the release store"
+        assert link.resolve() == (release / name).resolve()
+
+
+async def test_install_script_never_writes_binaries_into_bin_itself(client):
+    # The 2026-09-09 incident: the installer's two `mv`s into ~/.local/bin
+    # replaced the pair under a running daemon of another account. The shell
+    # now downloads into scratch and hands the pair to spawnd, which publishes
+    # it as an immutable release and points bin/ at it — or leaves bin/ alone
+    # while a daemon still starts from it.
+    r = await client.get("/install.sh")
+    script = r.text
+    assert 'mv "$TMP_BIN" "$BIN"' not in script
+    assert 'mv "$TMP_WORKER" "$WORKER_BIN"' not in script
+    assert '--root "$INSTALL_ROOT"' not in script
+    assert '__publish-release --install-root "$INSTALL_ROOT"' in script
+    # The old shared-pair unit generators are gone; possess owns the service.
+    assert "start_systemd_service" not in script
+    assert "start_launchd_service" not in script
+    # Everything after the download runs the published release.
+    assert 'exec_attached "$RUN_BIN" --server "$SERVER" possess' in script
+    assert 'exec_attached "$BIN"' not in script
 
 
 async def test_unsupported_daemon_binary_target_404(client):
@@ -553,8 +614,12 @@ async def test_installer_downloads_prebuilt_for_supported_targets(
     assert f"downloading prebuilt spawnd + spawn-worker for {target}" in result.stdout
     assert f"/api/install/spawnd/{target}" in _log(logs, "curl.log")
     assert f"/api/install/spawn-worker/{target}" in _log(logs, "curl.log")
-    assert (install_root / "bin" / "spawnd").is_file()
-    assert (install_root / "bin" / "spawn-worker").is_file()
+    # The downloaded pair is handed to spawnd to publish; the shell writes
+    # nothing into bin/ and the download never lands there.
+    assert f"__publish-release --install-root {install_root}" in _log(logs, "spawnd.log")
+    assert not (install_root / "bin" / "spawnd.tmp.").exists()
+    _assert_published_layout(install_root)
+    assert f"release: {install_root / FAKE_RELEASE}" in result.stdout
     assert _log(logs, "git.log") == ""
     assert _log(logs, "cargo.log") == ""
     assert "skipping login" in result.stdout
@@ -599,8 +664,11 @@ async def test_installer_bad_prebuilt_falls_back_to_source_build(client, tmp_pat
         logs, "git.log"
     )
     assert "install --path" in _log(logs, "cargo.log")
-    assert (install_root / "bin" / "spawnd").is_file()
-    assert (install_root / "bin" / "spawn-worker").is_file()
+    # A source build installs into scratch and is published from there; the
+    # `--root` cargo is given is never the install root.
+    assert f"--root {install_root}" not in _log(logs, "cargo.log")
+    assert f"__publish-release --install-root {install_root}" in _log(logs, "spawnd.log")
+    _assert_published_layout(install_root)
 
 
 @requires_posix_shell
@@ -758,6 +826,9 @@ async def test_installer_replaces_existing_binary_on_reinstall(client, tmp_path:
     assert "installed spawnd fake 1.0" in first.stdout
     assert "old spawnd" not in first.stdout
     assert "old spawn-worker" not in (bin_dir / "spawn-worker").read_text()
+    # It is spawnd that decided the old pair could go (nothing launches from
+    # it in this fixture); the shell only ever hands the new pair over.
+    _assert_published_layout(install_root)
 
     second, _logs, _home, _install_root = _run_installer(
         script,
@@ -915,9 +986,7 @@ async def test_variant_routes_serve_the_published_pair_under_the_plain_names(
     assert 'filename="spawn-worker"' in worker.headers["content-disposition"]
     # The release routes still hand out the release pair, not the variant.
     assert (await client.get("/api/install/spawnd/linux-x86_64")).content == b"release-daemon"
-    assert (
-        await client.get("/api/install/spawn-worker/linux-x86_64")
-    ).content == b"release-worker"
+    assert (await client.get("/api/install/spawn-worker/linux-x86_64")).content == b"release-worker"
 
 
 async def test_variant_routes_fail_closed(client, tmp_path: Path, monkeypatch):
@@ -1034,6 +1103,12 @@ async def test_install_powershell_renders_hash_pinned_script(client, monkeypatch
     assert response.headers["content-type"].startswith("text/plain")
     assert response.headers["cache-control"] == "no-store"
     assert "$DefaultServer = 'https://spawn.test/team/o''hara'" in response.text
+    # Windows publishes through spawnd too, and no longer stops every instance's
+    # daemon to make room for a file rename.
+    assert "__publish-release --install-root $InstallRoot --json" in response.text
+    assert "Install-Pair" not in response.text
+    assert "disconnect" not in response.text
+    assert "Assert-Sha256 $releaseSpawnd $PinnedSpawndSha256" in response.text
     assert f"$PinnedSpawndSha256 = '{spawnd_sha.lower()}'" in response.text
     assert f"$PinnedWorkerSha256 = '{worker_sha.lower()}'" in response.text
     assert "__DEFAULT_SERVER__" not in response.text
@@ -1058,9 +1133,7 @@ async def test_install_powershell_renders_hash_pinned_script(client, monkeypatch
     assert "$spawnPlatformIsWindows" in response.text
     assigned_variables = {
         match.group(1).casefold()
-        for match in re.finditer(
-            r"(?mi)^\s*\$([a-z_][a-z0-9_]*)\s*=", response.text
-        )
+        for match in re.finditer(r"(?mi)^\s*\$([a-z_][a-z0-9_]*)\s*=", response.text)
     }
     readonly_automatic_variables = {
         "args",
