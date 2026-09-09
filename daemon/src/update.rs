@@ -1943,13 +1943,6 @@ fn evaluate_preconditions(mode: Mode) -> Result<Preconditions, BlockReason> {
 /// A shell command cannot lend its older counter to a newer instance. Keep
 /// the higher floor when an update has selected a build not yet running.
 fn instance_build_counter(mode: Mode, config_dir: &Path, current: Option<&Release>) -> Option<u64> {
-    if mode == Mode::Daemon {
-        return crate::version::build_counter();
-    }
-    let live = crate::state::read(config_dir)
-        .ok()
-        .flatten()
-        .filter(|state| crate::state::daemon_state_is_live(config_dir, state));
     let selected_counter = current.and_then(|release| {
         release.meta.build_counter.or_else(|| {
             install::probe_build_info(&release.spawnd())
@@ -1960,6 +1953,21 @@ fn instance_build_counter(mode: Mode, config_dir: &Path, current: Option<&Releas
                 .and_then(|info| info.build_counter)
         })
     });
+    if mode == Mode::Daemon {
+        // Possession can select a newer build before the service restarts.
+        // The old process must not lower that selection in the meantime.
+        if current.is_some() && selected_counter.is_none() {
+            return None;
+        }
+        return selected_counter
+            .into_iter()
+            .chain(crate::version::build_counter())
+            .max();
+    }
+    let live = crate::state::read(config_dir)
+        .ok()
+        .flatten()
+        .filter(|state| crate::state::daemon_state_is_live(config_dir, state));
     let running_counter = live.as_ref().and_then(|state| {
         state.build_counter.or_else(|| {
             let exe = install::live_daemon_exe(config_dir)?;

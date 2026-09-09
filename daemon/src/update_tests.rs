@@ -30,6 +30,10 @@ fn cli_downgrade_floor_comes_from_the_selected_instance() {
     };
     let floor = instance_build_counter(Mode::Cli, tmp.path(), Some(&selected));
     assert_eq!(floor, selected.meta.build_counter);
+    assert_eq!(
+        instance_build_counter(Mode::Daemon, tmp.path(), Some(&selected)),
+        floor
+    );
     let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
     let (manifest, signature, public_key) = signed_manifest(&key, 2000);
     let failure = verify_manifest_bytes(
