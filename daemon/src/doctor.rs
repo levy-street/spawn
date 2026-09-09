@@ -243,8 +243,10 @@ async fn inspect(server_cli: Option<String>) -> Vec<Check> {
                 .and_then(|dir| crate::state::read(dir).ok().flatten())
             {
                 Some(state)
-                    if crate::state::daemon_state_is_live(&state)
-                        && state_file_fresh(config_dir.as_deref().unwrap()) =>
+                    if crate::state::daemon_state_is_live(
+                        config_dir.as_deref().unwrap(),
+                        &state,
+                    ) && state_file_fresh(config_dir.as_deref().unwrap()) =>
                 {
                     ok(8, "daemon heartbeat", format!("fresh (pid {})", state.pid))
                 }

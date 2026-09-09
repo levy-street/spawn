@@ -248,10 +248,10 @@ pub(super) fn status(config_dir: &Path) -> super::ServiceStatus {
         match state {
             Some(state) => {
                 state.pid == pid
-                    && crate::state::daemon_state_is_live(&state)
+                    && crate::state::daemon_state_is_live(config_dir, &state)
                     && crate::state::heartbeat_is_fresh(config_dir, Duration::from_secs(90))
             }
-            None => crate::state::pid_matches_current_daemon(pid, None),
+            None => crate::state::pid_matches_instance_daemon(config_dir, pid, None),
         }
     });
     let (stdout_log, stderr_log) = super::service_log_paths(config_dir);

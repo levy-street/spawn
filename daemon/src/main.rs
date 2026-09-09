@@ -112,6 +112,10 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Run(args) => run::run(cli.server.clone(), args).await,
+        Command::BuildInfo => {
+            println!("{}", serde_json::to_string(&version::BuildInfo::own())?);
+            Ok(())
+        }
         Command::Update => update::run_cli(cli.server.clone(), explicit_config).await,
         Command::Doctor(args) => doctor::run(cli.server.clone(), args, explicit_config).await,
         Command::Reconnect => lifecycle::reconnect(cli.server.clone(), explicit_config).await,

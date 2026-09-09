@@ -1106,16 +1106,23 @@ A host now keeps releases the way a package manager would:
 - **`possess` and `update` select.** A fresh instance is pointed at the
   release the possessing command runs; its unit's `ExecStart` is the constant
   path `instances/<tag>/current/spawnd`, so the unit is written once. An
-  update publishes the signed pair as a new release and repoints one
+  existing instance keeps its variant when possession activates a newer
+  installer: a standard installer fetches the signed diagnostics pair for a
+  diagnostics instance. The old live daemon is never published into the store.
+  A newer selected release is retained when possession runs from an older CLI.
+  An update publishes the signed pair as a new release and repoints one
   instance; the daemon re-executes from the new release with the same PID.
   Two instances updating to the same release publish it once between them.
 - **A failed update is undone by pointing back.** The previous release stays
   on disk through probation. Two failed starts or five minutes without
   registration repoint the instance at it and report the health failure.
-- **Migration is the first start.** A daemon launched from the old shared
-  pair adopts that exact pair into the store as a release, points its
-  instance at it, rewrites its unit for the constant path, and on Unix
-  re-executes from the store before it connects. Sessions, credentials, the
+- **Migration starts with a store-aware build.** `possess` selects and starts
+  the new installer build, preserving credentials and the instance's variant.
+  Publishing leaves a live legacy pair untouched even when its heartbeat
+  predates executable-path metadata. A store-aware daemon launched from a shared
+  pair can adopt that exact pair into the store as a release, point its
+  instance at it, rewrite its unit for the constant path, and on Unix
+  re-execute from the store before it connects. Sessions, credentials, the
   host identity, and browser trust are untouched: workers live outside the
   daemon and are re-adopted, and everything else is in the config directory,
   which gains one record (`install.json`) naming the install root. A macOS

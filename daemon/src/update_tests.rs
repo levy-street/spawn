@@ -10,6 +10,51 @@ fn test_executable(directory: &Path, stem: &str) -> PathBuf {
     directory.join(crate::platform::executable_name(stem))
 }
 
+#[test]
+fn cli_downgrade_floor_comes_from_the_selected_instance() {
+    let tmp = tempdir().unwrap();
+    let selected = Release {
+        dir: tmp.path().join("release"),
+        meta: install::ReleaseMeta {
+            id: "selected".into(),
+            version: "0.1.0+gselected".into(),
+            tree: "c".repeat(40),
+            variant: "release".into(),
+            spawnd_sha256: "a".repeat(64),
+            spawn_worker_sha256: "b".repeat(64),
+            installed_at_unix_ms: 0,
+            source: "test".into(),
+            build_counter: Some(u64::MAX - 1),
+            release_store: 1,
+        },
+    };
+    let floor = instance_build_counter(Mode::Cli, tmp.path(), Some(&selected));
+    assert_eq!(floor, selected.meta.build_counter);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let (manifest, signature, public_key) = signed_manifest(&key, 2000);
+    let failure = verify_manifest_bytes(
+        &manifest,
+        Some(signature.as_bytes()),
+        &manifest_request(),
+        "darwin-aarch64",
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: floor,
+            downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, "downgrade");
+    let mut unknown = selected;
+    unknown.meta.build_counter = None;
+    assert_eq!(
+        instance_build_counter(Mode::Cli, tmp.path(), Some(&unknown)),
+        None
+    );
+}
+
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -553,6 +598,7 @@ fn a_manifest_carrying_variants_still_verifies_and_resolves_the_release_pair() {
     let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
     let request = manifest_request();
     let expected = UpdatePlan {
+        build_counter: 2000,
         version: request.version.clone(),
         spawnd: request.spawnd.clone(),
         spawn_worker: request.spawn_worker.clone(),
@@ -596,6 +642,7 @@ fn the_diagnostics_variant_installs_its_own_pair_from_the_signed_manifest() {
     assert_eq!(
         plan,
         UpdatePlan {
+            build_counter: 2000,
             version: "0.1.0+gnew.diagnostics".into(),
             spawnd: DaemonUpdateArtifact {
                 path: "/api/install/spawnd/darwin-aarch64/diagnostics".into(),
@@ -1044,6 +1091,8 @@ async fn downloads_verifies_and_publishes_the_pair_as_one_release() {
             spawn_worker_sha256: worker_sha.clone(),
             installed_at_unix_ms: unix_millis(),
             source: "update".into(),
+            build_counter: Some(2000),
+            release_store: 1,
         },
     )
     .unwrap();

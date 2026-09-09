@@ -75,6 +75,9 @@ pub enum Command {
     /// to after downloading.
     #[command(name = "__publish-release", hide = true)]
     PublishRelease(PublishReleaseArgs),
+    /// Internal local build identity, including the downgrade floor.
+    #[command(name = "__build-info", hide = true)]
+    BuildInfo,
 }
 
 #[derive(Debug, Args)]

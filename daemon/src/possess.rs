@@ -178,13 +178,39 @@ fn breakaway_choice(picked: usize) -> BreakawayAction {
     }
 }
 
-fn install_background(dir: &Path, server: &Url, mode: Option<service::ServiceMode>) -> Result<()> {
+async fn install_background(
+    dir: &Path,
+    server: &Url,
+    mode: Option<service::ServiceMode>,
+) -> Result<()> {
+    let changed = crate::update::prepare_possession(dir, server).await?;
     #[cfg(windows)]
     service::ensure_user_path()?;
     match mode {
         Some(mode) => service::install_with_mode(dir, server.as_str(), mode),
         None => service::install(dir, server.as_str()),
+    }?;
+    // systemd's enable --now leaves an already-active daemon running. Restart
+    // after changing its selection so migration actually activates the pair.
+    #[cfg(target_os = "linux")]
+    if changed {
+        service::reconnect(dir, server.as_str())?;
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = changed;
+    // Publishing may have kept the pre-store CLI while the old daemon was
+    // alive. Once migration has restarted it, finish that deferred handoff.
+    if !matches!(
+        crate::install::provenance(),
+        crate::install::Provenance::Unmanaged
+    ) {
+        let layout = crate::install::layout_for_instance(dir)?;
+        if let Some(release) = crate::install::selected(&layout, dir)? {
+            let in_use = service::legacy_pair_in_use(&layout);
+            crate::install::set_cli_entry(&layout, &release, in_use)?;
+        }
+    }
+    Ok(())
 }
 
 fn offer_breakaway_fallback(dir: &Path, server: &Url) -> Result<()> {
@@ -275,6 +301,7 @@ async fn keep_possessed(
         )?;
         print_starting_step();
         install_background(dir, &server, service_mode)
+            .await
             .map_err(|error| login::background_service_error(&error))?;
         offer_breakaway_fallback(dir, &server)
             .map_err(|error| login::background_service_error(&error))?;
@@ -412,10 +439,12 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
 
     std::env::set_var("SPAWN_CONFIG_DIR", &final_dir);
     ui.begin(3, "[ RUNNING ]");
-    install_background(&final_dir, &server, service_mode).map_err(|error| {
-        ui.fail(3, "not started");
-        login::background_service_error(&error)
-    })?;
+    install_background(&final_dir, &server, service_mode)
+        .await
+        .map_err(|error| {
+            ui.fail(3, "not started");
+            login::background_service_error(&error)
+        })?;
     ui.complete(3, "running");
     ui.finish();
     offer_breakaway_fallback(&final_dir, &server)
@@ -540,12 +569,14 @@ async fn possess_dir(
             print_starting_step();
         }
     }
-    install_background(dir, &server, service_mode).map_err(|error| {
-        if let Some(ui) = &ui {
-            ui.fail(3, "not started");
-        }
-        login::background_service_error(&error)
-    })?;
+    install_background(dir, &server, service_mode)
+        .await
+        .map_err(|error| {
+            if let Some(ui) = &ui {
+                ui.fail(3, "not started");
+            }
+            login::background_service_error(&error)
+        })?;
     if let Some(ui) = ui {
         ui.complete(3, "running");
         ui.finish();

@@ -55,6 +55,7 @@ pub const RELEASE_META: &str = "release.json";
 /// The record in an instance's config directory naming its install root.
 pub const INSTALL_RECORD: &str = "install.json";
 /// Unix: the per-instance pointer under `instances/<tag>/`.
+#[cfg(not(windows))]
 pub const CURRENT_LINK: &str = "current";
 /// Windows: the per-instance record under `instances\<tag>\`.
 #[cfg(windows)]
@@ -226,8 +227,8 @@ pub fn running_exe_dir() -> Option<PathBuf> {
 
 /// The executable a live process runs, and whether the file it was started
 /// from has since been replaced on disk — which is exactly the state a daemon
-/// is in when an installer swapped the pair under it. Linux reads it from the
-/// process itself; elsewhere only the daemon's own heartbeat can say.
+/// is in when an installer swapped the pair under it. Linux and Windows read
+/// the image from the process; elsewhere the daemon's heartbeat supplies it.
 pub fn live_exe(pid: u32) -> Option<(PathBuf, bool)> {
     #[cfg(target_os = "linux")]
     {
@@ -238,7 +239,11 @@ pub fn live_exe(pid: u32) -> Option<(PathBuf, bool)> {
             None => Some((link, false)),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        crate::state::live_process_exe(pid).map(|path| (path, false))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = pid;
         None
@@ -319,6 +324,10 @@ pub struct ReleaseMeta {
     pub installed_at_unix_ms: u64,
     /// `install`, `update`, or `adopt` (a running pair brought into the store).
     pub source: String,
+    #[serde(default)]
+    pub build_counter: Option<u64>,
+    #[serde(default)]
+    pub release_store: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +356,8 @@ impl Release {
 pub struct PairIdentity {
     pub version: String,
     pub tree: String,
+    pub build_counter: Option<u64>,
+    pub release_store: u32,
 }
 
 impl PairIdentity {
@@ -457,8 +468,12 @@ fn now_unix_ms() -> u64 {
 /// Run `<binary> --version` with a deadline; a binary that hangs is not one
 /// we install.
 fn run_version(binary: &Path) -> Result<String> {
-    let mut child =
-        spawn_version(binary).with_context(|| format!("running {} --version", binary.display()))?;
+    run_probe(binary, "--version")
+}
+
+fn run_probe(binary: &Path, argument: &str) -> Result<String> {
+    let mut child = spawn_probe(binary, argument)
+        .with_context(|| format!("running {} {argument}", binary.display()))?;
     let mut stdout = child.stdout.take().context("capturing --version output")?;
     let reader = std::thread::spawn(move || {
         use std::io::Read;
@@ -493,11 +508,11 @@ fn run_version(binary: &Path) -> Result<String> {
 /// every open descriptor until its own exec — so a brief retry is the
 /// difference between an installer that works and one that fails on a busy
 /// host.
-fn spawn_version(binary: &Path) -> io::Result<std::process::Child> {
+fn spawn_probe(binary: &Path, argument: &str) -> io::Result<std::process::Child> {
     let mut attempts = 0;
     loop {
         match std::process::Command::new(binary)
-            .arg("--version")
+            .arg(argument)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -538,10 +553,23 @@ pub fn probe_pair(spawnd: &Path, spawn_worker: &Path) -> Result<PairIdentity> {
     if daemon_version != worker_version {
         bail!("spawn-worker {worker_version} does not match spawnd {daemon_version}");
     }
+    let info = probe_build_info(spawnd).ok();
+    if let Some(info) = &info {
+        if info.version != daemon_version || Some(info.tree.as_str()) != tree.as_deref() {
+            bail!("spawnd build identity does not match its worker");
+        }
+    }
     Ok(PairIdentity {
         version: daemon_version,
         tree: tree.unwrap_or_default(),
+        build_counter: info.as_ref().and_then(|info| info.build_counter),
+        release_store: info.map_or(0, |info| info.release_store),
     })
+}
+
+pub fn probe_build_info(binary: &Path) -> Result<crate::version::BuildInfo> {
+    serde_json::from_str(&run_probe(binary, "__build-info")?)
+        .context("reading spawnd build identity")
 }
 
 pub fn read_release(dir: &Path) -> Result<Release> {
@@ -623,7 +651,7 @@ pub struct PublishSource<'a> {
 fn copy_executable(from: &Path, to: &Path) -> io::Result<()> {
     fs::copy(from, to)?;
     crate::platform::set_executable(to)?;
-    fs::File::open(to)?.sync_all()
+    fs::OpenOptions::new().write(true).open(to)?.sync_all()
 }
 
 fn write_json_new(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -671,6 +699,9 @@ fn staging_dir(layout: &Layout) -> PathBuf {
 /// name already taken is refused, never overwritten.
 pub fn publish(layout: &Layout, source: PublishSource<'_>) -> Result<Release> {
     let identity = probe_pair(source.spawnd, source.spawn_worker)?;
+    if identity.release_store != 1 {
+        bail!("this spawnd predates the release store; install a current SPAWN D build");
+    }
     let spawnd_sha256 = sha256_file(source.spawnd)
         .with_context(|| format!("hashing {}", source.spawnd.display()))?;
     let spawn_worker_sha256 = sha256_file(source.spawn_worker)
@@ -684,6 +715,8 @@ pub fn publish(layout: &Layout, source: PublishSource<'_>) -> Result<Release> {
         spawn_worker_sha256,
         installed_at_unix_ms: now_unix_ms(),
         source: source.source.to_owned(),
+        build_counter: identity.build_counter,
+        release_store: identity.release_store,
     };
     publish_with_meta(layout, source, meta)
 }
@@ -719,7 +752,7 @@ pub fn publish_with_meta(
         // The staged files must reach stable storage before the directory
         // rename publishes them, or a power loss leaves a named release
         // whose files are empty.
-        fs::File::open(&staging)?.sync_all().ok();
+        crate::platform::sync_parent_dir(&staging.join(RELEASE_META))?;
         Ok(())
     })();
     if let Err(error) = staged {
@@ -795,16 +828,15 @@ pub fn recorded_layout(config_dir: &Path) -> Option<Layout> {
     (record.version == 1 && record.root.is_absolute()).then(|| Layout::at(record.root))
 }
 
-/// The layout that holds an instance's pointer. A daemon running from the
-/// store is in the layout that holds it; anything else follows what the
-/// instance recorded, then where a legacy launch path says the root is, then
-/// the user default.
+/// The instance's recorded root wins over the command's own install root.
+/// An instance without a record follows the executable's layout, then the
+/// user default.
 pub fn layout_for_instance(config_dir: &Path) -> Result<Layout> {
-    if let Provenance::Store { layout, .. } = provenance() {
-        return Ok(layout.clone());
-    }
     if let Some(layout) = recorded_layout(config_dir) {
         return Ok(layout);
+    }
+    if let Provenance::Store { layout, .. } = provenance() {
+        return Ok(layout.clone());
     }
     match provenance() {
         Provenance::Legacy { layout } => Ok(layout.clone()),
@@ -815,6 +847,22 @@ pub fn layout_for_instance(config_dir: &Path) -> Result<Layout> {
 // ---------------------------------------------------------------------------
 // Per-instance selection
 // ---------------------------------------------------------------------------
+
+/// Serialize selection changes from installers and updater processes. The
+/// file is separate from the pointer and closes (unlocking) on every error.
+pub fn lock_instance(layout: &Layout, config_dir: &Path) -> Result<fs::File> {
+    let instance = layout.instance_dir(config_dir);
+    fs::create_dir_all(&instance)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(instance.join("selection.lock"))?;
+    file.try_lock()
+        .context("another process is changing this instance's release")?;
+    Ok(file)
+}
 
 #[cfg(windows)]
 #[derive(Debug, Serialize, Deserialize)]
@@ -1030,31 +1078,47 @@ pub fn probation_marker_path(layout: &Layout, config_dir: &Path) -> PathBuf {
 /// selection already there. This is how a legacy launch converges and how a
 /// fresh `possess` gets its first release.
 ///
-/// Which pair: the one the instance's live daemon runs, when there is one
-/// and the machine can name it — so resuming a diagnostics instance from a
-/// release-build command keeps it on diagnostics — else this process's own.
+/// Only this process's store-aware pair can initialize a selection. A live
+/// instance of another variant must first be migrated by possession.
 pub fn ensure_selected(config_dir: &Path) -> Result<(Layout, Release)> {
     let layout = layout_for_instance(config_dir)?;
+    let _selection_lock = lock_instance(&layout, config_dir)?;
     if let Some(release) = selected(&layout, config_dir)? {
+        if release.meta.release_store != 1 {
+            bail!("this selection predates the release-store identity; run spawnd possess to migrate it");
+        }
         return Ok((layout, release));
     }
-    let release = match live_daemon_exe(config_dir) {
-        Some(exe) if running_exe() != Some(exe.as_path()) => adopt_pair_at(&layout, &exe)
-            .or_else(|error| {
-                tracing::warn!(%error, "could not adopt the running daemon's pair; adopting this command's");
-                adopt_running_pair(&layout)
-            })?,
-        _ => adopt_running_pair(&layout)?,
-    };
+    let wanted = instance_variant(&layout, config_dir);
+    let release = adopt_running_pair(&layout)?;
+    if wanted.is_some_and(|variant| variant != release.meta.variant) {
+        bail!("this instance uses another release variant; run spawnd possess to migrate it");
+    }
     select(&layout, config_dir, &release)?;
     Ok((layout, release))
 }
 
+/// Preserve an instance's variant even when the installer is the standard
+/// build. A stopped legacy instance can still be identified from its unit.
+pub fn instance_variant(layout: &Layout, config_dir: &Path) -> Option<String> {
+    if let Ok(Some(release)) = selected(layout, config_dir) {
+        return Some(release.meta.variant);
+    }
+    if let Ok(Some(state)) = crate::state::read(config_dir) {
+        if crate::state::daemon_state_is_live(config_dir, &state) {
+            return Some(variant_of_version(&state.version).to_owned());
+        }
+    }
+    let executable = crate::service::launch_report(config_dir).binary?;
+    let (version, _) = parse_version_line(&run_version(&executable).ok()?, "spawnd").ok()?;
+    Some(variant_of_version(&version).to_owned())
+}
+
 /// The executable the instance's live daemon runs, when a heartbeat is live
 /// and the kernel or the heartbeat names it.
-fn live_daemon_exe(config_dir: &Path) -> Option<PathBuf> {
+pub fn live_daemon_exe(config_dir: &Path) -> Option<PathBuf> {
     let state = crate::state::read(config_dir).ok().flatten()?;
-    if !crate::state::daemon_state_is_live(&state) {
+    if !crate::state::daemon_state_is_live(config_dir, &state) {
         return None;
     }
     match live_exe(state.pid) {
@@ -1073,7 +1137,9 @@ fn adopt_pair_at(layout: &Layout, exe: &Path) -> Result<Release> {
     } = provenance_of(exe)
     {
         if &own == layout {
-            if let Some(release) = release_by_id(layout, &release_id)? {
+            if let Some(release) =
+                release_by_id(layout, &release_id)?.filter(|r| r.meta.release_store == 1)
+            {
                 return Ok(release);
             }
         }
@@ -1096,31 +1162,8 @@ fn adopt_pair_at(layout: &Layout, exe: &Path) -> Result<Release> {
 /// The running pair as a release: the store copy when this is one, else the
 /// pair beside the executable, published.
 pub fn adopt_running_pair(layout: &Layout) -> Result<Release> {
-    if let Provenance::Store {
-        layout: own,
-        release_id,
-    } = provenance()
-    {
-        if own == layout {
-            if let Some(release) = release_by_id(layout, release_id)? {
-                return Ok(release);
-            }
-        }
-    }
     let exe = running_exe().context("resolving the running spawnd")?;
-    let worker = exe
-        .parent()
-        .map(|dir| dir.join(crate::platform::executable_name("spawn-worker")))
-        .filter(|worker| worker.is_file())
-        .context("no spawn-worker beside the running spawnd")?;
-    publish(
-        layout,
-        PublishSource {
-            spawnd: exe,
-            spawn_worker: &worker,
-            source: "adopt",
-        },
-    )
+    adopt_pair_at(layout, exe)
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,6 +1176,7 @@ pub enum LaunchRedirect {
     /// Running from the store, or from nowhere the store manages.
     None,
     /// Unix: the instance's release is at this path; re-execute from it.
+    #[cfg(unix)]
     Exec(PathBuf),
     /// The instance is recorded and its pointer set; this process keeps its
     /// legacy pair until it restarts (Windows, or an exec that cannot happen).
@@ -1146,13 +1190,16 @@ pub enum LaunchRedirect {
 /// While a legacy probation marker sits beside the executable the previous
 /// updater's promise is kept first, and adoption waits for the next start.
 pub fn prepare_launch(config_dir: &Path) -> Result<LaunchRedirect> {
-    let Provenance::Legacy { .. } = provenance() else {
+    if matches!(provenance(), Provenance::Unmanaged) {
         return Ok(LaunchRedirect::None);
-    };
-    if legacy_marker_present() {
+    }
+    if provenance().is_legacy() && legacy_marker_present() {
         return Ok(LaunchRedirect::None);
     }
     let (layout, release) = ensure_selected(config_dir)?;
+    if matches!(provenance(), Provenance::Store { release_id, .. } if release_id == release.id()) {
+        return Ok(LaunchRedirect::None);
+    }
     tracing::info!(
         release = release.id(),
         launch = %launch_path(&layout, config_dir).display(),
@@ -1373,7 +1420,7 @@ pub fn collect_garbage(layout: &Layout, config_dirs: &[PathBuf]) -> GcReport {
     }
     for config_dir in config_dirs {
         if let Ok(Some(state)) = crate::state::read(config_dir) {
-            if crate::state::daemon_state_is_live(&state) {
+            if crate::state::daemon_state_is_live(config_dir, &state) {
                 protected.extend(state.release);
             }
         }
@@ -1621,12 +1668,66 @@ fn publish_lines(output: &PublishOutput) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn publishing_flushes_and_selects_a_complete_pair_on_every_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().join("install"));
+        let daemon = tmp.path().join("daemon-source");
+        let worker = tmp.path().join("worker-source");
+        fs::write(&daemon, b"daemon bytes").unwrap();
+        fs::write(&worker, b"worker bytes").unwrap();
+        let daemon_sha = sha256_file(&daemon).unwrap();
+        let worker_sha = sha256_file(&worker).unwrap();
+        let release = publish_with_meta(
+            &layout,
+            PublishSource {
+                spawnd: &daemon,
+                spawn_worker: &worker,
+                source: "test",
+            },
+            ReleaseMeta {
+                id: release_id("0.1.0+gtest", &daemon_sha, &worker_sha),
+                version: "0.1.0+gtest".into(),
+                tree: "a".repeat(40),
+                variant: "release".into(),
+                spawnd_sha256: daemon_sha,
+                spawn_worker_sha256: worker_sha,
+                installed_at_unix_ms: 0,
+                source: "test".into(),
+                build_counter: Some(3000),
+                release_store: 1,
+            },
+        )
+        .unwrap();
+        verify_release(&release).unwrap();
+        let config = tmp.path().join("config");
+        fs::create_dir(&config).unwrap();
+        select(&layout, &config, &release).unwrap();
+        assert_eq!(selected(&layout, &config).unwrap(), Some(release));
+        assert_eq!(
+            fs::read(launch_path(&layout, &config)).unwrap(),
+            b"daemon bytes"
+        );
+    }
+
+    #[test]
+    fn selection_lock_excludes_other_handles_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::at(tmp.path().join("install"));
+        let config = tmp.path().join("config");
+        let lock = lock_instance(&layout, &config).unwrap();
+        assert!(lock_instance(&layout, &config).is_err());
+        drop(lock);
+        assert!(lock_instance(&layout, &config).is_ok());
+    }
+
+    #[cfg(unix)]
     fn fake_pair(dir: &Path, version: &str, tree: &str, body_tag: &str) -> (PathBuf, PathBuf) {
         let spawnd = dir.join(crate::platform::executable_name("spawnd"));
         let worker = dir.join(crate::platform::executable_name("spawn-worker"));
         fs::write(
             &spawnd,
-            format!("#!/bin/sh\n# {body_tag}\nprintf 'spawnd {version}\\n'\n"),
+            format!("#!/bin/sh\n# {body_tag}\nif [ \"$1\" = __build-info ]; then\nprintf '%s\\n' '{{\"version\":\"{version}\",\"tree\":\"{tree}\",\"build_counter\":1000,\"release_store\":1}}'\nelse\nprintf 'spawnd {version}\\n'\nfi\n"),
         )
         .unwrap();
         fs::write(

@@ -65,6 +65,7 @@ update_test_new_fixture two-accounts
 update_test_prepare_database
 update_test_start_server 0
 update_test_mint_credentials
+python3 scripts/test-install-migration.py "$UPDATE_ARTIFACTS/new/spawnd" "$UPDATE_DAEMON_URL"
 first_config="$UPDATE_CONFIG_DIR"
 first_home="$UPDATE_DAEMON_HOME"
 update_test_start_daemon
@@ -93,14 +94,14 @@ chmod 755 "$stage/spawnd" "$stage/spawn-worker"
 # off bin/ — the first daemon's own pair, had it not moved into the store.
 mkdir -p "$first_home/.config/systemd/user"
 printf 'ExecStart="%s" run\n' "$UPDATE_BIN_DIR/spawnd" >"$first_home/.config/systemd/user/spawn-legacy.service"
-publish_out="$(HOME="$first_home" "$stage/spawnd" __publish-release --install-root "$UPDATE_FIXTURE")"
+publish_out="$(env -u XDG_CONFIG_HOME -u SPAWN_CONFIG_DIR HOME="$first_home" "$stage/spawnd" __publish-release --install-root "$UPDATE_FIXTURE")"
 printf '%s\n' "$publish_out"
 grep -q "was left as it is" <<<"$publish_out" \
   || update_test_die "the installer replaced a pair a daemon still starts from"
 cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
   || update_test_die "bin/spawnd was rewritten under a unit that names it"
 rm "$first_home/.config/systemd/user/spawn-legacy.service"
-publish_out="$(HOME="$first_home" "$stage/spawnd" __publish-release --install-root "$UPDATE_FIXTURE")"
+publish_out="$(env -u XDG_CONFIG_HOME -u SPAWN_CONFIG_DIR HOME="$first_home" "$stage/spawnd" __publish-release --install-root "$UPDATE_FIXTURE")"
 printf '%s\n' "$publish_out"
 grep -q "now runs this release" <<<"$publish_out" \
   || update_test_die "the installer did not point bin/ at the new release once nothing launched from it"
@@ -209,8 +210,7 @@ worker = checks["worker binary"]
 assert worker["status"] == "ok", worker
 assert "matches the running spawnd" in worker["detail"], worker
 layout = checks["install layout"]
-assert layout["status"] == "warn", layout
-assert "without a selection" in layout["detail"], layout
+assert layout["status"] == "ok", layout
 PY
 printf '%s\n' "test-instance-releases: PASS status/doctor judge the instance"
 
@@ -246,6 +246,23 @@ cmp -s "$(exe_of "$SECOND_DAEMON_PID")" "$UPDATE_ARTIFACTS/new-diagnostics/spawn
   || update_test_die "updating the first instance disturbed the second"
 pair_matches_at "$(exe_of "$first_pid")" && pair_matches_at "$(exe_of "$SECOND_DAEMON_PID")" \
   || update_test_die "a pair stopped matching after the updates"
+
+# A shell's old CLI must use the instance's newer counter when a server
+# replays an older, correctly signed release. No local downgrade consent.
+update_test_write_manifest "$UPDATE_TREE_A" "$UPDATE_COUNTER_A" \
+  "$UPDATE_ARTIFACTS/old/spawnd" "$UPDATE_ARTIFACTS/old/spawn-worker"
+replay_log="$UPDATE_FIXTURE/replayed-release.log"
+if env -u SPAWN_SERVER_URL -u XDG_CONFIG_HOME HOME="$first_home" \
+  SPAWN_DISABLE_KEYRING=1 SPAWN_CONFIG_DIR="$first_config" \
+  "$UPDATE_ARTIFACTS/old/spawnd" --server "$UPDATE_DAEMON_URL" \
+    --config-dir "$first_config" update >"$replay_log" 2>&1; then
+  update_test_die "an old CLI accepted a signed downgrade of the newer instance"
+fi
+grep -q downgrade "$replay_log" || update_test_die "replay was not rejected by the counter guard"
+update_test_installed_is new || update_test_die "the replay changed the instance selection"
+[[ -S "$first_worker_socket" ]] || update_test_die "the replay disturbed the session"
+update_test_write_manifest "$UPDATE_TREE_B" "$UPDATE_COUNTER_B"
+printf '%s\n' "test-instance-releases: PASS old CLI rejects a signed downgrade of its instance"
 # Collection: the two releases the instances moved off stay through the grace
 # period, then go on the next pass — except the one the command on PATH still
 # resolves to, which must keep working. The two live releases remain.
