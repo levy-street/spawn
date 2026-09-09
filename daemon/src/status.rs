@@ -112,6 +112,7 @@ fn instance_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
 /// What an instance runs and what it is pointed at, read from the machine
 /// rather than assumed from the command. Shared with `doctor`.
 pub(crate) struct InstanceBuild {
+    config_dir: PathBuf,
     pub(crate) state: Option<crate::state::StateFile>,
     pub(crate) selected: Option<crate::install::Release>,
     /// The version to report for the instance.
@@ -125,7 +126,7 @@ impl InstanceBuild {
     pub(crate) fn live(&self) -> Option<&crate::state::StateFile> {
         self.state
             .as_ref()
-            .filter(|state| crate::state::daemon_state_is_live(state))
+            .filter(|state| crate::state::daemon_state_is_live(&self.config_dir, state))
     }
 }
 
@@ -133,7 +134,7 @@ pub(crate) fn instance_build(config_dir: &Path) -> InstanceBuild {
     let state = crate::state::read(config_dir).ok().flatten();
     let live = state
         .as_ref()
-        .filter(|state| crate::state::daemon_state_is_live(state));
+        .filter(|state| crate::state::daemon_state_is_live(config_dir, state));
     let selected = crate::install::layout_for_instance(config_dir)
         .ok()
         .and_then(|layout| crate::install::selected(&layout, config_dir).ok().flatten());
@@ -168,6 +169,7 @@ pub(crate) fn instance_build(config_dir: &Path) -> InstanceBuild {
                 .flatten()
         });
     InstanceBuild {
+        config_dir: config_dir.to_path_buf(),
         state,
         selected,
         version,
@@ -181,7 +183,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     let server = crate::config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
     let build = instance_build(dir);
     let heartbeat = build.state.as_ref();
-    let connection = connection_text(heartbeat);
+    let connection = connection_text(dir, heartbeat);
     let sessions = heartbeat.map_or(0, |state| state.sessions);
     let update = release_state(&server, build.tree.as_deref()).await;
     let host_key = crate::creds::host_identity(&stored)?.map(|identity| identity.fingerprint);
@@ -281,10 +283,15 @@ fn pair_text(live: Option<&crate::state::StateFile>) -> String {
     }
 }
 
-fn connection_text(state: Option<&crate::state::StateFile>) -> String {
-    let Some(state) = state.filter(|state| crate::state::daemon_state_is_live(state)) else {
+fn connection_text(config_dir: &Path, state: Option<&crate::state::StateFile>) -> String {
+    let Some(state) = state.filter(|state| crate::state::daemon_state_is_live(config_dir, state))
+    else {
         return "not running — start with: spawnd reconnect".into();
     };
+    live_connection_text(state)
+}
+
+fn live_connection_text(state: &crate::state::StateFile) -> String {
     if state.connected {
         let age = state
             .connected_at
@@ -451,6 +458,7 @@ mod tests {
             }),
             sessions: 1,
             tree: None,
+            build_counter: None,
             exe: exe.map(str::to_owned),
             release: None,
             worker_mismatch,
@@ -460,7 +468,7 @@ mod tests {
     #[test]
     fn auth_heartbeat_has_the_exact_status_remedy() {
         assert_eq!(
-            connection_text(Some(&state("0.1.0", None, false))),
+            live_connection_text(&state("0.1.0", None, false)),
             "rejected by server (signed out) — fix with: spawnd login"
         );
     }

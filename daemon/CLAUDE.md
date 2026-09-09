@@ -406,7 +406,8 @@ the layout that ends this:
 ```
 
 - **A release is published once and never modified.** `install::publish`
-  probes both binaries' `--version`, refuses a pair whose halves disagree,
+  probes both binaries' `--version` and the daemon's `__build-info`, refuses
+  a pair whose halves disagree or whose daemon predates the release store,
   writes a staging directory under `releases/` and renames it into place.
   Publishing the same bytes again returns the release already there; a
   different pair under the same name is refused. Two installers racing to
@@ -425,8 +426,12 @@ the layout that ends this:
   command on PATH becomes a link into the store — unless some daemon still
   starts from a regular-file pair in `bin/` (`service::legacy_pair_in_use`),
   in which case that pair is left untouched until the daemon restarts.
-  `service::install` writes a unit for the instance's launch path and selects
-  the running release for a fresh instance; `update` publishes the signed
+  `possess` selects the installer build, preserving the instance's variant
+  (fetching its signed pair when the installer is another variant), then
+  registers and starts it. It never adopts a live pre-store daemon. Legacy
+  heartbeats without an executable field are checked against the live process;
+  an unknown image keeps the shared pair intact. `service::install` writes a
+  unit for the instance's launch path; `update` publishes the signed
   pair and repoints one instance. Nothing ever writes a file another instance
   is running.
 - **A legacy launch converges on its first start.** `run` calls
@@ -442,6 +447,8 @@ the layout that ends this:
   failed probation points the instance back at the previous release, which
   stays on disk until nothing refers to it. A marker the in-place updater left
   beside a legacy binary is still honoured with its `.prev` semantics, once.
+  Installers and updaters lock `selection.lock` before changing the pointer;
+  an existing probation marker prevents another update from replacing it.
 - **Collection is conservative.** `install::collect_garbage` removes releases
   no instance selects, no marker names, the command on PATH does not resolve
   to, this process does not run, no live heartbeat records, and that are older
@@ -449,8 +456,9 @@ the layout that ends this:
   `spawnd update`, `exorcise`, and `reset`.
 
 `SPAWN_INSTALL_ROOT` chooses the root for an install and for a binary the
-store does not yet manage; a binary the store does manage knows its root
-from its own path. A checkout's `target/debug/spawnd` is "unmanaged": it is
+store does not yet manage. An instance's `install.json` takes precedence over
+the inspecting CLI's install root; without a record the executable supplies
+its root. A checkout's `target/debug/spawnd` is "unmanaged": it is
 launched from where it is and only its first update moves it into the store.
 
 `spawn-worker --version` prints the same build/tree identity stamped into
@@ -474,7 +482,12 @@ a daemon's.
 Every self-update first downloads the origin-pinned
 `/api/install/manifest.json{,.sig}`, verifies the exact manifest bytes against
 the rotation list in `release_key.rs`, matches its tree and both artifact
-hashes, and enforces the build.rs-stamped monotonic release counter. Nothing the
+hashes, and enforces the build.rs-stamped monotonic release counter. A CLI
+uses the higher counter of the target instance's selected and live builds,
+recorded in `release.json` and its heartbeat; a known instance with missing
+identity blocks updating until possession migrates it. Downloaded build
+metadata must match the signed counter, version, tree, and store capability.
+Nothing the
 server sends can waive that counter: `daemon.update` carries an
 `allow_downgrade` flag, but it only *asks*, and the daemon proceeds only when a
 downgrade has also been consented to on this machine — a `allow-downgrade` file
@@ -495,7 +508,9 @@ above.
 The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
 `status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,
 `reset`, and foreground-only `run`; `__publish-release` is the installers'
-hidden handoff. `possess --new-account` creates another isolated account
+hidden handoff, and `__build-info` reports version, tree, monotonic counter,
+and release-store capability as JSON without changing `--version`.
+`possess --new-account` creates another isolated account
 instance with its own release pointer. `update`, like `reconnect`, acts on
 every instance it can see and judges each by the release it runs, whatever
 build the command itself is. On Windows, `possess --service-mode task|run`

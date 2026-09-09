@@ -27,6 +27,27 @@ pub fn build_counter() -> Option<u64> {
     BUILD_COUNTER_RAW.parse().ok()
 }
 
+/// Local installer/updater contract. An old in-place updater must never run
+/// from an immutable release shared by several instances.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BuildInfo {
+    pub version: String,
+    pub tree: String,
+    pub build_counter: Option<u64>,
+    pub release_store: u32,
+}
+
+impl BuildInfo {
+    pub fn own() -> Self {
+        Self {
+            version: build_version(),
+            tree: DAEMON_TREE.to_owned(),
+            build_counter: build_counter(),
+            release_store: 1,
+        }
+    }
+}
+
 /// Stable, machine-readable identity emitted by `spawn-worker --version`.
 pub fn worker_identity_line() -> String {
     format!("spawn-worker {BUILD_VERSION} tree={DAEMON_TREE}")

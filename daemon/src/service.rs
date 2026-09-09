@@ -610,11 +610,11 @@ pub fn legacy_pair_in_use(layout: &crate::install::Layout) -> bool {
     let bin_text = bin.display().to_string();
     for dir in crate::install::known_config_dirs() {
         if let Ok(Some(state)) = crate::state::read(&dir) {
-            if crate::state::daemon_state_is_live(&state)
-                && state
-                    .exe
-                    .as_deref()
-                    .is_some_and(|exe| same_launch_path(Path::new(exe), &bin))
+            if crate::state::daemon_state_is_live(&dir, &state)
+                && crate::install::live_exe(state.pid)
+                    .map(|(exe, _)| exe)
+                    .or_else(|| state.exe.as_deref().map(PathBuf::from))
+                    .is_none_or(|exe| same_launch_path(&exe, &bin))
             {
                 return true;
             }
@@ -1025,6 +1025,9 @@ pub fn install_with_mode(config_dir: &Path, server: &str, mode: ServiceMode) -> 
             }
             ServiceMode::Run => {
                 windows_task::uninstall(config_dir)?;
+                // Reinstalling the same mode must release the old watchdog's
+                // lock and daemon before starting the newly selected pair.
+                windows_run::uninstall(config_dir)?;
                 windows_run::install(config_dir, &server)
             }
         }

@@ -540,6 +540,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     // continues under its service manager.
     let config_dir = crate::config::config_dir()?;
     match crate::install::prepare_launch(&config_dir) {
+        #[cfg(unix)]
         Ok(crate::install::LaunchRedirect::Exec(target)) => {
             #[cfg(unix)]
             {
