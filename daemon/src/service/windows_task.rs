@@ -185,6 +185,20 @@ fn query_xml(config_dir: &Path) -> Option<String> {
     Some(decode_command_text(&output.stdout))
 }
 
+/// The `<Command>` the registered task runs, when the task exists.
+#[cfg(windows)]
+pub(super) fn registered_binary(config_dir: &Path) -> Option<std::path::PathBuf> {
+    let xml = query_xml(config_dir)?;
+    parse_task_command(&xml).map(std::path::PathBuf::from)
+}
+
+fn parse_task_command(xml: &str) -> Option<String> {
+    let open = xml.find("<Command>")? + "<Command>".len();
+    let rest = &xml[open..];
+    let close = rest.find("</Command>")?;
+    Some(super::xml_unescape(rest[..close].trim()))
+}
+
 #[cfg(windows)]
 fn decode_command_text(bytes: &[u8]) -> String {
     let little_endian =
@@ -205,9 +219,9 @@ fn decode_command_text(bytes: &[u8]) -> String {
 
 #[cfg(windows)]
 pub(super) fn install(config_dir: &Path, server: &str) -> Result<()> {
-    let bin = super::current_bin()?;
+    let bin = super::launch_bin(config_dir)?;
     if !bin.is_absolute() {
-        bail!("the running spawnd executable path is not absolute");
+        bail!("the spawnd launch path is not absolute");
     }
     let sid = super::control::current_user_sid()?;
     let xml = task_xml(config_dir, &bin, server, &sid)?;
@@ -315,7 +329,7 @@ pub(super) fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
     let breakaway = crate::state::read(config_dir)
         .ok()
         .flatten()
-        .filter(crate::state::daemon_state_is_live)
+        .filter(|state| crate::state::daemon_state_is_live(config_dir, state))
         .filter(|_| crate::state::heartbeat_is_fresh(config_dir, Duration::from_secs(90)))
         .and_then(|state| state.task_breakaway_denied);
     if breakaway != Some(false) {
@@ -342,10 +356,10 @@ pub(super) fn status(config_dir: &Path) -> super::ServiceStatus {
         match state {
             Some(state) => {
                 state.pid == pid
-                    && crate::state::daemon_state_is_live(&state)
+                    && crate::state::daemon_state_is_live(config_dir, &state)
                     && crate::state::heartbeat_is_fresh(config_dir, Duration::from_secs(90))
             }
-            None => crate::state::pid_matches_current_daemon(pid, None),
+            None => crate::state::pid_matches_instance_daemon(config_dir, pid, None),
         }
     });
     let (stdout_log, stderr_log) = super::service_log_paths(config_dir);
@@ -362,7 +376,7 @@ pub(super) fn status(config_dir: &Path) -> super::ServiceStatus {
 #[cfg(windows)]
 pub(super) fn diagnostic(config_dir: &Path) -> Option<String> {
     let xml = query_xml(config_dir)?;
-    let bin = super::current_bin().ok()?;
+    let bin = super::expected_launch_bin(config_dir)?;
     let server = super::registered_server(config_dir, "");
     let sid = super::control::current_user_sid().ok()?;
     let required = [
@@ -623,6 +637,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded, xml);
+    }
+
+    #[test]
+    fn the_registered_command_is_read_back_from_the_task_xml() {
+        let config = Path::new(r"C:\Users\a\AppData\Local\spawn\acct");
+        let bin = Path::new(r"C:\Users\a & b\AppData\Local\spawn\instances\1234abcd\spawnd.exe");
+        let xml = task_xml(config, bin, "https://spawnd.dev", "S-1-5-21-1").unwrap();
+        assert_eq!(
+            parse_task_command(&xml).as_deref(),
+            Some(bin.to_str().unwrap())
+        );
+        assert_eq!(parse_task_command("<Task/>"), None);
     }
 
     #[test]

@@ -29,6 +29,23 @@ pub struct StateFile {
     pub server: String,
     pub last_error: Option<LastError>,
     pub sessions: usize,
+    /// The daemon tree this process was built from; what `status` compares
+    /// against the server's release for *this* instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_counter: Option<u64>,
+    /// The canonical executable this process runs, so a command in a shell
+    /// can tell which build an instance actually is, not which one it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    /// The release-store id when the executable is a published release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+    /// Whether the co-installed worker last failed the identity check — the
+    /// state in which the daemon refuses new sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_mismatch: bool,
 }
 
 pub struct StateStore {
@@ -60,6 +77,14 @@ pub fn active_heartbeat(sessions: usize) {
     }
 }
 
+/// Record the worker identity check's latest verdict. Written only when it
+/// changes, so the check before every session create costs no disk write.
+pub fn active_worker_mismatch(mismatch: bool) {
+    if let Some(store) = ACTIVE_STATE.get() {
+        store.worker_mismatch(mismatch);
+    }
+}
+
 pub fn connection_error_class(class: &str) -> (&'static str, &'static str) {
     match class {
         "dns" => ("dns", "dns"),
@@ -83,6 +108,7 @@ impl StateStore {
         server: &str,
         task_breakaway_denied: Option<bool>,
     ) -> Self {
+        let provenance = crate::install::provenance();
         Self {
             path: state_path(config_dir),
             state: Mutex::new(StateFile {
@@ -95,7 +121,23 @@ impl StateStore {
                 server: server.to_owned(),
                 last_error: None,
                 sessions: 0,
+                tree: crate::version::daemon_tree().map(str::to_owned),
+                build_counter: crate::version::build_counter(),
+                exe: crate::install::running_exe().map(|exe| exe.display().to_string()),
+                release: provenance.release_id().map(str::to_owned),
+                worker_mismatch: false,
             }),
+        }
+    }
+
+    pub fn worker_mismatch(&self, mismatch: bool) {
+        let mut state = self.state.lock().expect("state heartbeat lock");
+        if state.worker_mismatch == mismatch {
+            return;
+        }
+        state.worker_mismatch = mismatch;
+        if let Err(error) = write_atomic(&self.path, &state) {
+            tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }
     }
 
@@ -199,7 +241,11 @@ pub fn pid_is_alive(pid: u32) -> bool {
 /// Stronger Windows daemon check used by status and doctor: the process is
 /// live, is the expected running `spawnd.exe`, and (when recorded) has the
 /// same creation time so a recycled PID cannot satisfy the heartbeat.
-pub fn pid_matches_current_daemon(pid: u32, expected_started_100ns: Option<u64>) -> bool {
+pub fn pid_matches_instance_daemon(
+    config_dir: &Path,
+    pid: u32,
+    expected_started_100ns: Option<u64>,
+) -> bool {
     #[cfg(windows)]
     {
         let Some(process) = open_live_process(pid) else {
@@ -213,20 +259,44 @@ pub fn pid_matches_current_daemon(pid: u32, expected_started_100ns: Option<u64>)
         let Some(actual) = process_image_path(process.0) else {
             return false;
         };
-        let Ok(expected) = std::env::current_exe() else {
-            return false;
-        };
-        same_windows_path(&actual, &expected)
+        expected_daemon_paths(config_dir)
+            .iter()
+            .any(|expected| same_windows_path(&actual, expected))
     }
     #[cfg(not(windows))]
     {
-        let _ = expected_started_100ns;
+        let _ = (config_dir, expected_started_100ns);
         pid_is_alive(pid)
     }
 }
 
-pub fn daemon_state_is_live(state: &StateFile) -> bool {
-    pid_matches_current_daemon(state.pid, state.process_started_100ns)
+pub fn daemon_state_is_live(config_dir: &Path, state: &StateFile) -> bool {
+    pid_matches_instance_daemon(config_dir, state.pid, state.process_started_100ns)
+}
+
+#[cfg(windows)]
+fn expected_daemon_paths(config_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    // Read the target instance's record, never infer it from the CLI's image.
+    if let Ok(layout) = crate::install::recorded_layout(config_dir)
+        .map(Ok)
+        .unwrap_or_else(crate::install::Layout::default_user)
+    {
+        paths.push(crate::install::launch_path(&layout, config_dir));
+        paths.push(layout.cli_path("spawnd"));
+        if let Ok(Some(release)) = crate::install::selected(&layout, config_dir) {
+            paths.push(release.spawnd());
+        }
+    }
+    if let Some(registered) = crate::service::launch_report(config_dir).binary {
+        paths.push(registered);
+    }
+    paths
+}
+
+#[cfg(windows)]
+pub fn live_process_exe(pid: u32) -> Option<PathBuf> {
+    process_image_path(open_live_process(pid)?.0)
 }
 
 #[cfg(windows)]
@@ -417,6 +487,71 @@ fn unix_seconds_rfc3339(seconds: u64) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process for the Windows instance identity regression"]
+    fn parked_instance() {
+        if std::env::var_os("SPAWND_TEST_PARK_INSTANCE").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recognizes_an_instance_image_and_rejects_wrong_process_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        fs::create_dir(&config).unwrap();
+        let layout = crate::install::Layout::at(tmp.path().join("install"));
+        fs::write(
+            config.join(crate::install::INSTALL_RECORD),
+            serde_json::to_vec(&serde_json::json!({"version": 1, "root": layout.root()})).unwrap(),
+        )
+        .unwrap();
+        let image = crate::install::launch_path(&layout, &config);
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Child(
+            std::process::Command::new(&image)
+                .args(["--exact", "state::tests::parked_instance", "--ignored"])
+                .env("SPAWND_TEST_PARK_INSTANCE", "1")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let process = open_live_process(child.0.id()).unwrap();
+        let started = process_started_100ns(process.0).unwrap();
+        assert!(pid_matches_instance_daemon(
+            &config,
+            child.0.id(),
+            Some(started)
+        ));
+        assert!(!pid_matches_instance_daemon(
+            &config,
+            child.0.id(),
+            Some(started + 1)
+        ));
+        // Another instance must not borrow this heartbeat, nor may an arbitrary
+        // live process be accepted merely because its PID exists.
+        assert!(!pid_matches_instance_daemon(
+            &tmp.path().join("other"),
+            child.0.id(),
+            Some(started)
+        ));
+        assert!(!pid_matches_instance_daemon(
+            &config,
+            std::process::id(),
+            current_process_started_100ns()
+        ));
+    }
+
     #[test]
     fn state_json_has_the_stable_contract_shape_and_writes_atomically() {
         let dir = tempfile::tempdir().unwrap();
@@ -454,8 +589,37 @@ mod tests {
         .unwrap();
         assert_eq!(state.process_started_100ns, None);
         assert_eq!(state.task_breakaway_denied, None);
+        // A heartbeat written before the release store carries no build
+        // identity beyond its version, and says nothing about its worker.
+        assert_eq!(state.tree, None);
+        assert_eq!(state.exe, None);
+        assert_eq!(state.release, None);
+        assert!(!state.worker_mismatch);
         let value = serde_json::to_value(state).unwrap();
         assert!(value.get("process_started_100ns").is_none());
         assert!(value.get("task_breakaway_denied").is_none());
+        assert!(value.get("exe").is_none());
+        assert!(value.get("worker_mismatch").is_none());
+    }
+
+    #[test]
+    fn the_heartbeat_names_the_running_build_and_its_worker_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path(), "https://spawnd.dev/");
+        store.heartbeat(0);
+        let state = read(dir.path()).unwrap().unwrap();
+        assert_eq!(state.tree, crate::version::daemon_tree().map(str::to_owned));
+        assert!(state
+            .exe
+            .as_deref()
+            .is_some_and(|exe| std::path::Path::new(exe).is_absolute()));
+        assert!(!state.worker_mismatch);
+        store.worker_mismatch(true);
+        let state = read(dir.path()).unwrap().unwrap();
+        assert!(state.worker_mismatch);
+        assert_eq!(
+            serde_json::to_value(&state).unwrap()["worker_mismatch"],
+            true
+        );
     }
 }

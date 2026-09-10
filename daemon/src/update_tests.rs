@@ -10,9 +10,55 @@ fn test_executable(directory: &Path, stem: &str) -> PathBuf {
     directory.join(crate::platform::executable_name(stem))
 }
 
-fn test_executable_variant(directory: &Path, stem: &str, tag: &str) -> PathBuf {
-    crate::platform::executable_variant(&test_executable(directory, stem), tag).unwrap()
+#[test]
+fn cli_downgrade_floor_comes_from_the_selected_instance() {
+    let tmp = tempdir().unwrap();
+    let selected = Release {
+        dir: tmp.path().join("release"),
+        meta: install::ReleaseMeta {
+            id: "selected".into(),
+            version: "0.1.0+gselected".into(),
+            tree: "c".repeat(40),
+            variant: "release".into(),
+            spawnd_sha256: "a".repeat(64),
+            spawn_worker_sha256: "b".repeat(64),
+            installed_at_unix_ms: 0,
+            source: "test".into(),
+            build_counter: Some(u64::MAX - 1),
+            release_store: 1,
+        },
+    };
+    let floor = instance_build_counter(Mode::Cli, tmp.path(), Some(&selected));
+    assert_eq!(floor, selected.meta.build_counter);
+    assert_eq!(
+        instance_build_counter(Mode::Daemon, tmp.path(), Some(&selected)),
+        floor
+    );
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let (manifest, signature, public_key) = signed_manifest(&key, 2000);
+    let failure = verify_manifest_bytes(
+        &manifest,
+        Some(signature.as_bytes()),
+        &manifest_request(),
+        "darwin-aarch64",
+        &VerifyPolicy {
+            allow_unsigned: false,
+            public_keys: &[&public_key],
+            build_counter: floor,
+            downgrade_authorized: false,
+            variant: ReleaseVariant::Release,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, "downgrade");
+    let mut unknown = selected;
+    unknown.meta.build_counter = None;
+    assert_eq!(
+        instance_build_counter(Mode::Cli, tmp.path(), Some(&unknown)),
+        None
+    );
 }
+
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -337,7 +383,7 @@ fn sha256_comparison_rejects_mismatch_and_malformed_values() {
 #[tokio::test]
 async fn version_check_requires_success_and_expected_suffix() {
     let directory = tempdir().unwrap();
-    let binary = test_executable_variant(directory.path(), "spawnd", "tmp");
+    let binary = test_executable(directory.path(), "spawnd");
     fs::write(
         &binary,
         b"#!/bin/sh\nprintf 'spawnd 0.1.0+g123456789abc\\n'\n",
@@ -360,7 +406,7 @@ async fn version_check_requires_success_and_expected_suffix() {
 async fn version_check_executes_a_real_pe_fixture() {
     let directory = tempdir().unwrap();
     let source = directory.path().join("version-fixture.rs");
-    let binary = test_executable_variant(directory.path(), "spawnd", "tmp");
+    let binary = test_executable(directory.path(), "spawnd");
     fs::write(
         &source,
         r#"fn main() { println!("spawnd 0.1.0+gwindowsfixture"); }"#,
@@ -409,134 +455,44 @@ async fn worker_pair_check_requires_the_exact_shared_tree_stamp() {
 }
 
 #[test]
-fn swap_rolls_back_when_the_second_rename_fails() {
-    let directory = tempdir().unwrap();
-    let live = test_executable(directory.path(), "spawnd");
-    let missing_temporary = test_executable_variant(directory.path(), "spawnd", "tmp");
-    fs::write(&live, b"old").unwrap();
-
-    swap_one(&live, &missing_temporary).expect_err("missing replacement must fail");
-    assert_eq!(fs::read(&live).unwrap(), b"old");
-    assert!(!previous_path(&live).exists());
-}
-
-#[test]
-fn worker_swap_failure_rolls_back_the_completed_daemon_swap() {
-    let directory = tempdir().unwrap();
-    let daemon = test_executable(directory.path(), "spawnd");
-    let daemon_temporary = test_executable_variant(directory.path(), "spawnd", "tmp");
-    let worker = test_executable(directory.path(), "spawn-worker");
-    let missing_worker_temporary = test_executable_variant(directory.path(), "spawn-worker", "tmp");
-    fs::write(&daemon, b"old daemon").unwrap();
-    fs::write(&daemon_temporary, b"new daemon").unwrap();
-    fs::write(&worker, b"old worker").unwrap();
-
-    let failure = swap_binaries(
-        &daemon,
-        &daemon_temporary,
-        &worker,
-        &missing_worker_temporary,
-    )
-    .expect_err("worker replacement must fail");
-    assert_eq!(failure.stage, UpdateStage::Swap);
-    assert_eq!(failure.error, "swap_failed");
-    assert_eq!(fs::read(&daemon).unwrap(), b"old daemon");
-    assert_eq!(fs::read(&daemon_temporary).unwrap(), b"new daemon");
-    assert_eq!(fs::read(&worker).unwrap(), b"old worker");
-    assert!(!previous_path(&daemon).exists());
-    assert!(!previous_path(&worker).exists());
-}
-
-#[test]
 fn precondition_reasons_are_short_stable_classes() {
-    let daemon = PathBuf::from("/daemon").join(crate::platform::executable_name("spawnd"));
-    let worker = PathBuf::from("/worker").join(crate::platform::executable_name("spawn-worker"));
-    let writable = |_: &Path| true;
-
+    let ok = Ok(ReleaseVariant::Release);
+    assert_eq!(
+        classify_preconditions(true, true, true, false, Some("darwin-aarch64"), ok),
+        Err(BlockReason::Disabled)
+    );
+    assert_eq!(
+        classify_preconditions(false, false, true, false, Some("darwin-aarch64"), ok),
+        Err(BlockReason::Unwritable)
+    );
+    assert_eq!(
+        classify_preconditions(false, true, false, false, Some("darwin-aarch64"), ok),
+        Err(BlockReason::WorkerMissing)
+    );
+    // A daemon still running from the shared legacy pair must not swap files
+    // it does not own; a command from a shell re-registers it instead.
+    assert_eq!(
+        classify_preconditions(false, true, true, true, Some("darwin-aarch64"), ok),
+        Err(BlockReason::LegacyLaunch)
+    );
+    assert_eq!(
+        classify_preconditions(false, true, true, false, None, ok),
+        Err(BlockReason::UnsupportedTarget)
+    );
     assert_eq!(
         classify_preconditions(
+            false,
             true,
-            Some(daemon.clone()),
-            Some(worker.clone()),
-            Some("darwin-aarch64"),
-            Ok(ReleaseVariant::Release),
-            writable,
-        )
-        .unwrap_err(),
-        BlockReason::Disabled
-    );
-    assert_eq!(
-        classify_preconditions(
+            true,
             false,
-            None,
-            Some(worker.clone()),
-            Some("darwin-aarch64"),
-            Ok(ReleaseVariant::Release),
-            writable,
-        )
-        .unwrap_err(),
-        BlockReason::Unwritable
-    );
-    assert_eq!(
-        classify_preconditions(
-            false,
-            Some(daemon.clone()),
-            None,
-            Some("darwin-aarch64"),
-            Ok(ReleaseVariant::Release),
-            writable,
-        )
-        .unwrap_err(),
-        BlockReason::WorkerMissing
-    );
-    assert_eq!(
-        classify_preconditions(
-            false,
-            Some(daemon.clone()),
-            Some(worker.clone()),
-            None,
-            Ok(ReleaseVariant::Release),
-            writable,
-        )
-        .unwrap_err(),
-        BlockReason::UnsupportedTarget
-    );
-    assert_eq!(
-        classify_preconditions(
-            false,
-            Some(daemon.clone()),
-            Some(worker.clone()),
             Some("darwin-aarch64"),
             Err(BlockReason::InvalidVariant),
-            writable,
-        )
-        .unwrap_err(),
-        BlockReason::InvalidVariant
+        ),
+        Err(BlockReason::InvalidVariant)
     );
     assert_eq!(
-        classify_preconditions(
-            false,
-            Some(daemon.clone()),
-            Some(worker.clone()),
-            Some("darwin-aarch64"),
-            Ok(ReleaseVariant::Diagnostics),
-            writable,
-        )
-        .unwrap()
-        .variant,
-        ReleaseVariant::Diagnostics
-    );
-    assert_eq!(
-        classify_preconditions(
-            false,
-            Some(daemon),
-            Some(worker),
-            Some("darwin-aarch64"),
-            Ok(ReleaseVariant::Release),
-            |_| false,
-        )
-        .unwrap_err(),
-        BlockReason::Unwritable
+        classify_preconditions(false, true, true, false, Some("darwin-aarch64"), ok),
+        Ok(())
     );
     assert_eq!(BlockReason::Disabled.as_str(), "disabled");
     assert_eq!(BlockReason::Unwritable.as_str(), "unwritable");
@@ -546,6 +502,7 @@ fn precondition_reasons_are_short_stable_classes() {
     );
     assert_eq!(BlockReason::WorkerMissing.as_str(), "worker_missing");
     assert_eq!(BlockReason::InvalidVariant.as_str(), "invalid_variant");
+    assert_eq!(BlockReason::LegacyLaunch.as_str(), "legacy_launch");
 }
 
 #[test]
@@ -645,6 +602,7 @@ fn a_manifest_carrying_variants_still_verifies_and_resolves_the_release_pair() {
     let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
     let request = manifest_request();
     let expected = UpdatePlan {
+        build_counter: 2000,
         version: request.version.clone(),
         spawnd: request.spawnd.clone(),
         spawn_worker: request.spawn_worker.clone(),
@@ -688,6 +646,7 @@ fn the_diagnostics_variant_installs_its_own_pair_from_the_signed_manifest() {
     assert_eq!(
         plan,
         UpdatePlan {
+            build_counter: 2000,
             version: "0.1.0+gnew.diagnostics".into(),
             spawnd: DaemonUpdateArtifact {
                 path: "/api/install/spawnd/darwin-aarch64/diagnostics".into(),
@@ -847,8 +806,8 @@ fn the_signature_covers_the_variant_hashes_and_the_counter_still_applies() {
 #[test]
 fn plain_cli_outcomes_are_byte_stable() {
     assert_eq!(
-        cli_no_update_line("current"),
-        "SPAWN D daemon update not applied (current)."
+        cli_no_update_line("9f1c2d3e", "current"),
+        "SPAWN D daemon update not applied for 9f1c2d3e (current)."
     );
     assert_eq!(
         UpdateFailure::new(UpdateStage::Verify, "manifest_bad_signature").to_string(),
@@ -887,12 +846,35 @@ fn executable_update_names_keep_the_target_suffix_last() {
             );
         }
     }
+    // The marker the in-place updater left beside its binary is data, with
+    // no executable suffix; the store's marker sits in the instance dir.
     assert_eq!(
-        marker_path(&test_executable(directory.path(), "spawnd"))
+        legacy_marker_path(&test_executable(directory.path(), "spawnd"))
             .file_name()
             .unwrap(),
         "spawnd.updating"
     );
+    let layout = install::Layout::at(directory.path().join("root"));
+    let marker = install::probation_marker_path(&layout, Path::new("/srv/spawn/alice"));
+    assert_eq!(marker.file_name().unwrap(), "spawnd.updating");
+    assert!(marker.starts_with(layout.instances_dir()));
+}
+
+/// A marker written by the in-place updater (`worker_path`, no release ids)
+/// still reads, and a store marker names what it moved between.
+#[test]
+fn probation_markers_read_both_generations() {
+    let legacy: ProbationMarker = serde_json::from_str(
+        r#"{"attempts":1,"old_tree":"a","deadline_unix_ms":5,"attempted_tree":"b","version_before":"0.1.0+gold","worker_path":"/x/spawn-worker","reverted":false}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy.worker_path, Some(PathBuf::from("/x/spawn-worker")));
+    assert_eq!(legacy.previous_release, None);
+    let store = test_marker(0, 10, false);
+    let value = serde_json::to_value(&store).unwrap();
+    assert_eq!(value["previous_release"], "0.1.0+gold-11111111");
+    assert_eq!(value["attempted_release"], "0.1.0+gnew-22222222");
+    assert!(value.get("worker_path").is_none());
 }
 
 #[test]
@@ -969,8 +951,8 @@ fn post_register_cleanup_removes_only_the_installed_pair_backups() {
     let directory = tempdir().unwrap();
     let daemon = test_executable(directory.path(), "spawnd");
     let worker = test_executable(directory.path(), "spawn-worker");
-    let daemon_previous = test_executable_variant(directory.path(), "spawnd", "prev");
-    let worker_previous = test_executable_variant(directory.path(), "spawn-worker", "prev");
+    let daemon_previous = install::previous_path(&daemon);
+    let worker_previous = install::previous_path(&worker);
     let unrelated = directory.path().join("notes.prev");
     fs::write(&daemon_previous, b"old daemon").unwrap();
     fs::write(&worker_previous, b"old worker").unwrap();
@@ -991,8 +973,10 @@ fn test_marker(attempts: u32, deadline_unix_ms: u64, reverted: bool) -> Probatio
         attempted_tree: "b".repeat(40),
         version_before: "0.1.0+gold".into(),
         request_id: Some("request-1".into()),
-        worker_path: PathBuf::from("/bin").join(crate::platform::executable_name("spawn-worker")),
+        worker_path: None,
         reverted,
+        previous_release: Some("0.1.0+gold-11111111".into()),
+        attempted_release: Some("0.1.0+gnew-22222222".into()),
     }
 }
 
@@ -1035,31 +1019,13 @@ fn reverted_probation_reports_a_stable_health_failure() {
 }
 
 #[test]
-fn health_revert_restores_both_fake_binaries() {
-    let directory = tempdir().unwrap();
-    let daemon = test_executable(directory.path(), "spawnd");
-    let worker = test_executable(directory.path(), "spawn-worker");
-    fs::write(&daemon, b"bad daemon").unwrap();
-    fs::write(&worker, b"bad worker").unwrap();
-    fs::write(previous_path(&daemon), b"old daemon").unwrap();
-    fs::write(previous_path(&worker), b"old worker").unwrap();
-
-    revert_binaries(&daemon, &worker).unwrap();
-
-    assert_eq!(fs::read(&daemon).unwrap(), b"old daemon");
-    assert_eq!(fs::read(&worker).unwrap(), b"old worker");
-    assert!(!previous_path(&daemon).exists());
-    assert!(!previous_path(&worker).exists());
-}
-
-#[test]
 fn corrupt_marker_recovery_requires_both_previous_binaries() {
     let directory = tempdir().unwrap();
     let daemon = test_executable(directory.path(), "spawnd");
     let worker = test_executable(directory.path(), "spawn-worker");
-    fs::write(previous_path(&daemon), b"old daemon").unwrap();
+    fs::write(install::previous_path(&daemon), b"old daemon").unwrap();
     assert!(!complete_previous_pair(&daemon, &worker));
-    fs::write(previous_path(&worker), b"old worker").unwrap();
+    fs::write(install::previous_path(&worker), b"old worker").unwrap();
     assert!(complete_previous_pair(&daemon, &worker));
     assert_eq!(
         previous_worker_path_for_recovery(&daemon),
@@ -1070,47 +1036,82 @@ fn corrupt_marker_recovery_requires_both_previous_binaries() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn downloads_verifies_and_swaps_both_fake_binaries() {
+async fn downloads_verifies_and_publishes_the_pair_as_one_release() {
     let daemon_bytes = b"#!/bin/sh\nprintf 'spawnd 0.1.0+gintegration\\n'\n".to_vec();
-    let worker_bytes = b"new worker".to_vec();
+    let worker_bytes = format!(
+        "#!/bin/sh\nprintf 'spawn-worker 0.1.0+gintegration tree={}\\n'\n",
+        "b".repeat(40)
+    )
+    .into_bytes();
     let daemon_sha = digest_hex(&Sha256::digest(&daemon_bytes));
     let worker_sha = digest_hex(&Sha256::digest(&worker_bytes));
     let (server, serving) = serve_responses(vec![daemon_bytes.clone(), worker_bytes.clone()]).await;
 
     let directory = tempdir().unwrap();
-    let live_daemon = test_executable(directory.path(), "spawnd");
-    let live_worker = test_executable(directory.path(), "spawn-worker");
-    let temp_daemon = test_executable_variant(directory.path(), "spawnd", "tmp.test");
-    let temp_worker = test_executable_variant(directory.path(), "spawn-worker", "tmp.test");
-    fs::write(&live_daemon, b"old daemon").unwrap();
-    fs::write(&live_worker, b"old worker").unwrap();
+    let layout = install::Layout::at(directory.path().join("root"));
+    let staging = StagingDir::new(&layout).unwrap();
+    assert!(staging.dir.starts_with(layout.releases_dir()));
 
     let client = http_client().unwrap();
-    let downloaded_daemon = download_to(&client, server.join("daemon").unwrap(), &temp_daemon)
+    let downloaded_daemon = download_to(&client, server.join("daemon").unwrap(), &staging.daemon)
         .await
         .unwrap();
-    let downloaded_worker = download_to(&client, server.join("worker").unwrap(), &temp_worker)
+    let downloaded_worker = download_to(&client, server.join("worker").unwrap(), &staging.worker)
         .await
         .unwrap();
     assert_eq!(downloaded_daemon, daemon_sha);
     assert_eq!(downloaded_worker, worker_sha);
-    chmod_executable(&temp_daemon).unwrap();
-    chmod_executable(&temp_worker).unwrap();
-    verify_version(&temp_daemon, "0.1.0+gintegration")
+    chmod_executable(&staging.daemon).unwrap();
+    chmod_executable(&staging.worker).unwrap();
+    verify_version(&staging.daemon, "0.1.0+gintegration")
         .await
         .unwrap();
-    swap_binaries(&live_daemon, &temp_daemon, &live_worker, &temp_worker).unwrap();
+    verify_worker_identity(&staging.worker, "0.1.0+gintegration", &"b".repeat(40))
+        .await
+        .unwrap();
+    // A worker that reports another tree never gets published beside a daemon.
+    let failure = verify_worker_identity(&staging.worker, "0.1.0+gintegration", &"c".repeat(40))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (failure.stage, failure.error),
+        (UpdateStage::Verify, "worker_mismatch")
+    );
 
-    assert_eq!(fs::read(&live_daemon).unwrap(), daemon_bytes);
-    assert_eq!(fs::read(&live_worker).unwrap(), worker_bytes);
-    assert_eq!(
-        fs::read(previous_path(&live_daemon)).unwrap(),
-        b"old daemon"
-    );
-    assert_eq!(
-        fs::read(previous_path(&live_worker)).unwrap(),
-        b"old worker"
-    );
+    let id = install::release_id("0.1.0+gintegration", &daemon_sha, &worker_sha);
+    let release = install::publish_with_meta(
+        &layout,
+        install::PublishSource {
+            spawnd: &staging.daemon,
+            spawn_worker: &staging.worker,
+            source: "update",
+        },
+        install::ReleaseMeta {
+            id: id.clone(),
+            version: "0.1.0+gintegration".into(),
+            tree: "b".repeat(40),
+            variant: "release".into(),
+            spawnd_sha256: daemon_sha.clone(),
+            spawn_worker_sha256: worker_sha.clone(),
+            installed_at_unix_ms: unix_millis(),
+            source: "update".into(),
+            build_counter: Some(2000),
+            release_store: 1,
+        },
+    )
+    .unwrap();
+    drop(staging);
+    assert_eq!(release.id(), id);
+    assert_eq!(fs::read(release.spawnd()).unwrap(), daemon_bytes);
+    assert_eq!(fs::read(release.spawn_worker()).unwrap(), worker_bytes);
+    install::verify_release(&release).unwrap();
+    // The staging directory is gone; only the release remains.
+    let entries: Vec<_> = fs::read_dir(layout.releases_dir())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec![id]);
     serving.await.unwrap();
 }
 
