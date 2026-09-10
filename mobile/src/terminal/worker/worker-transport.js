@@ -311,6 +311,7 @@
   }
 
   function teardown(sendClose) {
+    api.closeHostConsumers?.();
     api.closePairChannels?.();
     if (state.mode === "host" && sendClose && state.rtcSessionId && state.bindingNonce) {
       emitSignal({ type: "rtc.close", ...outerTuple() });
@@ -339,6 +340,7 @@
   }
 
   api.handleTransportMessage = async (message) => {
+    if (api.handleHostConsumerMessage?.(message)) return;
     if (api.handlePairMessage?.(message)) return;
     switch (message.type) {
       case "connect":

@@ -25,6 +25,7 @@ user_token=""
 base_url=""
 worker_dir="$tmp_dir/workers"
 web_dist_dir=".next-browser-live-$$"
+web_tsconfig=".tsconfig-browser-live-$$.json"
 
 cleanup() {
   local status=$?
@@ -88,6 +89,7 @@ PY
     done
   fi
   rm -rf "$tmp_dir" "$repo_root/web/$web_dist_dir"
+  rm -f "$repo_root/web/$web_tsconfig"
   exit "$status"
 }
 trap cleanup EXIT
@@ -449,10 +451,12 @@ workspace_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["workspa
 live_session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])' <<<"$live_ids")"
 
 printf '%s\n' "smoke-local-browser-live: starting web server on $web_url"
+cp "$repo_root/web/tsconfig.json" "$repo_root/web/$web_tsconfig"
 (
   cd web
   exec env \
     SPAWN_NEXT_DIST_DIR="$web_dist_dir" \
+    SPAWN_NEXT_TSCONFIG_PATH="$web_tsconfig" \
     SPAWN_API_PROXY_TARGET="$base_url" \
     NEXT_PUBLIC_SPAWN_WS_URL="$ws_url" \
     bun run dev -- -H 127.0.0.1 -p "$web_port"

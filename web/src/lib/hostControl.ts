@@ -1908,6 +1908,10 @@ export class HostControlClient {
       // malformed list degrades to "offers nothing extra" rather than failing
       // the channel: the connection is fine, we just cannot read its menu.
       this.capabilities = parseCapabilities(message.capabilities);
+      if (this.options.deviceConnection && !this.capabilities.has("session.transport.v1")) {
+        this.requireTransportUpdate("Update SPAWN D on this host to share its connection.");
+        return;
+      }
       this.setState("ready");
       return;
     }

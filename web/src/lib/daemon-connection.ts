@@ -48,6 +48,7 @@ type Wire = {
   to?: string;
   owner?: string;
   term?: number;
+  epoch?: number;
   type: string;
   channel?: string;
   label?: string;
@@ -77,6 +78,7 @@ export class SharedDaemonConnection implements DaemonConnection {
   private owner: string | null = null;
   private leader: string | null = null;
   private term = 0;
+  private epoch = 0;
   private ownerSeen = 0;
   private lockAbort: AbortController | null = null;
   private releaseLock: (() => void) | null = null;
@@ -136,13 +138,19 @@ export class SharedDaemonConnection implements DaemonConnection {
     if (this.channels.size >= MAX_CHANNELS) throw new Error("Too many open views");
     const id = crypto.randomUUID();
     const owner = this.owner;
+    const epoch = this.epoch;
     const channel = new RemoteDaemonChannel(label, (event) => {
       if (event.type === "close") {
         this.channels.delete(id);
-        this.post({ type: "channel-close", channel: id, owner });
+        this.post({ type: "channel-close", channel: id, owner, epoch });
         return;
       }
-      if (this.owner !== owner || this.snapshot.state !== "ready" || !this.isActive()) {
+      if (
+        this.owner !== owner ||
+        this.epoch !== epoch ||
+        this.snapshot.state !== "ready" ||
+        !this.isActive()
+      ) {
         channel.retired();
         this.channels.delete(id);
         return;
@@ -151,6 +159,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         type: "channel-send",
         channel: id,
         owner,
+        epoch,
         sequence: event.sequence,
         data: event.data,
       });
@@ -160,7 +169,7 @@ export class SharedDaemonConnection implements DaemonConnection {
     // connection can deliver its first channel events.
     queueMicrotask(() => {
       if (channel.readyState === "connecting")
-        this.post({ type: "channel-open", channel: id, label, owner });
+        this.post({ type: "channel-open", channel: id, label, owner, epoch });
     });
     return channel;
   }
@@ -206,6 +215,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         this.term = Math.max(Date.now(), saved + 1, this.term + 1);
         localStorage.setItem(termKey, String(this.term));
         this.leader = `${this.tab}:${this.term}`;
+        this.epoch = 0;
         this.owner = null;
         this.scheduler = new DaemonSendScheduler();
         this.root = this.createRoot();
@@ -252,6 +262,13 @@ export class SharedDaemonConnection implements DaemonConnection {
   private announce(): void {
     const root = this.root;
     if (!root || !this.leader) return;
+    // The peer UUID can survive ICE recovery. A separate child epoch fences
+    // opens still in another tab's dispatch queue when readiness is lost.
+    if (
+      this.snapshot.generation !== root.getConnectionGeneration() ||
+      (this.snapshot.state === "ready" && root.getState() !== "ready")
+    )
+      this.epoch++;
     this.post({
       type: "snapshot",
       owner: this.leader,
@@ -268,19 +285,27 @@ export class SharedDaemonConnection implements DaemonConnection {
     });
   }
 
-  private publish(snapshot: DaemonSnapshot): void {
-    if (JSON.stringify(this.snapshot) === JSON.stringify(snapshot)) return;
-    const changed = this.snapshot.generation !== snapshot.generation;
+  private publish(snapshot: DaemonSnapshot, retireChildren = false): void {
+    if (!retireChildren && JSON.stringify(this.snapshot) === JSON.stringify(snapshot)) return;
+    const changed =
+      retireChildren ||
+      this.snapshot.generation !== snapshot.generation ||
+      (this.snapshot.state === "ready" && snapshot.state !== "ready");
     this.snapshot = snapshot;
     if (changed) {
-      for (const channel of this.channels.values()) channel.retired();
+      // Readiness can be lost without replacing the physical peer. Retire
+      // every child at that boundary, including the owner's unsent queues;
+      // a later same-peer recovery must attach afresh, never replay input.
+      const retired = [...this.channels.values()];
       this.channels.clear();
+      for (const id of [...this.owned.keys()]) this.closeOwned(id);
+      for (const channel of retired) channel.retired();
     }
     for (const listener of this.listeners) listener();
   }
 
   private post(message: Omit<Wire, "v" | "from">): void {
-    const wire: Wire = { v: 1, from: this.tab, ...message };
+    const wire: Wire = { v: 1, from: this.tab, epoch: this.epoch, ...message };
     // BroadcastChannel does not echo to the sender. Use the same route for
     // local consumers so they have the same ordering and credit semantics.
     this.bus?.postMessage(wire);
@@ -295,23 +320,29 @@ export class SharedDaemonConnection implements DaemonConnection {
     if (message.to && message.to !== this.tab) return;
     if (message.type === "snapshot" && message.owner && message.snapshot) {
       if (!Number.isSafeInteger(message.term) || (message.term ?? 0) < this.term) return;
+      if (!Number.isSafeInteger(message.epoch) || (message.epoch ?? -1) < 0) return;
       if (message.term === this.term && this.owner && this.owner !== message.owner) return;
+      if (message.term === this.term && message.epoch! < this.epoch) return;
       this.term = message.term!;
       this.ownerSeen = Date.now();
-      if (this.owner !== message.owner) {
-        this.owner = message.owner;
-        for (const channel of this.channels.values()) channel.retired();
-        this.channels.clear();
-      }
-      this.publish(message.snapshot);
+      const retireChildren = this.owner !== message.owner || this.epoch !== message.epoch;
+      this.owner = message.owner;
+      this.epoch = message.epoch!;
+      this.publish(message.snapshot, retireChildren);
       return;
     }
     if (
       ["channel-opened", "channel-data", "channel-ack", "channel-closed"].includes(message.type)
     ) {
-      if (message.owner !== this.owner || !message.channel) return;
+      if (message.owner !== this.owner || message.epoch !== this.epoch || !message.channel) return;
       const channel = this.channels.get(message.channel);
-      if (!channel) return;
+      if (!channel) {
+        // A local timeout can retire a proxy while its owner is still ready.
+        // Close a late allocation whose consumer has already gone away.
+        if (message.type === "channel-opened")
+          this.post({ type: "channel-close", owner: message.owner, channel: message.channel });
+        return;
+      }
       if (message.type === "channel-opened") channel.opened();
       else if (message.type === "channel-closed") {
         this.channels.delete(message.channel);
@@ -349,10 +380,12 @@ export class SharedDaemonConnection implements DaemonConnection {
       root.retryConnection();
       return;
     }
+    if (message.epoch !== this.epoch) return;
     const id = message.channel;
     if (typeof id !== "string" || id.length > 64) return;
     if (message.type === "channel-open") {
       if (
+        root.getState() !== "ready" ||
         this.owned.has(id) ||
         this.owned.size >= MAX_CHANNELS ||
         !message.label ||

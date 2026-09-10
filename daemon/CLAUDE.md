@@ -66,6 +66,9 @@ tests/           integration tests (worker_e2e.rs), and
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
+                 and a read/reset missed-notification fix. It is a workspace
+                 member so its regression tests use the daemon's Cargo.lock;
+                 default cargo commands still select only spawnd
 ```
 
 ## Where things go
@@ -321,6 +324,12 @@ updater knew about variants.
   or session removal; `focus_view` only moves control within that device.
   See `docs/DEVICE_CONNECTIONS.md` for the lifecycle and compatibility contract.
 
+`host_control::install` returns a `Lifetime` handle with only `is_retired` and
+`retire`. Pair retirement fences those handles before removal from the host
+map becomes observable, then performs asynchronous channel cleanup. The
+protected-content guard pins that narrow exported surface; it exposes no
+content or server publication capability.
+
 ## Before calling a change done
 
 ```bash
@@ -337,8 +346,15 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --features diagnostics -- -D warnings
 cargo test --locked
 cargo test --locked --features diagnostics
+cargo test --locked -p webrtc-sctp --lib stream::stream_test::
 cargo build --locked --profile diagnostics --features diagnostics
 ```
+
+The SCTP stream tests also run in Linux and Windows CI. `read_sctp` registers
+its notification waiter before checking shutdown or awaiting the reassembly
+queue lock: a remote reset uses `notify_waiters`, so registering afterward can
+lose the notification and strand a closed channel's reader. The regression
+holds that queue lock and resets the stream while the reader is waiting.
 
 Native Windows CI additionally gates every binary, test/example target, and
 cfg-specific lint path:

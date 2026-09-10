@@ -42,6 +42,15 @@ export interface PairChannelMessage {
 }
 
 export type NativeToWorkerMessage =
+  | (NativeMessage & { type: "host-consumer-open" | "host-consumer-close"; consumerId: string })
+  | (NativeMessage & { type: "host-consumer-received"; consumerId: string; sequence: number })
+  | (NativeMessage & {
+      type: "host-consumer-command";
+      consumerId: string;
+      command:
+        | { type: "host-request"; requestId: string; operation: string; payload?: unknown }
+        | { type: "host-cancel"; requestId: string };
+    })
   | (NativeMessage & PairAttachment & { type: "pair-attach" })
   | (NativeMessage & PairAttachment & { type: "pair-view" })
   | (NativeMessage & PairChannelMessage & { type: "pair-command" | "pair-event" })
@@ -129,6 +138,12 @@ export type NativeToWorkerMessage =
 type WorkerMessage = { v: typeof TERMINAL_BRIDGE_VERSION };
 
 export type WorkerToNativeMessage =
+  | (WorkerMessage & {
+      type: "host-consumer-event";
+      consumerId: string;
+      message: unknown;
+      sequence?: number;
+    })
   | (WorkerMessage & PairChannelMessage & { type: "pair-command" | "pair-event" })
   | (WorkerMessage & { type: "ready"; renderer: "webgl" | "dom" | null })
   | (WorkerMessage & { type: "state"; state: TransportState; gate?: string })
@@ -245,6 +260,10 @@ export function parseWorkerMessage(raw: string): WorkerToNativeMessage {
 }
 
 const NATIVE_MESSAGE_TYPES = new Set([
+  "host-consumer-open",
+  "host-consumer-close",
+  "host-consumer-command",
+  "host-consumer-received",
   "pair-attach",
   "pair-view",
   "pair-command",
@@ -277,6 +296,7 @@ const NATIVE_MESSAGE_TYPES = new Set([
 ]);
 
 const WORKER_MESSAGE_TYPES = new Set([
+  "host-consumer-event",
   "pair-command",
   "pair-event",
   "ready",

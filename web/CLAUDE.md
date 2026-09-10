@@ -121,6 +121,8 @@ npm run test:e2e              # Playwright, when the change warrants it
 
 An end-to-end test that starts another Next server gives it its own disposable
 `SPAWN_NEXT_DIST_DIR`. Sharing `.next` overwrites the running suite's build.
+Use `SPAWN_NEXT_TSCONFIG_PATH` with a disposable config copy as well, so Next's
+generated type paths never rewrite the tracked `tsconfig.json`.
 
 ## Keeping this file true
 

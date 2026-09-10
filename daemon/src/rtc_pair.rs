@@ -17,6 +17,38 @@ pub(super) struct PairContext {
     ice_restart: bool,
     remote_ufrags: Mutex<HashSet<String>>,
     restart: Mutex<()>,
+    retired: AtomicBool,
+    host_channels: std::sync::Mutex<Vec<Weak<crate::host_control::Lifetime>>>,
+}
+
+impl PairContext {
+    pub(super) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        let mut channels = self
+            .host_channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for channel in channels.drain(..).filter_map(|channel| channel.upgrade()) {
+            channel.retire();
+        }
+    }
+
+    fn register_host(&self, lifetime: Arc<crate::host_control::Lifetime>) {
+        let mut channels = self
+            .host_channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.retired.load(Ordering::Acquire) {
+            lifetime.retire();
+        } else {
+            channels.retain(|channel| {
+                channel
+                    .upgrade()
+                    .is_some_and(|channel| !channel.is_retired())
+            });
+            channels.push(Arc::downgrade(&lifetime));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -121,6 +153,8 @@ impl RtcSessions {
             ice_restart,
             remote_ufrags: Mutex::new(HashSet::from([ufrag])),
             restart: Mutex::new(()),
+            retired: AtomicBool::new(false),
+            host_channels: std::sync::Mutex::new(Vec::new()),
         });
         if let Err(error) = self
             .create_host_answer(
@@ -167,13 +201,14 @@ impl RtcSessions {
             proposed.ice_restart
                 && existing.binding == *binding
                 && pair.device_key == proposed.device_key
+                && !pair.retired.load(Ordering::Acquire)
                 && self.trust_epoch_is_current(pair.trust_epoch)
                 && !pair.remote_ufrags.lock().await.contains(&ufrag),
             "stale device restart"
         );
         let local = negotiate(&existing.pc, sdp.to_string()).await?;
         anyhow::ensure!(
-            self.trust_epoch_is_current(pair.trust_epoch),
+            !pair.retired.load(Ordering::Acquire) && self.trust_epoch_is_current(pair.trust_epoch),
             "trust changed during restart"
         );
         pair.remote_ufrags.lock().await.insert(ufrag);
@@ -211,6 +246,11 @@ impl RtcSessions {
                 .collect::<Vec<_>>();
             ids.into_iter()
                 .filter_map(|id| hosts.remove(&id))
+                .inspect(|peer| {
+                    if let Some(pair) = &peer.pair {
+                        pair.retire();
+                    }
+                })
                 .collect::<Vec<_>>()
         };
         for peer in retired {
@@ -262,7 +302,10 @@ impl RtcSessions {
                 let reliable = dc.ordered()
                     && dc.max_packet_lifetime().is_none()
                     && dc.max_retransmits().is_none();
-                if !reliable || !sessions.trust_epoch_is_current(pair.trust_epoch) {
+                if !reliable
+                    || pair.retired.load(Ordering::Acquire)
+                    || !sessions.trust_epoch_is_current(pair.trust_epoch)
+                {
                     reject_channel(&dc).await;
                     return;
                 }
@@ -298,13 +341,13 @@ impl RtcSessions {
                         return;
                     }
                     live.insert(label.to_string(), Arc::downgrade(&dc));
-                    install_host_control_channel(
+                    pair.register_host(install_host_control_channel(
                         dc,
                         signal_id,
                         binding,
                         sessions.signaling.clone(),
                         None,
-                    );
+                    ));
                     return;
                 }
                 let Some(label) = attachment_label(label) else {
@@ -892,5 +935,73 @@ mod tests {
         for pc in [first, other, successor] {
             let _ = pc.close().await;
         }
+    }
+    #[tokio::test]
+    async fn parent_retirement_fences_host_consumers_before_blocked_terminal_cleanup() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let pc = connect_pair(&sessions, &registry, [7; 32]).await;
+        // connect_pair's signaling receiver has gone away; install a live sink.
+        let (signal_tx, mut signal_rx) = mpsc::channel(128);
+        sessions.signaling.install(signal_tx);
+        let signal_sink = tokio::spawn(async move { while signal_rx.recv().await.is_some() {} });
+        let (_pty, _ctl) = attach(&pc, id).await;
+        let host = pc
+            .create_data_channel(&format!("spawn.host.ctl/{}", Uuid::new_v4()), None)
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        host.on_message(Box::new(move |message| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx
+                    .send(serde_json::from_slice::<Value>(&message.data).unwrap())
+                    .await;
+            })
+        }));
+        let hello = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello["type"], "hello");
+        let closer = sessions.session_closer(binding).await;
+        let guard = closer.lock().await;
+        let retire_sessions = sessions.clone();
+        let retiring = tokio::spawn(async move {
+            retire_sessions.retire_device_pair([7; 32]).await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !sessions.host_peers.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!retiring.is_finished());
+        host.send_text(json!({"version":1,"type":"request","request_id":"after-retire","operation":"fs.home","payload":{}}).to_string()).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        drop(guard);
+        retiring.await.unwrap();
+        let _ = pc.close().await;
+        worker.abort();
+        signal_sink.abort();
+        assert!(
+            response.is_err(),
+            "retired parent published a host response: {response:?}"
+        );
     }
 }

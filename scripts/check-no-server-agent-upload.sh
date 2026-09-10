@@ -240,20 +240,37 @@ if sender_types != {"ReadSignal", "WriteCleanup"}:
         "no-server-agent-upload: protected host-control sender inventory changed: "
         + ", ".join(sorted(sender_types))
     )
-expected_control_export = """pub(crate) fn install(
+# The parent receives only a retirement handle: it can observe a closed bit
+# and revoke effects, but cannot read protected values or publish to signaling.
+expected_control_exports = [
+    "pub(crate) struct Lifetime {",
+    "pub(crate) fn is_retired(&self) -> bool {",
+    "pub(crate) fn retire(&self) {",
+    """pub(crate) fn install(
     dc: Arc<RTCDataChannel>,
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
-) {"""
+) -> Arc<Lifetime> {""",
+]
 control_exports = list(
     re.finditer(r"(?m)^[ \t]*(?P<export>pub(?:\([^\n)]*\))?\s+)", control)
 )
-if len(control_exports) != 1 or not control.startswith(
-    expected_control_export, control_exports[0].start("export")
+if len(control_exports) != len(expected_control_exports) or any(
+    not control.startswith(expected, actual.start("export"))
+    for expected, actual in zip(expected_control_exports, control_exports)
 ):
     raise SystemExit(
         "no-server-agent-upload: protected host-control exported surface changed"
     )
+# Pin the private state and entire retirement implementation as well. Public
+# trait methods and derives need no `pub` keyword, so the export list alone
+# cannot detect them. The symbol inventory below rejects additional impls in
+# this or another module, just as it does for HostConnectedSignal.
+lifetime_block = control[control.index("struct Context {"):control.index("impl Context {")]
+if hashlib.sha256(lifetime_block.encode()).hexdigest() != (
+    "1439d68c0d88eaaaa21a58b9b7d2203fe42f2e049160cba7415f8b50f9168879"
+):
+    raise SystemExit("no-server-agent-upload: protected host retirement capability changed")
 if control.count("connected_signal: HostConnectedSignal") != 1:
     raise SystemExit("no-server-agent-upload: narrow connected signal capability changed")
 if len(re.findall(r"\bconnected_signal\b", control)) != 4:
@@ -267,6 +284,12 @@ expected_symbol_counts = {
     "daemon/src/rtc.rs": 2,
 }
 found_symbol_counts = {}
+expected_lifetime_counts = {
+    "daemon/src/host_control.rs": 4,
+    "daemon/src/rtc.rs": 1,
+    "daemon/src/rtc_pair.rs": 2,
+}
+found_lifetime_counts = {}
 daemon_root = os.path.join(root, "daemon/src")
 for directory, names, files in os.walk(daemon_root):
     names[:] = [name for name in names if name != "target"]
@@ -275,10 +298,17 @@ for directory, names, files in os.walk(daemon_root):
             continue
         path = os.path.join(directory, name)
         with open(path, encoding="utf-8") as source:
-            count = len(re.findall(r"\bHostConnectedSignal\b", source.read()))
+            text = source.read()
+        count = len(re.findall(r"\bHostConnectedSignal\b", text))
+        lifetime_count = len(re.findall(r"\bLifetime\b", text))
+        if lifetime_count:
+            relative = os.path.relpath(path, root).replace(os.sep, "/")
+            found_lifetime_counts[relative] = lifetime_count
         if count:
             relative = os.path.relpath(path, root).replace(os.sep, "/")
             found_symbol_counts[relative] = count
+if found_lifetime_counts != expected_lifetime_counts:
+    raise SystemExit("no-server-agent-upload: host retirement capability escaped its fixed inventory")
 if found_symbol_counts != expected_symbol_counts:
     raise SystemExit(
         "no-server-agent-upload: host connected capability escaped its fixed module/use inventory: "
@@ -630,6 +660,7 @@ self_test() {
     >"$fixture/server/spawn_server/ws/daemon.py"
   cp "$source_root/daemon/src/main.rs" "$fixture/daemon/src/main.rs"
   cp "$source_root/daemon/src/rtc.rs" "$fixture/daemon/src/rtc.rs"
+  cp "$source_root/daemon/src/rtc_pair.rs" "$fixture/daemon/src/rtc_pair.rs"
   cp "$source_root/daemon/src/host_control.rs" "$fixture/daemon/src/host_control.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
@@ -750,6 +781,20 @@ self_test() {
   if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
     printf '%s\n' \
       "no-server-agent-upload self-test: protected host-control value export passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  printf '%s\n' \
+    "$host_control_original" \
+    'impl AsRef<serde_json::Value> for Lifetime {' \
+    '  fn as_ref(&self) -> &serde_json::Value { unimplemented!() }' \
+    '}' \
+    >"$fixture/daemon/src/host_control.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: retirement capability trait export passed" >&2
     return 1
   fi
   printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"

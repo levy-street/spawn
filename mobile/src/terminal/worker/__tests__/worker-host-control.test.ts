@@ -57,8 +57,8 @@ describe("offline host-control worker", () => {
           bufferedAmount: 32 * 1024 + 1,
           bufferedAmountLowThreshold: 0,
           send,
-          addEventListener: jest.fn((_type: string, listener: () => void) => {
-            writable = listener;
+          addEventListener: jest.fn((type: string, listener: () => void) => {
+            if (type === "bufferedamountlow") writable = listener;
           }),
           removeEventListener: jest.fn(),
         },

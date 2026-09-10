@@ -3,7 +3,21 @@ import { deviceIdentity, setDeviceIdentityAccount } from "@/lib/crypto/identity"
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 
 const mockRelease = jest.fn();
-const mockTransport = { state: "ready", on: jest.fn(() => () => undefined), prepare: jest.fn() };
+const mockTransport = {
+  state: "ready",
+  on: jest.fn(() => () => undefined),
+  prepare: jest.fn(),
+  open: jest.fn(async () => {}),
+  close: jest.fn(),
+};
+const mockConsumer = {
+  ...mockTransport,
+  open: jest.fn(async () => {}),
+  close: jest.fn(),
+};
+jest.mock("@/terminal/transport/host-transport", () => ({
+  createHostConsumerTransport: () => mockConsumer,
+}));
 const mockLease = {
   ownerId: Symbol("consumer"),
   shared: { owner: Symbol("root"), transport: mockTransport, bridge: {} },
@@ -18,6 +32,8 @@ jest.mock("@/terminal/transport/host-transport-registry", () => ({
 }));
 jest.mock("react-native-webview", () => ({ __esModule: true, default: () => null }));
 
+beforeEach(() => jest.clearAllMocks());
+
 test("a consumer joining a ready app-owned connection immediately receives readiness", async () => {
   const onStateChange = jest.fn();
   const onTransport = jest.fn();
@@ -29,9 +45,31 @@ test("a consumer joining a ready app-owned connection immediately receives readi
       onStateChange={onStateChange}
     />,
   );
-  expect(onTransport).toHaveBeenCalledWith(mockTransport);
+  expect(onTransport).toHaveBeenCalledWith(mockConsumer);
   expect(onStateChange).toHaveBeenLastCalledWith("ready");
+  expect(mockConsumer.open).toHaveBeenCalledTimes(1);
+  expect(mockTransport.open).not.toHaveBeenCalled();
   await result.unmount();
+  expect(mockConsumer.close).toHaveBeenCalledTimes(1);
+  expect(mockTransport.close).not.toHaveBeenCalled();
+  expect(mockRelease).toHaveBeenCalledTimes(1);
+});
+
+test("the app connection owner exposes the root without creating or closing a tool", async () => {
+  const onTransport = jest.fn();
+  const result = await render(
+    <HostTransportSurface
+      connectionOwner
+      hostId="host"
+      hostIdentityPublicKey="key"
+      onTransport={onTransport}
+    />,
+  );
+  expect(onTransport).toHaveBeenCalledWith(mockTransport);
+  expect(mockConsumer.open).not.toHaveBeenCalled();
+  await result.unmount();
+  expect(mockConsumer.close).not.toHaveBeenCalled();
+  expect(mockTransport.close).not.toHaveBeenCalled();
   expect(mockRelease).toHaveBeenCalledTimes(1);
 });
 

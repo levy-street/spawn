@@ -180,7 +180,9 @@ async function readyTransport(options?: {
       protocol: "spawn.host.ctl",
       ...(options?.omitCapabilities
         ? {}
-        : { capabilities: options?.capabilities ?? FULL_CAPABILITIES }),
+        : {
+            capabilities: [...(options?.capabilities ?? FULL_CAPABILITIES), "session.transport.v1"],
+          }),
       limits: {
         frame_bytes: 16 * 1024,
         chunk_bytes: HOST_STREAM_CHUNK_BYTES,
@@ -192,7 +194,12 @@ async function readyTransport(options?: {
     },
   });
   bridge.emit({ v: 1, type: "state", state: "ready" });
-  await opening;
+  try {
+    await opening;
+  } catch (error) {
+    transport.close();
+    throw error;
+  }
   return { bridge, signal, transport };
 }
 
@@ -450,11 +457,10 @@ describe("HostTransport capabilities", () => {
     transport.close();
   });
 
-  test("treats an absent capability field as an empty advertised set", async () => {
-    const { transport } = await readyTransport({ omitCapabilities: true });
-    expect(transport.capabilities?.operations).toEqual([]);
-    expect(transport.hasCapability("fs.read")).toBe(false);
-    transport.close();
+  test("refuses shared root readiness without the session transport capability", async () => {
+    await expect(readyTransport({ omitCapabilities: true })).rejects.toMatchObject({
+      code: "daemon_update_required",
+    });
   });
 });
 

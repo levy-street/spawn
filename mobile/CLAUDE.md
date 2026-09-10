@@ -89,8 +89,10 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
 - Device transport: `terminal/DaemonConnections.tsx` mounts the persistent
   host workers under the authenticated app. `transport/host-transport-registry.ts`
   scopes them by account and host identity; `session-transport.ts` owns only
-  view attachments. `worker/worker-pair.js` proxies their channels through the
-  native bridge. Rebuild `worker.html` and `worker-html.ts` with
+  view attachments. Host-tool surfaces own separate consumer channels;
+  `worker/worker-host-consumers.js` isolates their queues and protocol failures
+  from the root and sibling consumers. `worker/worker-pair.js` proxies terminal
+  channels through the native bridge. Rebuild `worker.html` and `worker-html.ts` with
   `node src/terminal/worker/build-worker.mjs` after worker source edits.
   Read `docs/DEVICE_CONNECTIONS.md` before changing lifecycle or control rules.
 

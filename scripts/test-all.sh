@@ -76,6 +76,9 @@ printf '%s\n' "== daemon tests, diagnostics variant =="
 # test that only fails with the feature on must not merge green.
 (cd daemon && cargo test --locked --features diagnostics)
 
+printf '%s\n' "== SCTP stream lifecycle regressions =="
+(cd daemon && cargo test --locked -p webrtc-sctp --lib stream::stream_test::)
+
 printf '%s\n' "== daemon updater end-to-end =="
 scripts/test-update-e2e.sh
 

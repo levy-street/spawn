@@ -38,6 +38,7 @@ function DaemonSurface({
   return (
     <>
       <HostTransportSurface
+        connectionOwner
         hostId={hostId}
         hostIdentityPublicKey={publicKey}
         onTransport={(next) => {

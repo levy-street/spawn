@@ -20,6 +20,7 @@ const runtimeFiles = [
   "worker-runtime.js",
   "worker-session.js",
   "worker-host.js",
+  "worker-host-consumers.js",
   "worker-pair.js",
   "worker-transport.js",
 ];

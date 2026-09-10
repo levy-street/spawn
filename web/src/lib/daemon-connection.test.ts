@@ -6,12 +6,14 @@ import type { HostControlClient, HostControlState } from "./hostControl";
 class Bus {
   static instances = new Set<Bus>();
   static messages: unknown[] = [];
+  static delayOpens = false;
   onmessage: ((event: { data: unknown }) => void) | null = null;
   constructor(readonly name: string) {
     Bus.instances.add(this);
   }
   postMessage(data: unknown) {
     Bus.messages.push(structuredClone(data));
+    if (Bus.delayOpens && (data as { type: string }).type === "channel-open") return;
     for (const bus of Bus.instances)
       if (bus !== this && bus.name === this.name)
         queueMicrotask(() => {
@@ -76,7 +78,7 @@ class Channel {
 }
 class Root {
   state: HostControlState = "idle";
-  readonly generation = crypto.randomUUID();
+  generation = crypto.randomUUID();
   readonly channels: Channel[] = [];
   readonly listeners = new Set<() => void>();
   closed = false;
@@ -168,6 +170,7 @@ beforeEach(() => {
   }
   roots.length = 0;
   Bus.messages.length = 0;
+  Bus.delayOpens = false;
 });
 afterEach(async () => {
   for (const connection of connections.splice(0)) connection.close();
@@ -238,6 +241,93 @@ test("connection loss and account retirement discard pending input", async () =>
   await Bun.sleep(10);
   expect(roots[0].channels[1].sent).toEqual([]);
   expect(() => connection.createChannel(label())).toThrow();
+});
+
+test("same-peer readiness loss retires downstream queues in every tab before recovery", async () => {
+  const owner = connect(),
+    follower = connect();
+  await until(() => follower.getSnapshot().state === "ready");
+  const channels = [
+    owner.createChannel(label()),
+    follower.createChannel(label()),
+    follower.createChannel(label("ctl")),
+    owner.createChannel(`spawn.host.ctl/${crypto.randomUUID()}`),
+  ];
+  await until(() => channels.every((channel) => channel.readyState === "open"));
+  const root = roots[0];
+  for (const native of root.channels) native.bufferedAmount = 128 * 1024;
+  for (const channel of channels) channel.send("must not replay after network loss");
+  // Wait for dispatch across the local bus into the owner's scheduler. An
+  // immediate loss only exercises the earlier proxy promise tail.
+  await until(
+    () =>
+      Bus.messages.filter((message) => (message as { type: string }).type === "channel-send")
+        .length === channels.length,
+  );
+  await Bun.sleep(10);
+  const staleSends = Bus.messages.filter(
+    (message) => (message as { type: string }).type === "channel-send",
+  );
+  root.setState("connecting");
+  expect(root.channels.every((native) => native.readyState === "closed")).toBe(true);
+  root.setState("ready");
+  await until(() => channels.every((channel) => channel.readyState === "closed"));
+  expect(channels.every((channel) => channel.bufferedAmount === 0)).toBe(true);
+  for (const native of root.channels) native.bufferedAmount = 0;
+  for (const bus of Bus.instances)
+    for (const message of staleSends) bus.onmessage?.({ data: message });
+  await Bun.sleep(10);
+  expect(root.channels.every((native) => native.sent.length === 0)).toBe(true);
+  expect(roots).toHaveLength(1);
+  expect(root.closed).toBe(false);
+  expect(follower.getSnapshot().generation).toBe(root.generation);
+  const fresh = follower.createChannel(label());
+  await until(() => fresh.readyState === "open");
+  fresh.send("new input");
+  await until(() => root.channels.at(-1)!.sent.length === 1);
+  expect(root.channels.at(-1)!.sent).toEqual(["new input"]);
+});
+
+test("same-peer recovery rejects follower opens delayed past their readiness epoch", async () => {
+  connect();
+  const follower = connect();
+  await until(() => follower.getSnapshot().state === "ready");
+  Bus.delayOpens = true;
+  const pending = follower.createChannel(label());
+  await until(() =>
+    Bus.messages.some((message) => (message as { type: string }).type === "channel-open"),
+  );
+  const staleOpen = Bus.messages.find(
+    (message) => (message as { type: string }).type === "channel-open",
+  );
+  expect(roots[0].channels).toHaveLength(0);
+  roots[0].setState("connecting");
+  roots[0].setState("ready");
+  await until(() => pending.readyState === "closed");
+  Bus.delayOpens = false;
+  for (const bus of Bus.instances) bus.onmessage?.({ data: staleOpen });
+  await Bun.sleep(10);
+  expect(roots[0].channels).toHaveLength(0);
+  const fresh = follower.createChannel(label());
+  await until(() => fresh.readyState === "open");
+  expect(roots).toHaveLength(1);
+  expect(roots[0].channels).toHaveLength(1);
+});
+
+test("a retirement callback can attach to the published successor without its new channel being retired", async () => {
+  const owner = connect();
+  await until(() => owner.getSnapshot().state === "ready");
+  const old = owner.createChannel(label());
+  await until(() => old.readyState === "open");
+  let replacement: ReturnType<typeof owner.createChannel> | null = null;
+  old.onclose = () => {
+    replacement = owner.createChannel(label());
+  };
+  roots[0].generation = crypto.randomUUID();
+  roots[0].setState("ready");
+  await until(() => replacement?.readyState === "open");
+  expect(old.readyState).toBe("closed");
+  expect(roots[0].channels.at(-1)!.readyState).toBe("open");
 });
 
 test("separate daemons and accounts do not share a peer", async () => {

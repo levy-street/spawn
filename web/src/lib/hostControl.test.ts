@@ -301,8 +301,13 @@ afterEach(() => {
 
 describe("HostControlClient", () => {
   test.each([
-    1, 2,
-  ])("signed host v%i applies only the host-signed transcript SDP", async (version) => {
+    { version: 1, supportsSessions: true },
+    { version: 2, supportsSessions: true },
+    { version: 2, supportsSessions: false },
+  ])("signed host handshake %o applies authenticated SDP and required capabilities", async ({
+    version,
+    supportsSessions,
+  }) => {
     const signed = await signedRtcTrust();
     const client = new HostControlClient(hostId, {
       deviceConnection: version === 2,
@@ -366,9 +371,16 @@ describe("HostControlClient", () => {
           version: 1,
           type: "hello",
           protocol: HOST_CONTROL_PROTOCOL,
-          capabilities: ["session.transport.v1"],
+          capabilities: supportsSessions ? ["session.transport.v1"] : ["ping"],
         }),
       );
+      if (!supportsSessions) {
+        expect(client.getState()).not.toBe("ready");
+        expect(client.getConnectionError()).toContain("Update SPAWN D");
+        expect(pc.channel.closed).toBe(true);
+        client.close();
+        return;
+      }
       expect(client.getState()).toBe("ready");
       pc.connectionState = "disconnected";
       window.dispatchEvent(new Event("online"));

@@ -4,6 +4,7 @@ import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import { subscribeRetirementReason } from "@/data/realtime/lifecycle";
 import { deviceIdentityGeneration, subscribeDeviceIdentityAccount } from "@/lib/crypto/identity";
 import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
+import { createHostConsumerTransport } from "@/terminal/transport/host-transport";
 import { retainHostTransport } from "@/terminal/transport/host-transport-registry";
 import type {
   HostTransport,
@@ -21,6 +22,8 @@ import terminalWorkerAsset from "../../assets/terminal/worker.html";
 const USE_FILE_WORKER_FALLBACK = false;
 
 export interface HostTransportSurfaceProps extends Omit<HostTransportOptions, "bridge"> {
+  /** The authenticated app retains the root; tool surfaces own child channels. */
+  connectionOwner?: boolean;
   onTransport(transport: HostTransport): void;
   onStateChange?(state: TransportState): void;
   onError?(error: TransportError): void;
@@ -41,6 +44,7 @@ function HostTransportInstance({
   hostIdentityPublicKey,
   forceRelay,
   openSignal,
+  connectionOwner = false,
   onTransport,
   onStateChange,
   onError,
@@ -61,7 +65,14 @@ function HostTransportInstance({
       }),
     [forceRelay, hostId, hostIdentityPublicKey, openSignal],
   );
-  const { bridge, transport } = lease.shared;
+  const { bridge, transport: rootTransport } = lease.shared;
+  const transport = useMemo(
+    () =>
+      connectionOwner
+        ? rootTransport
+        : createHostConsumerTransport({ hostId, hostIdentityPublicKey, bridge }, rootTransport),
+    [bridge, connectionOwner, hostId, hostIdentityPublicKey, rootTransport],
+  );
   const [ownsWorker, setOwnsWorker] = useState(lease.shared.owner === lease.ownerId);
 
   useEffect(() => lease.subscribeOwnership(setOwnsWorker), [lease]);
@@ -78,21 +89,24 @@ function HostTransportInstance({
       transport.on("diagnostic", (diagnostic) => callbacks.current.onDiagnostic?.(diagnostic)),
     ];
     callbacks.current.onStateChange?.(transport.state);
+    if (transport !== rootTransport) void transport.open().catch(() => {});
     return () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
+      if (transport !== rootTransport) transport.close();
       lease.release();
     };
-  }, [lease, transport]);
+  }, [lease, rootTransport, transport]);
 
   useEffect(() => {
-    transport.prepare?.();
+    if (!ownsWorker) return;
+    rootTransport.prepare?.();
     return subscribeRetirementReason((reason) => {
-      if (reason === "interface-change") transport.networkChanged?.();
+      if (reason === "interface-change") rootTransport.networkChanged?.();
     });
-  }, [transport]);
+  }, [ownsWorker, rootTransport]);
 
   const openTransport = useCallback((): void => {
-    void transport.open().catch((error: unknown) => {
+    void rootTransport.open().catch((error: unknown) => {
       // A coded rejection (device_not_trusted above all) keeps its code:
       // rewrapping it generically is what hid the approval ceremony.
       callbacks.current.onError?.({
@@ -101,7 +115,7 @@ function HostTransportInstance({
         retryable: true,
       });
     });
-  }, [transport]);
+  }, [rootTransport]);
 
   useEffect(() => {
     let backgroundTimer: ReturnType<typeof setTimeout> | null = null;
@@ -112,7 +126,7 @@ function HostTransportInstance({
         backgroundTimer = setTimeout(() => {
           backgroundTimer = null;
           retiredForBackground.current = true;
-          transport.close();
+          rootTransport.close();
         }, 3_000);
         return;
       }
@@ -128,7 +142,7 @@ function HostTransportInstance({
       if (backgroundTimer !== null) clearTimeout(backgroundTimer);
       subscription.remove();
     };
-  }, [openTransport, transport]);
+  }, [openTransport, rootTransport]);
 
   const handleMessage = (event: WebViewMessageEvent): void => {
     try {
@@ -180,7 +194,7 @@ function HostTransportInstance({
       }}
       onContentProcessDidTerminate={() => {
         workerLoaded.current = false;
-        transport.close();
+        rootTransport.close();
         webViewRef.current?.reload();
       }}
     />

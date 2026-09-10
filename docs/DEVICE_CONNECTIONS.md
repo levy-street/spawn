@@ -9,8 +9,9 @@ this change does not move those authorities to the daemon.
 
 The existing `spawn.host.v1` signaling websocket accepts `rtc_version=2`.
 Its signed transcript uses host scope, protocol `spawn.host.ctl`, and protocol
-version 2. Both endpoints verify the expected identity and the exact RTC
-session/binding generation. Unsigned v2 offers and answers fail closed.
+version 2. Both endpoints verify the expected identity and signed RTC session;
+the outer binding nonce/generation are checked separately as routing and
+lifecycle fields. Unsigned v2 offers and answers fail closed.
 The daemon advertises `supports_device_connections` at registration and
 `session.transport.v1` in its host hello. New clients show an update message
 when the server or daemon lacks support; existing host-v1 and session-v2
@@ -36,29 +37,37 @@ cannot close its siblings' peer.
 
 The browser app provider owns host connections across route changes. Web Locks
 elect one owner across same-origin tabs, and BroadcastChannel carries bounded
-channel traffic to it. Monotonic owner terms fence delayed messages. Closing or
-freezing the owner releases its lock; another tab connects and its views replay
-from their existing history anchors. Unsupported coordination APIs produce an
-explicit error. Each account, registered device key, and host has its own lock
-and connection. Registration finishes before connection admission; replacing a
+channel traffic to it. Monotonic owner terms fence handovers, and child epochs
+reject delayed opens after readiness loss on the same peer. Closing or
+freezing the owner releases its lock; another tab connects and its views fetch
+a fresh history seed, merging live output at its PTY offset. Unsupported
+coordination APIs produce an explicit error. Each account, registered device key,
+and host has its own lock and connection. Registration finishes before
+connection admission; replacing a
 device key retires its connections and authenticates successors with the new key.
 
 The mobile authenticated root retains a host WebView independently of terminal
 screens. Terminal WebViews render locally and proxy channel operations through
-the native bridge. Three seconds in the background may retire the transport;
-foreground reopening restores views. Neither backgrounding nor closing the last
-view terminates a session. Signing out, changing accounts, or revoking host trust
+the native bridge. Each host-tool surface has its own host-control channel,
+request/stream state, a bounded send queue and receive credits; closing or
+failing it leaves the root, other tools and terminal attachments intact. Three
+seconds in the background may retire the transport; foreground reopening
+restores views. Neither backgrounding nor closing the last view terminates a
+session. Signing out, changing accounts, or revoking host trust
 retires the affected connections and pending work. Replacing the phone's signing
 key also recreates its host and terminal workers, even within the same account.
 
 Each host has one reconnect notice and retry action. Panes preserve their last
 output for copying and indicate that input is paused. Input accepted before a
-loss may have executed; unsent input is discarded and never replayed on a new
-attachment. Upload and file-write uncertainty continues to use the existing
-reconciliation flows and stable operation IDs.
+loss may have executed; unsent input is discarded at every application queue.
+Leaving host readiness retires child channels even when ICE repair retains the
+physical peer. Recovery creates fresh attachments and host consumers, so delayed
+old dispatches cannot resume. Upload and file-write uncertainty continues to use
+the existing reconciliation flows and stable operation IDs.
 
-A session remembers its controlling device even when that device has no attached
-views. Viewing and reconnecting from another device do not resize the terminal
+A session remembers its controlling device in supervisor memory even when that
+device has no attached views; the lease does not survive a supervisor restart.
+Viewing and reconnecting from another device do not resize the terminal
 or acquire input control. **Take control** explicitly transfers that lease.
 Focusing another view within the owning device transfers its active view and
 geometry. The UI waits for daemon confirmation before enabling input.
@@ -77,6 +86,6 @@ Behavioral coverage belongs in daemon native WebRTC tests, the browser connectio
 manager tests, mobile worker/transport tests, and `smoke-local-browser-live.sh`.
 The live smoke checks signed shell output, input, uploads, same-device tab reuse,
 typing in a second session during an 8 MiB upload, and owner handover against an
-isolated API and daemon. Native mobile lifecycle,
-real network transitions, and platform release gates still require their own
+isolated API and daemon. Native mobile lifecycle, real network transitions,
+and platform release gates still require their own
 runtime evidence before release.

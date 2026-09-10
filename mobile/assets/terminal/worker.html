@@ -2009,196 +2009,411 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
 // biome-ignore-all lint: This source executes inside WKWebView, not the React Native runtime.
 (() => {
   "use strict";
-  const api = globalThis.spawnWorker;
-  const state = api.state;
-  const host = { binding: false, channel: false, hello: false };
-  const HOST_HELLO_BRIDGE_ID = "$host.hello";
-  const HOST_STREAM_BRIDGE_PREFIX = "$host.stream:";
-  const STREAM_COMMAND_PREFIX = "$host.stream.";
-  const MAX_FRAME_BYTES = 16 * 1024;
-  const MAX_CHUNK_BYTES = 8 * 1024;
-  const BUFFERED_HIGH_WATER = 32 * 1024;
-  const STREAM_TIMEOUT_MS = 60_000;
+  const root = globalThis.spawnWorker;
+  function createHostProtocol(api) {
+    const state = api.state;
+    const host = { binding: false, channel: false, hello: false };
+    const HOST_HELLO_BRIDGE_ID = "$host.hello";
+    const HOST_STREAM_BRIDGE_PREFIX = "$host.stream:";
+    const STREAM_COMMAND_PREFIX = "$host.stream.";
+    const MAX_FRAME_BYTES = 16 * 1024;
+    const MAX_CHUNK_BYTES = 8 * 1024;
+    const BUFFERED_HIGH_WATER = 32 * 1024;
+    const STREAM_TIMEOUT_MS = 60_000;
 
-  function checkReady() {
-    if (host.binding && host.channel && host.hello) api.post({ type: "state", state: "ready" });
-  }
-
-  function postResponse(requestId, ok, result, error) {
-    api.post({
-      type: "host-response",
-      requestId,
-      ok,
-      ...(result === undefined ? {} : { result }),
-      ...(error === undefined ? {} : { error }),
-    });
-  }
-
-  function encodeFrame(frame) {
-    const text = JSON.stringify(frame);
-    if (new TextEncoder().encode(text).byteLength > MAX_FRAME_BYTES) {
-      throw new Error("Host-control frame exceeds 16 KiB.");
+    function checkReady() {
+      if (host.binding && host.channel && host.hello) api.post({ type: "state", state: "ready" });
     }
-    return text;
-  }
 
-  function sendFrame(frame) {
-    if (!state.ctl || state.ctl.readyState !== "open") {
-      throw new Error("Host-control channel is not ready.");
+    function postResponse(requestId, ok, result, error) {
+      api.post({
+        type: "host-response",
+        requestId,
+        ok,
+        ...(result === undefined ? {} : { result }),
+        ...(error === undefined ? {} : { error }),
+      });
     }
-    state.ctl.send(encodeFrame(frame));
-  }
 
-  async function waitForWritable() {
-    const channel = state.ctl;
-    if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
-    if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
-    channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        channel.removeEventListener("bufferedamountlow", onWritable);
-        reject(new Error("Host stream backpressure timed out."));
-      }, STREAM_TIMEOUT_MS);
-      const onWritable = () => {
-        clearTimeout(timer);
-        resolve();
+    function encodeFrame(frame) {
+      const text = JSON.stringify(frame);
+      if (new TextEncoder().encode(text).byteLength > MAX_FRAME_BYTES) {
+        throw new Error("Host-control frame exceeds 16 KiB.");
+      }
+      return text;
+    }
+
+    function sendFrame(frame) {
+      if (!state.ctl || state.ctl.readyState !== "open") {
+        throw new Error("Host-control channel is not ready.");
+      }
+      return state.ctl.send(encodeFrame(frame));
+    }
+
+    async function waitForWritable() {
+      const channel = state.ctl;
+      if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
+      if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
+      channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          channel.removeEventListener("bufferedamountlow", onWritable);
+          channel.removeEventListener("close", onClose);
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error("Host stream backpressure timed out."));
+        }, STREAM_TIMEOUT_MS);
+        const onWritable = () => {
+          if (channel.bufferedAmount > BUFFERED_HIGH_WATER) return;
+          cleanup();
+          resolve();
+        };
+        const onClose = () => {
+          cleanup();
+          reject(new Error("Host-control channel closed."));
+        };
+        channel.addEventListener("bufferedamountlow", onWritable);
+        channel.addEventListener("close", onClose, { once: true });
+        onWritable();
+      });
+      if (channel.readyState !== "open") throw new Error("Host-control channel is not ready.");
+    }
+
+    function streamFrame(type, payload) {
+      if (!payload || typeof payload.stream_id !== "string" || payload.stream_id.length === 0) {
+        throw new Error("Host stream command is missing its stream ID.");
+      }
+      if (type === "chunk") {
+        if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 0) {
+          throw new Error("Host stream chunk sequence is invalid.");
+        }
+        if (typeof payload.bytes_b64 !== "string") {
+          throw new Error("Host stream chunk bytes are invalid.");
+        }
+        const bytes = api.decodeBase64(payload.bytes_b64);
+        if (bytes.byteLength === 0 || bytes.byteLength > MAX_CHUNK_BYTES) {
+          throw new Error("Host stream chunk exceeds 8 KiB.");
+        }
+      } else if (type === "end") {
+        if (
+          !Number.isSafeInteger(payload.length) ||
+          payload.length < 0 ||
+          typeof payload.sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/.test(payload.sha256)
+        ) {
+          throw new Error("Host stream end frame is invalid.");
+        }
+      } else if (type === "ack") {
+        if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 1) {
+          throw new Error("Host stream acknowledgement is invalid.");
+        }
+      }
+      return {
+        version: 1,
+        type: `stream.${type}`,
+        stream_id: payload.stream_id,
+        ...(type === "chunk"
+          ? { sequence: payload.sequence, bytes_b64: payload.bytes_b64 }
+          : type === "end"
+            ? { length: payload.length, sha256: payload.sha256 }
+            : type === "ack"
+              ? { sequence: payload.sequence }
+              : {}),
       };
-      channel.addEventListener("bufferedamountlow", onWritable, { once: true });
-    });
-    if (channel.readyState !== "open") throw new Error("Host-control channel is not ready.");
-  }
+    }
 
-  function streamFrame(type, payload) {
-    if (!payload || typeof payload.stream_id !== "string" || payload.stream_id.length === 0) {
-      throw new Error("Host stream command is missing its stream ID.");
+    async function sendHostMessage(message) {
+      try {
+        if (message.type === "host-cancel") {
+          await sendFrame({ version: 1, type: "cancel", request_id: message.requestId });
+          return;
+        }
+        if (message.type !== "host-request") return;
+        if (message.operation.startsWith(STREAM_COMMAND_PREFIX)) {
+          const type = message.operation.slice(STREAM_COMMAND_PREFIX.length);
+          if (!["ack", "cancel", "chunk", "end"].includes(type)) {
+            throw new Error("Unknown host stream command.");
+          }
+          if (type === "chunk" || type === "end") await waitForWritable();
+          await sendFrame(streamFrame(type, message.payload));
+          postResponse(message.requestId, true, { sent: true });
+          return;
+        }
+        await sendFrame({
+          version: 1,
+          type: "request",
+          request_id: message.requestId,
+          operation: message.operation,
+          ...(message.payload === undefined ? {} : { payload: message.payload }),
+        });
+      } catch (error) {
+        postResponse(message.requestId, false, undefined, {
+          code: "host_send_failed",
+          detail: error instanceof Error ? error.message : "Host-control send failed.",
+        });
+      }
     }
-    if (type === "chunk") {
-      if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 0) {
-        throw new Error("Host stream chunk sequence is invalid.");
+
+    api.resetHostGeneration = () => {
+      host.binding = false;
+      host.channel = false;
+      host.hello = false;
+    };
+
+    api.hostBindingAccepted = () => {
+      host.binding = true;
+      checkReady();
+    };
+
+    api.hostChannelOpened = () => {
+      host.channel = true;
+      checkReady();
+    };
+
+    api.receiveHostCtl = (value) => {
+      if (typeof value !== "string") {
+        api.error("host_binary", "Unexpected host-control binary frame.", false);
+        return;
       }
-      if (typeof payload.bytes_b64 !== "string") {
-        throw new Error("Host stream chunk bytes are invalid.");
+      if (new TextEncoder().encode(value).byteLength > MAX_FRAME_BYTES) {
+        api.error("host_frame_size", "Host-control frame exceeds 16 KiB.", false);
+        return;
       }
-      const bytes = api.decodeBase64(payload.bytes_b64);
-      if (bytes.byteLength === 0 || bytes.byteLength > MAX_CHUNK_BYTES) {
-        throw new Error("Host stream chunk exceeds 8 KiB.");
+      let message;
+      try {
+        message = JSON.parse(value);
+      } catch {
+        api.error("host_json", "Host-control frame is not valid JSON.", false);
+        return;
       }
-    } else if (type === "end") {
-      if (
-        !Number.isSafeInteger(payload.length) ||
-        payload.length < 0 ||
-        typeof payload.sha256 !== "string" ||
-        !/^[0-9a-f]{64}$/.test(payload.sha256)
-      ) {
-        throw new Error("Host stream end frame is invalid.");
+      if (message?.version !== 1) {
+        api.error("host_version", "Host-control frame has an unsupported version.", false);
+        return;
       }
-    } else if (type === "ack") {
-      if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 1) {
-        throw new Error("Host stream acknowledgement is invalid.");
+      if (message.type === "hello" && message.protocol === "spawn.host.ctl") {
+        postResponse(HOST_HELLO_BRIDGE_ID, true, message);
+        host.hello = true;
+        checkReady();
+        return;
       }
-    }
-    return {
-      version: 1,
-      type: `stream.${type}`,
-      stream_id: payload.stream_id,
-      ...(type === "chunk"
-        ? { sequence: payload.sequence, bytes_b64: payload.bytes_b64 }
-        : type === "end"
-          ? { length: payload.length, sha256: payload.sha256 }
-          : type === "ack"
-            ? { sequence: payload.sequence }
-            : {}),
+      if (typeof message.type === "string" && message.type.startsWith("stream.")) {
+        if (typeof message.stream_id !== "string") {
+          api.error("host_stream", "Host stream frame is missing its stream ID.", false);
+          return;
+        }
+        postResponse(`${HOST_STREAM_BRIDGE_PREFIX}${message.stream_id}`, true, message);
+        return;
+      }
+      if (message.type !== "response" || typeof message.request_id !== "string") return;
+      postResponse(message.request_id, message.ok === true, message.result, message.error);
+    };
+
+    api.handleHostMessage = (message) => {
+      void sendHostMessage(message);
     };
   }
+  root.createHostProtocol = createHostProtocol;
+  createHostProtocol(root);
+})();
 
-  async function sendHostMessage(message) {
-    try {
-      if (message.type === "host-cancel") {
-        sendFrame({ version: 1, type: "cancel", request_id: message.requestId });
+// biome-ignore-all lint: This source executes inside WebView, not React Native.
+(() => {
+  "use strict";
+  const api = globalThis.spawnWorker;
+  const consumers = new Map();
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  function post(id, message) {
+    const entry = consumers.get(id);
+    let sequence;
+    if (entry && message.type === "host-response") {
+      const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+      if (entry.unreceived + bytes > 2 * 1024 * 1024 || entry.receipts.size >= 1024) {
+        post(id, {
+          type: "error",
+          code: "host_consumer_receive_limit",
+          message: "Host tool receive queue is full.",
+          retryable: false,
+        });
+        close(id);
         return;
       }
-      if (message.type !== "host-request") return;
-      if (message.operation.startsWith(STREAM_COMMAND_PREFIX)) {
-        const type = message.operation.slice(STREAM_COMMAND_PREFIX.length);
-        if (!["ack", "cancel", "chunk", "end"].includes(type)) {
-          throw new Error("Unknown host stream command.");
-        }
-        if (type === "chunk" || type === "end") await waitForWritable();
-        sendFrame(streamFrame(type, message.payload));
-        postResponse(message.requestId, true, { sent: true });
-        return;
-      }
-      sendFrame({
-        version: 1,
-        type: "request",
-        request_id: message.requestId,
-        operation: message.operation,
-        ...(message.payload === undefined ? {} : { payload: message.payload }),
-      });
-    } catch (error) {
-      postResponse(message.requestId, false, undefined, {
-        code: "host_send_failed",
-        detail: error instanceof Error ? error.message : "Host-control send failed.",
-      });
+      sequence = ++entry.receiveSequence;
+      entry.unreceived += bytes;
+      entry.receipts.set(sequence, bytes);
     }
+    api.post({
+      type: "host-consumer-event",
+      consumerId: id,
+      message,
+      ...(sequence === undefined ? {} : { sequence }),
+    });
   }
 
-  api.resetHostGeneration = () => {
-    host.binding = false;
-    host.channel = false;
-    host.hello = false;
-  };
+  function close(id) {
+    const entry = consumers.get(id);
+    if (!entry) return;
+    consumers.delete(id);
+    clearTimeout(entry.timer);
+    entry.dc.onclose = entry.dc.onerror = entry.dc.onmessage = entry.dc.onopen = null;
+    entry.dc.removeEventListener("bufferedamountlow", entry.onBuffered);
+    entry.dc.close();
+    for (const item of entry.queue.splice(0)) item.reject(new Error("Host consumer closed."));
+    entry.queued = 0;
+    entry.receipts.clear();
+    entry.unreceived = 0;
+    entry.channel.dispatchEvent(new Event("close"));
+    post(id, { type: "state", state: "reconnecting" });
+  }
 
-  api.hostBindingAccepted = () => {
-    host.binding = true;
-    checkReady();
-  };
-
-  api.hostChannelOpened = () => {
-    host.channel = true;
-    checkReady();
-  };
-
-  api.receiveHostCtl = (value) => {
-    if (typeof value !== "string") {
-      api.error("host_binary", "Unexpected host-control binary frame.", false);
+  function drain(id) {
+    const entry = consumers.get(id);
+    if (!entry) return;
+    entry.timer = null;
+    if (api.state.pc?.connectionState !== "connected" || entry.dc.readyState !== "open") {
+      close(id);
       return;
     }
-    if (new TextEncoder().encode(value).byteLength > MAX_FRAME_BYTES) {
-      api.error("host_frame_size", "Host-control frame exceeds 16 KiB.", false);
-      return;
-    }
-    let message;
-    try {
-      message = JSON.parse(value);
-    } catch {
-      api.error("host_json", "Host-control frame is not valid JSON.", false);
-      return;
-    }
-    if (message?.version !== 1) {
-      api.error("host_version", "Host-control frame has an unsupported version.", false);
-      return;
-    }
-    if (message.type === "hello" && message.protocol === "spawn.host.ctl") {
-      postResponse(HOST_HELLO_BRIDGE_ID, true, message);
-      host.hello = true;
-      checkReady();
-      return;
-    }
-    if (typeof message.type === "string" && message.type.startsWith("stream.")) {
-      if (typeof message.stream_id !== "string") {
-        api.error("host_stream", "Host stream frame is missing its stream ID.", false);
+    // A bounded queue and native buffer for this consumer. Service one frame
+    // per turn so bulk work yields to terminal channels and sibling tools.
+    if (entry.queue.length && entry.dc.bufferedAmount <= 32 * 1024) {
+      const item = entry.queue.shift();
+      entry.queued -= item.bytes;
+      try {
+        entry.dc.send(item.text);
+        item.resolve();
+      } catch (error) {
+        item.reject(error);
+        close(id);
         return;
       }
-      postResponse(`${HOST_STREAM_BRIDGE_PREFIX}${message.stream_id}`, true, message);
+      entry.channel.dispatchEvent(new Event("bufferedamountlow"));
+    }
+    if (entry.queue.length) entry.timer = setTimeout(() => drain(id), 4);
+  }
+
+  function open(id) {
+    if (consumers.has(id)) return;
+    if (
+      !uuid.test(id) ||
+      consumers.size >= 32 ||
+      api.state.mode !== "host" ||
+      api.state.pc?.connectionState !== "connected" ||
+      api.state.ctl?.readyState !== "open"
+    ) {
+      post(id, {
+        type: "error",
+        code: "host_consumer_unavailable",
+        message: "Host connection is not ready for another tool.",
+        retryable: false,
+      });
       return;
     }
-    if (message.type !== "response" || typeof message.request_id !== "string") return;
-    postResponse(message.request_id, message.ok === true, message.result, message.error);
-  };
+    const dc = api.state.pc.createDataChannel(`spawn.host.ctl/${id}`, { ordered: true });
+    const entry = {
+      dc,
+      queue: [],
+      queued: 0,
+      timer: null,
+      channel: null,
+      protocol: null,
+      receiveSequence: 0,
+      unreceived: 0,
+      receipts: new Map(),
+      onBuffered: null,
+    };
+    const channel = new EventTarget();
+    Object.defineProperties(channel, {
+      readyState: { get: () => (consumers.get(id) === entry ? dc.readyState : "closed") },
+      bufferedAmount: { get: () => entry.queued + dc.bufferedAmount },
+      bufferedAmountLowThreshold: {
+        get: () => dc.bufferedAmountLowThreshold,
+        set: (value) => {
+          dc.bufferedAmountLowThreshold = value;
+        },
+      },
+    });
+    channel.send = (text) =>
+      new Promise((resolve, reject) => {
+        const bytes = new TextEncoder().encode(text).byteLength;
+        if (
+          channel.readyState !== "open" ||
+          bytes > 64 * 1024 ||
+          entry.queued + bytes > 256 * 1024 ||
+          entry.queue.length >= 1024
+        ) {
+          reject(new Error("Host consumer send queue is unavailable."));
+          return;
+        }
+        entry.queue.push({ text, bytes, resolve, reject });
+        entry.queued += bytes;
+        if (entry.timer === null) entry.timer = setTimeout(() => drain(id), 0);
+      });
+    entry.channel = channel;
+    const protocol = {
+      state: { ctl: channel },
+      decodeBase64: api.decodeBase64,
+      post: (message) => {
+        if (consumers.get(id) === entry) post(id, message);
+      },
+      error: (code, message) => {
+        if (consumers.get(id) !== entry) return;
+        post(id, { type: "error", code, message, retryable: false });
+        close(id);
+      },
+    };
+    api.createHostProtocol(protocol);
+    entry.protocol = protocol;
+    consumers.set(id, entry);
+    protocol.hostBindingAccepted();
+    dc.onopen = () => {
+      if (consumers.get(id) === entry) protocol.hostChannelOpened();
+    };
+    dc.onmessage = ({ data }) => {
+      if (consumers.get(id) === entry) protocol.receiveHostCtl(data);
+    };
+    dc.onclose = dc.onerror = () => close(id);
+    entry.onBuffered = () => channel.dispatchEvent(new Event("bufferedamountlow"));
+    dc.addEventListener("bufferedamountlow", entry.onBuffered);
+  }
 
-  api.handleHostMessage = (message) => {
-    void sendHostMessage(message);
+  api.closeHostConsumers = () => {
+    for (const id of [...consumers.keys()]) close(id);
+  };
+  api.handleHostConsumerMessage = (message) => {
+    if (message.type === "host-consumer-open") {
+      try {
+        open(message.consumerId);
+      } catch {
+        post(message.consumerId, {
+          type: "error",
+          code: "host_consumer_open",
+          message: "Host tool channel could not open.",
+          retryable: false,
+        });
+      }
+      return true;
+    }
+    if (message.type === "host-consumer-close") {
+      close(message.consumerId);
+      return true;
+    }
+    if (message.type === "host-consumer-command") {
+      consumers.get(message.consumerId)?.protocol.handleHostMessage(message.command);
+      return true;
+    }
+    if (message.type === "host-consumer-received") {
+      const entry = consumers.get(message.consumerId);
+      const bytes = entry?.receipts.get(message.sequence);
+      if (bytes !== undefined) {
+        entry.receipts.delete(message.sequence);
+        entry.unreceived -= bytes;
+      }
+      return true;
+    }
+    return false;
   };
 })();
 
@@ -2845,6 +3060,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   function teardown(sendClose) {
+    api.closeHostConsumers?.();
     api.closePairChannels?.();
     if (state.mode === "host" && sendClose && state.rtcSessionId && state.bindingNonce) {
       emitSignal({ type: "rtc.close", ...outerTuple() });
@@ -2873,6 +3089,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   api.handleTransportMessage = async (message) => {
+    if (api.handleHostConsumerMessage?.(message)) return;
     if (api.handlePairMessage?.(message)) return;
     switch (message.type) {
       case "connect":

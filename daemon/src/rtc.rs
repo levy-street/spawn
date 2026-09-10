@@ -1326,7 +1326,11 @@ impl RtcSessions {
                 .get(signal_id)
                 .is_some_and(|peer| Arc::ptr_eq(&peer.pc, pc))
             {
-                peers.remove(signal_id)
+                peers.remove(signal_id).inspect(|peer| {
+                    if let Some(pair) = &peer.pair {
+                        pair.retire();
+                    }
+                })
             } else {
                 None
             }
@@ -1368,7 +1372,11 @@ impl RtcSessions {
                 .get(&signal.signal_id)
                 .is_some_and(|peer| peer.binding == binding)
             {
-                peers.remove(&signal.signal_id)
+                peers.remove(&signal.signal_id).inspect(|peer| {
+                    if let Some(pair) = &peer.pair {
+                        pair.retire();
+                    }
+                })
             } else {
                 None
             }
@@ -1890,6 +1898,15 @@ impl RtcSessions {
     }
 
     pub async fn close_all(&self) {
+        let host_peers = {
+            let mut hosts = self.host_peers.lock().await;
+            for peer in hosts.values() {
+                if let Some(pair) = &peer.pair {
+                    pair.retire();
+                }
+            }
+            std::mem::take(&mut *hosts)
+        };
         #[cfg(test)]
         if let Some(gate) = self.slow_close_all_gate.lock().await.take() {
             gate.entered.notify_one();
@@ -1943,7 +1960,6 @@ impl RtcSessions {
                 peers.remove(&signal_id);
             }
         }
-        let host_peers = std::mem::take(&mut *self.host_peers.lock().await);
         for (_, peer) in host_peers {
             let _ = peer.pc.close().await;
         }
@@ -1973,7 +1989,15 @@ impl RtcSessions {
         // Remove host peers from admission immediately as well. Close their
         // transports alongside the more involved session cleanup so neither
         // class delays fail-closed publication for the other.
-        let host_peers = std::mem::take(&mut *self.host_peers.lock().await);
+        let host_peers = {
+            let mut hosts = self.host_peers.lock().await;
+            for peer in hosts.values() {
+                if let Some(pair) = &peer.pair {
+                    pair.retire();
+                }
+            }
+            std::mem::take(&mut *hosts)
+        };
         let close_hosts = async move {
             for (_, peer) in host_peers {
                 let _ = peer.pc.close().await;
@@ -4154,9 +4178,9 @@ fn install_host_control_channel(
     binding: HostRtcBinding,
     signaling: RtcWsSender,
     files_override: Option<Arc<HostFileService>>,
-) {
+) -> Arc<crate::host_control::Lifetime> {
     let connected_signal = HostConnectedSignal::new(signaling, signal_id, binding);
-    crate::host_control::install(dc, connected_signal, files_override);
+    crate::host_control::install(dc, connected_signal, files_override)
 }
 
 pub(crate) async fn send_host_status(

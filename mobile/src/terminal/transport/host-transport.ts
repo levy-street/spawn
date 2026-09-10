@@ -10,7 +10,12 @@ import {
 import { subscribeHostPinChanges } from "@/data/trust/host-pins";
 import { randomBytes } from "@/lib/crypto/bootstrap";
 import { bytesToUuid, encodeHex } from "@/lib/crypto/bytes";
-import { TERMINAL_BRIDGE_VERSION, type WorkerToNativeMessage } from "@/terminal/transport/bridge";
+import {
+  type NativeToWorkerMessage,
+  parseWorkerMessage,
+  TERMINAL_BRIDGE_VERSION,
+  type WorkerToNativeMessage,
+} from "@/terminal/transport/bridge";
 import { verifyDaemonHost } from "@/terminal/transport/daemon-trust";
 import {
   assertHostFileSize,
@@ -174,8 +179,13 @@ class WebViewHostTransport implements StreamingHostTransport {
   readonly #stateListeners = new Set<(state: TransportState) => void>();
   readonly #errorListeners = new Set<(error: TransportError) => void>();
   readonly #diagnosticListeners = new Set<(diagnostic: WorkerDiagnostic) => void>();
+  #consumerId: string | null = null;
+  #parentUnsubscribe: (() => void) | null = null;
 
-  constructor(private readonly options: HostTransportOptions) {
+  constructor(
+    private readonly options: HostTransportOptions,
+    private readonly parent?: HostTransport,
+  ) {
     this.hostId = options.hostId;
     this.#streamTimeout =
       options.streamTimeoutMs === undefined || !Number.isFinite(options.streamTimeoutMs)
@@ -201,6 +211,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   prepare(): void {
+    if (this.parent) return;
     if (this.#prepared) return;
     this.#prepared = true;
     this.#lastError = null;
@@ -221,10 +232,11 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   networkChanged(): void {
+    if (this.parent) return;
     if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
     this.#refreshConfigBefore(() => {
       if (!this.#workerStarted || this.#state === "closed" || this.#state === "failed") return;
-      this.options.bridge.send({
+      this.#send({
         v: TERMINAL_BRIDGE_VERSION,
         type: "network-changed",
         ...(this.#cachedConfig
@@ -250,6 +262,49 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#resolveOpen = resolve;
       this.#rejectOpen = reject;
     });
+    if (this.parent) {
+      const opening = this.#opening;
+      this.#prepared = true;
+      this.#bridgeUnsubscribe?.();
+      this.#parentUnsubscribe?.();
+      this.#bridgeUnsubscribe = this.options.bridge.onMessage((message) => {
+        if (message.type !== "host-consumer-event" || message.consumerId !== this.#consumerId)
+          return;
+        try {
+          const event = parseWorkerMessage(
+            JSON.stringify({
+              ...(record(message.message) ?? {}),
+              v: TERMINAL_BRIDGE_VERSION,
+            }),
+          );
+          if (["state", "host-response", "error"].includes(event.type)) {
+            void this.#handleWorkerMessage(event)
+              .then(() => {
+                if (
+                  message.consumerId === this.#consumerId &&
+                  typeof message.sequence === "number"
+                ) {
+                  this.options.bridge.send({
+                    v: TERMINAL_BRIDGE_VERSION,
+                    type: "host-consumer-received",
+                    consumerId: message.consumerId,
+                    sequence: message.sequence,
+                  });
+                }
+              })
+              .catch(() => {
+                if (message.consumerId === this.#consumerId)
+                  this.#fail("host_consumer_protocol", "Host tool event could not be delivered.");
+              });
+          }
+        } catch {
+          this.#fail("host_consumer_protocol", "Host tool channel sent an invalid event.");
+        }
+      });
+      this.#parentUnsubscribe = this.parent.on("state", () => this.#syncConsumer());
+      this.#syncConsumer();
+      return opening;
+    }
     this.prepare();
     const opening = this.#opening;
     try {
@@ -261,7 +316,7 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#bridgeUnsubscribe = this.options.bridge.onMessage((message) => {
         void this.#handleWorkerMessage(message);
       });
-      this.options.bridge.send({
+      this.#send({
         v: TERMINAL_BRIDGE_VERSION,
         type: "init",
         mode: "host",
@@ -291,13 +346,14 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (this.#state === "closed") return;
     this.#pinUnsubscribe?.();
     this.#pinUnsubscribe = null;
+    this.#parentUnsubscribe?.();
+    this.#parentUnsubscribe = null;
     this.#clearConnectWatchdog();
-    clearTimeout(this.#reconnectTimer ?? undefined);
-    this.#reconnectTimer = null;
+    this.#clearReconnectTimer();
     clearTimeout(this.#resumeTimer ?? undefined);
     this.#resumeTimer = null;
     try {
-      this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "close" });
+      this.#send({ v: TERMINAL_BRIDGE_VERSION, type: "close" });
     } catch {
       // A terminated WebContent process has nothing left to close.
     }
@@ -373,7 +429,7 @@ class WebViewHostTransport implements StreamingHostTransport {
       }
       this.#pending.set(requestId, pending);
       try {
-        this.options.bridge.send({
+        this.#send({
           v: TERMINAL_BRIDGE_VERSION,
           type: "host-request",
           requestId,
@@ -390,7 +446,7 @@ class WebViewHostTransport implements StreamingHostTransport {
 
   cancel(requestId: string): void {
     try {
-      this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "host-cancel", requestId });
+      this.#send({ v: TERMINAL_BRIDGE_VERSION, type: "host-cancel", requestId });
     } catch {
       // Cancellation remains best-effort if WebContent retired at the same instant.
     }
@@ -669,7 +725,7 @@ class WebViewHostTransport implements StreamingHostTransport {
       }, this.#streamTimeout);
       this.#commands.set(requestId, { resolve, reject, timer });
       try {
-        this.options.bridge.send({
+        this.#send({
           v: TERMINAL_BRIDGE_VERSION,
           type: "host-request",
           requestId,
@@ -692,6 +748,83 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#signalStateUnsubscribe =
       this.#signal.onState?.((state) => this.#handleSignalState(state)) ?? null;
     if (this.#signal.state === "open") this.#signalHasOpened = true;
+  }
+
+  #send(message: NativeToWorkerMessage): void {
+    if (!this.parent) {
+      this.options.bridge.send(message);
+      return;
+    }
+    if (message.type === "close") {
+      this.#detachConsumer();
+      return;
+    }
+    if (!this.#consumerId || !["host-request", "host-cancel"].includes(message.type))
+      throw new HostControlTransportError("not_ready", "Host tool channel is not ready.");
+    if (message.type === "host-request" || message.type === "host-cancel")
+      this.options.bridge.send({
+        v: TERMINAL_BRIDGE_VERSION,
+        type: "host-consumer-command",
+        consumerId: this.#consumerId,
+        command: message,
+      });
+  }
+
+  #detachConsumer(): void {
+    const consumerId = this.#consumerId;
+    this.#consumerId = null;
+    if (consumerId) {
+      try {
+        this.options.bridge.send({
+          v: TERMINAL_BRIDGE_VERSION,
+          type: "host-consumer-close",
+          consumerId,
+        });
+      } catch {
+        /* A retired WebView has no remaining channels. */
+      }
+    }
+  }
+
+  #syncConsumer(): void {
+    if (!this.parent || !this.#prepared) return;
+    if (this.parent.state !== "ready") {
+      this.#clearReconnectTimer();
+      this.#detachConsumer();
+      this.#clearConnectWatchdog();
+      this.#capabilities = null;
+      const parentError = this.parent.state === "failed" ? this.parent.lastError : null;
+      const error = new HostControlTransportError(
+        parentError?.code ?? "connection_lost",
+        parentError?.message ?? "Host connection is paused.",
+      );
+      this.#rejectActive(error);
+      this.#setState(this.parent.state === "failed" ? "failed" : "connecting");
+      if (this.parent.state === "failed") {
+        if (parentError) this.#emitError(parentError);
+        this.#rejectOpen?.(error);
+        this.#settleOpening();
+      }
+      return;
+    }
+    if (this.#consumerId) return;
+    this.#clearReconnectTimer();
+    this.#consumerId = newUuid();
+    this.#capabilities = null;
+    this.#setState("connecting");
+    this.#armConnectWatchdog();
+    try {
+      this.options.bridge.send({
+        v: TERMINAL_BRIDGE_VERSION,
+        type: "host-consumer-open",
+        consumerId: this.#consumerId,
+      });
+    } catch (error) {
+      this.#fail(
+        "host_consumer_open",
+        error instanceof Error ? error.message : "Host tool channel could not open.",
+      );
+    }
   }
 
   #retireSignal(): void {
@@ -785,7 +918,7 @@ class WebViewHostTransport implements StreamingHostTransport {
           protocolVersion: 2,
         },
       );
-      this.options.bridge.send({
+      this.#send({
         v: TERMINAL_BRIDGE_VERSION,
         type: "signal-frame",
         frame: verified,
@@ -803,7 +936,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#activeRtcSessionId = newUuid();
     this.#activeBindingNonce = encodeHex(randomBytes(16));
     this.#activeBindingGeneration = null;
-    this.options.bridge.send({
+    this.#send({
       v: TERMINAL_BRIDGE_VERSION,
       type: "connect",
       rtcSessionId: this.#activeRtcSessionId,
@@ -883,6 +1016,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   async #handleWorkerMessage(message: WorkerToNativeMessage): Promise<void> {
+    if (this.#state === "closed" || this.#state === "failed") return;
     switch (message.type) {
       case "state":
         if (message.state === "reconnecting") this.#scheduleReconnect();
@@ -896,13 +1030,15 @@ class WebViewHostTransport implements StreamingHostTransport {
           // or the worker's restart deadline will request a fresh one.
         }
         break;
-      case "sign-request":
+      case "sign-request": {
+        const epoch = this.#prepareEpoch;
         try {
           const [signature, carriedEndorsements] = await Promise.all([
             signWorkerRequest(message),
             this.#endorsements,
           ]);
-          this.options.bridge.send({
+          if (epoch !== this.#prepareEpoch || !this.#workerStarted) return;
+          this.#send({
             v: TERMINAL_BRIDGE_VERSION,
             type: "sign-response",
             requestId: message.requestId,
@@ -910,7 +1046,8 @@ class WebViewHostTransport implements StreamingHostTransport {
             ...(carriedEndorsements.length > 0 ? { carriedEndorsements } : {}),
           });
         } catch (error) {
-          this.options.bridge.send({
+          if (epoch !== this.#prepareEpoch || !this.#workerStarted) return;
+          this.#send({
             v: TERMINAL_BRIDGE_VERSION,
             type: "sign-response",
             requestId: message.requestId,
@@ -918,6 +1055,7 @@ class WebViewHostTransport implements StreamingHostTransport {
           });
         }
         break;
+      }
       case "host-response":
         this.#handleHostResponse(message);
         break;
@@ -936,17 +1074,16 @@ class WebViewHostTransport implements StreamingHostTransport {
         }
         break;
       case "error":
+        if (!message.retryable) {
+          this.#fail(message.code, message.message);
+          break;
+        }
         this.#emitError({
           code: message.code,
           message: message.message,
           retryable: message.retryable,
           ...(message.detail === undefined ? {} : { detail: message.detail }),
         });
-        if (!message.retryable) {
-          const error = new HostControlTransportError(message.code, message.message);
-          this.#setState("failed");
-          this.#rejectActive(error);
-        }
         break;
       default:
         break;
@@ -957,6 +1094,12 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (message.requestId === HOST_HELLO_BRIDGE_ID) {
       try {
         this.#capabilities = parseHostHello(message.result);
+        if (!this.parent && !this.hasCapability("session.transport.v1")) {
+          this.#fail(
+            "daemon_update_required",
+            "Update SPAWN D on this host to share its connection.",
+          );
+        }
       } catch (error) {
         this.#fail(
           "host_hello",
@@ -1023,6 +1166,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#state = state;
     for (const listener of this.#stateListeners) listener(state);
     if (state === "ready") {
+      this.#clearReconnectTimer();
       this.#hasEverReady = true;
       this.#reconnectAttempt = 0;
       this.#reconnectStartedAt = null;
@@ -1079,11 +1223,21 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#reconnectTimer = null;
       if (this.#state === "closed" || this.#state === "failed") return;
       this.#capabilities = null;
+      if (this.parent) {
+        this.#detachConsumer();
+        this.#syncConsumer();
+        return;
+      }
       this.#setState("signalling");
       this.#loadEndorsements(this.#preflightTrust());
       this.#armConnectWatchdog();
       this.#startSignal();
     }, delay);
+  }
+
+  #clearReconnectTimer(): void {
+    clearTimeout(this.#reconnectTimer ?? undefined);
+    this.#reconnectTimer = null;
   }
 
   /**
@@ -1132,6 +1286,12 @@ class WebViewHostTransport implements StreamingHostTransport {
   #fail(code: string, message: string): void {
     if (this.#state === "failed" || this.#state === "closed") return;
     this.#clearConnectWatchdog();
+    this.#clearReconnectTimer();
+    if (this.parent) {
+      this.#parentUnsubscribe?.();
+      this.#parentUnsubscribe = null;
+      this.#detachConsumer();
+    }
     const error = new HostControlTransportError(code, message);
     this.#emitError({ code, message, retryable: false });
     this.#setState("failed");
@@ -1177,4 +1337,12 @@ class WebViewHostTransport implements StreamingHostTransport {
 
 export function createHostTransport(options: HostTransportOptions): StreamingHostTransport {
   return new WebViewHostTransport(options);
+}
+
+/** A file-tool protocol instance with its own channel on the retained root. */
+export function createHostConsumerTransport(
+  options: HostTransportOptions,
+  parent: HostTransport,
+): StreamingHostTransport {
+  return new WebViewHostTransport(options, parent);
 }
