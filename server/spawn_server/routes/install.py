@@ -343,75 +343,20 @@ INSTALL_PS1 = dedent(
         }
     }
 
-    function Move-WithRetry([string] $Source, [string] $Destination) {
-        $lastError = $null
-        foreach ($attempt in 1..20) {
-            try {
-                Move-Item -LiteralPath $Source -Destination $Destination -Force
-                return
-            } catch {
-                $lastError = $_
-                Start-Sleep -Milliseconds 250
-            }
+    function Publish-Pair([string] $StagedSpawnd, [string] $InstallRoot) {
+        # spawnd publishes the staged pair as one immutable release under
+        # <root>\releases\<version>-<hash> and points <root>\bin at it, unless
+        # a daemon on this machine still starts from the old shared pair there,
+        # in which case that pair is left alone and follows once it restarts.
+        # Nothing here renames or replaces a file a running daemon may be
+        # using, and no daemon is stopped to make room.
+        $lines = & $StagedSpawnd __publish-release --install-root $InstallRoot --json
+        if ($LASTEXITCODE -ne 0) {
+            throw "spawnd could not publish the downloaded pair into $InstallRoot (exit code $LASTEXITCODE)"
         }
-        throw "could not rename $Source to $Destination after stopping SPAWN D: $lastError"
-    }
-
-    function Install-Pair(
-        [string] $StagedSpawnd,
-        [string] $StagedWorker,
-        [string] $SpawndPath,
-        [string] $WorkerPath,
-        [string] $ServerUrl
-    ) {
-        $spawndCurrent = (Test-Path -LiteralPath $SpawndPath) -and
-            ((Get-Sha256 $SpawndPath) -eq $PinnedSpawndSha256)
-        $workerCurrent = (Test-Path -LiteralPath $WorkerPath) -and
-            ((Get-Sha256 $WorkerPath) -eq $PinnedWorkerSha256)
-        if ($spawndCurrent -and $workerCurrent) {
-            Write-Spawn 'the current release daemon pair is already installed'
-            return
-        }
-
-        # A running Windows image may be locked. Ask the existing supervised daemon
-        # to stop, then retry same-volume renames. A still-locked image fails closed.
-        if (Test-Path -LiteralPath $SpawndPath) {
-            try {
-                & $SpawndPath --server $ServerUrl disconnect
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Spawn "the existing daemon returned exit code $LASTEXITCODE while disconnecting"
-                }
-            } catch {
-                Write-Spawn "the existing daemon did not disconnect cleanly: $_"
-            }
-        }
-
-        $nonce = [Guid]::NewGuid().ToString('N')
-        $spawndBackup = Join-Path (Split-Path $SpawndPath) "spawnd.$nonce.prev.exe"
-        $workerBackup = Join-Path (Split-Path $WorkerPath) "spawn-worker.$nonce.prev.exe"
-        $hadSpawnd = Test-Path -LiteralPath $SpawndPath
-        $hadWorker = Test-Path -LiteralPath $WorkerPath
-
-        try {
-            if ($hadSpawnd) { Move-WithRetry $SpawndPath $spawndBackup }
-            if ($hadWorker) { Move-WithRetry $WorkerPath $workerBackup }
-            Move-WithRetry $StagedSpawnd $SpawndPath
-            Move-WithRetry $StagedWorker $WorkerPath
-        } catch {
-            # Restore the complete old pair whenever its members were moved aside.
-            Remove-Item -LiteralPath $SpawndPath -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $WorkerPath -Force -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $spawndBackup) {
-                Move-Item -LiteralPath $spawndBackup -Destination $SpawndPath -Force
-            }
-            if (Test-Path -LiteralPath $workerBackup) {
-                Move-Item -LiteralPath $workerBackup -Destination $WorkerPath -Force
-            }
-            throw
-        }
-
-        Remove-Item -LiteralPath $spawndBackup -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $workerBackup -Force -ErrorAction SilentlyContinue
+        $result = (($lines | Out-String).Trim() -split "`n" | Select-Object -Last 1) | ConvertFrom-Json
+        if (-not $result.dir) { throw 'spawnd did not report where it published the release' }
+        return $result
     }
 
     function Add-UserPath([string] $Directory) {
@@ -485,9 +430,12 @@ INSTALL_PS1 = dedent(
         throw 'the live manifest does not match the hashes baked into install.ps1; fetch the installer again'
     }
 
+    # Stage under the install root so the published copy can be a hard link.
     $nonce = [Guid]::NewGuid().ToString('N')
-    $stagedSpawnd = Join-Path $binDir "spawnd.$nonce.new.exe"
-    $stagedWorker = Join-Path $binDir "spawn-worker.$nonce.new.exe"
+    $stageDir = Join-Path $installRoot "staging-$nonce"
+    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+    $stagedSpawnd = Join-Path $stageDir 'spawnd.exe'
+    $stagedWorker = Join-Path $stageDir 'spawn-worker.exe'
     try {
         Write-Spawn "downloading the SPAWN D daemon pair for $Target"
         Invoke-WebRequest -UseBasicParsing -Uri "$Server/api/install/spawnd/$Target" -OutFile $stagedSpawnd
@@ -498,16 +446,24 @@ INSTALL_PS1 = dedent(
         Unblock-File -LiteralPath $stagedWorker -ErrorAction SilentlyContinue
         Invoke-Native { & $stagedSpawnd --version } 'downloaded spawnd.exe validation'
         Invoke-Native { & $stagedWorker --version } 'downloaded spawn-worker.exe validation'
-        Install-Pair $stagedSpawnd $stagedWorker $spawndPath $workerPath $Server
+        $release = Publish-Pair $stagedSpawnd $installRoot
     } finally {
-        Remove-Item -LiteralPath $stagedSpawnd -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $stagedWorker -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Assert-Sha256 $spawndPath $PinnedSpawndSha256 'installed spawnd.exe'
-    Assert-Sha256 $workerPath $PinnedWorkerSha256 'installed spawn-worker.exe'
+    # The release is what this run installed and what it runs from here on.
+    $releaseSpawnd = Join-Path $release.dir 'spawnd.exe'
+    $releaseWorker = Join-Path $release.dir 'spawn-worker.exe'
+    Assert-Sha256 $releaseSpawnd $PinnedSpawndSha256 'published spawnd.exe'
+    Assert-Sha256 $releaseWorker $PinnedWorkerSha256 'published spawn-worker.exe'
     Add-UserPath $binDir
-    Write-Spawn "installed SPAWN D at $spawndPath with $workerPath"
+    Write-Spawn "installed SPAWN D release $($release.release) at $($release.dir)"
+    if ($release.cli_replaced) {
+        Write-Spawn "$spawndPath now runs this release"
+    } else {
+        Write-Spawn "$spawndPath was left as it is: $($release.cli_note)"
+    }
+    $spawndPath = $releaseSpawnd
 
     if ($NoLogin) {
         Write-Spawn 'skipping login'
@@ -572,6 +528,18 @@ INSTALL_SCRIPT = dedent(
     BIN_DIR="$INSTALL_ROOT/bin"
     BIN="$BIN_DIR/spawnd"
     WORKER_BIN="$BIN_DIR/spawn-worker"
+    # The release this run publishes; set by publish_pair. Everything the
+    # installer runs afterwards runs this exact build.
+    RELEASE_DIR=""
+    RUN_BIN=""
+
+    # Everything downloaded or built lands here and never in $BIN_DIR. The
+    # daemon publishes the pair from here into the release store itself.
+    TMP_BASE=${TMPDIR:-/tmp}
+    TMP_DIR="$TMP_BASE/spawn-install.$$"
+    rm -rf "$TMP_DIR"
+    mkdir -p "$TMP_DIR"
+    trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
     say() {
       printf '%s\n' "SPAWN D: $*"
@@ -819,21 +787,34 @@ INSTALL_SCRIPT = dedent(
       need cargo || die "cargo was not found after rustup install"
     }
 
+    # Hand a pair to spawnd itself. It publishes the two files as one immutable
+    # release under $INSTALL_ROOT/lib/spawn/releases/<version>-<hash> and points
+    # $BIN at it — unless a daemon on this machine still starts from the old
+    # shared pair in $BIN_DIR, in which case that pair is left exactly as it is
+    # and follows once that daemon restarts. Nothing in this script writes a
+    # file a running daemon could be using; that is what took a host's
+    # sessions down on 2026-09-09. A second account installed here gets its own
+    # release directory beside this one, never this one's files.
+    publish_pair() {
+      _pair_dir=$1
+      _out=$("$_pair_dir/spawnd" __publish-release --install-root "$INSTALL_ROOT") \
+        || die "spawnd could not publish the downloaded pair into $INSTALL_ROOT"
+      printf '%s\n' "$_out"
+      RELEASE_DIR=$(printf '%s\n' "$_out" | sed -n 's/^spawn: published .* to //p' | head -n 1)
+      [ -n "$RELEASE_DIR" ] && [ -x "$RELEASE_DIR/spawnd" ] \
+        || die "spawnd did not report where it published the release"
+      RUN_BIN="$RELEASE_DIR/spawnd"
+    }
+
     install_spawnd() {
       say "building spawnd from $REPO#$BRANCH"
       export PATH="$BIN_DIR:$HOME/.cargo/bin:$PATH"
-      mkdir -p "$BIN_DIR"
-
-      TMP_BASE=${TMPDIR:-/tmp}
-      TMP_DIR="$TMP_BASE/spawn-install.$$"
-      rm -rf "$TMP_DIR"
-      mkdir -p "$TMP_DIR"
-      trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
       git clone --depth 1 --branch "$BRANCH" "$REPO" "$TMP_DIR/spawn"
-      cargo install --path "$TMP_DIR/spawn/daemon" --locked --root "$INSTALL_ROOT" --force
-      [ -x "$BIN" ] || die "spawnd did not install to $BIN"
-      [ -x "$WORKER_BIN" ] || die "spawn-worker did not install to $WORKER_BIN"
+      cargo install --path "$TMP_DIR/spawn/daemon" --locked --root "$TMP_DIR/build" --force
+      [ -x "$TMP_DIR/build/bin/spawnd" ] || die "spawnd did not build"
+      [ -x "$TMP_DIR/build/bin/spawn-worker" ] || die "spawn-worker did not build"
+      publish_pair "$TMP_DIR/build/bin"
     }
 
     host_target() {
@@ -907,13 +888,15 @@ INSTALL_SCRIPT = dedent(
       need curl || return 1
       URL="${SERVER%/}/api/install/spawnd/$TARGET"
       WORKER_URL="${SERVER%/}/api/install/spawn-worker/$TARGET"
-      TMP_BIN="$BIN.tmp.$$"
-      TMP_WORKER="$WORKER_BIN.tmp.$$"
+      STAGE="$TMP_DIR/prebuilt"
+      mkdir -p "$STAGE"
+      TMP_BIN="$STAGE/spawnd"
+      TMP_WORKER="$STAGE/spawn-worker"
       rule "INSTALLING SPAWN D"
       say "downloading prebuilt spawnd + spawn-worker for $TARGET"
       if curl -fsSL "$URL" -o "$TMP_BIN" && curl -fsSL "$WORKER_URL" -o "$TMP_WORKER"; then
         if ! verify_prebuilt "$TMP_BIN" spawnd || ! verify_prebuilt "$TMP_WORKER" spawn-worker; then
-          rm -f "$TMP_BIN" "$TMP_WORKER"
+          rm -rf "$STAGE"
           say "prebuilt checksum verification failed; falling back to source"
           return 1
         fi
@@ -921,152 +904,21 @@ INSTALL_SCRIPT = dedent(
         chmod 755 "$TMP_BIN"
         chmod 755 "$TMP_WORKER"
         if "$TMP_BIN" --version >/dev/null 2>&1; then
-          mv "$TMP_BIN" "$BIN"
-          mv "$TMP_WORKER" "$WORKER_BIN"
+          publish_pair "$STAGE"
           return 0
         fi
-        rm -f "$TMP_BIN" "$TMP_WORKER"
+        rm -rf "$STAGE"
         say "prebuilt daemon is not compatible with this host"
         return 1
       fi
-      rm -f "$TMP_BIN" "$TMP_WORKER"
+      rm -rf "$STAGE"
       return 1
-    }
-
-    xml_escape() {
-      printf '%s' "$1" | sed \
-        -e 's/&/\&amp;/g' \
-        -e 's/</\&lt;/g' \
-        -e 's/>/\&gt;/g' \
-        -e 's/"/\&quot;/g'
-    }
-
-    start_launchd_service() {
-      [ "$USE_SERVICE" = "1" ] || return 1
-      [ "$(uname -s 2>/dev/null || printf unknown)" = "Darwin" ] || return 1
-      need launchctl || return 1
-
-      LABEL="app.spawn.spawnd"
-      PLIST_DIR="$HOME/Library/LaunchAgents"
-      STATE_DIR="$HOME/.local/state/spawn"
-      PLIST="$PLIST_DIR/$LABEL.plist"
-      mkdir -p "$PLIST_DIR" "$STATE_DIR"
-
-      BIN_XML=$(xml_escape "$BIN")
-      SERVER_XML=$(xml_escape "$SERVER")
-      PATH_XML=$(xml_escape "$BIN_DIR:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-      OUT_XML=$(xml_escape "$STATE_DIR/spawnd.out.log")
-      ERR_XML=$(xml_escape "$STATE_DIR/spawnd.err.log")
-
-      cat > "$PLIST" <<EOF
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-    <dict>
-      <key>Label</key>
-      <string>$LABEL</string>
-      <key>ProgramArguments</key>
-      <array>
-        <string>$BIN_XML</string>
-        <string>--server</string>
-        <string>$SERVER_XML</string>
-        <string>run</string>
-      </array>
-      <key>EnvironmentVariables</key>
-      <dict>
-        <key>PATH</key>
-        <string>$PATH_XML</string>
-      </dict>
-      <key>RunAtLoad</key>
-      <true/>
-      <key>KeepAlive</key>
-      <true/>
-      <key>SoftResourceLimits</key>
-      <dict>
-        <key>NumberOfFiles</key>
-        <integer>16384</integer>
-      </dict>
-      <key>StandardOutPath</key>
-      <string>$OUT_XML</string>
-      <key>StandardErrorPath</key>
-      <string>$ERR_XML</string>
-    </dict>
-    </plist>
-    EOF
-
-      launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
-      if launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1; then
-        :
-      else
-        launchctl load "$PLIST" >/dev/null 2>&1 || return 1
-      fi
-      launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-      say "started LaunchAgent $LABEL"
-      say "logs: tail -f $STATE_DIR/spawnd.err.log"
-      return 0
-    }
-
-    start_systemd_service() {
-      [ "$USE_SERVICE" = "1" ] || return 1
-      need systemctl || return 1
-      systemctl --user show-environment >/dev/null 2>&1 || return 1
-      enable_systemd_linger
-
-      SERVICE_DIR="$HOME/.config/systemd/user"
-      mkdir -p "$SERVICE_DIR"
-      cat > "$SERVICE_DIR/spawnd.service" <<EOF
-    [Unit]
-    Description=spawnd daemon
-    After=network-online.target
-    Wants=network-online.target
-
-    [Service]
-    Type=simple
-    ExecStart="$BIN" --server "$SERVER" run
-    Restart=always
-    RestartSec=2
-    # Only kill spawnd itself on stop/restart: the per-session workers live in
-    # this cgroup and must survive supervisor updates.
-    KillMode=process
-    # Headroom against fd exhaustion taking the host offline.
-    LimitNOFILE=65536:infinity
-    Environment="PATH=$BIN_DIR:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-    # Signed signaling is enforced by default: this daemon refuses RTC offers
-    # that are not signed by a browser identity it pins. Approve new devices
-    # from a browser that already works (Settings -> Browser devices) or pair
-    # them here. Recovery escape hatch, accepting unauthenticated offers:
-    # Environment="SPAWND_REQUIRE_SIGNED_RTC=0"
-
-    [Install]
-    WantedBy=default.target
-    EOF
-
-      systemctl --user daemon-reload
-      systemctl --user enable --now spawnd.service
-      say "started user service spawnd.service"
-      say "logs: journalctl --user -u spawnd.service -f"
-      return 0
-    }
-
-    enable_systemd_linger() {
-      need loginctl || return 0
-      USER_NAME=$(id -un 2>/dev/null || printf '')
-      [ -n "$USER_NAME" ] || return 0
-      if loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null | grep -qx yes; then
-        return 0
-      fi
-      if loginctl enable-linger "$USER_NAME" >/dev/null 2>&1; then
-        say "enabled systemd linger for $USER_NAME"
-      else
-        say "systemd linger is not enabled; spawnd may start after login rather than boot"
-      fi
     }
 
     start_background() {
       STATE_DIR="$HOME/.local/state/spawn"
       mkdir -p "$STATE_DIR"
-      nohup "$BIN" --server "$SERVER" run >> "$STATE_DIR/spawnd.log" 2>&1 &
+      nohup "$RUN_BIN" --server "$SERVER" run >> "$STATE_DIR/spawnd.log" 2>&1 &
       say "started spawnd in the background, pid $!"
       say "logs: tail -f $STATE_DIR/spawnd.log"
     }
@@ -1091,14 +943,15 @@ INSTALL_SCRIPT = dedent(
       fi
     }
 
+    # exec replaces this shell, so the EXIT trap never fires: clean up first.
     exec_attached() {
+      rm -rf "$TMP_DIR"
       if have_tty; then
         exec "$@" < /dev/tty
       fi
       exec "$@"
     }
 
-    mkdir -p "$BIN_DIR"
     if ! install_prebuilt_spawnd; then
       [ "$PREBUILT_ONLY" = "0" ] || die "prebuilt daemon unavailable for this host"
       say "prebuilt daemon unavailable; falling back to source build"
@@ -1108,42 +961,51 @@ INSTALL_SCRIPT = dedent(
       install_spawnd
     fi
     install_runtime_prereqs
-    "$BIN" --version >/dev/null 2>&1 || die "installed spawnd cannot run on this host"
+    "$RUN_BIN" --version >/dev/null 2>&1 || die "installed spawnd cannot run on this host"
+    [ -x "$BIN" ] || die "spawnd is not on PATH at $BIN"
     [ -x "$WORKER_BIN" ] || die "installed spawn-worker is missing"
 
-    say "installed $("$BIN" --version 2>/dev/null || printf spawnd) at $BIN with $WORKER_BIN"
+    say "installed $("$RUN_BIN" --version 2>/dev/null || printf spawnd) at $BIN with $WORKER_BIN"
+    say "release: $RELEASE_DIR"
 
     if [ "$LOGIN_AFTER_INSTALL" = "0" ]; then
       say "skipping login"
       exit 0
     fi
 
+    # Every command below runs the release just published, whatever $BIN
+    # resolves to: a host whose daemon still starts from the old shared pair
+    # keeps that pair on PATH until the daemon restarts, and must still be
+    # possessed by the new build.
+
     # --no-start: register the host but do not start it.
     if [ "$START_AFTER_LOGIN" = "0" ]; then
-      run_attached "$BIN" --server "$SERVER" login --no-run
+      run_attached "$RUN_BIN" --server "$SERVER" login --no-run
       say "login complete; not starting daemon because --no-start was set"
       exit 0
     fi
 
     # --foreground: register, then run in the foreground.
     if [ "$FOREGROUND" = "1" ]; then
-      run_attached "$BIN" --server "$SERVER" login --no-run
-      exec "$BIN" --server "$SERVER" run
+      run_attached "$RUN_BIN" --server "$SERVER" login --no-run
+      rm -rf "$TMP_DIR"
+      exec "$RUN_BIN" --server "$SERVER" run
     fi
 
     # --no-service: register, then background without a service manager.
     if [ "$USE_SERVICE" = "0" ]; then
-      run_attached "$BIN" --server "$SERVER" login --no-run
+      run_attached "$RUN_BIN" --server "$SERVER" login --no-run
       start_background
       say "done"
       exit 0
     fi
 
     # Default: possess runs the login flow (if needed) and installs a supervised
-    # background service, idempotently — it owns the service lifecycle now.
+    # background service, idempotently — it owns the service lifecycle now, and
+    # points the service at this instance's release, never at $BIN.
     if [ "$NEW_ACCOUNT" = "1" ]; then
-      exec_attached "$BIN" --server "$SERVER" possess --new-account
+      exec_attached "$RUN_BIN" --server "$SERVER" possess --new-account
     fi
-    exec_attached "$BIN" --server "$SERVER" possess
+    exec_attached "$RUN_BIN" --server "$SERVER" possess
     """
 ).lstrip()

@@ -24,6 +24,7 @@ mod host_metrics;
 mod host_mime;
 mod host_preview;
 mod host_signal;
+mod install;
 mod lifecycle;
 mod login;
 mod platform;
@@ -111,8 +112,12 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Run(args) => run::run(cli.server.clone(), args).await,
-        Command::Update => update::run_cli(cli.server.clone()).await,
-        Command::Doctor(args) => doctor::run(cli.server.clone(), args).await,
+        Command::BuildInfo => {
+            println!("{}", serde_json::to_string(&version::BuildInfo::own())?);
+            Ok(())
+        }
+        Command::Update => update::run_cli(cli.server.clone(), explicit_config).await,
+        Command::Doctor(args) => doctor::run(cli.server.clone(), args, explicit_config).await,
         Command::Reconnect => lifecycle::reconnect(cli.server.clone(), explicit_config).await,
         Command::Disconnect => lifecycle::disconnect(explicit_config),
         Command::Logout(args) => lifecycle::logout(args, explicit_config).await,
@@ -122,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Watchdog(args) => service::run_watchdog(&args.instance).await,
         Command::UpdateHandoff(args) => update::relaunch_after_parent_exit(args.parent_pid),
+        Command::PublishRelease(args) => install::publish_self(&args),
     };
     #[cfg(windows)]
     if let Some(role) = background_role {

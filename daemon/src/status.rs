@@ -1,4 +1,11 @@
 //! Human and JSON status across every local account instance.
+//!
+//! Every line here is about the *instance*: the daemon that is running for
+//! it, the release it is pointed at, and whether the pair it runs matches.
+//! The command producing the report is one more binary on the machine and
+//! says so under `cli_version`; it never speaks for a daemon. On 2026-09-09 a
+//! shared `spawnd status` reported its own version and "up to date" for an
+//! instance whose daemon was a different build, refusing every new session.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,10 +32,44 @@ struct InstanceStatus {
     connection: String,
     service: crate::service::ServiceStatus,
     sessions: usize,
+    /// The build this instance runs: its live daemon's, else the release it
+    /// is pointed at, else — with neither — this command's own.
     version: String,
     update: String,
     host_key: Option<String>,
     browser_pins: usize,
+    /// The build of the command printing this. Not the daemon's.
+    cli_version: String,
+    /// The daemon process alive for this instance, when there is one.
+    running: Option<RunningBuild>,
+    /// The release the instance is pointed at in the store, when it is.
+    release: Option<SelectedRelease>,
+    /// Where the instance launches from: `release store`, `legacy shared
+    /// binary`, `custom path`, or `not running`.
+    launch: String,
+    /// Whether the running daemon's spawn-worker matches it.
+    pair: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RunningBuild {
+    pid: u32,
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release: Option<String>,
+    worker_mismatch: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SelectedRelease {
+    id: String,
+    version: String,
+    variant: String,
+    dir: String,
 }
 
 pub async fn run(
@@ -68,15 +109,100 @@ fn instance_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
     }
 }
 
+/// What an instance runs and what it is pointed at, read from the machine
+/// rather than assumed from the command. Shared with `doctor`.
+pub(crate) struct InstanceBuild {
+    config_dir: PathBuf,
+    pub(crate) state: Option<crate::state::StateFile>,
+    pub(crate) selected: Option<crate::install::Release>,
+    /// The version to report for the instance.
+    pub(crate) version: String,
+    /// The daemon tree to judge the server's release against; `None` when
+    /// the machine offers no way to know it.
+    pub(crate) tree: Option<String>,
+}
+
+impl InstanceBuild {
+    pub(crate) fn live(&self) -> Option<&crate::state::StateFile> {
+        self.state
+            .as_ref()
+            .filter(|state| crate::state::daemon_state_is_live(&self.config_dir, state))
+    }
+}
+
+pub(crate) fn instance_build(config_dir: &Path) -> InstanceBuild {
+    let state = crate::state::read(config_dir).ok().flatten();
+    let live = state
+        .as_ref()
+        .filter(|state| crate::state::daemon_state_is_live(config_dir, state));
+    let selected = crate::install::layout_for_instance(config_dir)
+        .ok()
+        .and_then(|layout| crate::install::selected(&layout, config_dir).ok().flatten());
+    let own_version = crate::version::build_version();
+    let version = live
+        .map(|state| state.version.clone())
+        .or_else(|| {
+            selected
+                .as_ref()
+                .map(|release| release.meta.version.clone())
+        })
+        .unwrap_or_else(|| own_version.clone());
+    // A daemon that predates the heartbeat's `tree` field still has one thing
+    // to go on: when it reports this command's commit — the variant segment
+    // aside, a diagnostics build and its release share a tree — it is this
+    // command's build. A dirty checkout's tree names nothing else's.
+    let tree = live
+        .and_then(|state| state.tree.clone())
+        .or_else(|| {
+            selected
+                .as_ref()
+                .map(|release| release.meta.tree.clone())
+                .filter(|tree| !tree.is_empty())
+        })
+        .or_else(|| {
+            (crate::install::base_version(&version) == crate::install::base_version(&own_version))
+                .then(|| {
+                    crate::version::daemon_tree()
+                        .filter(|tree| !tree.ends_with("-dirty"))
+                        .map(str::to_owned)
+                })
+                .flatten()
+        });
+    InstanceBuild {
+        config_dir: config_dir.to_path_buf(),
+        state,
+        selected,
+        version,
+        tree,
+    }
+}
+
 async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<InstanceStatus> {
-    let _guard = ConfigDirGuard::set(dir);
+    let _guard = crate::lifecycle::ConfigDirGuard::set(dir);
     let stored = crate::creds::load().context("loading stored credentials")?;
     let server = crate::config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
-    let heartbeat = crate::state::read(dir).ok().flatten();
-    let connection = connection_text(heartbeat.as_ref());
-    let sessions = heartbeat.as_ref().map_or(0, |state| state.sessions);
-    let update = release_state(&server).await;
+    let build = instance_build(dir);
+    let heartbeat = build.state.as_ref();
+    let connection = connection_text(dir, heartbeat);
+    let sessions = heartbeat.map_or(0, |state| state.sessions);
+    let update = release_state(&server, build.tree.as_deref()).await;
     let host_key = crate::creds::host_identity(&stored)?.map(|identity| identity.fingerprint);
+    let running = build.live().map(|state| RunningBuild {
+        pid: state.pid,
+        version: state.version.clone(),
+        tree: state.tree.clone(),
+        exe: state.exe.clone(),
+        release: state.release.clone(),
+        worker_mismatch: state.worker_mismatch,
+    });
+    let release = build.selected.as_ref().map(|release| SelectedRelease {
+        id: release.meta.id.clone(),
+        version: release.meta.version.clone(),
+        variant: release.meta.variant.clone(),
+        dir: release.dir.display().to_string(),
+    });
+    let launch = launch_text(build.live());
+    let pair = pair_text(build.live());
     Ok(InstanceStatus {
         account: dir
             .file_name()
@@ -88,17 +214,84 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         connection,
         service: crate::service::status(dir),
         sessions,
-        version: crate::version::build_version(),
+        version: build.version,
         update,
         host_key,
         browser_pins: stored.browser_pins().len(),
+        cli_version: crate::version::build_version(),
+        running,
+        release,
+        launch,
+        pair,
     })
 }
 
-fn connection_text(state: Option<&crate::state::StateFile>) -> String {
-    let Some(state) = state.filter(|state| crate::state::daemon_state_is_live(state)) else {
+/// Where the live daemon was launched from, as the machine reports it: the
+/// process's own executable on Linux, the path it recorded elsewhere.
+fn launch_text(live: Option<&crate::state::StateFile>) -> String {
+    let Some(state) = live else {
+        return "not running".into();
+    };
+    let exe = crate::install::live_exe(state.pid)
+        .map(|(exe, _)| exe)
+        .or_else(|| state.exe.as_deref().map(PathBuf::from));
+    match exe {
+        Some(exe) => match crate::install::provenance_of(&exe) {
+            crate::install::Provenance::Store { .. } => "release store".into(),
+            crate::install::Provenance::Legacy { .. }
+                if crate::install::is_shared_legacy_pair(&exe) =>
+            {
+                "legacy shared binary".into()
+            }
+            crate::install::Provenance::Legacy { .. } => "hand-placed pair".into(),
+            crate::install::Provenance::Unmanaged => "custom path".into(),
+        },
+        None => "unknown".into(),
+    }
+}
+
+/// Whether the running daemon's worker matches it: the daemon's own verdict
+/// first, then — where the machine can say which executable the process runs
+/// — whether that file was replaced under it and whether the worker beside it
+/// is the same build. A daemon too old to record any of this is asked about
+/// through `/proc` on Linux and reported unknown elsewhere.
+fn pair_text(live: Option<&crate::state::StateFile>) -> String {
+    let Some(state) = live else {
+        return "not running".into();
+    };
+    if state.worker_mismatch {
+        return "MISMATCH — new sessions are refused; restart: spawnd reconnect".into();
+    }
+    let exe = match crate::install::live_exe(state.pid) {
+        Some((_, true)) => {
+            return "daemon binary was replaced on disk; restart: spawnd reconnect".into()
+        }
+        Some((exe, false)) => Some(exe),
+        None => state.exe.as_deref().map(PathBuf::from),
+    };
+    let Some(exe) = exe else {
+        return "unknown (this daemon predates the pair report)".into();
+    };
+    let worker = exe.with_file_name(crate::platform::executable_name("spawn-worker"));
+    match crate::install::probe_pair(&exe, &worker) {
+        Ok(identity) if identity.version == state.version => "matches".into(),
+        Ok(identity) => format!(
+            "MISMATCH — the pair beside the daemon is {} but the daemon is {}; restart: spawnd reconnect",
+            identity.version, state.version
+        ),
+        Err(_) => "MISMATCH — no matching spawn-worker beside the daemon; restart: spawnd reconnect".into(),
+    }
+}
+
+fn connection_text(config_dir: &Path, state: Option<&crate::state::StateFile>) -> String {
+    let Some(state) = state.filter(|state| crate::state::daemon_state_is_live(config_dir, state))
+    else {
         return "not running — start with: spawnd reconnect".into();
     };
+    live_connection_text(state)
+}
+
+fn live_connection_text(state: &crate::state::StateFile) -> String {
     if state.connected {
         let age = state
             .connected_at
@@ -137,7 +330,8 @@ fn format_age(connected_at: i64) -> String {
     }
 }
 
-async fn release_state(server: &url::Url) -> String {
+/// Compare the server's release with the tree *this instance* runs.
+async fn release_state(server: &url::Url, instance_tree: Option<&str>) -> String {
     #[derive(serde::Deserialize)]
     struct Release {
         daemon: Option<Daemon>,
@@ -146,6 +340,9 @@ async fn release_state(server: &url::Url) -> String {
     struct Daemon {
         tree: String,
     }
+    let Some(instance_tree) = instance_tree else {
+        return "unknown (this daemon does not report its build)".into();
+    };
     let Ok(url) = crate::config::api_url(server, "/api/release") else {
         return "unknown".into();
     };
@@ -161,10 +358,10 @@ async fn release_state(server: &url::Url) -> String {
     let Ok(release) = response.json::<Release>().await else {
         return "unknown".into();
     };
-    match (release.daemon, crate::version::daemon_tree()) {
-        (Some(daemon), Some(own)) if daemon.tree == own => "up to date".into(),
-        (Some(_), Some(_)) => "update available".into(),
-        _ => "unknown".into(),
+    match release.daemon {
+        Some(daemon) if daemon.tree == instance_tree => "up to date".into(),
+        Some(_) => "update available".into(),
+        None => "unknown".into(),
     }
 }
 
@@ -194,6 +391,23 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
             "  version      {} · {}",
             instance.version, instance.update
         );
+        match &instance.release {
+            Some(release) => {
+                let _ = writeln!(
+                    text,
+                    "  release      {} ({}) · {}",
+                    release.id, release.variant, release.dir
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    text,
+                    "  release      none selected · launch: {}",
+                    instance.launch
+                );
+            }
+        }
+        let _ = writeln!(text, "  pair         {}", instance.pair);
         let fingerprint = instance.host_key.as_deref().unwrap_or("(none)");
         let shown = if verbose > 0 {
             fingerprint.to_string()
@@ -209,6 +423,11 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
     } else {
         let _ = writeln!(text, "\nOther instances on this machine: {others}");
     }
+    let _ = writeln!(
+        text,
+        "This command: spawnd {}",
+        crate::version::build_version()
+    );
     text
 }
 
@@ -219,36 +438,16 @@ fn abbreviate(value: &str) -> String {
     format!("{}…", value.chars().take(16).collect::<String>())
 }
 
-struct ConfigDirGuard(Option<std::ffi::OsString>);
-
-impl ConfigDirGuard {
-    fn set(dir: &Path) -> Self {
-        let previous = std::env::var_os("SPAWN_CONFIG_DIR");
-        std::env::set_var("SPAWN_CONFIG_DIR", dir);
-        Self(previous)
-    }
-}
-
-impl Drop for ConfigDirGuard {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(previous) => std::env::set_var("SPAWN_CONFIG_DIR", previous),
-            None => std::env::remove_var("SPAWN_CONFIG_DIR"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn auth_heartbeat_has_the_exact_status_remedy() {
-        let state = crate::state::StateFile {
+    fn state(version: &str, exe: Option<&str>, worker_mismatch: bool) -> crate::state::StateFile {
+        crate::state::StateFile {
             pid: std::process::id(),
             process_started_100ns: None,
             task_breakaway_denied: None,
-            version: "0.1.0".into(),
+            version: version.into(),
             connected: false,
             connected_at: None,
             server: "https://spawnd.dev".into(),
@@ -258,10 +457,41 @@ mod tests {
                 at: "2026-08-25T00:00:00Z".into(),
             }),
             sessions: 1,
-        };
+            tree: None,
+            build_counter: None,
+            exe: exe.map(str::to_owned),
+            release: None,
+            worker_mismatch,
+        }
+    }
+
+    #[test]
+    fn auth_heartbeat_has_the_exact_status_remedy() {
         assert_eq!(
-            connection_text(Some(&state)),
+            live_connection_text(&state("0.1.0", None, false)),
             "rejected by server (signed out) — fix with: spawnd login"
+        );
+    }
+
+    /// The incident line: a running daemon whose worker no longer matches is
+    /// named as such, with the remedy, whatever build this command is.
+    #[test]
+    fn the_pair_verdict_comes_from_the_daemon_not_the_command() {
+        assert_eq!(pair_text(None), "not running");
+        assert_eq!(
+            pair_text(Some(&state(
+                "0.1.0+gx.diagnostics",
+                Some("/x/spawnd"),
+                true
+            ))),
+            "MISMATCH — new sessions are refused; restart: spawnd reconnect"
+        );
+        // A live process with no recorded executable: Linux asks the kernel,
+        // and this test process has no spawn-worker beside it.
+        let verdict = pair_text(Some(&state("0.1.0", None, false)));
+        assert!(
+            verdict.starts_with("unknown") || verdict.starts_with("MISMATCH"),
+            "{verdict}"
         );
     }
 
@@ -284,23 +514,61 @@ mod tests {
                     stderr_log: None,
                 },
                 sessions: 2,
-                version: "0.4.2".into(),
+                version: "0.4.2+gabc.diagnostics".into(),
                 update: "up to date".into(),
                 host_key: Some("SHA256:Yr0kQmVd12345678".into()),
                 browser_pins: 3,
+                cli_version: "0.4.2+gabc".into(),
+                running: Some(RunningBuild {
+                    pid: 42,
+                    version: "0.4.2+gabc.diagnostics".into(),
+                    tree: Some("t".repeat(40)),
+                    exe: Some(
+                        "/Users/x/.local/lib/spawn/releases/0.4.2+gabc.diagnostics-1234abcd/spawnd"
+                            .into(),
+                    ),
+                    release: Some("0.4.2+gabc.diagnostics-1234abcd".into()),
+                    worker_mismatch: false,
+                }),
+                release: Some(SelectedRelease {
+                    id: "0.4.2+gabc.diagnostics-1234abcd".into(),
+                    version: "0.4.2+gabc.diagnostics".into(),
+                    variant: "diagnostics".into(),
+                    dir: "/Users/x/.local/lib/spawn/releases/0.4.2+gabc.diagnostics-1234abcd"
+                        .into(),
+                }),
+                launch: "release store".into(),
+                pair: "matches".into(),
             }],
         };
         let plain = format_plain(&output, 0);
         assert!(plain.starts_with("SPAWN D on mac-studio\n"));
         assert!(plain.contains("  connection   connected · 42 min · last error: none\n"));
         assert!(plain.contains("  service      running (launchd app.spawn.spawnd.3f9ac3e1)\n"));
-        assert!(plain.ends_with("Other instances on this machine: none\n"));
+        // The version line is the instance's daemon, and the release line
+        // names what it is pointed at; the command's own build is one line
+        // at the end, never mistaken for either.
+        assert!(plain.contains("  version      0.4.2+gabc.diagnostics · up to date\n"));
+        assert!(plain.contains(
+            "  release      0.4.2+gabc.diagnostics-1234abcd (diagnostics) · /Users/x/.local/lib/spawn/releases/0.4.2+gabc.diagnostics-1234abcd\n"
+        ));
+        assert!(plain.contains("  pair         matches\n"));
+        assert!(plain.contains("Other instances on this machine: none\n"));
+        assert!(plain.ends_with(&format!(
+            "This command: spawnd {}\n",
+            crate::version::build_version()
+        )));
 
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["host"], "mac-studio");
         assert_eq!(json["instances"][0]["sessions"], 2);
         assert_eq!(json["instances"][0]["service"]["running"], true);
         assert_eq!(json["instances"][0]["browser_pins"], 3);
+        assert_eq!(json["instances"][0]["version"], "0.4.2+gabc.diagnostics");
+        assert_eq!(json["instances"][0]["cli_version"], "0.4.2+gabc");
+        assert_eq!(json["instances"][0]["running"]["worker_mismatch"], false);
+        assert_eq!(json["instances"][0]["release"]["variant"], "diagnostics");
+        assert_eq!(json["instances"][0]["launch"], "release store");
     }
 
     #[test]

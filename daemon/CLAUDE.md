@@ -32,6 +32,10 @@ src/
     endpoint/    platform transport boundary: mod.rs is the common facade,
                  unix.rs owns stream/datagram sockets, and windows.rs owns
                  named pipes plus reservation-handle transfer
+  install.rs     the installed layout: the immutable release store, which
+                 release each instance runs, the command on PATH, adopting a
+                 legacy launch, and collecting releases nothing runs — see
+                 "Where a daemon's binaries live"
   <feature>.rs   one module per concern: run.rs (register + main loop),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
@@ -42,9 +46,10 @@ src/
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
   state.rs       atomic local daemon heartbeat contract (`state.json`)
-  status.rs      human/JSON status across local account instances
-  doctor.rs      the ordered 14-check local health report, plus the Windows
-                 agent-shell dependency diagnostic
+  status.rs      human/JSON status across local account instances, each
+                 described by the daemon running for it, never by the command
+  doctor.rs      the ordered 15-check local health report, per instance, plus
+                 the Windows agent-shell dependency diagnostic
   lifecycle.rs   reconnect, disconnect, logout, and local reset commands
   version.rs     the version the daemon reports; build.rs stamps the source
                  commit into it (0.1.0+g<commit>)
@@ -380,20 +385,110 @@ execution path to make an old server work. The replacement requires endpoint
 authorization and durable effect handling; `docs/DAEMON_COMMAND_AUTHORITY.md`
 records the remaining command surfaces, including server-selected version probes.
 
+## Where a daemon's binaries live
+
+Two daemons under one OS user used to share one pair of files,
+`~/.local/bin/spawnd` and `spawn-worker`, and every unit named that pair.
+Installing a second account replaced both under the first daemon, which kept
+running its old image while every worker it launched came from the new files
+(2026-09-09, dream: `worker_mismatch`, no new sessions, and a `spawnd status`
+that reported the *command's* version and "up to date"). `install.rs` owns
+the layout that ends this:
+
+```text
+<root>/                         ~/.local (Unix), %LOCALAPPDATA%\spawn (Windows)
+  bin/spawnd -> ../lib/spawn/releases/<id>/spawnd      the command on PATH
+  lib/spawn/                    (Windows: <root> itself)
+    releases/<version>-<hash>/  immutable: spawnd, spawn-worker, release.json
+    instances/<tag>/current -> ../../releases/<id>     what this instance runs
+    instances/<tag>/spawnd.updating                    an update on trial
+<config_dir>/install.json       names <root> for the instance
+```
+
+- **A release is published once and never modified.** `install::publish`
+  probes both binaries' `--version` and the daemon's `__build-info`, refuses
+  a pair whose halves disagree or whose daemon predates the release store,
+  writes a staging directory under `releases/` and renames it into place.
+  Publishing the same bytes again returns the release already there; a
+  different pair under the same name is refused. Two installers racing to
+  publish one release both end up with it.
+- **Each instance owns a pointer, nothing else.** On Unix the `current`
+  symlink is swapped atomically and the unit's `ExecStart` goes through it,
+  so the worker beside the running executable is the worker of the same
+  release *by construction* (`worker_backend::worker_bin` resolves beside the
+  canonical executable, once). On Windows, where a link needs a privilege a
+  user may not have, `instances\<tag>\` holds a hard-linked pair only that
+  instance's update swaps, `current.json` names the release, and the task or
+  Run registration names that constant path.
+- **Installers publish; `possess` and `update` select.** `install.sh` and
+  `install.ps1` download into scratch and run `spawnd __publish-release
+  --install-root <root>` from there; they never write into `bin/`. The
+  command on PATH becomes a link into the store — unless some daemon still
+  starts from a regular-file pair in `bin/` (`service::legacy_pair_in_use`),
+  in which case that pair is left untouched until the daemon restarts.
+  `possess` selects the installer build, preserving the instance's variant
+  (fetching its signed pair when the installer is another variant), then
+  registers and starts it. It never adopts a live pre-store daemon. Legacy
+  heartbeats without an executable field are checked against the live process;
+  process images also cover foreground launches before their first heartbeat.
+  An unknown image keeps the shared pair intact. `service::install` writes a
+  unit for the instance's launch path; `update` publishes the signed
+  pair and repoints one instance. Nothing ever writes a file another instance
+  is running.
+- **A legacy launch converges on its first start.** `run` calls
+  `install::prepare_launch` before anything else: a daemon launched from
+  `bin/` (or from a pair placed by hand under `instances/<tag>/`) adopts its
+  own pair into the store, selects it unless a selection exists, rewrites its
+  unit or plist for the constant launch path, and on Unix re-executes from
+  the store with the same PID and argv. Windows records the pointer and keeps
+  running until its next restart; only `possess`, `reconnect`, or `update`
+  from a shell re-register it, and a daemon still launched from `bin\`
+  blocks its own self-update with `legacy_launch`.
+- **Probation is per instance.** The marker lives in `instances/<tag>/`; a
+  failed probation points the instance back at the previous release, which
+  stays on disk until nothing refers to it. A marker the in-place updater left
+  beside a legacy binary is still honoured with its `.prev` semantics, once.
+  Installers and updaters lock `selection.lock` before changing the pointer;
+  an existing probation marker prevents another update from replacing it.
+- **Collection is conservative.** `install::collect_garbage` removes releases
+  no instance selects, no marker names, the command on PATH does not resolve
+  to, this process does not run, no live heartbeat records, and that are older
+  than fifteen minutes; it runs after a healthy registration and after
+  `spawnd update`, `exorcise`, and `reset`.
+
+`SPAWN_INSTALL_ROOT` chooses the root for an install and for a binary the
+store does not yet manage. An instance's `install.json` takes precedence over
+the inspecting CLI's install root; without a record the executable supplies
+its root. A checkout's `target/debug/spawnd` is "unmanaged": it is
+launched from where it is and only its first update moves it into the store.
+
 `spawn-worker --version` prints the same build/tree identity stamped into
 `spawnd`. The supervisor checks that pair at startup and before every new
-session; a mismatch is reported as `worker_mismatch` and existing workers keep
-running, but new sessions are refused. Reapplying the same release is allowed
-while mismatched so self-update can repair the pair. Self-updates retain both `.prev`
-binaries and a sibling `spawnd.updating` probation marker until the new daemon
-registers. Two failed startups or five minutes without registration atomically
-restore the pair and report a `health` update failure after the old daemon
-registers.
+session; a mismatch is reported as `worker_mismatch`, recorded in `state.json`
+for `status` and `doctor`, and existing workers keep running, but new sessions
+are refused. Inside the store the check is a tripwire — the pair cannot
+disagree by construction — and it remains the frontline for a daemon still
+launched from a legacy path. Two failed startups or five minutes without
+registration point the instance back at the previous release and report a
+`health` update failure after the old daemon registers.
+
+`status` and `doctor` describe the *instance*: the version, tree, executable,
+and worker verdict its live daemon wrote to `state.json` (on Linux, whether
+`/proc/<pid>/exe` says the file was replaced under it), the release it is
+pointed at, and what its service will actually start (`service::launch_report`
+reads `systemctl show`, which is how a drop-in override is caught). The
+command's own build appears once, as `cli_version`, and is never mistaken for
+a daemon's.
 
 Every self-update first downloads the origin-pinned
 `/api/install/manifest.json{,.sig}`, verifies the exact manifest bytes against
 the rotation list in `release_key.rs`, matches its tree and both artifact
-hashes, and enforces the build.rs-stamped monotonic release counter. Nothing the
+hashes, and enforces the build.rs-stamped monotonic release counter. A CLI
+uses the higher counter of the target instance's selected and live builds,
+recorded in `release.json` and its heartbeat; a known instance with missing
+  identity blocks updating until possession migrates it. Downloaded build
+metadata must match the signed counter, version, tree, and store capability.
+Nothing the
 server sends can waive that counter: `daemon.update` carries an
 `allow_downgrade` flag, but it only *asks*, and the daemon proceeds only when a
 downgrade has also been consented to on this machine — a `allow-downgrade` file
@@ -413,8 +508,13 @@ above.
 
 The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
 `status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,
-`reset`, and foreground-only `run`. `possess --new-account` creates another
-isolated account instance. On Windows, `possess --service-mode task|run`
+`reset`, and foreground-only `run`; `__publish-release` is the installers'
+hidden handoff, and `__build-info` reports version, tree, monotonic counter,
+and release-store capability as JSON without changing `--version`.
+`possess --new-account` creates another isolated account
+instance with its own release pointer. `update`, like `reconnect`, acts on
+every instance it can see and judges each by the release it runs, whatever
+build the command itself is. On Windows, `possess --service-mode task|run`
 selects and persists the instance's background manager; a denied task
 breakaway is offered as a switch to the Run watchdog on the next `possess`.
 `run` writes `state.json` atomically (`<config_dir>` on Unix,

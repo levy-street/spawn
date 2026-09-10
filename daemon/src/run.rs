@@ -472,6 +472,21 @@ async fn wait_for_credential_change_with(
 /// launchd's 256 run out at a laptop's worth of sessions (#80).
 const OPEN_FILE_LIMIT_TARGET: u64 = 65_536;
 
+/// Replace this process with `path`, same argv and environment. Returns only
+/// on failure.
+#[cfg(unix)]
+fn exec_into(path: &Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let mut argv = std::env::args_os();
+    let argv0 = argv.next();
+    let mut command = std::process::Command::new(path);
+    if let Some(argv0) = argv0 {
+        command.arg0(argv0);
+    }
+    command.args(argv);
+    command.exec()
+}
+
 fn raise_open_file_limit() {
     let ceiling = |limit: &crate::platform::OpenFileLimit| {
         limit
@@ -518,8 +533,35 @@ fn raise_open_file_limit() {
 }
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
-    // First, before any peer: every session costs descriptors, and the
-    // inherited limit is a laptop's worth of them (#80).
+    // Before anything else: a daemon launched from the shared legacy pair
+    // moves into the release store and, on Unix, re-executes from there, so
+    // every worker it launches from here on is the worker of its own release.
+    // Nothing below has run yet, so the exec loses nothing; the same PID
+    // continues under its service manager.
+    let config_dir = crate::config::config_dir()?;
+    match crate::install::prepare_launch(&config_dir) {
+        #[cfg(unix)]
+        Ok(crate::install::LaunchRedirect::Exec(target)) => {
+            #[cfg(unix)]
+            {
+                tracing::info!(target = %target.display(), "re-executing from the release store");
+                let error = exec_into(&target);
+                tracing::warn!(
+                    %error,
+                    "could not re-execute from the release store; continuing from the legacy path"
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = target;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not move this instance into the release store; continuing from the legacy path"
+        ),
+    }
+    // Every session costs descriptors, and the inherited limit is a laptop's
+    // worth of them (#80).
     raise_open_file_limit();
     install_sighup_handler();
     #[cfg(windows)]
@@ -539,7 +581,6 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
     let registry = SessionRegistry::new();
-    let config_dir = crate::config::config_dir()?;
     #[cfg(windows)]
     crate::service::instance_state_dir(&config_dir)?;
     #[cfg(windows)]
@@ -668,18 +709,21 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         let reconnect_now = res.as_ref().err().and_then(ws::close_disposition)
             == Some(ws::CloseDisposition::ImmediateReconnect);
         let delay = if protocol_required {
-            let failure = match crate::update::apply_from_release(&server_url).await {
-                Ok(crate::update::HttpUpdateOutcome::Applied(applied)) => {
-                    Some(crate::update::exec(applied))
-                }
-                Ok(crate::update::HttpUpdateOutcome::NoUpdate(reason)) => {
-                    Some(crate::update::UpdateFailure {
-                        stage: crate::update::UpdateStage::Precondition,
-                        error: reason,
-                    })
-                }
-                Err(failure) => Some(failure),
-            };
+            let failure =
+                match crate::update::apply_from_release(&server_url, crate::update::Mode::Daemon)
+                    .await
+                {
+                    Ok(crate::update::HttpUpdateOutcome::Applied(applied)) => {
+                        Some(crate::update::exec(applied))
+                    }
+                    Ok(crate::update::HttpUpdateOutcome::NoUpdate(reason)) => {
+                        Some(crate::update::UpdateFailure {
+                            stage: crate::update::UpdateStage::Precondition,
+                            error: reason,
+                        })
+                    }
+                    Err(failure) => Some(failure),
+                };
             if let Some(failure) = failure {
                 let now = Instant::now();
                 let should_log = last_protocol_update_error

@@ -80,8 +80,10 @@ PY
 fetch "/install.sh" >"$tmp_dir/install.sh"
 contains "$tmp_dir/install.sh" "DEFAULT_SERVER=$base_url"
 contains "$tmp_dir/install.sh" "/api/install/spawnd/"
-contains "$tmp_dir/install.sh" "enable-linger"
-contains "$tmp_dir/install.sh" "LaunchAgent"
+# The shell publishes a matched pair; possession owns service registration
+# (including systemd linger and LaunchAgents) inside the daemon.
+contains "$tmp_dir/install.sh" '__publish-release --install-root "$INSTALL_ROOT"'
+contains "$tmp_dir/install.sh" 'exec_attached "$RUN_BIN" --server "$SERVER" possess'
 
 # The Windows installer is rendered by the server and 503s until a Windows
 # release exists, so its body is not assertable here — but reaching the server

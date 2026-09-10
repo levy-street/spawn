@@ -293,7 +293,13 @@ update_test_new_fixture() {
   UPDATE_BROWSER_LOG="$UPDATE_FIXTURE/browser.log"
   UPDATE_WEB_LOG="$UPDATE_FIXTURE/web.log"
   UPDATE_DAEMON_HOME="$UPDATE_FIXTURE/daemon-home"
+  # The pair starts out installed the old way — a bare pair in <root>/bin —
+  # so every cell also proves the first start adopts it into the store.
   UPDATE_BIN_DIR="$UPDATE_FIXTURE/bin"
+  UPDATE_CONFIG_DIR="$UPDATE_DAEMON_HOME/.config/spawn"
+  UPDATE_STORE="$UPDATE_FIXTURE/lib/spawn"
+  UPDATE_RELEASES="$UPDATE_STORE/releases"
+  UPDATE_INSTANCE=""
   # macOS limits Unix-domain socket paths to 103 bytes. Session IDs consume
   # most of that budget, so keep worker state under canonical /tmp rather than
   # a potentially long per-user TMPDIR. The resolver removes platform-specific
@@ -314,10 +320,12 @@ update_test_new_fixture() {
   UPDATE_ANCHOR_SEED=""
   UPDATE_SESSION_ID=""
   UPDATE_WORKSPACE_ID=""
-  mkdir -p "$UPDATE_DAEMON_HOME" "$UPDATE_BIN_DIR" "$UPDATE_SESSION_CWD"
+  mkdir -p "$UPDATE_DAEMON_HOME" "$UPDATE_BIN_DIR" "$UPDATE_SESSION_CWD" "$UPDATE_CONFIG_DIR"
+  chmod 700 "$UPDATE_CONFIG_DIR"
   cp "$UPDATE_ARTIFACTS/$installed/spawnd" "$UPDATE_BIN_DIR/spawnd"
   cp "$UPDATE_ARTIFACTS/$installed/spawn-worker" "$UPDATE_BIN_DIR/spawn-worker"
   chmod 755 "$UPDATE_BIN_DIR/spawnd" "$UPDATE_BIN_DIR/spawn-worker"
+  UPDATE_INSTANCE="$UPDATE_STORE/instances/$(update_test_instance_tag "$UPDATE_CONFIG_DIR")"
   cat >"$UPDATE_SHELL" <<'SH'
 #!/usr/bin/env sh
 set -u
@@ -328,6 +336,83 @@ while IFS= read -r line; do
 done
 SH
   chmod 755 "$UPDATE_SHELL"
+}
+
+# The 8-hex tag the daemon derives for a config root: four bytes of SHA-256
+# over the canonical path, the same derivation as `service::instance_tag`.
+update_test_instance_tag() { # config-dir
+  python3 - "$1" <<'PYTAG'
+import hashlib
+import os
+import sys
+
+path = os.path.realpath(sys.argv[1])
+print(hashlib.sha256(path.encode()).hexdigest()[:8])
+PYTAG
+}
+
+# The release directory the fixture's instance is pointed at, or nothing.
+update_test_selected_release() {
+  local link="$UPDATE_INSTANCE/current"
+  [[ -L "$link" ]] || return 1
+  (cd -P -- "$link" 2>/dev/null && pwd -P)
+}
+
+# The spawnd the instance runs: the selected release's, else the legacy pair.
+update_test_installed_spawnd() {
+  local release
+  if release="$(update_test_selected_release)"; then
+    printf '%s\n' "$release/spawnd"
+  else
+    printf '%s\n' "$UPDATE_BIN_DIR/spawnd"
+  fi
+}
+
+update_test_installed_worker() {
+  local release
+  if release="$(update_test_selected_release)"; then
+    printf '%s\n' "$release/spawn-worker"
+  else
+    printf '%s\n' "$UPDATE_BIN_DIR/spawn-worker"
+  fi
+}
+
+# Whether the instance's selected pair is byte-identical to a built identity.
+update_test_installed_is() { # artifact-name
+  cmp -s "$(update_test_installed_spawnd)" "$UPDATE_ARTIFACTS/$1/spawnd" \
+    && cmp -s "$(update_test_installed_worker)" "$UPDATE_ARTIFACTS/$1/spawn-worker"
+}
+
+# Wait until the instance is pointed at a release whose pair is `artifact`.
+update_test_wait_installed() { # artifact-name, timeout
+  local deadline=$((SECONDS + ${2:-30}))
+  while ((SECONDS < deadline)); do
+    update_test_installed_is "$1" && return 0
+    sleep 0.1
+  done
+  update_test_die "the instance never selected the $1 pair; selected=$(update_test_selected_release || echo none)"
+}
+
+update_test_probation_marker() {
+  printf '%s\n' "$UPDATE_INSTANCE/spawnd.updating"
+}
+
+# Age a release's record past the collector's grace period, so a test can
+# prove collection without waiting fifteen minutes.
+update_test_age_release() { # release-dir
+  python3 - "$1/release.json" <<'PYAGE'
+import json
+import sys
+
+path = sys.argv[1]
+meta = json.load(open(path, encoding="utf-8"))
+meta["installed_at_unix_ms"] = 1
+json.dump(meta, open(path, "w", encoding="utf-8"))
+PYAGE
+}
+
+update_test_release_count() {
+  find "$UPDATE_RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.staging-*' 2>/dev/null | wc -l | tr -d ' '
 }
 
 update_test_prepare_database() {
@@ -471,11 +556,14 @@ update_test_stop_web() {
   update_test_stop_process web UPDATE_WEB_PID
 }
 
-update_test_mint_credentials() {
+# Mint a user, a host registration, and a credential record under
+# $UPDATE_DAEMON_HOME. A second call in one fixture needs its own label, or
+# it collides on the fixture user's email.
+update_test_mint_credentials() { # [daemon-origin] [label-suffix]
   local daemon_origin="${1:-$UPDATE_DAEMON_URL}"
   local email_label
   update_test_require_local_url "$daemon_origin"
-  email_label="$(basename "$UPDATE_FIXTURE" | tr -cd 'a-zA-Z0-9')"
+  email_label="$(basename "$UPDATE_FIXTURE" | tr -cd 'a-zA-Z0-9')${2:-}"
   local result
   result="$({
     cd "$UPDATE_REPO_ROOT/server"
@@ -484,8 +572,9 @@ update_test_mint_credentials() {
       SPAWN_JWT_SECRET=update-test-secret-with-enough-length \
       SPAWN_PUBLIC_URL="$UPDATE_SERVER_URL" \
       "$UPDATE_REPO_ROOT/server/.venv/bin/python" - \
-      "$UPDATE_SERVER_URL" "$daemon_origin" "$UPDATE_DAEMON_HOME" "$email_label" <<'PY'
+      "$UPDATE_SERVER_URL" "$daemon_origin" "$UPDATE_DAEMON_HOME" "$email_label" "${2:-}" <<'PY'
 import asyncio
+import hashlib
 import base64
 import json
 import os
@@ -511,7 +600,7 @@ from spawn_server.host_pair_possession import (
 )
 from spawn_server.models import User
 
-api_origin, daemon_origin, daemon_home, label = sys.argv[1:]
+api_origin, daemon_origin, daemon_home, label, suffix = sys.argv[1:]
 
 
 def request(method: str, path: str, payload: dict | None = None, token: str | None = None) -> dict:
@@ -552,8 +641,14 @@ async def create_fixture_user() -> tuple[str, str]:
 
 
 token, user_id = asyncio.run(create_fixture_user())
-seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
-public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+if suffix:
+    # A second host on one server needs its own key: the server keeps a host
+    # key bound to the account that first registered it.
+    seed = hashlib.sha256(f"update-test-host-{label}".encode()).digest()
+    public = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()
+else:
+    seed = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    public = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
 host_public_key = base64.urlsafe_b64encode(public).rstrip(b"=").decode()
 host_binding = {"host_key_algorithm": "ed25519", "host_public_key": host_public_key}
 started = request(
@@ -695,7 +790,6 @@ update_test_exec_daemon_env() {
     SPAWN_DISABLE_KEYRING=1 \
     SPAWN_CONFIG_DIR="$UPDATE_DAEMON_HOME/.config/spawn" \
     SPAWND_WORKER_DIR="$UPDATE_WORKER_DIR" \
-    SPAWND_WORKER_BIN="$UPDATE_BIN_DIR/spawn-worker" \
     SHELL="$UPDATE_SHELL" \
     NO_COLOR=1 \
     "$@"
@@ -975,6 +1069,9 @@ update_test_cleanup_fixture() {
   update_test_delete_sessions || cleanup_status=1
   if [[ -n "${UPDATE_BIN_DIR:-}" ]]; then
     chmod 755 "$UPDATE_BIN_DIR" 2>/dev/null || true
+  fi
+  if [[ -n "${UPDATE_STORE:-}" && -d "$UPDATE_STORE" ]]; then
+    chmod -R u+w "$UPDATE_STORE" 2>/dev/null || true
   fi
   update_test_stop_daemon || cleanup_status=1
   update_test_stop_recorded_workers || cleanup_status=1

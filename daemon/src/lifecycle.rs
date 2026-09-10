@@ -129,6 +129,7 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
     for dir in dirs {
         let _guard = ConfigDirGuard::set(&dir);
         let _ = crate::service::uninstall(&dir);
+        crate::possess::forget_release_selection(&dir);
         crate::creds::reset_local_credentials()?;
         crate::service::purge_local_instance_data(&dir)?;
         if let Err(error) = std::fs::remove_dir_all(&dir) {
@@ -142,7 +143,10 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
     Ok(())
 }
 
-fn selected_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
+/// The instances a command acts on: the explicit one, else every account
+/// instance under the default base, else the base itself (a legacy single
+/// instance). Shared by reconnect, disconnect, logout, reset, and update.
+pub(crate) fn selected_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
     if explicit_config {
         return Ok(vec![crate::config::config_dir()?]);
     }
@@ -155,7 +159,7 @@ fn selected_dirs(explicit_config: bool) -> Result<Vec<PathBuf>> {
     }
 }
 
-fn instance_name(dir: &Path) -> String {
+pub(crate) fn instance_name(dir: &Path) -> String {
     dir.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "default".into())
@@ -172,10 +176,12 @@ fn send_sighup(pid: u32) -> bool {
     })
 }
 
-struct ConfigDirGuard(Option<std::ffi::OsString>);
+/// Point `SPAWN_CONFIG_DIR` at one instance for the guard's lifetime, so the
+/// ambient-config helpers (`creds::load`, `config::config_dir`) act on it.
+pub(crate) struct ConfigDirGuard(Option<std::ffi::OsString>);
 
 impl ConfigDirGuard {
-    fn set(dir: &Path) -> Self {
+    pub(crate) fn set(dir: &Path) -> Self {
         let previous = std::env::var_os("SPAWN_CONFIG_DIR");
         std::env::set_var("SPAWN_CONFIG_DIR", dir);
         Self(previous)

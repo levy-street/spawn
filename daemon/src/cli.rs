@@ -70,6 +70,14 @@ pub enum Command {
     /// Internal post-update service-manager handoff.
     #[command(name = "__update-handoff", hide = true)]
     UpdateHandoff(UpdateHandoffArgs),
+    /// Internal: publish the pair beside this executable into the release
+    /// store and make it the command on PATH. What the installers hand off
+    /// to after downloading.
+    #[command(name = "__publish-release", hide = true)]
+    PublishRelease(PublishReleaseArgs),
+    /// Internal local build identity, including the downgrade floor.
+    #[command(name = "__build-info", hide = true)]
+    BuildInfo,
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +164,18 @@ pub struct WatchdogArgs {
 pub struct UpdateHandoffArgs {
     #[arg(long)]
     pub parent_pid: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct PublishReleaseArgs {
+    /// The install root to publish under (default: $SPAWN_INSTALL_ROOT, else
+    /// the platform's per-user root).
+    #[arg(long, value_name = "PATH")]
+    pub install_root: Option<PathBuf>,
+
+    /// Print one JSON object instead of `spawn:` lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

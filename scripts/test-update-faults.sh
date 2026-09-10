@@ -61,10 +61,14 @@ run_failure_case() {
   [[ "$UPDATE_HTTP_STATUS" == "202" ]] \
     || update_test_die "$label update returned $UPDATE_HTTP_STATUS: $UPDATE_HTTP_BODY"
   update_test_wait_host "$UPDATE_TREE_A" failed "$expected_error" 45 >/dev/null
-  cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
-    || update_test_die "$label changed the installed old daemon"
-  cmp -s "$UPDATE_BIN_DIR/spawn-worker" "$UPDATE_ARTIFACTS/old/spawn-worker" \
-    || update_test_die "$label changed the installed old worker"
+  update_test_installed_is old \
+    || update_test_die "$label changed the release the instance is pointed at"
+  # A failed download or verification publishes nothing: the store holds the
+  # adopted old pair and no staging directory.
+  [[ "$(update_test_release_count)" == "1" ]] \
+    || update_test_die "$label left $(update_test_release_count) releases in the store"
+  ! find "$UPDATE_RELEASES" -mindepth 1 -maxdepth 1 -name '.staging-*' | grep -q . \
+    || update_test_die "$label left a staging directory behind"
   kill -0 "$UPDATE_DAEMON_PID" 2>/dev/null \
     || update_test_die "$label stopped the registered old daemon"
   python3 -c 'import json,sys; h=json.load(sys.stdin); assert h["status"] == "online"' \
@@ -115,7 +119,7 @@ update_test_post_update '{}'
 [[ "$UPDATE_HTTP_STATUS" == "202" ]] \
   || update_test_die "manifest signature update returned $UPDATE_HTTP_STATUS: $UPDATE_HTTP_BODY"
 update_test_wait_host "$UPDATE_TREE_A" failed 'manifest bad signature' 45 >/dev/null
-cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
+update_test_installed_is old \
   || update_test_die "manifest signature failure changed the installed daemon"
 printf '%s\n' "test-update-faults: PASS manifest_bad_signature"
 update_test_cleanup_fixture
@@ -138,7 +142,7 @@ trickle_host="$(update_test_wait_host "$UPDATE_TREE_B" current "" 120 2>/dev/nul
 trickle_status=$?
 set -e
 if [[ "$trickle_status" == "0" ]]; then
-  cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+  update_test_wait_installed new 10 \
     || update_test_die "trickle reported current without installing v-new"
   printf '%s\n' "test-update-faults: PASS trickle -> completed"
 else
@@ -152,7 +156,7 @@ update = host["update"]
 if update["state"] != "failed" or not str(update.get("error") or "").startswith(("download:", "verify:")):
     raise SystemExit(f"trickle neither completed nor failed cleanly: {host!r}")
 ' <<<"$host"
-  cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/old/spawnd" \
+  update_test_installed_is old \
     || update_test_die "failed trickle changed the old daemon"
   printf '%s\n' "test-update-faults: PASS trickle -> clean failure"
 fi

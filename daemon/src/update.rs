@@ -3,6 +3,11 @@
 //! The supervisor process may be replaced, but it never terminates workers:
 //! they own the live sessions and the new process re-adopts them through the
 //! existing discovery registry.
+//!
+//! An update publishes the signed pair as an immutable release in the store
+//! (`install.rs`) and points this instance at it; nothing another instance
+//! runs is ever written. The previous release stays on disk, and a daemon
+//! that does not register within its probation window is pointed back at it.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -21,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::install::{self, Layout, Release};
 use crate::proto::DaemonUpdateArtifact;
 
 #[path = "update_io.rs"]
@@ -35,9 +41,12 @@ const DOWNGRADE_CONSENT_WINDOW: Duration = Duration::from_secs(30 * 60);
 const DOWNGRADE_CONSENT_FILE: &str = "allow-downgrade";
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-/// Names the release variant this daemon follows; empty or unset means its
-/// own build's. Any other value than a known variant blocks self-update.
+/// Names the release variant this daemon follows; empty or unset means the
+/// instance's own. Any other value than a known variant blocks self-update.
 const RELEASE_VARIANT_ENV: &str = "SPAWND_RELEASE_VARIANT";
+/// The marker the updater that ran before the release store left beside the
+/// binary it replaced in place.
+const LEGACY_MARKER: &str = "spawnd.updating";
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static WORKER_MISMATCH: AtomicBool = AtomicBool::new(false);
 static UNSIGNED_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -104,6 +113,11 @@ enum BlockReason {
     UnsupportedTarget,
     WorkerMissing,
     InvalidVariant,
+    /// The daemon runs from the shared legacy pair and could not move into
+    /// the store; only `spawnd possess` or `spawnd update` from a shell can
+    /// re-register it, so it must not swap files it does not own.
+    LegacyLaunch,
+    IdentityUnknown,
     #[cfg(windows)]
     TaskBreakawayUnconfirmed,
 }
@@ -116,6 +130,8 @@ impl BlockReason {
             Self::UnsupportedTarget => "unsupported_target",
             Self::WorkerMissing => "worker_missing",
             Self::InvalidVariant => "invalid_variant",
+            Self::LegacyLaunch => "legacy_launch",
+            Self::IdentityUnknown => "identity_unknown",
             #[cfg(windows)]
             Self::TaskBreakawayUnconfirmed => "task_breakaway_unconfirmed",
         }
@@ -127,11 +143,12 @@ impl BlockReason {
 /// One signed manifest describes a release: the release pair for every
 /// target under `targets`, and under `variants` the alternative builds cut
 /// from the same tree at the same counter — today only `diagnostics`, the
-/// build with symbols kept and debug logging on. A daemon follows the variant
-/// it was built as, so a host running diagnostics keeps running diagnostics
-/// across updates with nothing to configure, and a release host never picks
-/// up a variant by accident. `SPAWND_RELEASE_VARIANT` overrides the default
-/// in either direction.
+/// build with symbols kept and debug logging on. An instance follows the
+/// variant of the release it runs, so a host running diagnostics keeps
+/// running diagnostics across updates with nothing to configure, and a
+/// release host never picks up a variant by accident — whichever build the
+/// command doing the update happens to be. `SPAWND_RELEASE_VARIANT` overrides
+/// the default in either direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseVariant {
     Release,
@@ -146,7 +163,7 @@ impl ReleaseVariant {
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "release" => Some(Self::Release),
             "diagnostics" => Some(Self::Diagnostics),
@@ -162,13 +179,6 @@ impl ReleaseVariant {
             Self::Release
         }
     }
-}
-
-fn configured_variant() -> Result<ReleaseVariant, BlockReason> {
-    configured_variant_from(
-        std::env::var_os(RELEASE_VARIANT_ENV).as_deref(),
-        ReleaseVariant::own(),
-    )
 }
 
 fn configured_variant_from(
@@ -208,12 +218,27 @@ pub struct Capability {
     pub blocked: Option<&'static str>,
 }
 
+/// Who is asking for the update. The daemon updates the instance it is; a
+/// command from a shell updates an instance it may not be running as, and
+/// must judge that instance by what the instance runs, not by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Daemon,
+    Cli,
+}
+
 #[derive(Debug)]
 struct Preconditions {
-    daemon_path: PathBuf,
-    worker_path: PathBuf,
+    mode: Mode,
+    layout: Layout,
+    config_dir: PathBuf,
     target: &'static str,
     variant: ReleaseVariant,
+    /// The release the instance is pointed at, when it is in the store.
+    current: Option<Release>,
+    /// The daemon tree the instance runs, to judge a release against.
+    tree: Option<String>,
+    build_counter: Option<u64>,
 }
 
 /// What the signed manifest says to install, resolved for the variant this
@@ -223,10 +248,14 @@ struct Preconditions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpdatePlan {
     version: String,
+    build_counter: u64,
     spawnd: DaemonUpdateArtifact,
     spawn_worker: DaemonUpdateArtifact,
 }
 
+/// The durable record of an update on trial. A store update names the
+/// releases; a marker written by the in-place updater that preceded the
+/// store names the worker whose `.prev` restores the pair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProbationMarker {
     attempts: u32,
@@ -236,9 +265,14 @@ struct ProbationMarker {
     version_before: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
-    worker_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_path: Option<PathBuf>,
     #[serde(default)]
     reverted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_release: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempted_release: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,11 +282,22 @@ enum ProbationDecision {
     ReportRevert,
 }
 
+/// Where an update on trial keeps its state and how it is undone.
+#[derive(Debug)]
+enum ProbationKind {
+    /// `instances/<tag>/spawnd.updating`: undone by pointing the instance
+    /// back at the previous release.
+    Store { layout: Layout, config_dir: PathBuf },
+    /// `<bin>/spawnd.updating` beside a pair swapped in place: undone by the
+    /// `.prev` files beside it.
+    Legacy { daemon_path: PathBuf },
+}
+
 #[derive(Debug)]
 struct ProbationRuntime {
     marker_path: PathBuf,
     marker: ProbationMarker,
-    daemon_path: PathBuf,
+    kind: ProbationKind,
 }
 
 #[derive(Debug)]
@@ -268,7 +313,9 @@ impl Drop for UpdatePermit<'_> {
 
 #[derive(Debug)]
 pub struct AppliedUpdate {
-    daemon_path: PathBuf,
+    /// What to run next: the new release's daemon on Unix, the instance's
+    /// constant launch path on Windows.
+    exec_target: PathBuf,
     #[cfg(windows)]
     config_dir: PathBuf,
     _permit: UpdatePermit<'static>,
@@ -369,6 +416,7 @@ async fn verify_release_manifest(
     request: &UpdateRequest,
     target: &str,
     variant: ReleaseVariant,
+    build_counter: Option<u64>,
 ) -> Result<UpdatePlan, UpdateFailure> {
     let allow_unsigned = allow_unsigned_update();
     let manifest = fetch_bounded_metadata(
@@ -403,7 +451,7 @@ async fn verify_release_manifest(
         &VerifyPolicy {
             allow_unsigned,
             public_keys: &keys,
-            build_counter: crate::version::build_counter(),
+            build_counter,
             downgrade_authorized,
             variant,
         },
@@ -549,6 +597,7 @@ fn verify_manifest_bytes(
     match variant {
         ReleaseVariant::Release => Ok(UpdatePlan {
             version: request.version.clone(),
+            build_counter: manifest.release_counter,
             spawnd: request.spawnd.clone(),
             spawn_worker: request.spawn_worker.clone(),
         }),
@@ -583,6 +632,7 @@ fn variant_plan(
     }
     Ok(UpdatePlan {
         version: entry.version.clone(),
+        build_counter: manifest.release_counter,
         spawnd: DaemonUpdateArtifact {
             path: variant_install_path("spawnd", target, variant),
             sha256: artifacts.spawnd_sha256.clone(),
@@ -594,9 +644,9 @@ fn variant_plan(
     })
 }
 
-/// Nothing to do when the release already describes this build: the same
-/// tree, a matching worker, and the variant this daemon follows being the one
-/// it is. A variant switch on the same tree is an update, not a no-op.
+/// Nothing to do when the release already describes this instance: the same
+/// tree, a matching worker, and the variant the instance follows being the
+/// one it runs. A variant switch on the same tree is an update, not a no-op.
 fn release_is_current(
     release_tree: &str,
     own_tree: &str,
@@ -608,7 +658,7 @@ fn release_is_current(
 }
 
 pub fn capability() -> Capability {
-    match evaluate_preconditions() {
+    match evaluate_preconditions(Mode::Daemon) {
         Ok(_) => Capability {
             self_update: true,
             blocked: None,
@@ -626,15 +676,57 @@ pub async fn apply(
 ) -> Result<AppliedUpdate, UpdateFailure> {
     log_stage(UpdateStage::Precondition);
     let permit = acquire_update()?;
-    let preconditions = evaluate_preconditions().map_err(UpdateFailure::from)?;
+    let preconditions = evaluate_preconditions(Mode::Daemon).map_err(UpdateFailure::from)?;
     apply_guarded(server_origin, &request, preconditions, permit).await
 }
 
-pub async fn apply_from_release(server: &Url) -> Result<HttpUpdateOutcome, UpdateFailure> {
+pub async fn apply_from_release(
+    server: &Url,
+    mode: Mode,
+) -> Result<HttpUpdateOutcome, UpdateFailure> {
     log_stage(UpdateStage::Precondition);
     let permit = acquire_update()?;
-    let preconditions = evaluate_preconditions().map_err(UpdateFailure::from)?;
+    let preconditions = evaluate_preconditions(mode).map_err(UpdateFailure::from)?;
     log_stage(UpdateStage::Download);
+    let release = fetch_release(server).await?;
+    let Some(own_tree) = preconditions
+        .tree
+        .as_deref()
+        .filter(|tree| clean_tree(tree))
+    else {
+        return Ok(HttpUpdateOutcome::NoUpdate("identity_unknown"));
+    };
+    let Some(daemon) = release.daemon.filter(|daemon| clean_tree(&daemon.tree)) else {
+        return Ok(HttpUpdateOutcome::NoUpdate("release_unavailable"));
+    };
+    let own_variant = instance_variant(&preconditions);
+    let mismatch = match mode {
+        Mode::Daemon => worker_mismatch(),
+        Mode::Cli => crate::state::read(&preconditions.config_dir)
+            .ok()
+            .flatten()
+            .filter(|state| crate::state::daemon_state_is_live(&preconditions.config_dir, state))
+            .is_some_and(|state| state.worker_mismatch),
+    };
+    if release_is_current(
+        &daemon.tree,
+        own_tree,
+        mismatch,
+        own_variant,
+        preconditions.variant,
+    ) {
+        return Ok(HttpUpdateOutcome::NoUpdate("current"));
+    }
+    if !daemon.targets.contains_key(preconditions.target) {
+        return Ok(HttpUpdateOutcome::NoUpdate("target_unavailable"));
+    }
+    let request = request_for_release(daemon, preconditions.target)?;
+    apply_guarded(server, &request, preconditions, permit)
+        .await
+        .map(HttpUpdateOutcome::Applied)
+}
+
+async fn fetch_release(server: &Url) -> Result<ReleaseResponse, UpdateFailure> {
     let release_url = crate::config::api_url(server, "/api/release")
         .map_err(|_| UpdateFailure::new(UpdateStage::Download, "release_unavailable"))?;
     let client = http_client()?;
@@ -653,42 +745,124 @@ pub async fn apply_from_release(server: &Url) -> Result<HttpUpdateOutcome, Updat
         .json()
         .await
         .map_err(|_| UpdateFailure::new(UpdateStage::Download, "release_invalid"))?;
-    let Some(own_tree) = crate::version::daemon_tree().filter(|tree| clean_tree(tree)) else {
-        return Ok(HttpUpdateOutcome::NoUpdate("identity_unknown"));
-    };
-    let Some(daemon) = release.daemon.filter(|daemon| clean_tree(&daemon.tree)) else {
-        return Ok(HttpUpdateOutcome::NoUpdate("release_unavailable"));
-    };
-    if release_is_current(
-        &daemon.tree,
-        own_tree,
-        worker_mismatch(),
-        ReleaseVariant::own(),
-        preconditions.variant,
-    ) {
-        return Ok(HttpUpdateOutcome::NoUpdate("current"));
-    }
-    let Some(target) = daemon.targets.get(preconditions.target) else {
-        return Ok(HttpUpdateOutcome::NoUpdate("target_unavailable"));
-    };
-    let request = UpdateRequest {
+    Ok(release)
+}
+
+fn request_for_release(
+    daemon: ReleaseDaemon,
+    target_name: &str,
+) -> Result<UpdateRequest, UpdateFailure> {
+    let target = daemon
+        .targets
+        .get(target_name)
+        .ok_or_else(|| UpdateFailure::new(UpdateStage::Precondition, "target_unavailable"))?;
+    Ok(UpdateRequest {
         request_id: None,
         version: daemon.version,
         tree: daemon.tree,
-        target: preconditions.target.to_string(),
+        target: target_name.to_owned(),
         spawnd: DaemonUpdateArtifact {
-            path: format!("/api/install/spawnd/{}", preconditions.target),
+            path: format!("/api/install/spawnd/{target_name}"),
             sha256: target.spawnd_sha256.clone(),
         },
         spawn_worker: DaemonUpdateArtifact {
-            path: format!("/api/install/spawn-worker/{}", preconditions.target),
+            path: format!("/api/install/spawn-worker/{target_name}"),
             sha256: target.spawn_worker_sha256.clone(),
         },
         allow_downgrade: false,
+    })
+}
+
+/// An installer activates a store-aware build, never the pre-store daemon
+/// that happens to be alive. Fetch the signed sibling variant when this
+/// standard installer is resuming a diagnostics instance.
+pub async fn prepare_possession(config_dir: &Path, server: &Url) -> Result<bool> {
+    if matches!(install::provenance(), install::Provenance::Unmanaged) {
+        return Ok(false);
+    }
+    let layout = install::layout_for_instance(config_dir)?;
+    let _selection_lock = install::lock_instance(&layout, config_dir)?;
+    if install::probation_marker_path(&layout, config_dir).exists() {
+        anyhow::bail!("this instance has an update in probation; wait for it before reinstalling");
+    }
+    let current = install::selected(&layout, config_dir)?;
+    let own_variant = install::instance_variant(&layout, config_dir)
+        .as_deref()
+        .and_then(ReleaseVariant::from_name)
+        .unwrap_or(ReleaseVariant::own());
+    let variant = configured_variant_from(
+        std::env::var_os(RELEASE_VARIANT_ENV).as_deref(),
+        own_variant,
+    )
+    .map_err(UpdateFailure::from)?;
+    let floor = current
+        .as_ref()
+        .and_then(|release| release.meta.build_counter)
+        .into_iter()
+        .chain(crate::version::build_counter())
+        .max();
+    if current.as_ref().is_some_and(|release| {
+        release.meta.release_store == 1
+            && release.meta.variant == variant.as_str()
+            && release.meta.build_counter > crate::version::build_counter()
+    }) {
+        return Ok(false);
+    }
+    let candidate = if variant == ReleaseVariant::own() {
+        install::adopt_running_pair(&layout)?
+    } else {
+        let daemon = fetch_release(server)
+            .await?
+            .daemon
+            .filter(|daemon| clean_tree(&daemon.tree))
+            .context("the server has no release for this instance's variant")?;
+        let target = target_for(std::env::consts::OS, std::env::consts::ARCH)
+            .context("no published release for this platform")?;
+        let request = request_for_release(daemon, target)?;
+        let client = http_client()?;
+        let plan =
+            verify_release_manifest(&client, server, &request, target, variant, floor).await?;
+        let preconditions = Preconditions {
+            mode: Mode::Cli,
+            layout: layout.clone(),
+            config_dir: config_dir.to_path_buf(),
+            target,
+            variant,
+            current: current.clone(),
+            tree: None,
+            build_counter: floor,
+        };
+        obtain_release(&client, server, &request, &plan, &preconditions).await?
     };
-    apply_guarded(server, &request, preconditions, permit)
-        .await
-        .map(HttpUpdateOutcome::Applied)
+    if current
+        .as_ref()
+        .is_some_and(|release| release.id() == candidate.id())
+    {
+        return Ok(false);
+    }
+    install::select(&layout, config_dir, &candidate)?;
+    Ok(true)
+}
+
+/// The variant the instance runs today: its selected release's, else what
+/// its live heartbeat says, else this build's.
+fn instance_variant(preconditions: &Preconditions) -> ReleaseVariant {
+    preconditions
+        .current
+        .as_ref()
+        .and_then(|release| ReleaseVariant::from_name(&release.meta.variant))
+        .or_else(|| {
+            crate::state::read(&preconditions.config_dir)
+                .ok()
+                .flatten()
+                .filter(|state| {
+                    crate::state::daemon_state_is_live(&preconditions.config_dir, state)
+                })
+                .and_then(|state| {
+                    ReleaseVariant::from_name(install::variant_of_version(&state.version))
+                })
+        })
+        .unwrap_or(ReleaseVariant::own())
 }
 
 async fn apply_guarded(
@@ -713,6 +887,7 @@ async fn apply_guarded(
         request,
         preconditions.target,
         preconditions.variant,
+        preconditions.build_counter,
     )
     .await?;
     tracing::info!(
@@ -721,16 +896,136 @@ async fn apply_guarded(
         version = %plan.version,
         "SPAWN D daemon self-update follows this release variant"
     );
+
+    let release = obtain_release(&client, server_origin, request, &plan, &preconditions).await?;
+
+    let _selection_lock = install::lock_instance(&preconditions.layout, &preconditions.config_dir)
+        .map_err(|_| UpdateFailure::new(UpdateStage::Precondition, "busy"))?;
+    if install::probation_marker_path(&preconditions.layout, &preconditions.config_dir).exists() {
+        return Err(UpdateFailure::new(UpdateStage::Precondition, "busy"));
+    }
+
+    // Re-evaluate every filesystem and platform condition immediately before
+    // the instance is repointed. A changed resolution fails closed rather
+    // than selecting into a layout other than the one we prepared for.
+    let current = evaluate_preconditions(preconditions.mode).map_err(UpdateFailure::from)?;
+    if current.layout != preconditions.layout
+        || current.config_dir != preconditions.config_dir
+        || current.target != preconditions.target
+        || current.variant != preconditions.variant
+        || current.current != preconditions.current
+        || current.build_counter != preconditions.build_counter
+    {
+        return Err(UpdateFailure::new(
+            UpdateStage::Precondition,
+            "preconditions_changed",
+        ));
+    }
+
+    log_stage(UpdateStage::Swap);
+    // The revert target must exist before the pointer moves. An instance
+    // already in the store has one; anything else brings its running pair
+    // in first, so a failed probation has somewhere to go back to.
+    let previous = match preconditions.current.clone() {
+        Some(previous) => previous,
+        None => install::adopt_running_pair(&preconditions.layout)
+            .map_err(|_| UpdateFailure::new(UpdateStage::Swap, "adopt_failed"))?,
+    };
+    let marker_path =
+        install::probation_marker_path(&preconditions.layout, &preconditions.config_dir);
+    let marker = ProbationMarker {
+        attempts: 0,
+        old_tree: preconditions.tree.clone().unwrap_or_default(),
+        deadline_unix_ms: unix_millis().saturating_add(PROBATION_WINDOW.as_millis() as u64),
+        attempted_tree: request.tree.clone(),
+        version_before: previous.meta.version.clone(),
+        request_id: request.request_id.clone(),
+        worker_path: None,
+        reverted: false,
+        previous_release: Some(previous.id().to_owned()),
+        attempted_release: Some(release.id().to_owned()),
+    };
+    if let Some(parent) = marker_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    write_marker(&marker_path, &marker)
+        .map_err(|_| UpdateFailure::new(UpdateStage::Swap, "marker_write_failed"))?;
+    if let Err(error) = install::select(&preconditions.layout, &preconditions.config_dir, &release)
+    {
+        tracing::error!(stage = "swap", %error, "could not point this instance at the new release");
+        let _ = fs::remove_file(&marker_path);
+        return Err(UpdateFailure::new(UpdateStage::Swap, "swap_failed"));
+    }
+    // The service definition follows the pointer, which is constant, so this
+    // is a no-op for an instance already in the store and the one-time move
+    // for one that was not.
+    if let Err(error) =
+        crate::service::rewrite_launch_path(&preconditions.config_dir, &preconditions.layout)
+    {
+        tracing::warn!(stage = "swap", %error, "could not point the background service at the release store");
+    }
+    Ok(AppliedUpdate {
+        exec_target: exec_target(&preconditions.layout, &preconditions.config_dir, &release),
+        #[cfg(windows)]
+        config_dir: preconditions.config_dir,
+        _permit: permit,
+    })
+}
+
+fn exec_target(layout: &Layout, config_dir: &Path, release: &Release) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = release;
+        install::launch_path(layout, config_dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (layout, config_dir);
+        release.spawnd()
+    }
+}
+
+/// The release the plan names: already in the store and intact, or
+/// downloaded, verified against the signed hashes and its own identity, and
+/// published.
+async fn obtain_release(
+    client: &reqwest::Client,
+    server_origin: &Url,
+    request: &UpdateRequest,
+    plan: &UpdatePlan,
+    preconditions: &Preconditions,
+) -> Result<Release, UpdateFailure> {
+    let id = install::release_id(
+        &plan.version,
+        &plan.spawnd.sha256,
+        &plan.spawn_worker.sha256,
+    );
+    if let Ok(Some(existing)) = install::release_by_id(&preconditions.layout, &id) {
+        if existing.meta.release_store == 1
+            && existing.meta.build_counter == Some(plan.build_counter)
+            && existing.meta.version == plan.version
+            && existing.meta.tree == request.tree
+            && existing.meta.variant == preconditions.variant.as_str()
+            && install::verify_release(&existing).is_ok()
+        {
+            tracing::info!(
+                stage = UpdateStage::Download.as_str(),
+                release = existing.id(),
+                "release is already in the store"
+            );
+            return Ok(existing);
+        }
+    }
+
     // The release pair keeps the URLs already checked above; a variant's are
     // derived from the target, so they are joined and checked here.
     let daemon_url = join_install_url(server_origin, &plan.spawnd.path)?;
     let worker_url = join_install_url(server_origin, &plan.spawn_worker.path)?;
-
-    let temporary = TempFiles::new(&preconditions)?;
+    let staging = StagingDir::new(&preconditions.layout)?;
     log_stage(UpdateStage::Download);
     let downloads = async {
-        let daemon_hash = download_to(&client, daemon_url, &temporary.daemon).await?;
-        let worker_hash = download_to(&client, worker_url, &temporary.worker).await?;
+        let daemon_hash = download_to(client, daemon_url, &staging.daemon).await?;
+        let worker_hash = download_to(client, worker_url, &staging.worker).await?;
         Ok::<_, UpdateFailure>((daemon_hash, worker_hash))
     };
     let (daemon_hash, worker_hash) = tokio::time::timeout(DOWNLOAD_TIMEOUT, downloads)
@@ -743,56 +1038,47 @@ async fn apply_guarded(
     {
         return Err(UpdateFailure::new(UpdateStage::Verify, "sha256_mismatch"));
     }
-    chmod_executable(&temporary.daemon)?;
-    chmod_executable(&temporary.worker)?;
-    verify_version(&temporary.daemon, &plan.version).await?;
-
-    // Re-evaluate every filesystem and platform condition immediately before
-    // the atomic renames. A changed resolution fails closed rather than
-    // swapping a different file from the one we prepared for.
-    let current = evaluate_preconditions().map_err(UpdateFailure::from)?;
-    if current.daemon_path != preconditions.daemon_path
-        || current.worker_path != preconditions.worker_path
-        || current.target != preconditions.target
-        || current.variant != preconditions.variant
+    chmod_executable(&staging.daemon)?;
+    chmod_executable(&staging.worker)?;
+    verify_version(&staging.daemon, &plan.version).await?;
+    verify_worker_identity(&staging.worker, &plan.version, &request.tree).await?;
+    let identity = install::probe_build_info(&staging.daemon)
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "legacy_release"))?;
+    if identity.release_store != 1
+        || identity.version != plan.version
+        || identity.tree != request.tree
+        || identity.build_counter != Some(plan.build_counter)
     {
         return Err(UpdateFailure::new(
-            UpdateStage::Precondition,
-            "preconditions_changed",
+            UpdateStage::Verify,
+            "build_identity_mismatch",
         ));
     }
 
-    log_stage(UpdateStage::Swap);
-    let marker_path = marker_path(&preconditions.daemon_path);
-    let marker = ProbationMarker {
-        attempts: 0,
-        old_tree: crate::version::daemon_tree()
-            .unwrap_or_default()
-            .to_string(),
-        deadline_unix_ms: unix_millis().saturating_add(PROBATION_WINDOW.as_millis() as u64),
-        attempted_tree: request.tree.clone(),
-        version_before: crate::version::build_version(),
-        request_id: request.request_id.clone(),
-        worker_path: preconditions.worker_path.clone(),
-        reverted: false,
+    let meta = install::ReleaseMeta {
+        id,
+        version: plan.version.clone(),
+        tree: request.tree.clone(),
+        variant: preconditions.variant.as_str().to_owned(),
+        spawnd_sha256: daemon_hash,
+        spawn_worker_sha256: worker_hash,
+        installed_at_unix_ms: unix_millis(),
+        source: "update".to_owned(),
+        build_counter: Some(plan.build_counter),
+        release_store: 1,
     };
-    write_marker(&marker_path, &marker)
-        .map_err(|_| UpdateFailure::new(UpdateStage::Swap, "marker_write_failed"))?;
-    if let Err(failure) = swap_binaries(
-        &preconditions.daemon_path,
-        &temporary.daemon,
-        &preconditions.worker_path,
-        &temporary.worker,
-    ) {
-        let _ = fs::remove_file(&marker_path);
-        return Err(failure);
-    }
-    Ok(AppliedUpdate {
-        daemon_path: preconditions.daemon_path,
-        #[cfg(windows)]
-        config_dir: crate::config::config_dir()
-            .map_err(|_| UpdateFailure::new(UpdateStage::Precondition, "config_unavailable"))?,
-        _permit: permit,
+    install::publish_with_meta(
+        &preconditions.layout,
+        install::PublishSource {
+            spawnd: &staging.daemon,
+            spawn_worker: &staging.worker,
+            source: "update",
+        },
+        meta,
+    )
+    .map_err(|error| {
+        tracing::error!(stage = "verify", %error, "could not publish the downloaded pair");
+        UpdateFailure::new(UpdateStage::Swap, "publish_failed")
     })
 }
 
@@ -802,12 +1088,12 @@ pub fn exec(applied: AppliedUpdate) -> UpdateFailure {
     {
         use std::os::unix::process::CommandExt;
         let AppliedUpdate {
-            daemon_path,
+            exec_target,
             _permit: permit,
         } = applied;
         let mut argv = std::env::args_os();
         let argv0 = argv.next();
-        let mut command = std::process::Command::new(daemon_path);
+        let mut command = std::process::Command::new(exec_target);
         if let Some(argv0) = argv0 {
             command.arg0(argv0);
         }
@@ -823,11 +1109,11 @@ pub fn exec(applied: AppliedUpdate) -> UpdateFailure {
         #[cfg(windows)]
         {
             let AppliedUpdate {
-                daemon_path,
+                exec_target,
                 config_dir,
                 _permit: permit,
             } = applied;
-            let result = spawn_update_handoff(&daemon_path, &config_dir);
+            let result = spawn_update_handoff(&exec_target, &config_dir);
             drop(permit);
             if result.is_ok() {
                 std::process::exit(0);
@@ -911,74 +1197,121 @@ fn log_stage(stage: UpdateStage) {
     tracing::info!(stage = stage.as_str(), "SPAWN D daemon self-update stage");
 }
 
-pub async fn run_cli(server_cli: Option<String>) -> Result<()> {
-    let stored = crate::creds::load().context("loading stored credentials")?;
-    let server = crate::config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
-    let spinner = crate::tui::Spinner::start("checking for an update");
-    match apply_from_release(&server).await {
-        Ok(HttpUpdateOutcome::NoUpdate(reason)) => {
-            spinner.finish(true, "update check complete");
-            println!("{}", cli_no_update_line(reason));
-            Ok(())
+/// `spawnd update`: every instance this command can see, each judged by the
+/// release it runs. One instance's failure does not stop the others, and the
+/// store is collected once at the end.
+pub async fn run_cli(server_cli: Option<String>, explicit_config: bool) -> Result<()> {
+    let dirs = crate::lifecycle::selected_dirs(explicit_config)?;
+    let mut failures = Vec::new();
+    let mut layouts = Vec::new();
+    for dir in &dirs {
+        let _guard = crate::lifecycle::ConfigDirGuard::set(dir);
+        let name = crate::lifecycle::instance_name(dir);
+        let stored = crate::creds::load()
+            .with_context(|| format!("loading stored credentials for {name}"))?;
+        let server = crate::config::server_url_for_instance(
+            server_cli.clone(),
+            stored.server_url.as_deref(),
+        )?;
+        let spinner = crate::tui::Spinner::start(&format!("checking {name} for an update"));
+        match apply_from_release(&server, Mode::Cli).await {
+            Ok(HttpUpdateOutcome::NoUpdate(reason)) => {
+                spinner.finish(true, "update check complete");
+                println!("{}", cli_no_update_line(&name, reason));
+            }
+            Ok(HttpUpdateOutcome::Applied(applied)) => {
+                spinner.finish(true, "update verified; restarting");
+                if let Err(error) = finish_cli_update(applied, &server, &name) {
+                    failures.push(format!("{name}: {error:#}"));
+                }
+            }
+            Err(failure) => {
+                spinner.finish(false, "update not applied");
+                failures.push(format!("{name}: {failure}"));
+            }
         }
-        Ok(HttpUpdateOutcome::Applied(applied)) => {
-            spinner.finish(true, "update verified; restarting");
-            finish_cli_update(applied, &server)
+        if let Ok(layout) = install::layout_for_instance(dir) {
+            if !layouts.contains(&layout) {
+                layouts.push(layout);
+            }
         }
-        Err(failure) => {
-            spinner.finish(false, "update not applied");
-            anyhow::bail!("SPAWN D daemon update failed: {failure}")
+    }
+    let known = install::known_config_dirs();
+    for layout in layouts {
+        let report = install::collect_garbage(&layout, &known);
+        for removed in report.removed {
+            println!("spawn: removed unused release {removed}");
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("SPAWN D daemon update failed: {}", failures.join("; "))
     }
 }
 
-/// Hand the swapped-in binaries to whatever is actually running the daemon.
+/// Hand the selected release to whatever is actually running the instance.
 ///
 /// `exec` is right when the *service* applies its own update: the running
 /// process is the daemon, so replacing its image in place keeps the same PID
 /// and its manager none the wiser. It is wrong here. `spawnd update` is a
 /// short-lived CLI, and exec'ing its own argv just re-runs `spawnd update` on
 /// the new binary, which reports "current" and exits — while the service goes
-/// on running the old code. From there every consequence is silent: new
-/// sessions fail `worker_mismatch` (whose remedy is the command that just
-/// claimed it had nothing to do), the leftover `.prev` blocks the next
-/// server-pushed repair with `swap_failed`, and at the next restart the
-/// probation deadline has expired, so the update is reverted and reported as a
-/// health failure. Windows already avoids all of this by handing off to the
-/// service manager; this is the Unix equivalent.
+/// on running the old code, refusing new sessions as `worker_mismatch` and
+/// reverting the update when its probation expires. Windows already avoids
+/// this by handing off to the service manager; this is the Unix equivalent.
 #[cfg(unix)]
-fn finish_cli_update(applied: AppliedUpdate, server: &Url) -> Result<()> {
-    // The swap is already on disk; the permit only guards concurrent updates.
+fn finish_cli_update(applied: AppliedUpdate, server: &Url, name: &str) -> Result<()> {
+    // The pointer is already moved; the permit only guards concurrent updates.
     drop(applied);
     let config_dir = crate::config::config_dir().context("resolving the SPAWN D config dir")?;
     let status = crate::service::status(&config_dir);
     if !status.installed {
         println!(
-            "SPAWN D daemon updated. Restart the daemon to run it — an update that never \
-             registers is rolled back after five minutes."
+            "SPAWN D daemon updated for {name}. Restart the daemon to run it — an update that \
+             never registers is rolled back after five minutes."
         );
         return Ok(());
     }
     crate::service::reconnect(&config_dir, server.as_str())
         .context("restarting the SPAWN D daemon service onto the updated build")?;
-    println!("SPAWN D daemon updated; {} is restarting.", status.name);
+    println!(
+        "SPAWN D daemon updated for {name}; {} is restarting.",
+        status.name
+    );
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn finish_cli_update(applied: AppliedUpdate, _server: &Url) -> Result<()> {
-    // Windows hands off to a detached helper that waits for this process to
-    // exit and then asks the service manager to start the new binary.
-    let failure = exec(applied);
-    anyhow::bail!("SPAWN D daemon update failed: {failure}")
+fn finish_cli_update(applied: AppliedUpdate, server: &Url, name: &str) -> Result<()> {
+    // Windows re-registers the manager on the instance's constant launch
+    // path, then restarts it onto the linked pair.
+    drop(applied);
+    let config_dir = crate::config::config_dir().context("resolving the SPAWN D config dir")?;
+    let status = crate::service::status(&config_dir);
+    if !status.installed {
+        println!(
+            "SPAWN D daemon updated for {name}. Restart the daemon to run it — an update that \
+             never registers is rolled back after five minutes."
+        );
+        return Ok(());
+    }
+    crate::service::install(&config_dir, server.as_str())
+        .context("re-registering the SPAWN D daemon onto the updated build")?;
+    println!(
+        "SPAWN D daemon updated for {name}; {} is restarting.",
+        status.name
+    );
+    Ok(())
 }
 
-fn cli_no_update_line(reason: &str) -> String {
-    format!("SPAWN D daemon update not applied ({reason}).")
+fn cli_no_update_line(name: &str, reason: &str) -> String {
+    format!("SPAWN D daemon update not applied for {name} ({reason}).")
 }
 
 /// Re-check the co-installed worker identity and publish the result through
-/// the existing self-update capability fields on the next register.
+/// the existing self-update capability fields on the next register, and
+/// through the heartbeat for `status` and `doctor`.
 pub async fn refresh_worker_pair_status() -> bool {
     let (matches, mismatch) = match resolve_program(crate::worker_backend::worker_bin()) {
         Some(worker) => {
@@ -988,6 +1321,7 @@ pub async fn refresh_worker_pair_status() -> bool {
         None => (false, false),
     };
     WORKER_MISMATCH.store(mismatch, Ordering::Release);
+    crate::state::active_worker_mismatch(mismatch);
     if mismatch {
         tracing::error!(
             "spawn-worker identity does not match spawnd; refusing new sessions until the installed pair is repaired"
@@ -1019,8 +1353,31 @@ async fn worker_pair_matches(worker: &Path) -> bool {
             .is_ok_and(|stdout| stdout.trim_end() == crate::version::worker_identity_line())
 }
 
-fn marker_path(daemon_path: &Path) -> PathBuf {
-    daemon_path.with_file_name("spawnd.updating")
+/// A downloaded worker must be the worker of the daemon it is paired with,
+/// before either is published: the same version, and the tree the request
+/// named.
+async fn verify_worker_identity(
+    worker: &Path,
+    version: &str,
+    tree: &str,
+) -> Result<(), UpdateFailure> {
+    let mut command = tokio::process::Command::new(worker);
+    command.arg("--version").kill_on_drop(true);
+    let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
+        .await
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "version_timeout"))?
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "version_check_failed"))?;
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "version_check_failed"))?;
+    let expected = format!("spawn-worker {version} tree={tree}");
+    if !output.status.success() || stdout.trim_end() != expected {
+        return Err(UpdateFailure::new(UpdateStage::Verify, "worker_mismatch"));
+    }
+    Ok(())
+}
+
+fn legacy_marker_path(daemon_path: &Path) -> PathBuf {
+    daemon_path.with_file_name(LEGACY_MARKER)
 }
 
 fn unix_millis() -> u64 {
@@ -1046,7 +1403,11 @@ fn write_marker(path: &Path, marker: &ProbationMarker) -> std::io::Result<()> {
     use std::io::Write;
 
     let bytes = serde_json::to_vec(marker).map_err(std::io::Error::other)?;
-    let temporary = path.with_file_name(format!("spawnd.updating.tmp.{}", std::process::id()));
+    let temporary = path.with_file_name(format!(
+        "{}.tmp.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
     let result = (|| {
         let mut file = fs::OpenOptions::new()
             .create_new(true)
@@ -1055,9 +1416,9 @@ fn write_marker(path: &Path, marker: &ProbationMarker) -> std::io::Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         crate::platform::durable_replace(&temporary, path)?;
-        // The marker must reach stable storage before the swap it guards, or a
-        // power loss between the two persists new binaries with nothing to
-        // revert them.
+        // The marker must reach stable storage before the pointer it guards
+        // moves, or a power loss between the two persists a new release with
+        // nothing to revert it.
         crate::platform::sync_parent_dir(path)?;
         Ok(())
     })();
@@ -1076,44 +1437,78 @@ fn read_marker(path: &Path) -> Result<ProbationMarker> {
 }
 
 /// Enter update probation before a daemon control connection is attempted.
-/// A second startup or an expired deadline restores the complete prior pair.
+/// A second startup or an expired deadline restores the previous release.
+///
+/// The marker is looked for where this build writes it, in the instance's
+/// directory under the store, and then beside the executable, where the
+/// in-place updater that preceded the store wrote it — a daemon that build
+/// installed keeps its promise to revert.
 pub fn prepare_probation() -> Result<()> {
-    let daemon_path = std::env::current_exe()
-        .ok()
-        .and_then(resolve_file)
-        .context("resolving spawnd for update probation")?;
-    let marker_path = marker_path(&daemon_path);
     let state = PROBATION.get_or_init(|| Arc::new(Mutex::new(None)));
-    if !marker_path.exists() {
-        return Ok(());
+    let config_dir = crate::config::config_dir()?;
+    let layout = install::layout_for_instance(&config_dir)?;
+    let store_marker = install::probation_marker_path(&layout, &config_dir);
+    if store_marker.exists() {
+        return prepare_probation_at(
+            state,
+            store_marker,
+            ProbationKind::Store { layout, config_dir },
+        );
     }
+    if !matches!(install::provenance(), install::Provenance::Store { .. }) {
+        if let Some(daemon_path) = install::running_exe() {
+            let legacy_marker = legacy_marker_path(daemon_path);
+            if legacy_marker.exists() {
+                return prepare_probation_at(
+                    state,
+                    legacy_marker,
+                    ProbationKind::Legacy {
+                        daemon_path: daemon_path.to_path_buf(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
+fn prepare_probation_at(
+    state: &Arc<Mutex<Option<ProbationRuntime>>>,
+    marker_path: PathBuf,
+    kind: ProbationKind,
+) -> Result<()> {
     let mut marker = match read_marker(&marker_path) {
         Ok(marker) => marker,
         Err(error) => {
-            let worker_path = previous_worker_path_for_recovery(&daemon_path);
             tracing::warn!(stage = "health", %error, "self-update probation marker is unreadable");
-            if let Some(worker_path) = worker_path {
-                let recovered = ProbationMarker {
-                    attempts: 2,
-                    old_tree: String::new(),
-                    deadline_unix_ms: unix_millis(),
-                    attempted_tree: crate::version::daemon_tree()
-                        .unwrap_or_default()
-                        .to_string(),
-                    version_before: crate::version::build_version(),
-                    request_id: None,
-                    worker_path,
-                    reverted: false,
-                };
-                if let Err(error) = revert_and_exec(ProbationRuntime {
-                    marker_path,
-                    marker: recovered,
-                    daemon_path,
-                }) {
-                    tracing::error!(stage = "health", %error, "SPAWN D daemon health revert failed");
+            // Only the in-place layout can recover a lost marker from its
+            // `.prev` files; a store marker with no readable previous release
+            // has nothing to go back to.
+            if let ProbationKind::Legacy { daemon_path } = &kind {
+                if let Some(worker_path) = previous_worker_path_for_recovery(daemon_path) {
+                    let recovered = ProbationMarker {
+                        attempts: 2,
+                        old_tree: String::new(),
+                        deadline_unix_ms: unix_millis(),
+                        attempted_tree: crate::version::daemon_tree()
+                            .unwrap_or_default()
+                            .to_string(),
+                        version_before: crate::version::build_version(),
+                        request_id: None,
+                        worker_path: Some(worker_path),
+                        reverted: false,
+                        previous_release: None,
+                        attempted_release: None,
+                    };
+                    if let Err(error) = revert_and_exec(ProbationRuntime {
+                        marker_path,
+                        marker: recovered,
+                        kind,
+                    }) {
+                        tracing::error!(stage = "health", %error, "SPAWN D daemon health revert failed");
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
             if let Err(remove_error) = fs::remove_file(&marker_path) {
                 if remove_error.kind() != std::io::ErrorKind::NotFound {
@@ -1134,7 +1529,7 @@ pub fn prepare_probation() -> Result<()> {
             *state.lock().expect("probation state lock") = Some(ProbationRuntime {
                 marker_path,
                 marker,
-                daemon_path,
+                kind,
             });
             Ok(())
         }
@@ -1142,19 +1537,19 @@ pub fn prepare_probation() -> Result<()> {
             *state.lock().expect("probation state lock") = Some(ProbationRuntime {
                 marker_path,
                 marker,
-                daemon_path,
+                kind,
             });
             Ok(())
         }
         ProbationDecision::Revert => {
             // A revert that fails is reported, not fatal: propagating here
             // exits the daemon on every start, which is a crash loop rather
-            // than a recovery. `revert_binaries` rolls back its own partial
-            // steps, so the tree on disk stays coherent either way.
+            // than a recovery. Every revert step rolls back its own partial
+            // work, so the tree on disk stays coherent either way.
             if let Err(error) = revert_and_exec(ProbationRuntime {
                 marker_path,
                 marker,
-                daemon_path,
+                kind,
             }) {
                 tracing::error!(stage = "health", %error, "SPAWN D daemon health revert failed");
             }
@@ -1164,7 +1559,7 @@ pub fn prepare_probation() -> Result<()> {
 }
 
 fn complete_previous_pair(daemon_path: &Path, worker_path: &Path) -> bool {
-    previous_path(daemon_path).is_file() && previous_path(worker_path).is_file()
+    install::previous_path(daemon_path).is_file() && install::previous_path(worker_path).is_file()
 }
 
 fn previous_worker_path_for_recovery(daemon_path: &Path) -> Option<PathBuf> {
@@ -1213,29 +1608,56 @@ pub fn arm_probation_deadline() {
     });
 }
 
+/// Put the previous build back and run it. Nothing to revert to is reported
+/// and survived, never fatal: failing here would exit the daemon, the
+/// service manager would restart it, and it would reach the same conclusion
+/// three seconds later — a crash loop that takes the host offline until a
+/// human deletes the marker by hand, and that still does not restore the
+/// previous build. Clear the marker, stay loud, and keep running.
 fn revert_and_exec(mut runtime: ProbationRuntime) -> Result<()> {
-    // Nothing to revert to. Failing here would exit the daemon, the service
-    // manager would restart it, and it would arrive at this same conclusion
-    // three seconds later — a crash loop that takes the host offline until a
-    // human deletes the marker by hand, and that still does not restore the
-    // previous build. Clear the marker, stay loud, and keep running: that is
-    // already what the unreadable-marker path decides, and this makes the
-    // readable one agree with it.
-    if !complete_previous_pair(&runtime.daemon_path, &runtime.marker.worker_path) {
-        tracing::error!(
-            stage = "health",
-            "self-update probation wanted to revert, but the previous daemon pair is \
-             incomplete; continuing on the current build"
-        );
-        if let Err(error) = fs::remove_file(&runtime.marker_path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(stage = "health", %error, "could not clear the probation marker");
+    let next = match &runtime.kind {
+        ProbationKind::Store { layout, config_dir } => {
+            let previous = runtime
+                .marker
+                .previous_release
+                .as_deref()
+                .and_then(|id| install::release_by_id(layout, id).ok().flatten());
+            match previous {
+                Some(previous) => {
+                    restore_release(layout, config_dir, &previous)
+                        .context("pointing this instance back at the previous release")?;
+                    exec_target(layout, config_dir, &previous)
+                }
+                None => {
+                    tracing::error!(
+                        stage = "health",
+                        "self-update probation wanted to revert, but the previous release is \
+                         gone; continuing on the current build"
+                    );
+                    clear_marker(&runtime.marker_path);
+                    return Ok(());
+                }
             }
         }
-        return Ok(());
-    }
-    revert_binaries(&runtime.daemon_path, &runtime.marker.worker_path)
-        .context("restoring previous daemon binaries")?;
+        ProbationKind::Legacy { daemon_path } => {
+            let Some(worker_path) = runtime.marker.worker_path.clone() else {
+                clear_marker(&runtime.marker_path);
+                return Ok(());
+            };
+            if !complete_previous_pair(daemon_path, &worker_path) {
+                tracing::error!(
+                    stage = "health",
+                    "self-update probation wanted to revert, but the previous daemon pair is \
+                     incomplete; continuing on the current build"
+                );
+                clear_marker(&runtime.marker_path);
+                return Ok(());
+            }
+            install::revert_pair(daemon_path, &worker_path)
+                .context("restoring previous daemon binaries")?;
+            daemon_path.clone()
+        }
+    };
     runtime.marker.reverted = true;
     write_marker(&runtime.marker_path, &runtime.marker)
         .context("recording completed daemon health revert")?;
@@ -1243,7 +1665,25 @@ fn revert_and_exec(mut runtime: ProbationRuntime) -> Result<()> {
         stage = "health",
         "updated daemon did not register; reverting"
     );
-    exec_path(&runtime.daemon_path)
+    exec_path(&next)
+}
+
+fn restore_release(layout: &Layout, config_dir: &Path, previous: &Release) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if install::previous_pair_complete(layout, config_dir) {
+            return install::select_previous_pair(layout, config_dir, previous);
+        }
+    }
+    install::select(layout, config_dir, previous)
+}
+
+fn clear_marker(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(stage = "health", %error, "could not clear the probation marker");
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1273,10 +1713,14 @@ fn exec_path(_path: &Path) -> Result<()> {
 }
 
 /// Commit a healthy update after registration, or report a completed revert
-/// before deleting its durable marker.
+/// before deleting its durable marker. Then collect what no instance runs.
 pub async fn registered(out_tx: &tokio::sync::mpsc::Sender<crate::pty::WsOutbound>) {
-    let Some(state) = PROBATION.get() else { return };
+    let Some(state) = PROBATION.get() else {
+        cleanup_healthy_selection();
+        return;
+    };
     let Some(runtime) = state.lock().expect("probation state lock").take() else {
+        cleanup_healthy_selection();
         return;
     };
     if runtime.marker.reverted {
@@ -1307,12 +1751,52 @@ pub async fn registered(out_tx: &tokio::sync::mpsc::Sender<crate::pty::WsOutboun
             return;
         }
     }
-    cleanup_previous_paths(&runtime.daemon_path, &runtime.marker.worker_path);
-    cleanup_failed_paths(&runtime.daemon_path, &runtime.marker.worker_path);
+    match &runtime.kind {
+        ProbationKind::Store { layout, config_dir } => {
+            #[cfg(windows)]
+            install::cleanup_pair_backups(layout, config_dir);
+            #[cfg(not(windows))]
+            let _ = config_dir;
+            let report = install::collect_garbage(layout, &install::known_config_dirs());
+            for removed in report.removed {
+                tracing::info!(stage = "cleanup", release = %removed, "removed unused release");
+            }
+        }
+        ProbationKind::Legacy { daemon_path } => {
+            if let Some(worker_path) = &runtime.marker.worker_path {
+                cleanup_previous_paths(daemon_path, worker_path);
+                cleanup_failed_paths(daemon_path, worker_path);
+            }
+        }
+    }
     tracing::info!(
         stage = "health",
         "daemon update passed post-register health gate"
     );
+}
+
+/// A normal possession also switches the Windows pair. Clear its backups
+/// only once the selected daemon registers, never from a previous process
+/// reconnecting while a newer selection is still in probation.
+fn cleanup_healthy_selection() {
+    let Ok(config_dir) = crate::config::config_dir() else {
+        return;
+    };
+    let Ok(layout) = install::layout_for_instance(&config_dir) else {
+        return;
+    };
+    if install::probation_marker_path(&layout, &config_dir).exists() {
+        return;
+    }
+    let Ok(Some(release)) = install::selected(&layout, &config_dir) else {
+        return;
+    };
+    if install::provenance().release_id() != Some(release.id()) {
+        return;
+    }
+    #[cfg(windows)]
+    install::cleanup_pair_backups(&layout, &config_dir);
+    let _ = install::collect_garbage(&layout, &install::known_config_dirs());
 }
 
 fn health_failure_result(marker: &ProbationMarker) -> crate::proto::Outbound {
@@ -1330,7 +1814,10 @@ fn health_failure_result(marker: &ProbationMarker) -> crate::proto::Outbound {
 }
 
 fn cleanup_previous_paths(daemon_path: &Path, worker_path: &Path) {
-    for previous in [previous_path(daemon_path), previous_path(worker_path)] {
+    for previous in [
+        install::previous_path(daemon_path),
+        install::previous_path(worker_path),
+    ] {
         match fs::remove_file(previous) {
             Ok(()) => tracing::info!(stage = "cleanup", "removed self-update backup"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1393,29 +1880,147 @@ fn acquire_from(flag: &AtomicBool) -> Result<UpdatePermit<'_>, UpdateFailure> {
         .map_err(|_| UpdateFailure::new(UpdateStage::Precondition, "busy"))
 }
 
-fn evaluate_preconditions() -> Result<Preconditions, BlockReason> {
+/// Everything an update needs to be true of this instance and this host.
+fn evaluate_preconditions(mode: Mode) -> Result<Preconditions, BlockReason> {
     let disabled = std::env::var_os("SPAWND_NO_SELF_UPDATE").is_some_and(|value| !value.is_empty());
-    let daemon_path = std::env::current_exe().ok().and_then(resolve_file);
-    let worker_path = resolve_program(crate::worker_backend::worker_bin());
-    let preconditions = classify_preconditions(
+    let config_dir = crate::config::config_dir().map_err(|_| BlockReason::Unwritable)?;
+    let layout = install::layout_for_instance(&config_dir).map_err(|_| BlockReason::Unwritable)?;
+    let current = install::selected(&layout, &config_dir).ok().flatten();
+    // A daemon still launching from the shared pair could not move into the
+    // store at startup; a shell command re-registers it, the daemon must not.
+    let legacy_launch = mode == Mode::Daemon && install::provenance().is_legacy();
+    let own_variant = current
+        .as_ref()
+        .and_then(|release| ReleaseVariant::from_name(&release.meta.variant))
+        .or_else(|| {
+            crate::state::read(&config_dir)
+                .ok()
+                .flatten()
+                .filter(|state| crate::state::daemon_state_is_live(&config_dir, state))
+                .and_then(|state| {
+                    ReleaseVariant::from_name(install::variant_of_version(&state.version))
+                })
+        })
+        .unwrap_or(ReleaseVariant::own());
+    let variant = configured_variant_from(
+        std::env::var_os(RELEASE_VARIANT_ENV).as_deref(),
+        own_variant,
+    );
+    classify_preconditions(
         disabled,
-        daemon_path,
-        worker_path,
+        store_writable(&layout),
+        resolve_program(crate::worker_backend::worker_bin()).is_some(),
+        legacy_launch,
         target_for(std::env::consts::OS, std::env::consts::ARCH),
-        configured_variant(),
-        probe_writable,
+        variant,
     )?;
     #[cfg(windows)]
     {
-        let config_dir =
-            crate::config::config_dir().map_err(|_| BlockReason::TaskBreakawayUnconfirmed)?;
         if crate::service::preferred_mode(&config_dir) == crate::service::ServiceMode::Task
             && !task_breakaway_confirmed(&config_dir)
         {
             return Err(BlockReason::TaskBreakawayUnconfirmed);
         }
     }
-    Ok(preconditions)
+    let tree = instance_tree(mode, &config_dir, current.as_ref());
+    let build_counter = instance_build_counter(mode, &config_dir, current.as_ref());
+    if build_counter.is_none() && !allow_unsigned_update() {
+        return Err(BlockReason::IdentityUnknown);
+    }
+    Ok(Preconditions {
+        mode,
+        layout,
+        config_dir,
+        target: target_for(std::env::consts::OS, std::env::consts::ARCH)
+            .ok_or(BlockReason::UnsupportedTarget)?,
+        variant: variant?,
+        current,
+        tree,
+        build_counter,
+    })
+}
+
+/// A shell command cannot lend its older counter to a newer instance. Keep
+/// the higher floor when an update has selected a build not yet running.
+fn instance_build_counter(mode: Mode, config_dir: &Path, current: Option<&Release>) -> Option<u64> {
+    let selected_counter = current.and_then(|release| {
+        release.meta.build_counter.or_else(|| {
+            install::probe_build_info(&release.spawnd())
+                .ok()
+                .filter(|info| {
+                    info.version == release.meta.version && info.tree == release.meta.tree
+                })
+                .and_then(|info| info.build_counter)
+        })
+    });
+    if mode == Mode::Daemon {
+        // Possession can select a newer build before the service restarts.
+        // The old process must not lower that selection in the meantime.
+        if current.is_some() && selected_counter.is_none() {
+            return None;
+        }
+        return selected_counter
+            .into_iter()
+            .chain(crate::version::build_counter())
+            .max();
+    }
+    let live = crate::state::read(config_dir)
+        .ok()
+        .flatten()
+        .filter(|state| crate::state::daemon_state_is_live(config_dir, state));
+    let running_counter = live.as_ref().and_then(|state| {
+        state.build_counter.or_else(|| {
+            let exe = install::live_daemon_exe(config_dir)?;
+            install::probe_build_info(&exe)
+                .ok()
+                .filter(|info| info.version == state.version)
+                .and_then(|info| info.build_counter)
+        })
+    });
+    // Missing identity for either known target fails closed. The installer
+    // migrates pre-store daemons; the updater does not guess their counter.
+    if (current.is_some() && selected_counter.is_none())
+        || (live.is_some() && running_counter.is_none())
+    {
+        return None;
+    }
+    selected_counter
+        .into_iter()
+        .chain(running_counter)
+        .max()
+        .or_else(|| {
+            (current.is_none() && live.is_none())
+                .then(crate::version::build_counter)
+                .flatten()
+        })
+}
+
+/// The daemon tree an update is judged against. The daemon is its own
+/// instance; a command from a shell reads the instance's selected release,
+/// then its live heartbeat, and only then assumes the instance runs this
+/// command's own build.
+fn instance_tree(mode: Mode, config_dir: &Path, current: Option<&Release>) -> Option<String> {
+    let own = crate::version::daemon_tree().map(str::to_string);
+    if mode == Mode::Daemon {
+        return own;
+    }
+    current
+        .map(|release| release.meta.tree.clone())
+        .filter(|tree| !tree.is_empty())
+        .or_else(|| {
+            crate::state::read(config_dir)
+                .ok()
+                .flatten()
+                .filter(|state| crate::state::daemon_state_is_live(config_dir, state))
+                .and_then(|state| state.tree)
+        })
+        .or(own)
+}
+
+fn store_writable(layout: &Layout) -> bool {
+    [layout.releases_dir(), layout.instances_dir()]
+        .iter()
+        .all(|dir| fs::create_dir_all(dir).is_ok() && probe_writable(dir))
 }
 
 #[cfg(windows)]
@@ -1427,38 +2032,29 @@ fn task_breakaway_confirmed(config_dir: &Path) -> bool {
             .is_some_and(|state| state.task_breakaway_denied == Some(false))
 }
 
-fn classify_preconditions<F>(
+fn classify_preconditions(
     disabled: bool,
-    daemon_path: Option<PathBuf>,
-    worker_path: Option<PathBuf>,
+    store_writable: bool,
+    worker_present: bool,
+    legacy_launch: bool,
     target: Option<&'static str>,
     variant: Result<ReleaseVariant, BlockReason>,
-    writable: F,
-) -> Result<Preconditions, BlockReason>
-where
-    F: Fn(&Path) -> bool,
-{
+) -> Result<(), BlockReason> {
     if disabled {
         return Err(BlockReason::Disabled);
     }
-    let daemon_path = daemon_path.ok_or(BlockReason::Unwritable)?;
-    let daemon_dir = daemon_path.parent().ok_or(BlockReason::Unwritable)?;
-    if !writable(daemon_dir) {
+    if !store_writable {
         return Err(BlockReason::Unwritable);
     }
-    let worker_path = worker_path.ok_or(BlockReason::WorkerMissing)?;
-    let worker_dir = worker_path.parent().ok_or(BlockReason::WorkerMissing)?;
-    if !writable(worker_dir) {
-        return Err(BlockReason::Unwritable);
+    if !worker_present {
+        return Err(BlockReason::WorkerMissing);
     }
-    let target = target.ok_or(BlockReason::UnsupportedTarget)?;
-    let variant = variant?;
-    Ok(Preconditions {
-        daemon_path,
-        worker_path,
-        target,
-        variant,
-    })
+    if legacy_launch {
+        return Err(BlockReason::LegacyLaunch);
+    }
+    target.ok_or(BlockReason::UnsupportedTarget)?;
+    variant?;
+    Ok(())
 }
 
 #[cfg(test)]
