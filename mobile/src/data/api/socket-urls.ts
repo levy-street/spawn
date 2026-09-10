@@ -14,7 +14,7 @@ export function buildBrowserSocketUrl(sessionId: string): Promise<string> {
 }
 
 export function buildHostSocketUrl(hostId: string): Promise<string> {
-  return socketUrl("/ws/host", { host_id: hostId });
+  return socketUrl("/ws/host", { host_id: hostId, rtc_version: "2" });
 }
 
 export function buildAlertsSocketUrl(): Promise<string> {

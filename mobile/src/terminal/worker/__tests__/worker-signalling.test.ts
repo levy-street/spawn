@@ -194,7 +194,7 @@ function hostFrame(extra: Record<string, unknown>): Record<string, unknown> {
     scope_type: "host",
     scope_id: HOST_ID,
     protocol: "spawn.host.ctl",
-    protocol_version: 1,
+    protocol_version: 2,
     ...extra,
   };
 }
@@ -323,7 +323,7 @@ describe("host-scoped signalling", () => {
         scope_type: "host",
         scope_id: HOST_ID,
         protocol: "spawn.host.ctl",
-        protocol_version: 1,
+        protocol_version: 2,
         status: "unavailable",
       },
     });
@@ -345,10 +345,10 @@ describe("host-scoped signalling", () => {
   });
 });
 
-describe("session-scoped signalling", () => {
+describe("shared daemon signalling", () => {
   test("reports selected path and RTT every five seconds while connected", async () => {
     jest.useFakeTimers();
-    const harness = createHarness("session");
+    const harness = createHarness("host");
     try {
       await connect(harness);
       const pc = FakePeerConnection.last;
@@ -370,7 +370,7 @@ describe("session-scoped signalling", () => {
   });
 
   test("restarts ICE on the same binding after a network change", async () => {
-    const harness = createHarness("session");
+    const harness = createHarness("host");
     await connect(harness);
     await signOffer(harness);
     const pc = FakePeerConnection.last;
@@ -397,7 +397,7 @@ describe("session-scoped signalling", () => {
   });
 
   test("carries endorsements on the outer offer only", async () => {
-    const harness = createHarness("session");
+    const harness = createHarness("host");
     await connect(harness);
     await signOffer(harness, [CARRIED_EDGE]);
 
@@ -409,46 +409,17 @@ describe("session-scoped signalling", () => {
   });
 
   test("omits carried_endorsements when the sign response has none", async () => {
-    const harness = createHarness("session");
+    const harness = createHarness("host");
     await connect(harness);
     await signOffer(harness);
 
     expect(emittedFrames(harness, "rtc.offer")[0]).not.toHaveProperty("carried_endorsements");
   });
 
-  test("keeps the nonce match and generation gate the session channel provides", async () => {
+  test("terminal views cannot negotiate a separate peer", async () => {
     const harness = createHarness("session");
-    await connect(harness);
-    await signOffer(harness);
-
-    const pc = FakePeerConnection.last;
-    pc?.onicecandidate?.({ candidate: { toJSON: () => ({ candidate: "queued" }) } });
-    expect(emittedFrames(harness, "rtc.candidate")).toHaveLength(0);
-
-    const status = {
-      type: "rtc.status",
-      session_id: RTC_SESSION_ID,
-      scope_type: "session",
-      scope_id: SESSION_ID,
-      protocol: "spawn.pty",
-      protocol_version: 2,
-      status: "negotiating",
-      binding_generation: 7,
-    };
-    // A session frame without the browser's own nonce is not ours.
-    await harness.handleTransportMessage?.({
-      type: "signal-frame",
-      frame: { ...status, binding_nonce: SERVER_NONCE },
-    });
-    expect(harness.sessionGate).not.toHaveBeenCalled();
-
-    await harness.handleTransportMessage?.({
-      type: "signal-frame",
-      frame: { ...status, binding_nonce: CLIENT_NONCE },
-    });
-    expect(harness.sessionGate).toHaveBeenCalledWith("bindingAccepted");
-    const candidates = emittedFrames(harness, "rtc.candidate");
-    expect(candidates).toHaveLength(1);
-    expect(candidates[0]?.["binding_generation"]).toBe(7);
+    await expect(connect(harness)).rejects.toThrow(
+      "Terminal views attach to the daemon connection.",
+    );
   });
 });

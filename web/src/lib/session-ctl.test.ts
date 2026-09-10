@@ -391,6 +391,47 @@ describe("spawn.ctl browser protocol", () => {
     assert.deepEqual(delivered, ["blob-first", "array-buffer-second"]);
   });
 
+  test("bounds queued decodes behind a stalled frame and releases credit", async () => {
+    const queue = new OrderedAsyncQueue(4, 2);
+    let release = () => {};
+    const stalled = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = queue.enqueue(
+      () => stalled,
+      () => {},
+      4,
+    );
+    await assert.rejects(
+      queue.enqueue(
+        () => "oversize",
+        () => {},
+        1,
+      ),
+      /queue is full/,
+    );
+    const empty = queue.enqueue(
+      () => "",
+      () => {},
+      0,
+    );
+    await assert.rejects(
+      queue.enqueue(
+        () => "",
+        () => {},
+        0,
+      ),
+      /queue is full/,
+    );
+    release();
+    await Promise.all([first, empty]);
+    await queue.enqueue(
+      () => "new",
+      () => {},
+      4,
+    );
+  });
+
   test("never drains queued input into another session generation", () => {
     const queue = new SessionGenerationInputQueue(4);
     assert.equal(queue.enqueue(1, new Uint8Array([1, 2])), true);

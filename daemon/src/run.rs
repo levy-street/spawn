@@ -1051,6 +1051,7 @@ async fn serve_one_connection_with_loader(
         existing_sessions: registry.ids(),
         spec: crate::host_metrics::sampler().spec(),
         supports_account_chains: true,
+        supports_device_connections: true,
     };
     let register_json = serde_json::to_string(&register)?;
     out_tx
@@ -2254,6 +2255,8 @@ async fn dispatch_loop(
                             if let Some(verified) = &verified_offer {
                                 let t = verified.transcript();
                                 let scope_ok = t.scope_type() == ScopeType::Host
+                                    && Some(t.protocol_version())
+                                        == protocol_version.map(u32::from)
                                     && scope_id
                                         .as_ref()
                                         .is_some_and(|id| t.scope_id() == id.to_string().as_str());
@@ -2267,28 +2270,50 @@ async fn dispatch_loop(
                             let task_key = signal_id.clone();
                             let rtc_sessions = rtc_sessions.clone();
                             let out_tx = out_tx.clone();
+                            let registry = registry.clone();
                             enqueue_rtc_job(
                                 &mut rtc_tasks,
                                 task_key,
                                 Box::pin(async move {
-                                    rtc_sessions
-                                        .handle_host_offer(
-                                            HostRtcSignal {
-                                                signal_id,
-                                                binding_nonce: Some(binding_nonce),
-                                                binding_generation,
-                                                scope_type,
-                                                scope_id,
-                                                protocol,
-                                                protocol_version,
-                                            },
-                                            offer_sdp,
-                                            ice_servers,
-                                            ice_transport_policy,
-                                            out_tx,
-                                            answer_signer,
-                                        )
-                                        .await;
+                                    let signal = HostRtcSignal {
+                                        signal_id,
+                                        binding_nonce: Some(binding_nonce),
+                                        binding_generation,
+                                        scope_type,
+                                        scope_id,
+                                        protocol,
+                                        protocol_version,
+                                    };
+                                    if signal.protocol_version == Some(2) {
+                                        if let (Some(key), Some(signer)) =
+                                            (offer_key, answer_signer)
+                                        {
+                                            rtc_sessions
+                                                .handle_device_offer(
+                                                    signal,
+                                                    offer_sdp,
+                                                    ice_servers,
+                                                    ice_transport_policy,
+                                                    ice_restart,
+                                                    key,
+                                                    registry,
+                                                    out_tx,
+                                                    signer,
+                                                )
+                                                .await;
+                                        }
+                                    } else {
+                                        rtc_sessions
+                                            .handle_host_offer(
+                                                signal,
+                                                offer_sdp,
+                                                ice_servers,
+                                                ice_transport_policy,
+                                                out_tx,
+                                                answer_signer,
+                                            )
+                                            .await;
+                                    }
                                 }),
                             );
                         }

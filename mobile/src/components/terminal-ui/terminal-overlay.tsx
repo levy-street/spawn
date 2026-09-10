@@ -515,6 +515,10 @@ export function TerminalOverlay({
           awaitingApproval={awaitingApproval}
           error={connectionError}
           hasEverBeenReady={hasEverBeenReady}
+          sharedConnectionUnavailable={
+            transportRef.current?.daemonState !== undefined &&
+            transportRef.current.daemonState !== "ready"
+          }
           onDeviceTrust={() => setApprovalVisible(true)}
           onRetry={retry}
           state={hostKey ? connectionState : "failed"}

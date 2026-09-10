@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AppState, Image, StyleSheet } from "react-native";
 import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import { subscribeRetirementReason } from "@/data/realtime/lifecycle";
+import { deviceIdentityGeneration, subscribeDeviceIdentityAccount } from "@/lib/crypto/identity";
 import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 import { retainHostTransport } from "@/terminal/transport/host-transport-registry";
 import type {
@@ -26,7 +27,16 @@ export interface HostTransportSurfaceProps extends Omit<HostTransportOptions, "b
   onDiagnostic?(diagnostic: WorkerDiagnostic): void;
 }
 
-export function HostTransportSurface({
+export function HostTransportSurface(props: HostTransportSurfaceProps): React.JSX.Element {
+  const generation = useSyncExternalStore(
+    subscribeDeviceIdentityAccount,
+    deviceIdentityGeneration,
+    deviceIdentityGeneration,
+  );
+  return <HostTransportInstance key={generation} {...props} />;
+}
+
+function HostTransportInstance({
   hostId,
   hostIdentityPublicKey,
   forceRelay,
@@ -67,6 +77,7 @@ export function HostTransportSurface({
       transport.on("error", (error) => callbacks.current.onError?.(error)),
       transport.on("diagnostic", (diagnostic) => callbacks.current.onDiagnostic?.(diagnostic)),
     ];
+    callbacks.current.onStateChange?.(transport.state);
     return () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
       lease.release();

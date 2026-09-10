@@ -11,7 +11,7 @@
   function protocolTuple() {
     return state.mode === "session"
       ? { scopeType: "session", protocol: "spawn.pty", protocolVersion: 2 }
-      : { scopeType: "host", protocol: "spawn.host.ctl", protocolVersion: 1 };
+      : { scopeType: "host", protocol: "spawn.host.ctl", protocolVersion: 2 };
   }
 
   /** The two signalling channels bind a peer differently, and only the session
@@ -107,6 +107,7 @@
         // Stats are diagnostic only; an older WebKit must not affect the channel.
       } finally {
         scheduleStats();
+        api.hostChannelOpened?.();
       }
     }, 5_000);
   }
@@ -158,6 +159,7 @@
   }
 
   async function startPeer(message) {
+    if (state.mode !== "host") throw new Error("Terminal views attach to the daemon connection.");
     if (state.pc?.connectionState === "connected" && message.forceRebuild !== true) return;
     if (state.pc && state.rtcSessionId === message.rtcSessionId) return;
     teardown(false);
@@ -175,17 +177,9 @@
       iceTransportPolicy: relayOnly ? "relay" : "all",
     });
     state.pc = pc;
-    if (state.mode === "session") {
-      state.pty = pc.createDataChannel("spawn.pty", CHANNEL_OPTIONS);
-      state.ctl = pc.createDataChannel("spawn.ctl", CHANNEL_OPTIONS);
-      configureChannel(state.pty, "pty");
-      configureChannel(state.ctl, "ctl");
-      api.resetSessionGeneration?.();
-    } else {
-      state.ctl = pc.createDataChannel("spawn.host.ctl", CHANNEL_OPTIONS);
-      configureChannel(state.ctl, "ctl");
-      api.resetHostGeneration?.();
-    }
+    state.ctl = pc.createDataChannel("spawn.host.ctl", CHANNEL_OPTIONS);
+    configureChannel(state.ctl, "ctl");
+    api.resetHostGeneration?.();
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
       const frame = { type: "rtc.candidate", ...outerTuple(), candidate: candidate.toJSON() };
@@ -197,6 +191,10 @@
       else state.pendingLocalCandidates.push(frame);
     };
     pc.onconnectionstatechange = () => {
+      if (pc !== state.pc) return;
+      if (["failed", "disconnected"].includes(pc.connectionState)) {
+        api.post({ type: "state", state: "connecting" });
+      }
       if (pc.connectionState === "failed") void restartPeer();
       if (pc.connectionState === "disconnected") {
         clearTimeout(state.disconnectTimer);
@@ -206,6 +204,7 @@
         clearTimeout(state.restartTimer);
         state.restartTimer = null;
         scheduleStats();
+        api.hostChannelOpened?.();
       }
     };
     api.post({ type: "state", state: "connecting" });
@@ -312,7 +311,8 @@
   }
 
   function teardown(sendClose) {
-    if (sendClose && state.rtcSessionId && state.bindingNonce) {
+    api.closePairChannels?.();
+    if (state.mode === "host" && sendClose && state.rtcSessionId && state.bindingNonce) {
       emitSignal({ type: "rtc.close", ...outerTuple() });
     }
     clearTimeout(state.disconnectTimer);
@@ -339,6 +339,7 @@
   }
 
   api.handleTransportMessage = async (message) => {
+    if (api.handlePairMessage?.(message)) return;
     switch (message.type) {
       case "connect":
         await startPeer(message);

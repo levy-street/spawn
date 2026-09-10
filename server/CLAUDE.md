@@ -58,6 +58,13 @@ policies remain stored but inactive. Do not restore these effects from a
 server-side flag: `docs/DAEMON_COMMAND_AUTHORITY.md` records the endpoint
 authorization and durable-state requirements for their replacement.
 
+- Shared device RTC uses `/ws/host?rtc_version=2` with the existing
+  `spawn.host.v1` websocket subprotocol. Relay only signed host-v2 envelopes;
+  preserve the exact binding tuple through offers, resume, and close. Legacy
+  host-v1 and session-v2 routes remain supported. The daemon advertises
+  `supports_device_connections`; an old daemon must produce an explicit update
+  refusal. Session channel attachment never becomes a server signaling route.
+
 ## Before calling a change done
 
 ```bash

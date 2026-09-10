@@ -26,7 +26,25 @@ export interface SignalTranscriptRequest {
 
 type NativeMessage = { v: typeof TERMINAL_BRIDGE_VERSION };
 
+export interface PairAttachment {
+  attachmentId: string;
+  sessionId: string;
+  viewId: string;
+}
+export interface PairChannelMessage {
+  attachmentId: string;
+  channel: "pty" | "ctl";
+  event: "open" | "data" | "close" | "ack" | "send" | "received";
+  data?: string;
+  binary?: boolean;
+  sequence?: number;
+  bytes?: number;
+}
+
 export type NativeToWorkerMessage =
+  | (NativeMessage & PairAttachment & { type: "pair-attach" })
+  | (NativeMessage & PairAttachment & { type: "pair-view" })
+  | (NativeMessage & PairChannelMessage & { type: "pair-command" | "pair-event" })
   | (NativeMessage & {
       type: "init";
       mode: "session" | "host";
@@ -111,6 +129,7 @@ export type NativeToWorkerMessage =
 type WorkerMessage = { v: typeof TERMINAL_BRIDGE_VERSION };
 
 export type WorkerToNativeMessage =
+  | (WorkerMessage & PairChannelMessage & { type: "pair-command" | "pair-event" })
   | (WorkerMessage & { type: "ready"; renderer: "webgl" | "dom" | null })
   | (WorkerMessage & { type: "state"; state: TransportState; gate?: string })
   | (WorkerMessage & { type: "signal-frame"; frame: unknown })
@@ -226,6 +245,10 @@ export function parseWorkerMessage(raw: string): WorkerToNativeMessage {
 }
 
 const NATIVE_MESSAGE_TYPES = new Set([
+  "pair-attach",
+  "pair-view",
+  "pair-command",
+  "pair-event",
   "init",
   "connect",
   "signal-frame",
@@ -254,6 +277,8 @@ const NATIVE_MESSAGE_TYPES = new Set([
 ]);
 
 const WORKER_MESSAGE_TYPES = new Set([
+  "pair-command",
+  "pair-event",
   "ready",
   "state",
   "display",

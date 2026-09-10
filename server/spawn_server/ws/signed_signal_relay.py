@@ -77,7 +77,8 @@ _WORST_ENDORSEMENT_EDGE_BYTES = (
     + sum(len(key) + 3 + 2 + _MAX_ENDORSEMENT_FIELD_LEN for key in _ENDORSEMENT_KEYS)
 )
 _WORST_CARRIED_ENDORSEMENTS_BYTES = (
-    len(CARRIED_ENDORSEMENTS_FIELD) + 4  # ,"carried_endorsements":
+    len(CARRIED_ENDORSEMENTS_FIELD)
+    + 4  # ,"carried_endorsements":
     + 2  # brackets
     + (MAX_RELAYED_ENDORSEMENTS - 1)  # commas between edges
     + MAX_RELAYED_ENDORSEMENTS * _WORST_ENDORSEMENT_EDGE_BYTES
@@ -251,10 +252,10 @@ def validate_signed_rtc_relay_envelope(
     if value["protocol"] not in {"spawn.pty", "spawn.host.ctl"}:
         raise SignedRtcRelayError("invalid signed RTC protocol")
     expected_topology = {
-        "session": ("spawn.pty", 2),
-        "host": ("spawn.host.ctl", 1),
+        "session": {("spawn.pty", 2)},
+        "host": {("spawn.host.ctl", 1), ("spawn.host.ctl", 2)},
     }[value["scope_type"]]
-    if (value["protocol"], protocol_version) != expected_topology:
+    if (value["protocol"], protocol_version) not in expected_topology:
         raise SignedRtcRelayError("signed RTC protocol topology is inconsistent")
 
     for field in ("session_id", "scope_id"):

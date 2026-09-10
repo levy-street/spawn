@@ -2098,6 +2098,7 @@ pub(crate) fn install(
             // so an old daemon on a Mac correctly offers nothing extra and a
             // future Linux daemon lights up with no client change.
             let mut capabilities = vec![
+                "session.transport.v1",
                 "ping",
                 "fs.home",
                 "fs.list",

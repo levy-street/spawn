@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
 import type { Page, Route } from "@playwright/test";
 import { autoPlace, type GridLayout, type Rect, remove as removeTile } from "../../src/lib/grid";
+import { encodeSignedSignalTranscript } from "../../src/lib/signed-signal";
 import { activeTab, allTiles, type LayoutV3, tabOfSession, withTabTiles } from "../../src/lib/tabs";
 
 export const USER_ID = "00000000-0000-4000-8000-000000000001";
@@ -13,6 +14,16 @@ export const SESSION_B_ID = "00000000-0000-4000-8000-000000000008";
 export const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
 export const CREATED_AT = "2026-05-24T00:00:00Z";
 const APPROVAL_NONCE = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+// Public test fixture, independent of the approval ceremony key below.
+const RTC_TEST_KEY = createPrivateKey({
+  key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.alloc(32, 7)]),
+  format: "der",
+  type: "pkcs8",
+});
+const RTC_TEST_PUBLIC_KEY = createPublicKey(RTC_TEST_KEY)
+  .export({ format: "der", type: "spki" })
+  .subarray(-32)
+  .toString("base64url");
 const HOST_PUBLIC_KEY = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
 
 export const user = {
@@ -362,7 +373,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       invite_only: false,
       ...options.config,
     },
-    hosts: (options.hosts ?? [host]).map((item) => ({ ...(item as JsonRecord) })),
+    hosts: (options.hosts ?? [host]).map((item) => ({
+      host_public_key: RTC_TEST_PUBLIC_KEY,
+      ...(item as JsonRecord),
+    })),
     sessions: (options.sessions ?? []).map((item) => ({ ...(item as JsonRecord) })),
     workspaces: (options.workspaces ?? [workspace()]).map((item) => ({ ...(item as JsonRecord) })),
     agents: (options.agents ?? [agent()]).map((item) => ({ ...(item as JsonRecord) })),
@@ -405,7 +419,13 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
   const browserDeviceList: Array<Record<string, unknown>> = [
     ...(options.extraBrowserDevices ?? []),
   ];
-  const hostPinMap: Record<string, string[]> = { ...(options.hostPins ?? {}) };
+  const hostPinMap: Record<string, string[]> =
+    options.hostPins ??
+    Object.fromEntries(
+      store.hosts
+        .filter((item) => item.host_public_key === RTC_TEST_PUBLIC_KEY)
+        .map((item) => [String(item.id), [BROWSER_DEVICE_ID]]),
+    );
   const knockRows: Array<Record<string, unknown> & { browser_device_id: string }> = [];
   const pairingRows: Array<Record<string, unknown>> = (options.pairings ?? []).map((row) => ({
     ...row,
@@ -573,242 +593,332 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     },
   );
 
-  await page.addInitScript((capabilities: string[]) => {
-    Object.defineProperty(globalThis, "showSaveFilePicker", {
-      configurable: true,
-      value: undefined,
-    });
+  await page.exposeFunction(
+    "__spawnSignedHostAnswer",
+    (frame: Record<string, unknown>, hostId: string) => {
+      const offer = JSON.parse(String(frame.signed_envelope));
+      const sdp = `mock-answer:${hostId}`;
+      const signature = sign(
+        null,
+        encodeSignedSignalTranscript({
+          signalKind: "answer",
+          protocolVersion: 2,
+          sessionId: String(frame.session_id),
+          scopeType: "host",
+          scopeId: hostId,
+          senderRole: "daemon",
+          intendedPeerPublicKey: Buffer.from(offer.sender_identity_public_key, "base64url"),
+          sdp,
+        }),
+        RTC_TEST_KEY,
+      ).toString("base64url");
+      return JSON.stringify({
+        ...offer,
+        type: "rtc.answer",
+        sender_role: "daemon",
+        sdp,
+        signature,
+        sender_identity_public_key: RTC_TEST_PUBLIC_KEY,
+        intended_peer_identity_public_key: offer.sender_identity_public_key,
+      });
+    },
+  );
+  await page.addInitScript(
+    (capabilities: string[]) => {
+      Object.defineProperty(globalThis, "showSaveFilePicker", {
+        configurable: true,
+        value: undefined,
+      });
 
-    type HostInvoke = (
-      hostId: string,
-      operation: string,
-      payload: Record<string, unknown>,
-    ) => Promise<Record<string, unknown>>;
-    const invoke = () =>
-      (
-        globalThis as typeof globalThis & {
-          __spawnHostControlRequest: HostInvoke;
+      type HostInvoke = (
+        hostId: string,
+        operation: string,
+        payload: Record<string, unknown>,
+      ) => Promise<Record<string, unknown>>;
+      const invoke = () =>
+        (
+          globalThis as typeof globalThis & {
+            __spawnHostControlRequest: HostInvoke;
+          }
+        ).__spawnHostControlRequest;
+
+      class MockHostDataChannel {
+        readonly label: string;
+        readonly bufferedAmount = 0;
+        readyState: RTCDataChannelState = "connecting";
+        onopen: ((event: Event) => void) | null = null;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        onclose: ((event: Event) => void) | null = null;
+        onerror: ((event: Event) => void) | null = null;
+        private readonly writes = new Map<
+          string,
+          { declaration: Record<string, unknown>; chunks: string[] }
+        >();
+
+        constructor(
+          private readonly getHostId: () => string,
+          label: string,
+        ) {
+          this.label = label;
         }
-      ).__spawnHostControlRequest;
 
-    class MockHostDataChannel {
-      readonly label = "spawn.host.ctl";
-      readonly bufferedAmount = 0;
-      readyState: RTCDataChannelState = "connecting";
-      onopen: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onclose: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      private readonly writes = new Map<
-        string,
-        { declaration: Record<string, unknown>; chunks: string[] }
-      >();
+        open() {
+          this.readyState = "open";
+          this.onopen?.(new Event("open"));
+          this.emit({
+            version: 1,
+            type: "hello",
+            protocol: "spawn.host.ctl",
+            capabilities,
+          });
+        }
 
-      constructor(private readonly hostId: string) {}
+        close() {
+          if (this.readyState === "closed") return;
+          this.readyState = "closed";
+          this.onclose?.(new Event("close"));
+        }
 
-      open() {
-        this.readyState = "open";
-        this.onopen?.(new Event("open"));
-        this.emit({
-          version: 1,
-          type: "hello",
-          protocol: "spawn.host.ctl",
-          capabilities,
-        });
-      }
+        send(encoded: string) {
+          const frame = JSON.parse(encoded) as Record<string, unknown>;
+          void this.handle(frame);
+        }
 
-      close() {
-        if (this.readyState === "closed") return;
-        this.readyState = "closed";
-        this.onclose?.(new Event("close"));
-      }
+        private emit(frame: Record<string, unknown>) {
+          setTimeout(
+            () => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(frame) })),
+            0,
+          );
+        }
 
-      send(encoded: string) {
-        const frame = JSON.parse(encoded) as Record<string, unknown>;
-        void this.handle(frame);
-      }
-
-      private emit(frame: Record<string, unknown>) {
-        setTimeout(
-          () => this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(frame) })),
-          0,
-        );
-      }
-
-      private async handle(frame: Record<string, unknown>) {
-        const type = frame.type;
-        if (type === "request") {
-          const requestId = String(frame.request_id);
-          const operation = String(frame.operation);
-          const payload = (frame.payload ?? {}) as Record<string, unknown>;
-          if (operation === "ping") {
-            this.emit({
-              version: 1,
-              type: "response",
-              request_id: requestId,
-              ok: true,
-              result: { pong: true },
-            });
-            return;
-          }
-          if (operation === "fs.write.begin") {
-            const streamId = crypto.randomUUID();
-            this.writes.set(streamId, { declaration: payload, chunks: [] });
-            this.emit({
-              version: 1,
-              type: "response",
-              request_id: requestId,
-              ok: true,
-              result: { stream_id: streamId },
-            });
-            return;
-          }
-          try {
-            const result = await invoke()(this.hostId, operation, payload);
-            if (
-              operation === "fs.read" ||
-              operation === "fs.read.range" ||
-              operation === "fs.preview"
-            ) {
-              const streamId = crypto.randomUUID();
-              const bytes = String(result.bytes_b64 ?? "");
-              const { bytes_b64: _, ...declaration } = result;
+        private async handle(frame: Record<string, unknown>) {
+          const type = frame.type;
+          if (type === "request") {
+            const requestId = String(frame.request_id);
+            const operation = String(frame.operation);
+            const payload = (frame.payload ?? {}) as Record<string, unknown>;
+            if (operation === "ping") {
               this.emit({
                 version: 1,
                 type: "response",
                 request_id: requestId,
                 ok: true,
-                result: { ...declaration, stream_id: streamId },
-              });
-              // The client rejects any chunk over 8 KiB by tearing down the
-              // channel, and it requires strictly increasing sequence numbers.
-              // Emitting a whole file as one frame silently capped every
-              // fixture at 8 KiB, so anything larger has to be split here the
-              // way the daemon splits it.
-              const CHUNK_BYTES = 8 * 1024;
-              const binary = bytes ? atob(bytes) : "";
-              let sequence = 0;
-              for (let offset = 0; offset < binary.length; offset += CHUNK_BYTES) {
-                this.emit({
-                  version: 1,
-                  type: "stream.chunk",
-                  stream_id: streamId,
-                  sequence,
-                  bytes_b64: btoa(binary.slice(offset, offset + CHUNK_BYTES)),
-                });
-                sequence += 1;
-              }
-              this.emit({
-                version: 1,
-                type: "stream.end",
-                stream_id: streamId,
-                length: result.length,
-                sha256: result.sha256,
+                result: { pong: true },
               });
               return;
             }
-            this.emit({ version: 1, type: "response", request_id: requestId, ok: true, result });
-          } catch (error) {
+            if (operation === "fs.write.begin") {
+              const streamId = crypto.randomUUID();
+              this.writes.set(streamId, { declaration: payload, chunks: [] });
+              this.emit({
+                version: 1,
+                type: "response",
+                request_id: requestId,
+                ok: true,
+                result: { stream_id: streamId },
+              });
+              return;
+            }
+            try {
+              const result = await invoke()(this.getHostId(), operation, payload);
+              if (
+                operation === "fs.read" ||
+                operation === "fs.read.range" ||
+                operation === "fs.preview"
+              ) {
+                const streamId = crypto.randomUUID();
+                const bytes = String(result.bytes_b64 ?? "");
+                const { bytes_b64: _, ...declaration } = result;
+                this.emit({
+                  version: 1,
+                  type: "response",
+                  request_id: requestId,
+                  ok: true,
+                  result: { ...declaration, stream_id: streamId },
+                });
+                // The client rejects any chunk over 8 KiB by tearing down the
+                // channel, and it requires strictly increasing sequence numbers.
+                // Emitting a whole file as one frame silently capped every
+                // fixture at 8 KiB, so anything larger has to be split here the
+                // way the daemon splits it.
+                const CHUNK_BYTES = 8 * 1024;
+                const binary = bytes ? atob(bytes) : "";
+                let sequence = 0;
+                for (let offset = 0; offset < binary.length; offset += CHUNK_BYTES) {
+                  this.emit({
+                    version: 1,
+                    type: "stream.chunk",
+                    stream_id: streamId,
+                    sequence,
+                    bytes_b64: btoa(binary.slice(offset, offset + CHUNK_BYTES)),
+                  });
+                  sequence += 1;
+                }
+                this.emit({
+                  version: 1,
+                  type: "stream.end",
+                  stream_id: streamId,
+                  length: result.length,
+                  sha256: result.sha256,
+                });
+                return;
+              }
+              this.emit({ version: 1, type: "response", request_id: requestId, ok: true, result });
+            } catch (error) {
+              this.emit({
+                version: 1,
+                type: "response",
+                request_id: requestId,
+                ok: false,
+                error: { code: "mock_failed", detail: String(error) },
+              });
+            }
+            return;
+          }
+          const streamId = String(frame.stream_id ?? "");
+          if (type === "stream.chunk") {
+            this.writes.get(streamId)?.chunks.push(String(frame.bytes_b64 ?? ""));
+            return;
+          }
+          if (type === "stream.cancel") {
+            this.writes.delete(streamId);
+            return;
+          }
+          if (type === "stream.end") {
+            const write = this.writes.get(streamId);
+            if (!write) return;
+            this.writes.delete(streamId);
+            const result = await invoke()(this.getHostId(), "fs.write.commit", write.declaration);
             this.emit({
               version: 1,
-              type: "response",
-              request_id: requestId,
-              ok: false,
-              error: { code: "mock_failed", detail: String(error) },
+              type: "stream.committed",
+              stream_id: streamId,
+              path: result.path,
             });
           }
-          return;
-        }
-        const streamId = String(frame.stream_id ?? "");
-        if (type === "stream.chunk") {
-          this.writes.get(streamId)?.chunks.push(String(frame.bytes_b64 ?? ""));
-          return;
-        }
-        if (type === "stream.cancel") {
-          this.writes.delete(streamId);
-          return;
-        }
-        if (type === "stream.end") {
-          const write = this.writes.get(streamId);
-          if (!write) return;
-          this.writes.delete(streamId);
-          const result = await invoke()(this.hostId, "fs.write.commit", write.declaration);
-          this.emit({
-            version: 1,
-            type: "stream.committed",
-            stream_id: streamId,
-            path: result.path,
-          });
         }
       }
-    }
 
-    class MockHostPeerConnection {
-      connectionState: RTCPeerConnectionState = "new";
-      remoteDescription: RTCSessionDescription | null = null;
-      localDescription: RTCSessionDescription | null = null;
-      onicecandidate: ((event: RTCPeerConnectionIceEvent) => void) | null = null;
-      onconnectionstatechange: ((event: Event) => void) | null = null;
-      private channel: MockHostDataChannel | null = null;
-      constructor(private readonly hostId = "") {}
-      createDataChannel() {
-        this.channel = new MockHostDataChannel(this.hostId);
-        return this.channel as unknown as RTCDataChannel;
-      }
-      async createOffer() {
-        return { type: "offer" as const, sdp: "mock-offer" };
-      }
-      async setLocalDescription(description: RTCSessionDescriptionInit) {
-        this.localDescription = description as RTCSessionDescription;
-      }
-      async setRemoteDescription(description: RTCSessionDescriptionInit) {
-        this.remoteDescription = description as RTCSessionDescription;
-        this.connectionState = "connected";
-        this.channel?.open();
-      }
-      async addIceCandidate() {}
-      close() {
-        this.connectionState = "closed";
-        this.channel?.close();
-      }
-    }
-
-    let constructingHostPeerId: string | null = null;
-
-    class MockHostWebSocket {
-      static readonly CONNECTING = 0;
-      static readonly OPEN = 1;
-      static readonly CLOSING = 2;
-      static readonly CLOSED = 3;
-      readyState = MockHostWebSocket.CONNECTING;
-      onopen: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      onclose: ((event: CloseEvent) => void) | null = null;
-      readonly hostId: string;
-      constructor(url: string | URL) {
-        this.hostId = new URL(String(url), location.href).searchParams.get("host_id") ?? "";
-        setTimeout(() => {
-          this.readyState = MockHostWebSocket.OPEN;
-          this.onopen?.(new Event("open"));
-          this.emit({ type: "rtc.config", enabled: true, ice_servers: [] });
-        }, 0);
-      }
-      send(encoded: string) {
-        const message = JSON.parse(encoded) as Record<string, unknown>;
-        if (message.type === "rtc.offer") {
-          this.emit({ type: "rtc.answer", session_id: message.session_id, sdp: "mock-answer" });
+      type SessionMock = {
+        makeChannel(label: string, options?: RTCDataChannelInit): RTCDataChannel;
+        peerCreated(): void;
+        openChannels: boolean;
+      };
+      const sessionMock = () =>
+        (globalThis as typeof globalThis & { __spawnSessionMock?: SessionMock }).__spawnSessionMock;
+      const peers: MockHostPeerConnection[] = [];
+      (globalThis as typeof globalThis & { __spawnHostMock: unknown }).__spawnHostMock = {
+        count: () => peers.length,
+        disconnect: () => peers.find((peer) => peer.connectionState === "connected")?.close(),
+      };
+      class MockHostPeerConnection {
+        connectionState: RTCPeerConnectionState = "new";
+        iceConnectionState: RTCIceConnectionState = "new";
+        remoteDescription: RTCSessionDescription | null = null;
+        localDescription: RTCSessionDescription | null = null;
+        onicecandidate: ((event: RTCPeerConnectionIceEvent) => void) | null = null;
+        onconnectionstatechange: ((event: Event) => void) | null = null;
+        oniceconnectionstatechange: (() => void) | null = null;
+        private channels: Array<MockHostDataChannel | RTCDataChannel> = [];
+        private hostId = "";
+        constructor() {
+          peers.push(this);
+          sessionMock()?.peerCreated();
+        }
+        createDataChannel(label: string, options?: RTCDataChannelInit) {
+          const channel = label.startsWith("spawn.host.ctl")
+            ? new MockHostDataChannel(() => this.hostId, label)
+            : sessionMock()?.makeChannel(label, options);
+          if (!channel) throw new Error(`No mock for ${label}`);
+          this.channels.push(channel);
+          if (this.connectionState === "connected")
+            queueMicrotask(() => (channel as unknown as { open(): void }).open());
+          return channel as RTCDataChannel;
+        }
+        async createOffer() {
+          return { type: "offer" as const, sdp: `v=0\r\na=ice-ufrag:${crypto.randomUUID()}\r\n` };
+        }
+        async setLocalDescription(description: RTCSessionDescriptionInit) {
+          this.localDescription = description as RTCSessionDescription;
+        }
+        async setRemoteDescription(description: RTCSessionDescriptionInit) {
+          this.remoteDescription = description as RTCSessionDescription;
+          this.hostId = description.sdp?.slice("mock-answer:".length) ?? "";
+          if (sessionMock()?.openChannels === false) return;
+          this.connectionState = "connected";
+          this.iceConnectionState = "connected";
+          for (const channel of this.channels) (channel as unknown as { open(): void }).open();
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }
+        async getStats() {
+          return new Map();
+        }
+        async addIceCandidate() {}
+        close() {
+          this.connectionState = "closed";
+          for (const channel of this.channels) channel.close();
         }
       }
-      close() {
-        if (this.readyState === MockHostWebSocket.CLOSED) return;
-        this.readyState = MockHostWebSocket.CLOSED;
-        this.onclose?.(new CloseEvent("close"));
-      }
-      private emit(values: Record<string, unknown>) {
-        setTimeout(() => {
-          constructingHostPeerId = this.hostId;
-          try {
+
+      class MockHostWebSocket {
+        static readonly CONNECTING = 0;
+        static readonly OPEN = 1;
+        static readonly CLOSING = 2;
+        static readonly CLOSED = 3;
+        readyState = MockHostWebSocket.CONNECTING;
+        onopen: ((event: Event) => void) | null = null;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        onerror: ((event: Event) => void) | null = null;
+        onclose: ((event: CloseEvent) => void) | null = null;
+        readonly hostId: string;
+        constructor(url: string | URL) {
+          this.hostId = new URL(String(url), location.href).searchParams.get("host_id") ?? "";
+          setTimeout(() => {
+            this.readyState = MockHostWebSocket.OPEN;
+            this.onopen?.(new Event("open"));
+            this.emit({
+              type: "rtc.config",
+              enabled: true,
+              ice_servers: [],
+              binding_nonce_required: true,
+            });
+          }, 0);
+        }
+        send(encoded: string) {
+          const message = JSON.parse(encoded) as Record<string, unknown>;
+          if (message.type === "rtc.offer") {
+            void (
+              globalThis as typeof globalThis & {
+                __spawnRecordRtcTestMessage?: (label: string, value: string) => Promise<void>;
+              }
+            ).__spawnRecordRtcTestMessage?.("signal", JSON.stringify(message));
+            void (
+              globalThis as typeof globalThis & {
+                __spawnSignedHostAnswer(
+                  frame: Record<string, unknown>,
+                  hostId: string,
+                ): Promise<string>;
+              }
+            )
+              .__spawnSignedHostAnswer(message, this.hostId)
+              .then((signed_envelope) => {
+                this.emit({
+                  type: "rtc.answer",
+                  session_id: message.session_id,
+                  binding_nonce: message.binding_nonce ?? crypto.randomUUID().replaceAll("-", ""),
+                  binding_generation: 1,
+                  signed_envelope,
+                });
+              });
+          }
+        }
+        close() {
+          if (this.readyState === MockHostWebSocket.CLOSED) return;
+          this.readyState = MockHostWebSocket.CLOSED;
+          this.onclose?.(new CloseEvent("close"));
+        }
+        private emit(values: Record<string, unknown>) {
+          setTimeout(() => {
             this.onmessage?.(
               new MessageEvent("message", {
                 data: JSON.stringify({
@@ -816,46 +926,36 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
                   scope_type: "host",
                   scope_id: this.hostId,
                   protocol: "spawn.host.ctl",
-                  protocol_version: 1,
+                  protocol_version: 2,
                 }),
               }),
             );
-          } finally {
-            constructingHostPeerId = null;
-          }
-        }, 0);
+          }, 0);
+        }
       }
-    }
 
-    const OriginalWebSocket = globalThis.WebSocket;
-    const HostAwareWebSocket = function (
-      this: WebSocket,
-      url: string | URL,
-      protocols?: string | string[],
-    ) {
-      if (new URL(String(url), location.href).pathname === "/ws/host") {
-        return new MockHostWebSocket(url);
-      }
-      return new OriginalWebSocket(url, protocols);
-    } as unknown as typeof WebSocket;
-    Object.assign(HostAwareWebSocket, {
-      CONNECTING: WebSocket.CONNECTING,
-      OPEN: WebSocket.OPEN,
-      CLOSING: WebSocket.CLOSING,
-      CLOSED: WebSocket.CLOSED,
-    });
-    globalThis.WebSocket = HostAwareWebSocket;
-    const OriginalPeerConnection = globalThis.RTCPeerConnection;
-    globalThis.RTCPeerConnection = function (
-      this: RTCPeerConnection,
-      configuration?: RTCConfiguration,
-    ) {
-      const hostId = constructingHostPeerId;
-      return hostId
-        ? new MockHostPeerConnection(hostId)
-        : new OriginalPeerConnection(configuration);
-    } as unknown as typeof RTCPeerConnection;
-  }, options.capabilities ?? DEFAULT_HOST_CAPABILITIES);
+      const OriginalWebSocket = globalThis.WebSocket;
+      const HostAwareWebSocket = function (
+        this: WebSocket,
+        url: string | URL,
+        protocols?: string | string[],
+      ) {
+        if (new URL(String(url), location.href).pathname === "/ws/host") {
+          return new MockHostWebSocket(url);
+        }
+        return new OriginalWebSocket(url, protocols);
+      } as unknown as typeof WebSocket;
+      Object.assign(HostAwareWebSocket, {
+        CONNECTING: WebSocket.CONNECTING,
+        OPEN: WebSocket.OPEN,
+        CLOSING: WebSocket.CLOSING,
+        CLOSED: WebSocket.CLOSED,
+      });
+      globalThis.WebSocket = HostAwareWebSocket;
+      globalThis.RTCPeerConnection = MockHostPeerConnection as unknown as typeof RTCPeerConnection;
+    },
+    ["session.transport.v1", ...(options.capabilities ?? DEFAULT_HOST_CAPABILITIES)],
+  );
   let meReads = 0;
   let idCounter = 100;
   const nextId = () => `00000000-0000-4000-8000-${String(idCounter++).padStart(12, "0")}`;

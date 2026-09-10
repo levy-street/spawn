@@ -1,9 +1,12 @@
-import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
 import { decodeBridgeBytes } from "@/terminal/transport/bridge";
+import {
+  type HostTransportLease,
+  retainHostTransport,
+} from "@/terminal/transport/host-transport-registry";
 import { createSessionTransport } from "@/terminal/transport/session-transport";
 import type {
-  SignalChannelLike,
+  SessionTransport,
   TransportError,
   TransportState,
   UploadProgress,
@@ -12,393 +15,173 @@ import type {
 import { SESSION_UPLOAD_CHUNK_BYTES } from "@/terminal/transport/upload";
 import { terminalDark } from "@/theme";
 
-jest.mock("@/terminal/transport/signed-signalling", () => ({
-  browserIdentityWire: jest.fn(async () => "browser-key"),
-  signWorkerRequest: jest.fn(async () => "signature"),
-  verifyAnswerFrame: jest.fn((value: unknown) => value),
+const mockClose = jest.fn();
+const mockListeners = new Set<(state: TransportState) => void>();
+let mockState: TransportState = "ready";
+let mockLastError: TransportError | null = null;
+let mockCounter = 0;
+const mockCreateHostTransport = jest.fn(() => ({
+  get state() {
+    return mockState;
+  },
+  get lastError() {
+    return mockLastError;
+  },
+  close: mockClose,
+  on: (event: string, fn: (state: TransportState) => void) => {
+    if (event === "state") mockListeners.add(fn);
+    return () => mockListeners.delete(fn);
+  },
 }));
-
+jest.mock("@/terminal/transport/host-transport", () => ({
+  createHostTransport: () => mockCreateHostTransport(),
+}));
 jest.mock("@/lib/crypto/bootstrap", () => ({
-  randomBytes: jest.fn((length: number) => new Uint8Array(length)),
+  randomBytes: (length: number) => new Uint8Array(length).fill(++mockCounter),
 }));
-
-const CARRIED_EDGE: CarriedEndorsement = {
-  account_id: "account-id",
-  endorser_public_key: "endorser-key",
-  endorsed_public_key: "browser-key",
-  endorsed_device_id: "endorsed-device-id",
-  signature: "endorsement-signature",
+jest.mock("@/lib/crypto/identity", () => ({
+  activeDeviceIdentityAccount: () => "account",
+  subscribeDeviceIdentityAccount: () => () => undefined,
+}));
+const options = {
+  hostId: "11111111-2222-4333-8444-555555555555",
+  hostIdentityPublicKey: "host-key",
 };
-
+let root: HostTransportLease;
+let commands: NativeToWorkerMessage[];
+const views: SessionTransport[] = [];
 class FakeBridge implements WorkerEndpoint {
   readonly sent: NativeToWorkerMessage[] = [];
   readonly listeners = new Set<(message: WorkerToNativeMessage) => void>();
-
   send(message: NativeToWorkerMessage): void {
     this.sent.push(message);
   }
-
-  onMessage(listener: (message: WorkerToNativeMessage) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+  onMessage(fn: (message: WorkerToNativeMessage) => void) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
   }
-
-  emit(message: WorkerToNativeMessage): void {
+  emit(message: WorkerToNativeMessage) {
     for (const listener of this.listeners) listener(message);
   }
 }
-
-class FakeSignal implements SignalChannelLike {
-  state = "open";
-  closeInfo: { code: number; reason: string } | null = null;
-  readonly sent: unknown[] = [];
-  readonly listeners = new Set<(frame: unknown) => void>();
-  readonly stateListeners = new Set<(state: string) => void>();
-
-  send(frame: unknown): void {
-    this.sent.push(frame);
-  }
-
-  onFrame(listener: (frame: unknown) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
-  onState(listener: (state: string) => void): () => void {
-    this.stateListeners.add(listener);
-    return () => this.stateListeners.delete(listener);
-  }
-
-  close(): void {
-    this.listeners.clear();
-    this.stateListeners.clear();
-  }
-
-  emit(frame: unknown): void {
-    for (const listener of this.listeners) listener(frame);
-  }
-
-  emitState(state: string): void {
-    this.state = state;
-    for (const listener of this.stateListeners) listener(state);
-  }
-}
-
 function flush(): Promise<void> {
-  return new Promise((resolve) => setImmediate(() => resolve()));
+  return new Promise((resolve) => setImmediate(resolve));
 }
-
-async function readyTransport(
-  options: {
-    loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
-    directlyPinned?: boolean;
-  } = {},
-): Promise<{
-  bridge: FakeBridge;
-  signal: FakeSignal;
-  transport: ReturnType<typeof createSessionTransport>;
-}> {
+function state(next: TransportState) {
+  mockState = next;
+  for (const listener of mockListeners) listener(next);
+}
+function view() {
   const bridge = new FakeBridge();
-  const signal = new FakeSignal();
   const transport = createSessionTransport({
+    ...options,
     sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-    hostIdentityPublicKey: "host-key",
     initialSize: { cols: 80, rows: 24 },
     theme: terminalDark,
     bridge,
-    openSignal: () => signal,
-    loadCarriedEndorsements: options.loadCarriedEndorsements ?? (async () => []),
-    ...(options.directlyPinned === undefined
-      ? {}
-      : {
-          hostId: "b3ae000c-1da3-4c6c-aeda-23a37ecb01ac",
-          probeTrustResult: async () => ({
-            status: "trusted" as const,
-            directlyPinned: options.directlyPinned ?? false,
-          }),
-        }),
   });
-  const opening = transport.open();
-  await flush();
-  signal.emit({
-    type: "rtc.config",
-    enabled: true,
-    binding_nonce_required: true,
-    ice_servers: [],
-  });
-  for (const gate of ["bindingAccepted", "ptyOpen", "ctlOpen", "daemonReady", "historyReady"]) {
-    bridge.emit({ v: 1, type: "state", state: "connecting", gate });
-  }
-  await opening;
-  return { bridge, signal, transport };
+  views.push(transport);
+  return { bridge, transport };
 }
+async function readyTransport() {
+  const result = view();
+  const opening = result.transport.open();
+  result.bridge.emit({ v: 1, type: "display", owner: true, viewers: 1 });
+  result.bridge.emit({ v: 1, type: "state", state: "ready" });
+  await opening;
+  return result;
+}
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockState = "ready";
+  mockLastError = null;
+  commands = [];
+  root = retainHostTransport(options);
+  root.shared.bridge.attach((raw) => commands.push(JSON.parse(raw) as NativeToWorkerMessage));
+});
+afterEach(() => {
+  for (const transport of views.splice(0)) transport.close();
+  root.release();
+  mockListeners.clear();
+});
 
-describe("SessionTransport", () => {
-  test("relays the terminal's own relay-only policy to the worker", async () => {
-    const bridge = new FakeBridge();
-    const signal = new FakeSignal();
-    const transport = createSessionTransport({
-      sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-      hostIdentityPublicKey: "host-key",
-      initialSize: { cols: 80, rows: 24 },
-      theme: terminalDark,
-      bridge,
-      openSignal: () => signal,
-      loadCarriedEndorsements: async () => [],
-    });
-    // Never becomes ready here: this test only cares what the worker is told
-    // at connect time, so the open promise is expected to reject on close.
-    const opening = transport.open().catch(() => undefined);
-    await flush();
-
-    // The session channel is the one that carries the terminal, and it was the
-    // one channel never told whether a direct path exists.
-    signal.emit({
-      type: "rtc.config",
-      enabled: true,
-      binding_nonce_required: true,
-      ice_servers: [],
-      ice_transport_policy: "relay",
-    });
-    await flush();
-
-    const connect = bridge.sent.find((message) => message.type === "connect");
-    expect(connect).toMatchObject({ iceTransportPolicy: "relay" });
-    transport.close();
-    await opening;
+describe("session channels on the shared daemon connection", () => {
+  test("multiple views attach without negotiating or closing the daemon connection", async () => {
+    const a = await readyTransport(),
+      b = await readyTransport();
+    expect(mockCreateHostTransport).toHaveBeenCalledTimes(1);
+    expect(commands.filter((message) => message.type === "pair-attach")).toHaveLength(2);
+    expect(a.bridge.sent.some((message) => message.type === "connect")).toBe(false);
+    a.transport.close();
+    expect(mockClose).not.toHaveBeenCalled();
+    b.transport.write(Uint8Array.of(8));
+    expect(b.bridge.sent.at(-1)?.type).toBe("input");
+    expect(root.shared.owner).toBe(root.ownerId);
   });
-
-  test("initializes the worker, relays signalling, and signs worker requests", async () => {
-    const { bridge, signal, transport } = await readyTransport();
-    expect(bridge.sent[0]).toMatchObject({
-      type: "init",
-      mode: "session",
-      browserIdentityPublicKey: "browser-key",
-    });
-    expect(bridge.sent).toContainEqual(
-      expect.objectContaining({ type: "connect", forceRelay: false }),
-    );
-
-    bridge.emit({
-      v: 1,
-      type: "signal-frame",
-      frame: { type: "rtc.offer", signed_envelope: "signed" },
-    });
-    expect(signal.sent).toContainEqual({ type: "rtc.offer", signed_envelope: "signed" });
-
-    bridge.emit({
-      v: 1,
-      type: "sign-request",
-      requestId: "sign-1",
-      transcript: {
-        signalKind: "offer",
-        protocolVersion: 2,
-        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
-        scopeType: "session",
-        scopeId: "00112233-4455-6677-8899-aabbccddeeff",
-        senderRole: "browser",
-        intendedPeerIdentityPublicKey: "host-key",
-        sdp: "v=0",
-      },
-    });
-    await flush();
-    expect(bridge.sent).toContainEqual({
-      v: 1,
-      type: "sign-response",
-      requestId: "sign-1",
-      signature: "signature",
-    });
-    transport.close();
-  });
-
-  test("passes loaded carried endorsements in the sign response", async () => {
-    const loadCarriedEndorsements = jest.fn(async () => [CARRIED_EDGE]);
-    const { bridge, transport } = await readyTransport({ loadCarriedEndorsements });
-
-    bridge.emit({
-      v: 1,
-      type: "sign-request",
-      requestId: "sign-with-chain",
-      transcript: {
-        signalKind: "offer",
-        protocolVersion: 2,
-        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
-        scopeType: "session",
-        scopeId: "00112233-4455-6677-8899-aabbccddeeff",
-        senderRole: "browser",
-        intendedPeerIdentityPublicKey: "host-key",
-        sdp: "v=0",
-      },
-    });
-    await flush();
-
-    expect(loadCarriedEndorsements).toHaveBeenCalledTimes(1);
-    expect(bridge.sent).toContainEqual({
-      v: 1,
-      type: "sign-response",
-      requestId: "sign-with-chain",
-      signature: "signature",
-      carriedEndorsements: [CARRIED_EDGE],
-    });
-    transport.close();
-  });
-
-  test("skips carried-endorsement HTTP work for a directly pinned device", async () => {
-    const loadCarriedEndorsements = jest.fn(async () => [CARRIED_EDGE]);
-    const { bridge, transport } = await readyTransport({
-      loadCarriedEndorsements,
-      directlyPinned: true,
-    });
-
-    bridge.emit({
-      v: 1,
-      type: "sign-request",
-      requestId: "sign-direct-pin",
-      transcript: {
-        signalKind: "offer",
-        protocolVersion: 1,
-        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
-        scopeType: "session",
-        scopeId: "00112233-4455-6677-8899-aabbccddeeff",
-        senderRole: "browser",
-        intendedPeerIdentityPublicKey: "host-key",
-        sdp: "v=0",
-      },
-    });
-    await flush();
-
-    expect(loadCarriedEndorsements).not.toHaveBeenCalled();
-    expect(bridge.sent).toContainEqual({
-      v: 1,
-      type: "sign-response",
-      requestId: "sign-direct-pin",
-      signature: "signature",
-    });
-    transport.close();
-  });
-
-  test("still sends the signature when loading carried endorsements fails", async () => {
-    const loadCarriedEndorsements = jest.fn(async () => {
-      throw new Error("offline");
-    });
-    const { bridge, transport } = await readyTransport({ loadCarriedEndorsements });
-
-    bridge.emit({
-      v: 1,
-      type: "sign-request",
-      requestId: "sign-without-chain",
-      transcript: {
-        signalKind: "offer",
-        protocolVersion: 2,
-        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
-        scopeType: "session",
-        scopeId: "00112233-4455-6677-8899-aabbccddeeff",
-        senderRole: "browser",
-        intendedPeerIdentityPublicKey: "host-key",
-        sdp: "v=0",
-      },
-    });
-    await flush();
-
-    const response = bridge.sent.find(
-      (message) => message.type === "sign-response" && message.requestId === "sign-without-chain",
-    );
-    expect(response).toEqual({
-      v: 1,
-      type: "sign-response",
-      requestId: "sign-without-chain",
-      signature: "signature",
-    });
-    expect(response).not.toHaveProperty("carriedEndorsements");
-    transport.close();
-  });
-
-  test("caches refresh config, resumes a live binding, and rebuilds only when unavailable", async () => {
-    const { bridge, signal, transport } = await readyTransport();
-    const initial = bridge.sent.find(
-      (message): message is Extract<NativeToWorkerMessage, { type: "connect" }> =>
-        message.type === "connect",
-    );
-    expect(initial).toBeDefined();
-    signal.emit({
-      type: "rtc.status",
-      status: "connected",
-      session_id: initial?.rtcSessionId,
-      binding_nonce: initial?.bindingNonce,
-      binding_generation: 7,
-      scope_type: "session",
-      scope_id: "00112233-4455-6677-8899-aabbccddeeff",
-      protocol: "spawn.pty",
-      protocol_version: 2,
-    });
-    signal.emit({
-      type: "rtc.config",
-      enabled: true,
-      binding_nonce_required: true,
-      ice_servers: [],
-    });
-    expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
-
-    signal.emitState("reconnecting");
-    signal.emitState("open");
-    expect(signal.sent).toContainEqual(
-      expect.objectContaining({ type: "rtc.resume", binding_generation: 7 }),
-    );
-
-    signal.emit({
-      type: "rtc.status",
-      status: "unavailable",
-      session_id: initial?.rtcSessionId,
-      binding_nonce: initial?.bindingNonce,
-      binding_generation: 7,
-    });
-    expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(2);
-    expect(bridge.sent.at(-1)).toMatchObject({ type: "connect", forceRebuild: true });
-    transport.close();
-  });
-
-  test("buffers premature stdin and splits every large write at 16 KiB", async () => {
-    const bridge = new FakeBridge();
-    const signal = new FakeSignal();
-    const transport = createSessionTransport({
-      sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-      hostIdentityPublicKey: "host-key",
-      initialSize: { cols: 80, rows: 24 },
-      theme: terminalDark,
-      bridge,
-      openSignal: () => signal,
-    });
+  test("a disconnected or non-controlling view never queues stdin for later", async () => {
+    const { bridge, transport } = view();
     const opening = transport.open();
-    await flush();
-    transport.write(new Uint8Array([1, 2, 3]));
-    expect(bridge.sent.some((message) => message.type === "input")).toBe(false);
-    signal.emit({
-      type: "rtc.config",
-      enabled: true,
-      binding_nonce_required: true,
-      ice_servers: [],
-    });
-    for (const gate of ["bindingAccepted", "ptyOpen", "ctlOpen", "daemonReady", "historyReady"]) {
-      bridge.emit({ v: 1, type: "state", state: "connecting", gate });
-    }
+    transport.write(Uint8Array.of(1));
+    bridge.emit({ v: 1, type: "state", state: "ready" });
     await opening;
-    const firstInput = bridge.sent.find((message) => message.type === "input");
-    expect(firstInput?.type === "input" ? decodeBridgeBytes(firstInput.data) : null).toEqual(
-      new Uint8Array([1, 2, 3]),
-    );
-
-    transport.write(new Uint8Array(64 * 1024 * 2 + 1));
-    const lengths = bridge.sent
-      .filter(
-        (message): message is Extract<NativeToWorkerMessage, { type: "input" }> =>
-          message.type === "input",
-      )
-      .slice(1)
-      .map((message) => decodeBridgeBytes(message.data).byteLength);
-    expect(lengths).toEqual([...Array.from({ length: 8 }, () => 16 * 1024), 1]);
-    transport.close();
+    transport.write(Uint8Array.of(2));
+    expect(bridge.sent.filter((message) => message.type === "input")).toHaveLength(0);
+    bridge.emit({ v: 1, type: "display", owner: true, viewers: 1 });
+    transport.write(new Uint8Array(64 * 1024));
+    const input = bridge.sent.filter((message) => message.type === "input");
+    expect(input).toHaveLength(4);
+    expect(
+      input.every(
+        (message) =>
+          message.type === "input" && decodeBridgeBytes(message.data).length === 16 * 1024,
+      ),
+    ).toBe(true);
+    state("connecting");
+    transport.write(Uint8Array.of(3));
+    state("ready");
+    bridge.emit({ v: 1, type: "display", owner: true, viewers: 1 });
+    bridge.emit({ v: 1, type: "state", state: "ready" });
+    expect(bridge.sent.filter((message) => message.type === "input")).toHaveLength(4);
   });
-
+  test("channel events are attachment scoped and old generations cannot reach a reopened view", async () => {
+    const a = await readyTransport(),
+      b = await readyTransport();
+    const attachments = commands.filter((message) => message.type === "pair-attach");
+    const first = attachments[0],
+      second = attachments[1];
+    if (!first || !second) throw new Error("missing attachments");
+    const event = {
+      v: 1,
+      type: "pair-event",
+      attachmentId: first.attachmentId,
+      channel: "pty",
+      event: "data",
+      data: "hello",
+      binary: false,
+    };
+    root.shared.bridge.receive(JSON.stringify(event));
+    expect(a.bridge.sent.at(-1)).toEqual(event);
+    expect(b.bridge.sent).not.toContainEqual(event);
+    state("connecting");
+    state("ready");
+    const count = a.bridge.sent.length;
+    root.shared.bridge.receive(JSON.stringify(event));
+    expect(a.bridge.sent).toHaveLength(count);
+  });
+  test("closing the view cancels attachment retries and preserves the daemon lease", async () => {
+    jest.useFakeTimers();
+    try {
+      const { bridge, transport } = await readyTransport();
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      transport.close();
+      const count = commands.length;
+      jest.advanceTimersByTime(30_000);
+      expect(commands).toHaveLength(count);
+      expect(mockClose).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
   test("streams resumable 48 KiB upload chunks and persists before final dispatch", async () => {
     const { bridge, transport } = await readyTransport();
     const beforeFinalDispatch = jest.fn(async () => undefined);
@@ -482,270 +265,24 @@ describe("SessionTransport", () => {
   });
 });
 
-describe("SessionTransport connect failures", () => {
-  test("surfaces a permanent signalling refusal immediately", async () => {
-    const bridge = new FakeBridge();
-    const signal = new FakeSignal();
-    const transport = createSessionTransport({
-      sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-      hostIdentityPublicKey: "host-key",
-      initialSize: { cols: 80, rows: 24 },
-      theme: terminalDark,
-      bridge,
-      openSignal: () => signal,
-    });
-    const opening = transport.open();
-    await flush();
+test("a view joining an already refused daemon preserves its approval error", async () => {
+  mockState = "failed";
+  mockLastError = { code: "device_not_trusted", message: "Approve this device", retryable: false };
+  const { transport } = view();
+  const error = jest.fn();
+  transport.on("error", error);
+  await expect(transport.open()).rejects.toMatchObject({ code: "device_not_trusted" });
+  expect(error).toHaveBeenCalledWith(mockLastError);
+  expect(transport.daemonState).toBe("failed");
+});
 
-    signal.closeInfo = { code: 4003, reason: "protocol required" };
-    signal.emitState("failed");
-
-    await expect(opening).rejects.toMatchObject({
-      code: "signal_failed",
-      message: "Update SPAWN D to reconnect to this terminal.",
-    });
-    expect(transport.state).toBe("failed");
-  });
-
-  test("names an unapproved device instead of waiting out the watchdog", async () => {
-    const bridge = new FakeBridge();
-    const signal = new FakeSignal();
-    const errors: TransportError[] = [];
-    const states: TransportState[] = [];
-    const transport = createSessionTransport({
-      sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-      hostIdentityPublicKey: "host-key",
-      initialSize: { cols: 80, rows: 24 },
-      theme: terminalDark,
-      bridge,
-      openSignal: () => signal,
-      hostId: "b3ae000c-1da3-4c6c-aeda-23a37ecb01ac",
-      probeTrust: async () => "untrusted",
-    });
-    transport.on("error", (error) => errors.push(error));
-    transport.on("state", (state) => states.push(state));
-    // The rejection carries the code too: a caller that rewraps the rejection
-    // must still be able to tell a trust failure from a network one.
-    await expect(transport.open()).rejects.toMatchObject({
-      code: "device_not_trusted",
-      message: expect.stringMatching(/has not approved this device/i),
-    });
-    expect(errors).toContainEqual(
-      expect.objectContaining({ code: "device_not_trusted", retryable: false }),
-    );
-    expect(states).toContain("failed");
-    transport.close();
-  });
-
-  test("re-reads the endorsement chain after the host refuses an offer", async () => {
-    jest.useFakeTimers();
-    try {
-      const bridge = new FakeBridge();
-      const signal = new FakeSignal();
-      let edges: readonly CarriedEndorsement[] = [];
-      const loadCarriedEndorsements = jest.fn(async () => edges);
-      const transport = createSessionTransport({
-        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-        hostIdentityPublicKey: "host-key",
-        initialSize: { cols: 80, rows: 24 },
-        theme: terminalDark,
-        bridge,
-        openSignal: () => signal,
-        hostId: "b3ae000c-1da3-4c6c-aeda-23a37ecb01ac",
-        // The server says this device is pinned. The host is about to disagree,
-        // which is the whole case: the approval that settles it lands as an
-        // edge seconds later, and the offer has to carry it.
-        probeTrustResult: async () => ({ status: "trusted" as const, directlyPinned: true }),
-        loadCarriedEndorsements,
-      });
-      const opening = transport.open().catch(() => undefined);
-      await Promise.resolve();
-      await Promise.resolve();
-      signal.emit({
-        type: "rtc.config",
-        enabled: true,
-        binding_nonce_required: true,
-        ice_servers: [],
-      });
-      const connect = bridge.sent.find(
-        (message): message is Extract<NativeToWorkerMessage, { type: "connect" }> =>
-          message.type === "connect",
-      );
-      expect(loadCarriedEndorsements).not.toHaveBeenCalled();
-
-      signal.emit({
-        type: "rtc.status",
-        status: "failed",
-        message: "This host has not approved this device.",
-        session_id: connect?.rtcSessionId,
-        binding_nonce: connect?.bindingNonce,
-      });
-      // What the worker does with a refusal: name the daemon's reason and ask
-      // for another attempt.
-      bridge.emit({
-        v: 1,
-        type: "error",
-        code: "channel_closed",
-        message: "This host has not approved this device.",
-        retryable: true,
-      });
-      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
-      expect(transport.state).toBe("reconnecting");
-
-      // The approval lands between the refusal and the retry.
-      edges = [CARRIED_EDGE];
-      jest.advanceTimersByTime(2_000);
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(loadCarriedEndorsements).toHaveBeenCalled();
-
-      bridge.emit({
-        v: 1,
-        type: "sign-request",
-        requestId: "sign-after-refusal",
-        transcript: {
-          signalKind: "offer",
-          protocolVersion: 2,
-          sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
-          scopeType: "session",
-          scopeId: "00112233-4455-6677-8899-aabbccddeeff",
-          senderRole: "browser",
-          intendedPeerIdentityPublicKey: "host-key",
-          sdp: "v=0",
-        },
-      });
-      for (let step = 0; step < 10; step += 1) await Promise.resolve();
-      expect(
-        bridge.sent.find(
-          (message) =>
-            message.type === "sign-response" && message.requestId === "sign-after-refusal",
-        ),
-      ).toMatchObject({ carriedEndorsements: [CARRIED_EDGE] });
-      transport.close();
-      await opening;
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  test("a pending reconnect never resurrects a transport that has since failed", async () => {
-    jest.useFakeTimers();
-    try {
-      const bridge = new FakeBridge();
-      const signal = new FakeSignal();
-      const transport = createSessionTransport({
-        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-        hostIdentityPublicKey: "host-key",
-        initialSize: { cols: 80, rows: 24 },
-        theme: terminalDark,
-        bridge,
-        openSignal: () => signal,
-      });
-      const opening = transport.open().catch(() => undefined);
-      await Promise.resolve();
-      await Promise.resolve();
-      signal.emit({
-        type: "rtc.config",
-        enabled: true,
-        binding_nonce_required: true,
-        ice_servers: [],
-      });
-      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
-      expect(transport.state).toBe("reconnecting");
-
-      bridge.emit({
-        v: 1,
-        type: "error",
-        code: "worker_capability",
-        message: "This WebView cannot open a DataChannel.",
-        retryable: false,
-      });
-      expect(transport.state).toBe("failed");
-
-      const before = bridge.sent.length;
-      jest.advanceTimersByTime(30_000);
-      expect(transport.state).toBe("failed");
-      expect(bridge.sent).toHaveLength(before);
-      transport.close();
-      await opening;
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  test("fails a stalled connect on the watchdog rather than spinning forever", async () => {
-    jest.useFakeTimers();
-    try {
-      const bridge = new FakeBridge();
-      const signal = new FakeSignal();
-      const errors: TransportError[] = [];
-      const transport = createSessionTransport({
-        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-        hostIdentityPublicKey: "host-key",
-        initialSize: { cols: 80, rows: 24 },
-        theme: terminalDark,
-        bridge,
-        openSignal: () => signal,
-        connectTimeoutMs: 1_000,
-      });
-      transport.on("error", (error) => errors.push(error));
-      const opening = transport.open().catch(() => undefined);
-      await Promise.resolve();
-      await Promise.resolve();
-      signal.emit({
-        type: "rtc.config",
-        enabled: true,
-        binding_nonce_required: true,
-        ice_servers: [],
-      });
-      expect(transport.state).toBe("connecting");
-      jest.advanceTimersByTime(1_000);
-      await opening;
-      expect(transport.state).toBe("failed");
-      expect(errors).toContainEqual(
-        expect.objectContaining({ code: "connect_timeout", retryable: false }),
-      );
-      transport.close();
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  test("clears the watchdog once the session is ready", async () => {
-    jest.useFakeTimers();
-    try {
-      const bridge = new FakeBridge();
-      const signal = new FakeSignal();
-      const errors: TransportError[] = [];
-      const transport = createSessionTransport({
-        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
-        hostIdentityPublicKey: "host-key",
-        initialSize: { cols: 80, rows: 24 },
-        theme: terminalDark,
-        bridge,
-        openSignal: () => signal,
-        connectTimeoutMs: 1_000,
-      });
-      transport.on("error", (error) => errors.push(error));
-      const opening = transport.open();
-      await Promise.resolve();
-      await Promise.resolve();
-      signal.emit({
-        type: "rtc.config",
-        enabled: true,
-        binding_nonce_required: true,
-        ice_servers: [],
-      });
-      for (const gate of ["bindingAccepted", "ptyOpen", "ctlOpen", "daemonReady", "historyReady"]) {
-        bridge.emit({ v: 1, type: "state", state: "connecting", gate });
-      }
-      await opening;
-      jest.advanceTimersByTime(10_000);
-      expect(transport.state).toBe("ready");
-      expect(errors).toEqual([]);
-      transport.close();
-    } finally {
-      jest.useRealTimers();
-    }
-  });
+test("reopening a reconnecting view does not duplicate bridge subscriptions", async () => {
+  const { transport, bridge } = await readyTransport();
+  state("connecting");
+  const opening = transport.open();
+  expect(bridge.listeners.size).toBe(1);
+  expect(bridge.sent.filter((frame) => frame.type === "init")).toHaveLength(1);
+  state("ready");
+  bridge.emit({ v: 1, type: "state", state: "ready" });
+  await opening;
 });

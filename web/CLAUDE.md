@@ -104,6 +104,13 @@ from the catalogue. Every claim about spawnd survives a diff against
   anything, so the product runs as "SPAWN D on Mac" — the device that
   possessed the computer — and never as a second device of its own.
 
+- Device transport: `DaemonConnectionsProvider` owns one signed host connection
+  per registered device and host. Identity replacement retires its connections.
+  `lib/daemon-connection.ts` shares it across tabs with
+  Web Locks and BroadcastChannel; terminal hooks and host/file consumers own
+  channels only. Never create a peer or signaling websocket in a terminal.
+  Read `docs/DEVICE_CONNECTIONS.md` before changing attachment or control rules.
+
 ## Before calling a change done
 
 ```bash

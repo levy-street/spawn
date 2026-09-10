@@ -9,7 +9,7 @@
   const STREAM_COMMAND_PREFIX = "$host.stream.";
   const MAX_FRAME_BYTES = 16 * 1024;
   const MAX_CHUNK_BYTES = 8 * 1024;
-  const BUFFERED_HIGH_WATER = 256 * 1024;
+  const BUFFERED_HIGH_WATER = 32 * 1024;
   const STREAM_TIMEOUT_MS = 60_000;
 
   function checkReady() {

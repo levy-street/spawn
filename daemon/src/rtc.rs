@@ -32,7 +32,10 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::peer_connection::{OnDataChannelHdlrFn, RTCPeerConnection};
+
+#[path = "rtc_pair.rs"]
+mod pair;
 
 use crate::host_files::HostFileService;
 use crate::host_signal::HostConnectedSignal;
@@ -305,6 +308,7 @@ async fn pause_test_sender_close(
 struct HostRtcPeer {
     pc: Arc<RTCPeerConnection>,
     binding: HostRtcBinding,
+    pair: Option<Arc<pair::PairContext>>,
     _admission_permit: Arc<RtcPeerAdmissionPermit>,
 }
 
@@ -342,7 +346,7 @@ impl HostRtcSignal {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || self.scope_type.as_deref() != Some("host")
             || self.protocol.as_deref() != Some(HOST_CONTROL_LABEL)
-            || self.protocol_version != Some(RTC_PROTOCOL_VERSION)
+            || !matches!(self.protocol_version, Some(RTC_PROTOCOL_VERSION | 2))
             || generation > MAX_SAFE_SIGNAL_GENERATION
         {
             return None;
@@ -352,7 +356,7 @@ impl HostRtcSignal {
             binding_nonce: nonce.clone(),
             binding_generation: generation,
             protocol: HOST_CONTROL_LABEL.to_string(),
-            protocol_version: RTC_PROTOCOL_VERSION,
+            protocol_version: self.protocol_version?,
         })
     }
 }
@@ -360,6 +364,7 @@ impl HostRtcSignal {
 #[derive(Clone)]
 struct RtcPeer {
     pc: Arc<RTCPeerConnection>,
+    pair_channels: Option<Arc<pair::SessionChannels>>,
     session: SessionBinding,
     generation: String,
     active: Arc<AtomicBool>,
@@ -449,6 +454,7 @@ struct BoundRtcSession {
 }
 
 struct HostRtcAdmissionContext {
+    pair: Option<Arc<pair::PairContext>>,
     trust_epoch: u64,
     out_tx: mpsc::Sender<WsOutbound>,
 }
@@ -624,6 +630,7 @@ impl RtcSessions {
         let sessions = self.peers.lock().await;
         let mut live = sessions
             .iter()
+            .filter(|(_, peer)| peer.pair_channels.is_none())
             .map(|(signal_id, peer)| LiveRtcBinding {
                 session_id: signal_id.clone(),
                 binding_nonce: peer
@@ -667,7 +674,7 @@ impl RtcSessions {
         }
         let peers = self.peers.lock().await.clone();
         for (signal_id, peer) in peers {
-            if peer.channels.ready() {
+            if peer.pair_channels.is_none() && peer.channels.ready() {
                 let nonce = peer
                     .generation
                     .split_once(':')
@@ -979,6 +986,7 @@ impl RtcSessions {
                     binding.signaling.signal_id.clone(),
                     RtcPeer {
                         pc: Arc::clone(&pc),
+                        pair_channels: None,
                         session: binding.session,
                         generation: binding.signaling.generation.clone(),
                         active: Arc::clone(&active),
@@ -1021,7 +1029,7 @@ impl RtcSessions {
             .lock()
             .await
             .remove(&(binding.signaling.signal_id.clone(), SessionChannel::Control));
-        install_data_channel_handler(
+        pc.on_data_channel(session_data_channel_handler(
             &pc,
             self.clone(),
             binding.clone(),
@@ -1040,7 +1048,7 @@ impl RtcSessions {
             #[cfg(test)]
             control_sender_close_gate,
             out_tx.clone(),
-        );
+        ));
         self.install_reaper(&pc, binding.signaling.clone(), close);
 
         let local_sdp = match negotiate(&pc, sdp).await {
@@ -1101,6 +1109,9 @@ impl RtcSessions {
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) {
+        if signal.protocol_version != Some(1) {
+            return;
+        }
         self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
@@ -1119,6 +1130,7 @@ impl RtcSessions {
                 ice_servers,
                 ice_transport_policy,
                 HostRtcAdmissionContext {
+                    pair: None,
                     trust_epoch,
                     out_tx: out_tx.clone(),
                 },
@@ -1143,6 +1155,21 @@ impl RtcSessions {
         admission: HostRtcAdmissionContext,
         answer_signer: Option<RtcAnswerSigner>,
     ) -> Result<()> {
+        if let Some(pair) = &admission.pair {
+            if self
+                .restart_pair(
+                    &signal_id,
+                    &binding,
+                    pair,
+                    &sdp,
+                    &answer_signer,
+                    &admission.out_tx,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+        }
         let admission_permit = self
             .peer_admission
             .try_acquire()
@@ -1164,6 +1191,9 @@ impl RtcSessions {
             let _ = pc.close().await;
             anyhow::bail!("credential trust changed during host RTC negotiation");
         }
+        if let Some(pair) = &admission.pair {
+            self.retire_device_pair(pair.device_key).await;
+        }
         let admitted = {
             let mut hosts = self.host_peers.lock().await;
             if hosts.contains_key(&signal_id)
@@ -1177,6 +1207,7 @@ impl RtcSessions {
                     HostRtcPeer {
                         pc: Arc::clone(&pc),
                         binding: binding.clone(),
+                        pair: admission.pair.clone(),
                         _admission_permit: admission_permit,
                     },
                 );
@@ -1195,13 +1226,17 @@ impl RtcSessions {
             binding.clone(),
             self.signaling.clone(),
         );
-        install_host_data_channel_handler(
-            &pc,
-            signal_id.clone(),
-            binding.clone(),
-            self.signaling.clone(),
-            None,
-        );
+        if let Some(pair) = admission.pair.clone() {
+            self.install_pair_channels(&pc, signal_id.clone(), binding.clone(), pair);
+        } else {
+            install_host_data_channel_handler(
+                &pc,
+                signal_id.clone(),
+                binding.clone(),
+                self.signaling.clone(),
+                None,
+            );
+        }
         self.install_host_reaper(&pc, signal_id.clone());
 
         let local_sdp = match negotiate(&pc, sdp).await {
@@ -1297,6 +1332,7 @@ impl RtcSessions {
             }
         };
         if let Some(peer) = removed {
+            self.close_pair_sessions(&peer.pc).await;
             let _ = peer.pc.close().await;
         } else {
             let _ = pc.close().await;
@@ -1338,6 +1374,7 @@ impl RtcSessions {
             }
         };
         if let Some(peer) = peer {
+            self.close_pair_sessions(&peer.pc).await;
             let _ = peer.pc.close().await;
         }
     }
@@ -1482,7 +1519,9 @@ impl RtcSessions {
             self.close_if_same_until(signal_id, generation, pc, deadline)
                 .await;
         } else {
-            let _ = pc.close().await;
+            if !pair::is_session(signal_id) {
+                let _ = pc.close().await;
+            }
         }
     }
 
@@ -1513,14 +1552,18 @@ impl RtcSessions {
         let Some(session) =
             active_session.or_else(|| closing_peer.as_ref().map(|peer| peer.session))
         else {
-            let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
+            if !pair::is_session(signal_id) {
+                let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
+            }
             return;
         };
         if let Some(peer) = closing_peer {
             debug_assert_eq!(peer.close.initiate(), upload_deadline);
             self.uploads
                 .cancel_viewer_now(peer.session, &viewer_id(signal_id, &peer.generation));
-            let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
+            if !pair::is_session(signal_id) {
+                let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
+            }
             return;
         }
         let closer = self.session_closer(session).await;
@@ -1543,7 +1586,9 @@ impl RtcSessions {
             }
             return;
         }
-        let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
+        if !pair::is_session(signal_id) {
+            let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1591,11 +1636,16 @@ impl RtcSessions {
             if let Some(close) = close {
                 self.schedule_close_if_same(signal_id, generation, pc, &close);
             } else {
-                let _ = pc.close().await;
+                if !pair::is_session(signal_id) {
+                    let _ = pc.close().await;
+                }
             }
             return false;
         }
         let _ = out_tx;
+        if pair::is_session(signal_id) {
+            return true;
+        }
         self.send_or_defer_status(session_status_frame(
             signal_id,
             binding_nonce,
@@ -1663,7 +1713,8 @@ impl RtcSessions {
         if let Some(peer) = closing {
             self.uploads
                 .cancel_viewer_now(peer.session, &viewer_id(signal_id, &peer.generation));
-            let _ = tokio::time::timeout_at(upload_deadline, peer.pc.close()).await;
+            let _ = tokio::time::timeout_at(upload_deadline, pair::close_session_transport(&peer))
+                .await;
             return;
         }
         let closer = self.session_closer(session).await;
@@ -1794,6 +1845,7 @@ impl RtcSessions {
                 let pc = Arc::clone(&peer.pc);
                 let closing_pc = Arc::clone(&pc);
                 let closing_generation = peer.generation.clone();
+                let transport = peer.clone();
                 let cleanup = async move {
                     let _lifecycle = peer.channels.fail().await;
                     let _drained = peer.fence.write().await;
@@ -1803,7 +1855,7 @@ impl RtcSessions {
                         .cancel_viewer_and_wait(peer.session, &upload_viewer_id)
                         .await;
                 };
-                let (_closed, ()) = tokio::join!(pc.close(), cleanup);
+                let ((), ()) = tokio::join!(pair::close_session_transport(&transport), cleanup);
                 let mut closing = closing_peers.lock().await;
                 if closing.get(&closing_key).is_some_and(|current| {
                     current.generation == closing_generation
@@ -2156,7 +2208,7 @@ fn install_ice_handler(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn install_data_channel_handler(
+fn session_data_channel_handler(
     pc: &Arc<RTCPeerConnection>,
     sessions: RtcSessions,
     binding: BoundRtcSession,
@@ -2169,7 +2221,7 @@ fn install_data_channel_handler(
     #[cfg(test)] pty_sender_close_gate: Option<Arc<TestSenderCloseGate>>,
     #[cfg(test)] control_sender_close_gate: Option<Arc<TestSenderCloseGate>>,
     out_tx: mpsc::Sender<WsOutbound>,
-) {
+) -> OnDataChannelHdlrFn {
     {
         let active = Arc::clone(&guard.active);
         let channels = Arc::clone(&channels);
@@ -2214,7 +2266,7 @@ fn install_data_channel_handler(
     // its ICE sockets back — the pinned ports, lost one browser reconnect at
     // a time, until every new session can only reach the TURN relay.
     let handler_pc = Arc::downgrade(pc);
-    pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+    Box::new(move |dc: Arc<RTCDataChannel>| {
         let Some(pc) = handler_pc.upgrade() else {
             return Box::pin(async {});
         };
@@ -2233,18 +2285,23 @@ fn install_data_channel_handler(
         let channels = Arc::clone(&channels);
         let close = Arc::clone(&close);
         let sessions = sessions.clone();
-        let reliable = dc.ordered()
-            && dc.max_packet_lifetime().is_none()
-            && dc.max_retransmits().is_none();
-        let known_label = matches!(dc.label(), CONTROL_DATA_CHANNEL_LABEL | PTY_DATA_CHANNEL_LABEL);
+        let reliable =
+            dc.ordered() && dc.max_packet_lifetime().is_none() && dc.max_retransmits().is_none();
+        let label = if pair::is_session(&binding.signaling.signal_id) {
+            dc.label().split('/').next().unwrap_or("")
+        } else {
+            dc.label()
+        }
+        .to_string();
+        let known_label = matches!(
+            label.as_str(),
+            CONTROL_DATA_CHANNEL_LABEL | PTY_DATA_CHANNEL_LABEL
+        );
         if !reliable || !known_label {
             let _ = close.initiate();
         }
         Box::pin(async move {
-            let viewer_id = viewer_id(
-                &binding.signaling.signal_id,
-                &binding.signaling.generation,
-            );
+            let viewer_id = viewer_id(&binding.signaling.signal_id, &binding.signaling.generation);
             if !reliable {
                 tracing::warn!(session_id = %binding.signaling.session_id, label = %dc.label(), "rejecting unreliable rtc data channel");
                 channels.fail().await;
@@ -2256,7 +2313,7 @@ fn install_data_channel_handler(
                 );
                 return;
             }
-            if dc.label() == CONTROL_DATA_CHANNEL_LABEL {
+            if label == CONTROL_DATA_CHANNEL_LABEL {
                 if !channels.register(SessionChannel::Control).await {
                     sessions.schedule_close_if_same(
                         &binding.signaling.signal_id,
@@ -2285,7 +2342,7 @@ fn install_data_channel_handler(
                 );
                 return;
             }
-            if dc.label() != PTY_DATA_CHANNEL_LABEL {
+            if label != PTY_DATA_CHANNEL_LABEL {
                 tracing::warn!(session_id = %binding.signaling.session_id, label = %dc.label(), "rejecting unknown rtc data channel");
                 channels.fail().await;
                 sessions.schedule_close_if_same(
@@ -2314,6 +2371,9 @@ fn install_data_channel_handler(
             let input_active = Arc::clone(&active);
             let input_fence = Arc::clone(&fence);
             let input_channels = Arc::clone(&channels);
+            let input_controls = controls.clone();
+            let input_viewer = viewer_id.clone();
+            let require_owner = pair::is_session(&binding.signaling.signal_id);
             #[cfg(test)]
             let input_sessions = sessions.clone();
             #[cfg(test)]
@@ -2324,6 +2384,8 @@ fn install_data_channel_handler(
                 let active = Arc::clone(&input_active);
                 let fence = Arc::clone(&input_fence);
                 let channels = Arc::clone(&input_channels);
+                let controls = input_controls.clone();
+                let viewer = input_viewer.clone();
                 #[cfg(test)]
                 let sessions = input_sessions.clone();
                 #[cfg(test)]
@@ -2343,13 +2405,23 @@ fn install_data_channel_handler(
                     {
                         return;
                     }
-                    let result = forward_bound_data_channel_input(
-                        session,
-                        msg.is_string,
-                        &msg.data,
-                        &registry,
-                        &out_tx,
-                    );
+                    let write = || {
+                        forward_bound_data_channel_input(
+                            session,
+                            msg.is_string,
+                            &msg.data,
+                            &registry,
+                            &out_tx,
+                        )
+                    };
+                    let result = if require_owner {
+                        controls
+                            .with_input_owner(session_id, &viewer, write)
+                            .await
+                            .flatten()
+                    } else {
+                        write()
+                    };
                     if result.is_none() {
                         tracing::debug!(%session_id, "ignoring rtc stdin for unknown session");
                     } else if let Some(Err(e)) = result {
@@ -2705,7 +2777,7 @@ fn install_data_channel_handler(
                 })
             }));
         })
-    }));
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3260,7 +3332,15 @@ async fn execute_control_request(
             session_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
-        ControlOperation::TakeControl { cols, rows } => {
+        ControlOperation::TakeControl { cols, rows }
+        | ControlOperation::FocusView { cols, rows } => {
+            if operation_name == "focus_view" && !controls.may_focus(session_id, viewer_id).await {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "not_display_owner",
+                    "another device controls this session; choose Take control to continue",
+                ));
+            }
             if !controls.contains_viewer(session_id, viewer_id).await {
                 return Err(ProtocolError::new(
                     Some(request_id),
@@ -3289,6 +3369,13 @@ async fn execute_control_request(
             Ok(())
         }
         ControlOperation::Scroll { lines } => {
+            if viewer_id.starts_with("pair/") && !controls.is_owner(session_id, viewer_id).await {
+                return Err(ProtocolError::new(
+                    Some(request_id),
+                    "not_display_owner",
+                    "another view controls this session",
+                ));
+            }
             if !effect.valid() {
                 return Ok(());
             }
@@ -4551,6 +4638,7 @@ mod tests {
         sessions.peers.lock().await.insert(
             signal_id.to_owned(),
             RtcPeer {
+                pair_channels: None,
                 pc,
                 session,
                 generation: "old-generation".to_owned(),
@@ -4575,6 +4663,7 @@ mod tests {
         sessions.host_peers.lock().await.insert(
             "trust-reload-stale-host".to_owned(),
             HostRtcPeer {
+                pair: None,
                 pc: host_pc,
                 binding: HostRtcBinding {
                     host_id: Uuid::new_v4(),
@@ -4755,7 +4844,7 @@ mod tests {
         .expect("host control channel did not fail closed");
     }
 
-    fn insert_test_worker(
+    pub(super) fn insert_test_worker(
         registry: &SessionRegistry,
         session_id: Uuid,
     ) -> (SessionBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
@@ -6042,6 +6131,7 @@ mod tests {
         sessions.peers.lock().await.insert(
             signal_id.to_string(),
             RtcPeer {
+                pair_channels: None,
                 pc: Arc::clone(&pc),
                 session,
                 generation: generation.to_string(),
@@ -6464,6 +6554,7 @@ mod tests {
         sessions.peers.lock().await.insert(
             signal_id.to_string(),
             RtcPeer {
+                pair_channels: None,
                 pc: Arc::clone(&pc),
                 session,
                 generation: generation.clone(),
@@ -6540,6 +6631,7 @@ mod tests {
         sessions.peers.lock().await.insert(
             signal_id.to_string(),
             RtcPeer {
+                pair_channels: None,
                 pc: Arc::clone(&old_pc),
                 session: old,
                 generation: generation.to_string(),
@@ -6590,6 +6682,7 @@ mod tests {
         sessions.peers.lock().await.insert(
             signal_id.to_string(),
             RtcPeer {
+                pair_channels: None,
                 pc: Arc::clone(&replacement_pc),
                 session: replacement,
                 generation: "replacement-signal-generation".to_string(),
@@ -7798,6 +7891,7 @@ mod tests {
             (
                 "old-session".to_string(),
                 RtcPeer {
+                    pair_channels: None,
                     pc: old_pc,
                     session: old,
                     generation: "old-signal".to_string(),
@@ -7815,6 +7909,7 @@ mod tests {
             (
                 "current-session".to_string(),
                 RtcPeer {
+                    pair_channels: None,
                     pc: current_pc,
                     session: current,
                     generation: "current-signal".to_string(),

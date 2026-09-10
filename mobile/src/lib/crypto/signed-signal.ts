@@ -223,8 +223,8 @@ function assertEnvelopeTopology(envelope: SignedSignalEnvelope): void {
     if (envelope.protocol_version !== 2 || envelope.scope_type !== "session") {
       throw new Error("spawn.pty requires session scope and protocol version 2");
     }
-  } else if (envelope.protocol_version !== 1 || envelope.scope_type !== "host") {
-    throw new Error("spawn.host.ctl requires host scope and protocol version 1");
+  } else if (![1, 2].includes(envelope.protocol_version) || envelope.scope_type !== "host") {
+    throw new Error("spawn.host.ctl requires host scope and protocol version 1 or 2");
   }
 }
 

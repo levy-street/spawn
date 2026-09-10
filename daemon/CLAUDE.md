@@ -37,6 +37,7 @@ src/
                  legacy launch, and collecting releases nothing runs — see
                  "Where a daemon's binaries live"
   <feature>.rs   one module per concern: run.rs (register + main loop),
+                 rtc_pair.rs (shared device connections and session-channel admission),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
                  release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs,
@@ -312,6 +313,13 @@ release carries no diagnostics pair for its target refuses the update with
 the release pair. "The diagnostics variant" in `docs/RELEASE.md` has the
 operator's side, including the one-time step for a daemon built before the
 updater knew about variants.
+
+- Shared device RTC lives in `rtc_pair.rs`: signed host-v2 admission owns
+  the peer; local registry attachments reuse the session protocol and own only
+  channels. Fence every effect by parent trust/binding and worker generation.
+  `session_ctl.rs` retains the controlling device's lease until explicit take
+  or session removal; `focus_view` only moves control within that device.
+  See `docs/DEVICE_CONNECTIONS.md` for the lifecycle and compatibility contract.
 
 ## Before calling a change done
 

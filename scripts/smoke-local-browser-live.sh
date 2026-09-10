@@ -24,6 +24,7 @@ daemon_pid=""
 user_token=""
 base_url=""
 worker_dir="$tmp_dir/workers"
+web_dist_dir=".next-browser-live-$$"
 
 cleanup() {
   local status=$?
@@ -86,7 +87,7 @@ PY
       fi
     done
   fi
-  rm -rf "$tmp_dir"
+  rm -rf "$tmp_dir" "$repo_root/web/$web_dist_dir"
   exit "$status"
 }
 trap cleanup EXIT
@@ -377,7 +378,7 @@ env \
   SPAWN_DISABLE_KEYRING=1 \
   SPAWND_WORKER_DIR="$worker_dir" \
   SHELL="$live_shell" \
-  daemon/target/debug/spawnd --server "$base_url" run \
+  "${CARGO_TARGET_DIR:-$repo_root/daemon/target}/debug/spawnd" --server "$base_url" run \
   >"$daemon_log" 2>&1 &
 daemon_pid=$!
 
@@ -451,6 +452,7 @@ printf '%s\n' "smoke-local-browser-live: starting web server on $web_url"
 (
   cd web
   exec env \
+    SPAWN_NEXT_DIST_DIR="$web_dist_dir" \
     SPAWN_API_PROXY_TARGET="$base_url" \
     NEXT_PUBLIC_SPAWN_WS_URL="$ws_url" \
     bun run dev -- -H 127.0.0.1 -p "$web_port"
@@ -634,7 +636,7 @@ try {
       () =>
         page.evaluate(() =>
           (globalThis.__spawnRtcEvents || []).some(
-            (event) => event.type === "dc.open" && event.label === "spawn.pty",
+            (event) => event.type === "dc.open" && event.label?.startsWith("spawn.pty/"),
           ),
         ),
       { timeout: 20_000 },
@@ -652,10 +654,10 @@ try {
         page.evaluate(() => {
           const events = globalThis.__spawnRtcEvents || [];
           return {
-            sends: events.filter((event) => event.type === "dc.send" && event.label === "spawn.pty")
+            sends: events.filter((event) => event.type === "dc.send" && event.label?.startsWith("spawn.pty/"))
               .length,
             messages: events.filter(
-              (event) => event.type === "dc.message" && event.label === "spawn.pty",
+              (event) => event.type === "dc.message" && event.label?.startsWith("spawn.pty/"),
             ).length,
           };
         }),
@@ -665,9 +667,9 @@ try {
   const rtcCounts = await page.evaluate(() => {
     const events = globalThis.__spawnRtcEvents || [];
     return {
-      sends: events.filter((event) => event.type === "dc.send" && event.label === "spawn.pty")
+      sends: events.filter((event) => event.type === "dc.send" && event.label?.startsWith("spawn.pty/"))
         .length,
-      messages: events.filter((event) => event.type === "dc.message" && event.label === "spawn.pty")
+      messages: events.filter((event) => event.type === "dc.message" && event.label?.startsWith("spawn.pty/"))
         .length,
     };
   });
@@ -687,21 +689,69 @@ try {
     }, { timeout: 20_000 })
     .toBe("uploaded from live browser\n");
 
+  // A busy file stream and another session must share this same peer without
+  // making the other terminal wait for the file operation to finish.
+  const sourceSession = await (await page.request.get(`${webUrl}/api/sessions/${sessionId}`)).json();
+  const busyCreated = await page.request.post(`${webUrl}/api/workspaces`, {
+    data: { name: "concurrent transfer", first_session: { host_id: sourceSession.host_id, cwd: sourceSession.cwd } },
+  });
+  if (!busyCreated.ok()) throw new Error(`second session creation failed: ${busyCreated.status()}`);
+  const busyWorkspace = await busyCreated.json();
+  const busyPage = await context.newPage();
+  await busyPage.goto(`${webUrl}/w/${busyWorkspace.workspace.id}`);
+  await expect(busyPage.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "false", { timeout: 20_000 });
+  const bulkPath = uploadPath.replace(/live-upload\.txt$/, "busy-upload.bin");
+  const bulkBytes = 8 * 1024 * 1024;
+  const upload = (async () => {
+    await page.locator('input[type="file"]').setInputFiles({ name: "busy-upload.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(bulkBytes, 0x5a) });
+    await expect.poll(() => existsSync(bulkPath) ? readFileSync(bulkPath).length : 0, { timeout: 30_000 }).toBe(bulkBytes);
+  })();
+  await busyPage.bringToFront();
+  await busyPage.getByLabel("Session terminal").click();
+  for (let index = 0; index < 3; index++) {
+    await busyPage.keyboard.type(`during-upload-${index}`);
+    await busyPage.keyboard.press("Enter");
+    await expect(busyPage.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText(`browser-live:during-upload-${index}`, { timeout: 5_000 });
+  }
+  await upload;
+  if (await busyPage.evaluate(() => (globalThis.__spawnRtcEvents || []).filter((event) => event.type === "pc.created").length) !== 0) {
+    throw new Error("a second session created a separate peer");
+  }
+  await busyPage.close();
+
   const secondPage = await page.context().newPage();
   await secondPage.goto(`${webUrl}/w/${workspaceId}`);
   await expect(secondPage.getByLabel("Session terminal")).toBeVisible({ timeout: 20_000 });
-  // A newly opened active terminal claims control automatically. The original
-  // viewer becomes dimmed and may explicitly reclaim it.
+  // Focus on another view of the same device transfers its control lease.
+  // Neither opening a view nor reconnecting can steal from a different device.
+  await secondPage.getByLabel("Session terminal").click();
   await expect(page.getByRole("button", { name: "Take control" })).toBeVisible({
     timeout: 20_000,
   });
   await expect(secondPage.getByRole("button", { name: "Take control" })).toHaveCount(0);
   await secondPage.getByLabel("Session terminal").click();
+  await expect(secondPage.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "false", { timeout: 20_000 });
   await secondPage.keyboard.type("second");
   await secondPage.keyboard.press("Enter");
   await expect(secondPage.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("browser-live:second", {
     timeout: 20_000,
   });
+  const connectionCounts = await Promise.all([page, secondPage].map((view) =>
+    view.evaluate(() => (globalThis.__spawnRtcEvents || []).filter((event) => event.type === "pc.created").length),
+  ));
+  if (connectionCounts[0] !== 1 || connectionCounts[1] !== 0) {
+    throw new Error(`tabs did not share one peer: ${JSON.stringify(connectionCounts)}`);
+  }
+  await page.close();
+  await expect.poll(() => secondPage.evaluate(() =>
+    (globalThis.__spawnRtcEvents || []).filter((event) => event.type === "pc.created").length),
+    { timeout: 20_000 }).toBe(1);
+  await expect(secondPage.getByText("Connection paused.", { exact: false })).toHaveCount(0, { timeout: 20_000 });
+  await secondPage.getByLabel("Session terminal").click();
+  await expect(secondPage.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "false", { timeout: 20_000 });
+  await secondPage.keyboard.type("handover");
+  await secondPage.keyboard.press("Enter");
+  await expect(secondPage.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("browser-live:handover", { timeout: 20_000 });
   await secondPage.close();
   await context.close();
 } finally {

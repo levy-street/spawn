@@ -1,4 +1,9 @@
 import { sha256 } from "@noble/hashes/sha2.js";
+
+jest.mock("@/terminal/transport/daemon-trust", () => ({
+  verifyDaemonHost: jest.fn(async () => {}),
+}));
+
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
 import { decodeBridgeBytes, encodeBridgeBytes } from "@/terminal/transport/bridge";
@@ -162,7 +167,7 @@ async function readyTransport(options?: {
     scope_type: "host",
     scope_id: "00112233-4455-6677-8899-aabbccddeeff",
     protocol: "spawn.host.ctl",
-    protocol_version: 1,
+    protocol_version: 2,
   });
   bridge.emit({
     v: 1,
@@ -257,7 +262,7 @@ describe("HostTransport signalling", () => {
       requestId: "sign-with-chain",
       transcript: {
         signalKind: "offer",
-        protocolVersion: 1,
+        protocolVersion: 2,
         sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
         scopeType: "host",
         scopeId: HOST_ID,
@@ -291,7 +296,7 @@ describe("HostTransport signalling", () => {
       requestId: "sign-without-chain",
       transcript: {
         signalKind: "offer",
-        protocolVersion: 1,
+        protocolVersion: 2,
         sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
         scopeType: "host",
         scopeId: HOST_ID,
@@ -330,7 +335,7 @@ describe("HostTransport signalling", () => {
       scope_type: "host",
       scope_id: HOST_ID,
       protocol: "spawn.host.ctl",
-      protocol_version: 1,
+      protocol_version: 2,
     });
     await flush();
 
@@ -343,7 +348,7 @@ describe("HostTransport signalling", () => {
       scope_type: "host",
       scope_id: HOST_ID,
       protocol: "spawn.host.ctl",
-      protocol_version: 1,
+      protocol_version: 2,
     });
     expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
     transport.close();
@@ -366,7 +371,7 @@ describe("HostTransport signalling", () => {
       scope_type: "host",
       scope_id: HOST_ID,
       protocol: "spawn.host.ctl",
-      protocol_version: 1,
+      protocol_version: 2,
     });
     await flush();
 
@@ -390,7 +395,7 @@ describe("HostTransport signalling", () => {
       scope_type: "host",
       scope_id: HOST_ID,
       protocol: "spawn.host.ctl",
-      protocol_version: 1,
+      protocol_version: 2,
     });
     await flush();
 
@@ -413,7 +418,7 @@ describe("HostTransport signalling", () => {
       scope_type: "host",
       scope_id: "ffffffff-ffff-ffff-ffff-ffffffffffff",
       protocol: "spawn.host.ctl",
-      protocol_version: 1,
+      protocol_version: 2,
     });
     await flush();
 
@@ -674,9 +679,12 @@ describe("HostTransport streamed writes", () => {
       }),
       { dir: "/tmp", name: "maybe.bin", length: 1, sha256: digest(bytes) },
     );
+    // Observe rejection before yielding: the deliberately short timeout may
+    // expire while a loaded runner is still polling for the final frame.
+    const outcome = expect(pending).rejects.toMatchObject({ code: "outcome_unknown" });
     respond(bridge, await waitForRequest(bridge, "fs.write.begin"), { stream_id: "maybe" });
     await waitForRequest(bridge, "$host.stream.end");
-    await expect(pending).rejects.toMatchObject({ code: "outcome_unknown" });
+    await outcome;
     transport.close();
   });
 

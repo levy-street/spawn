@@ -13,6 +13,8 @@ import {
   socketCloseAction,
   watchSuspendResume,
 } from "@/lib/ws";
+import type { DaemonChannel } from "./daemon-channel";
+import type { DaemonConnection } from "./daemon-connection";
 
 export const HOST_CONTROL_PROTOCOL = "spawn.host.ctl";
 export const HOST_CONTROL_VERSION = 1;
@@ -30,7 +32,7 @@ const RTC_RESUME_TIMEOUT_MS = 3_000;
 const RTC_ICE_RESTART_TIMEOUT_MS = 10_000;
 const STREAM_CHUNK_BYTES = 8 * 1024;
 const STREAM_WINDOW_CHUNKS = 8;
-const STREAM_BUFFERED_HIGH_WATER = 256 * 1024;
+const STREAM_BUFFERED_HIGH_WATER = 128 * 1024;
 const STREAM_TIMEOUT_MS = 60_000;
 const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
 const MAX_STREAM_TOMBSTONES = 256;
@@ -228,7 +230,7 @@ interface SignalMetadata {
   scope_type: "host";
   scope_id: string;
   protocol: typeof HOST_CONTROL_PROTOCOL;
-  protocol_version: typeof HOST_CONTROL_VERSION;
+  protocol_version: 1 | 2;
 }
 
 interface HostBindingMetadata {
@@ -256,7 +258,7 @@ type SignalMessage =
       candidate: RTCIceCandidateInit;
     } & SignalMetadata &
       HostBindingMetadata)
-  | ({ type: "rtc.status"; session_id?: string; status: string } & SignalMetadata &
+  | ({ type: "rtc.status"; session_id?: string; status: string; code?: string } & SignalMetadata &
       HostBindingMetadata);
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
@@ -279,6 +281,10 @@ export interface CarriedEndorsement {
 }
 
 export interface HostControlClientOptions {
+  /** The sole physical connection owner uses signed host transport version 2. */
+  deviceConnection?: boolean;
+  /** UI consumers attach a control channel to the app-owned connection. */
+  sharedConnection?: DaemonConnection;
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
   maxPendingRequests?: number;
@@ -304,7 +310,16 @@ export class HostControlClient {
   private state: HostControlState = "idle";
   private ws: WebSocket | null = null;
   private pc: RTCPeerConnection | null = null;
-  private channel: RTCDataChannel | null = null;
+  private channel: DaemonChannel | null = null;
+  private helloReceived = false;
+  private connectionError: string | null = null;
+  private statsAt = 0;
+  private connectionInfo: {
+    kind: "direct" | "stun" | "relay" | null;
+    rttMs: number | null;
+    protocol: string | null;
+  } = { kind: null, rttMs: null, protocol: null };
+  private unsubscribeShared: (() => void) | null = null;
   private sessionId: string | null = null;
   private bindingNonce: string | null = null;
   private bindingGeneration: number | null = null;
@@ -363,6 +378,113 @@ export class HostControlClient {
     private readonly options: HostControlClientOptions = {},
   ) {}
 
+  getConnectionGeneration(): string | null {
+    return this.sessionId;
+  }
+
+  getSignalingTrust(): "verified" | "first_contact" | "raw" | null {
+    const decision = this.signedRtcDecisionForBinding;
+    return decision?.mode === "signed"
+      ? decision.hostVerified
+        ? "verified"
+        : "first_contact"
+      : decision?.mode === "unpinned"
+        ? "raw"
+        : null;
+  }
+
+  createDeviceChannel(label: string): RTCDataChannel {
+    if (!this.options.deviceConnection || this.state !== "ready" || !this.pc)
+      throw new Error("Daemon connection is not ready");
+    return this.pc.createDataChannel(label, { ordered: true });
+  }
+
+  getConnectionInfo() {
+    const pc = this.pc;
+    if (pc?.connectionState === "connected" && Date.now() - this.statsAt >= 5_000) {
+      this.statsAt = Date.now();
+      void pc
+        .getStats()
+        .then((stats) => {
+          if (pc !== this.pc) return;
+          let selected: RTCStats | undefined;
+          stats.forEach((entry) => {
+            if (entry.type === "candidate-pair" && entry.state === "succeeded" && entry.nominated)
+              selected = entry;
+          });
+          const pair = selected as RTCIceCandidatePairStats | undefined;
+          const local = pair ? stats.get(pair.localCandidateId) : null;
+          const remote = pair ? stats.get(pair.remoteCandidateId) : null;
+          const candidates = [local?.candidateType, remote?.candidateType];
+          this.connectionInfo = {
+            kind: candidates.includes("relay")
+              ? "relay"
+              : candidates.some((value) => value === "srflx" || value === "prflx")
+                ? "stun"
+                : candidates.includes("host")
+                  ? "direct"
+                  : null,
+            rttMs:
+              typeof pair?.currentRoundTripTime === "number"
+                ? Math.round(pair.currentRoundTripTime * 1000)
+                : null,
+            protocol: typeof local?.protocol === "string" ? local.protocol : null,
+          };
+        })
+        .catch(() => {});
+    }
+    return this.connectionInfo;
+  }
+
+  retryConnection(): void {
+    if (this.options.sharedConnection) {
+      this.options.sharedConnection.retry();
+      return;
+    }
+    this.close();
+    this.connect();
+  }
+
+  private connectShared(): void {
+    const connection = this.options.sharedConnection;
+    if (!connection || this.unsubscribeShared) return;
+    this.unsubscribeShared = connection.subscribe(() => this.syncShared());
+    this.syncShared();
+  }
+
+  private syncShared(): void {
+    const connection = this.options.sharedConnection;
+    if (!connection || this.stopped) return;
+    const snapshot = connection.getSnapshot();
+    this.signedRtcRefusal = snapshot.refusal;
+    if (snapshot.state !== "ready") {
+      this.setState(snapshot.state);
+      return;
+    }
+    if (this.channel?.readyState === "open" && this.helloReceived) {
+      this.setState("ready");
+      return;
+    }
+    if (this.channel?.readyState === "connecting" || this.channel?.readyState === "open") return;
+    const id = crypto.randomUUID();
+    try {
+      const channel = connection.createChannel(`spawn.host.ctl/${id}`);
+      this.sessionId = id;
+      this.channel = channel;
+      this.setState("connecting");
+      channel.onmessage = ({ data }) => this.handleControlMessage(data, id);
+      channel.onclose = () => {
+        if (this.sessionId === id) this.failRtc(id);
+      };
+      channel.onerror = () => {
+        if (this.sessionId === id) this.failRtc(id);
+      };
+    } catch {
+      this.setState("error");
+      this.scheduleReconnect();
+    }
+  }
+
   getState(): HostControlState {
     return this.state;
   }
@@ -374,10 +496,15 @@ export class HostControlClient {
   }
 
   connect(): void {
+    this.connectionError = null;
     if (!this.stopped) return;
     this.stopped = false;
     this.signedRtcRefusal = null;
     this.terminalReason = null;
+    if (this.options.sharedConnection) {
+      this.connectShared();
+      return;
+    }
     this.installGlobalListeners();
     this.prefetchTrustDecision();
     this.openWebSocket();
@@ -387,6 +514,16 @@ export class HostControlClient {
    * null. A refusal is terminal until an explicit reconnect. */
   getSignedRtcRefusal(): SignedRtcRefusalReason | null {
     return this.signedRtcRefusal;
+  }
+
+  getConnectionError(): string | null {
+    return this.connectionError;
+  }
+
+  private requireTransportUpdate(message: string): void {
+    this.close();
+    this.connectionError = message;
+    this.setState("error");
   }
 
   getTerminalReason(): HostControlTerminalReason | null {
@@ -419,6 +556,8 @@ export class HostControlClient {
 
   close(): void {
     this.stopped = true;
+    this.unsubscribeShared?.();
+    this.unsubscribeShared = null;
     this.uninstallGlobalListeners();
     this.connectionAttempt += 1;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -1102,7 +1241,10 @@ export class HostControlClient {
     }
     let ws: WebSocket;
     try {
-      ws = new WebSocket(buildHostWsUrl(this.hostId), HOST_SIGNAL_SUBPROTOCOL);
+      ws = new WebSocket(
+        `${buildHostWsUrl(this.hostId)}${this.options.deviceConnection ? "&rtc_version=2" : ""}`,
+        HOST_SIGNAL_SUBPROTOCOL,
+      );
     } catch {
       this.setState("error");
       this.scheduleReconnect();
@@ -1159,6 +1301,14 @@ export class HostControlClient {
         return;
       }
       const message = parsed as unknown as SignalMessage;
+      if (
+        this.options.deviceConnection &&
+        message.type === "rtc.config" &&
+        message.protocol_version !== 2
+      ) {
+        this.requireTransportUpdate("Update the SPAWN D server to share daemon connections.");
+        return;
+      }
       if (!this.matchesMetadata(message)) {
         if (message.type === "rtc.answer" && this.signedRtcSession !== null) this.failRtc();
         return;
@@ -1239,6 +1389,10 @@ export class HostControlClient {
           this.pendingRemoteCandidates.push(message.candidate);
         }
       } else if (message.type === "rtc.status" && message.session_id === this.sessionId) {
+        if (message.code === "daemon_update_required") {
+          this.requireTransportUpdate("Update SPAWN D on this host to share its connection.");
+          return;
+        }
         this.captureBindingMetadata(message);
         if (["resumed", "rebound", "signalling_lost", "connected"].includes(message.status)) {
           if (message.status === "resumed") this.clearRtcResumeTimer();
@@ -1392,9 +1546,16 @@ export class HostControlClient {
     pc.onconnectionstatechange = () => {
       if (this.sessionId !== sessionId || this.pc !== pc) return;
       if (pc.connectionState === "connected") {
+        if (
+          this.options.deviceConnection &&
+          this.capabilities.size &&
+          this.channel?.readyState === "open"
+        )
+          this.setState("ready");
         this.clearRtcDisconnectedTimer();
         this.clearRtcIceRestartTimer();
       } else if (pc.connectionState === "disconnected") {
+        if (this.options.deviceConnection) this.setState("connecting");
         if (!this.rtcDisconnectedTimer) {
           this.rtcDisconnectedTimer = setTimeout(() => {
             this.rtcDisconnectedTimer = null;
@@ -1404,6 +1565,7 @@ export class HostControlClient {
           }, RTC_DISCONNECTED_GRACE_MS);
         }
       } else if (pc.connectionState === "failed") {
+        if (this.options.deviceConnection) this.setState("connecting");
         void this.restartIce("failed");
       } else if (pc.connectionState === "closed") {
         this.failRtc(sessionId);
@@ -1433,6 +1595,11 @@ export class HostControlClient {
         decision = await decisionPromise;
         if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
       }
+      if (this.options.deviceConnection && decision.mode === "unpinned") {
+        this.terminalReason = "client_bug";
+        this.failRtc(sessionId);
+        return;
+      }
       if (decision.mode === "refuse") {
         // Host identity could not be verified against a local pin. Refuse the
         // control channel outright — no raw fallback, no auto-reconnect.
@@ -1458,7 +1625,7 @@ export class HostControlClient {
                 scopeType: "host",
                 scopeId: this.hostId,
                 protocol: HOST_CONTROL_PROTOCOL,
-                protocolVersion: HOST_CONTROL_VERSION,
+                protocolVersion: this.options.deviceConnection ? 2 : 1,
               },
               sessionId,
               decision.capability,
@@ -1609,7 +1776,7 @@ export class HostControlClient {
             scopeType: "host",
             scopeId: this.hostId,
             protocol: HOST_CONTROL_PROTOCOL,
-            protocolVersion: HOST_CONTROL_VERSION,
+            protocolVersion: this.options.deviceConnection ? 2 : 1,
           },
           sessionId,
           this.signedRtcDecisionForBinding.capability,
@@ -1733,6 +1900,7 @@ export class HostControlClient {
       return;
     }
     if (message.type === "hello" && message.protocol === HOST_CONTROL_PROTOCOL) {
+      this.helloReceived = true;
       this.clearConnectDeadline();
       this.reconnectAttempt = 0;
       // Parsed before `ready` so no subscriber can observe a ready client with
@@ -1881,7 +2049,7 @@ export class HostControlClient {
         scope_type: "host",
         scope_id: this.hostId,
         protocol: HOST_CONTROL_PROTOCOL,
-        protocol_version: HOST_CONTROL_VERSION,
+        protocol_version: this.options.deviceConnection ? 2 : 1,
       }),
     );
   }
@@ -1891,7 +2059,7 @@ export class HostControlClient {
       message.scope_type === "host" &&
       message.scope_id === this.hostId &&
       message.protocol === HOST_CONTROL_PROTOCOL &&
-      message.protocol_version === HOST_CONTROL_VERSION
+      message.protocol_version === (this.options.deviceConnection ? 2 : 1)
     );
   }
 
@@ -2117,7 +2285,9 @@ export class HostControlClient {
     this.signedRtcRequired = false;
     this.signedRtcDecisionForBinding = null;
     this.capabilities = new Set();
-    if (notifyServer && sessionId) {
+    this.helloReceived = false;
+    this.connectionInfo = { kind: null, rttMs: null, protocol: null };
+    if (notifyServer && sessionId && !this.options.sharedConnection) {
       this.sendSignal({
         type: "rtc.close",
         session_id: sessionId,
@@ -2160,6 +2330,14 @@ export class HostControlClient {
   }
 
   private scheduleReconnect(): void {
+    if (this.options.sharedConnection) {
+      if (!this.stopped && !this.reconnectTimer)
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          this.syncShared();
+        }, 500);
+      return;
+    }
     if (
       this.stopped ||
       this.signedRtcRefusal !== null ||

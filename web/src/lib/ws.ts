@@ -191,6 +191,7 @@ export function buildAlertsWsUrl(): string {
 
 export interface DisplayControlState {
   owner: boolean;
+  sameDevice?: boolean;
   cols: number | null;
   rows: number | null;
   viewers: number;

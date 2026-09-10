@@ -25,6 +25,7 @@ export type SessionCtlOperation =
   | "scroll"
   | "redraw"
   | "take_control"
+  | "focus_view"
   | "upload_start"
   | "upload_cancel"
   | "upload_complete"

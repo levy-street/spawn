@@ -9,6 +9,20 @@ const DATABASE_NAME = "spawn-trust.db";
 const MAX_PINS = 256;
 const MAX_HOST_IDS = 8;
 const MAX_ORIGIN_LENGTH = 512;
+const pinListeners = new Set<() => void>();
+export function subscribeHostPinChanges(listener: () => void): () => void {
+  pinListeners.add(listener);
+  return () => pinListeners.delete(listener);
+}
+function pinsChanged(): void {
+  for (const listener of [...pinListeners]) {
+    try {
+      listener();
+    } catch {
+      /* A consumer cannot undo a durable trust decision. */
+    }
+  }
+}
 
 export type HostPinState = "active" | "revoked";
 
@@ -232,6 +246,7 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
       } catch {
         throw new PinStoreError("PIN_STORAGE_UNAVAILABLE", "Trust storage is unavailable");
       }
+      pinsChanged();
       return copyPin(pin);
     },
 
@@ -241,6 +256,7 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
       if (exact === undefined) throw new PinStoreError("PIN_CONFLICT", "Host pin does not exist");
       try {
         await persistence.save({ ...exact, state: "revoked", revokedAtMs: Date.now() });
+        pinsChanged();
       } catch {
         throw new PinStoreError("PIN_STORAGE_UNAVAILABLE", "Trust storage is unavailable");
       }
@@ -285,6 +301,7 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
     async clearAccount(accountId): Promise<void> {
       try {
         await persistence.deleteAccount(parseCanonicalUuid(accountId));
+        pinsChanged();
       } catch {
         throw new PinStoreError("PIN_STORAGE_UNAVAILABLE", "Trust storage is unavailable");
       }

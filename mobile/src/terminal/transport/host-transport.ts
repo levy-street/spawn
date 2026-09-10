@@ -7,14 +7,15 @@ import {
   invalidateDeviceHostTrust,
   probeDeviceHostTrustResult,
 } from "@/data/trust/device-trust";
+import { subscribeHostPinChanges } from "@/data/trust/host-pins";
 import { randomBytes } from "@/lib/crypto/bootstrap";
 import { bytesToUuid, encodeHex } from "@/lib/crypto/bytes";
 import { TERMINAL_BRIDGE_VERSION, type WorkerToNativeMessage } from "@/terminal/transport/bridge";
+import { verifyDaemonHost } from "@/terminal/transport/daemon-trust";
 import {
   assertHostFileSize,
   collectHostStream,
   HOST_CONTROL_PROTOCOL,
-  HOST_CONTROL_VERSION,
   HOST_FILE_MAX_BYTES,
   HOST_RANGE_MAX_BYTES,
   HOST_STREAM_CHUNK_BYTES,
@@ -27,11 +28,6 @@ import {
   parseHostReadDeclaration,
   parseHostWriteStreamId,
 } from "@/terminal/transport/host-ctl-codec";
-import {
-  CONNECT_TIMEOUT_MESSAGE,
-  CONNECT_TIMEOUT_MS,
-  LOST_CONNECTION_MESSAGE,
-} from "@/terminal/transport/session-transport";
 import {
   browserIdentityWire,
   signWorkerRequest,
@@ -58,7 +54,10 @@ import type {
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
 import {
+  CONNECT_TIMEOUT_MESSAGE,
+  CONNECT_TIMEOUT_MS,
   iceServersNeedRefresh,
+  LOST_CONNECTION_MESSAGE,
   readTransportPolicy,
   sanitizeIceServers,
 } from "@/terminal/transport/types";
@@ -138,6 +137,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   readonly #streamTimeout: number;
   readonly #streams: HostStreamRuntime;
   #state: TransportState = "idle";
+  #lastError: TransportError | null = null;
   #capabilities: HostCapabilities | null = null;
   #browserKey: string | null = null;
   #signal: SignalChannelLike | null = null;
@@ -146,6 +146,8 @@ class WebViewHostTransport implements StreamingHostTransport {
   #bridgeUnsubscribe: (() => void) | null = null;
   #opening: Promise<void> | null = null;
   #prepared = false;
+  #prepareEpoch = 0;
+  #pinUnsubscribe: (() => void) | null = null;
   #preparePromise: Promise<void> | null = null;
   #workerStarted = false;
   #cachedConfig: CachedRtcConfig | null = null;
@@ -190,6 +192,10 @@ class WebViewHostTransport implements StreamingHostTransport {
     return this.#state;
   }
 
+  get lastError(): TransportError | null {
+    return this.#lastError;
+  }
+
   get capabilities(): HostCapabilities | null {
     return this.#capabilities;
   }
@@ -197,12 +203,21 @@ class WebViewHostTransport implements StreamingHostTransport {
   prepare(): void {
     if (this.#prepared) return;
     this.#prepared = true;
+    this.#lastError = null;
+    const epoch = ++this.#prepareEpoch;
+    this.#pinUnsubscribe ??= subscribeHostPinChanges(() => {
+      this.close();
+      void this.open().catch(() => {});
+    });
     this.#setState("signalling");
     this.#loadEndorsements(this.#preflightTrust());
     this.#startSignal();
-    this.#preparePromise = browserIdentityWire().then((browserKey) => {
-      this.#browserKey = browserKey;
+    this.#preparePromise = browserIdentityWire().then(async (browserKey) => {
+      await verifyDaemonHost(this.hostId, this.options.hostIdentityPublicKey);
+      if (epoch === this.#prepareEpoch) this.#browserKey = browserKey;
     });
+    // prepare can start before the WebView loads; open observes the rejection.
+    void this.#preparePromise.catch(() => {});
   }
 
   networkChanged(): void {
@@ -263,8 +278,9 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#armConnectWatchdog();
       if (this.#cachedConfig && this.#state === "signalling") this.#startPeer(this.#cachedConfig);
     } catch (error) {
+      if (this.#opening !== opening) return opening;
       this.#fail(
-        "host_open",
+        error instanceof HostControlTransportError ? error.code : "host_open",
         error instanceof Error ? error.message : "Host transport failed to open.",
       );
     }
@@ -273,6 +289,8 @@ class WebViewHostTransport implements StreamingHostTransport {
 
   close(): void {
     if (this.#state === "closed") return;
+    this.#pinUnsubscribe?.();
+    this.#pinUnsubscribe = null;
     this.#clearConnectWatchdog();
     clearTimeout(this.#reconnectTimer ?? undefined);
     this.#reconnectTimer = null;
@@ -288,6 +306,8 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#bridgeUnsubscribe = null;
     this.#workerStarted = false;
     this.#prepared = false;
+    this.#prepareEpoch++;
+    this.#browserKey = null;
     this.#preparePromise = null;
     this.#capabilities = null;
     this.#setState("closed");
@@ -687,6 +707,13 @@ class WebViewHostTransport implements StreamingHostTransport {
     const frame = record(value);
     if (!frame) return;
     if (frame.type === "rtc.config") {
+      if (frame.protocol_version !== 2) {
+        this.#fail(
+          "server_update_required",
+          "Update the SPAWN D server to share daemon connections.",
+        );
+        return;
+      }
       // /ws/host binds every frame to the host tuple instead of advertising
       // `binding_nonce_required`; that flag only exists on the session channel.
       if (
@@ -695,7 +722,7 @@ class WebViewHostTransport implements StreamingHostTransport {
         frame.scope_type !== "host" ||
         frame.scope_id !== this.hostId ||
         frame.protocol !== HOST_CONTROL_PROTOCOL ||
-        frame.protocol_version !== HOST_CONTROL_VERSION
+        frame.protocol_version !== 2
       ) {
         this.#fail("rtc_config", "Host RTC configuration is disabled or weakly bound.");
         return;
@@ -716,6 +743,13 @@ class WebViewHostTransport implements StreamingHostTransport {
     }
     if (frame.type === "rtc.status") {
       const matchesActiveBinding = frame["session_id"] === this.#activeRtcSessionId;
+      if (matchesActiveBinding && frame["code"] === "daemon_update_required") {
+        this.#fail(
+          "daemon_update_required",
+          "Update SPAWN D on this host to share its connection.",
+        );
+        return;
+      }
       if (matchesActiveBinding && Number.isSafeInteger(frame["binding_generation"])) {
         this.#activeBindingGeneration = frame["binding_generation"] as number;
       }
@@ -748,7 +782,7 @@ class WebViewHostTransport implements StreamingHostTransport {
           scopeType: "host",
           scopeId: this.hostId,
           protocol: "spawn.host.ctl",
-          protocolVersion: 1,
+          protocolVersion: 2,
         },
       );
       this.options.bridge.send({
@@ -798,7 +832,7 @@ class WebViewHostTransport implements StreamingHostTransport {
           scope_type: "host",
           scope_id: this.hostId,
           protocol: HOST_CONTROL_PROTOCOL,
-          protocol_version: HOST_CONTROL_VERSION,
+          protocol_version: 2,
         });
         clearTimeout(this.#resumeTimer ?? undefined);
         this.#resumeTimer = setTimeout(() => {
@@ -1130,6 +1164,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   #emitError(error: TransportError): void {
+    this.#lastError = error;
     for (const listener of this.#errorListeners) listener(error);
   }
 

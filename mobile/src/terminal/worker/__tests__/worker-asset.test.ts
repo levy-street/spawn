@@ -41,8 +41,8 @@ describe("offline terminal worker", () => {
 
   test("creates only exact ordered reliable protocol channels", () => {
     expect(TERMINAL_WORKER_HTML).toContain("Object.freeze({ ordered: true })");
-    expect(TERMINAL_WORKER_HTML).toContain('createDataChannel("spawn.pty", CHANNEL_OPTIONS)');
-    expect(TERMINAL_WORKER_HTML).toContain('createDataChannel("spawn.ctl", CHANNEL_OPTIONS)');
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: checking the generated worker's template source.
+    expect(TERMINAL_WORKER_HTML).toContain("spawn.${kind}/${sessionId}/${viewId}/${id}");
     expect(TERMINAL_WORKER_HTML).toContain('createDataChannel("spawn.host.ctl", CHANNEL_OPTIONS)');
     expect(TERMINAL_WORKER_HTML).not.toContain("maxPacketLifeTime");
     expect(TERMINAL_WORKER_HTML).not.toContain("maxRetransmits");
@@ -59,7 +59,7 @@ describe("offline terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).toContain('type: "diagnostic"');
   });
 
-  test("keeps PTY output inside the worker", () => {
+  test("renders PTY output in the terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).toContain("state.term.write(takeWriteBatch()");
     expect(TERMINAL_WORKER_HTML).not.toContain('type: "output"');
   });
