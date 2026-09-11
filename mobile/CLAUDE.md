@@ -65,8 +65,10 @@ scripts/, docs/   build helpers and app-specific notes
   disposable build copy, using the actual app providers and native WebViews.
   The Android job removes generated build directories after preserving the APK
   and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
+  Its hosted Ubuntu disk preflight reclaims a fixed unused-tool allowlist and
+  enforces build/emulator headroom; `e2e/test-android-disk-preflight.py` tests it.
   `e2e/test-native-runner.py` checks bounded installation, diagnostics and failure
-  reporting. Both run through the root test matrix.
+  reporting. These checks run through the root test matrix.
   Production routes and assets must never import this controller.
 
 ## Conventions
@@ -74,6 +76,9 @@ scripts/, docs/   build helpers and app-specific notes
 - Style only with `@/theme` tokens and the `ui/` primitives — no raw hex
   values, no inline magic numbers.
 - Biome is the linter (`biome.json`).
+- After login, use `adoptAuthenticatedAccount` in `data/queries/auth.ts` to clear
+  prior account data and seed the new account while retaining mounted query
+  observers, including disabled ones; removing them can strand `AuthGate`.
 - Anything that touches the native layer — a dependency with native code, a
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.

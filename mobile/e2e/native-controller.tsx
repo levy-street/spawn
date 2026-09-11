@@ -9,7 +9,7 @@ import { authToken } from "@/data/api/auth-token";
 import { getBaseUrl } from "@/data/api/config";
 import { getMe } from "@/data/api/endpoints/account";
 import { logOut } from "@/data/api/endpoints/auth";
-import { qk } from "@/data/queryKeys";
+import { adoptAuthenticatedAccount } from "@/data/queries/auth";
 import { ensureDeviceRegistered } from "@/data/trust/registration";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
 import { encodeBase64Url, encodeHex } from "@/lib/crypto/bytes";
@@ -180,10 +180,7 @@ export function NativeAcceptanceController(): React.JSX.Element {
       await authToken.set(next.bearerToken);
       const me = await getMe();
       if (me.user.id !== next.accountId) throw new Error("Fixture login returned another account.");
-      // Match successful login mutations: discard prior query results and seed
-      // the verified account response so an old query error cannot strand boot.
-      queryClient.removeQueries();
-      queryClient.setQueryData(qk.me(), me);
+      adoptAuthenticatedAccount(queryClient, me.user);
     };
     const perform = async ({ action, payload = {} }: Command): Promise<unknown> => {
       const key = payload["session"] === "b" ? "b" : "a";

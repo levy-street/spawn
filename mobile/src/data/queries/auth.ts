@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getMe } from "@/data/api/endpoints/account";
 import {
   confirmEmailVerification,
@@ -19,6 +19,17 @@ import { signInWithProvider } from "@/lib/oauth";
 
 function seedMe(queryClient: ReturnType<typeof useQueryClient>, user: UserOut): void {
   queryClient.setQueryData<MeResponse>(qk.me(), { user });
+}
+
+/** Clear the previous account without orphaning mounted auth-gate observers. */
+export function adoptAuthenticatedAccount(queryClient: QueryClient, user: UserOut): void {
+  queryClient.removeQueries({ predicate: (query) => query.getObserversCount() === 0 });
+  // Reset retains disabled-but-mounted queries too. Removing their Query objects
+  // leaves the gate observing old pending/error results after a successful login.
+  void queryClient.resetQueries();
+  // Keep this synchronous with the login result; a later login must not be
+  // overwritten after waiting for unrelated refetches to complete.
+  seedMe(queryClient, user);
 }
 
 export function useAuthConfigQuery(enabled = true) {
@@ -51,8 +62,7 @@ export function useLoginMutation() {
   return useMutation({
     mutationFn: logIn,
     onSuccess: (result) => {
-      queryClient.removeQueries();
-      seedMe(queryClient, result.user);
+      adoptAuthenticatedAccount(queryClient, result.user);
     },
   });
 }
@@ -62,8 +72,7 @@ export function useSignupMutation() {
   return useMutation({
     mutationFn: signUp,
     onSuccess: (result) => {
-      queryClient.removeQueries();
-      seedMe(queryClient, result.user);
+      adoptAuthenticatedAccount(queryClient, result.user);
     },
   });
 }
@@ -95,8 +104,7 @@ export function useOAuthSignInMutation() {
     },
     onSuccess: (result) => {
       if (result === null) return;
-      queryClient.removeQueries();
-      seedMe(queryClient, result.user);
+      adoptAuthenticatedAccount(queryClient, result.user);
     },
   });
 }

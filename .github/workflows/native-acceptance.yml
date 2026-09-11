@@ -64,6 +64,10 @@ jobs:
         with:
           ref: ${{ inputs.candidate }}
           persist-credentials: false
+      - name: Reserve hosted Android build and emulator disk space
+        if: matrix.platform == 'android'
+        timeout-minutes: 10
+        run: python3 mobile/e2e/android-disk-preflight.py prepare
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -100,7 +104,11 @@ jobs:
           fi
       - name: Build candidate daemon and worker
         working-directory: daemon
-        run: cargo build --locked --bin spawnd --bin spawn-worker
+        run: |
+          if [[ "$NATIVE_PLATFORM" == android ]]; then
+            python3 ../mobile/e2e/android-disk-preflight.py build
+          fi
+          cargo build --locked --bin spawnd --bin spawn-worker
       - name: Verify real fixture integration before native build
         run: server/.venv/bin/python scripts/test-native-acceptance.py --integration
       - name: Start isolated acceptance fixture
@@ -148,11 +156,17 @@ jobs:
       - name: Build native Release acceptance shell
         env:
           NATIVE_PLATFORM: ${{ matrix.platform }}
-        run: bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD"
+        run: |
+          if [[ "$NATIVE_PLATFORM" == android ]]; then
+            python3 mobile/e2e/android-disk-preflight.py build
+          fi
+          bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD"
       - name: Reclaim disposable Android build space for the emulator
         if: matrix.platform == 'android'
         timeout-minutes: 5
-        run: python3 mobile/e2e/compact-android-build.py "$ACCEPTANCE_BUILD" "$RUNNER_TEMP"
+        run: |
+          python3 mobile/e2e/compact-android-build.py "$ACCEPTANCE_BUILD" "$RUNNER_TEMP"
+          python3 mobile/e2e/android-disk-preflight.py emulator
       - name: Run iOS simulator acceptance
         if: matrix.platform == 'ios'
         run: |

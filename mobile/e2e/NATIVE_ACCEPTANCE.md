@@ -55,7 +55,24 @@ Android job cleans its Cargo compilation outputs. After a successful APK build,
 `compact-android-build.py` stages the APK beside its build metadata and removes
 only that run's generated `android/` and `node_modules/` directories before SDK
 installation. It requires the disposable `RUNNER_TEMP/native-app` directory;
-runner SDKs, shared caches, fixture executables and evidence remain available.
+required SDKs, fixture executables and evidence remain available.
+
+`android-disk-preflight.py` additionally reclaims four unused preinstalled tools
+on **GitHub-hosted Ubuntu 24.04 Android jobs only**: `/usr/share/dotnet`,
+`/usr/local/.ghcup`, `/opt/hostedtoolcache/CodeQL`, and `/usr/share/swift`.
+These roots come from the [verified image's installation scripts](https://github.com/actions/runner-images/tree/fc63e1b4dbfacf7e2449bf0706226f9f6eea583e/images/ubuntu/scripts/build).
+It rejects other environments and redirected roots, logs measured free bytes
+before/after reclamation, and requires 15 GiB before either compilation and
+16 GiB before emulator setup on each involved filesystem. No user directories
+or required Android, Java, Node, Rust, Python or shared compiler tools are removed.
+
+The emulator threshold reserves room for downloads, extraction, writable AVD
+data and logs. On 2026-09-11 the official API 35 Google APIs x86_64 r9 image and
+Linux emulator 37.1.11 archives totaled 1.93 GiB compressed and 4.30 GiB expanded
+(measured from ZIP central directories); simultaneous staging alone needs
+about 6.23 GiB. The [pinned emulator action installs both after the app build](https://github.com/ReactiveCircus/android-emulator-runner/blob/a421e43855164a8197daf9d8d40fe71c6996bb0d/src/sdk-installer.ts).
+The headroom checks fail the job early if the image changes or reclamation is
+insufficient; they do not replace native runtime acceptance.
 
 The iOS runner allows one 600-second installation attempt after its bounded
 300-second boot wait; a cold hosted run exceeded the previous 120-second
