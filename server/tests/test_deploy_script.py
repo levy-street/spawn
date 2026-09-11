@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -590,3 +592,142 @@ def test_deploy_refuses_branch_advance_after_local_acceptance_validation(tmp_pat
     assert _git(["rev-parse", "HEAD"], remote).stdout.strip() == original
     assert _log(tmp_path, "systemctl.log") == ""
     assert f"--candidate {original}" in _log(tmp_path, "acceptance.log")
+
+
+def test_deploy_rechecks_public_baseline_after_preparation(tmp_path: Path):
+    _origin, local, remote = _init_repo(tmp_path)
+    baseline = _git(["rev-parse", "HEAD"], local).stdout.strip()
+    (local / "README.md").write_text("concurrent release\n")
+    _git(["commit", "-am", "other release"], local)
+    advanced = _git(["rev-parse", "HEAD"], local).stdout.strip()
+    (local / "README.md").write_text("accepted candidate\n")
+    _git(["commit", "-am", "candidate"], local)
+    _git(["push", "origin", "master"], local)
+    candidate = _git(["rev-parse", "HEAD"], local).stdout.strip()
+    tree = _git(["rev-parse", f"{baseline}:daemon"], local).stdout.strip()
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(tmp_path, fakebin, remote)
+    public = tmp_path / "public-release.json"
+    public.write_text(
+        json.dumps({"server": {"commit": baseline, "dirty": False}, "daemon": {"tree": tree}})
+    )
+    advanced_public = tmp_path / "advanced-release.json"
+    advanced_public.write_text(
+        json.dumps({"server": {"commit": advanced, "dirty": False}, "daemon": {"tree": tree}})
+    )
+
+    # Run the real validator. Only its public HTTP response is replaced; stale
+    # evidence must fail because the production baseline changed, not because
+    # a test stub decides that the second invocation should return an error.
+    validator = tmp_path / "validator-driver.py"
+    validator.write_text(
+        "import importlib.util, io, json, os, sys\n"
+        "from pathlib import Path\n"
+        "spec = importlib.util.spec_from_file_location('gate', sys.argv[1])\n"
+        "gate = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(gate)\n"
+        "gate.ROOT = Path(os.environ['SPAWN_TEST_GATE_ROOT'])\n"
+        "def public(url, **kwargs):\n"
+        "    assert url == 'https://spawnd.dev/api/release', url\n"
+        "    data = Path(os.environ['SPAWN_TEST_PUBLIC_RELEASE']).read_bytes()\n"
+        "    with open(os.environ['SPAWN_DEPLOY_TEST_LOG_DIR'] + '/baseline.log', 'a') as log:\n"
+        "        log.write(json.loads(data)['server']['commit'] + '\\n')\n"
+        "    return io.BytesIO(data)\n"
+        "gate.urllib.request.urlopen = public\n"
+        "sys.argv = sys.argv[1:]\n"
+        "gate.main()\n"
+    )
+    python = shlex.quote(shutil.which("python3"))
+    _write_executable(
+        fakebin / "python3",
+        "#!/usr/bin/env bash\n"
+        'if [[ "${1:-}" == */scripts/check-release-acceptance.py ]]; then\n'
+        f'  exec {python} {shlex.quote(str(validator))} "$@"\n'
+        "fi\n"
+        f'exec {python} "$@"\n',
+    )
+    env.update(SPAWN_TEST_GATE_ROOT=str(local), SPAWN_TEST_PUBLIC_RELEASE=str(public))
+    reports = {}
+    native_cases = (
+        "shared_transport",
+        "background_short",
+        "background_retire",
+        "process_restart",
+        "relay_udp_outage",
+        "relay_udp_loss",
+        "upload_interruption",
+        "identity_retirement",
+    )
+    for name, kind, cases in (
+        ("ios", "native_simulator", native_cases),
+        ("android", "native_emulator", native_cases),
+        (
+            "canary",
+            "isolated_canary",
+            (
+                "baseline_holdback",
+                "candidate_soak",
+                "update_recovery",
+                "startup_rollback",
+            ),
+        ),
+    ):
+        reports[name] = {
+            "schema_version": 1,
+            "candidate_commit": candidate,
+            "baseline_commit": baseline,
+            "status": "passed",
+            "evidence_kind": kind,
+            "platform": name,
+            "physical_device": False,
+            "source_clean": True,
+            "cleanup_passed": True,
+            "cleanup_complete": True,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "completed_at": "2026-01-01T00:10:00+00:00",
+            "cases": [
+                {"id": case, "status": "passed", "metrics": {"soak_seconds": 120, "samples": 5}}
+                for case in cases
+            ],
+        }
+    Path(env["SPAWN_RELEASE_ACCEPTANCE"]).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "candidate_commit": candidate,
+                "baseline_commit": baseline,
+                "status": "passed",
+                "reports": reports,
+            }
+        )
+    )
+
+    # Another release finishes during staging. The target ref does not move,
+    # so the existing target-commit guard alone cannot detect this change.
+    ssh = fakebin / "ssh"
+    marker = 'script="$SPAWN_DEPLOY_TEST_LOG_DIR/remote-script.sh"'
+    advance = (
+        'if [[ "$2" == "cat > "* && ! -f "$SPAWN_DEPLOY_TEST_LOG_DIR/baseline-advanced" ]]; then\n'
+        f"  git -C {shlex.quote(str(remote))} fetch origin master\n"
+        f"  git -C {shlex.quote(str(remote))} checkout -B master {advanced}\n"
+        f"  cp {shlex.quote(str(advanced_public))} {shlex.quote(str(public))}\n"
+        '  touch "$SPAWN_DEPLOY_TEST_LOG_DIR/baseline-advanced"\n'
+        "fi\n"
+    )
+    ssh.write_text(ssh.read_text().replace(marker, advance + marker))
+    result = _deploy(local, env)
+    assert result.returncode != 0
+    assert "different candidate/baseline" in result.stderr
+    assert "baseline advanced during preparation" in result.stderr
+    assert _log(tmp_path, "baseline.log").splitlines() == [baseline, advanced]
+    assert _git(["rev-parse", "HEAD"], remote).stdout.strip() == advanced
+    assert _log(tmp_path, "systemctl.log") == ""
+    # The only remote write from the refused deploy was its staged temp script.
+    commands = _log(tmp_path, "ssh-command.log").splitlines()
+    staged = next(
+        command.removeprefix("cat > ").strip("'")
+        for command in commands
+        if command.startswith("cat > ")
+    )
+    assert not Path(staged).exists()

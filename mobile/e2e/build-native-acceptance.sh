@@ -11,12 +11,16 @@ npx tsc --noEmit --project native-acceptance-tsconfig.json
 npx expo prebuild --platform "$platform" --no-install
 if [[ "$platform" == ios ]]; then
   (cd ios && pod install)
-  # A simulator shell needs neither an Apple team nor a distribution identity.
+  # Xcode embeds simulator entitlements during linking. Disabling signing also
+  # skips that work and makes real SecureStore writes fail with -34018. The "-"
+  # identity signs locally without an Apple team, certificate or profile.
   workspace="$(find ios -maxdepth 1 -name '*.xcworkspace' -print -quit)"
   scheme="$(basename "$workspace" .xcworkspace)"
   xcodebuild -workspace "$workspace" -scheme "$scheme" -configuration Release \
     -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-    -derivedDataPath "$build_dir/native-build" CODE_SIGNING_ALLOWED=NO build
+    -derivedDataPath "$build_dir/native-build" CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+    PROVISIONING_PROFILE_SPECIFIER= build
   find "$build_dir/native-build/Build/Products/Release-iphonesimulator" -maxdepth 1 -name '*.app' > "$build_dir/native-artifact.txt"
 else
   # Expo's release template uses a disposable debug keystore locally. This APK
@@ -26,4 +30,27 @@ else
 fi
 test "$(wc -l < "$build_dir/native-artifact.txt" | tr -d ' ')" = 1
 test -e "$(cat "$build_dir/native-artifact.txt")"
+if [[ "$platform" == ios ]]; then
+  app="$(cat "$build_dir/native-artifact.txt")"
+  codesign --verify --strict "$app"
+  # Simulator entitlements live in the executable's Mach-O sections, not its
+  # macOS code signature. Check both plist and DER sections before installation.
+  python3 - "$app" <<'PY'
+import pathlib
+import plistlib
+import subprocess
+import sys
+
+app = pathlib.Path(sys.argv[1])
+info = plistlib.loads((app / "Info.plist").read_bytes())
+if info["CFBundleIdentifier"] != "dev.spawnd.acceptance":
+    raise SystemExit("Refusing a non-acceptance simulator app")
+binary = app / info["CFBundleExecutable"]
+sections = subprocess.check_output(["xcrun", "otool", "-l", str(binary)], text=True)
+for name in ("__entitlements", "__ents_der"):
+    if f"sectname {name}\n" not in sections:
+        raise SystemExit(f"Simulator executable lacks embedded {name}")
+print("Verified local simulator signature and embedded entitlement sections")
+PY
+fi
 echo "Native acceptance shell built: $platform"

@@ -539,7 +539,7 @@ commit. Missing, skipped, failed or stale evidence prevents deployment.
 PR acceptance supplies review evidence; master acceptance runs again for the
 commit that will actually ship.
 
-The native jobs build disposable unsigned Release apps containing a test-only
+The native jobs build disposable locally signed Release apps containing a test-only
 driver around the real app transport and WebViews. A private UDP TURN path
 proves actual packet loss and outage. The canary runs baseline holdback,
 candidate soak, live update/recovery and failed-start rollback with real
@@ -551,8 +551,10 @@ radio handover test or a selective rollout to production users.
 The `release-acceptance` artifact contains `acceptance.json`, the validated
 reports used by deployment. Direct deploys require the same artifact through
 `--acceptance-evidence FILE` (or `SPAWN_RELEASE_ACCEPTANCE`). Deployment validates
-the target commit and the current public baseline again before changing the
-remote host. `--allow-branch` does not waive acceptance.
+the target commit and the current public baseline before the first SSH call,
+then rechecks immediately before executing the staged remote script. A baseline
+change during preparation stops deployment. `--allow-branch` does not waive
+acceptance.
 The order inside it is the forced one described above: prebuilts land before
 the server that advertises them, and the OTA goes after the server is up.
 

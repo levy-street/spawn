@@ -138,7 +138,7 @@ jobs:
               env.write("SPAWN_ACCEPTANCE_API_URL=" + config["apiUrl"] + "\n")
               env.write("SPAWN_ACCEPTANCE_TOKEN=" + config["token"] + "\n")
           PY
-      - name: Build unsigned native Release shell
+      - name: Build native Release acceptance shell
         env:
           NATIVE_PLATFORM: ${{ matrix.platform }}
         run: bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD"

@@ -92,7 +92,7 @@ runtime evidence before release.
 
 ### Native acceptance
 
-`.github/workflows/acceptance.yml` builds and runs an unsigned Release app on
+`.github/workflows/acceptance.yml` builds and runs a disposable Release app on
 an iOS simulator and an Android emulator for the exact candidate commit. The
 driver exists only in a disposable build copy; it uses the real authenticated
 providers, terminal and host-tool surfaces, WebViews, daemon and session workers.

@@ -536,6 +536,14 @@ fi
 
 printf 'remote deploy: services updated\n'
 REMOTE
+# Downloading/verifying prebuilts and staging this script can take minutes.
+# A direct deploy can overlap the serialized GitHub release workflow, so check
+# the public baseline once more at the last boundary before checkout/build.
+if ! python3 "$script_dir/check-release-acceptance.py" \
+  --evidence "$acceptance_evidence" --candidate "$target_commit"; then
+  ssh "$host" "rm -f '$remote_script'" || true
+  die "release acceptance evidence changed or its baseline advanced during preparation; no production services were changed"
+fi
 ssh "$host" "${env_prefix}bash '$remote_script'; rc=\$?; rm -f '$remote_script'; exit \$rc"
 
 # Publish the exact release snapshot verified before deployment. Binaries land

@@ -2,9 +2,9 @@
 
 `.github/workflows/native-acceptance.yml` builds the exact requested candidate
 into a Release iOS simulator app and a Release Android emulator APK. It uses
-GitHub hosted runners without EAS credentials, Apple signing, Play publication,
-production access, or paid test services. The parent acceptance workflow calls
-it with full candidate and deployed-baseline commit SHAs; manual
+GitHub hosted runners without EAS credentials, Apple distribution credentials,
+Play publication, production access, or paid test services. The parent acceptance
+workflow calls it with full candidate and deployed-baseline commit SHAs; manual
 `workflow_dispatch` accepts the same inputs. The native suite exercises the
 candidate. Its baseline field records acceptance cohort provenance only.
 
@@ -27,6 +27,11 @@ credentials cannot enter the bundle. It leaves the source checkout and its exist
 
 - Application identifier `dev.spawnd.acceptance`, scheme `spawn-acceptance`,
   disabled OTA updates, and local HTTP permission.
+- An iOS simulator keychain group for that application identifier. Xcode uses
+  its local ad-hoc signing identity (`-`) and embeds the simulator entitlements;
+  the build verifies the signature and entitlement sections before installation.
+  No Apple team, certificate, or provisioning profile is used. Android's Release
+  APK uses the template's disposable debug keystore. Neither app is published.
 - The controller in `src/terminal/`, mounted inside the real `AuthGate`.
 - A worker bridge observation hook and an RTC wrapper. The wrapper creates real
   native `RTCPeerConnection` objects, replaces ICE configuration before peer
@@ -134,3 +139,5 @@ navigation pass is implied by these simulator/emulator artifacts.
 
 The build follows the official [Expo local native build commands](https://docs.expo.dev/more/expo-cli/#compiling-android)
 and [Android Emulator Runner configuration](https://github.com/ReactiveCircus/android-emulator-runner).
+Apple documents the application identifier's role in the
+[default keychain access group](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps).

@@ -95,6 +95,13 @@ delete config.android.googleServicesFile;
 delete config.extra.eas;
 config.scheme = "spawn-acceptance";
 config.ios.bundleIdentifier = "dev.spawnd.acceptance";
+// Simulator keychain access still requires an application access group. Xcode
+// embeds these entitlements when using its local ad-hoc signing identity.
+config.ios.entitlements = {
+  ...config.ios.entitlements,
+  "application-identifier": "dev.spawnd.acceptance",
+  "keychain-access-groups": ["dev.spawnd.acceptance"],
+};
 config.android.package = "dev.spawnd.acceptance";
 config.ios.infoPlist.NSAppTransportSecurity = { NSAllowsArbitraryLoads: true };
 config.updates = { enabled: false, checkAutomatically: "NEVER" };
