@@ -15,7 +15,7 @@ spawn_server/
                 auth_providers, account_recovery, admin, agents,
                 browser_devices, capabilities, device, device_pairing,
                 host_introductions, hosts, install, profile, push, release,
-                root_introductions, sessions, trust_bundle,
+                root_introductions, sessions, trust_bundle, waitlist,
                 workspace_templates, workspaces
   ws/           websocket handlers: browser.py, daemon.py, host.py,
                 broker.py, alerts.py, activity.py, host_signal.py,

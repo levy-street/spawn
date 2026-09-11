@@ -1279,6 +1279,34 @@ class Invite(Base):
     )
 
 
+
+class WaitlistEntry(Base):
+    """Someone who asked to be let in while signup is invite-only.
+
+    The marketing pages and the closed signup form both land here. An entry
+    is a plain address plus where it was left; it carries no credential, so
+    unlike an invite it is stored in the clear. Inviting an entry mints an
+    ordinary invite for that address and records which one, so the admin can
+    see who has been sent a code and whether it was used.
+    """
+
+    __tablename__ = "waitlist"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    # Normalised (trimmed, lower-cased) so one person cannot hold several rows.
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    # The page the address was left on — a site path such as
+    # ``/claude-code-remote`` or ``signup`` — for knowing which pages earn
+    # their keep. Bounded on write; never rendered as markup.
+    source: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    invited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invite_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("invites.id", ondelete="SET NULL"), nullable=True
+    )
+
 class LegionDay(Base):
     """One owner's fleet activity for one UTC day. Counters only.
 

@@ -27,6 +27,7 @@ export const qk = {
   adminEmails: () => ["admin", "emails"] as const,
   adminUsers: () => ["admin", "users"] as const,
   adminInvites: () => ["admin", "invites"] as const,
+  adminWaitlist: () => ["admin", "waitlist"] as const,
 
   browserDeviceRegistration: (userId: string) => ["browser-device-registration", userId] as const,
   browserDevices: () => ["browser-devices"] as const,

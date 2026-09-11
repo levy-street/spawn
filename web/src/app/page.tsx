@@ -16,6 +16,7 @@ import {
   RegistrationMarks,
   StoreBadges,
 } from "@/components/brand/press";
+import { StartAction } from "@/components/brand/waitlist";
 import { Wordmark } from "@/components/icons/BrandMark";
 import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { poster } from "@/lib/fonts";
@@ -764,10 +765,8 @@ export default function LandingPage() {
           ) : (
             <InstallCommand targets={targets} defaultTargetId={defaultTargetId} className="mb-9" />
           )}
-          <div className="flex flex-col items-center justify-center gap-5 sm:flex-row sm:gap-7">
-            <Link href="/signup" className={CTA_SLAB}>
-              Sign up
-            </Link>
+          <div className="mx-auto flex w-full max-w-xl flex-col items-center gap-7">
+            <StartAction source="/" align="center" className="w-full" />
             <Link href="/download" className={CTA_QUIET}>
               Download
             </Link>

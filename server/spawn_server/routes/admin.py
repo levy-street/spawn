@@ -20,7 +20,7 @@ from ..config import get_settings
 from ..db import get_session
 from ..invites import create_invite, invite_state, invite_url
 from ..mail import mailer_ready, send_email
-from ..models import BrowserDevice, EmailLog, Host, Invite, Session, User
+from ..models import BrowserDevice, EmailLog, Host, Invite, Session, User, WaitlistEntry
 
 log = logging.getLogger(__name__)
 
@@ -127,23 +127,30 @@ async def create_invite_endpoint(
     await session.commit()
     await session.refresh(invite)
 
-    url = invite_url(code)
     if body.email:
-        rendered = email_templates.invite(link=url, site_url=_site_url(), inviter=admin.email)
-        try:
-            await send_email(
-                to=body.email,
-                subject=rendered.subject,
-                body=rendered.text,
-                html_body=rendered.html,
-                kind="invite",
-            )
-        except Exception as exc:
-            # The URL is returned regardless: the admin can always hand it over
-            # themselves, and failing the request would discard a live invite.
-            log.warning("could not send invite email to %s: %s", body.email, exc)
+        await _mail_invite(invite_url(code), to=body.email, inviter=admin)
 
     return _invite_out(invite, code=code)
+
+
+async def _mail_invite(url: str, *, to: str, inviter: User) -> None:
+    """Send the invitation, best effort.
+
+    The URL is returned to the admin regardless: they can always hand it over
+    themselves, and failing the request would discard a live invite.
+    """
+
+    rendered = email_templates.invite(link=url, site_url=_site_url(), inviter=inviter.email)
+    try:
+        await send_email(
+            to=to,
+            subject=rendered.subject,
+            body=rendered.text,
+            html_body=rendered.html,
+            kind="invite",
+        )
+    except Exception as exc:
+        log.warning("could not send invite email to %s: %s", to, exc)
 
 
 @router.post("/invites/{invite_id}/revoke", response_model=schemas.AdminInviteOut)
@@ -160,6 +167,124 @@ async def revoke_invite(
         await session.commit()
         await session.refresh(invite)
     return _invite_out(invite)
+
+
+# ---------- waitlist ----------
+
+
+def _waitlist_out(
+    entry: WaitlistEntry,
+    *,
+    invite: Invite | None,
+    has_account: bool,
+) -> schemas.AdminWaitlistEntryOut:
+    return schemas.AdminWaitlistEntryOut(
+        id=entry.id,
+        email=entry.email,
+        source=entry.source,
+        created_at=entry.created_at,
+        invited_at=entry.invited_at,
+        invite_id=entry.invite_id,
+        invite_state=invite_state(invite) if invite is not None else None,
+        has_account=has_account,
+    )
+
+
+async def _account_exists(session: AsyncSession, email: str) -> bool:
+    found = (
+        await session.execute(select(User.id).where(func.lower(User.email) == email.lower()))
+    ).scalar_one_or_none()
+    return found is not None
+
+
+@router.get("/waitlist", response_model=list[schemas.AdminWaitlistEntryOut])
+async def list_waitlist(
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> list[schemas.AdminWaitlistEntryOut]:
+    entries = (
+        (await session.execute(select(WaitlistEntry).order_by(WaitlistEntry.created_at.desc())))
+        .scalars()
+        .all()
+    )
+    if not entries:
+        return []
+    invite_ids = [entry.invite_id for entry in entries if entry.invite_id is not None]
+    invites: dict[str, Invite] = {}
+    if invite_ids:
+        rows = (await session.execute(select(Invite).where(Invite.id.in_(invite_ids)))).scalars()
+        invites = {invite.id: invite for invite in rows}
+    emails = [entry.email for entry in entries]
+    accounts = {
+        row.lower()
+        for row in (
+            await session.execute(select(User.email).where(func.lower(User.email).in_(emails)))
+        ).scalars()
+    }
+    return [
+        _waitlist_out(
+            entry,
+            invite=invites.get(entry.invite_id) if entry.invite_id else None,
+            has_account=entry.email in accounts,
+        )
+        for entry in entries
+    ]
+
+
+@router.post("/waitlist/{entry_id}/invite", response_model=schemas.AdminInviteOut)
+async def invite_from_waitlist(
+    entry_id: str,
+    body: schemas.AdminWaitlistInvite | None = None,
+    admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.AdminInviteOut:
+    """Mint an invite for a waitlisted address and send it.
+
+    An ordinary invite, addressed to the entry, and recorded on the entry so
+    the list shows who has been sent a code and whether it was used. Inviting
+    again is allowed — the previous code may have expired — and simply points
+    the entry at the newest invite.
+    """
+
+    entry = await session.get(WaitlistEntry, entry_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="waitlist entry not found"
+        )
+    if await _account_exists(session, entry.email):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="this address already has an account"
+        )
+    invite, code = await create_invite(
+        session,
+        created_by=admin,
+        email=entry.email,
+        ttl_hours=body.ttl_hours if body is not None else None,
+    )
+    # The invite's id is assigned on flush; the entry needs it.
+    await session.flush()
+    entry.invite_id = invite.id
+    entry.invited_at = datetime.now(UTC)
+    await session.commit()
+    await session.refresh(invite)
+
+    await _mail_invite(invite_url(code), to=entry.email, inviter=admin)
+    return _invite_out(invite, code=code)
+
+
+@router.delete("/waitlist/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_from_waitlist(
+    entry_id: str,
+    _: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    entry = await session.get(WaitlistEntry, entry_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="waitlist entry not found"
+        )
+    await session.delete(entry)
+    await session.commit()
 
 
 @router.get("/mail", response_model=schemas.AdminMailStatus)

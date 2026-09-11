@@ -4,12 +4,20 @@ import type { PropsWithChildren } from "react";
 
 import {
   createAdminInvite,
+  inviteFromAdminWaitlist,
+  removeFromAdminWaitlist,
   revokeAdminInvite,
   sendAdminTestEmail,
 } from "@/data/api/endpoints/admin";
-import type { AdminEmailOut, AdminInviteOut } from "@/data/api/schemas/admin";
+import type {
+  AdminEmailOut,
+  AdminInviteOut,
+  AdminWaitlistEntryOut,
+} from "@/data/api/schemas/admin";
 import {
   useCreateAdminInviteMutation,
+  useInviteFromWaitlistMutation,
+  useRemoveFromWaitlistMutation,
   useRevokeAdminInviteMutation,
   useSendAdminTestEmailMutation,
 } from "@/data/queries/admin";
@@ -18,9 +26,12 @@ import { qk } from "@/data/queryKeys";
 jest.mock("@/data/api/endpoints/admin", () => ({
   createAdminInvite: jest.fn(),
   getAdminMailStatus: jest.fn(),
+  inviteFromAdminWaitlist: jest.fn(),
   listAdminEmails: jest.fn(),
   listAdminInvites: jest.fn(),
   listAdminUsers: jest.fn(),
+  listAdminWaitlist: jest.fn(),
+  removeFromAdminWaitlist: jest.fn(),
   revokeAdminInvite: jest.fn(),
   sendAdminTestEmail: jest.fn(),
 }));
@@ -35,6 +46,17 @@ const INVITE: AdminInviteOut = {
   created_by_user_id: "22222222-2222-4222-8222-222222222222",
   used_by_user_id: null,
   url: "https://spawn.example/signup?invite=secret",
+};
+
+const WAITING: AdminWaitlistEntryOut = {
+  id: "44444444-4444-4444-8444-444444444444",
+  email: "waiting@example.com",
+  source: "/claude-code-remote",
+  created_at: "2026-09-10T00:00:00Z",
+  invited_at: null,
+  invite_id: null,
+  invite_state: null,
+  has_account: false,
 };
 
 const EMAIL: AdminEmailOut = {
@@ -86,6 +108,38 @@ describe("admin query mutations", () => {
     );
     expect(revokeAdminInvite).toHaveBeenCalledWith(INVITE.id);
     await revoke.unmount();
+    queryClient.clear();
+  });
+
+  test("inviting from the waitlist files the invite and marks the entry", async () => {
+    const minted = { ...INVITE, email: WAITING.email };
+    jest.mocked(inviteFromAdminWaitlist).mockResolvedValue(minted);
+    const { queryClient, wrapper } = harness();
+    queryClient.setQueryData(qk.adminWaitlist(), [WAITING]);
+    const mutation = await renderHook(() => useInviteFromWaitlistMutation(), { wrapper });
+    await act(async () => {
+      await mutation.result.current.mutateAsync({ entryId: WAITING.id });
+    });
+    expect(inviteFromAdminWaitlist).toHaveBeenCalledWith(WAITING.id, { ttl_hours: null });
+    expect(queryClient.getQueryData(qk.adminInvites())).toEqual([minted]);
+    const [entry] = queryClient.getQueryData<AdminWaitlistEntryOut[]>(qk.adminWaitlist()) ?? [];
+    expect(entry).toMatchObject({ invite_id: minted.id, invite_state: "pending" });
+    expect(entry?.invited_at).not.toBeNull();
+    await mutation.unmount();
+    queryClient.clear();
+  });
+
+  test("removing an entry drops it from the waitlist cache", async () => {
+    jest.mocked(removeFromAdminWaitlist).mockResolvedValue(undefined);
+    const { queryClient, wrapper } = harness();
+    queryClient.setQueryData(qk.adminWaitlist(), [WAITING]);
+    const mutation = await renderHook(() => useRemoveFromWaitlistMutation(), { wrapper });
+    await act(async () => {
+      await mutation.result.current.mutateAsync(WAITING.id);
+    });
+    expect(removeFromAdminWaitlist).toHaveBeenCalledWith(WAITING.id);
+    expect(queryClient.getQueryData(qk.adminWaitlist())).toEqual([]);
+    await mutation.unmount();
     queryClient.clear();
   });
 

@@ -7,7 +7,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import { type AdminEmail, type AdminInvite, ApiError, admin } from "@/lib/api";
+import {
+  type AdminEmail,
+  type AdminInvite,
+  type AdminWaitlistEntry,
+  ApiError,
+  admin,
+} from "@/lib/api";
 
 const STATE_STYLE: Record<AdminInvite["state"], string> = {
   pending: "border-success/50 text-success",
@@ -24,6 +30,7 @@ function when(value: string | null): string {
 export default function AdminPage() {
   return (
     <div className="space-y-10">
+      <Waitlist />
       <Invites />
       <Users />
       <Emails />
@@ -236,6 +243,172 @@ function Users() {
   );
 }
 
+/**
+ * The link an invite was minted with, shown the one time it can be. Held in
+ * state by whoever minted it until dismissed — a reload cannot get it back.
+ */
+function FreshInvite({ invite, onDismiss }: { invite: AdminInvite; onDismiss: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    if (!invite.url) return;
+    try {
+      await navigator.clipboard.writeText(invite.url);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <div className="space-y-2 rounded-md border border-success/50 p-3" data-testid="fresh-invite">
+      <p className="text-sm font-medium">
+        Invite ready{invite.email ? ` — emailed to ${invite.email}` : ""}
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1.5 font-mono text-xs">
+          {invite.url}
+        </code>
+        <Button size="sm" variant="secondary" onClick={() => void copy()}>
+          {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+          {copied ? "Copied" : "Copy link"}
+        </Button>
+        <Button size="sm" variant="ghost" onClick={onDismiss}>
+          Dismiss
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Copy it now — the code is stored hashed, so this link cannot be shown again. Expires{" "}
+        {when(invite.expires_at)}.
+      </p>
+    </div>
+  );
+}
+
+function waitlistState(row: AdminWaitlistEntry): { label: string; style: string } {
+  if (row.has_account) return { label: "has account", style: STATE_STYLE.used };
+  if (row.invite_state === null)
+    return { label: "waiting", style: "border-warning/50 text-warning" };
+  if (row.invite_state === "pending") return { label: "invited", style: STATE_STYLE.pending };
+  return { label: row.invite_state, style: STATE_STYLE[row.invite_state] };
+}
+
+function Waitlist() {
+  const queryClient = useQueryClient();
+  const rows = useQuery({ queryKey: ["admin", "waitlist"], queryFn: admin.waitlist });
+  const [error, setError] = useState<string | null>(null);
+  const [fresh, setFresh] = useState<AdminInvite | null>(null);
+
+  const refresh = () => {
+    void queryClient.invalidateQueries({ queryKey: ["admin", "waitlist"] });
+    void queryClient.invalidateQueries({ queryKey: ["admin", "invites"] });
+  };
+
+  const invite = useMutation({
+    mutationFn: (id: string) => admin.inviteFromWaitlist(id),
+    onSuccess: (minted) => {
+      setFresh(minted);
+      setError(null);
+      refresh();
+    },
+    onError: (cause) =>
+      setError(cause instanceof ApiError ? cause.message : "Could not create an invite"),
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => admin.removeFromWaitlist(id),
+    onSuccess: () => {
+      setError(null);
+      refresh();
+    },
+    onError: (cause) =>
+      setError(cause instanceof ApiError ? cause.message : "Could not remove the entry"),
+  });
+
+  const busy = invite.isPending || remove.isPending;
+
+  return (
+    <section className="space-y-3">
+      <div>
+        <h2 className="text-lg font-semibold">Waitlist</h2>
+        <p className="text-sm text-muted-foreground">
+          People who asked for an invite while signup is closed. Inviting one mints and mails an
+          ordinary invite for that address.
+        </p>
+      </div>
+
+      {error !== null && (
+        <p className="text-sm text-destructive" role="alert">
+          {error}
+        </p>
+      )}
+
+      {fresh?.url && <FreshInvite invite={fresh} onDismiss={() => setFresh(null)} />}
+
+      <div className="overflow-x-auto rounded-md border border-border">
+        <table className="w-full min-w-[42rem] text-sm">
+          <thead className="border-b border-border text-left text-xs text-muted-foreground">
+            <tr>
+              <th className="px-3 py-2 font-medium">Email</th>
+              <th className="px-3 py-2 font-medium">Left on</th>
+              <th className="px-3 py-2 font-medium">Joined</th>
+              <th className="px-3 py-2 font-medium">State</th>
+              <th className="px-3 py-2" />
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border" data-testid="admin-waitlist">
+            {rows.isLoading && <LoadingRow colSpan={5} label="Loading the waitlist" />}
+            {!rows.isLoading && (rows.data ?? []).length === 0 && (
+              <tr>
+                <td className="px-3 py-3 text-muted-foreground" colSpan={5}>
+                  No one is waiting.
+                </td>
+              </tr>
+            )}
+            {(rows.data ?? []).map((row) => {
+              const state = waitlistState(row);
+              return (
+                <tr key={row.id}>
+                  <td className="px-3 py-2">{row.email}</td>
+                  <td className="px-3 py-2 font-mono text-xs text-muted-foreground">
+                    {row.source ?? "—"}
+                  </td>
+                  <td className="px-3 py-2 text-muted-foreground">{when(row.created_at)}</td>
+                  <td className="px-3 py-2">
+                    <span className={`rounded border px-1.5 py-0.5 text-[11px] ${state.style}`}>
+                      {state.label}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    <div className="flex justify-end gap-2">
+                      {!row.has_account && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={busy}
+                          onClick={() => invite.mutate(row.id)}
+                        >
+                          {row.invite_state === null ? "Invite" : "Invite again"}
+                        </Button>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        onClick={() => remove.mutate(row.id)}
+                      >
+                        Remove
+                      </Button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 function Invites() {
   const queryClient = useQueryClient();
   const invites = useQuery({ queryKey: ["admin", "invites"], queryFn: admin.invites });
@@ -246,7 +419,6 @@ function Invites() {
   // link is held here until the admin dismisses it — a reload cannot get it
   // back.
   const [fresh, setFresh] = useState<AdminInvite | null>(null);
-  const [copied, setCopied] = useState(false);
 
   const create = useMutation({
     mutationFn: () =>
@@ -256,7 +428,6 @@ function Invites() {
       }),
     onSuccess: (invite) => {
       setFresh(invite);
-      setCopied(false);
       setEmail("");
       setError(null);
       void queryClient.invalidateQueries({ queryKey: ["admin", "invites"] });
@@ -274,16 +445,6 @@ function Invites() {
     event.preventDefault();
     setError(null);
     create.mutate();
-  };
-
-  const copy = async () => {
-    if (!fresh?.url) return;
-    try {
-      await navigator.clipboard.writeText(fresh.url);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
   };
 
   return (
@@ -332,32 +493,7 @@ function Invites() {
         </p>
       )}
 
-      {fresh?.url && (
-        <div
-          className="space-y-2 rounded-md border border-success/50 p-3"
-          data-testid="fresh-invite"
-        >
-          <p className="text-sm font-medium">
-            Invite ready{fresh.email ? ` — emailed to ${fresh.email}` : ""}
-          </p>
-          <div className="flex flex-wrap items-center gap-2">
-            <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1.5 font-mono text-xs">
-              {fresh.url}
-            </code>
-            <Button size="sm" variant="secondary" onClick={() => void copy()}>
-              {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
-              {copied ? "Copied" : "Copy link"}
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setFresh(null)}>
-              Dismiss
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            Copy it now — the code is stored hashed, so this link cannot be shown again. Expires{" "}
-            {when(fresh.expires_at)}.
-          </p>
-        </div>
-      )}
+      {fresh?.url && <FreshInvite invite={fresh} onDismiss={() => setFresh(null)} />}
 
       <div className="overflow-x-auto rounded-md border border-border">
         <table className="w-full min-w-[42rem] text-sm">

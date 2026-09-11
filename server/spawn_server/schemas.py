@@ -236,6 +236,44 @@ class AdminInviteOut(BaseModel):
     url: str | None = None
 
 
+
+# ---------- waitlist ----------
+
+
+class WaitlistJoinRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+    # The site path the form sat on. Free text from the client: bounded here
+    # against abuse, trimmed to the column on the way in, and treated as a
+    # label everywhere it is shown. A long value must not cost the address.
+    source: str | None = Field(default=None, max_length=512)
+
+
+class WaitlistJoinOut(BaseModel):
+    # Always true: the response is identical whether the address was new,
+    # already listed, or already an account, so nothing can be enumerated.
+    ok: bool = True
+
+
+class AdminWaitlistInvite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_hours: int | None = Field(default=None, ge=1, le=24 * 30)
+
+
+class AdminWaitlistEntryOut(BaseModel):
+    id: str
+    email: str
+    source: str | None = None
+    created_at: datetime
+    invited_at: datetime | None = None
+    invite_id: str | None = None
+    # The state of the invite minted for this entry, when there is one.
+    invite_state: Literal["pending", "used", "expired", "revoked"] | None = None
+    # Whether an account now exists for the address, however it got in.
+    has_account: bool = False
+
 class AdminMailStatus(BaseModel):
     backend: str
     # False when the backend only logs (console) or is switched off.

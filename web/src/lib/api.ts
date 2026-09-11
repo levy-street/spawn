@@ -850,6 +850,19 @@ export const AdminInviteSchema = z.object({
 });
 export type AdminInvite = z.infer<typeof AdminInviteSchema>;
 
+/** One person waiting for an invite, as the admin surface sees them. */
+export const AdminWaitlistEntrySchema = z.object({
+  id: z.string().uuid(),
+  email: z.string(),
+  source: z.string().nullable().default(null),
+  created_at: z.string(),
+  invited_at: z.string().nullable().default(null),
+  invite_id: z.string().nullable().default(null),
+  invite_state: z.enum(["pending", "used", "expired", "revoked"]).nullable().default(null),
+  has_account: z.boolean().default(false),
+});
+export type AdminWaitlistEntry = z.infer<typeof AdminWaitlistEntrySchema>;
+
 export const AdminMailStatusSchema = z.object({
   backend: z.string(),
   delivering: z.boolean(),
@@ -890,6 +903,31 @@ export const admin = {
     }),
   revokeInvite: (id: string) =>
     api(`/api/admin/invites/${id}/revoke`, { method: "POST", schema: AdminInviteSchema }),
+  waitlist: () =>
+    api("/api/admin/waitlist", { method: "GET", schema: z.array(AdminWaitlistEntrySchema) }),
+  /** Mints an invite for the entry's address and mails it; the link comes back once. */
+  inviteFromWaitlist: (id: string, body: { ttl_hours?: number | null } = {}) =>
+    api(`/api/admin/waitlist/${id}/invite`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: AdminInviteSchema,
+    }),
+  removeFromWaitlist: (id: string) => api<void>(`/api/admin/waitlist/${id}`, { method: "DELETE" }),
+};
+
+export const WaitlistJoinSchema = z.object({ ok: z.boolean() });
+
+export const waitlist = {
+  /**
+   * Public. The answer is the same whatever the address's standing — new,
+   * already listed, already an account — so nothing can be learned from it.
+   */
+  join: (body: { email: string; source?: string | null }) =>
+    api("/api/waitlist", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: WaitlistJoinSchema,
+    }),
 };
 
 export const profile = {

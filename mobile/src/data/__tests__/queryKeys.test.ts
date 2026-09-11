@@ -36,6 +36,7 @@ describe("query key registry", () => {
       qk.adminEmails(),
       qk.adminUsers(),
       qk.adminInvites(),
+      qk.adminWaitlist(),
       qk.browserDeviceRegistration("user"),
       qk.browserDevices(),
       qk.browserDeviceLocalIdentity("user"),
