@@ -294,12 +294,16 @@ test("right-clicking while scrolled up keeps the reader where they were", async 
 test("typing while scrolled up returns to the live edge", async ({ page }) => {
   const messages = await openUnifiedTerminal(page);
   const live = page.getByTestId("terminal-live-host");
+  const input = live.locator(".xterm-helper-textarea");
+  await input.focus();
+  await expect(input).toBeFocused();
 
   await live.locator(".xterm").hover();
   await page.mouse.wheel(0, -600);
   await page.waitForTimeout(200);
   await expect(live.locator(".xterm-rows")).toContainText("commit-");
 
+  await expect(input).toBeFocused();
   await page.keyboard.type("x");
 
   await expect.poll(() => binaryText(messages)).toContain("x");
