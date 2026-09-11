@@ -238,6 +238,156 @@ function openTransport(bridge: FakeBridge, signal: FakeSignal) {
 }
 
 describe("HostTransport signalling", () => {
+  test("an unavailable initial offer waits for worker teardown and delayed reconnect", async () => {
+    jest.useFakeTimers();
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const { transport, settled } = openTransport(bridge, signal);
+    const config = {
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      scope_type: "host",
+      scope_id: HOST_ID,
+      protocol: "spawn.host.ctl",
+      protocol_version: 2,
+    };
+    try {
+      await jest.advanceTimersByTimeAsync(0);
+      signal.emit(config);
+      const first = bridge.sent.find((message) => message.type === "connect");
+      if (first?.type !== "connect") throw new Error("Missing initial peer.");
+      const unavailable = {
+        type: "rtc.status",
+        session_id: first.rtcSessionId,
+        scope_type: "host",
+        scope_id: HOST_ID,
+        protocol: "spawn.host.ctl",
+        protocol_version: 2,
+        status: "unavailable",
+      };
+      signal.emit(unavailable);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
+      expect(bridge.sent).toContainEqual({ v: 1, type: "signal-frame", frame: unavailable });
+      // The bundled worker closes its peer before requesting a delayed retry.
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      await jest.advanceTimersByTimeAsync(349);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
+      await jest.advanceTimersByTimeAsync(302);
+      signal.emit(config);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(2);
+    } finally {
+      transport.close();
+      await settled;
+      jest.useRealTimers();
+    }
+  });
+
+  test("prompt repeated refusals cannot extend the initial connection deadline", async () => {
+    jest.useFakeTimers();
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const transport = createHostTransport({
+      hostId: HOST_ID,
+      hostIdentityPublicKey: "host-key",
+      bridge,
+      openSignal: () => signal,
+      connectTimeoutMs: 2_000,
+    });
+    const settled = transport.open().catch((error: unknown) => error);
+    try {
+      await jest.advanceTimersByTimeAsync(0);
+      for (let tick = 0; tick < 20 && transport.state !== "failed"; tick += 1) {
+        signal.emit({
+          type: "rtc.config",
+          enabled: true,
+          ice_servers: [],
+          scope_type: "host",
+          scope_id: HOST_ID,
+          protocol: "spawn.host.ctl",
+          protocol_version: 2,
+        });
+        bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+        await jest.advanceTimersByTimeAsync(250);
+      }
+      expect(transport.state).toBe("failed");
+      await expect(settled).resolves.toMatchObject({ code: "connect_timeout" });
+      const created = bridge.sent.filter((message) => message.type === "connect").length;
+      expect(created).toBeLessThanOrEqual(4);
+      await jest.advanceTimersByTimeAsync(180_000);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(created);
+      expect(bridge.listeners.size).toBe(0);
+    } finally {
+      transport.close();
+      await settled;
+      jest.useRealTimers();
+    }
+  });
+
+  test("prompt repeated refusals stop at the established connection recovery budget", async () => {
+    const { transport, signal, bridge } = await readyTransport();
+    jest.useFakeTimers();
+    try {
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      for (let second = 0; second < 180; second += 1) {
+        signal.emit({
+          type: "rtc.config",
+          enabled: true,
+          ice_servers: [],
+          scope_type: "host",
+          scope_id: HOST_ID,
+          protocol: "spawn.host.ctl",
+          protocol_version: 2,
+        });
+        bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+        await jest.advanceTimersByTimeAsync(1_000);
+      }
+      expect(transport.state).toBe("failed");
+      expect(transport.lastError).toMatchObject({ code: "connect_timeout", retryable: false });
+      const created = bridge.sent.filter((message) => message.type === "connect").length;
+      expect(created).toBeLessThan(20);
+      await jest.advanceTimersByTimeAsync(180_000);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(created);
+    } finally {
+      transport.close();
+      jest.useRealTimers();
+    }
+  });
+
+  test("a refused resume rebuilds immediately once, then ordinary refusal tears down", async () => {
+    const { transport, signal, bridge } = await readyTransport();
+    jest.useFakeTimers();
+    try {
+      const first = bridge.sent.find((message) => message.type === "connect");
+      if (first?.type !== "connect") throw new Error("Missing initial peer.");
+      signal.emit({
+        type: "rtc.status",
+        session_id: first.rtcSessionId,
+        status: "connected",
+        binding_generation: 1,
+      });
+      signal.emitState("open");
+      expect(signal.sent).toContainEqual(expect.objectContaining({ type: "rtc.resume" }));
+      const unavailable = {
+        type: "rtc.status",
+        session_id: first.rtcSessionId,
+        status: "unavailable",
+      };
+      signal.emit(unavailable);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(2);
+      signal.emit(unavailable);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(2);
+      expect(bridge.sent.at(-1)).toEqual({ v: 1, type: "signal-frame", frame: unavailable });
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      transport.close();
+      await jest.advanceTimersByTimeAsync(180_000);
+      expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(2);
+    } finally {
+      transport.close();
+      jest.useRealTimers();
+    }
+  });
+
   test("fatal signalling retires the worker and rejects active work without losing the failure", async () => {
     const { bridge, signal, transport } = await readyTransport();
     const pending = transport.request("host.metrics", {});

@@ -52,11 +52,11 @@ if (
   fixtureUrl.hash
 )
   throw new Error("Build bootstrap must come from the runner's local fixture.");
-const response = await fetch(new URL("/__acceptance/bootstrap", fixtureUrl), {
+const response = await fetch(new URL("/__acceptance/config", fixtureUrl), {
   headers: { "X-Acceptance-Token": token },
   signal: AbortSignal.timeout(15_000),
 });
-if (!response.ok) throw new Error(`Fixture bootstrap failed: ${response.status}`);
+if (!response.ok) throw new Error(`Fixture build configuration failed: ${response.status}`);
 const bootstrap = await response.json();
 if (bootstrap.candidateCommit !== commit || !Array.isArray(bootstrap.iceServers))
   throw new Error("Fixture candidate/ICE configuration does not match the native build.");

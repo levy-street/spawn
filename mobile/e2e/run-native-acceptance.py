@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 APP_ID = "dev.spawnd.acceptance"
 SIMULATOR_INSTALL_TIMEOUT_SECONDS = 600
+FIXTURE_START_TIMEOUT_SECONDS = 90
 DIAGNOSTIC_STREAM_LIMIT = 32_768
 
 
@@ -111,14 +112,40 @@ class Runner:
     def simctl(self, *args: str, timeout: int = 120) -> str:
         return self.command("xcrun", "simctl", *args, timeout=timeout)
 
+    def require_fixture_identity(self, state: dict) -> None:
+        if (state.get("runId") != self.ready["runId"]
+                or state.get("candidateCommit") != self.manifest["candidate_commit"]):
+            raise ValueError("Native runner observed a different fixture run or candidate")
+
+    def start_fixture(self) -> None:
+        # Cold compilation, emulator boot and app installation precede the live
+        # daemon. Activation happens once; a dead fixture is never restarted.
+        self.control("start", {})
+        deadline = time.monotonic() + FIXTURE_START_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            status = self.control("status")
+            self.require_fixture_identity(status)
+            if status.get("phase") == "failed":
+                raise RuntimeError("Native fixture failed: " + str(status.get("failure_reason")))
+            if status.get("phase") == "ready" and status.get("ready") is True:
+                break
+            time.sleep(0.25)
+        else:
+            raise TimeoutError("Native fixture did not become ready within its startup budget")
+        health = self.control("health")
+        self.require_fixture_identity(health)
+        if health.get("phase") != "ready" or health.get("ready") is not True:
+            raise RuntimeError("Native fixture lost readiness before app launch")
+        bootstrap = self.control("bootstrap")
+        self.require_fixture_identity(bootstrap)
+        self.secrets.append(bootstrap["bearerToken"])
+        if bootstrap.get("secondAccount"):
+            self.secrets.append(bootstrap["secondAccount"]["bearerToken"])
+
     def install(self) -> None:
         artifact = Path((self.args.build / "native-artifact.txt").read_text().strip()).resolve(strict=True)
         if not artifact.is_relative_to(self.args.build.resolve()):
             raise ValueError("Native artifact must belong to the disposable build")
-        bootstrap = self.control("bootstrap")
-        self.secrets.append(bootstrap["bearerToken"])
-        if bootstrap.get("secondAccount"):
-            self.secrets.append(bootstrap["secondAccount"]["bearerToken"])
         if self.args.platform == "android":
             if not self.device:
                 devices = [line.split()[0] for line in self.command("adb", "devices").splitlines()[1:]
@@ -158,6 +185,8 @@ class Runner:
             # Installation exceeded the default 120s on a cold hosted run.
             # Give setup one larger bounded attempt; product cases are not retried.
             self.simctl("install", self.device, str(artifact), timeout=SIMULATOR_INSTALL_TIMEOUT_SECONDS)
+        self.platform_phase(platform_info, "starting_fixture")
+        self.start_fixture()
         self.platform_phase(platform_info, "launching")
         self.launch()
         self.platform_phase(platform_info, "launched")

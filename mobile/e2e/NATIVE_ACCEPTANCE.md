@@ -50,7 +50,7 @@ The Android acceptance build keeps a 2 GiB JVM heap and raises the metaspace
 limit to 1 GiB because Release lint exhausted the template's 512 MiB limit in
 hosted CI. `ExitOnOutOfMemoryError` makes the Gradle JVM exit if memory is
 exhausted again. The build still runs Release lint and targets only x86_64.
-After the isolated fixture starts from its private executable copies, the
+After the isolated fixture prepares its private executable copies, the
 Android job cleans its Cargo compilation outputs. After a successful APK build,
 `compact-android-build.py` stages the APK beside its build metadata and removes
 only that run's generated `android/` and `node_modules/` directories before SDK
@@ -83,13 +83,24 @@ and stderr, and failures with credentials redacted. Setup failures report a
 failed `runner-error` event to the fixture and still fail the job; product cases
 are not retried or accepted when setup fails.
 
+Fixture preparation starts the API and relay and copies the exact daemon/worker
+pair. Its authenticated build configuration contains the run, candidate and ICE
+configuration, without requiring live accounts or sessions. After compilation,
+emulator boot and app installation, the runner activates the daemon and sessions
+once and waits up to 90 seconds for readiness. It checks process liveness and
+fresh API host/session readiness before launching the app. Unexpected daemon or
+relay exits permanently fail the run and produce timestamped diagnostics; the
+fixture never restarts a failed process to obtain passing evidence. This keeps
+cold build work outside live daemon acceptance without changing the daemon's
+fail-closed credential deadline.
+
 ## Running with an isolated fixture
 
 The runner needs Node 22, Python 3.13 for the fixture, Rust for the real daemon
 pair, coturn, and either Xcode with an iOS Simulator runtime or the Android SDK
 with an x86_64 emulator. See the workflow for exact setup commands. From the
-repository root, start the fixture before building; its timeout includes build
-time:
+repository root, prepare the API and relay before building; the fixture timeout
+includes build time, while daemon activation waits until installation finishes:
 
 ```bash
 cargo build --locked --manifest-path daemon/Cargo.toml --bin spawnd --bin spawn-worker

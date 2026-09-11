@@ -7,7 +7,10 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import hashlib
+import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,7 +21,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,7 +42,10 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
         self.output = tempfile.TemporaryDirectory(prefix="native-boundary-")
         self.fixture = fixture_module.Fixture(
             argparse.Namespace(
-                output=Path(self.output.name), port=18100, client_host="127.0.0.1"
+                output=Path(self.output.name),
+                port=18100,
+                client_host="127.0.0.1",
+                transport="direct",
             )
         )
 
@@ -95,6 +101,196 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
     async def test_command_without_app_times_out(self):
         with self.assertRaises(TimeoutError):
             await self.fixture.command("snapshot", timeout=0.01)
+
+    async def test_preparation_copies_pair_without_live_provisioning(self):
+        source = self.fixture.scratch / "source"
+        source.mkdir()
+        for name in ("spawnd", "spawn-worker"):
+            binary = source / name
+            binary.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' '{name} 0.1.0+g{self.fixture.candidate[:12]}'\n"
+            )
+            binary.chmod(0o700)
+        self.fixture.args.daemon = source / "spawnd"
+        await self.fixture.prepare_binaries()
+        shutil.rmtree(source)  # Cargo cleanup cannot invalidate private copies.
+        for name, identity in self.fixture.binary_identity.items():
+            copied = self.fixture.binary_dir / name
+            self.assertTrue(identity["candidate_match"])
+            self.assertEqual(
+                identity["sha256"], hashlib.sha256(copied.read_bytes()).hexdigest()
+            )
+        self.assertEqual(self.fixture.account_id, "")
+        self.assertEqual(self.fixture.sessions, [])
+        self.assertIsNone(self.fixture.daemon)
+        self.assertIsNone(self.fixture.bootstrap)
+        config = self.fixture.configuration()
+        self.assertEqual(
+            set(config),
+            {"runId", "candidateCommit", "apiUrl", "iceServers", "forceRelay"},
+        )
+        self.assertNotIn(self.fixture.token, json.dumps(config))
+
+    async def test_start_is_prompt_and_exactly_once_until_verified_ready(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def provision():
+            entered.set()
+            await release.wait()
+
+        self.fixture.phase = "prepared"
+        self.fixture.provision = AsyncMock(side_effect=provision)
+        self.fixture.runtime_ready = AsyncMock(return_value=True)
+        first = self.fixture.start_provisioning()
+        task = self.fixture.provision_task
+        await asyncio.wait_for(entered.wait(), 1)
+        for _ in range(5):
+            self.assertEqual(self.fixture.start_provisioning()["phase"], "starting")
+            self.assertIs(self.fixture.provision_task, task)
+        self.assertFalse(first["ready"])
+        with self.assertRaisesRegex(ValueError, "not ready"):
+            await self.fixture.bootstrap_state()
+        release.set()
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(self.fixture.start_provisioning()["phase"], "ready")
+        self.fixture.provision.assert_awaited_once()
+        self.fixture.runtime_ready.assert_awaited_once()
+
+    async def test_provision_failure_is_permanent_and_redacted_before_boot(self):
+        self.fixture.phase = "prepared"
+        self.fixture.provision = AsyncMock(
+            side_effect=ValueError("private-token-secret")
+        )
+        self.fixture.start_provisioning()
+        await self.fixture.provision_task
+        with self.assertRaisesRegex(RuntimeError, "provisioning failed"):
+            self.fixture.start_provisioning()
+        self.fixture.provision.assert_awaited_once()
+        status = self.fixture.status()
+        self.assertEqual(status["phase"], "failed")
+        self.assertFalse(status["ready"])
+        report = json.loads((self.fixture.output / "evidence.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["cases"], [])
+        self.assertEqual(
+            report["failure_reason"], "fixture provisioning failed (ValueError)"
+        )
+        self.assertNotIn(
+            "private-token",
+            (self.fixture.output / "fixture-lifecycle.jsonl").read_text(),
+        )
+
+    async def test_pending_provisioning_has_a_fixed_failure_deadline(self):
+        self.fixture.phase = "prepared"
+        self.fixture.provision = AsyncMock(side_effect=asyncio.Event().wait)
+        with patch.object(fixture_module, "PROVISION_TIMEOUT_SECONDS", 0.01):
+            self.fixture.start_provisioning()
+            await asyncio.wait_for(self.fixture.provision_task, 1)
+        self.assertEqual(self.fixture.status()["phase"], "failed")
+        self.assertEqual(
+            self.fixture.failed, "fixture provisioning failed (TimeoutError)"
+        )
+        self.fixture.provision.assert_awaited_once()
+
+    async def test_cleanup_cancels_pending_provisioning_and_joins_owned_child(self):
+        entered = asyncio.Event()
+
+        async def provision():
+            await self.fixture.child(
+                [sys.executable, "-c", "import time; time.sleep(30)"], "daemon"
+            )
+            entered.set()
+            await asyncio.Event().wait()
+
+        self.fixture.phase = "prepared"
+        self.fixture.provision = AsyncMock(side_effect=provision)
+        self.fixture.start_provisioning()
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(self.fixture.close(), 2)
+        self.assertTrue(self.fixture.provision_task.cancelled())
+        self.assertIsNotNone(self.fixture.children[0].returncode)
+        self.assertIsNone(self.fixture.failed)
+
+    async def test_health_before_start_never_marks_fixture_ready_or_failed(self):
+        self.fixture.phase = "prepared"
+        with self.assertRaisesRegex(RuntimeError, "not ready"):
+            await self.fixture.health()
+        self.assertEqual(self.fixture.status()["phase"], "prepared")
+        self.assertIsNone(self.fixture.failed)
+
+    async def test_health_rechecks_api_and_permanently_fails_lost_readiness(self):
+        self.fixture.phase = "ready"
+        self.fixture.runtime_ready = AsyncMock(side_effect=[True, False])
+        healthy = await self.fixture.health()
+        self.assertEqual(healthy["runId"], self.fixture.run_id)
+        self.assertEqual(healthy["candidateCommit"], self.fixture.candidate)
+        self.assertTrue(healthy["ready"])
+        with self.assertRaisesRegex(RuntimeError, "readiness was lost"):
+            await self.fixture.health()
+        with self.assertRaises(RuntimeError):
+            await self.fixture.health()
+        self.assertEqual(self.fixture.runtime_ready.await_count, 2)
+        self.assertEqual(self.fixture.status()["phase"], "failed")
+
+    async def test_exited_owned_child_fails_waiting_suite_without_native_cases(self):
+        self.configure_suite()
+        self.fixture.phase = "prepared"
+        exercise = asyncio.create_task(suite.exercise(self.fixture))
+        child = await self.fixture.child([sys.executable, "-c", "pass"], "daemon")
+        await child.wait()
+        with self.assertRaisesRegex(RuntimeError, "daemon exited unexpectedly"):
+            await asyncio.wait_for(exercise, 2)
+        report = json.loads((self.fixture.output / "evidence.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["cases"], [])
+        self.assertIn("daemon exited unexpectedly", report["failure_reason"])
+        lifecycle = [
+            json.loads(row)
+            for row in (self.fixture.output / "fixture-lifecycle.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertEqual(len(lifecycle), 1)
+        self.assertIn("at", lifecycle[0])
+        await self.fixture.close()
+
+    async def test_intentional_cleanup_does_not_report_unexpected_child_exit(self):
+        await self.fixture.child(
+            [sys.executable, "-c", "import time; time.sleep(30)"], "turn"
+        )
+        await self.fixture.close()
+        self.assertIsNone(self.fixture.failed)
+        self.assertTrue(self.fixture.closed.is_set())
+
+    async def test_late_owned_child_exit_fails_previously_passing_evidence(self):
+        path = self.fixture.output / "evidence.json"
+        cases = [
+            {"id": "shared_transport", "status": "passed", "metrics": {"live_peers": 1}}
+        ]
+        fixture_module.write_json(
+            path,
+            {
+                "candidate_commit": self.fixture.candidate,
+                "status": "passed",
+                "cases": cases,
+            },
+        )
+        self.fixture.phase = "ready"
+        child = await self.fixture.child(
+            [sys.executable, "-c", "raise SystemExit(7)"], "turn"
+        )
+        await child.wait()
+        await asyncio.wait_for(self.fixture.failure_event.wait(), 1)
+        self.fixture.fail("later failure must not replace the original reason")
+        report = json.loads(path.read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["cases"], cases)
+        self.assertEqual(report["candidate_commit"], self.fixture.candidate)
+        self.assertEqual(
+            report["failure_reason"], "fixture turn exited unexpectedly (code 7)"
+        )
+        self.assertFalse(self.fixture.status()["ready"])
+        await self.fixture.close()
 
     def test_private_ready_file_is_not_world_readable(self):
         path = self.fixture.output / "ready.json"
@@ -263,10 +459,82 @@ def integration():
                     with urllib.request.urlopen(req, timeout=10) as response:
                         return response.status, json.load(response)
                 except urllib.error.HTTPError as error:
-                    return error.code, None
+                    return error.code, json.load(error)
 
             assert request("/__acceptance/bootstrap")[0] == 403
             assert request("/__acceptance/bootstrap", control="wrong")[0] == 403
+            for path in ("config", "status", "health", "start"):
+                assert (
+                    request(
+                        f"/__acceptance/{path}", body={} if path == "start" else None
+                    )[0]
+                    == 403
+                )
+            status, config = request(
+                "/__acceptance/config", control=configuration["token"]
+            )
+            assert status == 200 and config["runId"] == configuration["runId"]
+            assert set(config) == {
+                "runId",
+                "candidateCommit",
+                "apiUrl",
+                "iceServers",
+                "forceRelay",
+            }
+            assert configuration["token"] not in json.dumps(config)
+            status, prepared = request(
+                "/__acceptance/status", control=configuration["token"]
+            )
+            assert (
+                status == 200
+                and prepared["phase"] == "prepared"
+                and not prepared["ready"]
+            )
+            assert prepared["children"] == [], (
+                "pre-build direct fixture started a daemon"
+            )
+            pair = json.loads((directory / "evidence/native-binaries.json").read_text())
+            assert set(pair) == {"spawnd", "spawn-worker"}
+            assert all(len(item["sha256"]) == 64 for item in pair.values())
+            assert (
+                request("/__acceptance/health", control=configuration["token"])[0]
+                == 503
+            )
+            assert (
+                request("/__acceptance/bootstrap", control=configuration["token"])[0]
+                == 503
+            )
+            began = time.monotonic()
+            status, starting = request(
+                "/__acceptance/start", control=configuration["token"], body={}
+            )
+            assert time.monotonic() - began < 5, "start blocked on provisioning"
+            assert status == 200 and starting["phase"] == "starting"
+            assert not starting["ready"]
+            assert (
+                request("/__acceptance/start", control=configuration["token"], body={})[
+                    0
+                ]
+                == 200
+            )
+            deadline = time.monotonic() + 90
+            while True:
+                status, state = request(
+                    "/__acceptance/status", control=configuration["token"]
+                )
+                assert status == 200 and state["phase"] != "failed", state
+                if state["ready"]:
+                    break
+                assert time.monotonic() < deadline, "live fixture readiness timed out"
+                time.sleep(0.1)
+            status, health = request(
+                "/__acceptance/health", control=configuration["token"]
+            )
+            assert status == 200 and health["phase"] == "ready" and health["ready"]
+            assert (
+                health["runId"] == config["runId"]
+                and health["candidateCommit"] == config["candidateCommit"]
+            )
             status, bootstrap = request(
                 "/__acceptance/bootstrap", control=configuration["token"]
             )
@@ -317,11 +585,30 @@ def integration():
                 ]
                 == 400
             )
-            assert not (directory / "evidence/evidence.json").exists(), (
-                "API provisioning is not native evidence"
+            owned = [row for row in health["children"] if row["name"] == "daemon"]
+            assert len(owned) == 1 and owned[0]["returncode"] is None
+            os.kill(owned[0]["pid"], signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while True:
+                status, unhealthy = request(
+                    "/__acceptance/health", control=configuration["token"]
+                )
+                if status == 503:
+                    break
+                assert time.monotonic() < deadline, "dead daemon remained healthy"
+                time.sleep(0.05)
+            assert unhealthy["phase"] == "failed" and not unhealthy["ready"]
+            assert "daemon exited unexpectedly" in unhealthy["failure_reason"]
+            assert (
+                request("/__acceptance/start", control=configuration["token"], body={})[
+                    0
+                ]
+                == 503
             )
+            process.wait(timeout=40)
         finally:
-            process.terminate()
+            if process.poll() is None:
+                process.terminate()
             try:
                 process.wait(timeout=40)
             except subprocess.TimeoutExpired:
@@ -330,12 +617,26 @@ def integration():
                 raise AssertionError(
                     "fixture did not shut down its children promptly"
                 ) from None
-        assert process.returncode == 0, log_path.read_text()
+        assert process.returncode != 0, "unexpected daemon death must fail the fixture"
         assert scratch is not None and not scratch.exists(), (
             "disposable fixture directory was not cleaned"
         )
-        assert "Traceback" not in log_path.read_text(), log_path.read_text()
-        print("Real API/daemon fixture boundaries and shutdown passed")
+        report = json.loads((directory / "evidence/evidence.json").read_text())
+        assert report["status"] == "failed" and report["cases"] == []
+        assert report["cleanup_passed"] is True
+        assert "daemon exited unexpectedly" in report["failure_reason"]
+        lifecycle = [
+            json.loads(row)
+            for row in (directory / "evidence/fixture-lifecycle.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert [row["event"] for row in lifecycle].count("starting") == 1
+        assert [row["event"] for row in lifecycle].count("ready") == 1
+        assert lifecycle[-1]["event"] == "failed"
+        print(
+            "Real API/daemon prepared/start/health, account isolation, daemon-kill failure and cleanup passed (orchestration only; no native candidate claim)"
+        )
 
 
 if __name__ == "__main__":

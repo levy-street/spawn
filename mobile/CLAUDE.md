@@ -121,6 +121,10 @@ authenticated loopback acceptance fixture, and the environment described in
 `e2e/NATIVE_ACCEPTANCE.md`. `.github/workflows/native-acceptance.yml` runs both
 platforms against an exact candidate commit with real UDP relay faults. Jest,
 Metro exports, Expo Go, and generated native projects do not satisfy that gate.
+Fixture preparation copies the daemon pair and exposes build configuration;
+the native runner activates live accounts, daemon and sessions only after app
+installation. Startup and liveness failures fail evidence without restarting
+fixture processes.
 
 ## Keeping this file true
 

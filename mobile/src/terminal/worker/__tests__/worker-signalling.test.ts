@@ -329,6 +329,9 @@ describe("host-scoped signalling", () => {
     });
 
     expect(harness.error).toHaveBeenCalledWith("channel_closed", expect.any(String), true);
+    expect(posted(harness, "state")).toContainEqual({ type: "state", state: "reconnecting" });
+    expect(FakePeerConnection.last?.connectionState).toBe("closed");
+    expect(harness.state["pc"]).toBeNull();
   });
 
   test("still rejects a frame bound to a different host session", async () => {

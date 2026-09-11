@@ -167,7 +167,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #resumeTimer: ReturnType<typeof setTimeout> | null = null;
   #reconnectAttempt = 0;
-  #reconnectStartedAt: number | null = null;
+  #connectDeadline: number | null = null;
   #hasEverReady = false;
   /** True once this host has refused an offer from this device. */
   #refused = false;
@@ -361,6 +361,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#parentUnsubscribe = null;
     this.#clearConnectWatchdog();
     this.#clearReconnectTimer();
+    this.#connectDeadline = null;
     clearTimeout(this.#resumeTimer ?? undefined);
     this.#resumeTimer = null;
     this.#workerStarted = false;
@@ -799,6 +800,7 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#clearReconnectTimer();
       this.#detachConsumer();
       this.#clearConnectWatchdog();
+      this.#connectDeadline = null;
       this.#capabilities = null;
       const parentError = this.parent.state === "failed" ? this.parent.lastError : null;
       const error = new HostControlTransportError(
@@ -896,9 +898,12 @@ class WebViewHostTransport implements StreamingHostTransport {
       if (
         matchesActiveBinding &&
         frame["status"] === "unavailable" &&
+        this.#resumeTimer !== null &&
         this.#cachedConfig &&
         this.#workerStarted
       ) {
+        // Only a refused resume earns an immediate fresh binding. An unavailable
+        // offer reaches worker teardown below, then the bounded reconnect delay.
         clearTimeout(this.#resumeTimer ?? undefined);
         this.#resumeTimer = null;
         this.#startPeer(this.#cachedConfig, true);
@@ -939,7 +944,15 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   #startPeer(config: CachedRtcConfig, forceRebuild = false): void {
+    if (this.#remainingConnectTime() === 0) {
+      this.#fail(
+        "connect_timeout",
+        this.#hasEverReady ? LOST_CONNECTION_MESSAGE : CONNECT_TIMEOUT_MESSAGE,
+      );
+      return;
+    }
     this.#setState("connecting");
+    this.#armConnectWatchdog();
     this.#activeRtcSessionId = newUuid();
     this.#activeBindingNonce = encodeHex(randomBytes(16));
     this.#activeBindingGeneration = null;
@@ -1177,7 +1190,7 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#clearReconnectTimer();
       this.#hasEverReady = true;
       this.#reconnectAttempt = 0;
-      this.#reconnectStartedAt = null;
+      this.#connectDeadline = null;
       this.#clearConnectWatchdog();
       if (!this.#capabilities) {
         this.#fail("host_hello", "Host became ready without a capability hello.");
@@ -1190,21 +1203,32 @@ class WebViewHostTransport implements StreamingHostTransport {
 
   #armConnectWatchdog(): void {
     this.#clearConnectWatchdog();
-    this.#connectTimer = setTimeout(() => {
-      this.#connectTimer = null;
-      if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
-      if (
-        this.#hasEverReady &&
-        Date.now() - (this.#reconnectStartedAt ?? Date.now()) < RECONNECT_BUDGET_MS
-      ) {
-        this.#scheduleReconnect();
-        return;
-      }
-      this.#fail(
-        "connect_timeout",
-        this.#hasEverReady ? LOST_CONNECTION_MESSAGE : CONNECT_TIMEOUT_MESSAGE,
-      );
-    }, this.options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS);
+    const remaining = this.#remainingConnectTime();
+    this.#connectTimer = setTimeout(
+      () => {
+        this.#connectTimer = null;
+        if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
+        if (this.#hasEverReady && this.#remainingConnectTime() > 0) {
+          this.#scheduleReconnect();
+          return;
+        }
+        this.#fail(
+          "connect_timeout",
+          this.#hasEverReady ? LOST_CONNECTION_MESSAGE : CONNECT_TIMEOUT_MESSAGE,
+        );
+      },
+      Math.min(remaining, this.options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS),
+    );
+  }
+
+  #remainingConnectTime(): number {
+    // Prompt refusals must not extend the same connection attempt indefinitely.
+    this.#connectDeadline ??=
+      Date.now() +
+      (this.#hasEverReady
+        ? RECONNECT_BUDGET_MS
+        : (this.options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS));
+    return Math.max(0, this.#connectDeadline - Date.now());
   }
 
   #clearConnectWatchdog(): void {
@@ -1218,7 +1242,7 @@ class WebViewHostTransport implements StreamingHostTransport {
       return;
     }
     this.#clearConnectWatchdog();
-    this.#reconnectStartedAt ??= Date.now();
+    const remaining = this.#remainingConnectTime();
     this.#setState("reconnecting");
     const lost = new HostControlTransportError(
       "connection_lost",
@@ -1226,10 +1250,17 @@ class WebViewHostTransport implements StreamingHostTransport {
     );
     this.#emitError({ code: lost.code, message: lost.message, retryable: true });
     this.#rejectActive(lost);
-    const delay = reconnectDelay(this.#reconnectAttempt++);
+    const delay = Math.min(remaining, reconnectDelay(this.#reconnectAttempt++));
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = null;
       if (this.#state === "closed" || this.#state === "failed") return;
+      if (this.#remainingConnectTime() === 0) {
+        this.#fail(
+          "connect_timeout",
+          this.#hasEverReady ? LOST_CONNECTION_MESSAGE : CONNECT_TIMEOUT_MESSAGE,
+        );
+        return;
+      }
       this.#capabilities = null;
       if (this.parent) {
         this.#detachConsumer();

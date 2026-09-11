@@ -65,6 +65,8 @@ async def exercise(fixture: Any) -> None:
     evidence_path = fixture.output / "evidence.json"
 
     def save() -> None:
+        if fixture.failed is not None:
+            report.update(status="failed", failure_reason=fixture.failed)
         temporary = evidence_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(report, indent=2) + "\n")
         temporary.replace(evidence_path)
@@ -79,7 +81,9 @@ async def exercise(fixture: Any) -> None:
         started = time.monotonic()
         save()
         try:
+            await fixture.health()
             row["metrics"] = await action() or {}
+            fixture.raise_if_failed()
             row["status"] = "passed"
         except BaseException as error:
             row.update(status="failed", error=str(error))
@@ -159,6 +163,7 @@ async def exercise(fixture: Any) -> None:
         return values
 
     async def boot() -> dict[str, Any] | None:
+        fixture.raise_if_failed()
         for event in reversed(fixture.events):
             details = event.get("details", {})
             values = details.get("values", {})
@@ -180,8 +185,18 @@ async def exercise(fixture: Any) -> None:
         )
 
     try:
-        # Build time may precede the first app launch. It contributes no
-        # successful native evidence and remains bounded by the fixture timeout.
+        # The installed native runner starts provisioning once. Build time
+        # precedes all live daemon/session work and contributes no evidence.
+        async def provisioned() -> bool:
+            await boot()  # Preserve a runner setup failure before /start.
+            return fixture.status()["ready"]
+
+        await eventually(
+            provisioned,
+            timeout=fixture.args.timeout,
+            message="native fixture was never provisioned",
+        )
+        await fixture.health()
         event = await eventually(
             boot, timeout=fixture.args.timeout, message="native app never booted"
         )
@@ -728,12 +743,18 @@ async def exercise(fixture: Any) -> None:
             }
 
         await case("identity_retirement", identity)
+        await fixture.health()
+        fixture.raise_if_failed()
         report["status"] = "passed"
     except BaseException as error:
-        reason = str(error) or (
-            "native acceptance interrupted before completion"
-            if isinstance(error, asyncio.CancelledError)
-            else type(error).__name__
+        reason = (
+            fixture.failed
+            or str(error)
+            or (
+                "native acceptance interrupted before completion"
+                if isinstance(error, asyncio.CancelledError)
+                else type(error).__name__
+            )
         )
         report.update(status="failed", failure_reason=reason)
         raise

@@ -28,6 +28,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_EVENTS = 20000
+MAX_LIFECYCLE_EVENTS = 32
+PROVISION_TIMEOUT_SECONDS = 75
 
 
 def encoded(value: bytes) -> str:
@@ -128,6 +130,196 @@ class Fixture:
         self.client_ice: list[dict[str, Any]] = []
         self.closed = asyncio.Event()
         self.failed: str | None = None
+        self.phase = "preparing"
+        self.failure_event = asyncio.Event()
+        self.provision_task: asyncio.Task[None] | None = None
+        self.child_watchers: list[asyncio.Task[None]] = []
+        self.child_names: dict[int, str] = {}
+        self.closing = False
+        self.lifecycle_events = 0
+        self.binary_identity: dict[str, Any] = {}
+        self.binary_dir = self.scratch / "bin"
+        self.daemon: asyncio.subprocess.Process | None = None
+
+    def status(self) -> dict[str, Any]:
+        self.check_children()
+        return {
+            "runId": self.run_id,
+            "candidateCommit": self.candidate,
+            "phase": self.phase,
+            "ready": self.phase == "ready" and self.failed is None,
+            "failure_reason": self.failed,
+            "events": len(self.events),
+            "children": [
+                {
+                    "name": self.child_names[child.pid],
+                    "pid": child.pid,
+                    "returncode": child.returncode,
+                }
+                for child in self.children
+            ],
+        }
+
+    def configuration(self) -> dict[str, Any]:
+        # Build-time configuration contains no account or daemon bearer token.
+        return {
+            "runId": self.run_id,
+            "candidateCommit": self.candidate,
+            "apiUrl": self.client_origin,
+            "iceServers": self.client_ice,
+            "forceRelay": self.args.transport == "relay",
+        }
+
+    def lifecycle(self, event: str, **fields: Any) -> None:
+        if self.lifecycle_events >= MAX_LIFECYCLE_EVENTS:
+            return
+        self.lifecycle_events += 1
+        row = {"at": datetime.now(UTC).isoformat(), "event": event, **fields}
+        with (self.output / "fixture-lifecycle.jsonl").open("a") as log:
+            log.write(json.dumps(row) + "\n")
+        print("native-acceptance: " + json.dumps(row), flush=True)
+
+    def fail(self, reason: str) -> None:
+        # Callers supply fixed diagnostics or an exception class, never raw
+        # HTTP bodies, command lines, environment values or credential errors.
+        if self.failed is not None:
+            return
+        self.failed = reason
+        self.phase = "failed"
+        self.failure_event.set()
+        self.lifecycle("failed", failure_reason=reason)
+        path = self.output / "evidence.json"
+        report = (
+            json.loads(path.read_text())
+            if path.exists()
+            else {
+                "schema_version": 1,
+                "suite": "native_connections",
+                "candidate_commit": self.candidate,
+                "baseline_commit": getattr(self.args, "baseline", "0" * 40),
+                "source_clean": self.source_clean,
+                "physical_device": False,
+                "started_at": datetime.now(UTC).isoformat(),
+                "cases": [],
+                "binaries": self.binary_identity,
+            }
+        )
+        report.update(
+            status="failed",
+            failure_reason=reason,
+            completed_at=datetime.now(UTC).isoformat(),
+        )
+        write_json(path, report)
+
+    def check_children(self) -> None:
+        if self.closing:
+            return
+        for process in self.children:
+            if process.returncode is not None:
+                name = self.child_names[process.pid]
+                self.fail(
+                    f"fixture {name} exited unexpectedly (code {process.returncode})"
+                )
+
+    def raise_if_failed(self) -> None:
+        self.check_children()
+        if self.failed is not None:
+            raise RuntimeError(self.failed)
+
+    def watch_child(self, process: asyncio.subprocess.Process, name: str) -> None:
+        self.child_names[process.pid] = name
+
+        async def watch() -> None:
+            await process.wait()
+            self.check_children()
+
+        self.child_watchers.append(asyncio.create_task(watch()))
+
+    async def prepare_binaries(self) -> None:
+        self.binary_dir.mkdir()
+
+        def copy_pair() -> None:
+            for name in ("spawnd", "spawn-worker"):
+                source = self.args.daemon.resolve().parent / name
+                target = self.binary_dir / name
+                shutil.copy2(source, target)
+                version = subprocess.check_output(
+                    [str(target), "--version"], text=True, timeout=10
+                ).strip()
+                with target.open("rb") as executable:
+                    digest = hashlib.file_digest(executable, "sha256").hexdigest()
+                self.binary_identity[name] = {
+                    "version": version,
+                    "sha256": digest,
+                    "candidate_match": f"+g{self.candidate[:12]}" in version,
+                }
+
+        await asyncio.to_thread(copy_pair)
+        write_json(self.output / "native-binaries.json", self.binary_identity)
+
+    def start_provisioning(self) -> dict[str, Any]:
+        # No await between the state check and task assignment: simultaneous
+        # POSTs cannot create another account, daemon or set of sessions.
+        self.raise_if_failed()
+        if self.phase == "prepared" and self.provision_task is None:
+            self.phase = "starting"
+            self.lifecycle("starting")
+            self.provision_task = asyncio.create_task(self.provision_and_verify())
+        return self.status()
+
+    async def provision_and_verify(self) -> None:
+        try:
+            async with asyncio.timeout(PROVISION_TIMEOUT_SECONDS):
+                await self.provision()
+                while not await self.runtime_ready():
+                    self.raise_if_failed()
+                    await asyncio.sleep(0.1)
+                self.raise_if_failed()
+            self.phase = "ready"
+            self.lifecycle("ready")
+        except Exception as error:
+            self.fail(f"fixture provisioning failed ({type(error).__name__})")
+
+    async def runtime_ready(self) -> bool:
+        self.raise_if_failed()
+        if self.daemon is None or len(self.sessions) != 2:
+            return False
+        host = await self.request("GET", f"/api/hosts/{self.host_id}")
+        if host.get("status") != "online":
+            return False
+        for label, session_id in zip(("a", "b"), self.sessions, strict=True):
+            session = await self.request("GET", f"/api/sessions/{session_id}")
+            if (
+                session.get("status") != "running"
+                or session.get("host_id") != self.host_id
+            ):
+                return False
+            pid_file = self.cwd / label / "shell.pid"
+            if (
+                not pid_file.is_file()
+                or not (self.workers / f"{session_id}.sock").exists()
+            ):
+                return False
+            try:
+                os.kill(int(pid_file.read_text()), 0)
+            except (ValueError, OSError):
+                return False
+        self.raise_if_failed()
+        return True
+
+    async def health(self) -> dict[str, Any]:
+        self.raise_if_failed()
+        if self.phase != "ready":
+            raise RuntimeError("fixture is not ready")
+        try:
+            ready = await asyncio.wait_for(self.runtime_ready(), 15)
+        except Exception as error:
+            self.fail(f"fixture health check failed ({type(error).__name__})")
+        else:
+            if not ready:
+                self.fail("fixture host or session readiness was lost")
+        self.raise_if_failed()
+        return self.status()
 
     async def child(
         self, argv: list[str], name: str, **kwargs: Any
@@ -138,6 +330,7 @@ class Fixture:
             *argv, stdout=log, stderr=log, start_new_session=True, **kwargs
         )
         self.children.append(process)
+        self.watch_child(process, name)
         return process
 
     async def start_turn(self) -> None:
@@ -200,6 +393,7 @@ class Fixture:
             start_new_session=True,
         )
         self.children.append(self.proxy)
+        self.watch_child(self.proxy, "UDP proxy")
         assert self.proxy.stdout is not None
         ready = json.loads(await asyncio.wait_for(self.proxy.stdout.readline(), 10))
         if ready.get("event") != "ready":
@@ -266,7 +460,8 @@ class Fixture:
             return auth.issue_access_token(user.id, user.session_epoch)
 
     async def bootstrap_state(self) -> dict[str, Any]:
-        if self.bootstrap is None:
+        self.raise_if_failed()
+        if self.phase != "ready" or self.bootstrap is None:
             raise ValueError("fixture not ready")
         return {
             **self.bootstrap,
@@ -451,31 +646,15 @@ class Fixture:
                 "NO_COLOR": "1",
             }
         )
-        binary_dir = self.scratch / "bin"
-        binary_dir.mkdir()
-        self.binary_identity = {}
-        for name in ("spawnd", "spawn-worker"):
-            source = self.args.daemon.resolve().parent / name
-            shutil.copy2(source, binary_dir / name)
-            version = subprocess.check_output(
-                [str(binary_dir / name), "--version"], text=True
-            ).strip()
-            with (binary_dir / name).open("rb") as executable:
-                digest = hashlib.file_digest(executable, "sha256").hexdigest()
-            self.binary_identity[name] = {
-                "version": version,
-                "sha256": digest,
-                "candidate_match": f"+g{self.candidate[:12]}" in version,
-            }
-        write_json(self.output / "native-binaries.json", self.binary_identity)
         self.daemon = await self.child(
-            [str(binary_dir / "spawnd"), "--server", self.origin, "run"],
+            [str(self.binary_dir / "spawnd"), "--server", self.origin, "run"],
             "daemon",
             env=daemon_env,
             cwd=self.scratch,
         )
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
+            self.raise_if_failed()
             host = await self.request("GET", f"/api/hosts/{self.host_id}")
             if host["status"] == "online":
                 break
@@ -572,10 +751,12 @@ class Fixture:
         native: bool = False,
         timeout: float = 90,
     ) -> dict[str, Any]:
+        self.raise_if_failed()
         command = {"id": str(uuid.uuid4()), "action": action, "payload": payload or {}}
         (self.native_commands if native else self.commands).append(command)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self.raise_if_failed()
             result = self.results.pop(command["id"], None)
             if result:
                 if result.get("status") != "passed":
@@ -589,6 +770,10 @@ class Fixture:
         raise TimeoutError(f"native acceptance command timed out: {action}")
 
     async def close(self) -> None:
+        self.closing = True
+        if self.provision_task is not None and not self.provision_task.done():
+            self.provision_task.cancel()
+            await asyncio.gather(self.provision_task, return_exceptions=True)
         for session in self.sessions:
             try:
                 await self.request("DELETE", f"/api/sessions/{session}")
@@ -634,6 +819,8 @@ class Fixture:
                 raise RuntimeError("fixture worker cleanup failed")
         for log in self.logs:
             log.close()
+        await asyncio.gather(*self.child_watchers, return_exceptions=True)
+        self.closed.set()
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -645,6 +832,9 @@ async def run(args: argparse.Namespace) -> None:
     server = None
     task = None
     try:
+        # The ready-file permits Android to clean Cargo outputs. Private copies
+        # and their hashes must exist before that file is published.
+        await fixture.prepare_binaries()
         await fixture.start_turn()
         # Import configuration only after isolating it from ambient .env files.
         for key in list(os.environ):
@@ -671,6 +861,7 @@ async def run(args: argparse.Namespace) -> None:
         sys.path.insert(0, str(ROOT / "server"))
         import uvicorn
         from fastapi import HTTPException, Request
+        from fastapi.responses import JSONResponse
         from spawn_server.config import get_settings
         from spawn_server.db import Base, dispose_engine, init_engine
         from spawn_server.main import create_app
@@ -687,9 +878,21 @@ async def run(args: argparse.Namespace) -> None:
                 request.headers.get("x-acceptance-token", ""), fixture.token
             ):
                 raise HTTPException(403, "fixture token required")
+            if path == "config" and request.method == "GET":
+                return fixture.configuration()
+            if path == "start" and request.method == "POST":
+                try:
+                    return fixture.start_provisioning()
+                except RuntimeError:
+                    return JSONResponse(status_code=503, content=fixture.status())
+            if path == "health" and request.method == "GET":
+                try:
+                    return await fixture.health()
+                except RuntimeError:
+                    return JSONResponse(status_code=503, content=fixture.status())
             if path == "bootstrap" and request.method == "GET":
-                if fixture.bootstrap is None:
-                    raise HTTPException(503, "fixture not ready")
+                if not fixture.status()["ready"]:
+                    return JSONResponse(status_code=503, content=fixture.status())
                 return await fixture.bootstrap_state()
             if path in {"command", "native-command"} and request.method == "GET":
                 queue = (
@@ -705,6 +908,8 @@ async def run(args: argparse.Namespace) -> None:
                     raise HTTPException(400, str(error)) from error
                 return {"ok": True}
             if path == "device" and request.method == "POST":
+                if not fixture.status()["ready"]:
+                    return JSONResponse(status_code=503, content=fixture.status())
                 body = await request.json()
                 try:
                     await fixture.endorse_device(body["deviceId"], body["publicKey"])
@@ -714,12 +919,7 @@ async def run(args: argparse.Namespace) -> None:
                     ) from error
                 return {"approved": True}
             if path == "status" and request.method == "GET":
-                return {
-                    "runId": fixture.run_id,
-                    "ready": fixture.bootstrap is not None,
-                    "candidateCommit": fixture.candidate,
-                    "events": len(fixture.events),
-                }
+                return fixture.status()
             raise HTTPException(404)
 
         # Request's concrete annotation must remain resolvable with postponed
@@ -748,21 +948,23 @@ async def run(args: argparse.Namespace) -> None:
                 await task
                 raise RuntimeError("acceptance API failed to start")
             await asyncio.sleep(0.05)
-        await fixture.provision()
+        fixture.raise_if_failed()
+        fixture.phase = "prepared"
+        fixture.lifecycle("prepared")
         write_json(
             args.ready_file,
             {
-                "runId": fixture.run_id,
-                "candidateCommit": fixture.candidate,
-                "apiUrl": fixture.client_origin,
+                **fixture.configuration(),
                 "token": fixture.token,
-                "iceServers": fixture.client_ice,
-                "forceRelay": args.transport == "relay",
             },
             private=True,
         )
-        print("native-acceptance: isolated fixture ready", flush=True)
+        print("native-acceptance: isolated fixture prepared", flush=True)
         if args.provision_only:
+            fixture.start_provisioning()
+            assert fixture.provision_task is not None
+            await fixture.provision_task
+            await fixture.health()
             return
         import importlib.util
 
@@ -772,7 +974,34 @@ async def run(args: argparse.Namespace) -> None:
         assert spec and spec.loader
         suite = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(suite)
-        await asyncio.wait_for(suite.exercise(fixture), args.timeout)
+        exercise = asyncio.create_task(suite.exercise(fixture))
+        failed = asyncio.create_task(fixture.failure_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (exercise, failed, task),
+                timeout=args.timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if failed in done:
+                fixture.raise_if_failed()
+            if task in done:
+                fixture.fail("fixture API exited unexpectedly")
+                fixture.raise_if_failed()
+            if exercise not in done:
+                fixture.fail("native acceptance exceeded its fixture deadline")
+                raise TimeoutError(fixture.failed)
+            await exercise
+        finally:
+            for pending in (exercise, failed):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(exercise, failed, return_exceptions=True)
+    except BaseException as error:
+        # The suite persists its own actionable failure. Earlier setup and
+        # child failures still need evidence when no native case has begun.
+        if not (fixture.output / "evidence.json").exists():
+            fixture.fail(f"fixture setup interrupted ({type(error).__name__})")
+        raise
     finally:
         cleanup_error = None
         try:

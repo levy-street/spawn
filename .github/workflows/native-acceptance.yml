@@ -111,7 +111,7 @@ jobs:
           cargo build --locked --bin spawnd --bin spawn-worker
       - name: Verify real fixture integration before native build
         run: server/.venv/bin/python scripts/test-native-acceptance.py --integration
-      - name: Start isolated acceptance fixture
+      - name: Prepare isolated acceptance API and relay
         env:
           CLIENT_HOST: ${{ matrix.client-host }}
           BASELINE: ${{ inputs.baseline }}
@@ -134,11 +134,13 @@ jobs:
           else:
               raise SystemExit("Isolated acceptance fixture failed to become ready")
           config = json.loads(ready.read_text())
-          request = urllib.request.Request("http://127.0.0.1:18100/__acceptance/bootstrap",
+          request = urllib.request.Request("http://127.0.0.1:18100/__acceptance/config",
               headers={"X-Acceptance-Token": config["token"]})
           with urllib.request.urlopen(request, timeout=15) as response:
-              bootstrap = json.load(response)
-          for secret in [config["token"], bootstrap["bearerToken"],
+              build_config = json.load(response)
+          assert build_config["candidateCommit"] == config["candidateCommit"]
+          assert build_config["runId"] == config["runId"]
+          for secret in [config["token"],
                          *[server.get("credential", "") for server in config["iceServers"]]]:
               if secret:
                   print("::add-mask::" + secret)
@@ -151,7 +153,7 @@ jobs:
         timeout-minutes: 5
         working-directory: daemon
         # Readiness above follows copying both executables into the fixture's
-        # private bin directory; the running fixture no longer uses target/.
+        # private bin directory; later activation no longer uses target/.
         run: cargo clean
       - name: Build native Release acceptance shell
         env:

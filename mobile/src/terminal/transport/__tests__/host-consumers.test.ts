@@ -270,3 +270,24 @@ test("parent loss clears backpressured consumer work and fences delayed events o
     consumer.close();
   }
 });
+
+test("parent outage does not consume a fresh tool attachment budget", async () => {
+  jest.useFakeTimers();
+  const h = harness();
+  const consumer = h.create();
+  try {
+    const opening = consumer.open().catch((error: unknown) => error);
+    await jest.advanceTimersByTimeAsync(20_000);
+    h.setState("connecting");
+    await jest.advanceTimersByTimeAsync(40_000);
+    expect(consumer.state).toBe("connecting");
+    h.setState("ready");
+    await jest.advanceTimersByTimeAsync(1);
+    expect(consumer.state).toBe("connecting");
+    h.channel(1).open();
+    expect(await opening).toBeUndefined();
+    expect(consumer.state).toBe("ready");
+  } finally {
+    consumer.close();
+  }
+});

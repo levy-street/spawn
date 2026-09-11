@@ -90,6 +90,9 @@ canary, and `docs/DEVICE_CONNECTIONS.md` distinguishes automated native
 evidence from physical-device and production observations. The lightweight
 fixture, UDP fault-proxy and evidence-validator regressions run in
 `scripts/test-all.sh`; the real native builds run on hosted platform runners.
+Native fixtures prepare build configuration before compilation and activate
+their daemon only after app installation. Unexpected fixture process exits
+permanently fail acceptance; they are not silently restarted.
 
 ## These files stay true, or they are worse than nothing
 
