@@ -30,6 +30,19 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_EVENTS = 20000
 MAX_LIFECYCLE_EVENTS = 32
 PROVISION_TIMEOUT_SECONDS = 75
+CONTROL_TRACE_PATHS = frozenset(
+    {
+        "config",
+        "start",
+        "status",
+        "health",
+        "bootstrap",
+        "device",
+        "event",
+        "command",
+        "native-command",
+    }
+)
 
 
 def encoded(value: bytes) -> str:
@@ -68,7 +81,12 @@ class ApiRequestTrace:
                 # The router template excludes path parameters as well as the
                 # query string. Never copy raw request URLs, headers or bodies.
                 route = getattr(scope.get("route"), "path", "")
-                if route.startswith("/api/"):
+                control_path = scope.get("path_params", {}).get("path")
+                is_control = (
+                    route == "/__acceptance/{path}"
+                    and control_path in CONTROL_TRACE_PATHS
+                )
+                if route.startswith("/api/") or is_control:
                     headers = dict(scope.get("headers", []))
                     method = scope.get("method")
                     record = {
@@ -85,6 +103,12 @@ class ApiRequestTrace:
                         .startswith(b"bearer "),
                         "has_client_id": b"x-spawn-client" in headers,
                     }
+                    if is_control:
+                        # Only known control names, never arbitrary path values.
+                        # A refused initial bootstrap cannot report its own error
+                        # over this same channel, so retain its response status.
+                        record["control"] = control_path
+                        record["has_control_token"] = b"x-acceptance-token" in headers
                     self.count += 1
                     with self.output.open("a") as log:
                         log.write(json.dumps(record) + "\n")

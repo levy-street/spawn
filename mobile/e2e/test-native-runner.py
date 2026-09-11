@@ -152,7 +152,9 @@ class NativeRunnerSetup(unittest.TestCase):
             .read_text()
             .splitlines()
         ]
-        failure = records[-1]
+        failure = next(record for record in records
+            if record.get("status") == "failed"
+            and record.get("command", [])[:3] == ["xcrun", "simctl", "install"])
         self.assertEqual(failure["status"], "failed")
         self.assertEqual(failure["error_type"], "TimeoutExpired")
         self.assertIn("installer started", failure["stdout"])
@@ -206,6 +208,174 @@ class NativeRunnerSetup(unittest.TestCase):
         self.runner.event.side_effect = ConnectionError("fixture unavailable")
         with self.assertRaisesRegex(RuntimeError, "native setup failed"):
             self.runner.execute()
+
+    def configure_android_capture(self):
+        self.runner.args.platform = "android"
+        self.runner.device = "emulator-5554"
+        self.runner.validated_device = self.runner.device
+
+    def test_android_failure_captures_screen_and_redacted_hierarchy_before_logs(self):
+        self.configure_android_capture()
+        failure = RuntimeError("original controller startup failure")
+        self.runner.install = Mock(side_effect=failure)
+        order, commands = [], []
+        self.runner.collect_logs.side_effect = lambda: order.append("logs")
+        raw = b'<hierarchy><node text="Controller: fixture-secret Bearer private-token" /></hierarchy>'
+
+        def run(command, **kwargs):
+            commands.append((list(command), kwargs))
+            self.assertEqual(list(command)[:3], ["adb", "-s", "emulator-5554"])
+            self.assertLessEqual(kwargs["timeout"], 30)
+            if command[3:5] == ["exec-out", "screencap"]:
+                order.append("screenshot")
+                kwargs["stdout"].write(b"isolated-screenshot-fixture")
+            elif list(command)[3:6] == ["shell", "uiautomator", "dump"]:
+                order.append("dump")
+            elif command[3:5] == ["exec-out", "head"]:
+                order.append("read")
+                return subprocess.CompletedProcess(command, 0, raw, b"")
+            elif list(command)[3:6] == ["shell", "rm", "-f"]:
+                order.append("cleanup")
+            else:
+                self.fail(f"unexpected native diagnostic command: {command}")
+            return subprocess.CompletedProcess(command, 0, "completed", "")
+
+        with patch.object(module.subprocess, "run", side_effect=run):
+            with self.assertRaises(RuntimeError) as error:
+                self.runner.execute()
+        self.assertIs(error.exception, failure)
+        self.assertEqual(order, ["screenshot", "dump", "read", "cleanup", "logs"])
+        self.assertTrue((self.runner.args.output / "runner-failure.png").is_file())
+        xml = (self.runner.args.output / "runner-failure-ui.xml").read_text()
+        self.assertIn("Controller:", xml)
+        self.assertNotIn("fixture-secret", xml)
+        self.assertNotIn("private-token", xml)
+        remote = commands[1][0][-1]
+        self.assertRegex(remote, r"^/data/local/tmp/spawnd-acceptance-[0-9a-f]{32}\.xml$")
+        self.assertEqual(commands[2][0][-1], remote)
+        self.assertEqual(commands[3][0][-1], remote)
+        self.assertEqual(commands[2][0][-2], str(module.ACCESSIBILITY_DUMP_LIMIT + 1))
+        trace = (self.runner.args.output / "native-runner.jsonl").read_text()
+        self.assertNotIn("fixture-secret", trace)
+        self.assertNotIn("private-token", trace)
+
+    def test_capture_errors_and_full_output_disk_preserve_original_exception(self):
+        self.configure_android_capture()
+        failure = TimeoutError("original native deadline")
+        self.runner.install = Mock(side_effect=failure)
+        self.runner.screenshot = Mock(side_effect=OSError("screenshot fixture-secret"))
+        self.runner.accessibility_dump = Mock(side_effect=OSError("dump fixture-secret"))
+        self.runner.diagnostic = Mock(side_effect=OSError("disk full"))
+        self.runner.event.side_effect = ConnectionError("fixture offline")
+        self.runner.collect_logs.side_effect = OSError("logs disk full")
+        with self.assertRaises(TimeoutError) as error:
+            self.runner.execute()
+        self.assertIs(error.exception, failure)
+        self.runner.screenshot.assert_called_once_with("runner-failure", timeout=30)
+        self.runner.accessibility_dump.assert_called_once()
+        self.runner.collect_logs.assert_called_once()
+
+    def test_passed_finish_with_log_collection_failure_fails_the_job(self):
+        self.configure_android_capture()
+        failure = OSError("required log output could not be written")
+        self.runner.install = Mock()
+        self.runner.control = Mock(return_value={"id": "fixture-command", "action": "finish"})
+        self.runner.perform = Mock(return_value={"status": "passed"})
+        self.runner.collect_logs.side_effect = failure
+        with self.assertRaises(OSError) as error:
+            self.runner.execute()
+        self.assertIs(error.exception, failure)
+
+    def test_failed_finish_captures_best_effort_and_preserves_failure_exit(self):
+        self.configure_android_capture()
+        self.runner.install = Mock()
+        self.runner.control = Mock(return_value={"id": "fixture-command", "action": "finish"})
+        self.runner.perform = Mock(return_value={"status": "failed"})
+        order = []
+
+        def screenshot(*args, **kwargs):
+            order.append("screenshot")
+            raise OSError("screenshot failed")
+
+        def dump():
+            order.append("accessibility")
+            raise OSError("accessibility failed")
+
+        self.runner.screenshot = Mock(side_effect=screenshot)
+        self.runner.accessibility_dump = Mock(side_effect=dump)
+        self.runner.collect_logs.side_effect = lambda: order.append("logs")
+        self.assertEqual(self.runner.execute(), 1)
+        self.assertEqual(order, ["screenshot", "accessibility", "logs"])
+        self.runner.screenshot.assert_called_once_with("runner-failure", timeout=30)
+        self.runner.accessibility_dump.assert_called_once()
+        self.runner.event.assert_called_once_with("finish", {"status": "failed"}, "fixture-command")
+
+    def test_failed_action_reporting_cannot_replace_original_runtime_error(self):
+        self.configure_android_capture()
+        failure = RuntimeError("original native action failed")
+        self.runner.install = Mock()
+        self.runner.control = Mock(return_value={"id": "fixture-command", "action": "background"})
+        self.runner.perform = Mock(side_effect=failure)
+        self.runner.event.side_effect = ConnectionError("fixture offline")
+        self.runner.capture_failure = Mock()
+        with self.assertRaises(RuntimeError) as error:
+            self.runner.execute()
+        self.assertIs(error.exception, failure)
+        self.runner.capture_failure.assert_called_once()
+        self.runner.collect_logs.assert_called_once()
+
+    def test_failed_android_dump_still_removes_only_its_own_remote_file(self):
+        self.configure_android_capture()
+        failure = subprocess.TimeoutExpired("uiautomator", 10)
+        calls = []
+
+        def command(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[3:6] == ("shell", "uiautomator", "dump"):
+                raise failure
+            return "removed"
+
+        self.runner.command = Mock(side_effect=command)
+        with self.assertRaises(subprocess.TimeoutExpired) as error:
+            self.runner.accessibility_dump()
+        self.assertIs(error.exception, failure)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0][:6], ("adb", "-s", "emulator-5554", "shell", "rm", "-f"))
+        self.assertEqual(calls[0][0][-1], calls[1][0][-1])
+        self.assertEqual(calls[1][1]["timeout"], 10)
+
+    def test_oversized_hierarchy_is_not_written_or_logged_raw(self):
+        self.configure_android_capture()
+        self.runner.command = Mock(return_value="completed")
+        raw = b"fixture-secret" + b"x" * module.ACCESSIBILITY_DUMP_LIMIT
+        with patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, raw, b"")):
+            with self.assertRaisesRegex(ValueError, "diagnostic limit"):
+                self.runner.accessibility_dump()
+        self.assertFalse((self.runner.args.output / "runner-failure-ui.xml").exists())
+        self.assertEqual(self.runner.command.call_args.args[3:6], ("shell", "rm", "-f"))
+
+    def test_rejected_physical_device_receives_no_failure_captures_or_logs(self):
+        self.runner.args.platform = "android"
+        self.runner.device = "physical-device-serial"
+        self.runner.command = Mock(return_value="0")
+        self.runner.screenshot = Mock()
+        self.runner.accessibility_dump = Mock()
+        with self.assertRaisesRegex(RuntimeError, "refuses physical Android"):
+            self.runner.execute()
+        self.assertEqual(self.runner.command.call_args_list, [unittest.mock.call(
+            "adb", "-s", "physical-device-serial", "shell", "getprop", "ro.kernel.qemu")])
+        self.runner.screenshot.assert_not_called()
+        self.runner.accessibility_dump.assert_not_called()
+        self.runner.collect_logs.assert_not_called()
+
+    def test_device_changed_after_validation_is_not_captured(self):
+        self.configure_android_capture()
+        self.runner.device = "emulator-5556"
+        self.runner.screenshot = Mock()
+        self.runner.accessibility_dump = Mock()
+        self.runner.capture_failure()
+        self.runner.screenshot.assert_not_called()
+        self.runner.accessibility_dump.assert_not_called()
 
     def test_live_fixture_starts_only_after_native_install_and_health_precedes_launch(self):
         order = []

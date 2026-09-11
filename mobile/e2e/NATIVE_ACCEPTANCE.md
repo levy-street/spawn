@@ -83,6 +83,15 @@ and stderr, and failures with credentials redacted. Setup failures report a
 failed `runner-error` event to the fixture and still fail the job; product cases
 are not retried or accepted when setup fails.
 
+The controller records fixed startup phases and redacted local failures in
+`native.log`, even when fixture event reporting is unavailable. The bounded
+HTTP trace includes known control routes and token-presence flags without
+recording tokens or request content. Once fixture provisioning is ready, app
+boot has its own 180-second limit; failure starts no connection cases. Runner
+failures capture a screenshot and a bounded, redacted Android accessibility
+dump on the validated emulator. Diagnostic failures preserve the original
+failure, and temporary accessibility files are removed from that emulator.
+
 Fixture preparation starts the API and relay and copies the exact daemon/worker
 pair. Its authenticated build configuration contains the run, candidate and ICE
 configuration, without requiring live accounts or sessions. After compilation,
@@ -176,14 +185,17 @@ well as counts across lifecycle transitions. Destroyed/background workers can
 leave stale observations, so readiness requires a fresh sample, and retirement
 also needs independent daemon evidence.
 App-state events include `nativeDateMs`, captured with the actual lifecycle
-notification, so the suite checks the measured background interval. `deviceId`
+notification, so the suite checks the measured background interval. Background
+case `recovery_ms` measures the full control round trip, including the background
+wait and command overhead. `deviceId`
 supports revoking the registered key through the normal browser-device API.
 
 GitHub artifacts are `acceptance-native-ios` and `acceptance-native-android`.
 They contain fixture `evidence.json`/events/logs and runner metadata/screenshots.
-`api-requests.jsonl` records bounded API response metadata: route templates,
-methods, status codes, and whether bearer/client headers were present. It omits
-header values, URL parameters, query strings and request/response bodies.
+`api-requests.jsonl` records bounded API and acceptance-control response metadata:
+route templates, methods, status codes, and whether bearer/client headers or a
+control token were present. It omits header and token values, URL parameters,
+query strings and request/response bodies.
 The aggregate acceptance gate validates both candidate-bound verdicts. No
 physical-device, Wi-Fi/cellular handover, production canary or user interface
 navigation pass is implied by these simulator/emulator artifacts.

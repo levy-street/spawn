@@ -128,6 +128,38 @@ export function NativeAcceptanceController(): React.JSX.Element {
   useEffect(() => {
     let stopped = false;
     let current: Bootstrap;
+    let startupPhase = "mounted";
+    const startupError = (error: unknown) => {
+      let message = String(error);
+      for (const secret of [
+        build?.token,
+        current?.bearerToken,
+        current?.secondAccount?.bearerToken,
+      ]) {
+        if (secret) message = message.replaceAll(secret, "[REDACTED]");
+      }
+      return message
+        .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[REDACTED_JWT]")
+        .replace(/(Bearer\s+)[A-Za-z0-9._~+-]+/gi, "$1[REDACTED]")
+        .slice(0, 1000);
+    };
+    const diagnostic = (phase: string, error?: string) => {
+      startupPhase = phase;
+      const message = JSON.stringify({
+        type: "native-acceptance-startup",
+        phase,
+        candidate_commit: build?.candidateCommit ?? null,
+        source_clean: build?.sourceClean === true,
+        platform: Platform.OS,
+        token_configured: typeof build?.token === "string" && build.token.length >= 32,
+        ...(error === undefined ? {} : { error }),
+      });
+      // The control endpoint itself may be unreachable. Keep a bounded local
+      // diagnostic without serializing the configuration or bootstrap secrets.
+      if (error === undefined) console.info(message);
+      else console.error(message);
+    };
+    diagnostic(startupPhase);
     const snapshot = () => ({
       appState: AppState.currentState,
       nativeDateMs: Date.now(),
@@ -392,16 +424,22 @@ export function NativeAcceptanceController(): React.JSX.Element {
     });
     void (async () => {
       try {
+        diagnostic("bootstrap");
         current = await control<Bootstrap>("/__acceptance/bootstrap");
         if (current.candidateCommit !== build?.candidateCommit)
           throw new Error("Fixture candidate differs from the embedded native candidate.");
+        diagnostic("authentication");
         await authenticate(current);
+        diagnostic("account-gate");
         await until(() => accountRef.current.ready, "Authenticated app did not initialize.");
+        diagnostic("device-registration");
         await register();
         if (stopped) return;
         setBootstrap(current);
         setStatus("Native acceptance ready");
+        diagnostic("boot-report");
         await event("boot", { runId: current.runId, snapshot: snapshot() }, undefined, "passed");
+        diagnostic("ready");
         while (!stopped) {
           if (AppState.currentState !== "active") {
             await wait(250);
@@ -432,13 +470,12 @@ export function NativeAcceptanceController(): React.JSX.Element {
           }
         }
       } catch (error) {
-        setStatus(String(error));
-        await event(
-          "boot",
-          { error: String(error), snapshot: snapshot() },
-          undefined,
-          "failed",
-        ).catch(() => {});
+        const message = startupError(error);
+        diagnostic(startupPhase, message);
+        setStatus(message);
+        await event("boot", { error: message, snapshot: snapshot() }, undefined, "failed").catch(
+          () => {},
+        );
       }
     })();
     return () => {

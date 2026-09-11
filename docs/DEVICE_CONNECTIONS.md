@@ -52,8 +52,9 @@ the native bridge. Each host-tool surface has its own host-control channel,
 request/stream state, a bounded send queue and receive credits; closing or
 failing it leaves the root, other tools and terminal attachments intact. Three
 seconds in the background may retire the transport; foreground reopening
-restores views. Neither backgrounding nor closing the last view terminates a
-session. Signing out, changing accounts, or revoking host trust
+also checks the deadline because native runtimes can pause JavaScript timers.
+Reopening restores views. Neither backgrounding nor closing the last view
+terminates a session. Signing out, changing accounts, or revoking host trust
 retires the affected connections and pending work. Replacing the phone's signing
 key also recreates its host and terminal workers, even within the same account.
 

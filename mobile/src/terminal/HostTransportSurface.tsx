@@ -119,27 +119,38 @@ function HostTransportInstance({
 
   useEffect(() => {
     let backgroundTimer: ReturnType<typeof setTimeout> | null = null;
+    let backgroundDeadline: number | null = null;
+    const retireBackground = () => {
+      if (backgroundDeadline === null || Date.now() < backgroundDeadline) return;
+      backgroundDeadline = null;
+      backgroundTimer = null;
+      retiredForBackground.current = true;
+      rootTransport.close();
+    };
     const subscription = AppState.addEventListener("change", (nextState) => {
       if (nextState === "inactive") return;
       if (nextState === "background") {
-        if (!workerLoaded.current || backgroundTimer !== null) return;
-        backgroundTimer = setTimeout(() => {
-          backgroundTimer = null;
-          retiredForBackground.current = true;
-          rootTransport.close();
-        }, 3_000);
+        if (!workerLoaded.current || backgroundDeadline !== null || retiredForBackground.current)
+          return;
+        backgroundDeadline = Date.now() + 3_000;
+        backgroundTimer = setTimeout(retireBackground, 3_000);
         return;
       }
       if (backgroundTimer !== null) {
         clearTimeout(backgroundTimer);
         backgroundTimer = null;
       }
+      // Native runtimes can pause timers in the background. Retire an expired
+      // connection before foreground reopening even if its timer never ran.
+      if (backgroundDeadline !== null && Date.now() >= backgroundDeadline) retireBackground();
+      backgroundDeadline = null;
       if (!retiredForBackground.current || !workerLoaded.current) return;
       retiredForBackground.current = false;
       openTransport();
     });
     return () => {
       if (backgroundTimer !== null) clearTimeout(backgroundTimer);
+      backgroundDeadline = null;
       subscription.remove();
     };
   }, [openTransport, rootTransport]);

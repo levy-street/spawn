@@ -1,4 +1,5 @@
 import { waitFor } from "@testing-library/react-native";
+import { authToken } from "@/data/api/auth-token";
 import { NativeAcceptanceController } from "../e2e/native-controller";
 import { renderWithProviders } from "./render";
 
@@ -92,5 +93,71 @@ test("boot endorses and reports the server device row instead of the local key I
     await view.unmount();
     view.queryClient.clear();
     fetch.mockRestore();
+  }
+});
+
+test("bootstrap request failure stays locally visible when failure reporting also fails", async () => {
+  const secret = "t".repeat(32);
+  const log = jest.spyOn(console, "error").mockImplementation(() => {});
+  const fetch = jest
+    .spyOn(globalThis, "fetch")
+    .mockRejectedValue(new Error(`Network request failed ${secret} Bearer private-token`));
+  const view = await renderWithProviders(<NativeAcceptanceController />);
+  try {
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('"phase":"bootstrap"'));
+    const diagnostic = log.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(diagnostic).toContain("Network request failed");
+    expect(diagnostic).toContain('"candidate_commit":"candidate"');
+    expect(diagnostic).not.toContain(secret);
+    expect(diagnostic).not.toContain("private-token");
+  } finally {
+    await view.unmount();
+    view.queryClient.clear();
+    fetch.mockRestore();
+    log.mockRestore();
+  }
+});
+
+test("an authentication failure redacts both fixture accounts and JWTs before local reporting", async () => {
+  const firstToken = "first-fixture-account-secret";
+  const secondToken = "second-fixture-account-secret";
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signature";
+  const log = jest.spyOn(console, "error").mockImplementation(() => {});
+  jest
+    .mocked(authToken.set)
+    .mockRejectedValueOnce(
+      new Error(`Native storage rejected ${firstToken} ${secondToken} ${jwt}`),
+    );
+  const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    if (String(input).endsWith("/__acceptance/bootstrap"))
+      return new Response(
+        JSON.stringify({
+          accountId: ACCOUNT_ID,
+          bearerToken: firstToken,
+          candidateCommit: "candidate",
+          secondAccount: { accountId: "other-account", bearerToken: secondToken },
+        }),
+        { status: 200 },
+      );
+    throw new Error("Failure reporting unavailable");
+  });
+  const view = await renderWithProviders(<NativeAcceptanceController />);
+  try {
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('"phase":"authentication"'));
+    const diagnostic = log.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(diagnostic).toContain("Native storage rejected");
+    for (const secret of [firstToken, secondToken, jwt]) {
+      expect(diagnostic).not.toContain(secret);
+      expect(view.getByLabelText("Native acceptance status").props["children"]).not.toContain(
+        secret,
+      );
+    }
+  } finally {
+    await view.unmount();
+    view.queryClient.clear();
+    fetch.mockRestore();
+    log.mockRestore();
   }
 });

@@ -108,6 +108,8 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   channels through the native bridge. Rebuild `worker.html` and `worker-html.ts` with
   `node src/terminal/worker/build-worker.mjs` after worker source edits.
   Read `docs/DEVICE_CONNECTIONS.md` before changing lifecycle or control rules.
+  Native surfaces check the three-second background deadline on foreground as
+  well as in the timer callback, because the runtime can pause background timers.
 
 ## Before calling a change done
 
@@ -125,6 +127,9 @@ Fixture preparation copies the daemon pair and exposes build configuration;
 the native runner activates live accounts, daemon and sessions only after app
 installation. Startup and liveness failures fail evidence without restarting
 fixture processes.
+After fixture readiness, app boot has a separate 180-second deadline. Local
+startup diagnostics and validated-device failure captures remain available
+when the acceptance control channel cannot report an error.
 
 ## Keeping this file true
 

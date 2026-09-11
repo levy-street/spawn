@@ -93,6 +93,8 @@ fixture, UDP fault-proxy and evidence-validator regressions run in
 Native fixtures prepare build configuration before compilation and activate
 their daemon only after app installation. Unexpected fixture process exits
 permanently fail acceptance; they are not silently restarted.
+After fixture readiness, native app boot has a separate 180-second budget;
+local startup diagnostics and scoped device captures preserve setup failures.
 
 ## These files stay true, or they are worse than nothing
 

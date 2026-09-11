@@ -149,6 +149,82 @@ describe("TerminalSurface", () => {
     jest.useRealTimers();
   });
 
+  test.each([2_999, 3_000, 5_549])(
+    "foreground checks %i ms elapsed while terminal background timers were suspended",
+    async (elapsed) => {
+      jest.useFakeTimers();
+      let listener: ((state: AppStateStatus) => void) | undefined;
+      const appState = jest
+        .spyOn(AppState, "addEventListener")
+        .mockImplementation((_type, next) => {
+          listener = next;
+          return { remove: jest.fn() };
+        });
+      const screen = await render(<TerminalSurface {...props()} />);
+      try {
+        await act(() => mockWebViewProps.onLoad?.());
+        await act(() => listener?.("active"));
+        const started = Date.now();
+        await act(() => listener?.("background"));
+        jest.setSystemTime(started + 1_000);
+        await act(() => listener?.("background"));
+        await act(() => listener?.("inactive"));
+        jest.setSystemTime(started + elapsed);
+        expect(mockClose).not.toHaveBeenCalled();
+        await act(() => listener?.("active"));
+        const retired = elapsed >= 3_000 ? 1 : 0;
+        expect(mockClose).toHaveBeenCalledTimes(retired);
+        expect(mockOpen).toHaveBeenCalledTimes(1 + retired);
+        if (retired) {
+          expect(mockClose.mock.invocationCallOrder[0]).toBeLessThan(
+            mockOpen.mock.invocationCallOrder[1] ?? 0,
+          );
+        }
+        await act(() => jest.advanceTimersByTime(3_000));
+        await act(() => listener?.("active"));
+        expect(mockClose).toHaveBeenCalledTimes(retired);
+        expect(mockOpen).toHaveBeenCalledTimes(1 + retired);
+      } finally {
+        await screen.unmount();
+        appState.mockRestore();
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  test("an earlier background callback cannot retire a new terminal grace period", async () => {
+    jest.useFakeTimers();
+    const timers = jest.spyOn(globalThis, "setTimeout");
+    let listener: ((state: AppStateStatus) => void) | undefined;
+    const appState = jest.spyOn(AppState, "addEventListener").mockImplementation((_type, next) => {
+      listener = next;
+      return { remove: jest.fn() };
+    });
+    const screen = await render(<TerminalSurface {...props()} />);
+    try {
+      await act(() => mockWebViewProps.onLoad?.());
+      await act(() => listener?.("active"));
+      await act(() => listener?.("background"));
+      const oldTimer = timers.mock.calls.findLast((call) => call[1] === 3_000)?.[0];
+      if (typeof oldTimer !== "function") throw new Error("Missing retirement timer.");
+      jest.setSystemTime(Date.now() + 1_000);
+      await act(() => listener?.("active"));
+      await act(() => listener?.("background"));
+      jest.setSystemTime(Date.now() + 1_000);
+      await act(() => oldTimer());
+      expect(mockClose).not.toHaveBeenCalled();
+      jest.setSystemTime(Date.now() + 2_000);
+      await act(() => listener?.("active"));
+      expect(mockClose).toHaveBeenCalledTimes(1);
+      expect(mockOpen).toHaveBeenCalledTimes(2);
+    } finally {
+      await screen.unmount();
+      appState.mockRestore();
+      timers.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
   test("retires in background and reconnects after foregrounding", async () => {
     jest.useFakeTimers();
     let listener: ((state: AppStateStatus) => void) | undefined;

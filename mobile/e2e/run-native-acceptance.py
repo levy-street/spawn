@@ -9,14 +9,17 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from urllib.parse import urlparse
+import uuid
 
 APP_ID = "dev.spawnd.acceptance"
 SIMULATOR_INSTALL_TIMEOUT_SECONDS = 600
 FIXTURE_START_TIMEOUT_SECONDS = 90
 DIAGNOSTIC_STREAM_LIMIT = 32_768
+ACCESSIBILITY_DUMP_LIMIT = 262_144
 
 
 def local_origin(value: str) -> str:
@@ -40,6 +43,7 @@ class Runner:
             raise ValueError("Native artifact platform/application mismatch")
         self.origin = local_origin(args.fixture_url)
         self.device = args.device
+        self.validated_device: str | None = None
         self.secrets = [self.ready["token"]]
         for server in self.ready.get("iceServers", []):
             self.secrets.extend(str(server[key]) for key in ("username", "credential") if key in server)
@@ -155,6 +159,7 @@ class Runner:
                 self.device = devices[0]
             if self.adb("shell", "getprop", "ro.kernel.qemu") != "1":
                 raise RuntimeError("Acceptance runner refuses physical Android devices")
+            self.validated_device = self.device
             platform_info = {"sdk": self.adb("shell", "getprop", "ro.build.version.sdk"),
                 "release": self.adb("shell", "getprop", "ro.build.version.release"),
                 "model": self.adb("shell", "getprop", "ro.product.model"), "device": self.device}
@@ -173,6 +178,7 @@ class Runner:
             selected = next(((runtime, device) for runtime, device in available if device["udid"] == self.device), None)
             if not selected:
                 raise RuntimeError("Requested device is not an available iPhone simulator")
+            self.validated_device = self.device
             platform_info = {"runtime": selected[0], "device": self.device, "model": selected[1]["name"],
                 "initial_state": selected[1]["state"]}
             self.platform_phase(platform_info, "selected")
@@ -198,16 +204,63 @@ class Runner:
         else:
             self.simctl("launch", self.device, APP_ID)
 
-    def screenshot(self, label: str) -> str:
+    def screenshot(self, label: str, *, timeout: int = 120) -> str:
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)[:80]
         path = self.args.output / (safe + ".png")
         if self.args.platform == "android":
             with path.open("wb") as output:
                 subprocess.run(["adb", "-s", self.device, "exec-out", "screencap", "-p"],
-                    stdout=output, check=True, timeout=30)
+                    stdout=output, stderr=subprocess.PIPE, check=True, timeout=min(timeout, 30))
         else:
-            self.simctl("io", self.device, "screenshot", str(path))
+            self.simctl("io", self.device, "screenshot", str(path), timeout=timeout)
         return path.name
+
+    def accessibility_dump(self) -> str:
+        if self.args.platform != "android" or not self.device or self.device != self.validated_device:
+            raise RuntimeError("Accessibility capture requires the validated Android emulator")
+        remote = f"/data/local/tmp/spawnd-acceptance-{uuid.uuid4().hex}.xml"
+        try:
+            self.command("adb", "-s", self.device, "shell", "uiautomator", "dump", remote, timeout=10)
+            # Bound bytes before decoding, and never log/persist raw hierarchy
+            # content. A too-large dump fails this optional diagnostic instead.
+            result = subprocess.run(
+                ["adb", "-s", self.device, "exec-out", "head", "-c",
+                 str(ACCESSIBILITY_DUMP_LIMIT + 1), remote],
+                capture_output=True, check=True, timeout=10,
+            )
+            if len(result.stdout) > ACCESSIBILITY_DUMP_LIMIT:
+                raise ValueError("Android accessibility dump exceeds its diagnostic limit")
+            redacted = self.redact(result.stdout.decode("utf-8", errors="replace"))
+            if len(redacted.encode()) > ACCESSIBILITY_DUMP_LIMIT:
+                raise ValueError("Redacted accessibility dump exceeds its diagnostic limit")
+            path = self.args.output / "runner-failure-ui.xml"
+            path.write_text(redacted)
+            return path.name
+        finally:
+            try:
+                self.command("adb", "-s", self.device, "shell", "rm", "-f", remote, timeout=10)
+            except Exception:
+                # Cleanup is scoped to this unique file on the validated
+                # emulator and cannot replace the original runner failure.
+                pass
+
+    def capture_failure(self) -> None:
+        if not self.device or self.device != self.validated_device:
+            return
+        captures = [("screenshot", lambda: self.screenshot("runner-failure", timeout=30))]
+        if self.args.platform == "android":
+            captures.append(("accessibility", self.accessibility_dump))
+        for kind, capture in captures:
+            try:
+                artifact = capture()
+                record = {"failure_capture": kind, "status": "completed", "artifact": artifact}
+            except Exception as error:
+                record = {"failure_capture": kind, "status": "failed",
+                    "error_type": type(error).__name__, "error": self.redact(str(error))}
+            try:
+                self.diagnostic(record)
+            except Exception:
+                pass
 
     def perform(self, action: str, payload: dict) -> dict:
         if action == "background":
@@ -263,12 +316,27 @@ class Runner:
                     result = self.perform(command["action"], command.get("payload", {}))
                     self.event(command["action"], result, command["id"])
                     if command["action"] == "finish":
-                        return 0 if result["status"] == "passed" else 1
+                        if result["status"] == "passed":
+                            return 0
+                        try:
+                            self.capture_failure()
+                        except Exception:
+                            pass
+                        return 1
                 except Exception as error:
-                    self.event(command["action"], {"error": self.redact(str(error))}, command["id"], "failed")
+                    try:
+                        self.event(command["action"], {"error": self.redact(str(error))}, command["id"], "failed")
+                    except Exception:
+                        pass
                     raise
             raise TimeoutError("Native acceptance fixture did not finish within the runner budget")
         except Exception as error:
+            try:
+                self.capture_failure()
+            except Exception:
+                # Even a failed screenshot/dump or full output disk must leave
+                # the original setup/runtime exception as the job failure.
+                pass
             try:
                 self.event("runner-error", {"error": self.redact(str(error))}, status="failed")
             except Exception:
@@ -276,8 +344,13 @@ class Runner:
                 pass
             raise
         finally:
-            if self.device:
-                self.collect_logs()
+            failure_in_flight = sys.exc_info()[0] is not None
+            if self.device and self.device == self.validated_device:
+                try:
+                    self.collect_logs()
+                except Exception:
+                    if not failure_in_flight:
+                        raise
 
 
 def main() -> None:

@@ -325,6 +325,36 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
         self.fixture.binary_identity = {}
         self.fixture.command = AsyncMock(return_value={})
 
+    def test_revocation_binds_the_observed_native_key_and_candidate(self):
+        self.fixture.anchor = {"id": "anchor-device"}
+        self.fixture.record(
+            {
+                "type": "identity",
+                "details": {
+                    "candidate_commit": self.fixture.candidate,
+                    "values": {"deviceId": "native-device", "publicKey": "a" * 43},
+                },
+            }
+        )
+        self.fixture.record(
+            {
+                "type": "identity",
+                "details": {
+                    "candidate_commit": "wrong-candidate",
+                    "values": {"deviceId": "native-device", "publicKey": "b" * 43},
+                },
+            }
+        )
+        self.assertEqual(
+            suite.native_revocation_body(self.fixture, "native-device"),
+            {
+                "expected_public_key": "a" * 43,
+                "revoked_by_device_id": "anchor-device",
+            },
+        )
+        with self.assertRaisesRegex(AssertionError, "identity was not observed"):
+            suite.native_revocation_body(self.fixture, "another-device")
+
     async def test_runner_setup_error_keeps_reason_without_passing_native_cases(self):
         self.configure_suite()
         self.fixture.record(
@@ -367,6 +397,25 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
             report["failure_reason"], "native acceptance interrupted before completion"
         )
 
+    async def test_missing_app_boot_uses_its_own_budget_after_fixture_readiness(self):
+        self.configure_suite()
+        self.fixture.args.timeout = 60
+        self.fixture.phase = "ready"
+        self.fixture.health = AsyncMock(return_value={"ready": True})
+        with patch.object(suite, "NATIVE_BOOT_TIMEOUT_SECONDS", 0.01, create=True):
+            with self.assertRaisesRegex(AssertionError, "native app never booted"):
+                await asyncio.wait_for(suite.exercise(self.fixture), 0.5)
+        report = json.loads((self.fixture.output / "evidence.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["cases"], [])
+        self.assertIn("native app never booted", report["failure_reason"])
+        self.fixture.command.assert_any_await(
+            "finish",
+            {"status": "failed", "reason": report["failure_reason"]},
+            native=True,
+            timeout=10,
+        )
+
     async def test_http_trace_is_bounded_and_excludes_request_secrets(self):
         messages = []
 
@@ -402,6 +451,43 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
         await trace(scope, None, send)
         self.assertEqual(len(path.read_text().splitlines()), 1)
         self.assertEqual(len(messages), 4)
+
+    async def test_control_failures_are_observable_without_tokens_or_unknown_paths(
+        self,
+    ):
+        async def app(scope, _receive, send):
+            scope["route"] = SimpleNamespace(path="/__acceptance/{path}")
+            await send({"type": "http.response.start", "status": 403})
+            await send({"type": "http.response.body", "body": b"private response"})
+
+        send = AsyncMock()
+        path = self.fixture.output / "api-requests.jsonl"
+        trace = fixture_module.ApiRequestTrace(app, path)
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/__acceptance/private-path",
+            "path_params": {"path": "bootstrap"},
+            "query_string": b"private-query",
+            "headers": [(b"x-acceptance-token", b"private-control-token")],
+        }
+        await trace(scope, None, send)
+        self.assertTrue(
+            path.exists(), "failed controller bootstrap had no HTTP diagnostic"
+        )
+        entry = json.loads(path.read_text())
+        self.assertEqual(entry["control"], "bootstrap")
+        self.assertEqual(entry["status"], 403)
+        self.assertTrue(entry["has_control_token"])
+        self.assertNotIn("private", path.read_text())
+        scope["path_params"]["path"] = "private-unknown-control"
+        await trace(scope, None, send)
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+        scope["path_params"]["path"] = "event"
+        trace.count = fixture_module.MAX_EVENTS
+        await trace(scope, None, send)
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+        self.assertEqual(send.await_count, 6)
 
 
 def integration():
@@ -585,6 +671,79 @@ def integration():
                 ]
                 == 400
             )
+            # Exercise the native suite's exact revocation payload against the
+            # real API. This extra device belongs only to this disposable user.
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PrivateKey,
+            )
+
+            sys.path.insert(0, str(ROOT / "server"))
+            from spawn_server.browser_registration import (
+                encode_browser_registration_transcript,
+            )
+
+            anchor = request("/api/browser-devices", bearer=first)[1][0]
+            key = Ed25519PrivateKey.generate()
+            public = key.public_key().public_bytes_raw()
+            public_key = fixture_module.encoded(public)
+            transcript = encode_browser_registration_transcript(
+                bootstrap["accountId"], public, is_root=False
+            )
+            status, device = request(
+                "/api/browser-devices/register",
+                bearer=first,
+                body={
+                    "key_algorithm": "ed25519",
+                    "public_key": public_key,
+                    "signature": fixture_module.encoded(key.sign(transcript)),
+                },
+            )
+            assert status == 200
+            assert (
+                request(
+                    "/__acceptance/device",
+                    control=configuration["token"],
+                    body={
+                        "deviceId": device["id"],
+                        "publicKey": public_key,
+                    },
+                )[0]
+                == 200
+            )
+            identity = {
+                "type": "identity",
+                "details": {
+                    "candidate_commit": config["candidateCommit"],
+                    "values": {"deviceId": device["id"], "publicKey": public_key},
+                },
+            }
+            observed = SimpleNamespace(
+                candidate=config["candidateCommit"], anchor=anchor, events=[identity]
+            )
+            revoke_path = f"/api/browser-devices/{device['id']}/revoke"
+            assert (
+                request(
+                    revoke_path,
+                    bearer=first,
+                    body={"revoked_by_device_id": anchor["id"]},
+                )[0]
+                == 422
+            )
+            status, revoked = request(
+                revoke_path,
+                bearer=first,
+                body=suite.native_revocation_body(observed, device["id"]),
+            )
+            assert status == 200 and revoked["revoked_at"] is not None
+            assert (
+                revoked["public_key"] == public_key
+                and revoked["revoked_by_device_id"] == anchor["id"]
+            )
+            denylist = request("/api/browser-devices/revoked-keys", bearer=first)[1]
+            assert any(row["public_key"] == public_key for row in denylist)
+            print(
+                "Native revocation payload: old request422; observed-key request200 and permanent deny-list verified"
+            )
             owned = [row for row in health["children"] if row["name"] == "daemon"]
             assert len(owned) == 1 and owned[0]["returncode"] is None
             os.kill(owned[0]["pid"], signal.SIGTERM)
@@ -625,6 +784,15 @@ def integration():
         assert report["status"] == "failed" and report["cases"] == []
         assert report["cleanup_passed"] is True
         assert "daemon exited unexpectedly" in report["failure_reason"]
+        trace_path = directory / "evidence/api-requests.jsonl"
+        traced = [json.loads(row) for row in trace_path.read_text().splitlines()]
+        refused_bootstrap = [
+            row
+            for row in traced
+            if row.get("control") == "bootstrap" and row["status"] == 403
+        ]
+        assert {row["has_control_token"] for row in refused_bootstrap} == {True, False}
+        assert configuration["token"] not in trace_path.read_text()
         lifecycle = [
             json.loads(row)
             for row in (directory / "evidence/fixture-lifecycle.jsonl")

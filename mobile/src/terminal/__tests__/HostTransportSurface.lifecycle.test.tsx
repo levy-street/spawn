@@ -83,6 +83,7 @@ afterEach(() => {
   AppState.currentState = initialAppState;
   listeners.clear();
   jest.restoreAllMocks();
+  jest.useRealTimers();
 });
 
 async function appState(next: AppStateStatus) {
@@ -150,6 +151,73 @@ test("inactive and short background transitions preserve the root; three seconds
   expect(transport.open).toHaveBeenCalledTimes(2);
   expect(mockRoots).toHaveLength(1);
   await screen.unmount();
+});
+
+test.each([2_999, 3_000, 5_549])(
+  "foreground checks %i ms elapsed while background timers were suspended",
+  async (elapsed) => {
+    const screen = await render(
+      <>
+        <HostTransportSurface connectionOwner {...host} />
+        <HostTransportSurface {...host} />
+        <HostTransportSurface {...host} />
+      </>,
+    );
+    const transport = root();
+    try {
+      await act(() => worker().props.onLoad());
+      const started = Date.now();
+      await appState("background");
+      // The native runtime can pause timers while wall time continues.
+      jest.setSystemTime(started + 1_000);
+      await appState("background");
+      await appState("inactive");
+      jest.setSystemTime(started + elapsed);
+      expect(transport.close).not.toHaveBeenCalled();
+      await appState("active");
+      const retired = elapsed >= 3_000 ? 1 : 0;
+      expect(transport.close).toHaveBeenCalledTimes(retired);
+      expect(transport.open).toHaveBeenCalledTimes(1 + retired);
+      if (retired) {
+        expect(transport.close.mock.invocationCallOrder[0]).toBeLessThan(
+          transport.open.mock.invocationCallOrder[1] ?? 0,
+        );
+      }
+      await act(() => jest.advanceTimersByTime(3_000));
+      await appState("active");
+      expect(transport.close).toHaveBeenCalledTimes(retired);
+      expect(transport.open).toHaveBeenCalledTimes(1 + retired);
+      expect(mockRoots).toHaveLength(1);
+      expect(screen.getAllByTestId("host-worker")).toHaveLength(1);
+    } finally {
+      await screen.unmount();
+    }
+  },
+);
+
+test("a cancelled callback from an earlier background cannot retire a new grace period", async () => {
+  const timers = jest.spyOn(globalThis, "setTimeout");
+  const screen = await render(<HostTransportSurface connectionOwner {...host} />);
+  const transport = root();
+  try {
+    await act(() => worker().props.onLoad());
+    await appState("background");
+    const oldTimer = timers.mock.calls.findLast((call) => call[1] === 3_000)?.[0];
+    if (typeof oldTimer !== "function") throw new Error("Missing retirement timer.");
+    jest.setSystemTime(Date.now() + 1_000);
+    await appState("active");
+    await appState("background");
+    jest.setSystemTime(Date.now() + 1_000);
+    await act(() => oldTimer());
+    expect(transport.close).not.toHaveBeenCalled();
+    jest.setSystemTime(Date.now() + 2_000);
+    await appState("active");
+    expect(transport.close).toHaveBeenCalledTimes(1);
+    expect(transport.open).toHaveBeenCalledTimes(2);
+  } finally {
+    await screen.unmount();
+    timers.mockRestore();
+  }
 });
 
 test("a worker loaded in the background waits for foreground, including after process loss", async () => {

@@ -11,10 +11,33 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+NATIVE_BOOT_TIMEOUT_SECONDS = 180
+
 
 def require(condition: Any, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def native_revocation_body(fixture: Any, device_id: str) -> dict[str, str]:
+    for event in reversed(fixture.events):
+        details = event.get("details", {})
+        values = details.get("values", {})
+        if (
+            event.get("type") == "identity"
+            and details.get("candidate_commit") == fixture.candidate
+            and values.get("deviceId") == device_id
+        ):
+            public_key = values.get("publicKey")
+            require(
+                isinstance(public_key, str) and len(public_key) == 43,
+                "native revocation target lacks an observed public key",
+            )
+            return {
+                "expected_public_key": public_key,
+                "revoked_by_device_id": fixture.anchor["id"],
+            }
+    raise AssertionError("native revocation target identity was not observed")
 
 
 async def eventually(predicate: Any, *, timeout: float = 45, message: str) -> Any:
@@ -198,7 +221,9 @@ async def exercise(fixture: Any) -> None:
         )
         await fixture.health()
         event = await eventually(
-            boot, timeout=fixture.args.timeout, message="native app never booted"
+            boot,
+            timeout=min(fixture.args.timeout, NATIVE_BOOT_TIMEOUT_SECONDS),
+            message="native app never booted",
         )
         metadata = event["details"]
         require(
@@ -575,7 +600,7 @@ async def exercise(fixture: Any) -> None:
             await fixture.request(
                 "POST",
                 f"/api/browser-devices/{revoked_device}/revoke",
-                {"revoked_by_device_id": fixture.anchor["id"]},
+                native_revocation_body(fixture, revoked_device),
             )
 
             async def trust_retired() -> bool:
