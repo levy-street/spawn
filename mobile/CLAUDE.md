@@ -60,6 +60,10 @@ scripts/, docs/   build helpers and app-specific notes
   `protocol.required` frame, which is what routes into the update path. Read
   "The wire protocols" in `docs/RELEASE.md` before changing one.
 - Tests colocate in the nearest `__tests__/` directory (jest).
+- `e2e/NATIVE_ACCEPTANCE.md` describes the hosted iOS simulator and Android
+  emulator acceptance job. Its controller and RTC observation hook enter only a
+  disposable build copy, using the actual app providers and native WebViews.
+  Production routes and assets must never import this controller.
 
 ## Conventions
 
@@ -100,7 +104,14 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
 
 ```bash
 npm run ci                    # typecheck + lint + jest
+bash e2e/build-native-acceptance.sh ios /tmp/spawn-native-ios  # local fixture required
 ```
+
+The native command requires Xcode (or use `android` with the Android SDK), an
+authenticated loopback acceptance fixture, and the environment described in
+`e2e/NATIVE_ACCEPTANCE.md`. `.github/workflows/native-acceptance.yml` runs both
+platforms against an exact candidate commit with real UDP relay faults. Jest,
+Metro exports, Expo Go, and generated native projects do not satisfy that gate.
 
 ## Keeping this file true
 

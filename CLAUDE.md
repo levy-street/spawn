@@ -19,7 +19,8 @@ docs/     design docs; docs/RELEASE.md — the release process,
           docs/AZURE_SIGNING_SETUP.md — the Windows signing identity, for
           whoever holds Azure
 tools/    development utilities
-.github/  CI workflows: tests, the rolling daemon prebuilts, the Windows check
+.github/  CI workflows: tests, native connection acceptance and its promotion
+          gate, the rolling daemon prebuilts, the Windows check
           and its unsigned packaging rehearsal, and the signed desktop
           artifacts; readme/ holds the README's press art, struck from
           web/public/brand/ink
@@ -81,6 +82,14 @@ Before deploying or releasing anything — server, web, a mobile update or
 build, daemon prebuilts — read `docs/RELEASE.md` in full. It is the entire
 release process: what ships together, what the deploy script refuses and why,
 and how to verify what actually reached production.
+
+Connection acceptance runs through `.github/workflows/acceptance.yml`: exact
+candidate iOS/Android native runs plus the isolated daemon canary. Missing or
+failed evidence blocks promotion. `docs/CONNECTION_CANARY.md` describes the
+canary, and `docs/DEVICE_CONNECTIONS.md` distinguishes automated native
+evidence from physical-device and production observations. The lightweight
+fixture, UDP fault-proxy and evidence-validator regressions run in
+`scripts/test-all.sh`; the real native builds run on hosted platform runners.
 
 ## These files stay true, or they are worse than nothing
 

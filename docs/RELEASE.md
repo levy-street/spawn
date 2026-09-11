@@ -531,6 +531,28 @@ everything looks fine.
 `.github/workflows/release.yml` runs on every push to `master`. It calls
 `release-plan.sh` first and gates every job on the answer, so a docs-only push
 finishes in seconds and a daemon-only push deploys without touching the phone.
+Before any deployment, `acceptance.yml` requires passing iOS simulator, Android
+emulator and isolated-canary reports for the exact candidate commit and the
+currently published baseline from `/api/release`. It also waits for successful
+Linux tests and, when relevant sources changed, Windows checks on that master
+commit. Missing, skipped, failed or stale evidence prevents deployment.
+PR acceptance supplies review evidence; master acceptance runs again for the
+commit that will actually ship.
+
+The native jobs build disposable unsigned Release apps containing a test-only
+driver around the real app transport and WebViews. A private UDP TURN path
+proves actual packet loss and outage. The canary runs baseline holdback,
+candidate soak, live update/recovery and failed-start rollback with real
+worker-owned sessions. See `docs/DEVICE_CONNECTIONS.md` and
+`docs/CONNECTION_CANARY.md` for the assertions and limitations. This gate uses
+isolated hosts and simulator/emulator evidence; it does not claim a physical
+radio handover test or a selective rollout to production users.
+
+The `release-acceptance` artifact contains `acceptance.json`, the validated
+reports used by deployment. Direct deploys require the same artifact through
+`--acceptance-evidence FILE` (or `SPAWN_RELEASE_ACCEPTANCE`). Deployment validates
+the target commit and the current public baseline again before changing the
+remote host. `--allow-branch` does not waive acceptance.
 The order inside it is the forced one described above: prebuilts land before
 the server that advertises them, and the OTA goes after the server is up.
 
@@ -565,19 +587,16 @@ What is configured, so it can be audited rather than guessed:
 | `SPAWN_RELEASE_SIGNING_KEY` | The offline daemon release key, per the trade above. |
 | vars `SPAWN_DEPLOY_HOSTNAME`, `SPAWN_DEPLOY_USER` | The prod host and account. |
 
-**The pipeline has never run.** `workflow_dispatch` cannot see a workflow that
-is not on the default branch, so `release.yml` cannot be exercised before the
-merge that puts it there — the first real run is the merge itself, and it wants
-watching rather than assuming. The same is true of `desktop.yml` and
-`windows.yml`.
+The master pipeline has completed production releases. New acceptance stages
+must establish their own candidate evidence; earlier successful releases do
+not validate a changed workflow or native build.
 
 ### Things that will bite you off master
 
 `workflow_dispatch` only sees workflows that exist on the **default branch**.
-`windows.yml` and `desktop.yml` are not on master yet, so from a feature branch
-they cannot be dispatched at all; `[package]` in a commit subject is the only
-trigger that reaches `windows-package` from a branch. Merging is what fixes
-this, and it fixes it for good.
+New branch-only workflows therefore need a pull-request trigger for their first
+rehearsal. Existing Windows workflows also support `[package]` in a commit
+subject to request unsigned packaging evidence from a branch.
 
 Windows signing is restricted to `master` by the `windows-code-signing`
 environment's branch policy, so **a branch build can never be Authenticode
@@ -595,13 +614,15 @@ the supported way to stage a dev host.
 Deployment is over SSH, from a coding agent, using the script in this repo:
 
 ```bash
-scripts/deploy-prod.sh <ssh-host>     # pulls, migrates, restarts spawn-server + spawn-web
+scripts/deploy-prod.sh <ssh-host> --acceptance-evidence /path/to/acceptance.json
 ```
 
 The script refuses to run when the release would not be what it looks like:
 
 - a dirty checkout or unpushed commits
 - a branch other than master (`--allow-branch` to deploy one on purpose)
+- absent or invalid connection acceptance evidence, including evidence for a
+  different candidate or a baseline that is no longer deployed
 - an inherited `SPAWN_API_PROXY_TARGET` — the target is baked into the web
   build at build time, and an inherited value is indistinguishable from an
   intended one. Pass `--api-proxy-target URL` when you mean a non-default

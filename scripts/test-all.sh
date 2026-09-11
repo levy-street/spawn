@@ -41,6 +41,12 @@ scripts/test-update-probation.sh --self-test
 scripts/test-instance-releases.sh --self-test
 scripts/test-version-skew.sh --self-test
 scripts/chaos-drills.sh --self-test
+scripts/test-connection-canary.sh --self-test
+
+printf '%s\n' "== native connection acceptance harness guards =="
+python3 scripts/test-udp-chaos-proxy.py
+python3 scripts/test-native-acceptance.py
+python3 scripts/test-release-acceptance.py
 
 printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh

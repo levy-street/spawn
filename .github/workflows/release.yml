@@ -15,14 +15,14 @@ name: release
 # build that is refused just the same. The mobile OTA goes last for the mirror
 # reason: the server must already be up, so no phone fetches JavaScript newer
 # than the API it talks to.
-on:
+"on":
   push:
     branches:
       - master
   workflow_dispatch:
     inputs:
       from:
-        description: "Commit currently in production (default: the previous commit)"
+        description: "Optional assertion of the public deployed baseline (must match /api/release)"
         required: false
 
 # A half-finished release is worse than a queued one, so releases never cancel
@@ -33,30 +33,75 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  acceptance:
+    name: validate native connections and isolated canaries
+    needs: plan
+    if: >-
+      needs.plan.outputs.deploy == 'true' ||
+      needs.plan.outputs.daemon_prebuilts == 'true' ||
+      needs.plan.outputs.mobile_ota == 'true' ||
+      needs.plan.outputs.mobile_native_build == 'yes' ||
+      needs.plan.outputs.desktop_publish == 'true'
+    uses: ./.github/workflows/acceptance.yml
+    with:
+      candidate: ${{ github.sha }}
+      baseline: ${{ needs.plan.outputs.baseline }}
+
+  await_source_ci:
+    name: require exact master push test results
+    needs: acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 185
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Wait for Linux and required Windows validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ github.sha }}
+          REQUIRE_WINDOWS: ${{ needs.acceptance.outputs.require_windows }}
+        run: |
+          set -euo pipefail
+          args=(--wait-ci "$GITHUB_REPOSITORY" --candidate "$CANDIDATE" --timeout 10800)
+          if [[ "$REQUIRE_WINDOWS" == true ]]; then args+=(--require-windows); fi
+          python3 scripts/check-release-acceptance.py "${args[@]}"
+
   plan:
     name: what does this owe
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    if: github.ref == 'refs/heads/master'
     # EXPO_TOKEN is an environment secret, and the fingerprint check needs it;
     # without an environment the mobile row would silently read "unknown" and
     # a release that owed a store build would quietly not do one. The policy
     # permits only master, which is also what this workflow runs on.
     environment: production
     outputs:
+      baseline: ${{ steps.baseline.outputs.commit }}
       deploy: ${{ steps.plan.outputs.deploy }}
       daemon_prebuilts: ${{ steps.plan.outputs.daemon_prebuilts }}
       mobile_ota: ${{ steps.plan.outputs.mobile_ota }}
       mobile_native_build: ${{ steps.plan.outputs.mobile_native_build }}
       desktop_publish: ${{ steps.plan.outputs.desktop_publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
           # release-plan.sh compares two commits' subtrees, so it needs both.
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - name: Resolve the current public production baseline
+        id: baseline
+        run: |
+          baseline="$(python3 scripts/check-release-acceptance.py --resolve-baseline)"
+          printf 'commit=%s\n' "$baseline" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -74,15 +119,12 @@ jobs:
           # the store-build job below refuses to guess.
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           FROM: ${{ github.event.inputs.from }}
+          BASELINE: ${{ steps.baseline.outputs.commit }}
+          CANDIDATE: ${{ github.sha }}
         run: |
           set -euo pipefail
-          args=(--json)
-          if [ -n "${FROM:-}" ]; then
-            args+=(--from "$FROM")
-          elif [ -n "${{ github.event.before }}" ] && \
-               git rev-parse --verify --quiet "${{ github.event.before }}^{commit}" >/dev/null; then
-            args+=(--from "${{ github.event.before }}")
-          fi
+          [[ -z "${FROM:-}" || "$FROM" == "$BASELINE" ]] || { echo '::error::from must match the validated public baseline'; exit 1; }
+          args=(--json --from "$BASELINE" --to "$CANDIDATE")
           [ -n "${EXPO_TOKEN:-}" ] || args+=(--no-fingerprint)
           scripts/release-plan.sh "${args[@]}" | tee /tmp/plan.json
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -112,7 +154,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
       - name: Wait for the rolling release to describe this daemon tree
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,13 +177,15 @@ jobs:
 
   deploy:
     name: server, web, daemon manifest and the phone
-    needs: [plan, await_prebuilts]
+    needs: [plan, await_prebuilts, acceptance, await_source_ci]
     # A daemon-only change still deploys, because that is what publishes the
     # signed manifest. always() keeps this reachable when await-prebuilts was
     # skipped for a release that owes no prebuilts.
     if: >-
       always() &&
       needs.plan.result == 'success' &&
+      needs.acceptance.result == 'success' &&
+      needs.await_source_ci.result == 'success' &&
       needs.await_prebuilts.result != 'failure' &&
       needs.await_prebuilts.result != 'cancelled' &&
       (needs.plan.outputs.deploy == 'true' ||
@@ -149,11 +195,22 @@ jobs:
     timeout-minutes: 60
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - name: Select the validated commit on the local master branch
+        env:
+          CANDIDATE: ${{ github.sha }}
+        run: git checkout -B master "$CANDIDATE"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-acceptance
+          path: ${{ runner.temp }}/release-acceptance
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -212,7 +269,8 @@ jobs:
           SPAWN_DEPLOY_MOBILE_CHANNEL: production
         run: |
           set -euo pipefail
-          scripts/deploy-prod.sh spawnd-prod --api-proxy-target http://127.0.0.1:8001
+          scripts/deploy-prod.sh spawnd-prod --api-proxy-target http://127.0.0.1:8001 \
+            --acceptance-evidence "$RUNNER_TEMP/release-acceptance/acceptance.json"
 
   # Only when the tree no longer fits the native shell already on phones.
   # Most releases skip this; see the mobile note in docs/RELEASE.md.
@@ -224,8 +282,10 @@ jobs:
     timeout-minutes: 90
     environment: production
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -257,7 +317,9 @@ jobs:
     timeout-minutes: 60
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
       - name: Not yet wired
         run: |
           echo "::warning::desktop publication is not automated yet."

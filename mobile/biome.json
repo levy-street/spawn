@@ -4,6 +4,9 @@
     "includes": [
       "src/**",
       "tests/**",
+      "e2e/native-controller.tsx",
+      "e2e/native-peer-probe.js",
+      "e2e/prepare-native-acceptance.mjs",
       "!tests/fixtures",
       "*.js",
       "*.json",

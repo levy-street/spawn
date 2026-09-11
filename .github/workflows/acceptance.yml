@@ -1,0 +1,146 @@
+name: Release acceptance
+
+"on":
+  pull_request:
+  workflow_call:
+    inputs:
+      candidate:
+        description: Exact commit to build and exercise
+        required: true
+        type: string
+      baseline:
+        description: Optional assertion of the public deployed baseline
+        required: false
+        type: string
+    outputs:
+      baseline:
+        description: Public deployed commit observed before acceptance
+        value: ${{ jobs.resolve.outputs.baseline }}
+      require_windows:
+        description: Candidate changes require native Windows CI
+        value: ${{ jobs.resolve.outputs.require_windows }}
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Exact candidate commit (full SHA)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  resolve:
+    name: bind acceptance to candidate and deployed baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      candidate: ${{ steps.identity.outputs.candidate }}
+      baseline: ${{ steps.identity.outputs.baseline }}
+      require_windows: ${{ steps.identity.outputs.require_windows }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.candidate }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve exact identities
+        id: identity
+        env:
+          CANDIDATE: ${{ github.event.pull_request.head.sha || inputs.candidate }}
+          EXPECTED_BASELINE: ${{ inputs.baseline }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE" ]]
+          baseline="$(python3 scripts/check-release-acceptance.py --resolve-baseline)"
+          [[ -z "$EXPECTED_BASELINE" || "$EXPECTED_BASELINE" == "$baseline" ]] || { echo '::error::public baseline changed after planning'; exit 1; }
+          windows="$(python3 scripts/check-release-acceptance.py --requires-windows --candidate "$CANDIDATE" --baseline "$baseline")"
+          printf 'candidate=%s\nbaseline=%s\nrequire_windows=%s\n' "$CANDIDATE" "$baseline" "$windows" >> "$GITHUB_OUTPUT"
+
+  native:
+    name: native connection acceptance
+    needs: resolve
+    uses: ./.github/workflows/native-acceptance.yml
+    with:
+      candidate: ${{ needs.resolve.outputs.candidate }}
+      baseline: ${{ needs.resolve.outputs.baseline }}
+
+  canary:
+    name: isolated old and new canary cohorts
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Prepare isolated output and build paths
+        run: |
+          printf 'CANARY_OUTPUT=%s/acceptance-canary\nSPAWN_TEST_CARGO_TARGET_DIR=%s/canary-cargo\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.candidate }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: server/uv.lock
+          prune-cache: false
+      - name: Install fixture dependencies
+        working-directory: server
+        run: |
+          uv python install 3.13
+          uv sync --frozen
+      - name: Observe all four canary cases
+        env:
+          CANDIDATE: ${{ needs.resolve.outputs.candidate }}
+          BASELINE: ${{ needs.resolve.outputs.baseline }}
+        run: |
+          scripts/test-connection-canary.sh --baseline "$BASELINE" --candidate "$CANDIDATE" \
+            --output "$CANARY_OUTPUT/evidence.json" --soak-seconds 120
+      - name: Preserve canary report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: acceptance-canary
+          # Scratch credentials, private keys and logs are not promotion data.
+          path: ${{ runner.temp }}/acceptance-canary/evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  aggregate:
+    name: complete release acceptance
+    needs: [resolve, native, canary]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every acceptance job
+        env:
+          RESOLVE: ${{ needs.resolve.result }}
+          NATIVE: ${{ needs.native.result }}
+          CANARY: ${{ needs.canary.result }}
+        run: test "$RESOLVE/$NATIVE/$CANARY" = success/success/success
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.candidate }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: acceptance-*
+          path: ${{ runner.temp }}/acceptance-input
+      - name: Validate all measured cases and identities
+        env:
+          CANDIDATE: ${{ needs.resolve.outputs.candidate }}
+          BASELINE: ${{ needs.resolve.outputs.baseline }}
+        run: |
+          python3 scripts/check-release-acceptance.py --candidate "$CANDIDATE" --baseline "$BASELINE" \
+            --directory "$RUNNER_TEMP/acceptance-input" --output "$RUNNER_TEMP/acceptance.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-acceptance
+          path: ${{ runner.temp }}/acceptance.json
+          if-no-files-found: error
+          retention-days: 14

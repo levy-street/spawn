@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/deploy-prod.sh [ssh-host] [--api-proxy-target URL] [--allow-branch]
+Usage: scripts/deploy-prod.sh [ssh-host] --acceptance-evidence FILE [--api-proxy-target URL] [--allow-branch]
 
 Deploy the remote version of the current branch to a production host.
 
@@ -12,6 +12,11 @@ The script uses the caller's SSH config, so [ssh-host] can be an alias from
 current branch has commits that have not been pushed to the configured remote.
 
 Options:
+  --acceptance-evidence FILE
+                          acceptance.json from the release-acceptance artifact.
+                          Required for every deploy, including --allow-branch.
+                          Its candidate and baseline must match the fetched
+                          target and the current public production release.
   --api-proxy-target URL  Where the deployed web app proxies /api and /ws.
                           Default: http://127.0.0.1:8001. This is baked into
                           the build, so it MUST be passed as a flag -- an
@@ -25,6 +30,8 @@ Environment:
   SPAWN_DEPLOY_HOST       SSH host alias/name. Overridden by [ssh-host].
   SPAWN_DEPLOY_PATH       Repo path on the remote host. Default: /opt/spawn
   SPAWN_DEPLOY_REMOTE     Git remote to deploy from. Default: origin
+  SPAWN_RELEASE_ACCEPTANCE
+                          Alternative to --acceptance-evidence FILE.
   SPAWN_DEPLOY_SERVICES   Space-separated systemd services to restart.
                           Default: spawn-server spawn-web
   SPAWN_DEPLOY_SUDO       Command prefix for systemctl. Default: sudo -n
@@ -110,6 +117,7 @@ fi
 host=""
 proxy_target_flag=""
 allow_branch=0
+acceptance_evidence="${SPAWN_RELEASE_ACCEPTANCE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
@@ -118,6 +126,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allow-branch)
       allow_branch=1
+      shift
+      ;;
+    --acceptance-evidence)
+      [[ $# -ge 2 ]] || die "--acceptance-evidence needs a file"
+      acceptance_evidence="$2"
+      shift 2
+      ;;
+    --acceptance-evidence=*)
+      acceptance_evidence="${1#*=}"
       shift
       ;;
     --api-proxy-target)
@@ -247,6 +264,13 @@ prebuilt_variant_entries=()
 
 target_commit="$(git rev-parse "$remote_ref")"
 target_tree="$(git rev-parse "$remote_ref:daemon")"
+# A branch flag and the emergency prebuilt override cannot waive acceptance.
+# Resolve the baseline again here: production may have advanced since CI ran.
+[[ -n "$acceptance_evidence" && -f "$acceptance_evidence" ]] ||
+  die "matching release acceptance evidence is required; download acceptance.json from release-acceptance and pass --acceptance-evidence FILE"
+python3 "$script_dir/check-release-acceptance.py" \
+  --evidence "$acceptance_evidence" --candidate "$target_commit" ||
+  die "release acceptance evidence was refused; no production changes were made"
 host_probe_env="$(quote_env SPAWN_DEPLOY_PATH "$remote_path")"
 host_current_commit="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
 set -euo pipefail
@@ -314,6 +338,7 @@ printf 'deploy-prod: baking API proxy target %s\n' "$api_proxy_target"
 env_prefix="$(
   quote_env SPAWN_DEPLOY_PATH "$remote_path"
   quote_env SPAWN_DEPLOY_BRANCH "$branch"
+  quote_env SPAWN_DEPLOY_TARGET_COMMIT "$target_commit"
   quote_env SPAWN_DEPLOY_REMOTE "$remote"
   quote_env SPAWN_DEPLOY_SERVICES "$services"
   quote_env SPAWN_DEPLOY_SUDO "$sudo_cmd"
@@ -359,6 +384,8 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$SPAWN_DEPLOY_PATH i
 git fetch --prune "$SPAWN_DEPLOY_REMOTE" "$SPAWN_DEPLOY_BRANCH"
 target="$SPAWN_DEPLOY_REMOTE/$SPAWN_DEPLOY_BRANCH"
 git rev-parse --verify --quiet "$target" >/dev/null || die "remote branch $target does not exist"
+[[ "$(git rev-parse "$target")" == "$SPAWN_DEPLOY_TARGET_COMMIT" ]] ||
+  die "remote branch moved after acceptance validation; rerun with evidence for the new commit"
 
 if git show-ref --verify --quiet "refs/heads/$SPAWN_DEPLOY_BRANCH"; then
   read -r _ local_only < <(git rev-list --left-right --count "$target...$SPAWN_DEPLOY_BRANCH")
@@ -368,7 +395,7 @@ if git show-ref --verify --quiet "refs/heads/$SPAWN_DEPLOY_BRANCH"; then
 fi
 
 old_rev="$(git rev-parse --short HEAD)"
-git checkout -B "$SPAWN_DEPLOY_BRANCH" "$target"
+git checkout -B "$SPAWN_DEPLOY_BRANCH" "$SPAWN_DEPLOY_TARGET_COMMIT"
 new_rev="$(git rev-parse --short HEAD)"
 printf 'remote deploy: updated %s from %s to %s\n' "$SPAWN_DEPLOY_BRANCH" "$old_rev" "$new_rev"
 

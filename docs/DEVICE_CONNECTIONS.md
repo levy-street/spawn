@@ -92,11 +92,31 @@ runtime evidence before release.
 
 ### Native acceptance
 
-Run the following on both iOS and Android against an isolated test account and
-host. Record the candidate commit, app update/build identity, OS and device,
-network path, and observed result for each case. Simulator and Jest results
-must be labelled separately from physical-device results; neither establishes
-recovery across a real Wi-Fi/mobile-network transition.
+`.github/workflows/acceptance.yml` builds and runs an unsigned Release app on
+an iOS simulator and an Android emulator for the exact candidate commit. The
+driver exists only in a disposable build copy; it uses the real authenticated
+providers, terminal and host-tool surfaces, WebViews, daemon and session workers.
+No production account, host or mobile signing identity is needed.
+
+The fixture checks two sessions and two host tools sharing one peer, surface
+detach/reopen, short and long background intervals, process restart, account
+and device-identity retirement, and interrupted/fresh uploads with file hashes.
+Shell input and process survival are checked independently on the daemon host.
+A private coturn listener and bounded UDP proxy force a relay path. Native
+`getStats()` must identify relay/UDP, and TURN application-data counters must
+advance before actual bidirectional outage, packet loss and delay are injected.
+HTTP throttling or STUN keepalives cannot satisfy that evidence.
+
+The release gate requires separate passing iOS, Android and isolated-canary
+reports tied to the candidate and deployed baseline. Missing, skipped or failed
+cases block promotion. Logs and screenshots accompany native reports; private
+fixture credentials and the test app are excluded from artifacts.
+
+This provides unattended native runtime and controlled network-failure
+evidence. It does not establish physical-device memory pressure, real radio
+handover between Wi-Fi and cellular, or production fleet behavior. The following
+physical-device matrix remains useful supplemental evidence; label it separately
+from simulator, emulator and Jest results.
 
 | Case | Exercise | Required observation |
 | --- | --- | --- |
