@@ -1918,7 +1918,8 @@ pub(crate) fn install(
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
 ) -> Arc<Lifetime> {
-    let message_dc = Arc::clone(&dc);
+    // Stored handlers must not own their channel: close does not clear them.
+    let message_dc = Arc::downgrade(&dc);
     let context_slot = Arc::new(Mutex::new(None::<Context>));
     let publications = Arc::new(PublicationFence::default());
     let status_publication_fence = Arc::new(StdMutex::new(()));
@@ -1940,12 +1941,13 @@ pub(crate) fn install(
     let message_arrivals = Arc::clone(&arrivals);
     let message_closed = Arc::clone(&closed);
     dc.on_message(Box::new(move |message: DataChannelMessage| {
-        let dc = Arc::clone(&message_dc);
+        let dc = message_dc.upgrade();
         let normal_tx = normal_tx.clone();
         let fast_tx = fast_tx.clone();
         let arrivals = Arc::clone(&message_arrivals);
         let closed = Arc::clone(&message_closed);
         Box::pin(async move {
+            let Some(dc) = dc else { return };
             if closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1987,7 +1989,7 @@ pub(crate) fn install(
         })
     }));
 
-    let open_dc = Arc::clone(&dc);
+    let open_dc = Arc::downgrade(&dc);
     let open_context = Arc::clone(&context_slot);
     let open_publications = Arc::clone(&publications);
     let open_status_publication_fence = Arc::clone(&status_publication_fence);
@@ -1997,7 +1999,7 @@ pub(crate) fn install(
     let open_normal_rx = Arc::clone(&normal_rx);
     let open_fast_rx = Arc::clone(&fast_rx);
     dc.on_open(Box::new(move || {
-        let dc = Arc::clone(&open_dc);
+        let dc = open_dc.upgrade();
         let context_slot = Arc::clone(&open_context);
         let publications = Arc::clone(&open_publications);
         let status_publication_fence = Arc::clone(&open_status_publication_fence);
@@ -2009,6 +2011,7 @@ pub(crate) fn install(
         let normal_rx = Arc::clone(&open_normal_rx);
         let fast_rx = Arc::clone(&open_fast_rx);
         Box::pin(async move {
+            let Some(dc) = dc else { return };
             let files = match files {
                 Some(files) => files,
                 None => match HostFileService::discover().await {

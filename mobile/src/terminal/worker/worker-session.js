@@ -856,7 +856,19 @@
     ) {
       throw new Error("Upload bridge chunk length or final flag mismatch.");
     }
-    await waitForBufferedAmount();
+    const generation = session.generation;
+    const channel = state.ctl;
+    const isCurrent = () =>
+      generation === session.generation &&
+      channel === state.ctl &&
+      session.uploads.get(upload.uploadId) === upload;
+    try {
+      await waitForBufferedAmount();
+    } catch (error) {
+      if (!isCurrent()) return;
+      throw error;
+    }
+    if (!isCurrent()) return;
     const frame = encodeUploadChunk(upload.uploadId, message.sequence, message.last, payload);
     if (!frame || !state.ctl || state.ctl.readyState !== "open")
       throw new Error("Upload channel closed.");

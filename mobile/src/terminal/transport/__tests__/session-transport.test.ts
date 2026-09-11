@@ -61,6 +61,10 @@ class FakeBridge implements WorkerEndpoint {
     return () => this.listeners.delete(fn);
   }
   emit(message: WorkerToNativeMessage) {
+    const attachment = this.sent.filter((frame) => frame.type === "pair-view").at(-1);
+    this.emitRaw({ attachmentId: attachment?.attachmentId ?? null, ...message });
+  }
+  emitRaw(message: WorkerToNativeMessage) {
     for (const listener of this.listeners) listener(message);
   }
 }
@@ -167,6 +171,46 @@ describe("session channels on the shared daemon connection", () => {
     const count = a.bridge.sent.length;
     root.shared.bridge.receive(JSON.stringify(event));
     expect(a.bridge.sent).toHaveLength(count);
+  });
+  test("delayed readiness and display events cannot enable input on a replacement attachment", async () => {
+    const { bridge, transport } = await readyTransport();
+    const attachment = bridge.sent.filter((frame) => frame.type === "pair-view").at(-1);
+    if (!attachment) throw new Error("missing attachment");
+    const oldReady = { ...attachment, type: "state" as const, state: "ready" as const };
+    const oldDisplay = {
+      v: 1 as const,
+      type: "display" as const,
+      owner: true,
+      viewers: 1,
+      attachmentId: attachment.attachmentId,
+    };
+    state("connecting");
+    state("ready");
+    bridge.emit(oldReady);
+    bridge.emitRaw({ v: 1, type: "state", state: "ready" });
+    bridge.emit(oldDisplay);
+    transport.write(Uint8Array.of(1));
+    expect(transport.state).toBe("connecting");
+    expect(bridge.sent.filter((message) => message.type === "input")).toHaveLength(0);
+
+    bridge.emit({ v: 1, type: "state", state: "ready" });
+    transport.write(Uint8Array.of(2));
+    expect(bridge.sent.filter((message) => message.type === "input")).toHaveLength(0);
+    bridge.emit({ v: 1, type: "display", owner: true, viewers: 1 });
+    transport.write(Uint8Array.of(3));
+    expect(bridge.sent.filter((message) => message.type === "input")).toHaveLength(1);
+  });
+  test("a delayed reconnecting event cannot retire a healthy replacement attachment", async () => {
+    const { bridge, transport } = await readyTransport();
+    const old = bridge.sent.filter((frame) => frame.type === "pair-view").at(-1);
+    if (!old) throw new Error("missing attachment");
+    state("connecting");
+    state("ready");
+    bridge.emit({ v: 1, type: "state", state: "ready" });
+    const count = commands.length;
+    bridge.emit({ ...old, type: "state", state: "reconnecting" });
+    expect(transport.state).toBe("ready");
+    expect(commands).toHaveLength(count);
   });
   test("closing the view cancels attachment retries and preserves the daemon lease", async () => {
     jest.useFakeTimers();

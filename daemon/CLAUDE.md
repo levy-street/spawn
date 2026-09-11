@@ -66,9 +66,12 @@ tests/           integration tests (worker_e2e.rs), and
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
-                 and a read/reset missed-notification fix. It is a workspace
-                 member so its regression tests use the daemon's Cargo.lock;
-                 default cargo commands still select only spawnd
+                 and a read/reset missed-notification fix, and webrtc 0.17.2
+                 with closed-channel registry pruning (webrtc/PATCHES.md).
+                 SCTP is a workspace member so its regression tests use the
+                 daemon's Cargo.lock; webrtc is excluded to avoid resolving
+                 its optional OpenSSL features. Native daemon regressions
+                 cover its patch; default cargo commands select only spawnd
 ```
 
 ## Where things go
@@ -355,6 +358,13 @@ its notification waiter before checking shutdown or awaiting the reassembly
 queue lock: a remote reset uses `notify_waiters`, so registering afterward can
 lose the notification and strand a closed channel's reader. The regression
 holds that queue lock and resets the stream while the reader is waiting.
+
+Stored channel handlers capture their channel weakly, including `on_open`
+handlers that may never fire. The vendored WebRTC registry prunes closed
+channels on each local or remote admission, preserving cumulative close stats
+and bounded stream-ID reservations rather than reusing IDs before SCTP reset
+completes. Native daemon tests exercise 256 host consumers on one live parent
+and require all consumer state to be released after parent close.
 
 Native Windows CI additionally gates every binary, test/example target, and
 cfg-specific lint path:

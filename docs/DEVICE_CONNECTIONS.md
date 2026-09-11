@@ -89,3 +89,24 @@ typing in a second session during an 8 MiB upload, and owner handover against an
 isolated API and daemon. Native mobile lifecycle, real network transitions,
 and platform release gates still require their own
 runtime evidence before release.
+
+### Native acceptance
+
+Run the following on both iOS and Android against an isolated test account and
+host. Record the candidate commit, app update/build identity, OS and device,
+network path, and observed result for each case. Simulator and Jest results
+must be labelled separately from physical-device results; neither establishes
+recovery across a real Wi-Fi/mobile-network transition.
+
+| Case | Exercise | Required observation |
+| --- | --- | --- |
+| Reuse and detach | Open two sessions and a file browser on one host; close and reopen each surface. | One device-to-host peer serves them; closing a surface leaves its siblings and the session workers running. |
+| Background and resume | Background briefly, then for more than three seconds; resume with both sessions open. | The short interruption and transport retirement both recover. Views reattach once, stale worker events cannot enable input or retire a new attachment, and session processes survive. |
+| Network change | Switch Wi-Fi to mobile data and back while output is streaming; repeat with direct connectivity unavailable and UDP TURN available. | Recovery restores both sessions and tools. Each host has one reconnect notice; input stays paused until fresh attachment/control confirmation. |
+| Queued input and files | Interrupt a backpressured paste and an upload while typing in the other session. | Unsent input is discarded. Already-dispatched input remains explicitly uncertain; interrupted writes follow the existing reconciliation flow without a blind duplicate write. |
+| Process restart | Terminate and reopen the app while sessions are running. | A fresh connection restores history and live output; the daemon's session workers survive, and another device's control lease is not taken implicitly. |
+| Identity retirement | In the isolated fixture, sign out, switch accounts, replace the device key, and revoke host trust. | Each action retires the affected connection and pending work. Delayed bridge events cannot revive it or reach the next identity. |
+
+Retain device logs and the observed peer/attachment lifecycle with the review
+evidence. Report failures and unavailable cases explicitly rather than treating
+successful bundling, component tests, or a green CI lane as native acceptance.

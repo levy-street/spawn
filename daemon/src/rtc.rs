@@ -2458,7 +2458,7 @@ fn session_data_channel_handler(
             let open_binding_nonce = binding.signaling.binding_nonce.clone();
             let open_viewer_id = viewer_id.clone();
             let open_out_tx = out_tx.clone();
-            let open_dc = Arc::clone(&dc);
+            let open_dc = Arc::downgrade(&dc);
             let open_active = Arc::clone(&active);
             let open_fence = Arc::clone(&fence);
             let open_control = binding.control.clone();
@@ -2473,7 +2473,7 @@ fn session_data_channel_handler(
                 let binding_nonce = open_binding_nonce.clone();
                 let viewer_id = open_viewer_id.clone();
                 let out_tx = open_out_tx.clone();
-                let dc = Arc::clone(&open_dc);
+                let dc = open_dc.upgrade();
                 let active = Arc::clone(&open_active);
                 let fence = Arc::clone(&open_fence);
                 let control = open_control.clone();
@@ -2484,6 +2484,7 @@ fn session_data_channel_handler(
                 let signal_id = open_signal_id.clone();
                 let generation = open_generation.clone();
                 Box::pin(async move {
+                    let Some(dc) = dc else { return };
                     let Some(pc) = pc.upgrade() else { return };
                     if !active.load(Ordering::Acquire) || !registry.is_current(session) {
                         let _ = dc.close().await;
@@ -8534,6 +8535,45 @@ mod tests {
                 .count(),
             0,
             "session shutdown leaked a write temporary",
+        );
+    }
+
+    #[tokio::test]
+    async fn host_callbacks_release_a_channel_that_never_opens() {
+        let pc = webrtc::api::APIBuilder::new()
+            .build()
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .unwrap();
+        let channel = pc
+            .create_data_channel(HOST_CONTROL_LABEL, None)
+            .await
+            .unwrap();
+        let weak_channel = Arc::downgrade(&channel);
+        let lifetime = install_host_control_channel(
+            Arc::clone(&channel),
+            "never-opened-host".into(),
+            HostRtcBinding {
+                host_id: Uuid::new_v4(),
+                binding_nonce: "a".repeat(32),
+                binding_generation: 1,
+                protocol: HOST_CONTROL_LABEL.into(),
+                protocol_version: RTC_PROTOCOL_VERSION,
+            },
+            RtcWsSender::default(),
+            None,
+        );
+        let weak_lifetime = Arc::downgrade(&lifetime);
+        drop(lifetime);
+        drop(channel);
+        pc.close().await.unwrap();
+        assert!(
+            weak_channel.upgrade().is_none(),
+            "unfired handlers retain their channel"
+        );
+        assert!(
+            weak_lifetime.upgrade().is_none(),
+            "unfired handlers retain host state"
         );
     }
 

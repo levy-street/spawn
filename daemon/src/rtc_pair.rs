@@ -516,6 +516,155 @@ impl RtcSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_consumer_churn_releases_closed_channels_and_lifetimes() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_pair(&sessions, &registry, [8; 32]).await;
+        let (signal_tx, mut signal_rx) = mpsc::channel(128);
+        sessions.signaling.install(signal_tx);
+        let signal_sink = tokio::spawn(async move { while signal_rx.recv().await.is_some() {} });
+        let peer = sessions
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let mut lifetimes = Vec::new();
+        let mut local_channels = Vec::new();
+        let mut local_ids = HashSet::new();
+        for _ in 0..256 {
+            let channel = pc
+                .create_data_channel(&format!("spawn.host.ctl/{}", Uuid::new_v4()), None)
+                .await
+                .unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            channel.on_message(Box::new(move |message| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(serde_json::from_slice::<Value>(&message.data).unwrap());
+                })
+            }));
+            let hello = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(hello["type"], "hello");
+            assert!(
+                local_ids.insert(channel.id()),
+                "pruning reused an allocated stream ID"
+            );
+            channel
+                .send_text(
+                    json!({
+                        "version": 1, "type": "request", "request_id": "churn",
+                        "operation": "fs.home", "payload": {}
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply["request_id"], "churn");
+            assert_eq!(reply["ok"], true);
+            let lifetime = peer
+                .pair
+                .as_ref()
+                .unwrap()
+                .host_channels
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+            channel.close().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while channel.ready_state() != RTCDataChannelState::Closed
+                    || lifetime
+                        .upgrade()
+                        .is_some_and(|lifetime| !lifetime.is_retired())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("host consumer retired after close");
+            local_channels.push(Arc::downgrade(&channel));
+            lifetimes.push(lifetime);
+        }
+        // Admission removes the preceding closed channel; the final one may
+        // remain until another admission or parent close. Cleanup tasks can
+        // briefly hold references after retirement while they drain.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lifetimes
+                .iter()
+                .filter(|lifetime| lifetime.upgrade().is_some())
+                .count()
+                > 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed consumers accumulated on a live shared parent");
+        assert!(
+            local_channels
+                .iter()
+                .filter(|channel| channel.upgrade().is_some())
+                .count()
+                <= 1
+        );
+        let stats = peer.pc.get_stats().await;
+        let closed_channels = stats
+            .reports
+            .values()
+            .filter(|report| {
+                matches!(
+                    report, webrtc::stats::StatsReportType::DataChannel(channel)
+                        if channel.state == RTCDataChannelState::Closed
+                )
+            })
+            .count();
+        assert!(
+            closed_channels <= 1,
+            "closed transport registry grew with consumer history"
+        );
+        let closed_total = stats.reports.values().find_map(|report| match report {
+            webrtc::stats::StatsReportType::PeerConnection(peer) => Some(peer.data_channels_closed),
+            _ => None,
+        });
+        assert_eq!(
+            closed_total,
+            Some(256),
+            "pruning lost cumulative close statistics"
+        );
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Connected);
+        sessions.close_all().await;
+        pc.close().await.unwrap();
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lifetimes
+                .iter()
+                .any(|lifetime| lifetime.upgrade().is_some())
+                || local_channels
+                    .iter()
+                    .any(|channel| channel.upgrade().is_some())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host callbacks retained consumer state after parent close");
+        signal_sink.abort();
+    }
+
     #[test]
     fn attachment_labels_are_exact_and_canonical() {
         let session = Uuid::new_v4();

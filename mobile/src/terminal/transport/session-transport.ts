@@ -363,6 +363,15 @@ class WebViewSessionTransport implements SessionTransport {
   }
   #handleWorkerMessage(message: WorkerToNativeMessage): void {
     if (!this.#workerStarted || activeDeviceIdentityAccount() !== this.#accountId) return;
+    // WebView messages can arrive after the parent has already reattached.
+    // Readiness and control must belong to that fresh attachment, even if the
+    // terminal WebView itself survived the connection loss.
+    if (
+      (message.attachmentId !== undefined && message.attachmentId !== this.#attachmentId) ||
+      (["state", "display", "upload-progress"].includes(message.type) &&
+        (!this.#attachmentId || message.attachmentId !== this.#attachmentId))
+    )
+      return;
     switch (message.type) {
       case "pair-command":
         if (message.attachmentId === this.#attachmentId) {

@@ -135,7 +135,11 @@ export type NativeToWorkerMessage =
   | (NativeMessage & { type: "host-cancel"; requestId: string })
   | (NativeMessage & { type: "close" });
 
-type WorkerMessage = { v: typeof TERMINAL_BRIDGE_VERSION };
+type WorkerMessage = {
+  v: typeof TERMINAL_BRIDGE_VERSION;
+  /** Session events remain bound to the attachment that emitted them. */
+  attachmentId?: string | null;
+};
 
 export type WorkerToNativeMessage =
   | (WorkerMessage & {

@@ -68,8 +68,18 @@
   const api = (globalThis.spawnWorker = { state });
   const encoder = new TextEncoder();
 
+  function scopedMessage(message) {
+    return state.mode === "session" &&
+      message.type !== "diagnostic" &&
+      !Object.prototype.hasOwnProperty.call(message, "attachmentId")
+      ? { ...message, attachmentId: state.rtcSessionId }
+      : message;
+  }
+
   api.post = (message) => {
-    globalThis.ReactNativeWebView?.postMessage(JSON.stringify({ v: BRIDGE_VERSION, ...message }));
+    globalThis.ReactNativeWebView?.postMessage(
+      JSON.stringify({ v: BRIDGE_VERSION, ...scopedMessage(message) }),
+    );
   };
 
   api.error = (code, message, retryable = false, detail) => {
@@ -85,7 +95,8 @@
   const latestTelemetry = new Map();
   let telemetryTimer = null;
   api.telemetry = (message) => {
-    latestTelemetry.set(message.type, message);
+    // Capture before batching: a replacement may be current by flush time.
+    latestTelemetry.set(message.type, scopedMessage(message));
     if (telemetryTimer !== null) return;
     telemetryTimer = setTimeout(() => {
       telemetryTimer = null;
