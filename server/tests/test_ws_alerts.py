@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -160,6 +161,7 @@ class _AlertCollector:
         self.events: list[dict[str, Any]] = []
         self._task: asyncio.Task | None = None
         self._ready = asyncio.Event()
+        self._received = asyncio.Event()
 
     async def __aenter__(self) -> _AlertCollector:
         self._task = asyncio.create_task(self._pump())
@@ -183,6 +185,12 @@ class _AlertCollector:
                 event = json.loads(raw)
                 if event.get("type") == "alert":
                     self.events.append(event)
+                    self._received.set()
+
+    async def wait_for(self, event_name: str) -> None:
+        while not any(event.get("event") == event_name for event in self.events):
+            self._received.clear()
+            await self._received.wait()
 
 
 async def _run_daemon(token: str, frames: list[dict[str, Any]]) -> FakeDaemonWebSocket:
@@ -617,20 +625,44 @@ def _fast_quiet(monkeypatch, delay: float = 0.05) -> None:
     monkeypatch.setattr(daemon_mod, "ALERT_QUIET_SECONDS", delay / 2)
 
 
-async def _drive_daemon(token: str, frames: list[dict[str, Any]], *, settle: float) -> None:
+async def _drive_daemon(
+    token: str,
+    frames: list[dict[str, Any]],
+    *,
+    settle: float = 0.3,
+    until: Awaitable[None] | None = None,
+) -> None:
     ws = FakeDaemonWebSocket()
     ws.queue_text(REGISTER)
     for frame in frames:
         ws.queue_text(frame)
     task = asyncio.create_task(daemon_ws(ws, token=token))  # type: ignore[arg-type]
-    await asyncio.sleep(settle)
-    ws.queue_disconnect()
-    await asyncio.wait_for(task, timeout=2.0)
+    try:
+        if until is None:
+            await asyncio.sleep(settle)
+        else:
+            await asyncio.wait_for(until, timeout=5.0)
+    finally:
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=2.0)
 
 
-async def test_awaiting_input_publishes_for_a_quiet_agent(client, monkeypatch):
+@pytest.mark.parametrize("registration_delay", [0.0, 0.35])
+async def test_awaiting_input_publishes_for_a_quiet_agent(
+    client, monkeypatch, registration_delay
+):
     """The event the user actually wants: an agent that spoke, then stopped."""
     _fast_quiet(monkeypatch)
+    real_accept = FakeDaemonWebSocket.accept
+
+    async def delayed_accept(self, subprotocol=None):
+        # Registration may consume the entire old 300 ms settle budget before
+        # activity can even arm its quiet timer. Keep the connection alive
+        # until the alert is observed instead of timing it from task creation.
+        await asyncio.sleep(registration_delay)
+        await real_accept(self, subprotocol=subprotocol)
+
+    monkeypatch.setattr(FakeDaemonWebSocket, "accept", delayed_accept)
     user_id, _ = await _signup(client, "alert-quiet@example.com")
     host_id = await _create_host(user_id)
     pty_id = await _create_session_row(user_id, host_id)
@@ -643,7 +675,7 @@ async def test_awaiting_input_publishes_for_a_quiet_agent(client, monkeypatch):
                 {"type": "session.foreground", "session_id": pty_id, "command": "claude"},
                 {"type": "session.activity", "session_id": pty_id},
             ],
-            settle=0.3,
+            until=alerts.wait_for("agent.awaiting_input"),
         )
 
     awaiting = [e for e in alerts.events if e["event"] == "agent.awaiting_input"]
