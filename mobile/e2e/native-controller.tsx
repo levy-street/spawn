@@ -160,13 +160,18 @@ export function NativeAcceptanceController(): React.JSX.Element {
     });
     const register = async () => {
       setDeviceIdentityAccount(current.accountId);
-      await ensureDeviceRegistered({ accountId: current.accountId, label: "Native acceptance" });
+      const registered = await ensureDeviceRegistered({
+        accountId: current.accountId,
+        label: "Native acceptance",
+      });
       const identity = await deviceIdentity.ensure();
-      registeredDeviceId.current = identity.deviceId;
+      // Endorsements and revocation target the server row, whose UUID is
+      // independent of the deterministic local key ID.
+      registeredDeviceId.current = registered.id;
       const publicKey = encodeBase64Url(identity.publicKey);
-      await control("/__acceptance/device", { deviceId: identity.deviceId, publicKey });
+      await control("/__acceptance/device", { deviceId: registered.id, publicKey });
       await event("identity", {
-        deviceId: identity.deviceId,
+        deviceId: registered.id,
         publicKey,
         generation: deviceIdentityGeneration(),
       });
