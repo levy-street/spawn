@@ -45,6 +45,17 @@ Anthropic's own Remote Control and hosted product, and "claude code teams"
 mostly means the Team plan — those pages concede and teach the vendor's
 thing first.
 
+## The ask
+
+Signup is invite-only, so every page's one call is the waitlist: the Start
+block on each SEO page, the landing page's closing plate, and the signup page
+itself when someone arrives without a code. The form posts to
+`POST /api/waitlist` with the page it sat on as `source`, so the admin page's
+Waitlist section (web and mobile) shows which pages earn their keep and lets
+an admin mint and mail an invite in one click. The block reads the server's
+`invite_only` flag at runtime: the day signup opens, the same block shows the
+door instead, with no rebuild.
+
 ## Checks and shipping
 
 ```bash

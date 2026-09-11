@@ -102,6 +102,9 @@ async function mockAdminApi(page: import("@playwright/test").Page, options: { is
     }
     await route.fulfill({ status: 200, json: invites });
   });
+  await page.route("**/api/admin/waitlist", async (route) => {
+    await route.fulfill({ status: 200, json: [] });
+  });
 }
 
 test("an admin sees every account and can mint a shareable invite", async ({ page, context }) => {

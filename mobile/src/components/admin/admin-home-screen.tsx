@@ -29,6 +29,12 @@ export function AdminHomeScreen(): React.JSX.Element {
           onPress={() => router.push("/admin/invites")}
         />
         <SettingsLinkRow
+          hint="People who asked for an invite"
+          icon="Timer"
+          label="Waitlist"
+          onPress={() => router.push("/admin/waitlist")}
+        />
+        <SettingsLinkRow
           hint="Accounts on this deployment"
           icon="UserRound"
           label="Users"

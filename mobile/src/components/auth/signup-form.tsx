@@ -7,6 +7,7 @@ import { AuthMessage } from "@/components/auth/auth-message";
 import { useAuthBack } from "@/components/auth/auth-navigation";
 import { AuthBlock, AuthShell } from "@/components/auth/auth-shell";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
+import { WaitlistForm, waitlistCopy } from "@/components/auth/waitlist-form";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
@@ -178,6 +179,11 @@ export function SignupScreen({ invite }: { invite?: string }) {
   const router = useRouter();
   const goBack = useAuthBack();
   const configQuery = useAuthConfigQuery();
+  // A closed deployment leads with the waitlist: a stranger arriving cold has
+  // no code to type, and a form that demands one is a wall. The code path
+  // stays one press away for the person who was sent one by hand.
+  const [showForm, setShowForm] = useState(false);
+  const [joined, setJoined] = useState<string | null>(null);
 
   if (configQuery.isPending) return <SignupLoading onBack={goBack} />;
   if (configQuery.isError || configQuery.data === undefined) {
@@ -199,16 +205,55 @@ export function SignupScreen({ invite }: { invite?: string }) {
     );
   }
 
+  const accountFooter = (
+    <View style={authFooterRow}>
+      <Text color="mutedForeground" variant="sigilLabel">
+        Already have an account?
+      </Text>
+      <AuthLink emphasis label="Log in" onPress={() => router.replace("/login")} />
+    </View>
+  );
+  const closed = configQuery.data.invite_only && invite === undefined;
+
+  if (closed && !showForm) {
+    return (
+      <AuthShell
+        description={joined === null ? waitlistCopy.body : waitlistCopy.done(joined)}
+        footer={accountFooter}
+        onBack={goBack}
+        title={joined === null ? waitlistCopy.title : waitlistCopy.doneTitle}
+      >
+        {joined === null ? <WaitlistForm onJoined={setJoined} source="signup" /> : null}
+        <AuthBlock>
+          <AuthAction
+            label={waitlistCopy.haveInvite}
+            onPress={() => setShowForm(true)}
+            testID="signup-have-invite"
+            tone="quiet"
+          />
+        </AuthBlock>
+      </AuthShell>
+    );
+  }
+
   return (
     <AuthShell
       description="An account first. Then you bind the machine your daemons will run on."
       footer={
-        <View style={authFooterRow}>
-          <Text color="mutedForeground" variant="sigilLabel">
-            Already have an account?
-          </Text>
-          <AuthLink emphasis label="Log in" onPress={() => router.replace("/login")} />
-        </View>
+        closed ? (
+          <View style={styles.footerStack}>
+            <View style={authFooterRow}>
+              <AuthLink
+                label={waitlistCopy.backToWaitlist}
+                onPress={() => setShowForm(false)}
+                testID="signup-back-to-waitlist"
+              />
+            </View>
+            {accountFooter}
+          </View>
+        ) : (
+          accountFooter
+        )
       }
       onBack={goBack}
       title="Sign the pact"
@@ -225,6 +270,9 @@ export function SignupScreen({ invite }: { invite?: string }) {
 }
 
 const styles = StyleSheet.create({
+  footerStack: {
+    gap: spacing[2],
+  },
   form: {
     gap: authFormGap,
   },

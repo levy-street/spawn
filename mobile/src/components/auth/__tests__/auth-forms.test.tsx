@@ -11,9 +11,14 @@ import {
   ResetPasswordScreen,
   validateResetPasswordForm,
 } from "@/components/auth/reset-password-form";
-import { validateSignupForm } from "@/components/auth/signup-form";
+import { SignupScreen, validateSignupForm } from "@/components/auth/signup-form";
 import { ApiError } from "@/data/api/client";
-import { confirmPasswordReset, getAuthConfig, logIn } from "@/data/api/endpoints/auth";
+import {
+  confirmPasswordReset,
+  getAuthConfig,
+  joinWaitlist,
+  logIn,
+} from "@/data/api/endpoints/auth";
 import { signInWithProvider } from "@/lib/oauth";
 import { fontFamily, ThemeProvider } from "@/theme";
 
@@ -45,6 +50,7 @@ jest.mock("@/data/api/endpoints/auth", () => ({
   confirmEmailVerification: jest.fn(),
   confirmPasswordReset: jest.fn(),
   getAuthConfig: jest.fn(),
+  joinWaitlist: jest.fn(),
   logIn: jest.fn(),
   requestEmailVerification: jest.fn(),
   requestPasswordReset: jest.fn(),
@@ -187,6 +193,86 @@ describe("auth form wiring", () => {
       await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
     },
   );
+});
+
+describe("closed signup", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.mocked(getAuthConfig).mockResolvedValue({
+      providers: [],
+      email_verification_required: false,
+      invite_only: true,
+    });
+    jest.mocked(joinWaitlist).mockResolvedValue({ ok: true });
+  });
+
+  it("leads with the waitlist and keeps the invite code one press away", async () => {
+    const screen = await renderAuth(<SignupScreen />);
+    await screen.findByRole("header", { name: "Join the waitlist" });
+    expect(
+      screen.getByText(
+        "SPAWN D is invite-only right now. Leave your email and we’ll send an invite when there’s room.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByTestId("waitlist-email")).toBeTruthy();
+    expect(screen.queryByTestId("signup-invite")).toBeNull();
+
+    await fireEvent.press(screen.getByTestId("signup-have-invite"));
+    expect(await screen.findByTestId("signup-invite")).toBeTruthy();
+    expect(screen.queryByTestId("waitlist-email")).toBeNull();
+
+    await fireEvent.press(screen.getByTestId("signup-back-to-waitlist"));
+    expect(await screen.findByTestId("waitlist-email")).toBeTruthy();
+  });
+
+  it("goes straight to the form when an invite was carried in", async () => {
+    const screen = await renderAuth(<SignupScreen invite="abc123" />);
+    expect(await screen.findByTestId("signup-invite")).toBeTruthy();
+    expect(screen.queryByTestId("waitlist-email")).toBeNull();
+  });
+
+  it("joins with the address and the signup source, then says so", async () => {
+    const screen = await renderAuth(<SignupScreen />);
+    await fireEvent.changeText(await screen.findByTestId("waitlist-email"), " Person@Example.com ");
+    await fireEvent.press(screen.getByTestId("waitlist-submit"));
+
+    await screen.findByRole("header", { name: "You’re on the list." });
+    // The mutation hands the endpoint its variables first and the query
+    // context second; only the first is the contract.
+    expect(jest.mocked(joinWaitlist).mock.calls[0]?.[0]).toEqual({
+      email: "Person@Example.com",
+      source: "signup",
+    });
+    expect(screen.getByText("We’ll email Person@Example.com when there’s room.")).toBeTruthy();
+    expect(screen.queryByTestId("waitlist-email")).toBeNull();
+  });
+
+  it("blocks an invalid address with the shared copy", async () => {
+    const screen = await renderAuth(<SignupScreen />);
+    await fireEvent.changeText(await screen.findByTestId("waitlist-email"), "not-an-email");
+    await fireEvent.press(screen.getByTestId("waitlist-submit"));
+
+    expect(await screen.findByText("Enter a valid email address.")).toBeTruthy();
+    expect(joinWaitlist).not.toHaveBeenCalled();
+  });
+
+  it("tells the cap apart from an ordinary failure", async () => {
+    jest
+      .mocked(joinWaitlist)
+      .mockRejectedValueOnce(new ApiError(429, "http_429", "too many requests; slow down"))
+      .mockRejectedValueOnce(new ApiError(500, "http_500", "boom"));
+    const screen = await renderAuth(<SignupScreen />);
+    await fireEvent.changeText(await screen.findByTestId("waitlist-email"), "person@example.com");
+    await fireEvent.press(screen.getByTestId("waitlist-submit"));
+    expect(
+      await screen.findByText("Too many tries from this network. Try again later."),
+    ).toBeTruthy();
+
+    await fireEvent.press(screen.getByTestId("waitlist-submit"));
+    expect(
+      await screen.findByText("Could not join the waitlist. Try again in a moment."),
+    ).toBeTruthy();
+  });
 });
 
 describe("OAuth buttons", () => {

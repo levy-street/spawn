@@ -27,6 +27,21 @@ export const AdminInviteOutSchema = z.object({
   used_by_user_id: UUIDSchema.nullable(),
   url: z.string().nullable(),
 });
+export const AdminWaitlistInviteSchema = z.object({
+  ttl_hours: z.number().int().min(1).max(720).nullable().optional(),
+});
+export const AdminWaitlistEntryOutSchema = z.object({
+  id: UUIDSchema,
+  email: z.string(),
+  source: z.string().nullable(),
+  created_at: IsoDateTimeSchema,
+  invited_at: IsoDateTimeSchema.nullable(),
+  invite_id: UUIDSchema.nullable(),
+  // The state of the invite minted for this entry, when there is one.
+  invite_state: InviteStateSchema.nullable(),
+  // Whether an account now exists for the address, however it got in.
+  has_account: z.boolean(),
+});
 export const AdminMailStatusSchema = z.object({
   backend: z.string(),
   delivering: z.boolean(),
@@ -52,6 +67,8 @@ export type AdminUserOut = z.infer<typeof AdminUserOutSchema>;
 export type AdminInviteCreate = z.infer<typeof AdminInviteCreateSchema>;
 export type InviteState = z.infer<typeof InviteStateSchema>;
 export type AdminInviteOut = z.infer<typeof AdminInviteOutSchema>;
+export type AdminWaitlistInvite = z.infer<typeof AdminWaitlistInviteSchema>;
+export type AdminWaitlistEntryOut = z.infer<typeof AdminWaitlistEntryOutSchema>;
 export type AdminMailStatus = z.infer<typeof AdminMailStatusSchema>;
 export type AdminEmailStatus = z.infer<typeof AdminEmailStatusSchema>;
 export type AdminEmailOut = z.infer<typeof AdminEmailOutSchema>;

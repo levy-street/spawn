@@ -14,6 +14,10 @@ import {
   AdminTestEmailSchema,
   type AdminUserOut,
   AdminUserOutSchema,
+  type AdminWaitlistEntryOut,
+  AdminWaitlistEntryOutSchema,
+  type AdminWaitlistInvite,
+  AdminWaitlistInviteSchema,
 } from "@/data/api/schemas/admin";
 
 export function listAdminUsers(): Promise<AdminUserOut[]> {
@@ -37,6 +41,26 @@ export function revokeAdminInvite(inviteId: string): Promise<AdminInviteOut> {
     method: "POST",
     schema: AdminInviteOutSchema,
   });
+}
+
+export function listAdminWaitlist(): Promise<AdminWaitlistEntryOut[]> {
+  return api("/api/admin/waitlist", { schema: z.array(AdminWaitlistEntryOutSchema) });
+}
+
+/** Mint an invite addressed to a waitlisted entry and send it; the one-time URL comes back. */
+export function inviteFromAdminWaitlist(
+  entryId: string,
+  body: AdminWaitlistInvite = {},
+): Promise<AdminInviteOut> {
+  return api(`/api/admin/waitlist/${pathPart(entryId)}/invite`, {
+    method: "POST",
+    body: jsonBody(AdminWaitlistInviteSchema.parse(body)),
+    schema: AdminInviteOutSchema,
+  });
+}
+
+export function removeFromAdminWaitlist(entryId: string): Promise<void> {
+  return api(`/api/admin/waitlist/${pathPart(entryId)}`, { method: "DELETE" });
 }
 
 export function getAdminMailStatus(): Promise<AdminMailStatus> {

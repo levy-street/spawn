@@ -1,15 +1,14 @@
-import { ArrowRight } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import {
   Colophon,
   CTA_QUIET,
-  CTA_SLAB,
   Eyebrow,
   InstallCommand,
   Masthead,
   RegistrationMarks,
 } from "@/components/brand/press";
+import { StartAction } from "@/components/brand/waitlist";
 import { Inline } from "@/components/grimoire/Inline";
 import { INSTALL_COMMAND } from "@/components/grimoire/link";
 import { poster } from "@/lib/fonts";
@@ -160,23 +159,25 @@ export function CodeFigure({ caption, children }: { caption?: string; children: 
   );
 }
 
-/** The page's single call: the install chip, the bone slab, the quiet door. */
+/**
+ * The page's single call: the waitlist while signup is closed (the door once
+ * it opens), then the install chip and the quiet way to the daemon.
+ */
 export function Start({ heading }: { heading: string }) {
   return (
     <Section id="start">
       <div className="mx-auto w-full max-w-3xl">
         <Eyebrow className="mb-5 text-ember">Start</Eyebrow>
         <H2>{heading}</H2>
-        <div className="mt-9 flex flex-col items-stretch gap-4 sm:flex-row sm:items-center">
+        <div className="mt-9">
+          <StartAction />
+        </div>
+        <div className="mt-10 flex flex-col items-stretch gap-4 sm:flex-row sm:items-center">
           <InstallCommand command={INSTALL_COMMAND} />
-          <Link prefetch={false} href="/signup" className={CTA_SLAB}>
-            Sign up free
-            <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+          <Link prefetch={false} href="/download" className={CTA_QUIET}>
+            Install the daemon
           </Link>
         </div>
-        <Link prefetch={false} href="/download" className={cn(CTA_QUIET, "mt-8")}>
-          Install the daemon
-        </Link>
       </div>
     </Section>
   );

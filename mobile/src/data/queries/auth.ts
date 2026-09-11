@@ -4,6 +4,7 @@ import {
   confirmEmailVerification,
   confirmPasswordReset,
   getAuthConfig,
+  joinWaitlist,
   logIn,
   requestEmailVerification,
   requestPasswordReset,
@@ -98,6 +99,10 @@ export function useOAuthSignInMutation() {
       seedMe(queryClient, result.user);
     },
   });
+}
+
+export function useJoinWaitlistMutation() {
+  return useMutation({ mutationFn: joinWaitlist });
 }
 
 export function usePasswordResetRequestMutation() {
