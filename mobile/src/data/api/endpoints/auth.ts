@@ -30,6 +30,10 @@ import {
   SignupRequestSchema,
   type TokenResponse,
   TokenResponseSchema,
+  type WaitlistJoinOut,
+  WaitlistJoinOutSchema,
+  type WaitlistJoinRequest,
+  WaitlistJoinRequestSchema,
 } from "@/data/api/schemas/auth";
 import { unregisterForPushNotifications } from "@/lib/push";
 
@@ -39,6 +43,16 @@ export function healthCheck(): Promise<HealthzResponse> {
 
 export function getAuthConfig(): Promise<AuthConfigOut> {
   return api("/api/auth/config", { auth: false, schema: AuthConfigOutSchema });
+}
+
+/** Leave an address while signup is closed. Public; the answer is always `ok`. */
+export function joinWaitlist(body: WaitlistJoinRequest): Promise<WaitlistJoinOut> {
+  return api("/api/waitlist", {
+    method: "POST",
+    auth: false,
+    body: jsonBody(WaitlistJoinRequestSchema.parse(body)),
+    schema: WaitlistJoinOutSchema,
+  });
 }
 
 export function signUp(body: SignupRequest): Promise<TokenResponse> {

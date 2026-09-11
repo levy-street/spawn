@@ -2,13 +2,15 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
+import { WaitlistForm } from "@/components/brand/waitlist";
 import { AuthShell } from "@/components/onboarding/auth-shell";
 import { SignupForm } from "@/components/onboarding/signup-form";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useAuthConfig } from "@/lib/auth";
 import { safeNext } from "@/lib/safe-next";
+import { WAITLIST } from "@/lib/waitlist";
 
 /** Display name for a provider id, for copy that names who signed you in. */
 function providerName(id: string): string {
@@ -39,6 +41,10 @@ function SignupPageContent() {
   // stash, so the ceremony is finished in the flow the account is already in.
   const returnTo = requestedNext.startsWith("/device") ? "/onboarding" : requestedNext;
   const blockedProvider = searchParams.get("provider");
+  // Someone who arrives cold at a closed deployment is asked for an address,
+  // not a code they do not have; the code's field is one tap away for the
+  // people who do.
+  const [wantsForm, setWantsForm] = useState(false);
 
   if (loading || config === null) {
     if (error) {
@@ -54,6 +60,35 @@ function SignupPageContent() {
       );
     }
     return <SignupLoading />;
+  }
+
+  const closedCold = config.invite_only && invite === null && !inviteRequired;
+  if (closedCold && !wantsForm) {
+    return (
+      <AuthShell title={WAITLIST.title} description={WAITLIST.body}>
+        <div className="space-y-5">
+          <WaitlistForm tone="shell" source="signup" showBody={false} />
+          <p className="text-center text-sm text-ash">
+            <button
+              type="button"
+              onClick={() => setWantsForm(true)}
+              className="-my-2 inline-flex items-center py-2 font-medium text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
+            >
+              {WAITLIST.haveInvite}
+            </button>
+          </p>
+          <p className="text-center text-sm text-ash">
+            Already have an account?{" "}
+            <Link
+              href="/login"
+              className="-my-2 inline-flex items-center py-2 font-medium text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
+            >
+              Log in
+            </Link>
+          </p>
+        </div>
+      </AuthShell>
+    );
   }
 
   return (
@@ -87,6 +122,17 @@ function SignupPageContent() {
           oauthReturnTo={returnTo}
           onSuccess={() => router.replace(returnTo)}
         />
+        {closedCold ? (
+          <p className="text-center text-sm text-ash">
+            <button
+              type="button"
+              onClick={() => setWantsForm(false)}
+              className="-my-2 inline-flex items-center py-2 font-medium text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
+            >
+              {WAITLIST.backToWaitlist}
+            </button>
+          </p>
+        ) : null}
         <p className="text-center text-sm text-ash">
           Already have an account?{" "}
           <Link

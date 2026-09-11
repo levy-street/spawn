@@ -52,6 +52,15 @@ export const AppleNativeSignInSchema = z.object({
   identity_token: z.string().min(16).max(8192),
   invite: z.string().max(256).nullable().optional(),
 });
+// The address someone leaves while signup is closed. `source` names the page
+// the form sat on; the server bounds it and treats it as a label.
+export const WaitlistJoinRequestSchema = z.object({
+  email: z.string().email(),
+  source: z.string().max(120).nullable().optional(),
+});
+// Always `ok`: the server answers the same whether the address was new,
+// already listed, or already an account, so nothing can be enumerated.
+export const WaitlistJoinOutSchema = z.object({ ok: z.boolean() });
 export const AuthConfigOutSchema = z.object({
   providers: z.array(AuthProviderOutSchema),
   email_verification_required: z.boolean(),
@@ -75,3 +84,5 @@ export type AuthProviderOut = z.infer<typeof AuthProviderOutSchema>;
 export type OAuthExchangeRequest = z.infer<typeof OAuthExchangeRequestSchema>;
 export type AppleNativeSignIn = z.infer<typeof AppleNativeSignInSchema>;
 export type AuthConfigOut = z.infer<typeof AuthConfigOutSchema>;
+export type WaitlistJoinRequest = z.infer<typeof WaitlistJoinRequestSchema>;
+export type WaitlistJoinOut = z.infer<typeof WaitlistJoinOutSchema>;

@@ -131,3 +131,6 @@ LOGIN = RateLimit("login", limit=20, window_seconds=900)
 PASSWORD_RESET = RateLimit("password_reset", limit=5, window_seconds=3600)
 VERIFY_RESEND = RateLimit("verify_resend", limit=5, window_seconds=3600)
 DEVICE_PAIRING = RateLimit("device_pairing", limit=30, window_seconds=3600)
+# A public form on every marketing page: generous enough for an office
+# behind one address, small enough that a script cannot fill the table.
+WAITLIST = RateLimit("waitlist", limit=10, window_seconds=3600)

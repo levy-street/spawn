@@ -37,6 +37,7 @@ from .routes import release as release_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
 from .routes import trust_bundle as trust_bundle_routes
+from .routes import waitlist as waitlist_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
 from .turn import validate_and_log_ice_config
@@ -122,6 +123,7 @@ def create_app() -> FastAPI:
     app.include_router(account_recovery_routes.router)
     app.include_router(admin_routes.router)
     app.include_router(auth_config_routes.router)
+    app.include_router(waitlist_routes.router)
     app.include_router(auth_providers_routes.router)
     app.include_router(browser_devices_routes.router)
     app.include_router(capabilities_routes.router)

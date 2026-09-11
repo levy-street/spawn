@@ -44,6 +44,7 @@ export const APP_ROUTE_MAP = {
   "/settings/about": "settings/about",
   "/admin": "admin/index",
   "/admin/invites": "admin/invites",
+  "/admin/waitlist": "admin/waitlist",
   "/admin/users": "admin/users",
   "/admin/emails": "admin/emails",
 } as const;
@@ -108,6 +109,7 @@ export default function AppStackLayout(): React.JSX.Element | null {
             <Stack.Screen name="device-approval" />
             <Stack.Screen name="admin/index" />
             <Stack.Screen name="admin/invites" />
+            <Stack.Screen name="admin/waitlist" />
             <Stack.Screen name="admin/users" />
             <Stack.Screen name="admin/emails" />
           </Stack>
