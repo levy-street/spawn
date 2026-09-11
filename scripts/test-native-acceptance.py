@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -120,6 +121,55 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(suite.data_packets(status, "data"), 6)
         self.assertEqual(suite.data_packets(status, "dropped_packets"), 8)
         self.assertEqual(suite.data_packets(status, "dropped_data"), 8)
+
+    def configure_suite(self):
+        self.fixture.args.baseline = "a" * 40
+        self.fixture.args.transport = "relay"
+        self.fixture.args.timeout = 1
+        self.fixture.binary_identity = {}
+        self.fixture.command = AsyncMock(return_value={})
+
+    async def test_runner_setup_error_keeps_reason_without_passing_native_cases(self):
+        self.configure_suite()
+        self.fixture.record(
+            {
+                "type": "native-command",
+                "status": "failed",
+                "details": {
+                    "candidate_commit": self.fixture.candidate,
+                    "values": {
+                        "action": "runner-error",
+                        "result": {"error": "simctl install exceeded its deadline"},
+                    },
+                },
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "simctl install exceeded"):
+            await suite.exercise(self.fixture)
+        report = json.loads((self.fixture.output / "evidence.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("simctl install exceeded", report["failure_reason"])
+        self.assertEqual(report["cases"], [])
+        self.fixture.command.assert_any_await(
+            "finish",
+            {"status": "failed", "reason": report["failure_reason"]},
+            native=True,
+            timeout=10,
+        )
+
+    async def test_interrupted_setup_never_leaves_an_empty_failure_reason(self):
+        self.configure_suite()
+        task = asyncio.create_task(suite.exercise(self.fixture))
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        report = json.loads((self.fixture.output / "evidence.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["cases"], [])
+        self.assertEqual(
+            report["failure_reason"], "native acceptance interrupted before completion"
+        )
 
     async def test_http_trace_is_bounded_and_excludes_request_secrets(self):
         messages = []

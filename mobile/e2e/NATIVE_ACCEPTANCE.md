@@ -50,6 +50,21 @@ The Android acceptance build keeps a 2 GiB JVM heap and raises the metaspace
 limit to 1 GiB because Release lint exhausted the template's 512 MiB limit in
 hosted CI. `ExitOnOutOfMemoryError` makes the Gradle JVM exit if memory is
 exhausted again. The build still runs Release lint and targets only x86_64.
+After the isolated fixture starts from its private executable copies, the
+Android job cleans its Cargo compilation outputs. After a successful APK build,
+`compact-android-build.py` stages the APK beside its build metadata and removes
+only that run's generated `android/` and `node_modules/` directories before SDK
+installation. It requires the disposable `RUNNER_TEMP/native-app` directory;
+runner SDKs, shared caches, fixture executables and evidence remain available.
+
+The iOS runner allows one 600-second installation attempt after its bounded
+300-second boot wait; a cold hosted run exceeded the previous 120-second
+installation limit. The cause of that timeout was not captured. Simulator
+selection is now saved before boot/install in `native-platform.json`, and
+`native-runner.jsonl` records command timing, free disk space, separate stdout
+and stderr, and failures with credentials redacted. Setup failures report a
+failed `runner-error` event to the fixture and still fail the job; product cases
+are not retried or accepted when setup fails.
 
 ## Running with an isolated fixture
 

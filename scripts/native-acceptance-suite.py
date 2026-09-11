@@ -159,6 +159,17 @@ async def exercise(fixture: Any) -> None:
         return values
 
     async def boot() -> dict[str, Any] | None:
+        for event in reversed(fixture.events):
+            details = event.get("details", {})
+            values = details.get("values", {})
+            if (
+                event.get("type") == "native-command"
+                and event.get("status") == "failed"
+                and details.get("candidate_commit") == fixture.candidate
+                and values.get("action") == "runner-error"
+            ):
+                reason = values.get("result", {}).get("error", "unknown setup error")
+                raise RuntimeError(f"native runner failed: {reason}")
         return next(
             (
                 event
@@ -719,7 +730,12 @@ async def exercise(fixture: Any) -> None:
         await case("identity_retirement", identity)
         report["status"] = "passed"
     except BaseException as error:
-        report.update(status="failed", failure_reason=str(error))
+        reason = str(error) or (
+            "native acceptance interrupted before completion"
+            if isinstance(error, asyncio.CancelledError)
+            else type(error).__name__
+        )
+        report.update(status="failed", failure_reason=reason)
         raise
     finally:
         report["completed_at"] = datetime.now(UTC).isoformat()

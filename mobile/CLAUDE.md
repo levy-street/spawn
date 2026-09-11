@@ -63,6 +63,10 @@ scripts/, docs/   build helpers and app-specific notes
 - `e2e/NATIVE_ACCEPTANCE.md` describes the hosted iOS simulator and Android
   emulator acceptance job. Its controller and RTC observation hook enter only a
   disposable build copy, using the actual app providers and native WebViews.
+  The Android job removes generated build directories after preserving the APK
+  and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
+  `e2e/test-native-runner.py` checks bounded installation, diagnostics and failure
+  reporting. Both run through the root test matrix.
   Production routes and assets must never import this controller.
 
 ## Conventions

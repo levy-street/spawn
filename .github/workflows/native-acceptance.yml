@@ -138,10 +138,21 @@ jobs:
               env.write("SPAWN_ACCEPTANCE_API_URL=" + config["apiUrl"] + "\n")
               env.write("SPAWN_ACCEPTANCE_TOKEN=" + config["token"] + "\n")
           PY
+      - name: Reclaim Android fixture compilation outputs
+        if: matrix.platform == 'android'
+        timeout-minutes: 5
+        working-directory: daemon
+        # Readiness above follows copying both executables into the fixture's
+        # private bin directory; the running fixture no longer uses target/.
+        run: cargo clean
       - name: Build native Release acceptance shell
         env:
           NATIVE_PLATFORM: ${{ matrix.platform }}
         run: bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD"
+      - name: Reclaim disposable Android build space for the emulator
+        if: matrix.platform == 'android'
+        timeout-minutes: 5
+        run: python3 mobile/e2e/compact-android-build.py "$ACCEPTANCE_BUILD" "$RUNNER_TEMP"
       - name: Run iOS simulator acceptance
         if: matrix.platform == 'ios'
         run: |

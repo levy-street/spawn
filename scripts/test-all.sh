@@ -46,6 +46,8 @@ scripts/test-connection-canary.sh --self-test
 printf '%s\n' "== native connection acceptance harness guards =="
 python3 scripts/test-udp-chaos-proxy.py
 python3 scripts/test-native-acceptance.py
+python3 mobile/e2e/test-compact-android-build.py
+python3 mobile/e2e/test-native-runner.py
 python3 scripts/test-release-acceptance.py
 
 printf '%s\n' "== no server terminal content guard =="

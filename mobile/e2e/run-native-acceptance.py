@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 import urllib.request
 from urllib.parse import urlparse
 
 APP_ID = "dev.spawnd.acceptance"
-
-
-def run(*args: str, timeout: int = 120) -> str:
-    return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=timeout).strip()
+SIMULATOR_INSTALL_TIMEOUT_SECONDS = 600
+DIAGNOSTIC_STREAM_LIMIT = 32_768
 
 
 def local_origin(value: str) -> str:
@@ -68,11 +68,48 @@ class Runner:
                 "platform": self.args.platform,
                 "values": {"action": action, "result": result}}})
 
-    def adb(self, *args: str) -> str:
-        return run("adb", "-s", self.device, *args)
+    def command(self, *args: str, timeout: int = 120) -> str:
+        started = time.monotonic()
+        record = {"command": list(args), "timeout_seconds": timeout, "device": self.device}
+        self.diagnostic({**record, "status": "started"})
 
-    def simctl(self, *args: str) -> str:
-        return run("xcrun", "simctl", *args)
+        def stream(value: str | bytes | None) -> str:
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            # Redact before truncation so an output boundary cannot split a token.
+            return self.redact(value or "")[-DIAGNOSTIC_STREAM_LIMIT:]
+
+        try:
+            result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.diagnostic({**record, "status": "failed", "error_type": type(error).__name__,
+                "error": self.redact(str(error)), "returncode": getattr(error, "returncode", None),
+                "stdout": stream(getattr(error, "stdout", None)),
+                "stderr": stream(getattr(error, "stderr", None)),
+                "elapsed_seconds": round(time.monotonic() - started, 3)})
+            raise
+        self.diagnostic({**record, "status": "completed", "returncode": result.returncode,
+            "stdout": stream(result.stdout), "stderr": stream(result.stderr),
+            "elapsed_seconds": round(time.monotonic() - started, 3)})
+        return result.stdout.strip()
+
+    def diagnostic(self, record: dict) -> None:
+        entry = {**record, "at": datetime.now(timezone.utc).isoformat(),
+            "disk_free_bytes": shutil.disk_usage(self.args.output).free}
+        with (self.args.output / "native-runner.jsonl").open("a") as output:
+            output.write(self.redact(json.dumps(entry)) + "\n")
+
+    def platform_phase(self, info: dict, phase: str) -> None:
+        info.update(phase=phase, at=datetime.now(timezone.utc).isoformat(),
+            disk_free_bytes=shutil.disk_usage(self.args.output).free)
+        (self.args.output / "native-platform.json").write_text(json.dumps(info, indent=2) + "\n")
+        self.diagnostic({"platform": self.args.platform, **info})
+
+    def adb(self, *args: str) -> str:
+        return self.command("adb", "-s", self.device, *args)
+
+    def simctl(self, *args: str, timeout: int = 120) -> str:
+        return self.command("xcrun", "simctl", *args, timeout=timeout)
 
     def install(self) -> None:
         artifact = Path((self.args.build / "native-artifact.txt").read_text().strip()).resolve(strict=True)
@@ -80,20 +117,23 @@ class Runner:
             raise ValueError("Native artifact must belong to the disposable build")
         bootstrap = self.control("bootstrap")
         self.secrets.append(bootstrap["bearerToken"])
+        if bootstrap.get("secondAccount"):
+            self.secrets.append(bootstrap["secondAccount"]["bearerToken"])
         if self.args.platform == "android":
             if not self.device:
-                devices = [line.split()[0] for line in run("adb", "devices").splitlines()[1:]
+                devices = [line.split()[0] for line in self.command("adb", "devices").splitlines()[1:]
                            if line.endswith("\tdevice") and line.startswith("emulator-")]
                 if len(devices) != 1:
                     raise RuntimeError("Exactly one Android emulator is required")
                 self.device = devices[0]
             if self.adb("shell", "getprop", "ro.kernel.qemu") != "1":
                 raise RuntimeError("Acceptance runner refuses physical Android devices")
-            self.adb("install", "-r", str(artifact))
-            self.adb("logcat", "-c")
             platform_info = {"sdk": self.adb("shell", "getprop", "ro.build.version.sdk"),
                 "release": self.adb("shell", "getprop", "ro.build.version.release"),
                 "model": self.adb("shell", "getprop", "ro.product.model"), "device": self.device}
+            self.platform_phase(platform_info, "installing")
+            self.adb("install", "-r", str(artifact))
+            self.adb("logcat", "-c")
         else:
             devices = json.loads(self.simctl("list", "devices", "available", "--json"))["devices"]
             available = [(runtime, device) for runtime, entries in devices.items() for device in entries
@@ -106,14 +146,21 @@ class Runner:
             selected = next(((runtime, device) for runtime, device in available if device["udid"] == self.device), None)
             if not selected:
                 raise RuntimeError("Requested device is not an available iPhone simulator")
+            platform_info = {"runtime": selected[0], "device": self.device, "model": selected[1]["name"],
+                "initial_state": selected[1]["state"]}
+            self.platform_phase(platform_info, "selected")
+            platform_info["xcode"] = self.command("xcodebuild", "-version")
+            self.platform_phase(platform_info, "booting")
             if selected[1]["state"] != "Booted":
                 self.simctl("boot", self.device)
-            run("xcrun", "simctl", "bootstatus", self.device, "-b", timeout=300)
-            self.simctl("install", self.device, str(artifact))
-            platform_info = {"runtime": selected[0], "device": self.device, "model": selected[1]["name"],
-                "xcode": run("xcodebuild", "-version")}
-        (self.args.output / "native-platform.json").write_text(json.dumps(platform_info, indent=2) + "\n")
+            self.simctl("bootstatus", self.device, "-b", timeout=300)
+            self.platform_phase(platform_info, "installing")
+            # Installation exceeded the default 120s on a cold hosted run.
+            # Give setup one larger bounded attempt; product cases are not retried.
+            self.simctl("install", self.device, str(artifact), timeout=SIMULATOR_INSTALL_TIMEOUT_SECONDS)
+        self.platform_phase(platform_info, "launching")
         self.launch()
+        self.platform_phase(platform_info, "launched")
         self.event("launch", platform_info)
 
     def launch(self) -> None:
@@ -168,7 +215,7 @@ class Runner:
             if self.args.platform == "android":
                 logs = self.adb("logcat", "-d", "-v", "threadtime")
             else:
-                logs = run("xcrun", "simctl", "spawn", self.device, "log", "show", "--last", "30m",
+                logs = self.command("xcrun", "simctl", "spawn", self.device, "log", "show", "--last", "30m",
                     "--style", "compact", "--predicate", 'processImagePath CONTAINS "SPAWND"', timeout=60)
             (self.args.output / "native.log").write_text(self.redact(logs))
         except Exception as error:
@@ -192,6 +239,13 @@ class Runner:
                     self.event(command["action"], {"error": self.redact(str(error))}, command["id"], "failed")
                     raise
             raise TimeoutError("Native acceptance fixture did not finish within the runner budget")
+        except Exception as error:
+            try:
+                self.event("runner-error", {"error": self.redact(str(error))}, status="failed")
+            except Exception:
+                # Keep the native setup/runtime failure even if the fixture is unavailable.
+                pass
+            raise
         finally:
             if self.device:
                 self.collect_logs()
