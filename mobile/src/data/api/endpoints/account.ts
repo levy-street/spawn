@@ -13,9 +13,10 @@ export function getMe(): Promise<MeResponse> {
 }
 
 export async function deleteAccount(body: AccountDeleteRequest): Promise<void> {
+  const credentials = await authToken.snapshot();
   await api<void>("/api/account/delete", {
     method: "POST",
     body: jsonBody(AccountDeleteRequestSchema.parse(body)),
   });
-  await authToken.clear();
+  await authToken.clearIfCurrent(credentials, "identity");
 }

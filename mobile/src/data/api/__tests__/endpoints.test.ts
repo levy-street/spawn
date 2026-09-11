@@ -2,14 +2,29 @@ jest.mock("@/data/api/client", () => ({
   api: jest.fn(async () => undefined),
 }));
 
-jest.mock("@/data/api/auth-token", () => ({
-  authToken: {
+jest.mock("@/data/api/auth-token", () => {
+  const tokenStore = {
     get: jest.fn(async () => null),
-    set: jest.fn(async () => undefined),
+    set: jest.fn(async (_jwt: string) => undefined),
     clear: jest.fn(async () => undefined),
+    snapshot: jest.fn(async (baseUrl = "https://spawn.example.com") => ({
+      baseUrl,
+      token: "token",
+      revision: 0,
+      identity: 0,
+    })),
+    clearIfCurrent: jest.fn(async () => {
+      await tokenStore.clear();
+      return true;
+    }),
+    setIfCurrent: jest.fn(async (jwt: string) => {
+      await tokenStore.set(jwt);
+      return true;
+    }),
     captureFromResponse: jest.fn(async () => null),
-  },
-}));
+  };
+  return { authToken: tokenStore };
+});
 
 jest.mock("@/data/api/config", () => ({
   getBaseUrl: jest.fn(async () => "https://spawn.example.com"),

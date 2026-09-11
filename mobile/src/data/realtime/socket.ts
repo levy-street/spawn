@@ -1,3 +1,4 @@
+import type { AuthTokenSnapshot } from "@/data/api/auth-token";
 import { ApiError, reportUnauthenticated } from "@/data/api/client";
 
 export type SocketState =
@@ -60,7 +61,7 @@ export function retireAll(): void {
 }
 
 export interface ReconnectingSocketOptions {
-  url: () => string | Promise<string>;
+  url: (baseUrl?: string) => string | Promise<string>;
   protocol: string;
   watchdogMs?: number | null;
   reconnectBaseMs?: number;
@@ -69,7 +70,7 @@ export interface ReconnectingSocketOptions {
   reconnectDelayMs?: (attempt: number, random: number) => number;
   random?: () => number;
   watchdogFrameTypes?: readonly string[];
-  authorization?: () => string | null | Promise<string | null>;
+  authorization?: () => Promise<AuthTokenSnapshot>;
   createWebSocket?: (
     url: string,
     protocol: string,
@@ -88,7 +89,7 @@ export class ReconnectingSocket<Outbound = unknown> {
     maxReconnectAttempt: number;
     reconnectDelayMs: ((attempt: number, random: number) => number) | null;
     watchdogFrameTypes: readonly string[];
-    authorization: (() => string | null | Promise<string | null>) | null;
+    authorization: (() => Promise<AuthTokenSnapshot>) | null;
   };
 
   private current: WebSocket | null = null;
@@ -214,12 +215,14 @@ export class ReconnectingSocket<Outbound = unknown> {
     this.setState(reconnecting ? "reconnecting" : "connecting");
 
     let url: string;
+    let credentials: AuthTokenSnapshot | undefined;
     let token: string | null | undefined;
     try {
-      [url, token] = await Promise.all([
-        this.options.url(),
-        this.options.authorization?.() ?? Promise.resolve(undefined),
-      ]);
+      // Freeze the origin with its bearer before resolving a native socket URL.
+      // A server switch must never pair one server's URL with another's token.
+      credentials = await this.options.authorization?.();
+      token = credentials?.token;
+      url = await this.options.url(credentials?.baseUrl);
       if (this.options.authorization && token === null) {
         throw new ApiError(401, "not_authenticated", "No access token");
       }
@@ -295,7 +298,7 @@ export class ReconnectingSocket<Outbound = unknown> {
       if (event.code === 4003) emitProtocolRequired();
       if (event.code === 1008) {
         this.setState("unauthenticated");
-        void reportUnauthenticated();
+        void reportUnauthenticated(credentials);
         return;
       }
       if (PERMANENT_CLOSE_CODES.has(event.code)) {

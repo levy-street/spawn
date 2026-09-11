@@ -7,7 +7,9 @@ import { useEffect, useRef, useState } from "react";
 import { AppState, Platform, StyleSheet, Text, View } from "react-native";
 import { authToken } from "@/data/api/auth-token";
 import { getBaseUrl } from "@/data/api/config";
+import { getMe } from "@/data/api/endpoints/account";
 import { logOut } from "@/data/api/endpoints/auth";
+import { qk } from "@/data/queryKeys";
 import { ensureDeviceRegistered } from "@/data/trust/registration";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
 import { encodeBase64Url, encodeHex } from "@/lib/crypto/bytes";
@@ -168,6 +170,15 @@ export function NativeAcceptanceController(): React.JSX.Element {
         publicKey,
         generation: deviceIdentityGeneration(),
       });
+    };
+    const authenticate = async (next: { accountId: string; bearerToken: string }) => {
+      await authToken.set(next.bearerToken);
+      const me = await getMe();
+      if (me.user.id !== next.accountId) throw new Error("Fixture login returned another account.");
+      // Match successful login mutations: discard prior query results and seed
+      // the verified account response so an old query error cannot strand boot.
+      queryClient.removeQueries();
+      queryClient.setQueryData(qk.me(), me);
     };
     const perform = async ({ action, payload = {} }: Command): Promise<unknown> => {
       const key = payload["session"] === "b" ? "b" : "a";
@@ -352,8 +363,7 @@ export function NativeAcceptanceController(): React.JSX.Element {
           if (current.candidateCommit !== build?.candidateCommit)
             throw new Error("Fixture candidate differs from the embedded native candidate.");
           const next = payload["account"] === "b" ? current.secondAccount : current;
-          queryClient.removeQueries();
-          await authToken.set(next.bearerToken);
+          await authenticate(next);
           await until(
             () => accountRef.current.ready && accountRef.current.accountId === next.accountId,
             "Replacement account did not initialize.",
@@ -366,8 +376,7 @@ export function NativeAcceptanceController(): React.JSX.Element {
           current = await control<Bootstrap>("/__acceptance/bootstrap");
           if (current.candidateCommit !== build?.candidateCommit)
             throw new Error("Fixture candidate differs from the embedded native candidate.");
-          queryClient.removeQueries();
-          await authToken.set(current.bearerToken);
+          await authenticate(current);
           await until(() => accountRef.current.ready, "Account did not initialize.");
           await register();
           setBootstrap(current);
@@ -384,7 +393,7 @@ export function NativeAcceptanceController(): React.JSX.Element {
         current = await control<Bootstrap>("/__acceptance/bootstrap");
         if (current.candidateCommit !== build?.candidateCommit)
           throw new Error("Fixture candidate differs from the embedded native candidate.");
-        await authToken.set(current.bearerToken);
+        await authenticate(current);
         await until(() => accountRef.current.ready, "Authenticated app did not initialize.");
         await register();
         if (stopped) return;
@@ -422,7 +431,12 @@ export function NativeAcceptanceController(): React.JSX.Element {
         }
       } catch (error) {
         setStatus(String(error));
-        await event("boot", { error: String(error) }, undefined, "failed").catch(() => {});
+        await event(
+          "boot",
+          { error: String(error), snapshot: snapshot() },
+          undefined,
+          "failed",
+        ).catch(() => {});
       }
     })();
     return () => {

@@ -17,7 +17,14 @@ jest.mock("@/data/api/socket-urls", () => ({
 }));
 
 jest.mock("@/data/api/auth-token", () => ({
-  authToken: { get: jest.fn(async () => "secret") },
+  authToken: {
+    snapshot: jest.fn(async () => ({
+      baseUrl: "https://spawn.test",
+      token: "secret",
+      revision: 0,
+      identity: 0,
+    })),
+  },
 }));
 
 class FakeWebSocket {

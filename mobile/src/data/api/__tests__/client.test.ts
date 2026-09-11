@@ -2,8 +2,8 @@ import { z } from "zod";
 
 const mockTokenState: { value: string | null } = { value: null };
 
-jest.mock("@/data/api/auth-token", () => ({
-  authToken: {
+jest.mock("@/data/api/auth-token", () => {
+  const tokenStore = {
     get: jest.fn(async () => mockTokenState.value),
     set: jest.fn(async (token: string) => {
       mockTokenState.value = token;
@@ -11,9 +11,21 @@ jest.mock("@/data/api/auth-token", () => ({
     clear: jest.fn(async () => {
       mockTokenState.value = null;
     }),
+    isCurrent: jest.fn(async () => true),
+    snapshot: jest.fn(async (baseUrl = "https://api.spawn.test") => ({
+      baseUrl,
+      token: mockTokenState.value,
+      revision: 0,
+      identity: 0,
+    })),
+    clearIfCurrent: jest.fn(async () => {
+      await tokenStore.clear();
+      return true;
+    }),
     captureFromResponse: jest.fn(async () => null),
-  },
-}));
+  };
+  return { authToken: tokenStore };
+});
 
 jest.mock("@/data/api/config", () => ({
   getBaseUrl: jest.fn(async () => "https://api.spawn.test"),
@@ -64,12 +76,16 @@ it("adopts a renewed cookie from a non-login response", async () => {
   fetchMock.mockResolvedValue(response);
   jest.mocked(authToken.captureFromResponse).mockImplementationOnce(async () => {
     mockTokenState.value = "renewed";
-    return "renewed";
+    return { baseUrl: "https://api.spawn.test", token: "renewed", revision: 1, identity: 0 };
   });
 
   await api("/api/workspaces");
 
-  expect(authToken.captureFromResponse).toHaveBeenCalledWith(response);
+  expect(authToken.captureFromResponse).toHaveBeenCalledWith(
+    response,
+    expect.objectContaining({ baseUrl: "https://api.spawn.test" }),
+    false,
+  );
   expect(mockTokenState.value).toBe("renewed");
 });
 

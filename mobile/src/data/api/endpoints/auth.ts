@@ -59,6 +59,7 @@ export function signUp(body: SignupRequest): Promise<TokenResponse> {
   return api("/api/auth/signup", {
     method: "POST",
     auth: false,
+    replaceSession: true,
     body: jsonBody(SignupRequestSchema.parse(body)),
     schema: TokenResponseSchema,
   });
@@ -68,12 +69,14 @@ export function logIn(body: LoginRequest): Promise<TokenResponse> {
   return api("/api/auth/login", {
     method: "POST",
     auth: false,
+    replaceSession: true,
     body: jsonBody(LoginRequestSchema.parse(body)),
     schema: TokenResponseSchema,
   });
 }
 
 export async function logOut(): Promise<void> {
+  const credentials = await authToken.snapshot();
   try {
     // Before the token goes: the call needs this session to authorize, and a
     // handset that keeps its registration would go on showing the previous
@@ -81,7 +84,7 @@ export async function logOut(): Promise<void> {
     await unregisterForPushNotifications();
     await api<void>("/api/auth/logout", { method: "POST" });
   } finally {
-    await authToken.clear();
+    await authToken.clearIfCurrent(credentials, "identity");
   }
 }
 
@@ -93,12 +96,13 @@ export function renewSession(): Promise<SessionRenewResponse> {
 }
 
 export async function signOutEverywhere(): Promise<SignOutEverywhereResponse> {
+  const credentials = await authToken.snapshot();
   const result = await api("/api/auth/sign-out-everywhere", {
     method: "POST",
     schema: SignOutEverywhereResponseSchema,
   });
   // The body is authoritative even if an intermediary hides Set-Cookie.
-  await authToken.set(result.access_token);
+  await authToken.setIfCurrent(result.access_token, credentials, "identity");
   return result;
 }
 
@@ -114,6 +118,7 @@ export function confirmPasswordReset(body: PasswordResetConfirm): Promise<TokenR
   return api("/api/auth/password-reset/confirm", {
     method: "POST",
     auth: false,
+    replaceSession: true,
     body: jsonBody(PasswordResetConfirmSchema.parse(body)),
     schema: TokenResponseSchema,
   });
@@ -168,6 +173,7 @@ export function exchangeOAuthCode(body: OAuthExchangeRequest): Promise<TokenResp
   return api("/api/auth/oauth/exchange", {
     method: "POST",
     auth: false,
+    replaceSession: true,
     body: jsonBody(OAuthExchangeRequestSchema.parse(body)),
     schema: TokenResponseSchema,
   });
@@ -178,6 +184,7 @@ export function signInWithApple(body: AppleNativeSignIn): Promise<TokenResponse>
   return api("/api/auth/oauth/apple/native", {
     method: "POST",
     auth: false,
+    replaceSession: true,
     body: jsonBody(AppleNativeSignInSchema.parse(body)),
     schema: TokenResponseSchema,
   });

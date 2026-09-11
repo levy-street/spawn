@@ -22,14 +22,29 @@ jest.mock("expo-router", () => ({
   }),
 }));
 
-jest.mock("@/data/api/auth-token", () => ({
-  authToken: {
+jest.mock("@/data/api/auth-token", () => {
+  const tokenStore = {
     get: jest.fn(async () => "token"),
     set: jest.fn(async () => undefined),
     clear: jest.fn(async () => undefined),
+    snapshot: jest.fn(async (baseUrl = "https://spawn.example.com") => ({
+      baseUrl,
+      token: "token",
+      revision: 0,
+      identity: 0,
+    })),
+    clearIfCurrent: jest.fn(async () => {
+      await tokenStore.clear();
+      return true;
+    }),
+    setIfCurrent: jest.fn(async (_jwt: string) => {
+      await tokenStore.set();
+      return true;
+    }),
     captureFromResponse: jest.fn(async () => null),
-  },
-}));
+  };
+  return { authToken: tokenStore };
+});
 
 jest.mock("@/data/api/config", () => {
   const actual = jest.requireActual<typeof import("@/data/api/config")>("@/data/api/config");

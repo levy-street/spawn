@@ -55,7 +55,9 @@ describe("authToken.captureFromResponse", () => {
     ],
     ["a folded cookie after the session cookie", `spawn_session=${token}, other=value; Path=/`],
   ])("captures %s", async (_label, header) => {
-    await expect(authToken.captureFromResponse(responseWithCookie(header))).resolves.toBe(token);
+    await expect(authToken.captureFromResponse(responseWithCookie(header))).resolves.toEqual(
+      expect.objectContaining({ token }),
+    );
     await expect(authToken.get()).resolves.toBe(token);
   });
 

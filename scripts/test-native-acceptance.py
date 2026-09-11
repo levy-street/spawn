@@ -17,6 +17,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -120,6 +121,42 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(suite.data_packets(status, "dropped_packets"), 8)
         self.assertEqual(suite.data_packets(status, "dropped_data"), 8)
 
+    async def test_http_trace_is_bounded_and_excludes_request_secrets(self):
+        messages = []
+
+        async def app(scope, _receive, send):
+            scope["route"] = SimpleNamespace(path="/api/hosts/{host_id}")
+            await send({"type": "http.response.start", "status": 401})
+            await send({"type": "http.response.body", "body": b"private response"})
+
+        async def send(message):
+            messages.append(message)
+
+        path = self.fixture.output / "api-requests.jsonl"
+        trace = fixture_module.ApiRequestTrace(app, path)
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/hosts/private-host",
+            "query_string": b"token=private-query",
+            "headers": [
+                (b"authorization", b"Bearer private-bearer"),
+                (b"cookie", b"private-cookie"),
+                (b"x-spawn-client", b"private-client"),
+            ],
+        }
+        await trace(scope, None, send)
+        entry = json.loads(path.read_text())
+        self.assertEqual(entry["route"], "/api/hosts/{host_id}")
+        self.assertEqual(entry["status"], 401)
+        self.assertTrue(entry["has_bearer"])
+        self.assertTrue(entry["has_client_id"])
+        self.assertNotIn("private", path.read_text())
+        trace.count = fixture_module.MAX_EVENTS
+        await trace(scope, None, send)
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+        self.assertEqual(len(messages), 4)
+
 
 def integration():
     """Test actual HTTP authorization and process cleanup using our own fixture."""
@@ -198,6 +235,20 @@ def integration():
                 == bootstrap["secondAccount"]["accountId"]
             )
             assert request("/api/hosts", bearer=second) == (200, [])
+            assert request("/api/me")[0] == 401
+            trace = (directory / "evidence/api-requests.jsonl").read_text()
+            assert first not in trace and second not in trace
+            records = [json.loads(line) for line in trace.splitlines()]
+            assert any(
+                row["route"] == "/api/me" and row["status"] == 200 and row["has_bearer"]
+                for row in records
+            )
+            assert any(
+                row["route"] == "/api/me"
+                and row["status"] == 401
+                and not row["has_bearer"]
+                for row in records
+            )
             assert (
                 request("/api/sessions/" + bootstrap["sessionA"], bearer=second)[0]
                 == 404

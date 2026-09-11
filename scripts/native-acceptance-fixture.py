@@ -48,6 +48,49 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+class ApiRequestTrace:
+    """Bounded response metadata, without credentials or request content."""
+
+    def __init__(self, app: Any, output: Path) -> None:
+        self.app = app
+        self.output = output
+        self.count = 0
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def observe(message: Any) -> None:
+            if message["type"] == "http.response.start" and self.count < MAX_EVENTS:
+                # The router template excludes path parameters as well as the
+                # query string. Never copy raw request URLs, headers or bodies.
+                route = getattr(scope.get("route"), "path", "")
+                if route.startswith("/api/"):
+                    headers = dict(scope.get("headers", []))
+                    method = scope.get("method")
+                    record = {
+                        "at": datetime.now(UTC).isoformat(),
+                        "monotonic": time.monotonic(),
+                        "route": route,
+                        "method": method
+                        if method
+                        in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+                        else "OTHER",
+                        "status": message["status"],
+                        "has_bearer": headers.get(b"authorization", b"")
+                        .lower()
+                        .startswith(b"bearer "),
+                        "has_client_id": b"x-spawn-client" in headers,
+                    }
+                    self.count += 1
+                    with self.output.open("a") as log:
+                        log.write(json.dumps(record) + "\n")
+            await send(message)
+
+        await self.app(scope, receive, observe)
+
+
 class Fixture:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -691,7 +734,7 @@ async def run(args: argparse.Namespace) -> None:
 
         server = FixtureServer(
             uvicorn.Config(
-                app,
+                ApiRequestTrace(app, fixture.output / "api-requests.jsonl"),
                 host="127.0.0.1",
                 port=args.port,
                 log_level="warning",

@@ -25,7 +25,11 @@ if [[ "$platform" == ios ]]; then
 else
   # Expo's release template uses a disposable debug keystore locally. This APK
   # embeds the release Hermes bundle; it is never a Play Store artifact.
-  (cd android && ./gradlew :app:assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon)
+  # Release lint exhausted the template's 512 MiB metaspace limit in hosted CI.
+  # Keep its 2 GiB heap, allow 1 GiB metaspace, and fail promptly on another OOM.
+  (cd android && ./gradlew :app:assembleRelease -PreactNativeArchitectures=x86_64 \
+    '-Dorg.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=1024m -XX:+ExitOnOutOfMemoryError' \
+    --no-daemon)
   find "$build_dir/android/app/build/outputs/apk/release" -maxdepth 1 -name '*.apk' > "$build_dir/native-artifact.txt"
 fi
 test "$(wc -l < "$build_dir/native-artifact.txt" | tr -d ' ')" = 1

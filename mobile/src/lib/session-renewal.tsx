@@ -22,6 +22,16 @@ const defaultDependencies: SessionRenewalDependencies = {
 export async function renewSessionIfNeeded(
   dependencies: SessionRenewalDependencies = defaultDependencies,
 ): Promise<"renewed" | "not-needed" | "unsupported"> {
+  if (dependencies === defaultDependencies) {
+    const credentials = await authToken.snapshot();
+    return renewSessionIfNeeded({
+      ...defaultDependencies,
+      getToken: async () => credentials.token,
+      storeToken: async (jwt) => {
+        await authToken.setIfCurrent(jwt, credentials, "identity");
+      },
+    });
+  }
   const token = await dependencies.getToken();
   if (token === null || !sessionTokenNeedsRenewal(token, dependencies.nowSeconds())) {
     return "not-needed";

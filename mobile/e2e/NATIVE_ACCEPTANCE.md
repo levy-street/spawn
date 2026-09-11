@@ -46,6 +46,11 @@ fail preparation if the authenticated mount or worker bridge changes. Both the
 build and running controller refuse external fixture origins. Runtime events
 include the embedded candidate SHA, and the fixture rejects mismatched evidence.
 
+The Android acceptance build keeps a 2 GiB JVM heap and raises the metaspace
+limit to 1 GiB because Release lint exhausted the template's 512 MiB limit in
+hosted CI. `ExitOnOutOfMemoryError` makes the Gradle JVM exit if memory is
+exhausted again. The build still runs Release lint and targets only x86_64.
+
 ## Running with an isolated fixture
 
 The runner needs Node 22, Python 3.13 for the fixture, Rust for the real daemon
@@ -133,6 +138,9 @@ supports revoking the registered key through the normal browser-device API.
 
 GitHub artifacts are `acceptance-native-ios` and `acceptance-native-android`.
 They contain fixture `evidence.json`/events/logs and runner metadata/screenshots.
+`api-requests.jsonl` records bounded API response metadata: route templates,
+methods, status codes, and whether bearer/client headers were present. It omits
+header values, URL parameters, query strings and request/response bodies.
 The aggregate acceptance gate validates both candidate-bound verdicts. No
 physical-device, Wi-Fi/cellular handover, production canary or user interface
 navigation pass is implied by these simulator/emulator artifacts.
