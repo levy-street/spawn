@@ -238,6 +238,148 @@ function openTransport(bridge: FakeBridge, signal: FakeSignal) {
 }
 
 describe("HostTransport signalling", () => {
+  test("fatal signalling retires the worker and rejects active work without losing the failure", async () => {
+    const { bridge, signal, transport } = await readyTransport();
+    const pending = transport.request("host.metrics", {});
+    const rejected = expect(pending).rejects.toMatchObject({ code: "signal_failed" });
+    signal.emitState("failed");
+    await rejected;
+    expect(transport.state).toBe("failed");
+    expect(transport.lastError).toMatchObject({ code: "signal_failed", retryable: false });
+    expect(bridge.sent.filter((message) => message.type === "close")).toHaveLength(1);
+    expect(bridge.listeners.size).toBe(0);
+    expect(signal.listeners.size).toBe(0);
+    await expect(transport.open()).rejects.toThrow("failed state");
+    transport.close();
+  });
+
+  test("trust refusal after peer creation closes the worker and rejects opening", async () => {
+    let refuse = (_status: "untrusted") => {};
+    const verdict = new Promise<"untrusted">((resolve) => {
+      refuse = resolve;
+    });
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const transport = createHostTransport({
+      hostId: HOST_ID,
+      hostIdentityPublicKey: "host-key",
+      bridge,
+      openSignal: () => signal,
+      probeTrust: () => verdict,
+    });
+    const settled = transport.open().catch((error: unknown) => error);
+    await flush();
+    signal.emit({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      scope_type: "host",
+      scope_id: HOST_ID,
+      protocol: "spawn.host.ctl",
+      protocol_version: 2,
+    });
+    expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
+    refuse("untrusted");
+    await expect(settled).resolves.toMatchObject({ code: "device_not_trusted" });
+    expect(transport.state).toBe("failed");
+    expect(bridge.sent.filter((message) => message.type === "close")).toHaveLength(1);
+    transport.close();
+  });
+
+  test("pending endorsements cannot deliver a signature after fatal failure", async () => {
+    let release = (_edges: readonly CarriedEndorsement[]) => {};
+    const edges = new Promise<readonly CarriedEndorsement[]>((resolve) => {
+      release = resolve;
+    });
+    const { bridge, signal, transport } = await readyTransport({
+      loadCarriedEndorsements: () => edges,
+    });
+    bridge.emit({
+      v: 1,
+      type: "sign-request",
+      requestId: "retired-signature",
+      transcript: {
+        signalKind: "offer",
+        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
+        scopeType: "host",
+        scopeId: HOST_ID,
+        protocolVersion: 2,
+        senderRole: "browser",
+        intendedPeerIdentityPublicKey: "host-key",
+        sdp: "offer",
+      },
+    });
+    signal.emitState("failed");
+    release([CARRIED_EDGE]);
+    await flush();
+    expect(bridge.sent.filter((message) => message.type === "sign-response")).toHaveLength(0);
+    expect(transport.state).toBe("failed");
+    transport.close();
+  });
+
+  test("a refused prepare generation cannot fail an explicit retry", async () => {
+    let refuse = (_status: "untrusted") => {};
+    const verdict = new Promise<"untrusted">((resolve) => {
+      refuse = resolve;
+    });
+    const probeTrust = jest.fn().mockReturnValueOnce(verdict).mockResolvedValue("trusted");
+    const bridge = new FakeBridge();
+    const first = new FakeSignal();
+    const second = new FakeSignal();
+    const openSignal = jest.fn().mockReturnValueOnce(first).mockReturnValue(second);
+    const transport = createHostTransport({
+      hostId: HOST_ID,
+      hostIdentityPublicKey: "host-key",
+      bridge,
+      openSignal,
+      probeTrust,
+    });
+    const failed = transport.open().catch((error: unknown) => error);
+    await flush();
+    first.emitState("failed");
+    await failed;
+    transport.close();
+    const retry = transport.open().catch((error: unknown) => error);
+    await flush();
+    expect(transport.state).toBe("signalling");
+    refuse("untrusted");
+    await flush();
+    expect(transport.state).toBe("signalling");
+    expect(second.listeners.size).toBe(1);
+    transport.close();
+    await retry;
+  });
+
+  test("a retired ICE refresh cannot change the replacement worker after retry", async () => {
+    const { bridge, signal, transport } = await readyTransport();
+    jest.useFakeTimers();
+    let retry: Promise<unknown> | undefined;
+    try {
+      signal.emit({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [{ urls: "turn:localhost:3478", username: "1:expired", credential: "test" }],
+        scope_type: "host",
+        scope_id: HOST_ID,
+        protocol: "spawn.host.ctl",
+        protocol_version: 2,
+      });
+      transport.networkChanged?.();
+      expect(signal.sent).toContainEqual({ type: "rtc.config.request" });
+      signal.emitState("failed");
+      transport.close();
+      signal.state = "open";
+      retry = transport.open().catch((error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(2_001);
+      expect(transport.state).toBe("connecting");
+      expect(bridge.sent.filter((message) => message.type === "network-changed")).toHaveLength(0);
+    } finally {
+      transport.close();
+      await retry;
+      jest.useRealTimers();
+    }
+  });
+
   test("rejects active requests as retryable and schedules reconnect after channel loss", async () => {
     const { bridge, transport } = await readyTransport();
     jest.useFakeTimers();

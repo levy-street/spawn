@@ -574,6 +574,64 @@ async def exercise(fixture: Any) -> None:
                 timeout=45,
                 message="revocation did not close the measured native parent and attachments",
             )
+            closed_worker = (await snapshot())["peer"]["workerId"]
+            refused = await fixture.command("retry-host")
+            require(
+                refused.get("opened") is False and refused.get("state") == "failed",
+                "revoked identity was not refused on explicit reconnect",
+            )
+            refused_at = (await snapshot())["nativeDateMs"]
+
+            async def refused_closed() -> bool:
+                current = await snapshot()
+                peer = current.get("peer") or {}
+                return (
+                    peer.get("livePeerCount") == 0
+                    and peer.get("workerId") == closed_worker
+                    and peer.get("sampledAtMs", 0) >= refused_at
+                    and all(
+                        current["sessions"][label].get("daemonState") == "failed"
+                        for label in ("a", "b")
+                    )
+                )
+
+            await eventually(
+                refused_closed,
+                message="refused reconnect did not close its native peer",
+            )
+            closed_samples = []
+            observation_end = time.monotonic() + 3
+            last_sample = 0
+            while time.monotonic() < observation_end:
+                current = await snapshot()
+                peer = current.get("peer") or {}
+                require(
+                    peer.get("workerId") == closed_worker,
+                    "revocation check replaced the worker before proving refusal",
+                )
+                require(
+                    current.get("peerAgeMs", 999999) < 2000,
+                    "revocation check lost fresh native peer telemetry",
+                )
+                require(
+                    peer.get("livePeerCount") == 0,
+                    "refused reconnect left a native peer alive",
+                )
+                require(
+                    all(
+                        current["sessions"][label].get("daemonState") == "failed"
+                        for label in ("a", "b")
+                    ),
+                    "revoked parent did not remain failed",
+                )
+                if peer.get("sampledAtMs", 0) > last_sample:
+                    last_sample = peer["sampledAtMs"]
+                    closed_samples.append(last_sample)
+                await asyncio.sleep(0.25)
+            require(
+                len(closed_samples) >= 4,
+                "too few fresh native samples after refused reconnect",
+            )
             await fixture.command("rotate-identity")
             await fixture.command("mount", {"sessions": ["a", "b"], "tools": 2})
             replacement = await wait_ready()
@@ -653,6 +711,8 @@ async def exercise(fixture: Any) -> None:
                 "after_generation": new["identityGeneration"],
                 "revoked_device_id": revoked_device,
                 "replacement_device_id": replacement["deviceId"],
+                "revoked_reconnect": refused,
+                "closed_peer_samples": closed_samples,
                 "shell_pids": initial_pids,
             }
 

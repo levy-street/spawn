@@ -346,31 +346,38 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (this.#state === "closed") return;
     this.#pinUnsubscribe?.();
     this.#pinUnsubscribe = null;
+    this.#prepared = false;
+    this.#retireWorker();
+    this.#setState("closed");
+    const error = new HostControlTransportError("connection_closed", "Host transport closed.");
+    this.#rejectOpen?.(error);
+    this.#settleOpening();
+    this.#rejectActive(error);
+  }
+
+  /** Retire the native generation before publishing either close or failure. */
+  #retireWorker(): void {
     this.#parentUnsubscribe?.();
     this.#parentUnsubscribe = null;
     this.#clearConnectWatchdog();
     this.#clearReconnectTimer();
     clearTimeout(this.#resumeTimer ?? undefined);
     this.#resumeTimer = null;
+    this.#workerStarted = false;
+    this.#prepareEpoch++;
+    this.#bridgeUnsubscribe?.();
+    this.#bridgeUnsubscribe = null;
+    for (const finish of this.#configWaiters) finish();
+    this.#configWaiters.clear();
     try {
       this.#send({ v: TERMINAL_BRIDGE_VERSION, type: "close" });
     } catch {
       // A terminated WebContent process has nothing left to close.
     }
     this.#retireSignal();
-    this.#bridgeUnsubscribe?.();
-    this.#bridgeUnsubscribe = null;
-    this.#workerStarted = false;
-    this.#prepared = false;
-    this.#prepareEpoch++;
     this.#browserKey = null;
     this.#preparePromise = null;
     this.#capabilities = null;
-    this.#setState("closed");
-    const error = new HostControlTransportError("connection_closed", "Host transport closed.");
-    this.#rejectOpen?.(error);
-    this.#settleOpening();
-    this.#rejectActive(error);
   }
 
   request<T>(operation: string, payload?: unknown, options: HostRequestOptions = {}): Promise<T> {
@@ -998,13 +1005,14 @@ class WebViewHostTransport implements StreamingHostTransport {
       callback();
       return;
     }
+    const epoch = this.#prepareEpoch;
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       this.#configWaiters.delete(finish);
-      callback();
+      if (epoch === this.#prepareEpoch) callback();
     };
     const timer = setTimeout(finish, 2_000);
     this.#configWaiters.add(finish);
@@ -1266,6 +1274,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   /** Mirrors the session transport: a host that never pinned this device drops
    * its offers silently, so name that instead of waiting out the watchdog. */
   #preflightTrust(): Promise<DeviceHostTrustResult> {
+    const epoch = this.#prepareEpoch;
     const result = (
       this.options.probeTrustResult
         ? this.options.probeTrustResult(this.hostId)
@@ -1276,6 +1285,7 @@ class WebViewHostTransport implements StreamingHostTransport {
           : probeDeviceHostTrustResult(this.hostId)
     ).catch(() => ({ status: "unknown" as const, directlyPinned: false }));
     void result.then(({ status }) => {
+      if (epoch !== this.#prepareEpoch) return;
       if (status !== "untrusted") return;
       if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
       this.#fail(DEVICE_NOT_TRUSTED_CODE, DEVICE_NOT_TRUSTED_MESSAGE);
@@ -1285,19 +1295,12 @@ class WebViewHostTransport implements StreamingHostTransport {
 
   #fail(code: string, message: string): void {
     if (this.#state === "failed" || this.#state === "closed") return;
-    this.#clearConnectWatchdog();
-    this.#clearReconnectTimer();
-    if (this.parent) {
-      this.#parentUnsubscribe?.();
-      this.#parentUnsubscribe = null;
-      this.#detachConsumer();
-    }
+    this.#retireWorker();
     const error = new HostControlTransportError(code, message);
     this.#emitError({ code, message, retryable: false });
     this.#setState("failed");
     this.#rejectOpen?.(error);
     this.#settleOpening();
-    this.#retireSignal();
     this.#rejectActive(error);
   }
 

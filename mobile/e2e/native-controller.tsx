@@ -18,6 +18,7 @@ import {
 } from "@/lib/crypto/identity";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { TerminalSurface } from "@/terminal/TerminalSurface";
+import { retainHostTransport } from "@/terminal/transport/host-transport-registry";
 import type { HostTransport, SessionTransport, UploadProgress } from "@/terminal/transport/types";
 import { spacing, useTheme } from "@/theme";
 
@@ -209,6 +210,22 @@ export function NativeAcceptanceController(): React.JSX.Element {
           return snapshot();
         case "snapshot":
           return snapshot();
+        case "retry-host": {
+          const lease = retainHostTransport({
+            hostId: current.hostId,
+            hostIdentityPublicKey: current.hostPublicKey,
+          });
+          const root = lease.shared.transport;
+          try {
+            root.close();
+            await root.open();
+            return { opened: true, state: root.state };
+          } catch (error) {
+            return { opened: false, state: root.state, error: String(error) };
+          } finally {
+            lease.release();
+          }
+        }
         case "input": {
           const session = sessions.current.get(key);
           if (!session || !mounted.current.includes(key))

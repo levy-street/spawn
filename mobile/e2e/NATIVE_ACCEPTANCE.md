@@ -90,6 +90,7 @@ App commands from `GET /__acceptance/command` are `{id, action, payload}`:
 | `mount` | `{sessions:["a","b"],tools:2}`; wait for real attachments to become ready |
 | `unmount` | Detach all terminal and host-tool views |
 | `snapshot` | Sample actual session/tool states and latest native peer observation |
+| `retry-host` | Close/open the retained root through the public retry API without replacing or registering the device identity |
 | `input` | `{session,text,takeControl}`; optionally await daemon-confirmed control, then write |
 | `host-request` | `{tool,operation,payload}`; fixture permits `fs.home` / `fs.list` |
 | `upload` | `{session,uploadId,name,totalBytes,readDelayMs}`; start real byte source upload and return its SHA-256 |
