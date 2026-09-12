@@ -129,14 +129,34 @@ Windows machine. From an elevated PowerShell, with this directory copied locally
 .\scripts\ci\install-windows-runner.ps1 -Role release
 ```
 
-`-InstallTools` provisions Git, PowerShell 7, .NET 8, Azure CLI and the Visual
-Studio 2022 C++ workload through winget. Rust and Node versions are installed by
-the existing workflow actions. Setup requests each standard account's credential
+`-InstallTools` provisions machine-wide Git, PowerShell 7, .NET 8, Azure CLI and
+the Visual Studio 2022 C++ workload through winget, preserving installed package
+versions. PowerShell uses the machine-wide MSI, with remoting disabled. Setup
+checks the .NET 8 SDK, VS 2022 C++ tools and a complete x64 Windows SDK using
+machine paths. Each runner's `.env` records these paths, with Git Bash ahead of
+the System32 WSL launcher and its own profile's `.dotnet\tools` for AzureSignTool.
+Newly installed tools are available even when the service manager still has the
+PATH from boot. Rust, Node and uv are installed by the existing workflow actions.
+Setup requests each standard account's credential
 and a short-lived repository runner registration token (GitHub Settings →
 Actions → Runners → New self-hosted runner). It verifies the runner archive,
 restricts its directory ACL to that account/SYSTEM/administrators, and installs
 an automatic Windows service with restart-on-failure. It refuses an administrator
 job account, account reuse between roles, or overwriting an existing runner.
+An operator automation may supply `-ServiceCredential` as a `PSCredential` and
+`-RegistrationToken` as a `SecureString` instead of using the prompts. Generate
+or obtain these in memory; never put their plaintext values in command arguments
+or files. The installer passes secrets through GitHub's temporary
+`ACTIONS_RUNNER_INPUT_*` environment inputs, which the runner masks and removes.
+The operator's administration credential must remain outside both CI accounts.
+
+Create each account's Windows profile before starting its service, and restrict
+the profile to that account, SYSTEM and administrators. After setup, test tool
+access and profile/runner isolation under both actual service identities, and
+test the installed release hook against master and rejected branch/PR contexts.
+Record the plugged-in sleep setting, disable automatic sleep, and verify service
+recovery only while the runner is idle. If setup fails, inspect its directory,
+service and GitHub registration before resuming; do not rerun over partial state.
 
 The service uses its own runner credential thereafter; it never needs a GitHub
 PAT. Keep both role accounts isolated. Signing still requires the protected
