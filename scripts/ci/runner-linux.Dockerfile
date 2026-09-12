@@ -6,7 +6,7 @@ ARG RUNNER_SHA256
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git gh jq sudo unzip zip xz-utils zstd locales \
-    build-essential clang cmake pkg-config libssl-dev libicu70 libkrb5-3 \
+    build-essential clang cmake ninja-build pkg-config libssl-dev libicu70 libkrb5-3 \
     liblttng-ust1 libunwind8 libnuma1 libasound2 libnss3 libx11-6 libxcb1 \
     libxcomposite1 libxcursor1 libxdamage1 libxi6 libxtst6 libxrandr2 \
     libpulse0 libxkbcommon0 libdbus-1-3 libglib2.0-0 libgl1 libglu1-mesa \

@@ -42,6 +42,10 @@ in `runner-versions.json`. Updating them requires checking the new archive hash.
 Runner automatic updates remain enabled; refresh the image regularly.
 The image includes Python 3.13 for the evidence tools; Ubuntu 22.04's system
 Python 3.10 cannot run them. Jobs explicitly install their Node version.
+Android native dependencies require both CMake and Ninja. The image includes
+`ninja-build`; native acceptance also installs it when absent from an older
+disposable image, after checking the container-isolation marker. This bootstrap
+does not install packages on the host.
 
 The operator-side `runner-pool.py` uses the existing authenticated `gh` CLI to
 mint a just-in-time credential for each container. The GitHub administration
