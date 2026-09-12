@@ -55,6 +55,11 @@ databases owned by the job user and removes them afterward. This keeps the
 real owner-recovery smoke required without mounting a host Docker socket.
 The test workflow sets `SPAWN_E2E_WORKERS=2` rather than deriving browser
 concurrency from the larger host CPU count, and retains failure traces.
+The real systemd user restart smoke runs in a fresh Ubuntu 22.04 VM inside
+the job, using software emulation with no network, host mounts or KVM access.
+`smoke-systemd-vm.py` verifies Canonical's signed image checksum and requires
+the service-manager test to pass, rather than accepting its container skip.
+The VM powers off after the test; its serial evidence is retained as an artifact.
 
 The operator-side `runner-pool.py` uses the existing authenticated `gh` CLI to
 mint a just-in-time credential for each container. The GitHub administration
