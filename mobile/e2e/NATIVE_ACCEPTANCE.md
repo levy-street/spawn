@@ -2,7 +2,7 @@
 
 `.github/workflows/native-acceptance.yml` builds the exact requested candidate
 into a Release iOS simulator app and a Release Android emulator APK. It uses
-GitHub hosted runners without EAS credentials, Apple distribution credentials,
+our self-hosted platform runners without EAS credentials, Apple distribution credentials,
 Play publication, production access, or paid test services. The parent acceptance
 workflow calls it with full candidate and deployed-baseline commit SHAs; manual
 `workflow_dispatch` accepts the same inputs. The native suite exercises the
@@ -48,7 +48,7 @@ include the embedded candidate SHA, and the fixture rejects mismatched evidence.
 
 The Android acceptance build keeps a 2 GiB JVM heap and raises the metaspace
 limit to 1 GiB because Release lint exhausted the template's 512 MiB limit in
-hosted CI. `ExitOnOutOfMemoryError` makes the Gradle JVM exit if memory is
+CI. `ExitOnOutOfMemoryError` makes the Gradle JVM exit if memory is
 exhausted again. The build still runs Release lint and targets only x86_64.
 After the isolated fixture prepares its private executable copies, the
 Android job cleans its Cargo compilation outputs. After a successful APK build,
@@ -57,22 +57,21 @@ only that run's generated `android/` and `node_modules/` directories before SDK
 installation. It requires the disposable `RUNNER_TEMP/native-app` directory;
 required SDKs, fixture executables and evidence remain available.
 
-`android-disk-preflight.py` additionally reclaims four unused preinstalled tools
-on **GitHub-hosted Ubuntu 24.04 Android jobs only**: `/usr/share/dotnet`,
-`/usr/local/.ghcup`, `/opt/hostedtoolcache/CodeQL`, and `/usr/share/swift`.
-These roots come from the [verified image's installation scripts](https://github.com/actions/runner-images/tree/fc63e1b4dbfacf7e2449bf0706226f9f6eea583e/images/ubuntu/scripts/build).
-It rejects other environments and redirected roots, logs measured free bytes
-before/after reclamation, and requires 15 GiB before either compilation and
-16 GiB before emulator setup on each involved filesystem. No user directories
-or required Android, Java, Node, Rust, Python or shared compiler tools are removed.
+`android-disk-preflight.py --self-hosted` measures free space and never deletes
+installed tools. It requires 15 GiB before either compilation and 16 GiB before
+emulator setup on each involved filesystem. The former hosted-only tool cleanup
+mode remains guarded separately and refuses self-hosted machines. The SDK is
+installed in the isolated runner home; KVM is passed into its container with the
+correct group instead of changing host udev permissions. See
+[`CI_RUNNERS.md`](../../docs/CI_RUNNERS.md) for runner provisioning and isolation.
 
 The emulator threshold reserves room for downloads, extraction, writable AVD
 data and logs. On 2026-09-11 the official API 35 Google APIs x86_64 r9 image and
 Linux emulator 37.1.11 archives totaled 1.93 GiB compressed and 4.30 GiB expanded
 (measured from ZIP central directories); simultaneous staging alone needs
 about 6.23 GiB. The [pinned emulator action installs both after the app build](https://github.com/ReactiveCircus/android-emulator-runner/blob/a421e43855164a8197daf9d8d40fe71c6996bb0d/src/sdk-installer.ts).
-The headroom checks fail the job early if the image changes or reclamation is
-insufficient; they do not replace native runtime acceptance.
+The headroom checks fail the job early if available space is insufficient;
+they do not replace native runtime acceptance.
 
 The iOS runner allows one 600-second installation attempt after its bounded
 300-second boot wait; a cold hosted run exceeded the previous 120-second

@@ -33,7 +33,7 @@ permissions:
 jobs:
   resolve:
     name: bind acceptance to candidate and deployed baseline
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, spawn-linux-control]
     timeout-minutes: 5
     outputs:
       candidate: ${{ steps.identity.outputs.candidate }}
@@ -70,7 +70,7 @@ jobs:
   canary:
     name: isolated old and new canary cohorts
     needs: resolve
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, spawn-linux-build]
     timeout-minutes: 120
     steps:
       - name: Prepare isolated output and build paths
@@ -114,7 +114,7 @@ jobs:
     name: complete release acceptance
     needs: [resolve, native, canary]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, spawn-linux-control]
     timeout-minutes: 5
     steps:
       - name: Require every acceptance job

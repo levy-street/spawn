@@ -1,8 +1,8 @@
 name: Windows
 
 # windows-check builds the Windows daemon for real (cargo check/clippy/test plus
-# a release build and a desktop crate check) on windows-latest, which bills at
-# 2x. It used to run on an unfiltered `push:` *and* `pull_request:`, so every
+# a release build and a desktop crate check) on the dedicated Windows build
+# runner. It used to run on an unfiltered `push:` *and* `pull_request:`, so every
 # feature-branch push spent those minutes twice — once for each event — and did
 # it even when the change was a README.
 #
@@ -29,7 +29,7 @@ concurrency:
 jobs:
   windows-check:
     name: windows-check
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, spawn-windows-build]
     timeout-minutes: 60
     steps:
       - name: Check out repository
@@ -139,7 +139,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.head_commit.message, '[package]')
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, spawn-windows-build]
     timeout-minutes: 60
     env:
       # A rehearsal build is for a dev deployment, so it must point at one.

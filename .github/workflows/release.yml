@@ -53,7 +53,7 @@ jobs:
   await_source_ci:
     name: require exact master push test results
     needs: acceptance
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, spawn-linux-wait]
     timeout-minutes: 185
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -73,7 +73,7 @@ jobs:
 
   plan:
     name: what does this owe
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, spawn-linux-release]
     timeout-minutes: 15
     if: github.ref == 'refs/heads/master'
     # EXPO_TOKEN is an environment secret, and the fingerprint check needs it;
@@ -151,7 +151,7 @@ jobs:
     name: wait for prebuilt-latest
     needs: plan
     if: needs.plan.outputs.daemon_prebuilts == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, spawn-linux-wait]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -191,7 +191,7 @@ jobs:
       (needs.plan.outputs.deploy == 'true' ||
        needs.plan.outputs.daemon_prebuilts == 'true' ||
        needs.plan.outputs.mobile_ota == 'true')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, spawn-linux-release]
     timeout-minutes: 60
     environment: production
     steps:
@@ -278,7 +278,7 @@ jobs:
     name: TestFlight and Play
     needs: [plan, deploy]
     if: needs.plan.outputs.mobile_native_build == 'yes'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, spawn-linux-release]
     timeout-minutes: 90
     environment: production
     steps:
@@ -313,7 +313,7 @@ jobs:
     name: publish the desktop app
     needs: [plan, deploy]
     if: needs.plan.outputs.desktop_publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, spawn-linux-release]
     timeout-minutes: 60
     environment: production
     steps:

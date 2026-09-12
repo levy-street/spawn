@@ -60,13 +60,14 @@ scripts/, docs/   build helpers and app-specific notes
   `protocol.required` frame, which is what routes into the update path. Read
   "The wire protocols" in `docs/RELEASE.md` before changing one.
 - Tests colocate in the nearest `__tests__/` directory (jest).
-- `e2e/NATIVE_ACCEPTANCE.md` describes the hosted iOS simulator and Android
+- `e2e/NATIVE_ACCEPTANCE.md` describes the self-hosted iOS simulator and Android
   emulator acceptance job. Its controller and RTC observation hook enter only a
   disposable build copy, using the actual app providers and native WebViews.
   The Android job removes generated build directories after preserving the APK
   and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
-  Its hosted Ubuntu disk preflight reclaims a fixed unused-tool allowlist and
-  enforces build/emulator headroom; `e2e/test-android-disk-preflight.py` tests it.
+  Its self-hosted disk preflight measures build/emulator headroom without
+  deleting machine tooling. The legacy hosted-only reclamation mode remains
+  separately guarded; `e2e/test-android-disk-preflight.py` tests both boundaries.
   `e2e/test-native-runner.py` checks bounded installation, diagnostics and failure
   reporting. These checks run through the root test matrix.
   Production routes and assets must never import this controller.

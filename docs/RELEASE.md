@@ -835,7 +835,7 @@ then in `desktop/`, for `aarch64-apple-darwin` and `x86_64-apple-darwin`:
 `xcrun notarytool submit --wait` and `xcrun stapler staple` on the DMG (Tauri
 signs it but does not notarize it), and
 `COPYFILE_DISABLE=1 tar -czf SPAWN-D_<version>_<platform>.app.tar.gz -C <bundle>/macos "SPAWN D.app"`.
-Windows release artifacts must come from the `windows-latest` workflow job so
+Windows release artifacts must come from the `spawn-windows-release` workflow job so
 both Authenticode signatures and their timestamps are proved on Windows. Then
 continue from step 1 below. Note that `spctl --assess` reports a
 notarized, stapled build as "rejected" on some Macs; `syspolicy_check
@@ -1069,7 +1069,7 @@ after all five pairs are staged does the operator render and sign the offline
 Ed25519 manifest. Never modify a PE after Authenticode signing or construct the
 manifest from pre-signing hashes.
 
-When CI cannot run (out of credits, broken runner), the release goes stale and
+When our CI runners cannot run (offline host or broken runner), the release goes stale and
 the deploy will refuse — correctly. Refresh it by hand from the **pushed**
 master commit. Build Darwin and Linux as before:
 
@@ -1178,16 +1178,17 @@ diagnostics variant".
 ### The Linux compatibility floor
 
 **glibc 2.35 — Ubuntu 22.04.** Hosts older than that get no prebuilt and fall
-back to a source install. It is set in one place, `.github/workflows/prebuilt.yml`
-(`runs-on: ubuntu-22.04`), because CI is what publishes the rolling release on
-every daemon change; the recipe above only exists for when CI cannot run, and it
-matches that base deliberately.
+back to a source install. The self-hosted Linux runner image is based on Ubuntu 22.04 in
+`scripts/ci/runner-linux.Dockerfile`; the `spawn-linux-build` and
+`spawn-linux-arm64` pools must preserve that base. The manual recipe uses the
+same base when a runner is unavailable. See `CI_RUNNERS.md` for the pool map.
 
 Do not build the Linux binaries on an older base to "support more hosts". It
 works, and that is the problem: the hand-built release quietly admits hosts
 CI does not, they install and update happily, and the next ordinary CI build
 takes their prebuilt away again with nothing in the failure to explain why.
-Lowering the floor is a change to `prebuilt.yml` and to this section, together.
+Changing the floor requires updating the runner image, provisioning contract
+and this section together.
 
 Build Windows on a real x86_64 Windows 11 or Server machine with Visual Studio
 Build Tools' “Desktop development with C++” workload and stable Rust MSVC:
@@ -1432,7 +1433,7 @@ ship in this order:
    it compiles. Most of it needs no signing identity: the `windows-package` job
    produces an unsigned installer for exactly that purpose.
 1. Observe a successful native `windows-check` lane. Build the Windows daemon
-   pair and desktop app on `windows-latest`; Authenticode-sign and timestamp
+   pair and desktop app on `spawn-windows-release`; Authenticode-sign and timestamp
    every PE, including the final NSIS setup EXE, and verify the configured
    publisher before upload.
 2. Download the already-signed daemon assets, verify their release identity,

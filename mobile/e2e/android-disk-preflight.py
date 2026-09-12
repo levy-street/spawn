@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reclaim unused tooling only on the disposable hosted Ubuntu Android runner."""
+"""Measure Android headroom; tool reclamation is limited to hosted runners."""
 
 import argparse
 import json
@@ -37,6 +37,17 @@ def require_hosted_android() -> None:
         raise RuntimeError("Disk preflight requires the hosted Ubuntu 24.04 image")
 
 
+def require_self_hosted_android() -> None:
+    for name, value in {
+        "GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "self-hosted",
+        "RUNNER_OS": "Linux", "NATIVE_PLATFORM": "android",
+    }.items():
+        if os.environ.get(name) != value:
+            raise RuntimeError(f"Disk preflight requires {name}={value}")
+    if platform.system() != "Linux":
+        raise RuntimeError("Android runner must use Linux")
+
+
 def disk_snapshot(stage: str, event: str) -> dict[str, int]:
     paths = [Path("/")]
     for name in ("RUNNER_TEMP", "GITHUB_WORKSPACE", "ANDROID_HOME"):
@@ -72,11 +83,14 @@ def reclaim_tools() -> None:
         )
 
 
-def preflight(stage: str) -> None:
-    require_hosted_android()
+def preflight(stage: str, *, self_hosted: bool = False) -> None:
+    if self_hosted:
+        require_self_hosted_android()
+    else:
+        require_hosted_android()
     minimum = MIN_FREE[stage]
     disk_snapshot(stage, "before")
-    if stage == "prepare":
+    if stage == "prepare" and not self_hosted:
         reclaim_tools()
     free = disk_snapshot(stage, "after")
     insufficient = {path: value for path, value in free.items() if value < minimum}
@@ -91,4 +105,6 @@ def preflight(stage: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=MIN_FREE)
-    preflight(parser.parse_args().stage)
+    parser.add_argument("--self-hosted", action="store_true", help="Measure only; never delete host tooling")
+    args = parser.parse_args()
+    preflight(args.stage, self_hosted=args.self_hosted)

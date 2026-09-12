@@ -137,6 +137,29 @@ class HostedDiskPreflight(unittest.TestCase):
             disk.preflight("emulator")
         self.run.assert_not_called()
 
+    def test_self_hosted_mode_never_reclaims_any_tools(self):
+        with patch.dict(os.environ, {"RUNNER_ENVIRONMENT": "self-hosted"}):
+            for stage in disk.MIN_FREE:
+                disk.preflight(stage, self_hosted=True)
+        self.run.assert_not_called()
+        self.du.assert_not_called()
+        self.assertTrue(all((tool / "dummy-tool").exists() for tool in self.tools))
+
+    def test_self_hosted_mode_keeps_the_emulator_headroom_gate(self):
+        self.usage.return_value = SimpleNamespace(free=15 * disk.GIB)
+        with patch.dict(os.environ, {"RUNNER_ENVIRONMENT": "self-hosted"}):
+            with self.assertRaisesRegex(RuntimeError, "at least 16 GiB"):
+                disk.preflight("emulator", self_hosted=True)
+        self.run.assert_not_called()
+
+    def test_self_hosted_mode_refuses_a_local_or_wrong_platform_invocation(self):
+        for change in ({"GITHUB_ACTIONS": "false"}, {"NATIVE_PLATFORM": "ios"}):
+            with patch.dict(os.environ, {"RUNNER_ENVIRONMENT": "self-hosted", **change}):
+                with self.assertRaises(RuntimeError):
+                    disk.preflight("prepare", self_hosted=True)
+        self.run.assert_not_called()
+        self.usage.assert_not_called()
+
     def test_cleanup_failure_stops_before_other_roots(self):
         self.run.side_effect = subprocess.CalledProcessError(1, "mocked rm")
         with self.assertRaises(subprocess.CalledProcessError):

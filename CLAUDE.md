@@ -12,7 +12,8 @@ desktop/  Tauri v2 macOS + Windows companion → desktop/CLAUDE.md
 server/   FastAPI API + websockets + Alembic → server/CLAUDE.md
 daemon/   Rust spawnd + spawn-worker         → daemon/CLAUDE.md
 proto/    cross-runtime golden vectors shared by daemon and web crypto
-scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot
+scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot;
+          ci/ owns self-hosted runner images, pool control and platform setup
 infra/    docker-compose and nginx examples
 docs/     design docs; docs/RELEASE.md — the release process,
           docs/WINDOWS_VALIDATION.md — the Windows evidence gate, and
@@ -89,12 +90,19 @@ failed evidence blocks promotion. `docs/CONNECTION_CANARY.md` describes the
 canary, and `docs/DEVICE_CONNECTIONS.md` distinguishes automated native
 evidence from physical-device and production observations. The lightweight
 fixture, UDP fault-proxy and evidence-validator regressions run in
-`scripts/test-all.sh`; the real native builds run on hosted platform runners.
+`scripts/test-all.sh`; the real native builds run on our platform runners.
 Native fixtures prepare build configuration before compilation and activate
 their daemon only after app installation. Unexpected fixture process exits
 permanently fail acceptance; they are not silently restarted.
 After fixture readiness, native app boot has a separate 180-second budget;
 local startup diagnostics and scoped device captures preserve setup failures.
+
+Every workflow uses the explicit self-hosted pools in `docs/CI_RUNNERS.md`.
+Linux jobs run in one-job containers; Mac and Windows build/release services
+use separate standard accounts. Keep wait jobs on their own pool so they cannot
+occupy a builder they are waiting for. `scripts/ci/check-self-hosted.py` rejects
+hosted fallbacks, and the runner/disk regressions run in `scripts/test-all.sh`.
+Signing environments, exact-commit checks and release evidence remain required.
 
 ## These files stay true, or they are worse than nothing
 
