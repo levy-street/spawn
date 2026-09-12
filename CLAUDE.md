@@ -103,6 +103,8 @@ use separate standard accounts. Keep wait jobs on their own pool so they cannot
 occupy a builder they are waiting for. `scripts/ci/check-self-hosted.py` rejects
 hosted fallbacks, and the runner/disk regressions run in `scripts/test-all.sh`.
 Signing environments, exact-commit checks and release evidence remain required.
+Linux CI wraps `scripts/test-all.sh` with disposable PostgreSQL 16 and Redis 7
+fixtures, and sets `SPAWN_E2E_WORKERS=2` for its four-CPU container quota.
 
 ## These files stay true, or they are worse than nothing
 

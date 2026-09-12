@@ -189,7 +189,7 @@ printf '%s\n' "== web lint + browser tests + build =="
   cd web
   bun run lint
   bun run test:unit
-  bun run test:e2e
+  bun run test:e2e --workers="${SPAWN_E2E_WORKERS:-50%}"
   SPAWN_API_PROXY_TARGET="${SPAWN_API_PROXY_TARGET:-http://127.0.0.1:8001}" bun run build
 )
 
@@ -203,7 +203,7 @@ printf '%s\n' "== mobile typecheck + lint + tests =="
 printf '%s\n' "== desktop typecheck + lint + tests =="
 # This local lane exercises the macOS Tauri bundle and daemon linkage. Native
 # Windows daemon, desktop, and PowerShell installer checks run on
-# `windows-latest` in `.github/workflows/windows.yml`.
+# the self-hosted Windows build pool in `.github/workflows/windows.yml`.
 if [[ "$(uname -s)" == "Darwin" ]]; then
   (
     cd desktop

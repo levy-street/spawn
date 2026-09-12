@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     printf 'runner ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/runner && \
     mkdir -p /opt/actions-runner /opt/hostedtoolcache /opt/cargo /opt/rustup && \
     chown -R runner:runner /opt/actions-runner /opt/hostedtoolcache /opt/cargo /opt/rustup
+COPY install-linux-test-services.sh /tmp/install-linux-test-services.sh
+RUN SPAWN_RUNNER_ISOLATION=container bash /tmp/install-linux-test-services.sh && \
+    rm /tmp/install-linux-test-services.sh && rm -rf /var/lib/apt/lists/*
 # Release and native evidence scripts use Python 3.11+ stdlib APIs. Keep a
 # modern interpreter without raising the Ubuntu/glibc binary compatibility floor.
 RUN python3 -m pip install --no-cache-dir uv==0.11.8 && \

@@ -47,6 +47,15 @@ Android native dependencies require both CMake and Ninja. The image includes
 disposable image, after checking the container-isolation marker. This bootstrap
 does not install packages on the host.
 
+`install-linux-test-services.sh` adds PostgreSQL 16 and Redis 7 from their signed
+upstream package feeds, both when building the image and when an older image
+starts the test workflow. It refuses to provision outside the CI container.
+`with-test-databases.sh` runs the full test matrix with fresh, loopback-only
+databases owned by the job user and removes them afterward. This keeps the
+real owner-recovery smoke required without mounting a host Docker socket.
+The test workflow sets `SPAWN_E2E_WORKERS=2` rather than deriving browser
+concurrency from the larger host CPU count, and retains failure traces.
+
 The operator-side `runner-pool.py` uses the existing authenticated `gh` CLI to
 mint a just-in-time credential for each container. The GitHub administration
 credential stays on the operator machine. Only the one-job runner configuration
