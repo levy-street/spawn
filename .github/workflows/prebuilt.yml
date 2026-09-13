@@ -236,10 +236,10 @@ jobs:
           if-no-files-found: error
 
   linux-aarch64:
-    runs-on: [self-hosted, Linux, ARM64, spawn-linux-arm64]
+    runs-on: [self-hosted, Linux, X64, spawn-linux-build, spawn-minivac]
     timeout-minutes: 40
     # Preserve the existing non-fatal ARM64 build-result policy. An offline
-    # runner still queues this job, so provision this pool before releasing.
+    # Minivac runner still queues this job, so provision it before releasing.
     # Missing platform artifacts remain visible at deploy and verification.
     continue-on-error: true
     steps:
@@ -256,26 +256,20 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             daemon/target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('daemon/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-aarch64-${{ hashFiles('daemon/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-aarch64-
 
-      - name: Build arm64 (aarch64-unknown-linux-gnu)
-        working-directory: daemon
-        run: cargo build --release --locked --bin spawnd --bin spawn-worker
-
-      - name: Stage binaries
-        run: |
-          set -eu
-          mkdir -p out
-          cp daemon/target/release/spawnd       out/spawnd-aarch64-unknown-linux-gnu
-          cp daemon/target/release/spawn-worker out/spawn-worker-aarch64-unknown-linux-gnu
+      - name: Build arm64 and verify emulated execution on Minivac
+        run: bash scripts/ci/build-linux-arm64.sh
 
       - name: Upload linux-aarch64 artifacts
         uses: actions/upload-artifact@v4
         with:
           name: prebuilt-linux-aarch64
-          path: out/
+          path: |
+            out/spawnd-aarch64-unknown-linux-gnu
+            out/spawn-worker-aarch64-unknown-linux-gnu
           retention-days: 1
           if-no-files-found: error
 

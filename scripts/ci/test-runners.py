@@ -5,7 +5,6 @@ import copy
 import importlib.util
 import json
 import os
-import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -55,7 +54,7 @@ class RunnerIsolation(unittest.TestCase):
     def test_minivac_placement_cannot_be_assigned_to_another_host(self):
         changed = copy.deepcopy(self.config)
         changed["pools"][0]["host"] = "multivac"
-        with self.assertRaisesRegex(ValueError, "placement label"):
+        with self.assertRaisesRegex(ValueError, "all Linux pools"):
             pool.validate_config(changed)
 
     def test_minivac_builders_cannot_omit_the_placement_label(self):
@@ -64,15 +63,11 @@ class RunnerIsolation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicitly placed"):
             pool.validate_config(changed)
 
-    def test_minimac_always_targets_the_dedicated_arm_vm(self):
-        command = pool.ssh_command("minimac", ["docker", "info"])
-        remote = shlex.split(command[-1])
-        self.assertEqual(remote, [
-            "env", "LIMA_HOME=/Users/oem/.local/share/spawnd-ci/arm64-lima",
-            "/Users/oem/.local/share/spawnd-ci/lima-2.2.0/bin/limactl",
-            "shell", "--workdir=/home/ci-vm-admin",
-            "spawnd-ci-arm64", "docker", "info",
-        ])
+    def test_coordination_pool_cannot_move_off_minivac(self):
+        changed = copy.deepcopy(self.config)
+        changed["pools"][2]["host"] = "minimac"
+        with self.assertRaisesRegex(ValueError, "all Linux pools"):
+            pool.validate_config(changed)
 
     def test_cleanup_rejects_unowned_names_without_contacting_host(self):
         with patch.object(pool, "remote") as remote:

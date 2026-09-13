@@ -6,7 +6,6 @@
     {"label": "spawn-linux-android", "host": "minivac", "extra_labels": ["spawn-minivac"], "enabled": false, "count": 1, "cpus": 4, "memory_gib": 6, "kvm": true},
     {"label": "spawn-linux-control", "host": "minivac", "count": 1, "cpus": 2, "memory_gib": 3},
     {"label": "spawn-linux-wait", "host": "minivac", "count": 2, "cpus": 1, "memory_gib": 1},
-    {"label": "spawn-linux-release", "host": "minivac", "count": 1, "cpus": 2, "memory_gib": 3},
-    {"label": "spawn-linux-arm64", "host": "minimac", "enabled": false, "architecture": "ARM64", "count": 1, "cpus": 3, "memory_gib": 5}
+    {"label": "spawn-linux-release", "host": "minivac", "count": 1, "cpus": 2, "memory_gib": 3}
   ]
 }

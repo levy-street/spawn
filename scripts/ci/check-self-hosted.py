@@ -8,7 +8,7 @@ import re
 
 ROLES = {
     "Linux": {"spawn-linux-build", "spawn-linux-android", "spawn-linux-control",
-              "spawn-linux-wait", "spawn-linux-release", "spawn-linux-arm64"},
+              "spawn-linux-wait", "spawn-linux-release"},
     "macOS": {"spawn-macos-build", "spawn-macos-release"},
     "Windows": {"spawn-windows-build", "spawn-windows-release"},
 }
@@ -29,7 +29,7 @@ def validate_labels(labels):
         return
     if role not in ROLES[platform]:
         raise ValueError("unknown or mismatched runner pool")
-    expected = "ARM64" if platform == "macOS" or role == "spawn-linux-arm64" else "X64"
+    expected = "ARM64" if platform == "macOS" else "X64"
     if arch != expected:
         raise ValueError("runner architecture does not match its pool")
 

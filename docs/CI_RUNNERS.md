@@ -13,7 +13,7 @@ platform stays queued and cannot satisfy a release gate.
 | `spawn-linux-control` | Linux x64 | Resolve candidate/baseline and aggregate acceptance | Minivac |
 | `spawn-linux-wait` | Linux x64 | Wait for source CI and prebuilt publication | Minivac, two slots |
 | `spawn-linux-release` | Linux x64 | Protected release plan/deploy/OTA and artifact publication | Minivac |
-| `spawn-linux-arm64` | Linux ARM64, Ubuntu 22.04 | ARM64 daemon/worker binaries | ARM64 Linux VM on Minimac, pending provisioning |
+| `spawn-linux-build` + `spawn-minivac` | Linux x64, Ubuntu 22.04 cross toolchain | ARM64 daemon/worker binaries, executed with QEMU | Minivac; shares the general build slot |
 | `spawn-macos-build` | macOS ARM64 | Native iOS acceptance and unsigned branch binary builds | Minimac, pending Xcode/storage and standard CI account |
 | `spawn-macos-release` | macOS ARM64 | Protected Apple signing, Mac/Intel daemon and desktop builds | Minimac, separate standard release account |
 | `spawn-windows-build` | Windows x64 | MSVC tests and unsigned installer rehearsal | Dedicated Windows host, pending |
@@ -166,41 +166,26 @@ Keep the Simulator account's GUI session available. A dedicated ARM64 Linux VM
 can provide the separate `spawn-linux-arm64` label; macOS itself must never be
 labelled as Linux. Provision that pool with the matching ARM64 runner archive.
 
-### Linux ARM64 on Minimac
+### Linux ARM64 outputs on Minivac
 
-`linux-arm64.lima.yaml` describes a dedicated native VZ Ubuntu 22.04 VM with
-four CPUs, 6 GiB RAM and a 12 GiB disk. It mounts no host folders, forwards no
-SSH agent or application ports, and has its own Lima identity. The administrative
-VM user controls Docker; jobs run as UID 1001 in disposable containers with no
-host socket or operator files. Keep the personal Colima VM and Docker context
-untouched. Storage is bounded, so check host and guest free space before builds;
-additional Xcode/simulator storage remains a separate requirement.
+All Linux jobs belong on Minivac. Its real runner architecture is X64, including
+the job producing ARM64 artifacts. `build-linux-arm64.sh` installs the Ubuntu
+22.04 ARM64 cross compiler/sysroot and QEMU inside the disposable container,
+builds both locked release binaries for `aarch64-unknown-linux-gnu`, checks their
+AArch64 ELF headers and executes their version probes through QEMU. This proves
+cross-built ARM64 output and emulated execution, not native ARM hardware behavior.
+The previous native ARM64 run on Minimac remains historical evidence; its Lima
+configuration/image source is retained, but the VM is no longer an active pool.
+Preserve personal Colima data when retiring that dedicated CI VM.
 
-Use a separate Lima 2.2.0 installation under
-`/Users/oem/.local/share/spawnd-ci/lima-2.2.0` (Darwin ARM64 archive SHA256
-`bbdef91774885a0d05f7b048c4eb89ae2bcf3a0c252ae7ca7934e63df76d93c3`).
-The existing Lima 1.0.3 generates a null cloud-init mounts list rejected by current
-Ubuntu images. `LIMA_HOME` is `/Users/oem/.local/share/spawnd-ci/arm64-lima`, and
-the instance name is `spawnd-ci-arm64`. The pool controller explicitly selects
-this VM for every Docker operation, including cleanup.
-The VM is supervised by the system LaunchDaemon
-`dev.spawnd.ci.linux-arm64-vm`, with `RunAtLoad` and `KeepAlive`; it runs the VM
-manager as the operator, outside the job containers. A container is limited to
-three CPUs and 5 GiB, leaving VM memory for Docker and the kernel. Verify restart
-recovery only when the VM has no active job containers.
-
-Build `runner-linux-arm64.Dockerfile` inside the VM, supplying `RUNNER_VERSION`
-and the `linux-arm64` hash from `runner-versions.json`, and tag it with the pool's
-`spawnd-ci-linux:<version>` image name. This smaller image contains the native
-daemon toolchain; it does not claim Android or the full x64 test-suite capability.
-Keep the ARM pool disabled until the image and VM isolation are verified and the
-operator controller can reach it. Administration credentials remain outside jobs.
-
-Dispatch `test.yml` on the integration branch with `arm64_only=true` to build
-both release binaries natively, execute their version probes, verify AArch64 ELF
-headers and retain binaries, source SHA and SHA256 hashes as validation artifacts.
-The normal x64 test path remains the default. This dispatch does not run the
-prebuilt, desktop, signing, deployment or release-publication workflows.
+Dispatch `test.yml` with `arm64_only=true` for this validation without publication.
+It retains binaries, source SHA, version/architecture evidence and SHA256 hashes.
+The normal x64 suite remains the default; separate concurrency groups prevent
+one manual mode cancelling the other. Both use the same single 6 GiB build slot,
+so two heavy builds cannot consume Minivac's memory concurrently. The prebuilt
+workflow uses the same build/check script and uploads only its two expected ARM64
+binaries. Signing, deployment and release-publication workflows are not required
+to run this validation.
 
 ## Windows setup: outbound connections only
 
