@@ -81,7 +81,8 @@ require an additional `spawn-minivac` placement label, and the controller refuse
 to advertise that label from another SSH host. This keeps legacy Multivac JIT
 registrations, whose labels cannot be edited, from receiving the corrected jobs.
 Minivac uses disposable container disk storage instead of large tmpfs workspaces;
-the builder is capped at four CPUs and 6 GiB RAM. Existing unrelated services are
+the builder is capped at four CPUs and 8 GiB RAM. The initial 6 GiB cap caused a
+kernel OOM kill during the browser suite and is insufficient. Existing unrelated services are
 preserved. Android remains disabled until `/dev/kvm`, hardware virtualization and
 sufficient memory for concurrent heavy jobs are verified. Disabling its pool
 leaves required Android checks queued; it does not waive the acceptance gate.
@@ -195,7 +196,7 @@ Preserve personal Colima data when retiring that dedicated CI VM.
 Dispatch `test.yml` with `arm64_only=true` for this validation without publication.
 It retains binaries, source SHA, version/architecture evidence and SHA256 hashes.
 The normal x64 suite remains the default; separate concurrency groups prevent
-one manual mode cancelling the other. Both use the same single 6 GiB build slot,
+one manual mode cancelling the other. Both use the same single 8 GiB build slot,
 so two heavy builds cannot consume Minivac's memory concurrently. The prebuilt
 workflow uses the same build/check script and uploads only its two expected ARM64
 binaries. Signing, deployment and release-publication workflows are not required
