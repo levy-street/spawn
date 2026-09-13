@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -50,6 +51,16 @@ class RunnerIsolation(unittest.TestCase):
     def test_android_without_verified_kvm_gid_is_refused(self):
         with self.assertRaises(ValueError):
             pool.container_command(self.config, self.android, self.name)
+
+    def test_minimac_always_targets_the_dedicated_arm_vm(self):
+        command = pool.ssh_command("minimac", ["docker", "info"])
+        remote = shlex.split(command[-1])
+        self.assertEqual(remote, [
+            "env", "LIMA_HOME=/Users/oem/.local/share/spawnd-ci/arm64-lima",
+            "/Users/oem/.local/share/spawnd-ci/lima-2.2.0/bin/limactl",
+            "shell", "--workdir=/home/ci-vm-admin",
+            "spawnd-ci-arm64", "docker", "info",
+        ])
 
     def test_cleanup_rejects_unowned_names_without_contacting_host(self):
         with patch.object(pool, "remote") as remote:
@@ -110,7 +121,7 @@ class WorkflowRouting(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         counts = [guard.validate_workflow(path.read_text()) for path in (root / ".github/workflows").glob("*.yml")]
         self.assertEqual(len(counts), 7)
-        self.assertEqual(sum(counts), 21)
+        self.assertEqual(sum(counts), 22)
 
 
 class SigningCleanup(unittest.TestCase):

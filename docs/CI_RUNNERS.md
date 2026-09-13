@@ -161,6 +161,42 @@ Keep the Simulator account's GUI session available. A dedicated ARM64 Linux VM
 can provide the separate `spawn-linux-arm64` label; macOS itself must never be
 labelled as Linux. Provision that pool with the matching ARM64 runner archive.
 
+### Linux ARM64 on Minimac
+
+`linux-arm64.lima.yaml` describes a dedicated native VZ Ubuntu 22.04 VM with
+four CPUs, 6 GiB RAM and a 12 GiB disk. It mounts no host folders, forwards no
+SSH agent or application ports, and has its own Lima identity. The administrative
+VM user controls Docker; jobs run as UID 1001 in disposable containers with no
+host socket or operator files. Keep the personal Colima VM and Docker context
+untouched. Storage is bounded, so check host and guest free space before builds;
+additional Xcode/simulator storage remains a separate requirement.
+
+Use a separate Lima 2.2.0 installation under
+`/Users/oem/.local/share/spawnd-ci/lima-2.2.0` (Darwin ARM64 archive SHA256
+`bbdef91774885a0d05f7b048c4eb89ae2bcf3a0c252ae7ca7934e63df76d93c3`).
+The existing Lima 1.0.3 generates a null cloud-init mounts list rejected by current
+Ubuntu images. `LIMA_HOME` is `/Users/oem/.local/share/spawnd-ci/arm64-lima`, and
+the instance name is `spawnd-ci-arm64`. The pool controller explicitly selects
+this VM for every Docker operation, including cleanup.
+The VM is supervised by the system LaunchDaemon
+`dev.spawnd.ci.linux-arm64-vm`, with `RunAtLoad` and `KeepAlive`; it runs the VM
+manager as the operator, outside the job containers. A container is limited to
+three CPUs and 5 GiB, leaving VM memory for Docker and the kernel. Verify restart
+recovery only when the VM has no active job containers.
+
+Build `runner-linux-arm64.Dockerfile` inside the VM, supplying `RUNNER_VERSION`
+and the `linux-arm64` hash from `runner-versions.json`, and tag it with the pool's
+`spawnd-ci-linux:<version>` image name. This smaller image contains the native
+daemon toolchain; it does not claim Android or the full x64 test-suite capability.
+Keep the ARM pool disabled until the image and VM isolation are verified and the
+operator controller can reach it. Administration credentials remain outside jobs.
+
+Dispatch `test.yml` on the integration branch with `arm64_only=true` to build
+both release binaries natively, execute their version probes, verify AArch64 ELF
+headers and retain binaries, source SHA and SHA256 hashes as validation artifacts.
+The normal x64 test path remains the default. This dispatch does not run the
+prebuilt, desktop, signing, deployment or release-publication workflows.
+
 ## Windows setup: outbound connections only
 
 The official runner service maintains outbound HTTPS connections to GitHub and

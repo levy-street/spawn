@@ -109,6 +109,10 @@ Mac setup uses `scripts/ci/prepare-macos-accounts.py` to keep generated account
 passwords in the operator Keychain and install the release hook under a root-owned
 directory. `check-macos-runner.py` checks role identity and policy protection before
 registration; account and private password-prompt regressions run in `test-all.sh`.
+Linux ARM64 uses the separate, mount-free `linux-arm64.lima.yaml` VM and the
+daemon-only `runner-linux-arm64.Dockerfile`. Pool commands explicitly select that
+VM, preserving the operator's Colima context. Dispatch `test.yml` with
+`arm64_only=true` for native release-binary validation without publication.
 
 ## These files stay true, or they are worse than nothing
 

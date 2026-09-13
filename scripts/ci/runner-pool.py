@@ -65,7 +65,12 @@ def gh(repository, suffix, *, method="GET", body=None):
 
 def ssh_command(host, command):
     if command[0] == "docker" and host == "minimac":
-        command = ["/opt/homebrew/bin/docker", *command[1:]]
+        # Never use the operator's default Colima/Docker context. The dedicated
+        # Lima VM has no host mounts, SSH agent, or operator credentials.
+        command = ["env", "LIMA_HOME=/Users/oem/.local/share/spawnd-ci/arm64-lima",
+                   "/Users/oem/.local/share/spawnd-ci/lima-2.2.0/bin/limactl",
+                   "shell", "--workdir=/home/ci-vm-admin",
+                   "spawnd-ci-arm64", *command]
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host,
             shlex.join(command)]
