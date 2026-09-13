@@ -70,7 +70,7 @@ jobs:
   canary:
     name: isolated old and new canary cohorts
     needs: resolve
-    runs-on: [self-hosted, Linux, X64, spawn-linux-build]
+    runs-on: [self-hosted, Linux, X64, spawn-linux-build, spawn-minivac]
     timeout-minutes: 120
     steps:
       - name: Prepare isolated output and build paths

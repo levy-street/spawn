@@ -169,7 +169,7 @@ jobs:
           if-no-files-found: error
 
   linux-x86_64:
-    runs-on: [self-hosted, Linux, X64, spawn-linux-build]
+    runs-on: [self-hosted, Linux, X64, spawn-linux-build, spawn-minivac]
     timeout-minutes: 40
     steps:
       - name: Check out repository

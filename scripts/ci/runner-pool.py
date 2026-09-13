@@ -31,6 +31,11 @@ def validate_config(config):
         labels.add(label)
         if not re.fullmatch(r"[a-zA-Z0-9][\w.-]*", pool["host"]):
             raise ValueError("host must be an SSH alias")
+        extra = pool.get("extra_labels", [])
+        if extra not in ([], ["spawn-minivac"]) or (extra and pool["host"] != "minivac"):
+            raise ValueError("placement label must match the Minivac host")
+        if label in ("spawn-linux-build", "spawn-linux-android") and extra != ["spawn-minivac"]:
+            raise ValueError("Linux x64 builders must be explicitly placed on Minivac")
         for field, low, high in [("count", 1, 4), ("cpus", 1, 8), ("memory_gib", 1, 64)]:
             if type(pool[field]) is not int or not low <= pool[field] <= high:
                 raise ValueError(f"invalid {field}")
@@ -162,7 +167,7 @@ def worker(config, pool, slot, state):
             command = container_command(config, pool, name, gid)
             jit = gh(repository, "/generate-jitconfig", method="POST", body={
                 "name": name, "runner_group_id": 1,
-                "labels": ["self-hosted", "Linux", architecture, pool["label"]],
+                "labels": ["self-hosted", "Linux", architecture, pool["label"], *pool.get("extra_labels", [])],
                 "work_folder": "/home/runner/_work",
             })
             runner_id = jit["runner"]["id"]

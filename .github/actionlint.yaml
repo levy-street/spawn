@@ -1,5 +1,6 @@
 self-hosted-runner:
   labels:
+    - spawn-minivac
     - spawn-linux-build
     - spawn-linux-android
     - spawn-linux-control

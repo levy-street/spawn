@@ -8,8 +8,8 @@ platform stays queued and cannot satisfy a release gate.
 
 | Label | Platform | Purpose | Host |
 | --- | --- | --- | --- |
-| `spawn-linux-build` | Linux x64, Ubuntu 22.04 | Full tests, canary, Linux release and diagnostics binaries | Multivac |
-| `spawn-linux-android` | Linux x64 with KVM | Native Android Release app and emulator acceptance | Multivac |
+| `spawn-linux-build` + `spawn-minivac` | Linux x64, Ubuntu 22.04 | Full tests, canary, Linux release and diagnostics binaries | Minivac |
+| `spawn-linux-android` + `spawn-minivac` | Linux x64 with KVM | Native Android Release app and emulator acceptance | Minivac; disabled pending KVM and memory-capacity checks |
 | `spawn-linux-control` | Linux x64 | Resolve candidate/baseline and aggregate acceptance | Minivac |
 | `spawn-linux-wait` | Linux x64 | Wait for source CI and prebuilt publication | Minivac, two slots |
 | `spawn-linux-release` | Linux x64 | Protected release plan/deploy/OTA and artifact publication | Minivac |
@@ -76,10 +76,15 @@ restart it between active jobs. The state directory is private and contains
 runner IDs and diagnostics, not the GitHub administration credential. Archive or
 remove old completed diagnostics periodically; active records must be preserved.
 
-`pools.json` bounds CPUs, memory and concurrency. Multivac workspaces use tmpfs
-inside those memory limits, including `/tmp` and downloaded toolchains; their
-combined size leaves room for compiler/emulator memory. The two large jobs are
-capped at 88 GiB in total on Multivac's 128 GiB host.
+`pools.json` places Linux x64 build and Android jobs on Minivac. Their workflows
+require an additional `spawn-minivac` placement label, and the controller refuses
+to advertise that label from another SSH host. This keeps legacy Multivac JIT
+registrations, whose labels cannot be edited, from receiving the corrected jobs.
+Minivac uses disposable container disk storage instead of large tmpfs workspaces;
+the builder is capped at four CPUs and 6 GiB RAM. Existing unrelated services are
+preserved. Android remains disabled until `/dev/kvm`, hardware virtualization and
+sufficient memory for concurrent heavy jobs are verified. Disabling its pool
+leaves required Android checks queued; it does not waive the acceptance gate.
 Only the Android pool receives `/dev/kvm` and its actual supplementary group.
 It never changes the host's device permissions. Minivac coordination jobs use
 ordinary disposable container storage. Waiting jobs have separate slots to

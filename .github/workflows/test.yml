@@ -19,7 +19,7 @@ concurrency:
 jobs:
   test:
     if: github.event_name != 'workflow_dispatch' || inputs.arm64_only != true
-    runs-on: [self-hosted, Linux, X64, spawn-linux-build]
+    runs-on: [self-hosted, Linux, X64, spawn-linux-build, spawn-minivac]
     # The matrix outgrew 30 minutes when the mesh and workspaces work grew the
     # suites (server pytest ~8m, daemon tests, ten smokes, 220+ Playwright
     # specs, production build); 30 was cancelling runs mid-e2e.

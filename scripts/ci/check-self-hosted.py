@@ -16,9 +16,15 @@ MAC_ROLE = "${{ github.ref == 'refs/heads/master' && 'spawn-macos-release' || 's
 
 
 def validate_labels(labels):
-    if len(labels) != 4 or labels[0] != "self-hosted" or labels[1] not in ROLES:
+    if len(labels) not in (4, 5) or labels[0] != "self-hosted" or labels[1] not in ROLES:
         raise ValueError("runner must specify self-hosted, platform, architecture and a SPAWN D pool")
-    platform, arch, role = labels[1:]
+    platform, arch, role = labels[1:4]
+    placement = labels[4:]
+    if platform == "Linux" and role in ("spawn-linux-build", "spawn-linux-android"):
+        if placement != ["spawn-minivac"]:
+            raise ValueError("Linux x64 builders require explicit Minivac placement")
+    elif placement:
+        raise ValueError("unexpected runner placement label")
     if role == MAC_ROLE and platform == "macOS" and arch == "ARM64":
         return
     if role not in ROLES[platform]:

@@ -42,7 +42,7 @@ class RunnerIsolation(unittest.TestCase):
 
     def test_job_has_no_host_credentials_or_docker_socket(self):
         command = pool.container_command(self.config, self.android, self.name, 108)
-        self.assertIn("--tmpfs", command)
+        self.assertNotIn("--tmpfs", command)  # Minivac uses disposable disk storage.
         self.assertIn("/dev/kvm", command)
         for forbidden in ("--privileged", "--volume", "--mount", "/var/run/docker.sock", "--network=host"):
             self.assertNotIn(forbidden, command)
@@ -51,6 +51,18 @@ class RunnerIsolation(unittest.TestCase):
     def test_android_without_verified_kvm_gid_is_refused(self):
         with self.assertRaises(ValueError):
             pool.container_command(self.config, self.android, self.name)
+
+    def test_minivac_placement_cannot_be_assigned_to_another_host(self):
+        changed = copy.deepcopy(self.config)
+        changed["pools"][0]["host"] = "multivac"
+        with self.assertRaisesRegex(ValueError, "placement label"):
+            pool.validate_config(changed)
+
+    def test_minivac_builders_cannot_omit_the_placement_label(self):
+        changed = copy.deepcopy(self.config)
+        changed["pools"][0].pop("extra_labels")
+        with self.assertRaisesRegex(ValueError, "explicitly placed"):
+            pool.validate_config(changed)
 
     def test_minimac_always_targets_the_dedicated_arm_vm(self):
         command = pool.ssh_command("minimac", ["docker", "info"])
@@ -102,6 +114,13 @@ class RunnerIsolation(unittest.TestCase):
 
 
 class WorkflowRouting(unittest.TestCase):
+    def test_linux_builder_cannot_match_a_legacy_multivac_runner(self):
+        for role in ("spawn-linux-build", "spawn-linux-android"):
+            labels = ["self-hosted", "Linux", "X64", role]
+            with self.assertRaisesRegex(ValueError, "Minivac placement"):
+                guard.validate_labels(labels)
+            guard.validate_labels([*labels, "spawn-minivac"])
+
     def test_hosted_literal_and_expression_are_refused(self):
         for value in ("ubuntu-latest", "windows-latest", "macos-15", "${{ vars.RUNNER }}"):
             with self.subTest(value=value), self.assertRaises(ValueError):

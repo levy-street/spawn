@@ -2,8 +2,8 @@
   "repository": "levy-street/spawn",
   "image": "spawnd-ci-linux:2.337.0",
   "pools": [
-    {"label": "spawn-linux-build", "host": "multivac", "count": 1, "cpus": 4, "memory_gib": 48, "home_gib": 24, "tmp_gib": 16},
-    {"label": "spawn-linux-android", "host": "multivac", "count": 1, "cpus": 4, "memory_gib": 40, "home_gib": 28, "tmp_gib": 4, "kvm": true},
+    {"label": "spawn-linux-build", "host": "minivac", "extra_labels": ["spawn-minivac"], "count": 1, "cpus": 4, "memory_gib": 6},
+    {"label": "spawn-linux-android", "host": "minivac", "extra_labels": ["spawn-minivac"], "enabled": false, "count": 1, "cpus": 4, "memory_gib": 6, "kvm": true},
     {"label": "spawn-linux-control", "host": "minivac", "count": 1, "cpus": 2, "memory_gib": 3},
     {"label": "spawn-linux-wait", "host": "minivac", "count": 2, "cpus": 1, "memory_gib": 1},
     {"label": "spawn-linux-release", "host": "minivac", "count": 1, "cpus": 2, "memory_gib": 3},
