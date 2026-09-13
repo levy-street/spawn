@@ -126,6 +126,7 @@ Minivac can supervise its own build pool with `runner-pool.py --local-host miniv
 job containers. Keep this build-only service's config and state separate from the
 existing controller until its other pools are drained and migrated.
 `spawnd-ci-minivac-build.service` provides the corresponding automatic user service.
+Local mode clears inherited Docker context selection before pinning the local socket.
 
 ## These files stay true, or they are worse than nothing
 

@@ -119,10 +119,11 @@ class ControllerOperatorBoundary(unittest.TestCase):
                 pool.configure_execution("minivac", "git-credential")
 
     def test_local_mode_pins_docker_to_the_local_socket(self):
-        with patch.object(pool, "LOCAL_HOST", None), patch.object(pool, "AUTH_SOURCE", "gh"), patch.dict(os.environ, {"DOCKER_HOST": "ssh://another-host"}):
+        with patch.object(pool, "LOCAL_HOST", None), patch.object(pool, "AUTH_SOURCE", "gh"), patch.dict(os.environ, {"DOCKER_HOST": "ssh://another-host", "DOCKER_CONTEXT": "remote-context"}):
             with patch.object(pool.sys, "platform", "linux"), patch.object(pool.socket, "gethostname", return_value="minivac"), patch.object(pool.os, "geteuid", return_value=1000):
                 pool.configure_execution("minivac", "git-credential")
             self.assertEqual(os.environ["DOCKER_HOST"], "unix:///var/run/docker.sock")
+            self.assertNotIn("DOCKER_CONTEXT", os.environ)
             self.assertEqual(pool.ssh_command("minivac", ["docker", "info"]), ["docker", "info"])
 
     def test_credential_and_api_failure_details_cannot_reach_pool_logs(self):
@@ -134,7 +135,9 @@ class ControllerOperatorBoundary(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as raised:
                     pool.git_credential_api("levy-street/spawn", "/generate-jitconfig", method="POST", body={})
                 self.assertNotIn(fake_secret, str(raised.exception))
-                self.assertNotIn(fake_secret, repr(run.call_args))
+                self.assertNotIn(fake_secret, repr(run.call_args.args))
+                self.assertNotIn(fake_secret, run.call_args.kwargs["input"])
+                self.assertTrue(all(value != fake_secret for value in run.call_args.kwargs["env"].values()))
                 self.assertEqual(run.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
 
 

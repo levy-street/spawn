@@ -246,6 +246,7 @@ def configure_execution(local_host, auth_source):
         if os.geteuid() == 0:
             raise ValueError("run the controller as its existing operator, not root")
         # Do not inherit an operator Docker context pointing at another machine.
+        os.environ.pop("DOCKER_CONTEXT", None)
         os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
     LOCAL_HOST, AUTH_SOURCE = local_host, auth_source
 
