@@ -47,6 +47,7 @@ printf '%s\n' "== native connection acceptance harness guards =="
 python3 scripts/ci/check-self-hosted.py
 python3 scripts/ci/test-runners.py
 python3 scripts/ci/test-release-hooks.py
+python3 scripts/ci/test-macos-accounts.py
 python3 scripts/test-udp-chaos-proxy.py
 python3 scripts/test-native-acceptance.py
 python3 mobile/e2e/test-compact-android-build.py

@@ -35,7 +35,9 @@ class ReleaseHooks(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bash"), "bash is unavailable on this platform")
     def test_macos_hook(self):
-        self.check_hook(["bash", str(ROOT / "release-job-hook.sh")])
+        # Windows CreateProcess searches System32 before PATH for bare "bash".
+        # Execute the discovered Git Bash rather than the unrelated WSL launcher.
+        self.check_hook([shutil.which("bash"), str(ROOT / "release-job-hook.sh")])
 
     @unittest.skipUnless(os.environ.get("SPAWN_TEST_PWSH") or shutil.which("pwsh"), "PowerShell is unavailable on this platform")
     def test_windows_hook(self):

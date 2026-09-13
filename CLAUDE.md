@@ -105,6 +105,10 @@ hosted fallbacks, and the runner/disk regressions run in `scripts/test-all.sh`.
 Signing environments, exact-commit checks and release evidence remain required.
 Linux CI wraps `scripts/test-all.sh` with disposable PostgreSQL 16 and Redis 7
 fixtures, and sets `SPAWN_E2E_WORKERS=2` for its four-CPU container quota.
+Mac setup uses `scripts/ci/prepare-macos-accounts.py` to keep generated account
+passwords in the operator Keychain and install the release hook under a root-owned
+directory. `check-macos-runner.py` checks role identity and policy protection before
+registration; account and private password-prompt regressions run in `test-all.sh`.
 
 ## These files stay true, or they are worse than nothing
 

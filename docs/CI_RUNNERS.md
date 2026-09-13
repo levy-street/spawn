@@ -119,15 +119,41 @@ complete its first-launch components/license as the administrator.
 
 Use different **standard** macOS accounts for build and release. Keep the build
 account away from operator and release keychains, credentials and writable
-shared tooling. Do not run either service as the operator's `oem` account.
-From each account's logged-in session, run:
+shared tooling. Do not run either service as the operator's `oem` account. The
+account bootstrap refuses existing accounts, homes or a protected policy directory;
+inspect any partial installation before resuming. Run from the operator's local
+session with its login Keychain unlocked:
 
 ```bash
-bash scripts/ci/install-macos-runner.sh build   # release for the other account
+python3 scripts/ci/prepare-macos-accounts.py --operator "$USER" --prepare
+sudo python3 scripts/ci/prepare-macos-accounts.py --operator "$USER" --apply
 ```
 
-The script verifies the archive hash and platform tools, prompts for a short-lived
-repository runner registration token, and installs the official launchd service.
+It generates independent strong passwords in the operator login Keychain, passes
+them through a private non-echoing prompt to the native account tool, and creates
+`spawnd-ci-build` and `spawnd-ci-release` as standard accounts with private homes.
+It denies just these identities access to the operator home, preserving access
+for unrelated users and services. No personal credential is copied. The protected
+release hook is installed at
+`/Library/Application Support/SPAWN D CI/release-job-hook.sh`, owned by root, and
+its allow/deny cases are checked under both new accounts. No runner starts during
+this administrator step. Passwords remain in the operator login Keychain under
+service `dev.spawnd.ci.local-service-account`; do not print or copy them into logs.
+
+From each dedicated account's logged-in session, run its staged installer:
+
+```bash
+bash "$HOME/spawnd-ci/setup/install-macos-runner.sh" build   # release for the other account
+```
+
+The script verifies account isolation, archive hash and platform tools, prompts for
+a short-lived repository runner registration token, and installs the official
+launchd service. The token uses the runner's temporary `ACTIONS_RUNNER_INPUT_TOKEN`
+input rather than process arguments, and is not written to the service environment.
+Service PATH and UTF-8 locale are explicit. A build account must have CocoaPods
+and an available iOS Simulator runtime; both roles require completed Xcode first
+launch. Release startup refuses a writable policy file or ancestor, and rechecks
+the hook before starting. Registration never grants repository administration.
 Keep the Simulator account's GUI session available. A dedicated ARM64 Linux VM
 can provide the separate `spawn-linux-arm64` label; macOS itself must never be
 labelled as Linux. Provision that pool with the matching ARM64 runner archive.
