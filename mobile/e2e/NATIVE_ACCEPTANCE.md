@@ -17,6 +17,12 @@ Maestro service is unnecessary. These tests cover the transport acceptance
 boundary; they do not replace user interface navigation tests or physical
 handset evidence.
 
+On process relaunch, the controller reuses an identical stored fixture token
+after validating its account with the API. It lets the real AuthGate restore
+that account rather than resetting the ready identity during device registration.
+Fresh logins and account switches still use the normal account-adoption path;
+registration waits for the expected account to be ready.
+
 ## Build isolation
 
 `prepare-native-acceptance.mjs` copies `mobile/` into a **new directory outside

@@ -22,7 +22,9 @@ jest.mock("expo-constants", () => ({
   },
 }));
 jest.mock("@/data/api/config", () => ({ getBaseUrl: async () => "http://127.0.0.1:18100" }));
-jest.mock("@/data/api/auth-token", () => ({ authToken: { set: jest.fn(async () => {}) } }));
+jest.mock("@/data/api/auth-token", () => ({
+  authToken: { get: jest.fn(async () => null), set: jest.fn(async () => {}) },
+}));
 jest.mock("@/data/api/endpoints/account", () => ({
   getMe: async () => ({ user: { id: "11111111-1111-4111-8111-111111111111" } }),
 }));

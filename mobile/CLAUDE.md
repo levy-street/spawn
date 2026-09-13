@@ -70,6 +70,8 @@ scripts/, docs/   build helpers and app-specific notes
   separately guarded; `e2e/test-android-disk-preflight.py` tests both boundaries.
   `e2e/test-native-runner.py` checks bounded installation, diagnostics and failure
   reporting. These checks run through the root test matrix.
+  The restored-login regression uses the real AuthGate and verifies that the
+  controller does not retire an already-restored account during process relaunch.
   Production routes and assets must never import this controller.
 
 ## Conventions

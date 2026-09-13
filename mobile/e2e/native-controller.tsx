@@ -209,10 +209,14 @@ export function NativeAcceptanceController(): React.JSX.Element {
       });
     };
     const authenticate = async (next: { accountId: string; bearerToken: string }) => {
-      await authToken.set(next.bearerToken);
+      // A relaunched app restores this login through its real AuthGate. Writing
+      // the same token and resetting its queries retires that ready identity
+      // while device registration is awaiting native secure storage.
+      const restored = (await authToken.get()) === next.bearerToken;
+      if (!restored) await authToken.set(next.bearerToken);
       const me = await getMe();
       if (me.user.id !== next.accountId) throw new Error("Fixture login returned another account.");
-      adoptAuthenticatedAccount(queryClient, me.user);
+      if (!restored) adoptAuthenticatedAccount(queryClient, me.user);
     };
     const perform = async ({ action, payload = {} }: Command): Promise<unknown> => {
       const key = payload["session"] === "b" ? "b" : "a";
@@ -411,7 +415,10 @@ export function NativeAcceptanceController(): React.JSX.Element {
           if (current.candidateCommit !== build?.candidateCommit)
             throw new Error("Fixture candidate differs from the embedded native candidate.");
           await authenticate(current);
-          await until(() => accountRef.current.ready, "Account did not initialize.");
+          await until(
+            () => accountRef.current.ready && accountRef.current.accountId === current.accountId,
+            "Account did not initialize.",
+          );
           await register();
           setBootstrap(current);
           return snapshot();
@@ -431,7 +438,10 @@ export function NativeAcceptanceController(): React.JSX.Element {
         diagnostic("authentication");
         await authenticate(current);
         diagnostic("account-gate");
-        await until(() => accountRef.current.ready, "Authenticated app did not initialize.");
+        await until(
+          () => accountRef.current.ready && accountRef.current.accountId === current.accountId,
+          "Authenticated app did not initialize.",
+        );
         diagnostic("device-registration");
         await register();
         if (stopped) return;

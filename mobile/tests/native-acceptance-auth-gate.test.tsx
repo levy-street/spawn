@@ -104,6 +104,76 @@ function response(body: unknown, status = 200) {
   });
 }
 
+test("a restored native login reaches acceptance without retiring its ready account", async () => {
+  jest.useFakeTimers();
+  await setBaseUrl("http://127.0.0.1:18100");
+  await authToken.clear();
+  await authToken.set("fixture-token");
+  const credentialChanged = jest.fn();
+  const unsubscribe = authToken.subscribe(credentialChanged);
+  const bootstrap = deferred<Response>();
+  let client!: QueryClient;
+  let account = { accountId: null as string | null, ready: false };
+  const events: Array<{ type: string; status: string }> = [];
+  const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/__acceptance/bootstrap") return bootstrap.promise;
+    if (path === "/__acceptance/event") {
+      events.push(JSON.parse(String(init?.body)));
+      return response(null);
+    }
+    if (path === "/__acceptance/device") return response({ approved: true });
+    if (path === "/__acceptance/command") return response(null);
+    if (path === "/api/auth/config") return response(CONFIG);
+    if (path === "/api/hosts") return response([]);
+    if (path === "/api/me") return response({ user: USER });
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  function Observe() {
+    client = useQueryClient();
+    account = useAuthenticatedAccount();
+    return null;
+  }
+  const view = await render(
+    <AppProviders>
+      <AuthGate>
+        <Observe />
+        <NativeAcceptanceController />
+      </AuthGate>
+    </AppProviders>,
+  );
+  try {
+    // On process relaunch, the real gate can restore the stored login before
+    // the controller receives its bootstrap response. Preserve that identity.
+    await waitFor(() => expect(account).toEqual({ accountId: USER.id, ready: true }));
+    const resetQueries = jest.spyOn(client, "resetQueries");
+    await act(async () => {
+      bootstrap.resolve(
+        response({
+          accountId: USER.id,
+          bearerToken: "fixture-token",
+          candidateCommit: "candidate",
+        }),
+      );
+    });
+    await waitFor(() =>
+      expect(events).toContainEqual(expect.objectContaining({ type: "boot", status: "passed" })),
+    );
+    expect(credentialChanged).not.toHaveBeenCalled();
+    expect(resetQueries).not.toHaveBeenCalled();
+    expect(account).toEqual({ accountId: USER.id, ready: true });
+    resetQueries.mockRestore();
+  } finally {
+    await view.unmount();
+    client.clear();
+    fetch.mockRestore();
+    unsubscribe();
+    await authToken.clear();
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  }
+});
+
 test("native controller boots through real app providers while gate queries are already mounted", async () => {
   jest.useFakeTimers();
   await setBaseUrl("http://127.0.0.1:18100");
