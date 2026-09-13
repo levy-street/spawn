@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 
@@ -106,6 +107,35 @@ class RunnerIsolation(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     pool.recover(self.config, state)
                 cleanup.assert_not_called()
+
+
+class ControllerOperatorBoundary(unittest.TestCase):
+    def test_local_mode_refuses_another_machine_or_root(self):
+        with patch.object(pool.sys, "platform", "linux"), patch.object(pool.socket, "gethostname", return_value="multivac"):
+            with self.assertRaisesRegex(ValueError, "Minivac Linux host"):
+                pool.configure_execution("minivac", "git-credential")
+        with patch.object(pool.sys, "platform", "linux"), patch.object(pool.socket, "gethostname", return_value="minivac"), patch.object(pool.os, "geteuid", return_value=0):
+            with self.assertRaisesRegex(ValueError, "not root"):
+                pool.configure_execution("minivac", "git-credential")
+
+    def test_local_mode_pins_docker_to_the_local_socket(self):
+        with patch.object(pool, "LOCAL_HOST", None), patch.object(pool, "AUTH_SOURCE", "gh"), patch.dict(os.environ, {"DOCKER_HOST": "ssh://another-host"}):
+            with patch.object(pool.sys, "platform", "linux"), patch.object(pool.socket, "gethostname", return_value="minivac"), patch.object(pool.os, "geteuid", return_value=1000):
+                pool.configure_execution("minivac", "git-credential")
+            self.assertEqual(os.environ["DOCKER_HOST"], "unix:///var/run/docker.sock")
+            self.assertEqual(pool.ssh_command("minivac", ["docker", "info"]), ["docker", "info"])
+
+    def test_credential_and_api_failure_details_cannot_reach_pool_logs(self):
+        fake_secret = "fake-private-test-value"
+        for code in (0, 1):
+            result = subprocess.CompletedProcess([], code, "password=" + fake_secret, fake_secret)
+            failure = urllib.error.HTTPError("https://api.github.com", 403, fake_secret, {}, None)
+            with patch.object(pool.subprocess, "run", return_value=result) as run, patch.object(pool.urllib.request, "urlopen", side_effect=failure):
+                with self.assertRaises(RuntimeError) as raised:
+                    pool.git_credential_api("levy-street/spawn", "/generate-jitconfig", method="POST", body={})
+                self.assertNotIn(fake_secret, str(raised.exception))
+                self.assertNotIn(fake_secret, repr(run.call_args))
+                self.assertEqual(run.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
 
 
 class WorkflowRouting(unittest.TestCase):

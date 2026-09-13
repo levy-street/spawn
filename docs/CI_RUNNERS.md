@@ -14,9 +14,9 @@ platform stays queued and cannot satisfy a release gate.
 | `spawn-linux-wait` | Linux x64 | Wait for source CI and prebuilt publication | Minivac, two slots |
 | `spawn-linux-release` | Linux x64 | Protected release plan/deploy/OTA and artifact publication | Minivac |
 | `spawn-linux-build` + `spawn-minivac` | Linux x64, Ubuntu 22.04 cross toolchain | ARM64 daemon/worker binaries, executed with QEMU | Minivac; shares the general build slot |
-| `spawn-macos-build` | macOS ARM64 | Native iOS acceptance and unsigned branch binary builds | Minimac, pending Xcode/storage and standard CI account |
+| `spawn-macos-build` | macOS ARM64 | Native iOS acceptance and unsigned branch binary builds | Minimac, pending Xcode/storage and runner registration |
 | `spawn-macos-release` | macOS ARM64 | Protected Apple signing, Mac/Intel daemon and desktop builds | Minimac, separate standard release account |
-| `spawn-windows-build` | Windows x64 | MSVC tests and unsigned installer rehearsal | Dedicated Windows host, pending |
+| `spawn-windows-build` | Windows x64 | MSVC tests and unsigned installer rehearsal | ALTO, dedicated standard build account |
 | `spawn-windows-release` | Windows x64 | Protected Authenticode binary and desktop builds | Same Windows host, separate standard release account |
 
 Labels describe capabilities, not an assertion that an unfinished machine is
@@ -115,6 +115,20 @@ User lingering must be enabled for startup without an interactive login. The
 current controller runs on DREAM, whose existing user already has lingering.
 Stopping this service stops only its recorded CI containers and registrations.
 
+A separate build-only controller can run on Minivac itself with
+`--local-host minivac --auth-source git-credential`. Local mode verifies the Linux
+hostname, refuses root and pins Docker to the local Unix socket. It reads the
+operator's existing Git credential helper in memory, suppresses credential/API
+failure details, and sends only the one-job runner configuration into containers.
+No GitHub administration credential is copied or mounted into a job account.
+Use a distinct service, config and state directory containing only the build pool
+until the existing controller's other pools have been drained and migrated.
+`spawnd-ci-minivac-build.service` uses `~/.local/share/spawnd-ci/minivac-build/`
+for the controller and build-only `pools.json`, and
+`~/.local/state/spawnd-ci-minivac-build/` for private runtime state. Enable this
+systemd user service with lingering and `Restart=on-failure`; start it only after
+the temporary controller has stopped and its current build has finished.
+
 ## Mac setup
 
 Install full Xcode, its selected iOS Simulator runtime, Node 22, Python 3.13,
@@ -162,9 +176,9 @@ A build account must have CocoaPods
 and an available iOS Simulator runtime; both roles require completed Xcode first
 launch. Release startup refuses a writable policy file or ancestor, and rechecks
 the hook before starting. Registration never grants repository administration.
-Keep the Simulator account's GUI session available. A dedicated ARM64 Linux VM
-can provide the separate `spawn-linux-arm64` label; macOS itself must never be
-labelled as Linux. Provision that pool with the matching ARM64 runner archive.
+Keep the Simulator account's GUI session available. Minimac serves macOS jobs;
+Linux builds, including ARM64 outputs, use Minivac as described below. Do not
+reactivate the historical Linux VM pool or label a macOS runner as Linux.
 
 ### Linux ARM64 outputs on Minivac
 

@@ -10,12 +10,18 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import socket
 import subprocess
+import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
 
 STOP = threading.Event()
 OWNER_LABEL = "dev.spawnd.ci.managed"
+LOCAL_HOST = None
+AUTH_SOURCE = "gh"
 
 
 def validate_config(config):
@@ -58,7 +64,44 @@ def validate_config(config):
     return config
 
 
+def git_credential_api(repository, suffix, *, method="GET", body=None):
+    # Use the operator's existing credential helper. Never persist its output or
+    # put it in argv/environment; containers receive only their one-job config.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never",
+               GIT_ASKPASS="/bin/false", SSH_ASKPASS="/bin/false")
+    result = subprocess.run(["git", "credential", "fill"],
+                            input="protocol=https\nhost=github.com\n\n",
+                            text=True, capture_output=True, timeout=30, env=env)
+    credential = {}
+    request = None
+    try:
+        if result.returncode:
+            raise RuntimeError("operator Git credential lookup failed")
+        credential = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if not credential.get("password"):
+            raise RuntimeError("operator Git credential has no API token")
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/{repository}/actions/runners{suffix}",
+            data=json.dumps(body).encode() if body is not None else None, method=method,
+            headers={"Authorization": "Bearer " + credential["password"],
+                     "Accept": "application/vnd.github+json", "Content-Type": "application/json",
+                     "X-GitHub-Api-Version": "2022-11-28"})
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                data = response.read()
+                return json.loads(data) if data else None
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"runner API {method} failed with HTTP {exc.code}") from None
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            raise RuntimeError(f"runner API {method} failed: {type(exc).__name__}") from None
+    finally:
+        credential.clear()
+        result = request = None
+
+
 def gh(repository, suffix, *, method="GET", body=None):
+    if AUTH_SOURCE == "git-credential":
+        return git_credential_api(repository, suffix, method=method, body=body)
     command = ["gh", "api", "--method", method, f"repos/{repository}/actions/runners{suffix}"]
     if body is not None:
         command += ["--input", "-"]
@@ -71,6 +114,8 @@ def gh(repository, suffix, *, method="GET", body=None):
 
 
 def ssh_command(host, command):
+    if host == LOCAL_HOST:
+        return list(command)
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", host,
             shlex.join(command)]
@@ -192,11 +237,29 @@ def worker(config, pool, slot, state):
         STOP.wait(30)
 
 
+def configure_execution(local_host, auth_source):
+    global LOCAL_HOST, AUTH_SOURCE
+    if local_host is not None:
+        if (local_host != "minivac" or sys.platform != "linux"
+                or socket.gethostname().split(".")[0].lower() != local_host):
+            raise ValueError("local Docker execution requires the Minivac Linux host")
+        if os.geteuid() == 0:
+            raise ValueError("run the controller as its existing operator, not root")
+        # Do not inherit an operator Docker context pointing at another machine.
+        os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+    LOCAL_HOST, AUTH_SOURCE = local_host, auth_source
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--local-host", choices=["minivac"],
+                        help="execute Docker on this verified Minivac host, without SSH")
+    parser.add_argument("--auth-source", choices=["gh", "git-credential"], default="gh",
+                        help="use gh or the operator's existing noninteractive Git credential")
     args = parser.parse_args()
+    configure_execution(args.local_host, args.auth_source)
     config = validate_config(json.loads(args.config.read_text()))
     os.umask(0o077)
     args.state.mkdir(parents=True, exist_ok=True)

@@ -120,6 +120,12 @@ The builder keeps its real X64 runner label. Dispatch `test.yml` with
 group is separate from the full suite, and both share one bounded build slot.
 The earlier Minimac Linux VM configuration is retained as historical setup
 material; it is no longer an active CI pool. macOS jobs remain on Minimac.
+Do not reactivate that legacy Linux VM pool when completing the Mac setup.
+Minivac can supervise its own build pool with `runner-pool.py --local-host minivac
+--auth-source git-credential`: the existing operator credential stays outside the
+job containers. Keep this build-only service's config and state separate from the
+existing controller until its other pools are drained and migrated.
+`spawnd-ci-minivac-build.service` provides the corresponding automatic user service.
 
 ## These files stay true, or they are worse than nothing
 
