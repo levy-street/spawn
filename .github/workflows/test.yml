@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   test:
-    if: ${{ !inputs.arm64_only }}
+    if: github.event_name != 'workflow_dispatch' || inputs.arm64_only != true
     runs-on: [self-hosted, Linux, X64, spawn-linux-build]
     # The matrix outgrew 30 minutes when the mesh and workspaces work grew the
     # suites (server pytest ~8m, daemon tests, ten smokes, 220+ Playwright
@@ -127,7 +127,7 @@ jobs:
           retention-days: 14
 
   linux-arm64:
-    if: github.event_name == 'workflow_dispatch' && inputs.arm64_only
+    if: github.event_name == 'workflow_dispatch' && inputs.arm64_only == true
     runs-on: [self-hosted, Linux, ARM64, spawn-linux-arm64]
     timeout-minutes: 60
     permissions:
