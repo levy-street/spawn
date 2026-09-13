@@ -150,7 +150,10 @@ The script verifies account isolation, archive hash and platform tools, prompts 
 a short-lived repository runner registration token, and installs the official
 launchd service. The token uses the runner's temporary `ACTIONS_RUNNER_INPUT_TOKEN`
 input rather than process arguments, and is not written to the service environment.
-Service PATH and UTF-8 locale are explicit. A build account must have CocoaPods
+Service PATH and UTF-8 locale are explicit; Homebrew Python 3.13's unversioned
+commands come from its `libexec/bin` directory. Run account probes from the CI
+account's own home, since the operator home is intentionally inaccessible.
+A build account must have CocoaPods
 and an available iOS Simulator runtime; both roles require completed Xcode first
 launch. Release startup refuses a writable policy file or ancestor, and rechecks
 the hook before starting. Registration never grants repository administration.

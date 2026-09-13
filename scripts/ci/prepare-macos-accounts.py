@@ -232,7 +232,8 @@ def apply(operator):
             if probe.returncode != 1:
                 raise RuntimeError(f"{account} can read a protected profile; no services may start")
         subprocess.run(["/usr/bin/sudo", "-H", "-u", account, "/opt/homebrew/bin/python3",
-                        f"/Users/{account}/spawnd-ci/setup/check-macos-runner.py", "--hook-only"], check=True)
+                        f"/Users/{account}/spawnd-ci/setup/check-macos-runner.py", "--hook-only"],
+                       cwd=f"/Users/{account}", check=True)
     print("Account passwords remain in the operator login Keychain; no runner services have started.")
 
 

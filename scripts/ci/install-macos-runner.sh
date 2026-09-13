@@ -10,7 +10,7 @@ if id -Gn | tr ' ' '\n' | grep -qx admin; then
   echo 'Use a dedicated standard account, separate from the operator and the other CI role.' >&2
   exit 1
 fi
-export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/opt/python@3.13/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 python3 "$script_dir/check-macos-runner.py" --role "$role"
