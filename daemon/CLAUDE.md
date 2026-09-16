@@ -80,6 +80,16 @@ vendor/          exact upstream crate sources for narrowly documented patches;
   old name could not survive, and read "The wire protocols" in
   `docs/RELEASE.md` first — a bump is a fleet-wide cutover with a forced
   release order.
+- ICE restarts: webrtc-rs builds a peer's ICE agent once, from the servers
+  in the offer that created it, and a restart re-gathers on that same agent,
+  so the fresh TURN credentials a restart offer carries never reach the
+  relay from this side (`create_answer` in `src/rtc.rs` does not even read
+  them). The credential lifetime in `docs/NETWORK.md` is what keeps a
+  long-lived peer's relay alive; taking new credentials mid-connection means
+  a new agent on restart, which the library does not offer. A session peer
+  accepts a signed restart offer on the same peer; a host peer accepts no
+  restart at all (`create_host_answer` refuses a second offer for a signal
+  id it already holds), and both clients rebuild the host channel instead.
 
 ## Platform boundaries and Windows paths
 

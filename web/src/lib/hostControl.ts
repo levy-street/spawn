@@ -7,7 +7,7 @@ import {
   buildHostWsUrl,
   iceServersNeedRefresh,
   notifySocketUnauthorized,
-  RTC_LATCH_TIMEOUT_MS,
+  RTC_ICE_CANDIDATE_POOL_SIZE,
   SIGNAL_SILENCE_SUSPECT_MS,
   sanitizeIceServers,
   socketCloseAction,
@@ -27,7 +27,6 @@ const SIGNAL_WATCHDOG_MS = 80_000;
 const RTC_DISCONNECTED_GRACE_MS = 5_000;
 const RTC_CONFIG_REFRESH_TIMEOUT_MS = 2_000;
 const RTC_RESUME_TIMEOUT_MS = 3_000;
-const RTC_ICE_RESTART_TIMEOUT_MS = 10_000;
 const STREAM_CHUNK_BYTES = 8 * 1024;
 const STREAM_WINDOW_CHUNKS = 8;
 const STREAM_BUFFERED_HIGH_WATER = 256 * 1024;
@@ -286,7 +285,6 @@ export interface HostControlClientOptions {
   reconnectRandom?: () => number;
   watchdogMs?: number;
   resumeTimeoutMs?: number;
-  iceRestartTimeoutMs?: number;
   /** How long a claimed-OPEN socket may be silent before wake() presumes it a
    * corpse and redials. Deterministic tests shorten it. */
   silenceSuspectMs?: number;
@@ -315,11 +313,8 @@ export class HostControlClient {
   private signalWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
   private rtcResumeTimer: ReturnType<typeof setTimeout> | null = null;
-  private rtcIceRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private rtcConfigRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private rtcConfigRefreshResolve: (() => void) | null = null;
-  private iceRestartInFlight = false;
-  private iceRestartLatchedAt = 0;
   private resumeInFlight = false;
   /** When the server was last heard on the current socket; see wake(). */
   private lastSignalFrameAt = 0;
@@ -334,7 +329,6 @@ export class HostControlClient {
   // unreachable during the window before signedRtcSession is armed. Reset on
   // every teardown so a fresh generation starts unpinned until it decides.
   private signedRtcRequired = false;
-  private signedRtcDecisionForBinding: SignedRtcTrustDecision | null = null;
   private prefetchedTrustDecision: Promise<SignedRtcTrustDecision> | null = null;
   // What this generation's daemon said it can do, from its `hello`. Reset on
   // teardown so a reconnect onto a downgraded daemon cannot inherit a stale
@@ -1195,7 +1189,6 @@ export class HostControlClient {
           .verifyAndApplyAnswer(pc, message)
           .then(() => {
             if (!this.isCurrentWebSocket(ws, attempt) || this.pc !== pc) return;
-            if (pc.connectionState === "connected") this.clearRtcIceRestartTimer();
             for (const candidate of this.pendingRemoteCandidates.splice(0)) {
               void pc.addIceCandidate(candidate).catch(() => {});
             }
@@ -1223,7 +1216,6 @@ export class HostControlClient {
           .setRemoteDescription({ type: "answer", sdp: message.sdp })
           .then(() => {
             if (!this.isCurrentWebSocket(ws, attempt) || this.pc !== pc) return;
-            if (pc.connectionState === "connected") this.clearRtcIceRestartTimer();
             for (const candidate of this.pendingRemoteCandidates.splice(0)) {
               void pc.addIceCandidate(candidate).catch(() => {});
             }
@@ -1249,11 +1241,7 @@ export class HostControlClient {
           return;
         }
         if (["failed", "disabled", "unavailable"].includes(message.status)) {
-          if (this.iceRestartInFlight && message.status === "unavailable") {
-            this.fallBackToFreshRtc(this.sessionId);
-          } else {
-            this.failRtc(message.session_id);
-          }
+          this.failRtc(message.session_id);
         }
       }
     };
@@ -1325,7 +1313,7 @@ export class HostControlClient {
       pc = new RTCPeerConnection({
         iceServers: sanitizeIceServers(iceServers),
         iceTransportPolicy,
-        iceCandidatePoolSize: 1,
+        iceCandidatePoolSize: RTC_ICE_CANDIDATE_POOL_SIZE,
       });
       channel = pc.createDataChannel(HOST_CONTROL_PROTOCOL, { ordered: true });
     } catch {
@@ -1393,7 +1381,6 @@ export class HostControlClient {
       if (this.sessionId !== sessionId || this.pc !== pc) return;
       if (pc.connectionState === "connected") {
         this.clearRtcDisconnectedTimer();
-        this.clearRtcIceRestartTimer();
       } else if (pc.connectionState === "disconnected") {
         if (!this.rtcDisconnectedTimer) {
           this.rtcDisconnectedTimer = setTimeout(() => {
@@ -1446,7 +1433,6 @@ export class HostControlClient {
       // the legacy raw-answer branch is gated off for the entire lifetime of a
       // signed generation, not only once signedRtcSession is assigned below.
       this.signedRtcRequired = decision.mode === "signed";
-      this.signedRtcDecisionForBinding = decision;
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -1567,81 +1553,28 @@ export class HostControlClient {
     );
   }
 
+  /**
+   * "Restart" on the host channel is a rebuild of its peer on the same socket.
+   *
+   * The daemon has no host-scope ICE restart: `create_host_answer` refuses a
+   * second offer for a signal id it already holds a peer for, and its host
+   * dispatch never reads `ice_restart`. A restart offer sent here can only
+   * come back `failed`, which tears the websocket down and redials with
+   * backoff — a far worse recovery than the in-place rebuild this had always
+   * performed in practice, because the restart's `setConfiguration` threw in
+   * Chromium (#71) and the catch block rebuilt. Until the daemon gains the
+   * branch, the rebuild is the contract, stated rather than stumbled into.
+   */
   private async restartIce(_reason: "disconnected" | "failed" | "wake"): Promise<void> {
     const pc = this.pc;
     const sessionId = this.sessionId;
-    // A restart still "in flight" past its deadline is frozen mid-await, not
-    // slow — honouring the latch would make every later retry a no-op.
-    if (this.iceRestartInFlight && Date.now() - this.iceRestartLatchedAt < RTC_LATCH_TIMEOUT_MS) {
-      return;
-    }
     if (!pc || !sessionId) return;
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    if (!this.bindingNonce || this.bindingGeneration === null) {
-      this.fallBackToFreshRtc(sessionId);
-      return;
-    }
-    this.iceRestartInFlight = true;
-    this.iceRestartLatchedAt = Date.now();
-    await this.refreshRtcConfigIfStale();
-    if (this.pc !== pc || this.sessionId !== sessionId || !this.latestIceServers) {
-      this.clearRtcIceRestartTimer();
-      return;
-    }
-    try {
-      pc.setConfiguration({
-        iceServers: this.latestIceServers,
-        iceTransportPolicy: this.latestIceTransportPolicy,
-      });
-      this.pendingRemoteCandidates = [];
-      this.localCandidateGate?.block();
-      pc.restartIce();
-      const offer = await pc.createOffer({ iceRestart: true });
-      await pc.setLocalDescription(offer);
-      if (this.pc !== pc || this.sessionId !== sessionId) {
-        this.clearRtcIceRestartTimer();
-        return;
-      }
-      let carrier: { signed_envelope: string } | { sdp: string };
-      if (this.signedRtcDecisionForBinding?.mode === "signed") {
-        const nextSignedSession = new SignedRtcLiveSession(
-          {
-            scopeType: "host",
-            scopeId: this.hostId,
-            protocol: HOST_CONTROL_PROTOCOL,
-            protocolVersion: HOST_CONTROL_VERSION,
-          },
-          sessionId,
-          this.signedRtcDecisionForBinding.capability,
-        );
-        carrier = await nextSignedSession.createOffer(offer.sdp ?? "");
-        this.signedRtcSession?.abort();
-        this.signedRtcSession = nextSignedSession;
-      } else {
-        carrier = { sdp: offer.sdp ?? "" };
-      }
-      this.sendSignal({
-        type: "rtc.offer",
-        session_id: sessionId,
-        binding_nonce: this.bindingNonce,
-        binding_generation: this.bindingGeneration,
-        ice_restart: true,
-        ...carrier,
-      });
-      this.localCandidateGate?.release();
-      this.rtcIceRestartTimer = setTimeout(
-        () => this.fallBackToFreshRtc(sessionId),
-        Math.max(1, this.options.iceRestartTimeoutMs ?? RTC_ICE_RESTART_TIMEOUT_MS),
-      );
-    } catch {
-      this.clearRtcIceRestartTimer();
-      this.fallBackToFreshRtc(sessionId);
-    }
+    this.fallBackToFreshRtc(sessionId);
   }
 
   private fallBackToFreshRtc(expectedSessionId: string | null): void {
     if (!expectedSessionId || this.sessionId !== expectedSessionId) return;
-    this.clearRtcIceRestartTimer();
     this.cleanupRtc(true);
     this.prefetchTrustDecision();
     if (this.ws?.readyState === WebSocket.OPEN && this.latestIceServers) {
@@ -2115,7 +2048,6 @@ export class HostControlClient {
     this.signedRtcSession?.abort();
     this.signedRtcSession = null;
     this.signedRtcRequired = false;
-    this.signedRtcDecisionForBinding = null;
     this.capabilities = new Set();
     if (notifyServer && sessionId) {
       this.sendSignal({
@@ -2222,16 +2154,9 @@ export class HostControlClient {
     this.resumeInFlight = false;
   }
 
-  private clearRtcIceRestartTimer(): void {
-    if (this.rtcIceRestartTimer) clearTimeout(this.rtcIceRestartTimer);
-    this.rtcIceRestartTimer = null;
-    this.iceRestartInFlight = false;
-  }
-
   private clearRtcRecoveryTimers(): void {
     this.clearRtcDisconnectedTimer();
     this.clearRtcResumeTimer();
-    this.clearRtcIceRestartTimer();
   }
 
   private finishRtcConfigRefresh(): void {

@@ -4878,6 +4878,29 @@ mod tests {
         generation: &str,
         await_ready: bool,
     ) -> RtcTestClient {
+        connect_rtc_session_with_key(
+            sessions,
+            registry,
+            session_id,
+            signal_id,
+            generation,
+            await_ready,
+            None,
+        )
+        .await
+    }
+
+    /// `offer_key` is what a signed offer pins the peer to; only an offer that
+    /// carries the same key may later restart ICE on it.
+    async fn connect_rtc_session_with_key(
+        sessions: &RtcSessions,
+        registry: &SessionRegistry,
+        session_id: Uuid,
+        signal_id: &str,
+        generation: &str,
+        await_ready: bool,
+        offer_key: Option<[u8; 32]>,
+    ) -> RtcTestClient {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
         let api = APIBuilder::new().with_media_engine(media_engine).build();
@@ -4938,7 +4961,7 @@ mod tests {
                 Vec::new(),
                 None,
                 false,
-                None,
+                offer_key,
                 registry.clone(),
                 out_tx,
                 None,
@@ -5059,6 +5082,226 @@ mod tests {
             upload_capability,
             agent_generation: ready_agent_generation,
         }
+    }
+
+    async fn expect_worker_input(
+        inputs: &mut mpsc::UnboundedReceiver<crate::pty::DirectPayload>,
+        wanted: &[u8],
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let input = tokio::time::timeout_at(deadline, inputs.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the worker never received {wanted:?}"))
+                .expect("worker input channel closed");
+            if &*input == wanted {
+                return;
+            }
+        }
+    }
+
+    /// The daemon half of the relay credential refresh (#71). An hour before
+    /// its TURN credential expires, a browser sends an `ice_restart` offer
+    /// carrying fresh servers for a peer that is connected and carrying
+    /// bytes. The daemon must answer it on the SAME peer: no second peer,
+    /// both data channels open the whole way, bytes to the worker before and
+    /// after. The browser's Playwright spec proves its half against a mocked
+    /// peer; this drives a real webrtc-rs offerer through `handle_offer`,
+    /// with the answerer's implicit restart and re-gather inside webrtc-rs.
+    #[tokio::test]
+    async fn an_ice_restart_offer_keeps_the_data_channels_on_the_same_peer() {
+        use webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState;
+        use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
+
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
+        let worker_control = registry.control_for_binding(session).unwrap();
+        let (input_tx, mut inputs) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = worker_commands.recv().await {
+                match command {
+                    crate::pty::WorkerCmd::Replay { resp, .. } => {
+                        let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                            worker_control.source_offset(),
+                            Vec::new(),
+                        )));
+                    }
+                    crate::pty::WorkerCmd::Input(bytes) => {
+                        let _ = input_tx.send(bytes);
+                    }
+                    crate::pty::WorkerCmd::Resize { .. } => {}
+                }
+            }
+        });
+        let sessions = RtcSessions::new();
+        let signal_id = "restart-signal";
+        let offer_key = Some([7u8; 32]);
+        let client = connect_rtc_session_with_key(
+            &sessions,
+            &registry,
+            session_id,
+            signal_id,
+            "generation",
+            false,
+            offer_key,
+        )
+        .await;
+        client
+            .pty
+            .send(&Bytes::from_static(b"before the restart"))
+            .await
+            .unwrap();
+        expect_worker_input(&mut inputs, b"before the restart").await;
+
+        let daemon_pc = sessions
+            .peers
+            .lock()
+            .await
+            .get(signal_id)
+            .expect("daemon peer")
+            .pc
+            .clone();
+        // webrtc-rs refuses a restart while a gather is still running; a pane
+        // that has been connected for six days is long past that, and so is
+        // this one before the offer goes.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while daemon_pc.ice_gathering_state() != RTCIceGatheringState::Complete {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon peer never finished gathering"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let first_ufrag = ice_ufrag(&client.pc.local_description().await.unwrap().sdp).unwrap();
+        let daemon_first_ufrag =
+            ice_ufrag(&daemon_pc.local_description().await.unwrap().sdp).unwrap();
+
+        let offer = client
+            .pc
+            .create_offer(Some(RTCOfferOptions {
+                ice_restart: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let mut gathered = client.pc.gathering_complete_promise().await;
+        client.pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let restart_sdp = client.pc.local_description().await.unwrap().sdp;
+        assert_ne!(
+            ice_ufrag(&restart_sdp).unwrap(),
+            first_ufrag,
+            "a restart offer carries a fresh ufrag"
+        );
+
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        sessions
+            .handle_offer(
+                RtcSignalBinding::new(signal_id.to_string(), "generation".to_string(), session_id),
+                restart_sdp,
+                vec![RtcIceServerConfig {
+                    urls: vec!["turn:relay.example:3478?transport=udp".to_string()],
+                    username: Some("9999:user".to_string()),
+                    credential: Some("fresh".to_string()),
+                }],
+                None,
+                true,
+                offer_key,
+                registry.clone(),
+                out_tx,
+                None,
+            )
+            .await;
+
+        // A candidate the daemon re-gathers may reach the wire before its
+        // answer does; hold those until the answer is applied.
+        let mut early_candidates = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let outbound = tokio::time::timeout_at(deadline, out_rx.recv())
+                .await
+                .expect("the restart answer never came")
+                .expect("RTC signaling closed");
+            let value: serde_json::Value = serde_json::from_str(outbound.as_str()).unwrap();
+            match value["type"].as_str() {
+                Some("rtc.answer") => {
+                    let sdp = value["sdp"].as_str().expect("answer SDP").to_string();
+                    // The answerer restarted its own agent, not merely accepted
+                    // new remote credentials: its ufrag is fresh too.
+                    assert_ne!(
+                        ice_ufrag(&sdp).unwrap(),
+                        daemon_first_ufrag,
+                        "the daemon answered the restart with its old ufrag"
+                    );
+                    client
+                        .pc
+                        .set_remote_description(RTCSessionDescription::answer(sdp).unwrap())
+                        .await
+                        .unwrap();
+                    for candidate in early_candidates.drain(..) {
+                        let _ = client.pc.add_ice_candidate(candidate).await;
+                    }
+                    break;
+                }
+                Some("rtc.candidate") => {
+                    early_candidates.push(
+                        serde_json::from_value::<RTCIceCandidateInit>(value["candidate"].clone())
+                            .unwrap(),
+                    );
+                }
+                Some("rtc.status") if value["status"] == "failed" => {
+                    panic!("the daemon refused the restart offer: {value}");
+                }
+                _ => {}
+            }
+        }
+        // The daemon's re-gathered candidates follow the answer.
+        let feed_candidates = tokio::spawn({
+            let pc = client.pc.clone();
+            async move {
+                while let Some(outbound) = out_rx.recv().await {
+                    let value: serde_json::Value = serde_json::from_str(outbound.as_str()).unwrap();
+                    if value["type"] == "rtc.candidate" {
+                        let candidate: RTCIceCandidateInit =
+                            serde_json::from_value(value["candidate"].clone()).unwrap();
+                        let _ = pc.add_ice_candidate(candidate).await;
+                    }
+                }
+            }
+        });
+
+        let after = sessions
+            .peers
+            .lock()
+            .await
+            .get(signal_id)
+            .expect("daemon peer after the restart")
+            .pc
+            .clone();
+        assert!(
+            Arc::ptr_eq(&daemon_pc, &after),
+            "the restart was answered on a different peer"
+        );
+        assert_eq!(sessions.resident_session_count().await, 1);
+        assert_eq!(client.pty.ready_state(), RTCDataChannelState::Open);
+        assert_eq!(client.ctl.ready_state(), RTCDataChannelState::Open);
+
+        client
+            .pty
+            .send(&Bytes::from_static(b"after the restart"))
+            .await
+            .unwrap();
+        expect_worker_input(&mut inputs, b"after the restart").await;
+        // The bytes prove the path; the state callback that says Connected
+        // can trail the delivery that carried them by a tick.
+        wait_for_state(&client.pc, RTCPeerConnectionState::Connected).await;
+        assert_eq!(client.pty.ready_state(), RTCDataChannelState::Open);
+        assert_eq!(client.ctl.ready_state(), RTCDataChannelState::Open);
+
+        feed_candidates.abort();
+        worker.abort();
+        close_test_peer(&client.pc).await;
     }
 
     async fn connect_rtc_session(

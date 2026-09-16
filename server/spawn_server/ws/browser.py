@@ -14,7 +14,7 @@ from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Session, User
 from ..redis import get_backend, session_event_channel
-from ..turn import ice_servers_for_session, ice_transport_policy
+from ..turn import ice_servers_for_session, ice_transport_policy, rtc_ice_fields
 from .broker import BrowserConn, RtcSessionBinding, get_broker
 from .close_codes import (
     WS_CLOSE_CONTENT_FORBIDDEN,
@@ -66,14 +66,14 @@ BROWSER_WS_PROTOCOL = "spawn.v3"
 
 def _rtc_config_payload(user_id: str, *, binding_nonce_required: bool = False) -> dict[str, object]:
     settings = get_settings()
-    ice_servers = ice_servers_for_session(settings, label=user_id)
     return {
         "type": "rtc.config",
         "enabled": settings.webrtc_enabled,
-        "ice_servers": ice_servers,
         # The terminal is the channel that matters most on a hostile network,
-        # and it was the one channel never told whether a direct path exists.
-        "ice_transport_policy": ice_transport_policy(ice_servers),
+        # and it was the one channel never told whether a direct path exists:
+        # `rtc_ice_fields` carries the policy, and the credential window the
+        # pane refreshes itself before.
+        **rtc_ice_fields(settings, label=user_id),
         "binding_nonce_required": binding_nonce_required,
     }
 

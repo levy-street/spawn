@@ -40,9 +40,13 @@ import {
   backoffDelay,
   buildSessionWsUrl,
   type DisplayControlState,
-  iceServersNeedRefresh,
+  type IceCredentialWindow,
+  iceCredentialRefreshDelayMs,
+  iceCredentialWindow,
+  MAX_TIMER_DELAY_MS,
   notifySocketUnauthorized,
   parseInbound,
+  RTC_ICE_CANDIDATE_POOL_SIZE,
   RTC_LATCH_TIMEOUT_MS,
   rtcBindingFrameMatches,
   SIGNAL_SILENCE_SUSPECT_MS,
@@ -169,6 +173,12 @@ const UPLOAD_READY_WAIT_MS = 20_000;
 const RTC_DISCONNECTED_GRACE_MS = 5_000;
 const RTC_ICE_RESTART_TIMEOUT_MS = 10_000;
 const RTC_CONFIG_REFRESH_TIMEOUT_MS = 2_000;
+/** A scheduled credential refresh that found the connection busy — a restart
+ * in flight, not yet bound — looks again this much later. */
+const RTC_CREDENTIAL_REFRESH_RECHECK_MS = 30_000;
+/** Backoff for a scheduled refresh that got no fresher credential. */
+const RTC_CREDENTIAL_REFRESH_RETRY_BASE_MS = 5_000;
+const RTC_CREDENTIAL_REFRESH_RETRY_CAP_MS = 5 * 60_000;
 const RTC_RESUME_TIMEOUT_MS = 3_000;
 const SIGNAL_WATCHDOG_MS = 80_000;
 // Retry failed WebRTC attempts with backoff; there is no content fallback.
@@ -396,6 +406,11 @@ export function useSessionSocket({
     let rtcResumeTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcConfigRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcConfigRefreshResolve: (() => void) | null = null;
+    /** Counts every `rtc.config` heard on the current socket, so a request can
+     * tell a fresh reply from its own timeout. */
+    let rtcConfigFramesSeen = 0;
+    let rtcCredentialRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcCredentialRefreshAttempts = 0;
     let iceRestartInFlight = false;
     let iceRestartLatchedAt = 0;
     let resumeInFlight = false;
@@ -405,6 +420,12 @@ export function useSessionSocket({
     let lastSignalFrameAt = 0;
     let rtcRetryAttempts = 0;
     let lastRtcIceServers: RTCIceServer[] | null = null;
+    /** When the credential in `lastRtcIceServers` expires; null without TURN. */
+    let lastRtcCredentialWindow: IceCredentialWindow | null = null;
+    /** The window of the servers the live peer connection was built with or
+     * last restarted on — what its relay allocation actually presents, which
+     * an hourly `rtc.config` push does not change. */
+    let appliedRtcCredentialWindow: IceCredentialWindow | null = null;
     /** The deployment's answer to "is there a direct path?", from `rtc.config`. */
     let lastRtcTransportPolicy: RTCIceTransportPolicy = "all";
     let signedRtcSession: SignedRtcLiveSession | null = null;
@@ -467,6 +488,34 @@ export function useSessionSocket({
       resumeInFlight = false;
     };
 
+    const clearRelayCredentialRefresh = () => {
+      if (rtcCredentialRefreshTimer) clearTimeout(rtcCredentialRefreshTimer);
+      rtcCredentialRefreshTimer = null;
+      rtcCredentialRefreshAttempts = 0;
+      appliedRtcCredentialWindow = null;
+    };
+
+    /**
+     * Arm the one timer that keeps a long-lived pane's relay alive: an hour
+     * before the credential its peer connection presents expires (half-life
+     * when the lifetime is short), `refreshRelayCredentials` asks for fresh
+     * servers and restarts ICE on the same connection. Re-armed by every
+     * start and restart, from the window of the servers actually applied.
+     */
+    const scheduleRelayCredentialRefresh = (delayMs?: number) => {
+      if (rtcCredentialRefreshTimer) clearTimeout(rtcCredentialRefreshTimer);
+      rtcCredentialRefreshTimer = null;
+      if (!appliedRtcCredentialWindow || !isActiveSessionGeneration()) return;
+      const delay = Math.min(
+        MAX_TIMER_DELAY_MS,
+        delayMs ?? iceCredentialRefreshDelayMs(appliedRtcCredentialWindow),
+      );
+      rtcCredentialRefreshTimer = setTimeout(() => {
+        rtcCredentialRefreshTimer = null;
+        void refreshRelayCredentials();
+      }, delay);
+    };
+
     const finishRtcConfigRefresh = () => {
       if (rtcConfigRefreshTimer) clearTimeout(rtcConfigRefreshTimer);
       rtcConfigRefreshTimer = null;
@@ -517,6 +566,7 @@ export function useSessionSocket({
       signedRtcSession = null;
       signedRtcRequired = false;
       signedRtcDecisionForBinding = null;
+      clearRelayCredentialRefresh();
       try {
         rtc.ptyDc?.close();
         rtc.ctlDc?.close();
@@ -600,7 +650,7 @@ export function useSessionSocket({
         pc = new RTCPeerConnection({
           iceServers: sanitizeIceServers(iceServers),
           iceTransportPolicy: forceRelay ? "relay" : lastRtcTransportPolicy,
-          iceCandidatePoolSize: 1,
+          iceCandidatePoolSize: RTC_ICE_CANDIDATE_POOL_SIZE,
         });
         // Omitting both partial-reliability fields is intentional: both session
         // channels are fully reliable as well as ordered, and the daemon rejects
@@ -613,6 +663,8 @@ export function useSessionSocket({
         scheduleRtcRetry();
         return;
       }
+      appliedRtcCredentialWindow = lastRtcCredentialWindow;
+      scheduleRelayCredentialRefresh();
       const pendingLocalCandidates: RTCIceCandidateInit[] = [];
       const pendingControlTexts: string[] = [];
       const requests = new SessionCtlRequestTracker();
@@ -1503,8 +1555,11 @@ export function useSessionSocket({
       }
     };
 
-    const refreshRtcConfigIfStale = async () => {
-      if (!lastRtcIceServers || !iceServersNeedRefresh(lastRtcIceServers)) return;
+    /** Ask the server for a fresh `rtc.config`: "fresh" when one arrived
+     * before the timeout (joining a request already in flight counts its
+     * reply), "unsent" when the signalling socket could not carry the ask. */
+    const requestRtcConfig = async (): Promise<"fresh" | "timeout" | "unsent"> => {
+      const seen = rtcConfigFramesSeen;
       if (rtcConfigRefreshResolve) {
         await new Promise<void>((resolve) => {
           const previous = rtcConfigRefreshResolve;
@@ -1513,13 +1568,77 @@ export function useSessionSocket({
             resolve();
           };
         });
-        return;
+        return rtcConfigFramesSeen > seen ? "fresh" : "timeout";
       }
-      if (!sendJsonOverWs({ type: "rtc.config.request" })) return;
+      if (!sendJsonOverWs({ type: "rtc.config.request" })) return "unsent";
       await new Promise<void>((resolve) => {
         rtcConfigRefreshResolve = resolve;
         rtcConfigRefreshTimer = setTimeout(finishRtcConfigRefresh, RTC_CONFIG_REFRESH_TIMEOUT_MS);
       });
+      return rtcConfigFramesSeen > seen ? "fresh" : "timeout";
+    };
+
+    const refreshRtcConfigIfStale = async () => {
+      if (!lastRtcIceServers || !lastRtcCredentialWindow) return;
+      if (iceCredentialRefreshDelayMs(lastRtcCredentialWindow) > 0) return;
+      await requestRtcConfig();
+    };
+
+    /**
+     * The scheduled half of #71: a pane older than the credential lifetime
+     * used to die at the cliff, because the relay checks the expiry on every
+     * refresh and nothing on the client ever changed what the live peer
+     * connection presented. Runs when `scheduleRelayCredentialRefresh` says
+     * so, and again with backoff until it has either applied a fresher
+     * credential or the connection is gone.
+     */
+    const refreshRelayCredentials = async () => {
+      const current = rtcRef.current;
+      const applied = appliedRtcCredentialWindow;
+      if (!isActiveSessionGeneration() || !current.pc || !applied) return;
+      // A timer clamped at setTimeout's ceiling, or one that fired early for
+      // whatever reason, is re-armed rather than acted on.
+      if (iceCredentialRefreshDelayMs(applied) > 0) {
+        scheduleRelayCredentialRefresh();
+        return;
+      }
+      // Not connected, or not yet bound: the failure paths own this
+      // connection, and they carry fresh credentials in on their own.
+      if (current.pc.connectionState !== "connected" || current.bindingGeneration === null) {
+        scheduleRelayCredentialRefresh(RTC_CREDENTIAL_REFRESH_RECHECK_MS);
+        return;
+      }
+      const expectedRtcGeneration = current.rtcGeneration;
+      const outcome = await requestRtcConfig();
+      if (!isActiveSessionGeneration() || rtcRef.current.rtcGeneration !== expectedRtcGeneration) {
+        return;
+      }
+      const latest = lastRtcCredentialWindow;
+      if (outcome !== "fresh" || !latest || latest.expiresAtMs <= applied.expiresAtMs) {
+        const delay = backoffDelay(rtcCredentialRefreshAttempts, {
+          base: RTC_CREDENTIAL_REFRESH_RETRY_BASE_MS,
+          cap: RTC_CREDENTIAL_REFRESH_RETRY_CAP_MS,
+        });
+        rtcCredentialRefreshAttempts = Math.min(rtcCredentialRefreshAttempts + 1, 30);
+        const why =
+          outcome === "unsent"
+            ? "the signalling socket is closed"
+            : outcome === "timeout"
+              ? "rtc.config did not arrive"
+              : "the server's credential is no newer";
+        console.warn(
+          `SPAWN D: no fresh relay credentials for session ${sessionId} (${why}); retrying in ${Math.round(delay / 1000)} s`,
+        );
+        scheduleRelayCredentialRefresh(delay);
+        return;
+      }
+      rtcCredentialRefreshAttempts = 0;
+      if (!(await restartIce("credentials"))) {
+        // A restart already in flight (a wake, a disconnect) applies the
+        // fresh servers itself and re-arms this timer; check back in case
+        // it did not get that far.
+        scheduleRelayCredentialRefresh(RTC_CREDENTIAL_REFRESH_RECHECK_MS);
+      }
     };
 
     const startRtcWithLatest = async () => {
@@ -1535,14 +1654,22 @@ export function useSessionSocket({
       void startRtcWithLatest();
     };
 
-    const restartIce = async (_reason: "disconnected" | "failed" | "wake") => {
+    /** Restart ICE on the live peer connection with the latest servers,
+     * keeping its data channels. True once the restart offer is on the
+     * wire; false when nothing was sent, whether because a restart is
+     * already in flight or because the connection had to be rebuilt. */
+    const restartIce = async (
+      _reason: "disconnected" | "failed" | "wake" | "credentials",
+    ): Promise<boolean> => {
       const current = rtcRef.current;
-      if (iceRestartInFlight && Date.now() - iceRestartLatchedAt < RTC_LATCH_TIMEOUT_MS) return;
-      if (!current.pc || !current.rtcSessionId) return;
-      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+      if (iceRestartInFlight && Date.now() - iceRestartLatchedAt < RTC_LATCH_TIMEOUT_MS) {
+        return false;
+      }
+      if (!current.pc || !current.rtcSessionId) return false;
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
       if (!current.bindingNonce || current.bindingGeneration === null) {
         fallBackToFreshRtc(current.rtcGeneration);
-        return;
+        return false;
       }
       const pc = current.pc;
       const expectedRtcGeneration = current.rtcGeneration;
@@ -1556,13 +1683,16 @@ export function useSessionSocket({
         !lastRtcIceServers
       ) {
         clearRtcIceRestartTimer();
-        return;
+        return false;
       }
       try {
         pc.setConfiguration({
           iceServers: lastRtcIceServers,
           iceTransportPolicy: lastRtcTransportPolicy,
+          iceCandidatePoolSize: RTC_ICE_CANDIDATE_POOL_SIZE,
         });
+        appliedRtcCredentialWindow = lastRtcCredentialWindow;
+        scheduleRelayCredentialRefresh();
         pendingRemoteRtcCandidatesRef.current = [];
         blockCurrentLocalCandidates?.();
         pc.restartIce();
@@ -1570,7 +1700,7 @@ export function useSessionSocket({
         await pc.setLocalDescription(offer);
         if (rtcRef.current.pc !== pc || rtcRef.current.rtcGeneration !== expectedRtcGeneration) {
           clearRtcIceRestartTimer();
-          return;
+          return false;
         }
         let carrier: { signed_envelope: string } | { sdp: string | undefined };
         if (signedRtcDecisionForBinding?.mode === "signed") {
@@ -1605,9 +1735,11 @@ export function useSessionSocket({
           () => fallBackToFreshRtc(expectedRtcGeneration),
           RTC_ICE_RESTART_TIMEOUT_MS,
         );
+        return true;
       } catch {
         clearRtcIceRestartTimer();
         fallBackToFreshRtc(expectedRtcGeneration);
+        return false;
       }
     };
 
@@ -1715,6 +1847,7 @@ export function useSessionSocket({
               if (!rtcRef.current.pc) void startRtcWithLatest();
             }
           } else if (msg.type === "rtc.config") {
+            rtcConfigFramesSeen += 1;
             finishRtcConfigRefresh();
             if (msg.enabled) {
               setState("open");
@@ -1723,6 +1856,7 @@ export function useSessionSocket({
                 return;
               }
               lastRtcIceServers = sanitizeIceServers(msg.ice_servers ?? []);
+              lastRtcCredentialWindow = iceCredentialWindow(msg, lastRtcIceServers);
               lastRtcTransportPolicy = msg.ice_transport_policy === "relay" ? "relay" : "all";
               rtcRetryAttempts = 0;
               if (shouldResumeHealthyRtc && healthyRtc()) {
@@ -1735,6 +1869,7 @@ export function useSessionSocket({
               }
             } else {
               lastRtcIceServers = null;
+              lastRtcCredentialWindow = null;
               cleanupRtc(true, false);
               setState("disabled");
             }
@@ -2060,6 +2195,7 @@ export function useSessionSocket({
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
       clearRtcIceRestartTimer();
       clearRtcResumeTimer();
+      clearRelayCredentialRefresh();
       finishRtcConfigRefresh();
       if (isCurrentSessionGeneration() && wsRef.current) {
         const ws = wsRef.current;

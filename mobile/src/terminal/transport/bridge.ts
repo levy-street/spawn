@@ -82,6 +82,13 @@ export type NativeToWorkerMessage =
       iceServers?: readonly unknown[];
       iceTransportPolicy?: "all" | "relay";
     })
+  /** Fresh relay credentials for the live peer connection, applied with a
+   * non-disruptive ICE restart before the ones it presents expire (#71). */
+  | (NativeMessage & {
+      type: "refresh-ice";
+      iceServers: readonly unknown[];
+      iceTransportPolicy: "all" | "relay";
+    })
   | (NativeMessage & {
       type: "upload-start";
       uploadId: string;

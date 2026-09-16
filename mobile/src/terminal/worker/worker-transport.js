@@ -5,6 +5,8 @@
   const state = api.state;
   const CHANNEL_OPTIONS = Object.freeze({ ordered: true });
   state.restartTimer ??= null;
+  state.restartInFlight ??= false;
+  state.pendingIceRefresh ??= null;
   state.statsTimer ??= null;
   state.pendingRestartRequests ??= new Set();
 
@@ -113,7 +115,12 @@
 
   async function restartPeer(message = {}, cause = "connection lost") {
     const pc = state.pc;
-    if (!pc || pc.connectionState === "closed" || state.restartTimer !== null) {
+    if (
+      !pc ||
+      pc.connectionState === "closed" ||
+      state.restartTimer !== null ||
+      state.restartInFlight
+    ) {
       if (!pc) channelFailed("RTCPeerConnection");
       return;
     }
@@ -126,8 +133,13 @@
         iceTransportPolicy: relayOnly ? "relay" : "all",
       });
     }
-    pc.restartIce?.();
-    await requestSignedOffer(pc, true);
+    state.restartInFlight = true;
+    try {
+      pc.restartIce?.();
+      await requestSignedOffer(pc, true);
+    } finally {
+      state.restartInFlight = false;
+    }
     state.restartTimer = setTimeout(() => {
       state.restartTimer = null;
       if (state.pc?.connectionState !== "connected") {
@@ -135,10 +147,40 @@
           "ICE restart",
           cause === "network changed"
             ? "The network changed and the terminal connection could not be restored."
-            : "The host connection was lost and could not be restored.",
+            : cause === "credential refresh"
+              ? "The relay credentials were refreshed and the terminal connection could not be restored."
+              : "The host connection was lost and could not be restored.",
         );
+        return;
       }
+      // A restart that kept the connection up the whole way never fires a
+      // `connected` transition; this is the other end of that restart.
+      applyPendingIceRefresh();
     }, 10_000);
+  }
+
+  /** Fresh relay credentials for the live peer connection (#71): apply them
+   * and restart ICE, keeping the data channels. A restart already in flight
+   * — a network change, a disconnect — gathered with the credentials it had,
+   * so the refresh waits and runs as soon as that restart is over: on the
+   * `connected` transition if there is one, else when its fallback timer
+   * finds the connection up. A refresh is never dropped; a restart that
+   * fails tears the peer down, and the rebuild carries the fresh servers. */
+  async function refreshIce(message) {
+    const pc = state.pc;
+    if (!pc || pc.connectionState === "closed") return;
+    if (state.restartTimer !== null || state.restartInFlight) {
+      state.pendingIceRefresh = message;
+      return;
+    }
+    await restartPeer(message, "credential refresh");
+  }
+
+  function applyPendingIceRefresh() {
+    const pending = state.pendingIceRefresh;
+    if (!pending) return;
+    state.pendingIceRefresh = null;
+    void refreshIce(pending);
   }
 
   function configureChannel(channel, kind) {
@@ -206,6 +248,7 @@
         clearTimeout(state.restartTimer);
         state.restartTimer = null;
         scheduleStats();
+        applyPendingIceRefresh();
       }
     };
     api.post({ type: "state", state: "connecting" });
@@ -321,6 +364,7 @@
     state.disconnectTimer = null;
     state.restartTimer = null;
     state.statsTimer = null;
+    state.pendingIceRefresh = null;
     for (const channel of [state.pty, state.ctl]) {
       if (!channel) continue;
       channel.onclose = null;
@@ -351,6 +395,9 @@
         break;
       case "network-changed":
         await restartPeer(message, "network changed");
+        break;
+      case "refresh-ice":
+        await refreshIce(message);
         break;
       case "request-replay":
         api.requestReplay?.(message.fromOffset);

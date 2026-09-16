@@ -71,6 +71,9 @@ export async function installSessionRtcMock(
         historyEpoch,
         historyOffset: historyOffset ?? 0,
         connections: 0,
+        iceConfigurations: [] as RTCConfiguration[],
+        iceRestarts: 0,
+        restartOffers: 0,
         websocketHandshakes: [] as Array<{ path: string; protocols: string[] }>,
         activePtyChannel: null as FakeDataChannel | null,
         channels: new Map<string, FakeDataChannel>(),
@@ -372,6 +375,9 @@ export async function installSessionRtcMock(
         }
 
         open() {
+          // A real channel opens once; an ICE restart's answer re-runs
+          // setRemoteDescription on a connection whose channels are open.
+          if (this.readyState === "open") return;
           this.readyState = "open";
           this.onopen?.();
           if (this.label === "spawn.ctl") {
@@ -423,8 +429,10 @@ export async function installSessionRtcMock(
         onconnectionstatechange: (() => void) | null = null;
         oniceconnectionstatechange: (() => void) | null = null;
         channels: FakeDataChannel[] = [];
+        configuration: RTCConfiguration;
 
-        constructor() {
+        constructor(configuration?: RTCConfiguration) {
+          this.configuration = configuration ?? {};
           state.connections += 1;
         }
 
@@ -434,8 +442,35 @@ export async function installSessionRtcMock(
           return channel as unknown as RTCDataChannel;
         }
 
-        async createOffer() {
-          return { type: "offer" as const, sdp: "v=0\r\nmock-offer" };
+        async createOffer(options?: RTCOfferOptions) {
+          const restart = options?.iceRestart === true;
+          if (restart) state.restartOffers += 1;
+          return {
+            type: "offer" as const,
+            sdp: restart ? "v=0\r\nmock-restart-offer" : "v=0\r\nmock-offer",
+          };
+        }
+
+        setConfiguration(configuration: RTCConfiguration) {
+          // The rule real engines enforce (WebRTC "set a configuration", step
+          // 7; Chromium throws exactly this): once a local description is
+          // set, the pool size may not change — and leaving it out asks for 0.
+          if (
+            this.localDescription &&
+            (configuration.iceCandidatePoolSize ?? 0) !==
+              (this.configuration.iceCandidatePoolSize ?? 0)
+          ) {
+            throw new DOMException(
+              "Failed to execute 'setConfiguration' on 'RTCPeerConnection': Attempted to modify the PeerConnection's configuration in an unsupported way.",
+              "InvalidModificationError",
+            );
+          }
+          this.configuration = configuration;
+          state.iceConfigurations.push(configuration);
+        }
+
+        restartIce() {
+          state.iceRestarts += 1;
         }
 
         async setLocalDescription(description: RTCSessionDescriptionInit) {
@@ -506,6 +541,13 @@ export async function installSessionRtcMock(
             releaseHeldUploadCompletion: () => void;
             queueActiveUploadCompletion: () => boolean;
             replaceRtcGeneration: () => void;
+            transportSnapshot: () => {
+              connections: number;
+              ptyChannels: number;
+              iceRestarts: number;
+              restartOffers: number;
+              lastIceUsername: string | null;
+            };
             sendHistoryDelta: (epoch: string, offset: number, text: string) => void;
             sendHistoryWipe: (epoch: string) => void;
             sendHistoryGap: () => void;
@@ -580,6 +622,17 @@ export async function installSessionRtcMock(
         },
         replaceRtcGeneration() {
           state.channels.get("spawn.ctl")?.close();
+        },
+        transportSnapshot() {
+          const last = state.iceConfigurations.at(-1);
+          const servers = (last?.iceServers ?? []) as Array<{ username?: string }>;
+          return {
+            connections: state.connections,
+            ptyChannels: state.ptyChannels.length,
+            iceRestarts: state.iceRestarts,
+            restartOffers: state.restartOffers,
+            lastIceUsername: servers.find((server) => server.username)?.username ?? null,
+          };
         },
         sendHistoryDelta(epoch, offset, text) {
           const bytes = encoder.encode(text);

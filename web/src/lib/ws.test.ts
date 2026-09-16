@@ -3,6 +3,9 @@ import { describe, expect, test } from "bun:test";
 import {
   backoffDelay,
   buildSessionWsUrl,
+  ICE_CREDENTIAL_REFRESH_LEAD_MS,
+  iceCredentialRefreshDelayMs,
+  iceCredentialWindow,
   iceServersNeedRefresh,
   rtcBindingFrameMatches,
   SPAWN_WS_SUBPROTOCOL,
@@ -182,5 +185,74 @@ describe("connection reliability helpers", () => {
       ),
     ).toBe(false);
     expect(iceServersNeedRefresh([{ urls: "stun:stun.example" }], now)).toBe(false);
+  });
+});
+
+describe("relay credential window", () => {
+  const HOUR = 60 * 60 * 1000;
+  const turn = (expirySeconds: number) => [
+    { urls: "turn:relay.example", username: `${expirySeconds}:user`, credential: "x" },
+  ];
+
+  test("measures the remaining lifetime on the server's clock, not the device's", () => {
+    // The device runs two hours ahead of the server. The username's expiry
+    // would read as two hours nearer than it is; the frame's own window does not.
+    const deviceNow = 2_000_000_000_000;
+    const serverNow = Math.floor(deviceNow / 1000) - 2 * 3600;
+    const window = iceCredentialWindow(
+      { now: serverNow, expires_at: serverNow + 7 * 24 * 3600 },
+      turn(serverNow + 7 * 24 * 3600),
+      deviceNow,
+    );
+    expect(window).toEqual({
+      issuedAtMs: deviceNow,
+      expiresAtMs: deviceNow + 7 * 24 * HOUR,
+    });
+  });
+
+  test("falls back to the username's expiry when the server sends no window", () => {
+    const now = 2_000_000_000_000;
+    const expiry = Math.floor(now / 1000) + 3600;
+    expect(iceCredentialWindow({}, turn(expiry), now)).toEqual({
+      issuedAtMs: now,
+      expiresAtMs: expiry * 1000,
+    });
+    // A window that does not make sense is ignored the same way.
+    expect(iceCredentialWindow({ now: 10, expires_at: 5 }, turn(expiry), now)).toEqual({
+      issuedAtMs: now,
+      expiresAtMs: expiry * 1000,
+    });
+  });
+
+  test("has nothing to schedule without a TURN credential", () => {
+    const now = 2_000_000_000_000;
+    const serverNow = Math.floor(now / 1000);
+    expect(
+      iceCredentialWindow(
+        { now: serverNow, expires_at: serverNow + 3600 },
+        [{ urls: "stun:stun.example" }],
+        now,
+      ),
+    ).toBeNull();
+    expect(iceCredentialWindow({}, [], now)).toBeNull();
+  });
+
+  test("refreshes an hour early, at half-life for short lifetimes, and now when late", () => {
+    const issuedAtMs = 1_000_000;
+    const week = { issuedAtMs, expiresAtMs: issuedAtMs + 7 * 24 * HOUR };
+    expect(iceCredentialRefreshDelayMs(week, issuedAtMs)).toBe(
+      7 * 24 * HOUR - ICE_CREDENTIAL_REFRESH_LEAD_MS,
+    );
+    expect(iceCredentialRefreshDelayMs(week, issuedAtMs + 3 * 24 * HOUR)).toBe(
+      4 * 24 * HOUR - ICE_CREDENTIAL_REFRESH_LEAD_MS,
+    );
+    // Two hours is the boundary: at or above it the lead is the full hour.
+    const twoHours = { issuedAtMs, expiresAtMs: issuedAtMs + 2 * HOUR };
+    expect(iceCredentialRefreshDelayMs(twoHours, issuedAtMs)).toBe(HOUR);
+    const ninety = { issuedAtMs, expiresAtMs: issuedAtMs + 90 * 60_000 };
+    expect(iceCredentialRefreshDelayMs(ninety, issuedAtMs)).toBe(45 * 60_000);
+    // A device that slept through the lead, or past the expiry itself, is due now.
+    expect(iceCredentialRefreshDelayMs(week, issuedAtMs + 7 * 24 * HOUR - 10)).toBe(0);
+    expect(iceCredentialRefreshDelayMs(week, issuedAtMs + 8 * 24 * HOUR)).toBe(0);
   });
 });

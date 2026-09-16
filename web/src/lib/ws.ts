@@ -108,13 +108,97 @@ export function iceServersNeedRefresh(
   nowMs = Date.now(),
 ): boolean {
   const refreshBeforeSeconds = Math.floor(nowMs / 1000) + 60 * 60;
+  const expiry = earliestTurnExpirySeconds(iceServers);
+  return expiry !== null && expiry <= refreshBeforeSeconds;
+}
+
+/** The soonest Unix expiry among the TURN entries' REST usernames, if any. */
+function earliestTurnExpirySeconds(iceServers: readonly RTCIceServer[]): number | null {
+  let earliest: number | null = null;
   for (const server of iceServers) {
     const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
     if (!urls.some((url) => TURN_URL_PATTERN.test(url))) continue;
     const expiry = Number.parseInt(server.username?.split(":", 1)[0] ?? "", 10);
-    if (Number.isSafeInteger(expiry) && expiry <= refreshBeforeSeconds) return true;
+    if (Number.isSafeInteger(expiry) && (earliest === null || expiry < earliest)) earliest = expiry;
   }
-  return false;
+  return earliest;
+}
+
+/**
+ * When the TURN credential an `rtc.config` frame carried stops working, on
+ * this device's clock. coturn checks the credential's expiry on every
+ * allocation refresh, so a peer connection that outlives it loses its relay
+ * and every relayed pane on it drops (#71). The pane refreshes itself before
+ * that, and this is what it schedules from.
+ */
+export interface IceCredentialWindow {
+  /** Local-clock ms the credential was received: the start of its life. */
+  issuedAtMs: number;
+  /** Local-clock ms at which the relay stops honouring it. */
+  expiresAtMs: number;
+}
+
+/** A refresh runs this long before expiry, or at half-life when the whole
+ * lifetime is under twice this. */
+export const ICE_CREDENTIAL_REFRESH_LEAD_MS = 60 * 60 * 1000;
+
+/** `setTimeout` treats a delay past this as 1 ms; a longer wait is clamped
+ * and re-evaluated when the clamped timer fires. */
+export const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/**
+ * Every peer connection is built with this pool size, and every
+ * `setConfiguration` on it must repeat it: the WebRTC spec (and Chromium)
+ * throws `InvalidModificationError` when a configuration set after
+ * `setLocalDescription` changes the pool size, and omitting the field is
+ * asking for 0. An ICE restart that omitted it was never a restart — it was
+ * the catch block rebuilding the whole connection.
+ */
+export const RTC_ICE_CANDIDATE_POOL_SIZE = 1;
+
+/**
+ * The credential window of one `rtc.config` frame, or null when the frame
+ * carries no TURN credential (a STUN-only deployment has nothing to refresh).
+ *
+ * The server's `now` and `expires_at` are preferred: their difference is the
+ * remaining lifetime, and adding it to this clock needs no agreement between
+ * the device and the relay about what time it is. A server that predates the
+ * two fields leaves the username's Unix expiry, which is read on this clock
+ * as it was before — early when the device runs ahead, late when it lags.
+ */
+export function iceCredentialWindow(
+  frame: { now?: unknown; expires_at?: unknown },
+  iceServers: readonly RTCIceServer[],
+  nowMs = Date.now(),
+): IceCredentialWindow | null {
+  const usernameExpiry = earliestTurnExpirySeconds(iceServers);
+  if (usernameExpiry === null) return null;
+  const { now, expires_at: expiresAt } = frame;
+  if (
+    typeof now === "number" &&
+    typeof expiresAt === "number" &&
+    Number.isSafeInteger(now) &&
+    Number.isSafeInteger(expiresAt) &&
+    expiresAt > now
+  ) {
+    return { issuedAtMs: nowMs, expiresAtMs: nowMs + (expiresAt - now) * 1000 };
+  }
+  return { issuedAtMs: nowMs, expiresAtMs: usernameExpiry * 1000 };
+}
+
+/** Ms until the credential in `window` is due for a refresh: never negative,
+ * so a window already inside its lead — or past its expiry, as after a sleep —
+ * is due now. */
+export function iceCredentialRefreshDelayMs(
+  window: IceCredentialWindow,
+  nowMs = Date.now(),
+): number {
+  const lifetimeMs = window.expiresAtMs - window.issuedAtMs;
+  const leadMs =
+    lifetimeMs < 2 * ICE_CREDENTIAL_REFRESH_LEAD_MS
+      ? lifetimeMs / 2
+      : ICE_CREDENTIAL_REFRESH_LEAD_MS;
+  return Math.max(0, window.expiresAtMs - leadMs - nowMs);
 }
 
 /**
@@ -208,6 +292,10 @@ export type InboundMessage =
       /** "relay" when the deployment offers no direct path at all. */
       ice_transport_policy?: RTCIceTransportPolicy;
       binding_nonce_required?: boolean;
+      /** The server's clock when the TURN credential was minted, Unix seconds. */
+      now?: number;
+      /** When that credential expires, Unix seconds; absent without TURN. */
+      expires_at?: number;
     }
   | {
       type: "rtc.answer";

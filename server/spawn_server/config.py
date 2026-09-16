@@ -243,7 +243,13 @@ class Settings(BaseSettings):
         description="Comma-separated TURN URIs, e.g. turn:host:3478?transport=udp",
     )
     turn_secret: str | None = Field(default=None)
-    turn_ttl_seconds: int = Field(default=24 * 3600)
+    # Seven days. coturn checks the credential's expiry on every allocation
+    # refresh, so a peer connection that outlives it loses its relay at the
+    # cliff. Browsers and phones refresh an hour early; the daemon cannot (its
+    # ICE agent keeps the first offer's credentials), so this is the daemon's
+    # only protection. The relay carries ciphertext only, so a longer window
+    # costs bandwidth if a credential leaks, never content. docs/NETWORK.md.
+    turn_ttl_seconds: int = Field(default=7 * 24 * 3600)
     daemon_registration_concurrency: int = Field(default=32, ge=1, le=256)
 
     @model_validator(mode="after")

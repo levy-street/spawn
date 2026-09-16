@@ -901,7 +901,12 @@ describe("HostControlClient", () => {
     endpoint.client.close();
   });
 
-  test("wake keeps the gentle ICE-restart path while the socket is provably live", async () => {
+  test("wake rebuilds a disconnected host peer on the live socket and never asks for an ICE restart", async () => {
+    // The daemon has no host-scope ICE restart (`create_host_answer` refuses
+    // a second offer for a signal id it already holds a peer for), so a
+    // restart offer here could only come back `failed` and cost a websocket
+    // teardown and a backoff redial. The host channel rebuilds its peer in
+    // place instead: same socket, a plain offer, no `ice_restart`.
     const endpoint = await readyClient({ silenceSuspectMs: 60_000 });
     endpoint.ws.receive({
       type: "rtc.status",
@@ -913,36 +918,22 @@ describe("HostControlClient", () => {
     });
     endpoint.pc.connectionState = "disconnected";
     const socketsBefore = FakeWebSocket.instances.length;
+    const peersBefore = FakePeerConnection.instances.length;
+    const framesBefore = endpoint.ws.sent.length;
     window.dispatchEvent(new Event("online"));
-    await waitFor(() => endpoint.pc.restartIceCalls === 1);
+    await waitFor(() => FakePeerConnection.instances.length === peersBefore + 1);
+    // waitFor gives up quietly at its deadline; say the condition out loud.
+    expect(FakePeerConnection.instances.length).toBe(peersBefore + 1);
     expect(FakeWebSocket.instances.length).toBe(socketsBefore);
-    endpoint.client.close();
-  });
-
-  test("wake restarts ICE on the binding, then rebuilds if recovery never connects", async () => {
-    const endpoint = await readyClient({ iceRestartTimeoutMs: 5 });
-    endpoint.ws.receive({
-      type: "rtc.status",
-      session_id: endpoint.offer.session_id,
-      status: "connected",
-      binding_nonce: "c".repeat(32),
-      binding_generation: 9,
-      ...metadata,
-    });
-    endpoint.pc.connectionState = "disconnected";
-    window.dispatchEvent(new Event("online"));
-    await waitFor(() => endpoint.pc.restartIceCalls === 1);
-    const restartOffer = endpoint.ws.sent
+    expect(endpoint.pc.restartIceCalls).toBe(0);
+    expect(endpoint.pc.setConfigurationCalls).toEqual([]);
+    const offersSince = endpoint.ws.sent
+      .slice(framesBefore)
       .map((frame) => JSON.parse(frame))
-      .find((frame) => frame.type === "rtc.offer" && frame.ice_restart === true);
-    expect(restartOffer).toMatchObject({
-      session_id: endpoint.offer.session_id,
-      binding_nonce: "c".repeat(32),
-      binding_generation: 9,
-      ice_restart: true,
-    });
-    expect(endpoint.pc.offerOptions.at(-1)).toEqual({ iceRestart: true });
-    await waitFor(() => FakePeerConnection.instances.length === 2);
+      .filter((frame) => frame.type === "rtc.offer");
+    expect(offersSince).toHaveLength(1);
+    expect(offersSince[0].ice_restart).toBeUndefined();
+    expect(offersSince[0].session_id).not.toBe(endpoint.offer.session_id);
     endpoint.client.close();
   });
 
