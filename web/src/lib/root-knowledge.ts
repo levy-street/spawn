@@ -7,7 +7,8 @@
  * recorded here, and a key enters here ONLY through a channel the server
  * cannot forge —
  *
- *   1. "mint": this device generated the root during passkey setup;
+ *   1. "mint": this device generated the root itself — at passkey setup, or
+ *      passkey-free during the host-gossip establishment backfill;
  *   2. "bundle": this device unsealed it from the passkey trust bundle
  *      (authenticated, rollback-floored);
  *   3. "introduction": a SPAWN-ROOT-INTRO-V1 statement verified against a
