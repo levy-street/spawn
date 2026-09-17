@@ -125,7 +125,11 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   Native acceptance selects an iPhone runtime matching the active Xcode simulator
   SDK; an explicit `--device UUID` opts into another installed runtime.
   It warms Settings before timed background cases and foregrounds the disposable
-  app directly with `simctl launch` to avoid URL confirmation dialogs. Its bounded
+  app directly with `simctl launch` to avoid URL confirmation dialogs. Timed
+  background cases return locally before acknowledging the control command,
+  keeping fixture HTTP/polling delays outside the measured interval. The brief
+  case requests a 100 ms dwell and still requires real background/active callbacks
+  less than three seconds apart plus survival of the original parent. Its bounded
   lifecycle journal retains actual callbacks through suspension; missing,
   reordered or replaced observations fail
   acceptance rather than depending on diagnostic HTTP delivery.

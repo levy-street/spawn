@@ -353,9 +353,8 @@ async def exercise(fixture: Any) -> None:
             before = await snapshot()
             started = time.monotonic()
             await fixture.command(
-                "background", {"durationMs": milliseconds}, native=True
+                "background", {"durationMs": milliseconds, "returnToApp": True}, native=True
             )
-            await fixture.command("foreground", native=True)
             after = await wait_ready()
             await echo()
 
@@ -402,7 +401,10 @@ async def exercise(fixture: Any) -> None:
                 "live_peers": after["peer"]["livePeerCount"],
             }
 
-        await case("background_short", lambda: background(500))
+        # Native activation itself consumes part of the three-second grace.
+        # Request a brief dwell; actual callbacks must still prove a positive
+        # interval below three seconds and retention of the original parent.
+        await case("background_short", lambda: background(100))
         await case("background_retire", lambda: background(5000))
 
         async def restart() -> dict[str, Any]:

@@ -164,6 +164,28 @@ class NativeRunnerSetup(unittest.TestCase):
         self.runner.perform("foreground", {})
         self.runner.simctl.assert_called_once_with("launch", DEVICE, module.APP_ID)
 
+    def test_timed_background_returns_locally_before_control_acknowledgement(self):
+        for platform in ("ios", "android"):
+            with self.subTest(platform=platform):
+                self.runner.args.platform = platform
+                self.runner.device = DEVICE
+                self.runner.launch = module.Runner.launch.__get__(self.runner)
+                order = []
+                self.runner.command = Mock(side_effect=lambda *args, **kw: order.append(args))
+                with patch.object(module.time, "sleep", side_effect=lambda seconds: order.append(seconds)):
+                    result = self.runner.perform("background", {"durationMs": 100, "returnToApp": True})
+                self.assertEqual(result, {"completed": True})
+                self.assertEqual(len(order), 3)
+                self.assertEqual(order[1], 0.1)
+                if platform == "ios":
+                    self.assertEqual(order[0], ("xcrun", "simctl", "launch", DEVICE, "com.apple.Preferences"))
+                    self.assertEqual(order[2], ("xcrun", "simctl", "launch", DEVICE, module.APP_ID))
+                else:
+                    self.assertEqual(order[0][-1], "KEYCODE_HOME")
+                    self.assertEqual(order[2][-1], module.APP_ID + "/.MainActivity")
+                self.runner.control.assert_not_called()
+                self.runner.event.assert_not_called()
+
     def test_missing_sdk_runtime_fails_before_boot_install_or_fixture_start(self):
         calls = []
 

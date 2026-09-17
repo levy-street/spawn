@@ -278,14 +278,19 @@ class Runner:
 
     def perform(self, action: str, payload: dict) -> dict:
         if action == "background":
+            duration = float(payload.get("durationMs", 0)) / 1000
+            if not 0 <= duration <= 30:
+                raise ValueError("Native background duration must be between 0 and 30000 ms")
             if self.args.platform == "android":
                 self.adb("shell", "input", "keyevent", "KEYCODE_HOME")
             else:
                 self.simctl("launch", self.device, "com.apple.Preferences")
-            duration = float(payload.get("durationMs", 0)) / 1000
-            if not 0 <= duration <= 30:
-                raise ValueError("Native background duration must be between 0 and 30000 ms")
             time.sleep(duration)
+            if payload.get("returnToApp") is True:
+                # Keep HTTP acknowledgement and command polling out of the
+                # timed interval. The app's real lifecycle callbacks still
+                # determine whether the requested short/long case is valid.
+                self.launch()
         elif action == "foreground":
             # Activate the existing app directly. iOS URL activation can stop
             # at an OS "Open in" confirmation instead of resuming the app.
