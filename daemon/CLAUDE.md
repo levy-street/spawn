@@ -353,6 +353,11 @@ cargo test --locked -p webrtc-sctp --lib stream::stream_test::
 cargo build --locked --profile diagnostics --features diagnostics
 ```
 
+Upload admission tests coordinate async tasks with a Tokio barrier; blocking
+filesystem pauses use release guards so a failed assertion cannot strand a
+worker during runtime shutdown. The same-owner case runs on a single-thread
+executor and has a bounded completion deadline.
+
 The SCTP stream tests also run in Linux and Windows CI. `read_sctp` registers
 its notification waiter before checking shutdown or awaiting the reassembly
 queue lock: a remote reset uses `notify_waiters`, so registering afterward can

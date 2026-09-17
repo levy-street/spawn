@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(test)]
-use std::sync::{Barrier, Condvar};
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,10 +13,10 @@ use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use cap_std::{ambient_authority, fs::Dir as CapDir};
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use tokio::fs;
 use tokio::sync::Notify;
 use tokio::time::Instant as TokioInstant;
+#[cfg(test)]
+use tokio::{fs, sync::Barrier};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -302,27 +302,25 @@ impl UploadLifecycleHooks {
             }));
     }
 
-    fn pause_admit(&self) {
-        #[cfg(test)]
-        {
-            let pause = self
-                .admit
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(pause) = pause {
-                pause.barrier.wait();
-                if pause.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let mut armed = self
-                        .admit
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if armed
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &pause))
-                    {
-                        *armed = None;
-                    }
+    #[cfg(test)]
+    async fn pause_admit(&self) {
+        let pause = self
+            .admit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(pause) = pause {
+            pause.barrier.wait().await;
+            if pause.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                let mut armed = self
+                    .admit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if armed
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &pause))
+                {
+                    *armed = None;
                 }
             }
         }
@@ -492,6 +490,9 @@ impl UploadHub {
             capability,
             viewer_id: viewer_id.to_string(),
         };
+        // Test coordination must yield rather than block an async executor.
+        #[cfg(test)]
+        self.inner.hooks.pause_admit().await;
         let entry = match self.admit(key.clone(), owner.clone(), manifest.clone())? {
             UploadAdmission::Inserted(entry) => entry,
             UploadAdmission::Complete(result) => {
@@ -934,7 +935,6 @@ impl UploadHub {
         owner: UploadOwner,
         manifest: UploadManifest,
     ) -> UploadOpResult<UploadAdmission> {
-        self.inner.hooks.pause_admit();
         let mut state = self
             .inner
             .state
@@ -1871,98 +1871,102 @@ mod tests {
         assert_eq!(hub.retained_counts().await, (0, 0));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn concurrent_same_owner_start_prepares_once_and_resumes_the_inserted_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let hub = UploadHub::default();
-        let hooks = hub.lifecycle_hooks();
-        hooks.arm_admit_barrier(2);
-        hooks.prepare.arm();
-        hooks.ready_return.arm();
-        let session = SessionBinding::new(Uuid::new_v4(), 81);
-        let capability = Uuid::new_v4();
-        let upload_id = Uuid::new_v4();
-        let cwd = tmp.path().to_string_lossy().into_owned();
-        let upload_manifest = manifest(b"same", "same.bin", UploadDestination::Cwd);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let hub = UploadHub::default();
+            let hooks = hub.lifecycle_hooks();
+            hooks.arm_admit_barrier(2);
+            let mut prepare_pause = BlockingPauseReleaseGuard::arm(&hooks.prepare);
+            let mut ready_pause = BlockingPauseReleaseGuard::arm(&hooks.ready_return);
+            let session = SessionBinding::new(Uuid::new_v4(), 81);
+            let capability = Uuid::new_v4();
+            let upload_id = Uuid::new_v4();
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let upload_manifest = manifest(b"same", "same.bin", UploadDestination::Cwd);
 
-        let first_hub = hub.clone();
-        let first_cwd = cwd.clone();
-        let first_manifest = upload_manifest.clone();
-        let first = tokio::spawn(async move {
-            first_hub
-                .start(
-                    session,
-                    "viewer",
-                    capability,
-                    upload_id,
-                    &first_cwd,
-                    first_manifest,
-                )
-                .await
-        });
-        let second_hub = hub.clone();
-        let second_manifest = upload_manifest.clone();
-        let second = tokio::spawn(async move {
-            second_hub
-                .start(
-                    session,
-                    "viewer",
-                    capability,
-                    upload_id,
-                    &cwd,
-                    second_manifest,
-                )
-                .await
-        });
-        hooks.prepare.wait_until_entered().await;
-        tokio::task::yield_now().await;
-        assert!(!second.is_finished());
-        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
-        assert_eq!(hub.retained_counts().await.0, 1);
+            let first_hub = hub.clone();
+            let first_cwd = cwd.clone();
+            let first_manifest = upload_manifest.clone();
+            let first = tokio::spawn(async move {
+                first_hub
+                    .start(
+                        session,
+                        "viewer",
+                        capability,
+                        upload_id,
+                        &first_cwd,
+                        first_manifest,
+                    )
+                    .await
+            });
+            let second_hub = hub.clone();
+            let second_manifest = upload_manifest.clone();
+            let second = tokio::spawn(async move {
+                second_hub
+                    .start(
+                        session,
+                        "viewer",
+                        capability,
+                        upload_id,
+                        &cwd,
+                        second_manifest,
+                    )
+                    .await
+            });
+            hooks.prepare.wait_until_entered().await;
+            tokio::task::yield_now().await;
+            assert!(!second.is_finished());
+            assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+            assert_eq!(hub.retained_counts().await.0, 1);
 
-        hooks.prepare.release();
-        hooks.ready_return.wait_until_entered().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if first.is_finished() || second.is_finished() {
-                    break;
+            prepare_pause.release();
+            hooks.ready_return.wait_until_entered().await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if first.is_finished() || second.is_finished() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
+            })
+            .await
+            .expect("same-owner retry observes the prepared slot while the inserter is paused");
+            assert_ne!(first.is_finished(), second.is_finished());
+            ready_pause.release();
+            let (first, second) = tokio::join!(first, second);
+            for outcome in [first.unwrap().unwrap(), second.unwrap().unwrap()] {
+                assert!(matches!(
+                    outcome,
+                    UploadStartOutcome::Ready {
+                        next_sequence: 0,
+                        received_bytes: 0
+                    }
+                ));
             }
+            assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+            let private_temps = std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
+                .count();
+            assert_eq!(private_temps, 1);
+
+            assert!(hub
+                .cancel(session, "viewer", capability, upload_id)
+                .await
+                .unwrap());
+            wait_for_upload_drain(&hub).await;
+            assert_eq!(hub.retained_counts().await, (0, 0));
+            assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("spawn-upload")));
         })
         .await
-        .expect("same-owner retry observes the prepared slot while the inserter is paused");
-        assert_ne!(first.is_finished(), second.is_finished());
-        hooks.ready_return.release();
-        let (first, second) = tokio::join!(first, second);
-        for outcome in [first.unwrap().unwrap(), second.unwrap().unwrap()] {
-            assert!(matches!(
-                outcome,
-                UploadStartOutcome::Ready {
-                    next_sequence: 0,
-                    received_bytes: 0
-                }
-            ));
-        }
-        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
-        let private_temps = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
-            .count();
-        assert_eq!(private_temps, 1);
-
-        assert!(hub
-            .cancel(session, "viewer", capability, upload_id)
-            .await
-            .unwrap());
-        wait_for_upload_drain(&hub).await;
-        assert_eq!(hub.retained_counts().await, (0, 0));
-        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("spawn-upload")));
+        .expect("same-owner starts and cleanup finish within 30 seconds");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
