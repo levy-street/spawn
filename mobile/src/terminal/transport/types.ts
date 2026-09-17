@@ -103,6 +103,8 @@ export interface UploadHandle {
 }
 
 export interface WorkerEndpoint {
+  /** Native documents must finish loading before initialization can be sent. */
+  whenReady?(): Promise<void>;
   send(message: import("@/terminal/transport/bridge").NativeToWorkerMessage): void;
   onMessage(
     fn: (message: import("@/terminal/transport/bridge").WorkerToNativeMessage) => void,

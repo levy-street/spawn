@@ -367,16 +367,52 @@ type WorkerListener = (message: WorkerToNativeMessage) => void;
 export class WorkerBridge {
   readonly #listeners = new Set<WorkerListener>();
   #sender: ((raw: string) => void) | null = null;
+  #ready = false;
+  #readiness: Promise<void> | null = null;
+  #resolveReady: (() => void) | null = null;
+  #rejectReady: ((error: Error) => void) | null = null;
 
-  attach(sender: (raw: string) => void): () => void {
+  attach(sender: (raw: string) => void, ready = true): () => void {
+    this.#clearReadiness();
     this.#sender = sender;
+    this.#ready = ready;
     return () => {
-      if (this.#sender === sender) this.#sender = null;
+      if (this.#sender !== sender) return;
+      this.#sender = null;
+      this.#ready = false;
+      this.#clearReadiness();
     };
+  }
+
+  setReady(sender: (raw: string) => void, ready: boolean): void {
+    // A late load event from the outgoing owner cannot activate its successor.
+    if (this.#sender !== sender) return;
+    this.#ready = ready;
+    if (ready) this.#resolveReady?.();
+    else this.#clearReadiness();
+  }
+
+  whenReady(): Promise<void> {
+    if (!this.#sender)
+      return Promise.reject(new BridgeProtocolError("Terminal worker is not attached."));
+    if (this.#ready) return Promise.resolve();
+    this.#readiness ??= new Promise<void>((resolve, reject) => {
+      this.#resolveReady = resolve;
+      this.#rejectReady = reject;
+    });
+    return this.#readiness;
+  }
+
+  #clearReadiness(): void {
+    this.#rejectReady?.(new BridgeProtocolError("Terminal worker document was retired."));
+    this.#readiness = null;
+    this.#resolveReady = null;
+    this.#rejectReady = null;
   }
 
   send(message: NativeToWorkerMessage): void {
     if (!this.#sender) throw new BridgeProtocolError("Terminal worker is not attached.");
+    if (!this.#ready) throw new BridgeProtocolError("Terminal worker document is not ready.");
     this.#sender(serializeNativeMessage(message));
   }
 

@@ -4,6 +4,7 @@ import { AppState, type AppStateStatus } from "react-native";
 import { retireRegisteredGenerations } from "@/data/realtime/lifecycle";
 import { deviceIdentity, setDeviceIdentityAccount } from "@/lib/crypto/identity";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
+import type { HostTransportOptions, WorkerEndpoint } from "@/terminal/transport/types";
 
 function mockTransport() {
   return {
@@ -17,10 +18,12 @@ function mockTransport() {
 }
 const mockRoots: ReturnType<typeof mockTransport>[] = [];
 const mockConsumers: ReturnType<typeof mockTransport>[] = [];
+const mockBridges: WorkerEndpoint[] = [];
 jest.mock("@/terminal/transport/host-transport", () => ({
-  createHostTransport: () => {
+  createHostTransport: (options: HostTransportOptions) => {
     const transport = mockTransport();
     mockRoots.push(transport);
+    mockBridges.push(options.bridge);
     return transport;
   },
   createHostConsumerTransport: () => {
@@ -69,6 +72,7 @@ beforeEach(() => {
   jest.useFakeTimers();
   mockRoots.length = 0;
   mockConsumers.length = 0;
+  mockBridges.length = 0;
   mockWorkers.length = 0;
   initialAppState = AppState.currentState;
   AppState.currentState = "active";
@@ -107,6 +111,27 @@ function worker() {
 
 // The real surface, registry, identity events and AppState wiring run together;
 // WebView and transport effects are mocked, so these are not device evidence.
+test("root readiness follows document load and is withdrawn after process loss", async () => {
+  const screen = await render(<HostTransportSurface connectionOwner {...host} />);
+  const bridge = mockBridges[0];
+  if (!bridge?.whenReady) throw new Error("Missing document readiness gate.");
+  const ready = jest.fn();
+  const initial = bridge.whenReady().then(ready);
+  await act(async () => {});
+  expect(ready).not.toHaveBeenCalled();
+  await act(() => worker().props.onLoad());
+  await initial;
+  expect(ready).toHaveBeenCalledTimes(1);
+  await act(() => worker().props.onContentProcessDidTerminate());
+  const replacement = bridge.whenReady().then(ready);
+  await act(async () => {});
+  expect(ready).toHaveBeenCalledTimes(1);
+  await act(() => worker().props.onLoad());
+  await replacement;
+  expect(ready).toHaveBeenCalledTimes(2);
+  await screen.unmount();
+});
+
 test("the app owner survives tool route changes and handles each network change once", async () => {
   const screen = await render(<HostTransportSurface connectionOwner {...host} />);
   const transport = root();
@@ -226,10 +251,11 @@ test("a worker loaded in the background waits for foreground, including after pr
   const transport = root();
   await act(() => worker().props.onLoad());
   expect(transport.open).not.toHaveBeenCalled();
+  expect(transport.close).toHaveBeenCalledTimes(1);
   await appState("active");
   expect(transport.open).toHaveBeenCalledTimes(1);
   await act(() => worker().props.onContentProcessDidTerminate());
-  expect(transport.close).toHaveBeenCalledTimes(1);
+  expect(transport.close).toHaveBeenCalledTimes(2);
   expect(worker().reload).toHaveBeenCalledTimes(1);
   await appState("background");
   await act(() => worker().props.onLoad());
@@ -259,10 +285,13 @@ test.each(["account", "signing-key"])(
     const successor = root();
     const closeCount = retired.close.mock.calls.length;
     await act(() => worker().props.onLoad());
+    // Loading behind the app cancels any early approval retry before readiness
+    // is released. The old worker's timer must not close it again after resume.
+    expect(successor.close).toHaveBeenCalledTimes(1);
     await appState("active");
     await act(() => jest.advanceTimersByTime(3_000));
     expect(retired.close).toHaveBeenCalledTimes(closeCount);
-    expect(successor.close).not.toHaveBeenCalled();
+    expect(successor.close).toHaveBeenCalledTimes(1);
     expect(successor.open).toHaveBeenCalledTimes(1);
     expect(screen.getAllByTestId("host-worker")).toHaveLength(1);
     await screen.unmount();

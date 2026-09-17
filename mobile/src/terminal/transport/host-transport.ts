@@ -312,6 +312,15 @@ class WebViewHostTransport implements StreamingHostTransport {
       if (this.#opening !== opening || ["closed", "failed"].includes(this.#state)) {
         return opening;
       }
+      // Approval or pin-change retries can arrive before the owner's onLoad.
+      // postMessage during navigation is lost; the later open would otherwise
+      // reuse that stalled attempt until its connection watchdog expires.
+      if (this.options.bridge.whenReady) {
+        await Promise.race([this.options.bridge.whenReady(), opening]);
+      }
+      if (this.#opening !== opening || ["closed", "failed"].includes(this.#state)) {
+        return opening;
+      }
       this.#bridgeUnsubscribe?.();
       this.#bridgeUnsubscribe = this.options.bridge.onMessage((message) => {
         void this.#handleWorkerMessage(message);

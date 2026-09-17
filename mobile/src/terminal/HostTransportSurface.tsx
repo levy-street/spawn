@@ -74,12 +74,14 @@ function HostTransportInstance({
     [bridge, connectionOwner, hostId, hostIdentityPublicKey, rootTransport],
   );
   const [ownsWorker, setOwnsWorker] = useState(lease.shared.owner === lease.ownerId);
+  const sendToWorker = useCallback((raw: string) => webViewRef.current?.postMessage(raw), []);
 
   useEffect(() => lease.subscribeOwnership(setOwnsWorker), [lease]);
   useEffect(() => {
     if (!ownsWorker) return;
-    return bridge.attach((raw) => webViewRef.current?.postMessage(raw));
-  }, [bridge, ownsWorker]);
+    workerLoaded.current = false;
+    return bridge.attach(sendToWorker, false);
+  }, [bridge, ownsWorker, sendToWorker]);
 
   useEffect(() => {
     callbacks.current.onTransport(transport);
@@ -200,12 +202,21 @@ function HostTransportInstance({
       onMessage={handleMessage}
       onLoad={() => {
         workerLoaded.current = true;
-        if (AppState.currentState === "active") openTransport();
-        else retiredForBackground.current = true;
+        if (AppState.currentState === "active") {
+          bridge.setReady(sendToWorker, true);
+          openTransport();
+        } else {
+          // An approval retry may already be awaiting this document. Retire it
+          // before releasing readiness so loading behind the app cannot open RTC.
+          rootTransport.close();
+          retiredForBackground.current = true;
+          bridge.setReady(sendToWorker, true);
+        }
       }}
       onContentProcessDidTerminate={() => {
         workerLoaded.current = false;
         rootTransport.close();
+        bridge.setReady(sendToWorker, false);
         webViewRef.current?.reload();
       }}
     />

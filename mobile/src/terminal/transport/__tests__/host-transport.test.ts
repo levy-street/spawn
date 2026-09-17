@@ -238,6 +238,61 @@ function openTransport(bridge: FakeBridge, signal: FakeSignal) {
 }
 
 describe("HostTransport signalling", () => {
+  test("an early retry waits for the worker document before sending initialization", async () => {
+    let loaded!: () => void;
+    const workerReady = new Promise<void>((resolve) => {
+      loaded = resolve;
+    });
+    const bridge = Object.assign(new FakeBridge(), { whenReady: () => workerReady });
+    const signal = new FakeSignal();
+    const { transport, settled } = openTransport(bridge, signal);
+    try {
+      await flush();
+      signal.emit({
+        type: "rtc.config",
+        enabled: true,
+        ice_servers: [],
+        scope_type: "host",
+        scope_id: HOST_ID,
+        protocol: "spawn.host.ctl",
+        protocol_version: 2,
+      });
+      expect(bridge.sent).toEqual([]);
+      loaded();
+      await flush();
+      expect(bridge.sent.map((message) => message.type)).toEqual(["init", "connect"]);
+    } finally {
+      transport.close();
+      loaded();
+      await settled;
+    }
+  });
+
+  test("closing an attempt waiting for its document cannot revive it after load", async () => {
+    let loaded!: () => void;
+    const workerReady = new Promise<void>((resolve) => {
+      loaded = resolve;
+    });
+    const bridge = Object.assign(new FakeBridge(), { whenReady: () => workerReady });
+    const { transport, settled } = openTransport(bridge, new FakeSignal());
+    const cancelled = jest.fn();
+    void settled.then(cancelled);
+    try {
+      await flush();
+      transport.close();
+      await flush();
+      expect(cancelled).toHaveBeenCalledTimes(1);
+      expect(transport.state).toBe("closed");
+      loaded();
+      await flush();
+      expect(bridge.sent.map((message) => message.type)).toEqual(["close"]);
+    } finally {
+      transport.close();
+      loaded();
+      await settled;
+    }
+  });
+
   test("an unavailable initial offer waits for worker teardown and delayed reconnect", async () => {
     jest.useFakeTimers();
     const bridge = new FakeBridge();
