@@ -258,6 +258,13 @@ test.each([
             .slice(close + 1)
             .some((m) => m.type === "pair-attach" || m.type === "host-consumer-open"),
         ).toBe(false);
+        // WebView delivery can lag behind native close/open. This acknowledges
+        // the retired root, after the replacement subscribed to the same bridge.
+        await act(async () => {
+          mockEmit(hostWorker, { type: "state", state: "closed" });
+          await drain();
+        });
+        expect(root?.state).toBe("connecting");
         const retiredAttachments = commandIds(hostWorker, "pair-attach", "attachmentId");
         await act(async () => {
           for (const w of mockWorkers.filter((w) => w.mode === "session"))

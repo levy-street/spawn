@@ -1040,6 +1040,11 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (this.#state === "closed" || this.#state === "failed") return;
     switch (message.type) {
       case "state":
+        // Only an explicit native close command produces this acknowledgement.
+        // close() already retired the transport synchronously. WebView delivery
+        // may reach a later open() on the same bridge, so it cannot close that
+        // replacement or stop its signing and signalling messages.
+        if (message.state === "closed") break;
         if (message.state === "reconnecting") this.#scheduleReconnect();
         else this.#setState(message.state);
         break;

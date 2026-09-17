@@ -117,6 +117,8 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   Read `docs/DEVICE_CONNECTIONS.md` before changing lifecycle or control rules.
   Native surfaces check the three-second background deadline on foreground as
   well as in the timer callback, because the runtime can pause background timers.
+  Native close retires the root synchronously; its delayed WebView acknowledgement
+  must not close a replacement connection opened on the same bridge.
 
 ## Before calling a change done
 
