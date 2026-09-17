@@ -2,7 +2,7 @@ import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { act, waitFor } from "@testing-library/react-native";
 import { AppState, type AppStateStatus } from "react-native";
 import { authToken } from "@/data/api/auth-token";
-import { NativeAcceptanceController } from "../e2e/native-controller";
+import { NativeAcceptanceController, NativeAcceptanceUploadSource } from "../e2e/native-controller";
 import { renderWithProviders } from "./render";
 
 const ACCOUNT_ID = "11111111-1111-4111-8111-111111111111";
@@ -55,6 +55,46 @@ jest.mock("@/terminal/TerminalSurface", () => ({ TerminalSurface: () => null }))
 jest.mock("@/terminal/transport/host-transport-registry", () => ({
   retainHostTransport: jest.fn(),
 }));
+
+test("interruption source cannot finish during a slow OS transition", async () => {
+  jest.useFakeTimers();
+  const source = new NativeAcceptanceUploadSource(new Uint8Array([1, 2, 3, 4]), 15, true);
+  try {
+    const first = source.read(0, 2);
+    await jest.advanceTimersByTimeAsync(15);
+    await expect(first).resolves.toEqual(new Uint8Array([1, 2]));
+    let completed = false;
+    const next = source.read(2, 2).then((bytes) => {
+      completed = true;
+      return bytes;
+    });
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(source.paused).toBe(true);
+    expect(completed).toBe(false);
+    source.release();
+    await expect(next).resolves.toEqual(new Uint8Array([3, 4]));
+    expect(source.paused).toBe(false);
+    source.release();
+  } finally {
+    source.release();
+    jest.useRealTimers();
+  }
+});
+
+test.each([false, true])("fresh or released sources do not pause (held=%s)", async (held) => {
+  jest.useFakeTimers();
+  const source = new NativeAcceptanceUploadSource(new Uint8Array([1, 2, 3, 4]), 15, held);
+  try {
+    if (held) source.release();
+    const read = source.read(2, 2);
+    await jest.advanceTimersByTimeAsync(15);
+    await expect(read).resolves.toEqual(new Uint8Array([3, 4]));
+    expect(source.paused).toBe(false);
+  } finally {
+    source.release();
+    jest.useRealTimers();
+  }
+});
 
 test("snapshots retain bounded lifecycle evidence when background event requests fail", async () => {
   const listeners = new Set<(state: AppStateStatus) => void>();

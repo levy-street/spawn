@@ -548,7 +548,7 @@ async def exercise(fixture: Any) -> None:
                     "uploadId": interrupted_id,
                     "name": "interrupted.bin",
                     "totalBytes": 8 * 1024 * 1024,
-                    "readDelayMs": 30,
+                    "pauseAfterFirstChunk": True,
                 },
             )
 
@@ -562,22 +562,31 @@ async def exercise(fixture: Any) -> None:
                 )
                 return (
                     current
-                    if 0 < current.get("sentBytes", 0) < current.get("totalBytes", 0)
+                    if current.get("sourceReadPaused") is True
+                    and 0 < current.get("sentBytes", 0) < current.get("totalBytes", 0)
                     else None
                 )
 
             dispatched = await eventually(
                 in_flight,
                 timeout=45,
-                message="upload sent no bytes before interruption",
+                message="upload did not pause its source after sending bytes",
             )
-            await fixture.command("background", {"durationMs": 5000}, native=True)
-            await fixture.command("foreground", native=True)
-            await wait_ready()
+            retirement = await background(5000)
             state = await fixture.command("upload-status", {"uploadId": interrupted_id})
             require(
-                state.get("state") in {"failed", "cancelled", "outcome_unknown"},
+                state.get("state") in {"failed", "cancelled"}
+                and state.get("sourceReadPaused") is True
+                and state.get("sentBytes") == dispatched["sentBytes"],
                 "interrupted upload continued or reported unproven completion",
+            )
+            await fixture.command("upload-release-source", {"uploadId": interrupted_id})
+            released = await fixture.command("upload-status", {"uploadId": interrupted_id})
+            require(
+                released.get("state") in {"failed", "cancelled"}
+                and released.get("sentBytes") == dispatched["sentBytes"]
+                and not list((fixture.cwd / "a").rglob("interrupted.bin")),
+                "releasing the retired source resumed or completed its upload",
             )
             await echo("b")
             fresh_id = str(uuid.uuid4())
@@ -615,6 +624,8 @@ async def exercise(fixture: Any) -> None:
             return {
                 "interrupted_state": state["state"],
                 "bytes_before_interruption": dispatched["sentBytes"],
+                "retirement": retirement,
+                "released_source_state": released["state"],
                 "fresh_sha256": digest,
                 "result": finished,
             }

@@ -126,6 +126,9 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   lifecycle journal retains actual callbacks through suspension; missing,
   reordered or replaced observations fail
   acceptance rather than depending on diagnostic HTTP delivery.
+  The interrupted-upload case holds its source after the first transmitted chunk
+  until measured background retirement; releasing that source must not resume the
+  old upload. A slow OS transition cannot accidentally complete the test upload.
 
 ## Before calling a change done
 

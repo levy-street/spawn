@@ -21,7 +21,12 @@ import {
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { TerminalSurface } from "@/terminal/TerminalSurface";
 import { retainHostTransport } from "@/terminal/transport/host-transport-registry";
-import type { HostTransport, SessionTransport, UploadProgress } from "@/terminal/transport/types";
+import type {
+  HostTransport,
+  SessionTransport,
+  UploadProgress,
+  UploadSource,
+} from "@/terminal/transport/types";
 import { spacing, useTheme } from "@/theme";
 
 interface Bootstrap {
@@ -53,6 +58,41 @@ const build = Constants.expoConfig?.extra?.["nativeAcceptance"] as
   | undefined;
 const launchId = `launch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Fixture-only read backpressure; OS activation latency cannot finish this upload. */
+export class NativeAcceptanceUploadSource implements UploadSource {
+  readonly size: number;
+  paused = false;
+  private released = false;
+  private resumeRead!: () => void;
+  private readonly gate = new Promise<void>((resolve) => {
+    this.resumeRead = resolve;
+  });
+
+  constructor(
+    private readonly bytes: Uint8Array,
+    private readonly delayMs: number,
+    private readonly pauseAfterFirstChunk: boolean,
+  ) {
+    this.size = bytes.byteLength;
+  }
+
+  async read(offset: number, length: number): Promise<Uint8Array> {
+    await wait(this.delayMs);
+    if (this.pauseAfterFirstChunk && offset > 0 && !this.released) {
+      this.paused = true;
+      await this.gate;
+    }
+    return this.bytes.slice(offset, offset + length);
+  }
+
+  release(): void {
+    this.released = true;
+    this.paused = false;
+    this.resumeRead();
+  }
+}
+
 async function until(check: () => boolean, message: string, timeout = 60_000): Promise<void> {
   const end = Date.now() + timeout;
   while (!check()) {
@@ -127,6 +167,7 @@ export function NativeAcceptanceController(): React.JSX.Element {
 
   useEffect(() => {
     let stopped = false;
+    const uploadSources = new Map<string, NativeAcceptanceUploadSource>();
     let current: Bootstrap;
     let lifecycleSequence = 0;
     const lifecycleTransitions: Array<{
@@ -332,6 +373,12 @@ export function NativeAcceptanceController(): React.JSX.Element {
           if (!/^[0-9a-f-]{36}$/.test(uploadId) || !/^[a-zA-Z0-9._-]+$/.test(name))
             throw new Error("Invalid fixture upload identity.");
           const delay = Math.min(100, Math.max(0, Number(payload["readDelayMs"] ?? 15)));
+          const source = new NativeAcceptanceUploadSource(
+            bytes,
+            delay,
+            payload["pauseAfterFirstChunk"] === true,
+          );
+          uploadSources.set(uploadId, source);
           const handle = session.upload({
             uploadId,
             name,
@@ -339,13 +386,7 @@ export function NativeAcceptanceController(): React.JSX.Element {
             destination: "cwd",
             totalBytes,
             sha256: digest,
-            source: {
-              size: totalBytes,
-              read: async (offset, length) => {
-                await wait(delay);
-                return bytes.slice(offset, offset + length);
-              },
-            },
+            source,
             beforeFinalDispatch: async () => {
               await event("upload-final-dispatch", { uploadId });
             },
@@ -381,8 +422,19 @@ export function NativeAcceptanceController(): React.JSX.Element {
             .catch(() => {});
           return { uploadId, totalBytes, sha256: digest };
         }
-        case "upload-status":
-          return uploads.current.get(String(payload["uploadId"])) ?? null;
+        case "upload-status": {
+          const uploadId = String(payload["uploadId"]);
+          const progress = uploads.current.get(uploadId);
+          return progress
+            ? { ...progress, sourceReadPaused: uploadSources.get(uploadId)?.paused === true }
+            : null;
+        }
+        case "upload-release-source": {
+          const source = uploadSources.get(String(payload["uploadId"]));
+          if (!source) throw new Error("Unknown fixture upload source.");
+          source.release();
+          return { released: true };
+        }
         case "rotate-identity": {
           const previous = [...mounted.current];
           const previousTools = selectedTools.current;
@@ -508,6 +560,8 @@ export function NativeAcceptanceController(): React.JSX.Element {
     return () => {
       stopped = true;
       lifecycle.remove();
+      for (const source of uploadSources.values()) source.release();
+      uploadSources.clear();
     };
   }, [queryClient]);
 

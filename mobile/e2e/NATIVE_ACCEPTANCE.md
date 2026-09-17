@@ -173,11 +173,20 @@ App commands from `GET /__acceptance/command` are `{id, action, payload}`:
 | `retry-host` | Close/open the retained root through the public retry API without replacing or registering the device identity |
 | `input` | `{session,text,takeControl}`; optionally await daemon-confirmed control, then write |
 | `host-request` | `{tool,operation,payload}`; fixture permits `fs.home` / `fs.list` |
-| `upload` | `{session,uploadId,name,totalBytes,readDelayMs}`; start real byte source upload and return its SHA-256 |
+| `upload` | `{session,uploadId,name,totalBytes,readDelayMs,pauseAfterFirstChunk}`; start real byte source upload and return its SHA-256 |
 | `upload-status` | `{uploadId}`; latest actual upload progress/result |
+| `upload-release-source` | `{uploadId}`; release fixture-only source backpressure after retirement |
 | `rotate-identity` | Reset native identity and register/endorse the replacement |
 | `sign-out` / `sign-in` | Real logout and fresh fixture account login |
 | `switch-account` | `{account:"a"|"b"}`; account B owns no fixture hosts or sessions |
+
+The interruption case requires `sourceReadPaused` after a non-empty first chunk.
+That fixture source remains blocked while the suite measures a long background
+interval and verifies replacement of the peer. The upload must already have
+failed or cancelled before its source is released, must stay stopped afterward,
+and must not create its final file. Cleanup releases any held source reads. This
+avoids a race where a fast upload finishes while iOS is still moving the app into
+the background; the product's upload coordinator and transports remain real.
 
 The native runner consumes `GET /__acceptance/native-command`: `background`
 (optional `durationMs` up to 30000), `foreground`, `relaunch`, `screenshot`
