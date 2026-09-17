@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/deploy-prod.sh [ssh-host] --acceptance-evidence FILE [--api-proxy-target URL] [--allow-branch]
+Usage: scripts/deploy-prod.sh [ssh-host] --acceptance-evidence FILE [--resume] [--api-proxy-target URL] [--allow-branch]
 
 Deploy the remote version of the current branch to a production host.
 
@@ -17,6 +17,11 @@ Options:
                           Required for every deploy, including --allow-branch.
                           Its candidate and baseline must match the fetched
                           target and the current public production release.
+  --resume                Retry a partial deploy using its ORIGINAL evidence.
+                          Also accepts the candidate server with the baseline
+                          or candidate daemon tree. Other releases are refused.
+                          Mobile changes still compare against that original
+                          baseline, so an interrupted OTA is not skipped.
   --api-proxy-target URL  Where the deployed web app proxies /api and /ws.
                           Default: http://127.0.0.1:8001. This is baked into
                           the build, so it MUST be passed as a flag -- an
@@ -117,6 +122,7 @@ fi
 host=""
 proxy_target_flag=""
 allow_branch=0
+resume=0
 acceptance_evidence="${SPAWN_RELEASE_ACCEPTANCE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -126,6 +132,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allow-branch)
       allow_branch=1
+      shift
+      ;;
+    --resume)
+      resume=1
       shift
       ;;
     --acceptance-evidence)
@@ -265,12 +275,21 @@ prebuilt_variant_entries=()
 target_commit="$(git rev-parse "$remote_ref")"
 target_tree="$(git rev-parse "$remote_ref:daemon")"
 # A branch flag and the emergency prebuilt override cannot waive acceptance.
-# Resolve the baseline again here: production may have advanced since CI ran.
+# Snapshot the evidence so preparation and the final gate use the same transition.
 [[ -n "$acceptance_evidence" && -f "$acceptance_evidence" ]] ||
   die "matching release acceptance evidence is required; download acceptance.json from release-acceptance and pass --acceptance-evidence FILE"
-python3 "$script_dir/check-release-acceptance.py" \
-  --evidence "$acceptance_evidence" --candidate "$target_commit" ||
+cp -- "$acceptance_evidence" "$prebuilt_tmp/acceptance.json"
+acceptance_evidence="$prebuilt_tmp/acceptance.json"
+acceptance_args=(--evidence "$acceptance_evidence" --candidate "$target_commit")
+[[ "$resume" == "0" ]] || acceptance_args+=(--resume)
+python3 "$script_dir/check-release-acceptance.py" "${acceptance_args[@]}" ||
   die "release acceptance evidence was refused; no production changes were made"
+accepted_baseline="$(python3 - "$acceptance_evidence" <<'PY'
+import json, sys
+with open(sys.argv[1]) as evidence:
+    print(json.load(evidence)["baseline_commit"])
+PY
+)"
 host_probe_env="$(quote_env SPAWN_DEPLOY_PATH "$remote_path")"
 host_current_commit="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
 set -euo pipefail
@@ -539,8 +558,7 @@ REMOTE
 # Downloading/verifying prebuilts and staging this script can take minutes.
 # A direct deploy can overlap the serialized GitHub release workflow, so check
 # the public baseline once more at the last boundary before checkout/build.
-if ! python3 "$script_dir/check-release-acceptance.py" \
-  --evidence "$acceptance_evidence" --candidate "$target_commit"; then
+if ! python3 "$script_dir/check-release-acceptance.py" "${acceptance_args[@]}"; then
   ssh "$host" "rm -f '$remote_script'" || true
   die "release acceptance evidence changed or its baseline advanced during preparation; no production services were changed"
 fi
@@ -714,8 +732,9 @@ printf '\n'
 # The channel is never guessed. Publishing a dev build to the production
 # channel would push it to every phone in the field, so an origin this script
 # does not recognise prints the command instead of running it.
-if git cat-file -e "$host_current_commit^{commit}" 2>/dev/null &&
-  ! git diff --quiet "$host_current_commit" "$target_commit" -- mobile; then
+# A failed attempt may already have advanced the remote checkout. The accepted
+# baseline records what the entire release owes, including an unfinished OTA.
+if ! git diff --quiet "$accepted_baseline" "$target_commit" -- mobile; then
   mobile_channel="${SPAWN_DEPLOY_MOBILE_CHANNEL:-}"
   if [[ -z "$mobile_channel" && "$public_origin" == "https://spawnd.dev" && "$branch" == "master" ]]; then
     mobile_channel="production"

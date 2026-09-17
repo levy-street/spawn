@@ -2,11 +2,15 @@ name: Windows
 
 # windows-check runs native daemon checks/tests, a release build, desktop crate
 # checks and an isolated installer smoke. Standard hosted compute is free for
-# this public repository. Path-filtered pushes cover PR branches without a
-# duplicate pull_request run. Dispatch this workflow with --ref BRANCH to run
-# both checks and the unsigned packaging rehearsal before merge.
+# this public repository. Every master push needs a result: release compares
+# against the deployed baseline, which may include earlier undeployed daemon
+# changes even when this push only changes web files. PRs remain path-filtered.
+# Dispatch with --ref BRANCH for both checks and unsigned packaging before merge.
 "on":
   push:
+    branches:
+      - master
+  pull_request:
     paths:
       - "daemon/**"
       - "desktop/**"
@@ -117,7 +121,7 @@ jobs:
   # publish-desktop.sh refuses a setup EXE with no certificate table.
   #
   # Packaging is explicitly requested with workflow_dispatch (including a
-  # branch ref) or `[package]` in the push commit message. This produces an
+  # branch ref) or `[package]` in a master push commit message. This produces an
   # unsigned test installer; desktop.yml owns signed release packaging.
   windows-package:
     name: windows-package (unsigned rehearsal)

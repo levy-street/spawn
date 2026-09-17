@@ -270,6 +270,7 @@ jobs:
         run: |
           set -euo pipefail
           scripts/deploy-prod.sh spawnd-prod --api-proxy-target http://127.0.0.1:8001 \
+            --resume \
             --acceptance-evidence "$RUNNER_TEMP/release-acceptance/acceptance.json"
 
   # Only when the tree no longer fits the native shell already on phones.

@@ -2430,6 +2430,14 @@ fn session_data_channel_handler(
                         return;
                     }
                     let write = || {
+                        // Ownership can be contended across parent retirement.
+                        // Revalidate after that await, at the worker dispatch.
+                        if !effect.valid()
+                            || !active.load(Ordering::Acquire)
+                            || !registry.is_current(session)
+                        {
+                            return None;
+                        }
                         forward_bound_data_channel_input(
                             session,
                             msg.is_string,

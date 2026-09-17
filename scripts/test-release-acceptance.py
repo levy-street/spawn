@@ -7,6 +7,8 @@ import copy
 import importlib.util
 import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -268,8 +270,9 @@ class BaselineTests(unittest.TestCase):
             gate.ensure_baseline_commit(BASELINE)
             git.assert_called_once_with("cat-file", "-e", f"{BASELINE}^{{commit}}")
         missing = subprocess.CalledProcessError(1, ["git", "cat-file"])
-        with patch.object(gate, "git", side_effect=missing), self.assertRaises(
-            subprocess.CalledProcessError
+        with (
+            patch.object(gate, "git", side_effect=missing),
+            self.assertRaises(subprocess.CalledProcessError),
         ):
             gate.ensure_baseline_commit(BASELINE)
         with patch.object(gate, "git") as git, self.assertRaises(ValueError):
@@ -318,6 +321,290 @@ class BaselineTests(unittest.TestCase):
         ):
             gate.deployed_baseline("http://127.0.0.1:8000")
         request.assert_not_called()
+
+
+class DeploymentTests(unittest.TestCase):
+    baseline_tree = "c" * 40
+    candidate_tree = "d" * 40
+
+    def setUp(self):
+        self.evidence = {
+            "schema_version": 1,
+            "candidate_commit": CANDIDATE,
+            "baseline_commit": BASELINE,
+            "status": "passed",
+            "reports": {name: report(name) for name in ("ios", "android", "canary")},
+        }
+        git = patch.object(
+            gate,
+            "git",
+            side_effect=lambda *args: {
+                ("cat-file", "-e", f"{BASELINE}^{{commit}}"): "",
+                ("rev-parse", f"{BASELINE}:daemon"): self.baseline_tree,
+                ("rev-parse", f"{CANDIDATE}:daemon"): self.candidate_tree,
+            }[args],
+        )
+        git.start()
+        self.addCleanup(git.stop)
+
+    def validate(self, commit, tree, *, resume=False, dirty=False):
+        release = {
+            "server": {"commit": commit, "dirty": dirty},
+            "daemon": {"tree": tree},
+        }
+        with patch.object(
+            gate.urllib.request,
+            "urlopen",
+            return_value=io.BytesIO(json.dumps(release).encode()),
+        ):
+            return gate.validate_deployment(
+                self.evidence, CANDIDATE, "https://spawnd.dev", resume=resume
+            )
+
+    def test_initial_deployment_still_requires_original_baseline(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                self.assertEqual(
+                    self.validate(BASELINE, self.baseline_tree, resume=resume),
+                    self.evidence,
+                )
+        for tree in (self.baseline_tree, self.candidate_tree):
+            with self.subTest(tree=tree), self.assertRaises(ValueError):
+                self.validate(CANDIDATE, tree)
+
+    def test_resume_after_service_or_manifest_publication_preserves_original_baseline(
+        self,
+    ):
+        for tree in (self.baseline_tree, self.candidate_tree):
+            with self.subTest(tree=tree):
+                accepted = self.validate(CANDIDATE, tree, resume=True)
+                self.assertEqual(accepted["baseline_commit"], BASELINE)
+                self.assertEqual(accepted, self.evidence)
+
+    def test_resume_rejects_other_releases_unknown_trees_and_dirty_servers(self):
+        for commit, tree, dirty in (
+            ("e" * 40, self.baseline_tree, False),
+            ("e" * 40, self.candidate_tree, False),
+            (BASELINE, self.candidate_tree, False),
+            (CANDIDATE, "e" * 40, False),
+            (CANDIDATE, None, False),
+            (CANDIDATE, self.candidate_tree, True),
+        ):
+            with (
+                self.subTest(commit=commit, tree=tree, dirty=dirty),
+                self.assertRaises(ValueError),
+            ):
+                self.validate(commit, tree, resume=True, dirty=dirty)
+
+    def test_resume_does_not_waive_any_platform_evidence(self):
+        for kind in ("ios", "android", "canary"):
+            with self.subTest(kind=kind):
+                self.evidence["reports"][kind]["status"] = "failed"
+                with (
+                    patch.object(gate.urllib.request, "urlopen") as request,
+                    self.assertRaises(ValueError),
+                ):
+                    gate.validate_deployment(
+                        self.evidence, CANDIDATE, "https://spawnd.dev", resume=True
+                    )
+                request.assert_not_called()
+                self.evidence["reports"][kind]["status"] = "passed"
+
+    def test_resume_rechecks_production_and_refuses_if_another_release_advanced(self):
+        self.validate(CANDIDATE, self.baseline_tree, resume=True)
+        with self.assertRaises(ValueError):
+            self.validate("e" * 40, "f" * 40, resume=True)
+
+    def test_resume_cannot_override_public_identity_with_a_baseline_flag(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--resume",
+                "--evidence",
+                "unused.json",
+                "--candidate",
+                CANDIDATE,
+                "--baseline",
+                BASELINE,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("public production identity", result.stderr)
+
+
+@unittest.skipIf(os.name == "nt", "deploy orchestration requires POSIX shell semantics")
+class DeployScriptTests(unittest.TestCase):
+    """Exercise the actual deploy orchestration with isolated Git and fake I/O."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.root = self.directory / "repo"
+        self.root.mkdir()
+        self.bin = self.directory / "bin"
+        self.bin.mkdir()
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        for name in ("deploy-prod.sh", "release-lib.sh", "check-release-acceptance.py"):
+            shutil.copy2(SCRIPT.with_name(name), scripts / name)
+        (self.root / "daemon").mkdir()
+        (self.root / "daemon" / "source").write_text("unchanged daemon")
+        (self.root / "mobile").mkdir()
+        (self.root / "mobile" / "source").write_text("old phone bundle")
+        self.executable(
+            scripts / "update-mobile-prod.sh",
+            """
+import os
+from pathlib import Path
+attempts = Path(os.environ['TEST_IO']) / 'ota-attempts'
+previous = attempts.read_text() if attempts.exists() else ''
+attempts.write_text(previous + 'publish\\n')
+raise SystemExit(1 if not previous else 0)
+""",
+        )
+        self.git("init", "--initial-branch=master")
+        self.git("add", ".")
+        self.git("commit", "-m", "baseline")
+        self.baseline = self.git("rev-parse", "HEAD")
+        (self.root / "mobile" / "source").write_text("new phone bundle")
+        self.git("commit", "-am", "candidate")
+        self.candidate = self.git("rev-parse", "HEAD")
+        self.git("remote", "add", "origin", str(self.root))
+        tree = self.git("rev-parse", "HEAD:daemon")
+        release = {
+            "server": {"commit": self.candidate, "dirty": False},
+            "daemon": {"tree": tree},
+        }
+        (self.directory / "release.json").write_text(json.dumps(release))
+        evidence = {
+            "schema_version": 1,
+            "status": "passed",
+            "candidate_commit": self.candidate,
+            "baseline_commit": self.baseline,
+            "reports": {
+                name: {
+                    **report(name),
+                    "candidate_commit": self.candidate,
+                    "baseline_commit": self.baseline,
+                }
+                for name in ("ios", "android", "canary")
+            },
+        }
+        (self.directory / "acceptance.json").write_text(json.dumps(evidence))
+        # Inject only the public HTTP response; the production gate and all Git
+        # comparisons run normally. Any unexpected network request fails.
+        (self.directory / "sitecustomize.py").write_text("""
+import io, os, urllib.request
+from pathlib import Path
+def release_response(url, **kwargs):
+    assert url == 'https://spawnd.dev/api/release', url
+    return io.BytesIO((Path(os.environ['TEST_IO']) / 'release.json').read_bytes())
+urllib.request.urlopen = release_response
+""")
+        self.executable(
+            self.bin / "ssh",
+            """
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ['TEST_IO'])
+release = json.loads((root / 'release.json').read_text())
+with (root / 'ssh-calls').open('a') as calls:
+    calls.write('ssh\\n')
+command = sys.argv[-1]
+if command == 'mktemp /tmp/spawn-remote-deploy.XXXXXX':
+    print('/tmp/disposable-review-deploy')
+elif command.startswith('cat > '):
+    sys.stdin.read()
+elif "bash '/tmp/disposable-review-deploy'" in command:
+    pass
+else:
+    body = sys.stdin.read()
+    if 'git rev-parse HEAD' in body:
+        print(release['server']['commit'])
+    elif 'manifest.json' in body:
+        print(json.dumps(release['daemon']))
+    elif '/api/release' in body:
+        print(json.dumps(release))
+    else:
+        raise AssertionError((command, body))
+""",
+        )
+        for name in ("uv", "scp", "curl"):
+            self.executable(
+                self.bin / name, "raise AssertionError('Unexpected external command')"
+            )
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("SPAWN_", "GIT_", "PYTHON"))
+        }
+        self.env.update(
+            PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+            PYTHONPATH=str(self.directory),
+            TEST_IO=str(self.directory),
+            SPAWN_DEPLOY_PREBUILTS="0",
+            SPAWN_DEPLOY_MOBILE_CHANNEL="production",
+        )
+
+    def executable(self, path, source):
+        path.write_text(f"#!{sys.executable}\n" + source)
+        path.chmod(0o755)
+
+    def git(self, *args):
+        return subprocess.check_output(
+            [
+                "git",
+                "-c",
+                "user.name=Acceptance",
+                "-c",
+                "user.email=acceptance@example.com",
+                *args,
+            ],
+            cwd=self.root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+
+    def deploy(self, *args):
+        return subprocess.run(
+            [
+                "bash",
+                "scripts/deploy-prod.sh",
+                "fixture-only",
+                "--acceptance-evidence",
+                str(self.directory / "acceptance.json"),
+                *args,
+            ],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    def test_an_advanced_server_requires_explicit_resume_before_any_ssh(self):
+        result = self.deploy()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release acceptance evidence was refused", result.stderr)
+        self.assertFalse((self.directory / "ssh-calls").exists())
+
+    def test_resume_retries_failed_ota_even_when_remote_checkout_already_is_candidate(
+        self,
+    ):
+        first = self.deploy("--resume")
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("mobile OTA failed", first.stderr, first.stdout + first.stderr)
+        second = self.deploy("--resume")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("deploy-prod: complete", second.stdout)
+        self.assertEqual(
+            (self.directory / "ota-attempts").read_text(), "publish\npublish\n"
+        )
 
 
 class CITests(unittest.TestCase):
@@ -432,6 +719,14 @@ class CITests(unittest.TestCase):
                 self.assertTrue(
                     gate.requires_windows(git("rev-parse", "HEAD"), baseline)
                 )
+                # The latest push can be mobile-only while Windows is still
+                # owed for the daemon change since the deployed baseline.
+                (root / "mobile" / "source").write_text("follow-up")
+                git("commit", "-am", "mobile follow-up before daemon deployment")
+                candidate = git("rev-parse", "HEAD")
+                previous = git("rev-parse", "HEAD^")
+                self.assertFalse(gate.requires_windows(candidate, previous))
+                self.assertTrue(gate.requires_windows(candidate, baseline))
 
 
 if __name__ == "__main__":

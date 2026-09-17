@@ -316,11 +316,9 @@ output is `NotSigned`, names it `...-setup.UNSIGNED.exe`, and uploads it for
 seven days. That installer exists so the Windows handoff matrix can be run
 before the signing identity does, and it is never a release artifact:
 `publish-desktop.sh` refuses any Windows setup EXE with no Authenticode
-certificate table, whatever it is called. Packaging is a full release build on
-billed, doubled Windows minutes, so it is asked for rather than automatic: a
-manual dispatch, or `[package]` in the commit subject — the latter being the
-only way to reach it from a branch while `workflow_dispatch` cannot see the
-workflow off the default branch.
+certificate table, whatever it is called. Packaging is a full release build,
+so it is requested explicitly: dispatch the existing Windows workflow with
+`--ref <branch>`, or put `[package]` in a master push commit subject.
 
 The private key is a 32-byte Ed25519 seed stored as one line of unpadded
 base64url at
@@ -536,6 +534,9 @@ emulator and isolated-canary reports for the exact candidate commit and the
 currently published baseline from `/api/release`. It also waits for successful
 Linux tests and, when relevant sources changed, Windows checks on that master
 commit. Missing, skipped, failed or stale evidence prevents deployment.
+Windows runs on every master push, because even a web-only push can include
+undeployed daemon changes relative to production. Windows checks for pull
+requests remain path-filtered; manual dispatch still enables unsigned packaging.
 PR acceptance supplies review evidence; master acceptance runs again for the
 commit that will actually ship.
 
@@ -553,10 +554,36 @@ reports used by deployment. Direct deploys require the same artifact through
 `--acceptance-evidence FILE` (or `SPAWN_RELEASE_ACCEPTANCE`). Deployment validates
 the target commit and the current public baseline before the first SSH call,
 then rechecks immediately before executing the staged remote script. A baseline
-change during preparation stops deployment. `--allow-branch` does not waive
-acceptance.
-The order inside it is the forced one described above: prebuilts land before
-the server that advertises them, and the OTA goes after the server is up.
+change to an unrelated release during preparation stops deployment.
+`--allow-branch` does not waive acceptance.
+
+If deployment fails after updating services, retry the **same candidate with
+the original acceptance.json** and `--resume`. This also accepts the candidate's
+clean server identity with either its baseline daemon tree or its candidate
+daemon tree. It still rejects any third server commit, unknown daemon tree,
+dirty server or incomplete acceptance evidence. Both preflight checks use a
+snapshot of the same evidence. The original baseline remains the comparison for
+the mobile OTA, even if the remote checkout already advanced, so a failed OTA
+is still owed on retry. The public server/daemon identities verify how far that
+transition reached; the retry repeats deployment and publication for the same
+candidate rather than inferring that all release steps completed.
+
+```bash
+scripts/deploy-prod.sh <ssh-host> --resume --acceptance-evidence /path/to/original/acceptance.json
+```
+
+The release workflow passes `--resume` with its own acceptance artifact. Use
+**Re-run failed jobs** to retain that run's original plan and evidence. Starting
+a fresh workflow recalculates the plan from production and cannot reconstruct
+an earlier unfinished mobile release; use the explicit retry above when the
+original workflow is unavailable. Resume does not authorize a newer commit:
+if master has advanced, select and push an exact-candidate recovery branch and
+use the existing explicit `--allow-branch` procedure.
+
+The script verifies prebuilts before changing services, restarts server/web,
+then publishes and verifies the signed daemon manifest. The OTA goes last.
+The interval between service restart and manifest publication is one of the
+partial states the scoped retry handles.
 
 It is **armed**, as of 2026-08-31. What that means, precisely, is worth stating
 once rather than rediscovering during an incident.
@@ -597,8 +624,8 @@ not validate a changed workflow or native build.
 
 `workflow_dispatch` only sees workflows that exist on the **default branch**.
 New branch-only workflows therefore need a pull-request trigger for their first
-rehearsal. Existing Windows workflows also support `[package]` in a commit
-subject to request unsigned packaging evidence from a branch.
+rehearsal. Dispatch `windows.yml` with `--ref <branch>` for unsigned packaging
+evidence from a branch; `[package]` in a master push also requests packaging.
 
 Windows signing is restricted to `master` by the `windows-code-signing`
 environment's branch policy, so **a branch build can never be Authenticode
@@ -624,7 +651,8 @@ The script refuses to run when the release would not be what it looks like:
 - a dirty checkout or unpushed commits
 - a branch other than master (`--allow-branch` to deploy one on purpose)
 - absent or invalid connection acceptance evidence, including evidence for a
-  different candidate or a baseline that is no longer deployed
+  different candidate or a baseline that is no longer deployed (except the
+  exact candidate's partial deployment explicitly selected with `--resume`)
 - an inherited `SPAWN_API_PROXY_TARGET` — the target is baked into the web
   build at build time, and an inherited value is indistinguishable from an
   intended one. Pass `--api-proxy-target URL` when you mean a non-default

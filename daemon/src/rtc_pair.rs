@@ -518,6 +518,81 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn input_waiting_for_owner_lock_is_discarded_on_parent_retirement() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    crate::pty::WorkerCmd::Replay { resp, .. } => {
+                        let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                            control.source_offset(),
+                            vec![],
+                        )));
+                    }
+                    crate::pty::WorkerCmd::Input(bytes) => {
+                        let _ = input_tx.send(bytes.to_vec());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let pc = connect_pair(&sessions, &registry, [91; 32]).await;
+        let (pty, _ctl) = attach(&pc, id).await;
+        pty.send(&Bytes::from_static(b"before")).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), input_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"before"
+        );
+        let peer = sessions.peers.lock().await.values().next().unwrap().clone();
+        let owner_lock = sessions.controls.lock_input_owners_for_test().await;
+        pty.send(&Bytes::from_static(b"must be discarded"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if peer.fence.try_write().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("input callback reached owner lock");
+        let closing_sessions = sessions.clone();
+        let closing_pc = Arc::clone(&peer.pc);
+        let closing = tokio::spawn(async move {
+            closing_sessions.close_pair_sessions(&closing_pc).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while peer.active.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!peer.channels.ready());
+        drop(owner_lock);
+        let leaked = tokio::time::timeout(Duration::from_millis(250), input_rx.recv()).await;
+        closing.await.unwrap();
+        sessions.close_all().await;
+        pc.close().await.unwrap();
+        worker.abort();
+        assert!(
+            leaked.is_err(),
+            "input executed after parent retirement: {leaked:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn host_consumer_churn_releases_closed_channels_and_lifetimes() {
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;

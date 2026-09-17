@@ -194,7 +194,12 @@ def _deploy_env(tmp_path: Path, fakebin: Path, remote: Path, **overrides: str) -
     # shell running this suite must not trip every test into that refusal.
     env.pop("SPAWN_API_PROXY_TARGET", None)
     acceptance = tmp_path / "acceptance.json"
-    acceptance.write_text('{"fixture": "prevalidated acceptance"}\n')
+    acceptance.write_text(
+        json.dumps({
+            "fixture": "prevalidated acceptance",
+            "baseline_commit": _git(["rev-parse", "HEAD"], remote).stdout.strip(),
+        }) + "\n"
+    )
     env.update(
         {
             "PATH": f"{fakebin}:{env['PATH']}",
@@ -594,7 +599,8 @@ def test_deploy_refuses_branch_advance_after_local_acceptance_validation(tmp_pat
     assert f"--candidate {original}" in _log(tmp_path, "acceptance.log")
 
 
-def test_deploy_rechecks_public_baseline_after_preparation(tmp_path: Path):
+@pytest.mark.parametrize("resume", [False, True])
+def test_deploy_rechecks_public_baseline_after_preparation(tmp_path: Path, resume: bool):
     _origin, local, remote = _init_repo(tmp_path)
     baseline = _git(["rev-parse", "HEAD"], local).stdout.strip()
     (local / "README.md").write_text("concurrent release\n")
@@ -716,9 +722,9 @@ def test_deploy_rechecks_public_baseline_after_preparation(tmp_path: Path):
         "fi\n"
     )
     ssh.write_text(ssh.read_text().replace(marker, advance + marker))
-    result = _deploy(local, env)
+    result = _run([str(DEPLOY_SCRIPT), "prod", *(["--resume"] if resume else [])], local, env=env)
     assert result.returncode != 0
-    assert "different candidate/baseline" in result.stderr
+    assert "production does not match the acceptance baseline" in result.stderr
     assert "baseline advanced during preparation" in result.stderr
     assert _log(tmp_path, "baseline.log").splitlines() == [baseline, advanced]
     assert _git(["rev-parse", "HEAD"], remote).stdout.strip() == advanced

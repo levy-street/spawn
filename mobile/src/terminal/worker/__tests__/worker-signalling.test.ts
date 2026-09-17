@@ -349,6 +349,56 @@ describe("host-scoped signalling", () => {
 });
 
 describe("shared daemon signalling", () => {
+  test.each(["resolve", "reject"] as const)(
+    "late stats %s cannot revive a retired peer or publish diagnostics",
+    async (outcome) => {
+      jest.useFakeTimers();
+      const harness = createHarness("host");
+      try {
+        await connect(harness);
+        await signOffer(harness);
+        await harness.handleTransportMessage?.({ type: "signal-frame", frame: answerFrame() });
+        const pc = FakePeerConnection.last;
+        if (!pc) throw new Error("Missing connected peer");
+        pc.connectionState = "connected";
+        const channel = pc.channels[0];
+        if (!channel) throw new Error("Missing root channel");
+        channel.readyState = "open";
+        channel.onopen?.();
+        harness.receiveHostCtl?.(
+          JSON.stringify({
+            version: 1,
+            type: "hello",
+            protocol: "spawn.host.ctl",
+            capabilities: ["session.transport.v1"],
+            limits: {},
+          }),
+        );
+        const stats = Promise.withResolvers<Awaited<ReturnType<typeof pc.getStats>>>();
+        pc.getStats.mockImplementationOnce(() => stats.promise);
+        pc.onconnectionstatechange?.();
+        expect(posted(harness, "state").at(-1)).toMatchObject({ state: "ready" });
+        jest.advanceTimersByTime(5_000);
+        expect(pc.getStats).toHaveBeenCalledTimes(1);
+        channel.onclose?.();
+        expect(harness.state["pc"]).toBeNull();
+        expect(posted(harness, "state").at(-1)).toMatchObject({ state: "reconnecting" });
+        const stateCount = posted(harness, "state").length;
+        if (outcome === "resolve") stats.resolve(new Map());
+        else stats.reject(new Error("Peer closed during stats"));
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(posted(harness, "state")).toHaveLength(stateCount);
+        expect(posted(harness, "connection-info")).toHaveLength(0);
+        jest.advanceTimersByTime(5_000);
+        expect(pc.getStats).toHaveBeenCalledTimes(1);
+      } finally {
+        await harness.handleTransportMessage?.({ type: "close" });
+        jest.useRealTimers();
+      }
+    },
+  );
+
   test("reports selected path and RTT every five seconds while connected", async () => {
     jest.useFakeTimers();
     const harness = createHarness("host");

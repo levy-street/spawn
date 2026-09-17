@@ -80,6 +80,8 @@
       if (!pc || pc.connectionState !== "connected") return;
       try {
         const stats = await pc.getStats();
+        // A stats promise can settle after teardown or a replacement peer.
+        if (pc !== state.pc || pc.connectionState !== "connected") return;
         let selected = null;
         const records = new Map();
         stats.forEach((entry) => {
@@ -106,8 +108,8 @@
       } catch {
         // Stats are diagnostic only; an older WebKit must not affect the channel.
       } finally {
-        scheduleStats();
-        api.hostChannelOpened?.();
+        // Diagnostics must never publish readiness or rearm an old peer's timer.
+        if (pc === state.pc && pc.connectionState === "connected") scheduleStats();
       }
     }, 5_000);
   }
@@ -179,7 +181,6 @@
     state.pc = pc;
     state.ctl = pc.createDataChannel("spawn.host.ctl", CHANNEL_OPTIONS);
     configureChannel(state.ctl, "ctl");
-    api.resetHostGeneration?.();
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
       const frame = { type: "rtc.candidate", ...outerTuple(), candidate: candidate.toJSON() };
@@ -311,6 +312,7 @@
   }
 
   function teardown(sendClose) {
+    api.resetHostGeneration?.();
     api.closeHostConsumers?.();
     api.closePairChannels?.();
     if (state.mode === "host" && sendClose && state.rtcSessionId && state.bindingNonce) {

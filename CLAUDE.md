@@ -36,6 +36,11 @@ repeatable suite and the Windows checks with unsigned packaging, dispatch
 `gh workflow run test.yml --ref master` and
 `gh workflow run windows.yml --ref master`. These validation workflows do not
 deploy or publish a release.
+Windows runs on every master push so a later web-only commit can still release
+earlier undeployed daemon changes; pull-request Windows checks are path-filtered.
+To retry a partial deployment, `deploy-prod.sh --resume` retains the original
+acceptance evidence and accepts only the tested baseline/candidate identities;
+see `docs/RELEASE.md` for the exact-candidate retry procedure.
 
 ## spawn has two frontends. A change to one is a change to both
 

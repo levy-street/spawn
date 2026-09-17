@@ -182,6 +182,19 @@ class WorkflowRouting(unittest.TestCase):
         self.assertEqual(len(counts), 7)
         self.assertEqual(sum(counts), 22)
 
+    def test_windows_runs_for_master_even_when_the_latest_push_is_web_only(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = guard.yaml.load(
+            (root / ".github/workflows/windows.yml").read_text(), Loader=guard.WorkflowLoader
+        )
+        triggers = workflow["on"]
+        # Release compares against deployed production, not the previous push.
+        # A path filter here can strand earlier undeployed daemon changes.
+        self.assertEqual(triggers["push"], {"branches": ["master"]})
+        self.assertIn("daemon/**", triggers["pull_request"]["paths"])
+        self.assertIn("desktop/**", triggers["pull_request"]["paths"])
+        self.assertIn("workflow_dispatch", triggers)
+
 
 class SigningCleanup(unittest.TestCase):
     def test_restore_preserves_existing_keychains_and_deletes_only_the_job_keychain(self):

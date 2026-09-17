@@ -779,6 +779,11 @@ fn viewer_device(viewer: &str) -> Option<&str> {
 }
 
 impl SessionControlHub {
+    #[cfg(test)]
+    pub(crate) async fn lock_input_owners_for_test(&self) -> impl Drop + '_ {
+        self.inner.lock().await
+    }
+
     pub async fn transaction(&self, session_id: Uuid) -> Arc<Mutex<()>> {
         self.transactions
             .lock()

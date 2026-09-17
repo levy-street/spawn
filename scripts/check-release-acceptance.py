@@ -88,7 +88,7 @@ def observation_window(report: dict[str, Any]) -> None:
         raise ValueError("acceptance observation window is reversed or in the future")
 
 
-def deployed_baseline(origin: str) -> str:
+def production_identity(origin: str) -> tuple[str, str]:
     if origin != "https://spawnd.dev":
         raise ValueError(
             "release baseline must come from the configured production origin"
@@ -106,9 +106,17 @@ def deployed_baseline(origin: str) -> str:
         raise ValueError("production did not provide a complete server commit")
     if release.get("server", {}).get("dirty") is not False:
         raise ValueError("production reports a dirty server identity")
+    daemon_tree = release["daemon"].get("tree")
+    if not full_sha(daemon_tree):
+        raise ValueError("production did not provide a complete daemon tree")
+    return commit, daemon_tree
+
+
+def deployed_baseline(origin: str) -> str:
+    commit, daemon_tree = production_identity(origin)
     ensure_baseline_commit(commit)
     tree = git("rev-parse", f"{commit}:daemon")
-    if release.get("daemon", {}).get("tree") != tree:
+    if daemon_tree != tree:
         raise ValueError(
             "production daemon source differs from the proposed compatibility baseline"
         )
@@ -252,6 +260,35 @@ def validate_aggregate(report: Any, candidate: str, baseline: str) -> dict[str, 
     return report
 
 
+def validate_deployment(
+    report: Any, candidate: str, origin: str, *, resume: bool = False
+) -> dict[str, Any]:
+    # Evidence remains bound to the original transition, including on a retry.
+    # Do not turn the partially deployed candidate into its own test baseline.
+    baseline = report.get("baseline_commit") if isinstance(report, dict) else None
+    report = validate_aggregate(report, candidate, baseline)
+    ensure_baseline_commit(baseline)
+    baseline_tree = git("rev-parse", f"{baseline}:daemon")
+    commit, daemon_tree = production_identity(origin)
+    if commit == baseline and daemon_tree == baseline_tree:
+        return report
+    # deploy-prod advances server/web before publishing the daemon manifest.
+    # Only those two identities of this exact tested transition can resume;
+    # unrelated releases, unknown trees and dirty servers still fail closed.
+    if resume and commit == candidate:
+        candidate_tree = git("rev-parse", f"{candidate}:daemon")
+        if daemon_tree in {baseline_tree, candidate_tree}:
+            return report
+    raise ValueError(
+        "production does not match the acceptance baseline"
+        + (
+            " or this candidate's resumable deployment"
+            if resume
+            else "; use --resume with the original evidence only to finish this candidate"
+        )
+    )
+
+
 def verify(directory: Path, candidate: str, baseline: str) -> dict[str, Any]:
     if not full_sha(candidate) or not full_sha(baseline) or candidate == baseline:
         raise ValueError("candidate and baseline must be distinct full commit IDs")
@@ -359,6 +396,11 @@ def main() -> None:
     )
     parser.add_argument("--candidate")
     parser.add_argument("--baseline")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="allow this evidenced candidate's server with its baseline or candidate daemon tree",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--wait-ci", metavar="OWNER/REPO")
     parser.add_argument("--require-windows", action="store_true")
@@ -370,6 +412,17 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=5400)
     args = parser.parse_args()
     try:
+        if args.resume and (
+            not args.evidence
+            or args.baseline
+            or args.directory
+            or args.resolve_baseline
+            or args.requires_windows
+            or args.wait_ci
+        ):
+            parser.error(
+                "--resume requires --evidence and the public production identity"
+            )
         if args.resolve_baseline:
             print(deployed_baseline(args.origin))
             return
@@ -390,14 +443,22 @@ def main() -> None:
                 timeout=args.timeout,
             )
         if args.directory or args.evidence:
-            baseline = args.baseline or deployed_baseline(args.origin)
-            report = (
-                verify(args.directory, args.candidate, baseline)
-                if args.directory
-                else validate_aggregate(
-                    read_json(args.evidence), args.candidate, baseline
+            if args.evidence and not args.baseline:
+                report = validate_deployment(
+                    read_json(args.evidence),
+                    args.candidate,
+                    args.origin,
+                    resume=args.resume,
                 )
-            )
+            else:
+                baseline = args.baseline or deployed_baseline(args.origin)
+                report = (
+                    verify(args.directory, args.candidate, baseline)
+                    if args.directory
+                    else validate_aggregate(
+                        read_json(args.evidence), args.candidate, baseline
+                    )
+                )
             if args.output:
                 args.output.write_text(json.dumps(report, indent=2) + "\n")
             print(
