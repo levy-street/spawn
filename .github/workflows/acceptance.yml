@@ -33,7 +33,7 @@ permissions:
 jobs:
   resolve:
     name: bind acceptance to candidate and deployed baseline
-    runs-on: [self-hosted, Linux, X64, spawn-linux-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       candidate: ${{ steps.identity.outputs.candidate }}
@@ -70,7 +70,7 @@ jobs:
   canary:
     name: isolated old and new canary cohorts
     needs: resolve
-    runs-on: [self-hosted, Linux, X64, spawn-linux-build, spawn-minivac]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Prepare isolated output and build paths
@@ -98,6 +98,7 @@ jobs:
           CANDIDATE: ${{ needs.resolve.outputs.candidate }}
           BASELINE: ${{ needs.resolve.outputs.baseline }}
         run: |
+          git fetch --no-tags origin "$BASELINE"
           scripts/test-connection-canary.sh --baseline "$BASELINE" --candidate "$CANDIDATE" \
             --output "$CANARY_OUTPUT/evidence.json" --soak-seconds 120
       - name: Preserve canary report
@@ -114,7 +115,7 @@ jobs:
     name: complete release acceptance
     needs: [resolve, native, canary]
     if: always()
-    runs-on: [self-hosted, Linux, X64, spawn-linux-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require every acceptance job

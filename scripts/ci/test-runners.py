@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regress runner isolation, cleanup ownership and hosted-fallback refusals."""
+"""Regress runner isolation, cleanup ownership and standard hosted workflow routing."""
 
 import copy
 import importlib.util
@@ -21,7 +21,7 @@ def module(name, filename):
 
 
 pool = module("runner_pool", "runner-pool.py")
-guard = module("runner_guard", "check-self-hosted.py")
+guard = module("runner_guard", "check-hosted-runners.py")
 keychain = module("runner_keychain", "macos-keychain.py")
 
 
@@ -142,27 +142,39 @@ class ControllerOperatorBoundary(unittest.TestCase):
 
 
 class WorkflowRouting(unittest.TestCase):
-    def test_linux_builder_cannot_match_a_legacy_multivac_runner(self):
-        for role in ("spawn-linux-build", "spawn-linux-android"):
-            labels = ["self-hosted", "Linux", "X64", role]
-            with self.assertRaisesRegex(ValueError, "Minivac placement"):
-                guard.validate_labels(labels)
-            guard.validate_labels([*labels, "spawn-minivac"])
+    def workflow(self, job):
+        return "jobs:\n  check:\n" + job
 
-    def test_hosted_literal_and_expression_are_refused(self):
-        for value in ("ubuntu-latest", "windows-latest", "macos-15", "${{ vars.RUNNER }}"):
+    def test_standard_hosted_runners_are_accepted(self):
+        for value in guard.STANDARD_RUNNERS:
+            self.assertEqual(guard.validate_workflow(self.workflow("    runs-on: " + value)), 1)
+
+    def test_paid_self_hosted_and_dynamic_runners_are_refused(self):
+        for value in ("macos-15-large", "macos-15-xlarge", "ubuntu-latest-8-cores",
+                      "self-hosted", "[self-hosted, Linux, X64, spawn-linux-build]",
+                      "${{ vars.RUNNER }}", "${{ inputs.runner }}", "{group: paid}"):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                guard.validate_workflow("    runs-on: " + value)
+                guard.validate_workflow(self.workflow("    runs-on: " + value))
 
-    def test_hosted_matrix_fallback_is_refused(self):
+    def test_matrix_rejects_any_unapproved_runner(self):
+        source = self.workflow("    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        include:\n          - runner: macos-15\n          - runner: ")
+        self.assertEqual(guard.validate_workflow(source + "ubuntu-24.04"), 2)
+        for value in ("macos-15-large", "self-hosted", "${{ vars.RUNNER }}"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                guard.validate_workflow(source + value)
         with self.assertRaises(ValueError):
-            guard.validate_workflow("    runs-on: ${{ fromJSON(matrix.runner) }}\n            runner: '\"ubuntu-latest\"'")
+            guard.validate_workflow(self.workflow("    runs-on: ${{ matrix.runner }}"))
 
-    def test_missing_self_hosted_label_and_wrong_architecture_are_refused(self):
-        for labels in (["Linux", "X64", "spawn-linux-build"],
-                       ["self-hosted", "Windows", "ARM64", "spawn-windows-build"]):
-            with self.assertRaises(ValueError):
-                guard.validate_labels(labels)
+    def test_quoted_keys_aliases_and_duplicate_keys_cannot_hide_paid_runners(self):
+        self.assertEqual(guard.validate_workflow(self.workflow("    'runs-on': 'ubuntu-22.04' # floor")), 1)
+        for source in (
+            self.workflow('    "runs-on": "macos-15-large"'),
+            "runner: &paid macos-15-large\n" + self.workflow("    runs-on: *paid"),
+            self.workflow("    runs-on: ubuntu-latest\n    runs-on: macos-15-large"),
+            self.workflow("    uses: external/workflows/.github/workflows/paid.yml@main"),
+        ):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                guard.validate_workflow(source)
 
     def test_all_checked_in_jobs_have_valid_routing(self):
         root = Path(__file__).resolve().parents[2]

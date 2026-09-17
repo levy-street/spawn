@@ -250,6 +250,32 @@ class EvidenceTests(unittest.TestCase):
 
 
 class BaselineTests(unittest.TestCase):
+    def test_missing_baseline_fetches_only_the_exact_commit_without_tags(self):
+        missing = subprocess.CalledProcessError(1, ["git", "cat-file"])
+        with patch.object(gate, "git", side_effect=[missing, "", ""]) as git:
+            gate.ensure_baseline_commit(BASELINE)
+        self.assertEqual(
+            [call.args for call in git.call_args_list],
+            [
+                ("cat-file", "-e", f"{BASELINE}^{{commit}}"),
+                ("fetch", "--no-tags", "origin", BASELINE),
+                ("cat-file", "-e", f"{BASELINE}^{{commit}}"),
+            ],
+        )
+
+    def test_present_baseline_does_not_fetch_and_unavailable_baseline_fails(self):
+        with patch.object(gate, "git", return_value="") as git:
+            gate.ensure_baseline_commit(BASELINE)
+            git.assert_called_once_with("cat-file", "-e", f"{BASELINE}^{{commit}}")
+        missing = subprocess.CalledProcessError(1, ["git", "cat-file"])
+        with patch.object(gate, "git", side_effect=missing), self.assertRaises(
+            subprocess.CalledProcessError
+        ):
+            gate.ensure_baseline_commit(BASELINE)
+        with patch.object(gate, "git") as git, self.assertRaises(ValueError):
+            gate.ensure_baseline_commit("--all")
+        git.assert_not_called()
+
     def test_public_identity_requires_full_clean_server_and_matching_daemon_tree(self):
         good = {
             "server": {"commit": BASELINE, "dirty": False},

@@ -1,13 +1,1 @@
-self-hosted-runner:
-  labels:
-    - spawn-minivac
-    - spawn-linux-build
-    - spawn-linux-android
-    - spawn-linux-control
-    - spawn-linux-wait
-    - spawn-linux-release
-    - spawn-linux-arm64
-    - spawn-macos-build
-    - spawn-macos-release
-    - spawn-windows-build
-    - spawn-windows-release
+# All workflows use standard GitHub-hosted runners.

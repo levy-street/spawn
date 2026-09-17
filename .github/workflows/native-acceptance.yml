@@ -33,12 +33,12 @@ jobs:
       matrix:
         include:
           - platform: ios
-            runner: '["self-hosted", "macOS", "ARM64", "spawn-macos-build"]'
+            runner: macos-15
             client-host: 127.0.0.1
           - platform: android
-            runner: '["self-hosted", "Linux", "X64", "spawn-linux-android", "spawn-minivac"]'
+            runner: ubuntu-24.04
             client-host: 10.0.2.2
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
       CI: "1"
@@ -64,6 +64,10 @@ jobs:
         with:
           ref: ${{ inputs.candidate }}
           persist-credentials: false
+      - name: Reserve hosted Android build and emulator disk space
+        if: matrix.platform == 'android'
+        timeout-minutes: 10
+        run: python3 mobile/e2e/android-disk-preflight.py prepare
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -76,25 +80,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Install Android SDK in the isolated runner home
-        if: matrix.platform == 'android'
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
-        with:
-          log-accepted-android-sdk-licenses: false
-      - name: Check Android build and emulator disk space
-        if: matrix.platform == 'android'
-        run: python3 mobile/e2e/android-disk-preflight.py --self-hosted prepare
-      - name: Ensure Ninja is available for Android native dependencies
-        if: matrix.platform == 'android'
-        run: |
-          # Older one-job images included CMake but omitted its Ninja backend.
-          # Bootstrap only inside our disposable container, never on the host.
-          if ! command -v ninja >/dev/null; then
-            [[ "${SPAWN_RUNNER_ISOLATION:-}" == container ]]
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends ninja-build
-          fi
-          ninja --version
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Install uv
@@ -108,13 +93,20 @@ jobs:
         run: |
           uv python install 3.13
           uv sync --frozen
-      - name: Verify provisioned TURN server
-        run: command -v turnserver
+      - name: Install disposable TURN server
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            brew install coturn
+          else
+            sudo apt-get update
+            sudo apt-get install -y coturn ninja-build
+            sudo systemctl stop coturn || true
+          fi
       - name: Build candidate daemon and worker
         working-directory: daemon
         run: |
           if [[ "$NATIVE_PLATFORM" == android ]]; then
-            python3 ../mobile/e2e/android-disk-preflight.py --self-hosted build
+            python3 ../mobile/e2e/android-disk-preflight.py build
           fi
           cargo build --locked --bin spawnd --bin spawn-worker
       - name: Verify real fixture integration before native build
@@ -168,7 +160,7 @@ jobs:
           NATIVE_PLATFORM: ${{ matrix.platform }}
         run: |
           if [[ "$NATIVE_PLATFORM" == android ]]; then
-            python3 mobile/e2e/android-disk-preflight.py --self-hosted build
+            python3 mobile/e2e/android-disk-preflight.py build
           fi
           bash mobile/e2e/build-native-acceptance.sh "$NATIVE_PLATFORM" "$ACCEPTANCE_BUILD"
       - name: Reclaim disposable Android build space for the emulator
@@ -176,20 +168,19 @@ jobs:
         timeout-minutes: 5
         run: |
           python3 mobile/e2e/compact-android-build.py "$ACCEPTANCE_BUILD" "$RUNNER_TEMP"
-          python3 mobile/e2e/android-disk-preflight.py --self-hosted emulator
+          python3 mobile/e2e/android-disk-preflight.py emulator
       - name: Run iOS simulator acceptance
         if: matrix.platform == 'ios'
         run: |
           python3 mobile/e2e/run-native-acceptance.py --platform ios \
             --build "$ACCEPTANCE_BUILD" --ready-file "$ACCEPTANCE_READY" \
             --output "$ACCEPTANCE_OUTPUT" --timeout 1800
-      - name: Verify Android emulator acceleration
+      - name: Enable Android emulator acceleration
         if: matrix.platform == 'android'
         run: |
-          python3 - <<'PYCODE'
-          import os
-          assert os.access("/dev/kvm", os.R_OK | os.W_OK), "runner requires read/write KVM access"
-          PYCODE
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Run Android emulator acceptance
         if: matrix.platform == 'android'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2

@@ -13,7 +13,7 @@ server/   FastAPI API + websockets + Alembic → server/CLAUDE.md
 daemon/   Rust spawnd + spawn-worker         → daemon/CLAUDE.md
 proto/    cross-runtime golden vectors shared by daemon and web crypto
 scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot;
-          ci/ owns self-hosted runner images, pool control and platform setup
+          ci/ owns hosted-runner guards and isolated fixtures; retired pool tools remain for recovery
 infra/    docker-compose and nginx examples
 docs/     design docs; docs/RELEASE.md — the release process,
           docs/WINDOWS_VALIDATION.md — the Windows evidence gate, and
@@ -30,6 +30,12 @@ tools/    development utilities
 Each product folder has its own `CLAUDE.md` (with an `AGENTS.md` symlink
 beside it) describing its layout, where new things go, and its checks. Read
 the one for the folder you are changing before you change it.
+
+The default branch uses standard GitHub-hosted runners for CI. To run the full
+repeatable suite and the Windows checks with unsigned packaging, dispatch
+`gh workflow run test.yml --ref master` and
+`gh workflow run windows.yml --ref master`. These validation workflows do not
+deploy or publish a release.
 
 ## spawn has two frontends. A change to one is a change to both
 
@@ -90,44 +96,24 @@ failed evidence blocks promotion. `docs/CONNECTION_CANARY.md` describes the
 canary, and `docs/DEVICE_CONNECTIONS.md` distinguishes automated native
 evidence from physical-device and production observations. The lightweight
 fixture, UDP fault-proxy and evidence-validator regressions run in
-`scripts/test-all.sh`; the real native builds run on our platform runners.
+`scripts/test-all.sh`; the real native builds run on standard GitHub-hosted platform runners.
 Native fixtures prepare build configuration before compilation and activate
 their daemon only after app installation. Unexpected fixture process exits
 permanently fail acceptance; they are not silently restarted.
 After fixture readiness, native app boot has a separate 180-second budget;
 local startup diagnostics and scoped device captures preserve setup failures.
 
-Every workflow uses the explicit self-hosted pools in `docs/CI_RUNNERS.md`.
-Linux jobs run in one-job containers; Mac and Windows build/release services
-use separate standard accounts. Keep wait jobs on their own pool so they cannot
-occupy a builder they are waiting for. `scripts/ci/check-self-hosted.py` rejects
-hosted fallbacks, and the runner/disk regressions run in `scripts/test-all.sh`.
-Signing environments, exact-commit checks and release evidence remain required.
-Linux x64 build and Android jobs require the `spawn-minivac` placement label in
-addition to their capability labels. This prevents legacy Multivac registrations
-from receiving them. Minivac uses disposable disk workspaces and an 8 GiB builder
-limit; the initial 6 GiB cap OOM-killed the browser server. Android stays disabled
-until KVM and concurrent memory capacity are verified.
-Linux CI wraps `scripts/test-all.sh` with disposable PostgreSQL 16 and Redis 7
-fixtures, and sets `SPAWN_E2E_WORKERS=2` for its four-CPU container quota.
-Mac setup uses `scripts/ci/prepare-macos-accounts.py` to keep generated account
-passwords in the operator Keychain and install the release hook under a root-owned
-directory. `check-macos-runner.py` checks role identity and policy protection before
-registration; account and private password-prompt regressions run in `test-all.sh`.
-All Linux jobs run on Minivac. `scripts/ci/build-linux-arm64.sh` cross-compiles
-ARM64 outputs there against Ubuntu 22.04 and checks their execution with QEMU.
-The builder keeps its real X64 runner label. Dispatch `test.yml` with
-`arm64_only=true` for ARM64 binary validation without publication; its concurrency
-group is separate from the full suite, and both share one bounded build slot.
-The earlier Minimac Linux VM configuration is retained as historical setup
-material; it is no longer an active CI pool. macOS jobs remain on Minimac.
-Do not reactivate that legacy Linux VM pool when completing the Mac setup.
-Minivac can supervise its own build pool with `runner-pool.py --local-host minivac
---auth-source git-credential`: the existing operator credential stays outside the
-job containers. Keep this build-only service's config and state separate from the
-existing controller until its other pools are drained and migrated.
-`spawnd-ci-minivac-build.service` provides the corresponding automatic user service.
-Local mode clears inherited Docker context selection before pinning the local socket.
+Every workflow uses standard GitHub-hosted runners, as mapped in
+`docs/CI_RUNNERS.md`. `scripts/ci/check-hosted-runners.py` rejects paid runner
+sizes, self-hosted labels and unreviewed dynamic runner expressions. Runner and
+disk regressions run in `scripts/test-all.sh`. Signing environments,
+exact-commit checks and release evidence remain required.
+Linux CI uses disposable PostgreSQL 16 and Redis 7 fixtures and a networkless
+systemd VM. `SPAWN_E2E_WORKERS=2` leaves resources for the browser test server.
+Dispatch `test.yml` with `arm64_only=true` for native ARM64 binary validation
+without publication; the Ubuntu 22.04 build preserves the glibc 2.35 floor.
+The former pool controllers and machine installers in `scripts/ci/` are retired
+recovery tools. Do not register self-hosted runners or restart those pools.
 
 ## These files stay true, or they are worse than nothing
 

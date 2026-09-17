@@ -30,7 +30,7 @@ permissions:
 jobs:
   macos:
     name: macOS · ${{ matrix.target }}
-    runs-on: [self-hosted, macOS, ARM64, spawn-macos-release]
+    runs-on: macos-14
     # This job holds the whole Apple release identity — the exportable
     # Developer ID .p12, its password, and the App Store Connect key. Both
     # gates are load-bearing: `environment` scopes those secrets to a
@@ -130,7 +130,7 @@ jobs:
 
   windows:
     name: Windows · x86_64-pc-windows-msvc
-    runs-on: [self-hosted, Windows, X64, spawn-windows-release]
+    runs-on: windows-latest
     # The Key Vault federated credential is scoped to this environment; without
     # it the OIDC subject does not match and azure/login is refused. The
     # environment permits only `master`, so this job cannot sign from a branch.

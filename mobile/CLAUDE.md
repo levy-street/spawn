@@ -60,14 +60,13 @@ scripts/, docs/   build helpers and app-specific notes
   `protocol.required` frame, which is what routes into the update path. Read
   "The wire protocols" in `docs/RELEASE.md` before changing one.
 - Tests colocate in the nearest `__tests__/` directory (jest).
-- `e2e/NATIVE_ACCEPTANCE.md` describes the self-hosted iOS simulator and Android
+- `e2e/NATIVE_ACCEPTANCE.md` describes the GitHub-hosted iOS simulator and Android
   emulator acceptance job. Its controller and RTC observation hook enter only a
   disposable build copy, using the actual app providers and native WebViews.
   The Android job removes generated build directories after preserving the APK
   and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
-  Its self-hosted disk preflight measures build/emulator headroom without
-  deleting machine tooling. The legacy hosted-only reclamation mode remains
-  separately guarded; `e2e/test-android-disk-preflight.py` tests both boundaries.
+  Its hosted disk preflight reclaims only named unused tools on the disposable
+  Ubuntu runner and measures build/emulator headroom. Local machines are refused; `e2e/test-android-disk-preflight.py` tests both boundaries.
   `e2e/test-native-runner.py` checks bounded installation, diagnostics and failure
   reporting. These checks run through the root test matrix.
   The restored-login regression uses the real AuthGate and verifies that the

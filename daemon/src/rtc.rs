@@ -9293,6 +9293,7 @@ mod tests {
                 .await
                 .unwrap();
             let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+            let hooks = files.write_lifecycle_test_hooks();
             let binding = HostRtcBinding {
                 host_id: Uuid::new_v4(),
                 binding_nonce: "c".repeat(32),
@@ -9388,6 +9389,11 @@ mod tests {
             channel.send_text(terminal_frame.to_string()).await.unwrap();
 
             wait_for_host_channel_close(&channel).await;
+            // The remote channel can report Closed before the daemon's
+            // asynchronous shutdown has drained its temporary-file cleanup.
+            tokio::time::timeout(Duration::from_secs(2), hooks.wait_shutdown_returned())
+                .await
+                .expect("cancelled write shutdown did not finish cleanup");
             assert!(!root.path().join(name).exists());
             assert_eq!(
                 std::fs::read_dir(root.path())

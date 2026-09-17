@@ -2,7 +2,7 @@
 
 `.github/workflows/native-acceptance.yml` builds the exact requested candidate
 into a Release iOS simulator app and a Release Android emulator APK. It uses
-our self-hosted platform runners without EAS credentials, Apple distribution credentials,
+standard GitHub-hosted platform runners without EAS credentials, Apple distribution credentials,
 Play publication, production access, or paid test services. The parent acceptance
 workflow calls it with full candidate and deployed-baseline commit SHAs; manual
 `workflow_dispatch` accepts the same inputs. The native suite exercises the
@@ -63,13 +63,14 @@ only that run's generated `android/` and `node_modules/` directories before SDK
 installation. It requires the disposable `RUNNER_TEMP/native-app` directory;
 required SDKs, fixture executables and evidence remain available.
 
-`android-disk-preflight.py --self-hosted` measures free space and never deletes
-installed tools. It requires 15 GiB before either compilation and 16 GiB before
-emulator setup on each involved filesystem. The former hosted-only tool cleanup
-mode remains guarded separately and refuses self-hosted machines. The SDK is
-installed in the isolated runner home; KVM is passed into its container with the
-correct group instead of changing host udev permissions. See
-[`CI_RUNNERS.md`](../../docs/CI_RUNNERS.md) for runner provisioning and isolation.
+`android-disk-preflight.py` requires 15 GiB before either compilation and
+16 GiB before emulator setup on every involved filesystem. On the disposable
+Ubuntu 24.04 runner it reclaims only the explicitly named unused preinstalled
+tools; the guard refuses other hosts. Android uses the hosted SDK and KVM;
+macOS uses the installed Xcode and simulator runtimes. The workflow installs
+coturn on both platforms and Ninja for Android compilation. No persistent CI
+account, operator home or production credential is involved. See
+[`CI_RUNNERS.md`](../../docs/CI_RUNNERS.md) for the current runner map.
 
 The emulator threshold reserves room for downloads, extraction, writable AVD
 data and logs. On 2026-09-11 the official API 35 Google APIs x86_64 r9 image and

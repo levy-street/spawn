@@ -44,8 +44,8 @@ scripts/chaos-drills.sh --self-test
 scripts/test-connection-canary.sh --self-test
 
 printf '%s\n' "== native connection acceptance harness guards =="
-python3 scripts/ci/check-self-hosted.py
-python3 scripts/ci/test-runners.py
+uv run --project server python scripts/ci/check-hosted-runners.py
+uv run --project server python scripts/ci/test-runners.py
 python3 scripts/ci/test-release-hooks.py
 python3 scripts/ci/test-macos-accounts.py
 python3 scripts/test-udp-chaos-proxy.py

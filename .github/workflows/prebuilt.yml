@@ -7,7 +7,7 @@ name: prebuilt
 # `prebuilt-latest` release: the per-platform build jobs upload artifacts and a
 # single publish job assembles them, so the jobs never race to delete+recreate
 # the same release. Gated to daemon changes so it rarely spends macOS/arm minutes
-# on our own machines. Pool setup and isolation are in docs/CI_RUNNERS.md.
+# (billed on private repos; free entirely once the repo is public).
 "on":
   push:
     branches:
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   macos:
-    runs-on: [self-hosted, macOS, ARM64, "${{ github.ref == 'refs/heads/master' && 'spawn-macos-release' || 'spawn-macos-build' }}"]
+    runs-on: macos-14 # Apple Silicon; also cross-builds x86_64 from here
     timeout-minutes: 40
     # The Apple Developer ID lives in the `macos-code-signing` environment,
     # whose deployment branch policy permits only `master`. Off master the job
@@ -52,21 +52,15 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
-      # Runs the full daemon suite on real macOS — this is what catches
-      # macOS-only regressions like the sun_path socket bug before they ship.
-      # Non-blocking for now: the worker integration tests set a long temp
-      # SPAWND_WORKER_DIR that itself overflows sun_path on macOS, so this is
-      # expected red until those tests are hardened (tracked follow-up). Kept
-      # visible so we get the signal; flip to a hard gate once green.
+      # Native macOS failures must block publication. Keep test diagnostics
+      # visible even if a later test stalls before Rust prints its summary.
       - name: Test on macOS
         working-directory: daemon
-        continue-on-error: true
-        # Bounded for the same reason it is non-blocking: this step is signal,
-        # not a gate, and a wedged test must not starve the build steps of the
-        # job's 40-minute budget (observed: an upload test hung ~37 minutes on
-        # the runner and the release never built).
-        timeout-minutes: 10
-        run: cargo test --locked
+        timeout-minutes: 20
+        env:
+          TMPDIR: /private/tmp
+          RUST_BACKTRACE: "1"
+        run: cargo test --locked -- --nocapture
 
       - name: Build arm64 (aarch64-apple-darwin)
         working-directory: daemon
@@ -108,14 +102,6 @@ jobs:
           fi
           if [ "${DEVELOPER_ID:-}" = "true" ] && [ -n "${APPLE_CERTIFICATE:-}" ]; then
             keychain="$RUNNER_TEMP/spawnd-signing.keychain-db"
-            python3 scripts/ci/macos-keychain.py save
-            cleanup_signing() {
-              result=$?
-              python3 scripts/ci/macos-keychain.py restore || result=1
-              rm -f "$RUNNER_TEMP/daemon-cert.p12" || result=1
-              exit "$result"
-            }
-            trap cleanup_signing EXIT
             password="$(uuidgen)"
             security create-keychain -p "$password" "$keychain"
             security set-keychain-settings -lut 900 "$keychain"
@@ -146,9 +132,9 @@ jobs:
             # The whole point of the step. If either line is missing the build
             # would ship binaries that ask for consent anonymously, so fail
             # here rather than find out from a user.
-            codesign -dv --verbose=2 "$binary" 2>&1 | tee "$RUNNER_TEMP/sig.txt"
-            grep -q 'Identifier=dev\.spawnd\.daemon' "$RUNNER_TEMP/sig.txt"
-            grep -q 'Info\.plist entries=' "$RUNNER_TEMP/sig.txt"
+            codesign -dv --verbose=2 "$binary" 2>&1 | tee /tmp/sig.txt
+            grep -q 'Identifier=dev\.spawnd\.daemon' /tmp/sig.txt
+            grep -q 'Info\.plist entries=' /tmp/sig.txt
           done
 
       - name: Stage binaries
@@ -169,7 +155,7 @@ jobs:
           if-no-files-found: error
 
   linux-x86_64:
-    runs-on: [self-hosted, Linux, X64, spawn-linux-build, spawn-minivac]
+    runs-on: ubuntu-22.04 # glibc 2.35 floor — older hosts fall back to source
     timeout-minutes: 40
     steps:
       - name: Check out repository
@@ -236,11 +222,13 @@ jobs:
           if-no-files-found: error
 
   linux-aarch64:
-    runs-on: [self-hosted, Linux, X64, spawn-linux-build, spawn-minivac]
+    runs-on: ubuntu-22.04-arm # native arm64 — no cross toolchain, glibc 2.35 floor
     timeout-minutes: 40
-    # Preserve the existing non-fatal ARM64 build-result policy. An offline
-    # Minivac runner still queues this job, so provision it before releasing.
-    # Missing platform artifacts remain visible at deploy and verification.
+    # Non-blocking: native arm64 hosted runners depend on the repo's plan, and a
+    # missing runner must not wedge the whole rolling release (which would also
+    # stop shipping the Darwin + linux-x86_64 prebuilts). If this job is skipped
+    # or fails, publish still cuts the release from whatever artifacts exist; the
+    # absent target is loud at deploy (publish_prebuilts) and verify time (SKIP).
     continue-on-error: true
     steps:
       - name: Check out repository
@@ -256,26 +244,32 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             daemon/target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-aarch64-${{ hashFiles('daemon/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('daemon/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-aarch64-
+            cargo-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build arm64 and verify emulated execution on Minivac
-        run: bash scripts/ci/build-linux-arm64.sh
+      - name: Build arm64 (aarch64-unknown-linux-gnu)
+        working-directory: daemon
+        run: cargo build --release --locked --bin spawnd --bin spawn-worker
+
+      - name: Stage binaries
+        run: |
+          set -eu
+          mkdir -p out
+          cp daemon/target/release/spawnd       out/spawnd-aarch64-unknown-linux-gnu
+          cp daemon/target/release/spawn-worker out/spawn-worker-aarch64-unknown-linux-gnu
 
       - name: Upload linux-aarch64 artifacts
         uses: actions/upload-artifact@v4
         with:
           name: prebuilt-linux-aarch64
-          path: |
-            out/spawnd-aarch64-unknown-linux-gnu
-            out/spawn-worker-aarch64-unknown-linux-gnu
+          path: out/
           retention-days: 1
           if-no-files-found: error
 
   windows-x86_64:
     if: github.ref == 'refs/heads/master'
-    runs-on: [self-hosted, Windows, X64, spawn-windows-release]
+    runs-on: windows-latest
     environment: windows-code-signing
     timeout-minutes: 40
     permissions:
@@ -445,7 +439,7 @@ jobs:
     # on any other ref still builds and uploads run artifacts — the way to get
     # branch binaries for a dev host — but must never touch prebuilt-latest.
     if: github.ref == 'refs/heads/master'
-    runs-on: [self-hosted, Linux, X64, spawn-linux-release]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write # move the rolling `prebuilt-latest` tag + upload assets

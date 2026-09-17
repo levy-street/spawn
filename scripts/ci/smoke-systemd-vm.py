@@ -15,8 +15,10 @@ def run(*args):
 
 
 def main():
-    if os.environ.get("SPAWN_RUNNER_ISOLATION") != "container" or os.geteuid() == 0:
-        raise SystemExit("systemd VM smoke requires the unprivileged CI container")
+    if (os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+            or os.environ.get("RUNNER_OS") != "Linux" or os.geteuid() == 0):
+        raise SystemExit("systemd VM smoke requires an unprivileged hosted Linux runner")
     root = Path(__file__).resolve().parents[2]
     output = Path(os.environ["RUNNER_TEMP"]) / "spawnd-systemd-smoke-serial.log"
     with tempfile.TemporaryDirectory(prefix="spawnd-systemd-vm-", dir=os.environ["RUNNER_TEMP"]) as directory:

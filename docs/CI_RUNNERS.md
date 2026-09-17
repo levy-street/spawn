@@ -1,3 +1,60 @@
+# GitHub-hosted CI
+
+SPAWN D is public. All active workflows use standard GitHub-hosted runners;
+these public-repository compute minutes are free. Larger runners are not used.
+The repository cache limit remains the included 10 GiB. Artifact storage and
+other repositories have their own billing rules; free compute is not a claim
+about the organization's entire bill.
+
+| Work | Runner |
+| --- | --- |
+| Full Linux suite, isolated canary and acceptance coordination | Ubuntu 24.04 |
+| Linux release-profile binaries | Ubuntu 22.04 x86-64 and native ARM64 |
+| Darwin daemon and signed desktop builds | macOS 14 |
+| iOS simulator acceptance | macOS 15 |
+| Android emulator acceptance | Ubuntu 24.04 with KVM |
+| Windows daemon, desktop tests and unsigned packaging | windows-latest |
+| Release coordination and publication | Standard Ubuntu runners |
+
+`scripts/ci/check-hosted-runners.py` checks every workflow and rejects
+self-hosted labels, paid runner sizes and dynamic runner choices outside the
+explicit native platform matrix. Its regressions run in `scripts/test-all.sh`.
+Changing runner labels must preserve this check and the Linux glibc 2.35 floor.
+
+Run the full suite and Windows packaging against the same pushed candidate:
+
+```bash
+gh workflow run test.yml --ref <candidate-branch>
+gh workflow run windows.yml --ref <candidate-branch>
+gh workflow run test.yml --ref <candidate-branch> -f arm64_only=true
+```
+
+A pull request runs `acceptance.yml`, which binds native iOS/Android reports and
+the isolated old/new canary to the exact candidate and current public deployed
+baseline. All cases and cleanup must pass. Simulator/emulator evidence does
+not imply physical-device or production rollout evidence.
+
+Linux tests use fresh loopback-only PostgreSQL 16 and Redis 7 instances, plus a
+networkless disposable VM for actual systemd-user behavior. Android headroom
+checks may reclaim only approved unused tools on a verified hosted Ubuntu
+24.04 machine. Native fixture credentials and the disposable app are excluded
+from uploaded evidence. No production services are used by these fixtures.
+
+Release signing environments remain restricted to master. The rolling
+prebuilt release and deployment workflows publish or deploy and must not be
+manually dispatched for ordinary validation. Off-master `prebuilt.yml` builds
+Darwin and Linux artifacts while skipping Windows signing and publication;
+`windows.yml` supplies the unsigned Windows rehearsal separately. macOS daemon
+tests are a hard gate; a successful binary build cannot hide failed tests.
+
+## Retired self-hosted setup
+
+The self-hosted runner registrations and controller services were removed or
+disabled before publication. The following historical instructions and their
+scripts remain only for interpreting old evidence and recovering old setup.
+They are not the current CI contract. Do not restart these pools or register
+runners to satisfy a current check.
+
 # SPAWN D CI runners
 
 GitHub schedules the workflows and retains their logs and artifacts. Every job

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Give a command fresh loopback-only fixtures without exposing host Docker.
+# Give a hosted CI command fresh loopback-only database fixtures.
 set -euo pipefail
-[[ "${SPAWN_RUNNER_ISOLATION:-}" == container && "$EUID" != 0 ]]
+[[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]]
+[[ "${RUNNER_OS:-}" == Linux && "$EUID" != 0 ]]
 [[ $# -gt 0 ]]
 pg_bin=/usr/lib/postgresql/16/bin
 "$pg_bin/postgres" --version

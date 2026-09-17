@@ -37,7 +37,21 @@ CANARY_CASES = {
 
 
 def git(*arguments: str) -> str:
-    return subprocess.check_output(["git", *arguments], cwd=ROOT, text=True).strip()
+    return subprocess.check_output(
+        ["git", *arguments], cwd=ROOT, text=True, stderr=subprocess.PIPE
+    ).strip()
+
+
+def ensure_baseline_commit(commit: str) -> None:
+    if not full_sha(commit):
+        raise ValueError("baseline must be a full commit ID")
+    try:
+        git("cat-file", "-e", f"{commit}^{{commit}}")
+    except subprocess.CalledProcessError:
+        # A history rewrite leaves production on its original content identity.
+        # Fetch that exact object without restoring any old branch or tag.
+        git("fetch", "--no-tags", "origin", commit)
+        git("cat-file", "-e", f"{commit}^{{commit}}")
 
 
 def full_sha(value: Any) -> bool:
@@ -92,6 +106,7 @@ def deployed_baseline(origin: str) -> str:
         raise ValueError("production did not provide a complete server commit")
     if release.get("server", {}).get("dirty") is not False:
         raise ValueError("production reports a dirty server identity")
+    ensure_baseline_commit(commit)
     tree = git("rev-parse", f"{commit}:daemon")
     if release.get("daemon", {}).get("tree") != tree:
         raise ValueError(
