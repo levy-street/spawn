@@ -58,19 +58,15 @@ jobs:
 
       - name: Test daemon
         working-directory: daemon
-        env:
-          SPAWND_RTC_TEST_TRACE: "1"
         run: cargo test --locked --target x86_64-pc-windows-msvc
 
-      - name: Repeat shared device channel lifecycle with diagnostics
+      - name: Stress concurrent RTC tests without trace logging
         if: ${{ !cancelled() }}
         working-directory: daemon
-        env:
-          SPAWND_RTC_TEST_TRACE: "1"
         run: |
-          for ($iteration = 1; $iteration -le 50; $iteration++) {
-            Write-Host "Shared channel lifecycle repetition $iteration of 50"
-            cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact
+          for ($iteration = 1; $iteration -le 20; $iteration++) {
+            Write-Host "Concurrent RTC repetition $iteration of 20"
+            cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc:: -- --test-threads=8
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 

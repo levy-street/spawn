@@ -1159,6 +1159,18 @@ mod tests {
                     }
                 }
             }
+            let late_started = std::time::Instant::now();
+            let late = tokio::time::timeout(Duration::from_secs(10), async {
+                while missing.ready_state() != RTCDataChannelState::Closed {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            eprintln!(
+                "closure after the failed deadline: {late:?}, extra wait {:?}, state {:?}",
+                late_started.elapsed(),
+                missing.ready_state()
+            );
         }
         refused.expect("unknown local session refused");
         assert_eq!(pc.connection_state(), RTCPeerConnectionState::Connected);
