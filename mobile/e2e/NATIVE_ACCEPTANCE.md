@@ -144,8 +144,13 @@ The native runner selects an installed iPhone simulator matching the active
 Xcode simulator SDK's major/minor version, or the single running Android
 emulator. A missing matching iPhone runtime fails setup; use `--device UUID`
 for intentional coverage of another installed iPhone runtime. It refuses
-physical Android devices. It records the actual runtime, simulator SDK, app
-build metadata, screenshots and sanitized native logs. The fixture
+physical Android devices. On iOS it warms Settings before starting the fixture
+or test app, so initializing that system app is outside the timed cases.
+Foreground resumes the existing app through its disposable `spawn-acceptance`
+URL scheme; initial launch and process restart still use `simctl launch`.
+The suite continues to require actual native lifecycle callbacks and a measured
+short background interval below three seconds. It records the actual runtime,
+simulator SDK, app build metadata, screenshots and sanitized native logs. The fixture
 writes the acceptance verdict and verifies real shell input, upload hashes and
 UDP fault counters. A native build, typecheck, Expo export, Jest result, or Expo
 Go smoke alone does not produce a passing native verdict.
@@ -186,7 +191,8 @@ values contain `{runId,snapshot}`. Native command values contain `{action,result
 The schema kinds are `native_simulator` and `native_emulator`; neither means a
 physical phone passed.
 
-A snapshot has `appState`, `accountReady`, `accountId`, `deviceId`, `identityGeneration`,
+A snapshot has `appState`, `launchId`, `lifecycleSequence`, `lifecycleTransitions`,
+`accountReady`, `accountId`, `deviceId`, `identityGeneration`,
 `sessions:{a|b:{sessionId,state,daemonState,owner}}`, `tools:[{index,state}]`,
 `uploads`, `peer`, `peerAgeMs`, and `nativeDateMs`. The peer observation has `workerId`, `sampledAtMs`,
 `livePeerCount`, `createdPeerCount`, and `peers`. Each peer includes its ID,
@@ -197,7 +203,12 @@ well as counts across lifecycle transitions. Destroyed/background workers can
 leave stale observations, so readiness requires a fresh sample, and retirement
 also needs independent daemon evidence.
 App-state events include `nativeDateMs`, captured with the actual lifecycle
-notification, so the suite checks the measured background interval. Background
+notification. The controller synchronously retains the last 64 observations as
+`{sequence,state,nativeDateMs}` before attempting diagnostic HTTP delivery, which
+can be interrupted during suspension. After foregrounding, snapshots supply this
+journal for measured intervals. The suite requires contiguous observations after
+the case's starting sequence, the same app launch, and actual background then
+active callbacks; missing, overflowed or reversed evidence cannot pass. Background
 case `recovery_ms` measures the full control round trip, including the background
 wait and command overhead. `deviceId`
 supports revoking the registered key through the normal browser-device API.

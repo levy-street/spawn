@@ -200,6 +200,11 @@ class Runner:
             # Installation exceeded the default 120s on a cold hosted run.
             # Give setup one larger bounded attempt; product cases are not retried.
             self.simctl("install", self.device, str(artifact), timeout=SIMULATOR_INSTALL_TIMEOUT_SECONDS)
+            # The timed background case switches to Settings. Its first launch
+            # initializes a cold system app and can dominate the measured gap.
+            # Warm only that control app before the fixture or test app starts.
+            self.platform_phase(platform_info, "warming_background_target")
+            self.simctl("launch", self.device, "com.apple.Preferences")
         self.platform_phase(platform_info, "starting_fixture")
         self.start_fixture()
         self.platform_phase(platform_info, "launching")
@@ -282,7 +287,13 @@ class Runner:
                 raise ValueError("Native background duration must be between 0 and 30000 ms")
             time.sleep(duration)
         elif action == "foreground":
-            self.launch()
+            if self.args.platform == "ios":
+                # This scheme belongs only to the disposable acceptance app.
+                # URL activation resumes its existing process without waiting
+                # through simctl launch's process-start acknowledgement path.
+                self.simctl("openurl", self.device, "spawn-acceptance:///")
+            else:
+                self.launch()
         elif action == "relaunch":
             if self.args.platform == "android":
                 self.adb("shell", "am", "force-stop", APP_ID)

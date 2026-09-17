@@ -128,6 +128,12 @@ export function NativeAcceptanceController(): React.JSX.Element {
   useEffect(() => {
     let stopped = false;
     let current: Bootstrap;
+    let lifecycleSequence = 0;
+    const lifecycleTransitions: Array<{
+      sequence: number;
+      state: string;
+      nativeDateMs: number;
+    }> = [];
     let startupPhase = "mounted";
     const startupError = (error: unknown) => {
       let message = String(error);
@@ -162,6 +168,9 @@ export function NativeAcceptanceController(): React.JSX.Element {
     diagnostic(startupPhase);
     const snapshot = () => ({
       appState: AppState.currentState,
+      launchId,
+      lifecycleSequence,
+      lifecycleTransitions: lifecycleTransitions.slice(),
       nativeDateMs: Date.now(),
       accountReady: accountRef.current.ready,
       accountId: accountRef.current.accountId,
@@ -430,7 +439,12 @@ export function NativeAcceptanceController(): React.JSX.Element {
       }
     };
     const lifecycle = AppState.addEventListener("change", (state) => {
-      void event("app-state", { state, nativeDateMs: Date.now() }).catch(() => {});
+      const transition = { sequence: ++lifecycleSequence, state, nativeDateMs: Date.now() };
+      // Suspension can interrupt the diagnostic HTTP request. Keep the actual
+      // callback observation synchronously for the first snapshot after resume.
+      lifecycleTransitions.push(transition);
+      if (lifecycleTransitions.length > 64) lifecycleTransitions.shift();
+      void event("app-state", transition).catch(() => {});
     });
     void (async () => {
       try {

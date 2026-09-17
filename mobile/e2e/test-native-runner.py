@@ -142,6 +142,28 @@ class NativeRunnerSetup(unittest.TestCase):
         self.assertEqual(platform["runtime"], RUNTIME)
         self.assertEqual(platform["simulator_sdk"], "18.5")
 
+    def test_ios_background_target_is_warmed_before_fixture_and_app_launch(self):
+        order = []
+
+        def native(command, **kwargs):
+            if command[:3] == ("xcrun", "simctl", "launch"):
+                self.assertEqual(command[-1], "com.apple.Preferences")
+                order.append("warm-settings")
+            return self.completed(command, **kwargs)
+
+        self.runner.start_fixture = Mock(side_effect=lambda: order.append("fixture"))
+        self.runner.launch = Mock(side_effect=lambda: order.append("app"))
+        with patch.object(module.subprocess, "run", side_effect=native):
+            self.runner.install()
+        self.assertEqual(order, ["warm-settings", "fixture", "app"])
+
+    def test_ios_foreground_activates_only_the_disposable_app_scheme(self):
+        self.runner.device = DEVICE
+        self.runner.simctl = Mock()
+        self.runner.perform("foreground", {})
+        self.runner.simctl.assert_called_once_with("openurl", DEVICE, "spawn-acceptance:///")
+        self.runner.launch.assert_not_called()
+
     def test_missing_sdk_runtime_fails_before_boot_install_or_fixture_start(self):
         calls = []
 

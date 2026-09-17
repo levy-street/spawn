@@ -121,6 +121,10 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   must not close a replacement connection opened on the same bridge.
   Native acceptance selects an iPhone runtime matching the active Xcode simulator
   SDK; an explicit `--device UUID` opts into another installed runtime.
+  It warms Settings before timed background cases and foregrounds the disposable
+  app through its own URL scheme. Its bounded lifecycle journal retains actual
+  callbacks through suspension; missing, reordered or replaced observations fail
+  acceptance rather than depending on diagnostic HTTP delivery.
 
 ## Before calling a change done
 

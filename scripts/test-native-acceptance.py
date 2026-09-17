@@ -38,6 +38,56 @@ suite = load("native-acceptance-suite")
 
 
 class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
+    def test_lifecycle_interval_uses_retained_callbacks_after_the_case_start(self):
+        before = {"launchId": "same-process", "lifecycleSequence": 3}
+        after = {
+            "launchId": "same-process", "lifecycleSequence": 6,
+            "lifecycleTransitions": [
+                {"sequence": 1, "state": "inactive", "nativeDateMs": 100},
+                {"sequence": 2, "state": "background", "nativeDateMs": 200},
+                {"sequence": 3, "state": "active", "nativeDateMs": 300},
+                {"sequence": 4, "state": "inactive", "nativeDateMs": 1000},
+                {"sequence": 5, "state": "background", "nativeDateMs": 1100},
+                {"sequence": 6, "state": "active", "nativeDateMs": 1600},
+            ],
+        }
+        self.assertEqual(suite.lifecycle_interval(before, after), (1100, 1600))
+        after["lifecycleSequence"] = 3
+        after["lifecycleTransitions"] = after["lifecycleTransitions"][:3]
+        self.assertIsNone(suite.lifecycle_interval(before, after))
+
+    def test_lifecycle_interval_waits_for_real_background_and_active_callbacks(self):
+        before = {"launchId": "same-process", "lifecycleSequence": 0}
+        after = {
+            "launchId": "same-process", "lifecycleSequence": 1,
+            "lifecycleTransitions": [{"sequence": 1, "state": "inactive", "nativeDateMs": 100}],
+        }
+        self.assertIsNone(suite.lifecycle_interval(before, after))
+        after["lifecycleSequence"] = 2
+        after["lifecycleTransitions"].append({"sequence": 2, "state": "active", "nativeDateMs": 200})
+        self.assertIsNone(suite.lifecycle_interval(before, after))
+
+    def test_lifecycle_interval_rejects_missing_or_replaced_evidence(self):
+        before = {"launchId": "same-process", "lifecycleSequence": 0}
+        after = {
+            "launchId": "same-process", "lifecycleSequence": 2,
+            "lifecycleTransitions": [
+                {"sequence": 1, "state": "background", "nativeDateMs": 100},
+                {"sequence": 2, "state": "active", "nativeDateMs": 200},
+            ],
+        }
+        for mutate in (
+            lambda value: value.update(launchId="new-process"),
+            lambda value: value.update(lifecycleSequence=3),
+            lambda value: value["lifecycleTransitions"].pop(0),
+            lambda value: value["lifecycleTransitions"][1].update(nativeDateMs=50),
+        ):
+            with self.subTest(mutate=mutate):
+                changed = json.loads(json.dumps(after))
+                mutate(changed)
+                with self.assertRaises(AssertionError):
+                    suite.lifecycle_interval(before, changed)
+
     def setUp(self):
         self.output = tempfile.TemporaryDirectory(prefix="native-boundary-")
         self.fixture = fixture_module.Fixture(

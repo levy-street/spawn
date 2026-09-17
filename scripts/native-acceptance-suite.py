@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import time
 import uuid
@@ -17,6 +18,53 @@ NATIVE_BOOT_TIMEOUT_SECONDS = 180
 def require(condition: Any, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def lifecycle_interval(before: dict, after: dict) -> tuple[float, float] | None:
+    """Read actual callbacks retained by this app launch, not HTTP arrival order."""
+    require(
+        isinstance(before.get("launchId"), str)
+        and before["launchId"] == after.get("launchId"),
+        "backgrounding replaced the native app launch",
+    )
+    start = before.get("lifecycleSequence")
+    end = after.get("lifecycleSequence")
+    history = after.get("lifecycleTransitions")
+    require(
+        type(start) is int and type(end) is int and 0 <= start <= end,
+        "native lifecycle sequence is absent or went backwards",
+    )
+    require(isinstance(history, list) and len(history) <= 64, "invalid lifecycle history")
+    previous = None
+    for item in history:
+        require(
+            isinstance(item, dict)
+            and type(item.get("sequence")) is int
+            and item["sequence"] > 0
+            and isinstance(item.get("state"), str)
+            and type(item.get("nativeDateMs")) in (int, float)
+            and math.isfinite(item["nativeDateMs"]),
+            "invalid native lifecycle observation",
+        )
+        require(
+            previous is None or item["sequence"] == previous + 1,
+            "native lifecycle observations have a gap",
+        )
+        previous = item["sequence"]
+    require((previous or 0) == end, "native lifecycle history is incomplete")
+    changed = [item for item in history if item["sequence"] > start]
+    require(
+        not changed or changed[0]["sequence"] == start + 1,
+        "native lifecycle history overflowed during the case",
+    )
+    background = None
+    for item in changed:
+        if background is None and item["state"] == "background":
+            background = item["nativeDateMs"]
+        elif background is not None and item["state"] == "active":
+            require(item["nativeDateMs"] > background, "native lifecycle time went backwards")
+            return background, item["nativeDateMs"]
+    return None
 
 
 def native_revocation_body(fixture: Any, device_id: str) -> dict[str, str]:
@@ -304,36 +352,24 @@ async def exercise(fixture: Any) -> None:
         async def background(milliseconds: int) -> dict[str, Any]:
             before = await snapshot()
             started = time.monotonic()
-            event_start = len(fixture.events)
             await fixture.command(
                 "background", {"durationMs": milliseconds}, native=True
             )
             await fixture.command("foreground", native=True)
             after = await wait_ready()
             await echo()
-            transitions = [
-                event["details"]["values"]
-                for event in fixture.events[event_start:]
-                if event.get("type") == "app-state"
-            ]
-            inactive = next(
-                (item for item in transitions if item.get("state") == "background"),
-                None,
+
+            async def resumed():
+                observed = await snapshot()
+                interval = lifecycle_interval(before, observed)
+                return (observed, interval) if observed.get("appState") == "active" and interval else None
+
+            after, (inactive_ms, active_ms) = await eventually(
+                resumed,
+                message="native app did not retain background and foreground transitions",
             )
-            active = next(
-                (
-                    item
-                    for item in reversed(transitions)
-                    if item.get("state") == "active"
-                ),
-                None,
-            )
-            require(
-                inactive is not None and active is not None,
-                "native app did not report background and foreground transitions",
-            )
-            measured_ms = active["nativeDateMs"] - inactive["nativeDateMs"]
-            after = await wait_ready(min_sample_ms=active["nativeDateMs"])
+            measured_ms = active_ms - inactive_ms
+            after = await wait_ready(min_sample_ms=active_ms)
             require(measured_ms > 0, "native background interval was not measured")
             same_parent = (
                 before["peer"]["workerId"] == after["peer"]["workerId"]

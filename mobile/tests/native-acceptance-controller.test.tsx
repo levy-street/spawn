@@ -1,5 +1,6 @@
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { act, waitFor } from "@testing-library/react-native";
+import { AppState, type AppStateStatus } from "react-native";
 import { authToken } from "@/data/api/auth-token";
 import { NativeAcceptanceController } from "../e2e/native-controller";
 import { renderWithProviders } from "./render";
@@ -54,6 +55,77 @@ jest.mock("@/terminal/TerminalSurface", () => ({ TerminalSurface: () => null }))
 jest.mock("@/terminal/transport/host-transport-registry", () => ({
   retainHostTransport: jest.fn(),
 }));
+
+test("snapshots retain bounded lifecycle evidence when background event requests fail", async () => {
+  const listeners = new Set<(state: AppStateStatus) => void>();
+  const previousState = AppState.currentState;
+  const subscription = AppState.addEventListener;
+  AppState.currentState = "active";
+  AppState.addEventListener = jest.fn((_, listener) => {
+    listeners.add(listener);
+    return { remove: () => listeners.delete(listener) };
+  });
+  const events: Array<{
+    type: string;
+    commandId?: string;
+    details: { values: Record<string, unknown> };
+  }> = [];
+  let command: { id: string; action: string } | null = null;
+  const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    let body: unknown = null;
+    if (path === "/__acceptance/bootstrap") {
+      body = { accountId: ACCOUNT_ID, bearerToken: "fixture-token", candidateCommit: "candidate" };
+    } else if (path === "/__acceptance/device") {
+      body = { approved: true };
+    } else if (path === "/__acceptance/event") {
+      const entry = JSON.parse(String(init?.body));
+      if (entry.type === "app-state") throw new Error("request suspended with the app");
+      events.push(entry);
+    } else if (path === "/__acceptance/command") {
+      body = command;
+      command = null;
+    } else {
+      throw new Error(`Unexpected fixture path: ${path}`);
+    }
+    return new Response(JSON.stringify(body), { status: 200 });
+  });
+  const view = await renderWithProviders(<NativeAcceptanceController />);
+  try {
+    await waitFor(() => expect(events.some((entry) => entry.type === "boot")).toBe(true));
+    await act(async () => {
+      for (const state of ["inactive", "background", "active"] as const)
+        for (const listener of listeners) listener(state);
+    });
+    command = { id: "resumed", action: "snapshot" };
+    await waitFor(() => expect(events.some((entry) => entry.commandId === "resumed")).toBe(true));
+    expect(events.find((entry) => entry.commandId === "resumed")?.details.values["result"]).toEqual(
+      expect.objectContaining({
+        launchId: expect.any(String),
+        lifecycleSequence: 3,
+        lifecycleTransitions: [
+          { sequence: 1, state: "inactive", nativeDateMs: expect.any(Number) },
+          { sequence: 2, state: "background", nativeDateMs: expect.any(Number) },
+          { sequence: 3, state: "active", nativeDateMs: expect.any(Number) },
+        ],
+      }),
+    );
+    await act(async () => {
+      for (let i = 0; i < 70; i++) for (const listener of listeners) listener("inactive");
+    });
+    command = { id: "bounded", action: "snapshot" };
+    await waitFor(() => expect(events.some((entry) => entry.commandId === "bounded")).toBe(true));
+    const result = events.find((entry) => entry.commandId === "bounded")?.details.values["result"];
+    expect(result).toEqual(expect.objectContaining({ lifecycleSequence: 73 }));
+    expect((result as { lifecycleTransitions: unknown[] }).lifecycleTransitions).toHaveLength(64);
+  } finally {
+    await view.unmount();
+    view.queryClient.clear();
+    fetch.mockRestore();
+    AppState.currentState = previousState;
+    AppState.addEventListener = subscription;
+  }
+});
 
 test("boot waits for authentication reset and endorses the server device row", async () => {
   const queryClient = new QueryClient({
