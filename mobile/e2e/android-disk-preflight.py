@@ -11,6 +11,9 @@ import subprocess
 
 GIB = 1024**3
 MIN_FREE = {"prepare": 15 * GIB, "build": 15 * GIB, "emulator": 16 * GIB}
+# Preserve ample build/emulator space without walking or deleting preinstalled
+# tool trees on hosted images that already have more than enough free space.
+PREPARE_RESERVE = 40 * GIB
 # Verified against actions/runner-images ubuntu24/20260907.300 installation
 # scripts. No Android, Java, Node, Rust, Python, shared compiler or user paths.
 UNUSED_TOOLS = (
@@ -72,11 +75,7 @@ def reclaim_tools() -> None:
                 raise RuntimeError(f"Refusing non-directory or mounted tool path: {path}")
             present.append(path)
     for path in present:
-        size = subprocess.check_output(
-            ["sudo", "-n", "du", "-sx", "-B1", "--", str(path)],
-            text=True, timeout=30,
-        ).split()[0]
-        print(json.dumps({"event": "reclaim_tool", "path": str(path), "allocated_bytes": int(size)}), flush=True)
+        print(json.dumps({"event": "reclaim_tool", "path": str(path)}), flush=True)
         subprocess.run(
             ["sudo", "-n", "rm", "-rf", "--one-file-system", "--preserve-root=all", "--", str(path)],
             check=True, timeout=90,
@@ -89,8 +88,8 @@ def preflight(stage: str, *, self_hosted: bool = False) -> None:
     else:
         require_hosted_android()
     minimum = MIN_FREE[stage]
-    disk_snapshot(stage, "before")
-    if stage == "prepare" and not self_hosted:
+    before = disk_snapshot(stage, "before")
+    if stage == "prepare" and not self_hosted and min(before.values()) < PREPARE_RESERVE:
         reclaim_tools()
     free = disk_snapshot(stage, "after")
     insufficient = {path: value for path, value in free.items() if value < minimum}

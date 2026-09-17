@@ -105,11 +105,19 @@ class HostedDiskPreflight(unittest.TestCase):
 
         self.run.side_effect = remove_dummy
         disk.preflight("prepare")
+        self.du.assert_not_called()
         self.assertTrue(all(not tool.exists() for tool in self.tools))
         self.assertTrue((self.sdk / "required-tool").exists())
         reports = [json.loads(call.args[0]) for call in self.output.call_args_list]
         self.assertEqual([r["event"] for r in reports if "free_bytes" in r], ["before", "after"])
         self.assertEqual(reports[-1]["event"], "headroom_passed")
+
+    def test_ample_hosted_headroom_needs_no_tool_scan_or_reclamation(self):
+        self.usage.return_value = SimpleNamespace(free=40 * disk.GIB)
+        disk.preflight("prepare")
+        self.run.assert_not_called()
+        self.du.assert_not_called()
+        self.assertTrue(all((tool / "dummy-tool").exists() for tool in self.tools))
 
     def test_absent_allowlisted_tool_does_not_expand_cleanup_scope(self):
         for tool in self.tools:

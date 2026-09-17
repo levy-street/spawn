@@ -68,7 +68,8 @@ required SDKs, fixture executables and evidence remain available.
 `android-disk-preflight.py` requires 15 GiB before either compilation and
 16 GiB before emulator setup on every involved filesystem. On the disposable
 Ubuntu 24.04 runner it reclaims only the explicitly named unused preinstalled
-tools; the guard refuses other hosts. Android uses the hosted SDK and KVM;
+tools when less than 40 GiB is free. Before/after free-space measurements avoid
+recursive tool-size scans; the guard refuses other hosts. Android uses the hosted SDK and KVM;
 macOS uses the installed Xcode and simulator runtimes. The workflow installs
 coturn on both platforms and Ninja for Android compilation. No persistent CI
 account, operator home or production credential is involved. See

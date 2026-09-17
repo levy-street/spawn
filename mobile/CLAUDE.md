@@ -66,7 +66,9 @@ scripts/, docs/   build helpers and app-specific notes
   The Android job removes generated build directories after preserving the APK
   and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
   Its hosted disk preflight reclaims only named unused tools on the disposable
-  Ubuntu runner and measures build/emulator headroom. Local machines are refused; `e2e/test-android-disk-preflight.py` tests both boundaries.
+  Ubuntu runner when less than 40 GiB is free and measures build/emulator headroom
+  without recursively scanning tool trees. Local machines are refused;
+  `e2e/test-android-disk-preflight.py` tests these boundaries.
   `e2e/test-native-runner.py` checks bounded installation, diagnostics and failure
   reporting. These checks run through the root test matrix.
   The restored-login regression uses the real AuthGate and verifies that the
