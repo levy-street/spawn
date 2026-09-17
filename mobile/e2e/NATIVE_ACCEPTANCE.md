@@ -140,9 +140,12 @@ python3 mobile/e2e/run-native-acceptance.py --platform ios \
 
 Use `android` and a fresh build directory for Android. `--fixture-url` defaults
 to the runner's `http://127.0.0.1:18100`; the app uses the platform host alias.
-The native runner selects an installed iPhone simulator or the single running
-Android emulator. It refuses physical Android devices. It records the actual
-runtime, app build metadata, screenshots and sanitized native logs. The fixture
+The native runner selects an installed iPhone simulator matching the active
+Xcode simulator SDK's major/minor version, or the single running Android
+emulator. A missing matching iPhone runtime fails setup; use `--device UUID`
+for intentional coverage of another installed iPhone runtime. It refuses
+physical Android devices. It records the actual runtime, simulator SDK, app
+build metadata, screenshots and sanitized native logs. The fixture
 writes the acceptance verdict and verifies real shell input, upload hashes and
 UDP fault counters. A native build, typecheck, Expo export, Jest result, or Expo
 Go smoke alone does not produce a passing native verdict.

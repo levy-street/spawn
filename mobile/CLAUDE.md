@@ -119,6 +119,8 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   well as in the timer callback, because the runtime can pause background timers.
   Native close retires the root synchronously; its delayed WebView acknowledgement
   must not close a replacement connection opened on the same bridge.
+  Native acceptance selects an iPhone runtime matching the active Xcode simulator
+  SDK; an explicit `--device UUID` opts into another installed runtime.
 
 ## Before calling a change done
 

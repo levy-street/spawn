@@ -170,17 +170,26 @@ class Runner:
             devices = json.loads(self.simctl("list", "devices", "available", "--json"))["devices"]
             available = [(runtime, device) for runtime, entries in devices.items() for device in entries
                          if "iOS" in runtime and device["name"].startswith("iPhone")]
+            simulator_sdk = self.command("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version")
             if not self.device:
-                available.sort(key=lambda item: (item[1]["state"] == "Booted", item[0], item[1]["name"]), reverse=True)
-                if not available:
-                    raise RuntimeError("No installed iOS simulator runtime/iPhone device")
-                self.device = available[0][1]["udid"]
+                # Hosted images contain runtimes for several Xcode versions.
+                # Do not silently run a newer OS than the SDK used to build.
+                sdk_parts = simulator_sdk.split(".")
+                if len(sdk_parts) < 2 or not all(part.isdigit() for part in sdk_parts):
+                    raise RuntimeError("Cannot identify the active iOS simulator SDK")
+                runtime_prefix = "com.apple.CoreSimulator.SimRuntime.iOS-" + "-".join(sdk_parts[:2])
+                matching = [(runtime, device) for runtime, device in available
+                            if runtime == runtime_prefix or runtime.startswith(runtime_prefix + "-")]
+                matching.sort(key=lambda item: (item[1]["state"] == "Booted", item[0], item[1]["name"]), reverse=True)
+                if not matching:
+                    raise RuntimeError(f"No installed iPhone simulator matching active SDK {simulator_sdk}")
+                self.device = matching[0][1]["udid"]
             selected = next(((runtime, device) for runtime, device in available if device["udid"] == self.device), None)
             if not selected:
                 raise RuntimeError("Requested device is not an available iPhone simulator")
             self.validated_device = self.device
             platform_info = {"runtime": selected[0], "device": self.device, "model": selected[1]["name"],
-                "initial_state": selected[1]["state"]}
+                "initial_state": selected[1]["state"], "simulator_sdk": simulator_sdk}
             self.platform_phase(platform_info, "selected")
             platform_info["xcode"] = self.command("xcodebuild", "-version")
             self.platform_phase(platform_info, "booting")

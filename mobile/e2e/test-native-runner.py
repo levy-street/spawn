@@ -19,7 +19,7 @@ spec = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-26-2"
+RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-18-5"
 DEVICE = "simulator-fixture-uuid"
 
 
@@ -89,6 +89,8 @@ class NativeRunnerSetup(unittest.TestCase):
                     }
                 }
             )
+        elif command[:4] == ("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"):
+            stdout = "18.5"
         elif command[0] == "xcodebuild":
             stdout = "Xcode 16.4\nBuild version 16F6"
         else:
@@ -121,6 +123,55 @@ class NativeRunnerSetup(unittest.TestCase):
         )
         self.runner.launch.assert_called_once()
         self.runner.event.assert_called_once()
+
+    def test_default_simulator_matches_sdk_even_when_a_newer_runtime_is_booted(self):
+        def native(command, **kwargs):
+            result = self.completed(command, **kwargs)
+            if command[:4] == ("xcrun", "simctl", "list", "devices"):
+                devices = json.loads(result.stdout)
+                devices["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-2"] = [
+                    {"name": "iPhone newer", "state": "Booted", "udid": "newer-device"}
+                ]
+                result.stdout = json.dumps(devices)
+            return result
+
+        with patch.object(module.subprocess, "run", side_effect=native):
+            self.runner.install()
+        self.assertEqual(self.runner.device, DEVICE)
+        platform = json.loads((self.runner.args.output / "native-platform.json").read_text())
+        self.assertEqual(platform["runtime"], RUNTIME)
+        self.assertEqual(platform["simulator_sdk"], "18.5")
+
+    def test_missing_sdk_runtime_fails_before_boot_install_or_fixture_start(self):
+        calls = []
+
+        def native(command, **kwargs):
+            calls.append(command)
+            result = self.completed(command, **kwargs)
+            if command[:4] == ("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"):
+                result.stdout = "18.6"
+            return result
+
+        with patch.object(module.subprocess, "run", side_effect=native):
+            with self.assertRaisesRegex(RuntimeError, "matching active SDK 18.6"):
+                self.runner.install()
+        self.assertFalse(any(command[:3] in [("xcrun", "simctl", "boot"),
+                                            ("xcrun", "simctl", "install")] for command in calls))
+        self.runner.control.assert_not_called()
+        self.runner.launch.assert_not_called()
+
+    def test_explicit_simulator_allows_intentional_other_sdk_coverage(self):
+        self.runner.device = DEVICE
+
+        def native(command, **kwargs):
+            result = self.completed(command, **kwargs)
+            if command[:4] == ("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"):
+                result.stdout = "26.2"
+            return result
+
+        with patch.object(module.subprocess, "run", side_effect=native):
+            self.runner.install()
+        self.assertEqual(self.runner.device, DEVICE)
 
     def test_failed_setup_is_reported_without_launching_or_retrying(self):
         install_calls = 0
