@@ -5,6 +5,10 @@ name: test
   push:
     branches:
       - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: test-${{ github.ref }}

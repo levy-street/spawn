@@ -29,6 +29,12 @@ Each product folder has its own `CLAUDE.md` (with an `AGENTS.md` symlink
 beside it) describing its layout, where new things go, and its checks. Read
 the one for the folder you are changing before you change it.
 
+The default branch uses standard GitHub-hosted runners for CI. To run the full
+repeatable suite and the Windows checks with unsigned packaging, dispatch
+`gh workflow run test.yml --ref master` and
+`gh workflow run windows.yml --ref master`. These validation workflows do not
+deploy or publish a release.
+
 ## spawn has two frontends. A change to one is a change to both
 
 `web/` (Next.js) and `mobile/` (Expo/React Native) are two clients of the same
