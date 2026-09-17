@@ -38,7 +38,9 @@ credentials cannot enter the bundle. It leaves the source checkout and its exist
   the build verifies the signature and entitlement sections before installation.
   No Apple team, certificate, or provisioning profile is used. Android's Release
   APK uses the template's disposable debug keystore. Neither app is published.
-- The controller in `src/terminal/`, mounted inside the real `AuthGate`.
+- The controller in `src/terminal/`, mounted inside the real `AuthGate`. A fresh
+  login waits for the account query reset before registering the device;
+  process relaunch preserves an identical restored login without resetting it.
 - A worker bridge observation hook and an RTC wrapper. The wrapper creates real
   native `RTCPeerConnection` objects, replaces ICE configuration before peer
   construction with the isolated client TURN proxy, and samples `getStats()`

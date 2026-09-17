@@ -1,4 +1,5 @@
-import { waitFor } from "@testing-library/react-native";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { act, waitFor } from "@testing-library/react-native";
 import { authToken } from "@/data/api/auth-token";
 import { NativeAcceptanceController } from "../e2e/native-controller";
 import { renderWithProviders } from "./render";
@@ -54,7 +55,19 @@ jest.mock("@/terminal/transport/host-transport-registry", () => ({
   retainHostTransport: jest.fn(),
 }));
 
-test("boot endorses and reports the server device row instead of the local key ID", async () => {
+test("boot waits for authentication reset and endorses the server device row", async () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+  });
+  let finishRefresh!: (value: string[]) => void;
+  const refresh = new Promise<string[]>((resolve) => {
+    finishRefresh = resolve;
+  });
+  const fetchGate = jest.fn(() => refresh);
+  const gateKey = ["mounted-auth-gate"];
+  queryClient.setQueryData(gateKey, ["previous"]);
+  const gate = new QueryObserver(queryClient, { queryKey: gateKey, queryFn: fetchGate });
+  const unsubscribe = gate.subscribe(() => {});
   const events: Array<{ type: string; status: string; details: { values: unknown } }> = [];
   const approvals: Array<{ deviceId: string; publicKey: string }> = [];
   const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -76,8 +89,13 @@ test("boot endorses and reports the server device row instead of the local key I
     }
     return new Response(JSON.stringify(body), { status });
   });
-  const view = await renderWithProviders(<NativeAcceptanceController />);
+  const view = await renderWithProviders(<NativeAcceptanceController />, { queryClient });
   try {
+    // The rendered account can still look ready while the login reset's new
+    // gate request is pending. Registration must not use that stale readiness.
+    await waitFor(() => expect(fetchGate).toHaveBeenCalledTimes(2));
+    expect(approvals).toEqual([]);
+    await act(async () => finishRefresh(["current"]));
     await waitFor(() => expect(events.some((event) => event.type === "boot")).toBe(true));
     expect(approvals).toEqual([{ deviceId: SERVER_DEVICE_ID, publicKey: expect.any(String) }]);
     expect(approvals[0]?.deviceId).not.toBe(LOCAL_KEY_ID);
@@ -92,6 +110,8 @@ test("boot endorses and reports the server device row instead of the local key I
       }),
     );
   } finally {
+    finishRefresh(["cleanup"]);
+    unsubscribe();
     await view.unmount();
     view.queryClient.clear();
     fetch.mockRestore();

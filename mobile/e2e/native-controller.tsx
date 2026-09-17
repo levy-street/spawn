@@ -216,7 +216,10 @@ export function NativeAcceptanceController(): React.JSX.Element {
       if (!restored) await authToken.set(next.bearerToken);
       const me = await getMe();
       if (me.user.id !== next.accountId) throw new Error("Fixture login returned another account.");
-      if (!restored) adoptAuthenticatedAccount(queryClient, me.user);
+      // A token notification can briefly restore cached gate data before this
+      // reset is observed. Let its refetches settle before registering a key;
+      // otherwise the gate can retire the account during native storage I/O.
+      if (!restored) await adoptAuthenticatedAccount(queryClient, me.user);
     };
     const perform = async ({ action, payload = {} }: Command): Promise<unknown> => {
       const key = payload["session"] === "b" ? "b" : "a";

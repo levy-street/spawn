@@ -81,6 +81,9 @@ scripts/, docs/   build helpers and app-specific notes
 - After login, use `adoptAuthenticatedAccount` in `data/queries/auth.ts` to clear
   prior account data and seed the new account while retaining mounted query
   observers, including disabled ones; removing them can strand `AuthGate`.
+  The new account is seeded synchronously; the returned promise settles the
+  active query reset. Acceptance automation awaits it before device registration
+  so stale readiness cannot race native secure-storage operations.
 - Anything that touches the native layer — a dependency with native code, a
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.

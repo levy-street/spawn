@@ -6,8 +6,8 @@ name: prebuilt
 # Dreamhome AI Key Vault certificate. One workflow owns the rolling
 # `prebuilt-latest` release: the per-platform build jobs upload artifacts and a
 # single publish job assembles them, so the jobs never race to delete+recreate
-# the same release. Gated to daemon changes so it rarely spends macOS/arm minutes
-# (billed on private repos; free entirely once the repo is public).
+# the same release. Gated to daemon changes to avoid unnecessary builds.
+# Standard hosted compute is free for this public repository.
 "on":
   push:
     branches:

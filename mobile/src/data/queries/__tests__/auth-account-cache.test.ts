@@ -59,16 +59,22 @@ test("login clears disabled observed and unobserved prior-account data and ignor
     await tick();
     expect(calls).toEqual(["old"]);
     account = "new";
-    adoptAuthenticatedAccount(client, USER_B);
+    let adopted = false;
+    const adopting = Promise.resolve(adoptAuthenticatedAccount(client, USER_B)).then(() => {
+      adopted = true;
+    });
     expect(client.getQueryData(disabledKey)).toBeUndefined();
     expect(disabled.getCurrentResult().data).toBeUndefined();
     expect(client.getQueryCache().find({ queryKey: disabledKey })?.getObserversCount()).toBe(1);
     expect(client.getQueryData(unobservedKey)).toBeUndefined();
     expect(disabledFetch).not.toHaveBeenCalled();
     expect(client.getQueryData(qk.me())).toEqual({ user: USER_B });
+    await tick();
+    expect(adopted).toBe(false);
     const boundary = seen.length;
     current.resolve({ account: "new", secret: "current workspaces" });
-    await tick();
+    await adopting;
+    expect(adopted).toBe(true);
     expect(calls).toEqual(["old", "new"]);
     old.resolve({ account: "old", secret: "late previous workspaces" });
     await tick();

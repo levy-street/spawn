@@ -22,14 +22,15 @@ function seedMe(queryClient: ReturnType<typeof useQueryClient>, user: UserOut): 
 }
 
 /** Clear the previous account without orphaning mounted auth-gate observers. */
-export function adoptAuthenticatedAccount(queryClient: QueryClient, user: UserOut): void {
+export function adoptAuthenticatedAccount(queryClient: QueryClient, user: UserOut): Promise<void> {
   queryClient.removeQueries({ predicate: (query) => query.getObserversCount() === 0 });
   // Reset retains disabled-but-mounted queries too. Removing their Query objects
   // leaves the gate observing old pending/error results after a successful login.
-  void queryClient.resetQueries();
+  const reset = queryClient.resetQueries();
   // Keep this synchronous with the login result; a later login must not be
   // overwritten after waiting for unrelated refetches to complete.
   seedMe(queryClient, user);
+  return reset;
 }
 
 export function useAuthConfigQuery(enabled = true) {
