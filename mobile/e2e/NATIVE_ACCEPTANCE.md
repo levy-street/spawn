@@ -146,8 +146,9 @@ emulator. A missing matching iPhone runtime fails setup; use `--device UUID`
 for intentional coverage of another installed iPhone runtime. It refuses
 physical Android devices. On iOS it warms Settings before starting the fixture
 or test app, so initializing that system app is outside the timed cases.
-Foreground resumes the existing app through its disposable `spawn-acceptance`
-URL scheme; initial launch and process restart still use `simctl launch`.
+Foreground resumes the existing app directly with `simctl launch`; URL
+activation can leave it behind an iOS confirmation dialog. Only the explicit
+process-restart case terminates the app before launching it again.
 The suite continues to require actual native lifecycle callbacks and a measured
 short background interval below three seconds. It records the actual runtime,
 simulator SDK, app build metadata, screenshots and sanitized native logs. The fixture

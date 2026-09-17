@@ -287,13 +287,9 @@ class Runner:
                 raise ValueError("Native background duration must be between 0 and 30000 ms")
             time.sleep(duration)
         elif action == "foreground":
-            if self.args.platform == "ios":
-                # This scheme belongs only to the disposable acceptance app.
-                # URL activation resumes its existing process without waiting
-                # through simctl launch's process-start acknowledgement path.
-                self.simctl("openurl", self.device, "spawn-acceptance:///")
-            else:
-                self.launch()
+            # Activate the existing app directly. iOS URL activation can stop
+            # at an OS "Open in" confirmation instead of resuming the app.
+            self.launch()
         elif action == "relaunch":
             if self.args.platform == "android":
                 self.adb("shell", "am", "force-stop", APP_ID)

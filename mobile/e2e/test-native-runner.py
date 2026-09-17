@@ -157,12 +157,12 @@ class NativeRunnerSetup(unittest.TestCase):
             self.runner.install()
         self.assertEqual(order, ["warm-settings", "fixture", "app"])
 
-    def test_ios_foreground_activates_only_the_disposable_app_scheme(self):
+    def test_ios_foreground_activates_without_url_prompt_or_process_termination(self):
         self.runner.device = DEVICE
         self.runner.simctl = Mock()
+        self.runner.launch = module.Runner.launch.__get__(self.runner)
         self.runner.perform("foreground", {})
-        self.runner.simctl.assert_called_once_with("openurl", DEVICE, "spawn-acceptance:///")
-        self.runner.launch.assert_not_called()
+        self.runner.simctl.assert_called_once_with("launch", DEVICE, module.APP_ID)
 
     def test_missing_sdk_runtime_fails_before_boot_install_or_fixture_start(self):
         calls = []
