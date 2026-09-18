@@ -440,7 +440,7 @@ impl Association {
                             n=m;
                         }
                         Err(err) => {
-                            log::warn!("[{name}] failed to read packets on net_conn: {err}");
+                            eprintln!("DIAGNOSTIC SCTP [{name}] failed to read packets on net_conn: {err}");
                             break;
                         }
                     }
@@ -458,7 +458,7 @@ impl Association {
             {
                 let mut ai = association_internal.lock().await;
                 if let Err(err) = ai.handle_inbound(&inbound).await {
-                    log::warn!("[{name}] failed to handle_inbound: {err:?}");
+                    eprintln!("DIAGNOSTIC SCTP [{name}] failed to handle_inbound: {err:?}");
                     done = true;
                 }
             }
@@ -514,7 +514,7 @@ impl Association {
                     Ok(Ok(mut buf)) => {
                         let raw = buf.as_ref();
                         if let Err(err) = net_conn.send(raw.as_ref()).await {
-                            log::warn!("[{name2}] failed to write packets on net_conn: {err}");
+                            eprintln!("DIAGNOSTIC SCTP [{name2}] failed to write packets on net_conn: {err}");
                             done2.store(true, Ordering::Relaxed)
                         } else {
                             bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);

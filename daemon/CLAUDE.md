@@ -1,8 +1,9 @@
 # Working agreements for daemon/
 
-This diagnostic branch runs the shared-peer Windows case with warning-only
-transport logging to identify the association shutdown during ICE restart.
-Its workflow output is diagnostic evidence, not a full Windows validation.
+This diagnostic branch runs the shared-peer Windows case without a logging
+subscriber. Temporary direct stderr diagnostics capture only SCTP read, write
+and inbound errors, after they occur. Its workflow output is diagnostic
+evidence, not a full Windows validation.
 
 Rust. Two binaries: `spawnd`, the supervisor that dials out to the spawn
 server and registers the host, and `spawn-worker`, which owns one session's
