@@ -1,0 +1,15 @@
+[Unit]
+Description=SPAWN D disposable GitHub Actions runner pool
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/.local/share/spawnd-ci/controller/runner-pool.py --config %h/.local/share/spawnd-ci/controller/pools.json --state %h/.local/state/spawnd-ci
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=150
+UMask=0077
+
+[Install]
+WantedBy=default.target

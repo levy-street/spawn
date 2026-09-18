@@ -59,6 +59,7 @@ class DaemonConn:
     rtc_revocation_started: bool = False
     keeps_peers_across_reconnect: bool = False
     session_ice_policy: bool = False
+    supports_device_connections: bool = False
     durable_owner_valid_until: float = 0.0
 
     async def send_text(self, payload: dict) -> None:
@@ -94,6 +95,7 @@ class HostBrowserConn:
     user_id: str
     host_id: str
     websocket: WebSocket
+    rtc_protocol_version: int = 1
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

@@ -35,7 +35,7 @@ describe("useLoginMutation", () => {
       headers: { "content-type": "application/json", "set-cookie": "spawn_session=long-token" },
     });
     jest.spyOn(globalThis, "fetch").mockResolvedValue(response);
-    const capture = jest.spyOn(authToken, "captureFromResponse").mockResolvedValue("long-token");
+    const capture = jest.spyOn(authToken, "captureFromResponse");
     const set = jest.spyOn(authToken, "set");
     const wrapper = ({ children }: PropsWithChildren) => (
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>

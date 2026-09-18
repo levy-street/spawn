@@ -223,7 +223,6 @@ function PooledTerminal({
         mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
         imagePasteMode="bracketed-path"
         active={active}
-        autoTakeControl={active}
         onConnectionInfo={(info) => onInfo(sessionId, info)}
         onDisplayControl={(state) => onDisplay(sessionId, state)}
       />

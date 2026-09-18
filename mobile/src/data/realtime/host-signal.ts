@@ -41,9 +41,9 @@ class HostSignalChannel implements SignalChannel {
 
   constructor(private readonly hostId: string) {
     this.socket = new ReconnectingSocket({
-      url: () => buildHostSocketUrl(hostId),
+      url: (baseUrl) => buildHostSocketUrl(hostId, baseUrl),
       protocol: HOST_SIGNAL_PROTOCOL,
-      authorization: () => authToken.get(),
+      authorization: () => authToken.snapshot(),
       watchdogMs: 80_000,
       watchdogFrameTypes: ["ping"],
       reconnectDelayMs: signalReconnectDelay,

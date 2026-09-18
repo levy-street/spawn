@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, replace
+from typing import Annotated
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -101,12 +102,13 @@ class BrowserRtcSession:
         return self.active_daemon_generation or self.daemon_generation
 
 
-def _metadata_matches(obj: dict, host_id: str) -> bool:
+def _metadata_matches(obj: dict, host_id: str, protocol_version: int = 1) -> bool:
     return (
         obj.get("scope_type") == "host"
         and obj.get("scope_id") == host_id
         and obj.get("protocol") == HOST_CONTROL_PROTOCOL
-        and obj.get("protocol_version") == HOST_CONTROL_VERSION
+        and type(obj.get("protocol_version")) is int
+        and obj.get("protocol_version") == protocol_version
     )
 
 
@@ -250,7 +252,14 @@ async def _send_status(
     **values: object,
 ) -> None:
     await conn.send_text(
-        _signal_payload("rtc.status", session_id, host_id, status=status_value, **values)
+        _signal_payload(
+            "rtc.status",
+            session_id,
+            host_id,
+            status=status_value,
+            protocol_version=conn.rtc_protocol_version,
+            **values,
+        )
     )
 
 
@@ -296,7 +305,9 @@ async def _pump_browser_signals(
             if dispatch is None or dispatch.host_id != host_id:
                 continue
             signal = dispatch.signal
-            if not isinstance(signal, dict) or not _metadata_matches(signal, host_id):
+            if not isinstance(signal, dict) or not _metadata_matches(
+                signal, host_id, conn.rtc_protocol_version
+            ):
                 continue
             session_id = _valid_rtc_session_id(signal.get("session_id"))
             if session_id is None:
@@ -344,7 +355,7 @@ async def _pump_browser_signals(
                             expected_scope_type="host",
                             expected_scope_id=host_id,
                             expected_protocol=HOST_CONTROL_PROTOCOL,
-                            expected_protocol_version=HOST_CONTROL_VERSION,
+                            expected_protocol_version=conn.rtc_protocol_version,
                         )
                     elif signed_mode_selected(signal) or _valid_rtc_sdp(signal.get("sdp")) is None:
                         continue
@@ -436,6 +447,7 @@ async def host_ws(
     websocket: WebSocket,
     host_id: str = Query(...),
     token: str | None = Query(default=None),
+    rtc_version: Annotated[int, Query(ge=1, le=2)] = 1,
 ) -> None:
     offered = websocket.scope.get("subprotocols") or []
     if HOST_WS_SUBPROTOCOL not in offered:
@@ -464,7 +476,15 @@ async def host_ws(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="host not found")
             return
 
-    conn = HostBrowserConn(user_id=user.id, host_id=host_id, websocket=websocket)
+    conn = HostBrowserConn(
+        user_id=user.id, host_id=host_id, websocket=websocket, rtc_protocol_version=rtc_version
+    )
+
+    def signal_payload(
+        kind: str, session_id: str, host_id: str, **values: object
+    ) -> dict[str, object]:
+        return _signal_payload(kind, session_id, host_id, protocol_version=rtc_version, **values)
+
     errors = ErrorFrameSender(conn.send_text)
     config_requests = FrameRateLimiter(RTC_CONFIG_REQUEST_MIN_INTERVAL_SECONDS)
     response_channel = browser_signal_channel(conn.id)
@@ -488,7 +508,7 @@ async def host_ws(
             "scope_type": "host",
             "scope_id": host_id,
             "protocol": HOST_CONTROL_PROTOCOL,
-            "protocol_version": HOST_CONTROL_VERSION,
+            "protocol_version": rtc_version,
         }
 
     async def keepalive() -> None:
@@ -564,7 +584,7 @@ async def host_ws(
                 elif config_requests.allow():
                     await conn.send_text(rtc_config_payload())
                 continue
-            if not _metadata_matches(obj, host_id):
+            if not _metadata_matches(obj, host_id, rtc_version):
                 await errors.send("invalid_frame", frame_type)
                 continue
 
@@ -611,7 +631,7 @@ async def host_ws(
                     scope_type="host",
                     scope_id=host_id,
                     protocol=HOST_CONTROL_PROTOCOL,
-                    protocol_version=HOST_CONTROL_VERSION,
+                    protocol_version=rtc_version,
                 )
                 if resumed is None:
                     await _send_status(
@@ -635,7 +655,7 @@ async def host_ws(
                         active_daemon_generation=resumed.daemon.host_generation,
                     )
                 await conn.send_text(
-                    _signal_payload(
+                    signal_payload(
                         "rtc.status",
                         session_id,
                         host_id,
@@ -653,6 +673,9 @@ async def host_ws(
                     await errors.send("invalid_frame", frame_type)
                     continue
                 signed_signal = signed_mode_selected(obj)
+                if rtc_version == 2 and not signed_signal:
+                    await errors.send("invalid_frame", frame_type)
+                    continue
                 try:
                     if signed_signal:
                         reject_raw_sdp_in_signed_mode(obj)
@@ -663,7 +686,7 @@ async def host_ws(
                             expected_scope_type="host",
                             expected_scope_id=host_id,
                             expected_protocol=HOST_CONTROL_PROTOCOL,
-                            expected_protocol_version=HOST_CONTROL_VERSION,
+                            expected_protocol_version=conn.rtc_protocol_version,
                         ).wire
                         sdp = None
                     else:
@@ -733,7 +756,7 @@ async def host_ws(
                         host_id,
                         response_channel,
                         binding,
-                        _signal_payload("rtc.offer", session_id, host_id, **values),
+                        signal_payload("rtc.offer", session_id, host_id, **values),
                     ):
                         await _send_status(conn, host_id, session_id, "unavailable")
                     continue
@@ -797,7 +820,7 @@ async def host_ws(
                     host_id,
                     response_channel,
                     binding,
-                    _signal_payload("rtc.offer", session_id, host_id, **values),
+                    signal_payload("rtc.offer", session_id, host_id, **values),
                 )
                 if not published:
                     await _retire_if_exact_binding(
@@ -831,7 +854,7 @@ async def host_ws(
                     host_id,
                     response_channel,
                     binding,
-                    _signal_payload(
+                    signal_payload(
                         "rtc.candidate",
                         session_id,
                         host_id,
@@ -865,7 +888,7 @@ async def host_ws(
                         host_id,
                         response_channel,
                         binding,
-                        _signal_payload(
+                        signal_payload(
                             "rtc.close",
                             session_id,
                             host_id,
@@ -913,7 +936,7 @@ async def host_ws(
                         host_id,
                         response_channel,
                         binding,
-                        _signal_payload(
+                        signal_payload(
                             "rtc.close",
                             binding.session_id,
                             host_id,

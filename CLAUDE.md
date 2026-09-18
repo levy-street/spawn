@@ -12,14 +12,16 @@ desktop/  Tauri v2 macOS + Windows companion → desktop/CLAUDE.md
 server/   FastAPI API + websockets + Alembic → server/CLAUDE.md
 daemon/   Rust spawnd + spawn-worker         → daemon/CLAUDE.md
 proto/    cross-runtime golden vectors shared by daemon and web crypto
-scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot
+scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot;
+          ci/ owns hosted-runner guards and isolated fixtures; retired pool tools remain for recovery
 infra/    docker-compose and nginx examples
 docs/     design docs; docs/RELEASE.md — the release process,
           docs/WINDOWS_VALIDATION.md — the Windows evidence gate, and
           docs/AZURE_SIGNING_SETUP.md — the Windows signing identity, for
           whoever holds Azure
 tools/    development utilities
-.github/  CI workflows: tests, the rolling daemon prebuilts, the Windows check
+.github/  CI workflows: tests, native connection acceptance and its promotion
+          gate, the rolling daemon prebuilts, the Windows check
           and its unsigned packaging rehearsal, and the signed desktop
           artifacts; readme/ holds the README's press art, struck from
           web/public/brand/ink
@@ -34,6 +36,15 @@ repeatable suite and the Windows checks with unsigned packaging, dispatch
 `gh workflow run test.yml --ref master` and
 `gh workflow run windows.yml --ref master`. These validation workflows do not
 deploy or publish a release.
+Windows runs on every master push so a later web-only commit can still release
+earlier undeployed daemon changes; pull-request Windows checks are path-filtered.
+To retry a partial deployment, `deploy-prod.sh --resume` retains the original
+acceptance evidence and accepts only the tested baseline/candidate identities;
+see `docs/RELEASE.md` for the exact-candidate retry procedure.
+Daemon publication stages a complete signed snapshot under prebuilt `releases/`;
+`scripts/activate-prebuilt.py` verifies it before atomically switching `current`.
+The API resolves that pointer once per request; interrupted uploads leave the
+previous release readable and resumable. Legacy flat releases remain supported.
 
 ## spawn has two frontends. A change to one is a change to both
 
@@ -87,6 +98,33 @@ Before deploying or releasing anything — server, web, a mobile update or
 build, daemon prebuilts — read `docs/RELEASE.md` in full. It is the entire
 release process: what ships together, what the deploy script refuses and why,
 and how to verify what actually reached production.
+
+Connection acceptance runs through `.github/workflows/acceptance.yml`: exact
+candidate iOS/Android native runs plus the isolated daemon canary. Missing or
+failed evidence blocks promotion. `docs/CONNECTION_CANARY.md` describes the
+canary, and `docs/DEVICE_CONNECTIONS.md` distinguishes automated native
+evidence from physical-device and production observations. The lightweight
+fixture, UDP fault-proxy and evidence-validator regressions run in
+`scripts/test-all.sh`; the real native builds run on standard GitHub-hosted platform runners.
+Native fixtures prepare build configuration before compilation and activate
+their daemon only after app installation. Unexpected fixture process exits
+permanently fail acceptance; they are not silently restarted.
+After fixture readiness, native app boot has a separate 180-second budget;
+local startup diagnostics and scoped device captures preserve setup failures.
+
+Every workflow uses standard GitHub-hosted runners, as mapped in
+`docs/CI_RUNNERS.md`. `scripts/ci/check-hosted-runners.py` rejects paid runner
+sizes, self-hosted labels and unreviewed dynamic runner expressions. Runner and
+disk regressions run in `scripts/test-all.sh`. Vendored ICE route recovery
+regressions run there and in native Windows CI using the daemon's lockfile.
+Signing environments,
+exact-commit checks and release evidence remain required.
+Linux CI uses disposable PostgreSQL 16 and Redis 7 fixtures and a networkless
+systemd VM. `SPAWN_E2E_WORKERS=2` leaves resources for the browser test server.
+Dispatch `test.yml` with `arm64_only=true` for native ARM64 binary validation
+without publication; the Ubuntu 22.04 build preserves the glibc 2.35 floor.
+The former pool controllers and machine installers in `scripts/ci/` are retired
+recovery tools. Do not register self-hosted runners or restart those pools.
 
 ## These files stay true, or they are worse than nothing
 

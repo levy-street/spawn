@@ -22,6 +22,7 @@
     "src/**/*.tsx",
     "tests/**/*.ts",
     "tests/**/*.tsx",
+    "e2e/native-controller.tsx",
     ".expo/types/**/*.ts",
     "expo-env.d.ts"
   ],

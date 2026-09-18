@@ -7,6 +7,7 @@ import {
   type WebSocketRoute,
 } from "@playwright/test";
 import {
+  HOST_ID,
   mockApp,
   pinKeyboard,
   SESSION_B_ID,
@@ -98,7 +99,29 @@ async function openTerminalWithMockSocket(
 
   await page.goto(`/sessions/${SESSION_ID}`);
   await expect(page.getByLabel("Session terminal")).toBeVisible();
-  return { messages, sockets, uploads };
+  if (!options.noChannels && !options.noReady && options.autoSnapshot !== false) {
+    await expect(page.getByLabel("Session terminal")).toHaveAttribute("aria-busy", "false");
+  }
+  if (options.reconnect) {
+    await page.evaluate(() => {
+      setTimeout(
+        () =>
+          (
+            window as unknown as { __spawnHostMock: { disconnect(): void } }
+          ).__spawnHostMock.disconnect(),
+        1000,
+      );
+    });
+  }
+  return {
+    messages,
+    sockets,
+    uploads,
+    peerCount: () =>
+      page.evaluate(() =>
+        (window as unknown as { __spawnHostMock: { count(): number } }).__spawnHostMock.count(),
+      ),
+  };
 }
 
 function binaryText(messages: Array<string | Buffer>) {
@@ -326,12 +349,12 @@ test("on a Mac, ⌥ and ⌘ arrows are the shell's word and line keys", async ({
   await page.keyboard.press("Alt+ArrowLeft");
   await page.keyboard.press("Alt+ArrowRight");
   await expect.poll(() => binaryText(messages)).toContain("\x1bb");
-  expect(binaryText(messages)).toContain("\x1bf");
+  await expect.poll(() => binaryText(messages)).toContain("\x1bf");
 
   await page.keyboard.press("Meta+ArrowLeft");
   await page.keyboard.press("Meta+ArrowRight");
   await expect.poll(() => binaryText(messages)).toContain("\x01");
-  expect(binaryText(messages)).toContain("\x05");
+  await expect.poll(() => binaryText(messages)).toContain("\x05");
 });
 
 test("terminal sends control keys without waiting for a refresh", async ({ page }) => {
@@ -353,11 +376,11 @@ test("terminal attempts direct WebRTC transport when advertised", async ({ page 
     .toMatchObject({
       type: "rtc.offer",
       session_id: expect.any(String),
-      scope_type: "session",
-      scope_id: SESSION_ID,
-      protocol: "spawn.pty",
+      scope_type: "host",
+      scope_id: HOST_ID,
+      protocol: "spawn.host.ctl",
       protocol_version: 2,
-      sdp: expect.stringContaining("v=0"),
+      signed_envelope: expect.stringContaining("rtc.offer"),
     });
   // The handshake's subprotocol is not observable from here: page.routeWebSocket
   // intercepts the connection before the page's WebSocket constructor runs, so
@@ -365,34 +388,38 @@ test("terminal attempts direct WebRTC transport when advertised", async ({ page 
   // instead, where it is actually checkable.
 });
 
-test("opening a terminal as viewer claims control automatically", async ({ page }) => {
+test("opening another device's terminal preserves its control until explicit take", async ({
+  page,
+}) => {
   const { messages } = await openTerminalWithMockSocket(page, {
     control: { owner: false, cols: 156, rows: 38, viewers: 2 },
     history: "viewer\n",
   });
-
-  await expect
-    .poll(() => jsonMessages(messages).find((message) => message?.type === "take_control"))
-    .toMatchObject({
-      type: "take_control",
-      cols: expect.any(Number),
-      rows: expect.any(Number),
-    });
-  // Ownership is claimed optimistically, so no dimmed viewer overlay shows.
+  await expect(page.getByRole("button", { name: "Take control" })).toBeVisible();
+  await page.getByLabel("Session terminal").click();
+  await page.keyboard.type("ignored");
+  expect(binaryText(messages)).toBe("");
+  expect(jsonMessages(messages).some((message) => message?.type === "take_control")).toBe(false);
+  await page.getByRole("button", { name: "Take control" }).click();
   await expect(page.getByRole("button", { name: "Take control" })).toHaveCount(0);
+  await page.getByLabel("Session terminal").click();
+  await page.keyboard.type("allowed");
+  await expect.poll(() => binaryText(messages)).toBe("allowed");
 });
 
-test("losing control dims the terminal and re-takes from the centered button", async ({ page }) => {
+test("losing control leaves readable output and an explicit take-control button", async ({
+  page,
+}) => {
   // Opens as owner (default mock state) — the auto-claim never fires.
   const { messages } = await openTerminalWithMockSocket(page, { history: "owner\n" });
   await expect(liveTerminalRows(page)).toContainText("owner");
   expect(jsonMessages(messages).some((m) => m?.type === "take_control")).toBe(false);
 
-  // Another session steals control: the pane dims with a centered button.
+  // Another device takes control; the pane keeps its selectable output.
   await setDisplayControl(page, { owner: false, cols: 156, rows: 38, viewers: 2 });
   const button = page.getByRole("button", { name: "Take control" });
   await expect(button).toBeVisible();
-  await expect(page.getByText("Another session has control · 156x38 · 2 viewers")).toBeVisible();
+  await expect(page.getByText("Another view has control · 156x38 · 2 viewers")).toBeVisible();
 
   await button.click();
   await expect
@@ -843,7 +870,7 @@ test("removing an uploading attachment aborts it and sends upload_cancel", async
   await page.getByLabel("Session terminal").evaluate((terminal) => {
     const transfer = new DataTransfer();
     transfer.items.add(
-      new File([new Uint8Array(100_000).fill(0x31)], "cancel.png", { type: "image/png" }),
+      new File([new Uint8Array(1_000_000).fill(0x31)], "cancel.png", { type: "image/png" }),
     );
     terminal.dispatchEvent(
       new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
@@ -856,14 +883,14 @@ test("removing an uploading attachment aborts it and sends upload_cancel", async
     .toBe(true);
   await page.getByRole("button", { name: "Remove cancel.png" }).click();
   await expect(page.getByRole("button", { name: "Remove cancel.png" })).toHaveCount(0);
-  await expect
-    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
-    .toBe(true);
   await page.evaluate(() => {
     (
       window as unknown as { __spawnRtcTest: { releaseUploadBackpressure: () => void } }
     ).__spawnRtcTest.releaseUploadBackpressure();
   });
+  await expect
+    .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_cancel"))
+    .toBe(true);
   await page.waitForTimeout(100);
   expect(uploads).toHaveLength(0);
   await page.clock.install();
@@ -1043,7 +1070,7 @@ test("RTC generation replacement is definitive before final dispatch", async ({ 
   await page.locator('input[type="file"]').setInputFiles({
     name: "before.bin",
     mimeType: "application/octet-stream",
-    buffer: Buffer.alloc(100_000),
+    buffer: Buffer.alloc(1_000_000),
   });
   await expect
     .poll(() => jsonMessages(messages).some((message) => message?.type === "upload_start"))
@@ -1137,7 +1164,8 @@ test("spawn.v3 keeps keystrokes off the websocket until the DataChannel opens", 
     .poll(() => jsonMessages(messages).find((message) => message?.type === "rtc.offer"))
     .toMatchObject({
       type: "rtc.offer",
-      binding_nonce: expect.stringMatching(/^[0-9a-f]{32}$/),
+      protocol_version: 2,
+      signed_envelope: expect.any(String),
     });
 
   await page.getByLabel("Session terminal").click();
@@ -1145,8 +1173,7 @@ test("spawn.v3 keeps keystrokes off the websocket until the DataChannel opens", 
   await page.keyboard.press("Enter");
   await page.waitForTimeout(300);
 
-  // No DataChannel exists in the mock, so input is queued client-side; the
-  // relay path must never carry it.
+  // Input is discarded while disconnected; it never enters the relay.
   expect(binaryText(messages)).toBe("");
 });
 
@@ -1170,10 +1197,10 @@ test("spawn.v3 holds endpoint effects until the daemon readiness event", async (
 });
 
 test("terminal reconnect restores a fresh terminal history snapshot", async ({ page }) => {
-  const { sockets } = await openTerminalWithMockSocket(page, { reconnect: true });
+  const { peerCount } = await openTerminalWithMockSocket(page, { reconnect: true });
 
   await expect(liveTerminalRows(page)).toContainText("RED");
-  await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
+  await expect.poll(peerCount).toBeGreaterThanOrEqual(2);
   await expect(liveTerminalRows(page)).toContainText("after reconnect");
 });
 
@@ -1236,7 +1263,7 @@ test.fixme("previous-session callbacks remain scoped to the previous terminal", 
   await page.waitForTimeout(100);
 
   await expect(secondSessionRows).not.toContainText("STALE-FIRST-CALLBACK");
-  await expect(page.getByText("Another session has control · 222x88 · 9 viewers")).toBeHidden();
+  await expect(page.getByText("Another view has control · 222x88 · 9 viewers")).toBeHidden();
 });
 
 test("worker replay streams render exactly with geometry markers", async ({ page }) => {
@@ -1602,7 +1629,7 @@ test("a reconnect reseed keeps its history when the previous screen set a scroll
   // history scrolls inside those four rows and never reaches scrollback (#58).
   const seed = (lines: string[], screen: string) =>
     `\x1b[8;36;83t\x1b_sp:h1\x1b\\${lines.map((line) => `${line}\r\n`).join("")}\x1b[8;36;83t${screen}`;
-  const { sockets } = await openTerminalWithMockSocket(page, {
+  const { peerCount } = await openTerminalWithMockSocket(page, {
     reconnect: true,
     history: seed(["old 1", "old 2"], "\x1b[1;1Hbefore-reconnect\x1b[2;5r"),
     secondHistory: seed(
@@ -1611,7 +1638,7 @@ test("a reconnect reseed keeps its history when the previous screen set a scroll
     ),
   });
   await expect(liveTerminalRows(page)).toContainText("before-reconnect");
-  await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
+  await expect.poll(peerCount).toBeGreaterThanOrEqual(2);
   await expect(liveTerminalRows(page)).toContainText("after-reconnect");
   await liveTerminal(page).hover();
   await page.mouse.wheel(0, -1_000_000);

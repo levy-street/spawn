@@ -16,7 +16,7 @@ it("builds a browser signalling URL without leaking the token", async () => {
 
 it("builds a host signalling URL without leaking the token", async () => {
   await expect(buildHostSocketUrl("host-id")).resolves.toBe(
-    "wss://spawn.example.com/ws/host?host_id=host-id",
+    "wss://spawn.example.com/ws/host?host_id=host-id&rtc_version=2",
   );
 });
 

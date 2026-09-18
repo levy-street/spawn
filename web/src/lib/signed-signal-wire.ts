@@ -242,8 +242,8 @@ function validateTuple(protocol: RtcSignalProtocol, transcript: SignedSignalTran
   if (!protocolMatchesScope) {
     throw new SignedRtcWireError("inconsistent_tuple", "protocol does not match scope_type");
   }
-  const exactVersion = protocol === "spawn.pty" ? 2 : 1;
-  if (transcript.protocolVersion !== exactVersion) {
+  const versions = protocol === "spawn.pty" ? [2] : [1, 2];
+  if (!versions.includes(transcript.protocolVersion)) {
     throw new SignedRtcWireError(
       "inconsistent_tuple",
       "protocol_version does not match the current protocol",

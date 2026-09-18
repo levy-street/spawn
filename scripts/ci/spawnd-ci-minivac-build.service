@@ -1,0 +1,15 @@
+[Unit]
+Description=SPAWN D Minivac x64 and ARM64 build runner pool
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/.local/share/spawnd-ci/minivac-build/runner-pool.py --config %h/.local/share/spawnd-ci/minivac-build/pools.json --state %h/.local/state/spawnd-ci-minivac-build --local-host minivac --auth-source git-credential
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=150
+UMask=0077
+
+[Install]
+WantedBy=default.target

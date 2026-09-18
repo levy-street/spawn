@@ -1,3 +1,4 @@
+import { activeDeviceIdentityAccount, subscribeDeviceIdentityAccount } from "@/lib/crypto/identity";
 import { WorkerBridge } from "@/terminal/transport/bridge";
 import { createHostTransport } from "@/terminal/transport/host-transport";
 import type { HostTransportOptions, StreamingHostTransport } from "@/terminal/transport/types";
@@ -19,6 +20,11 @@ export interface HostTransportLease {
 
 const registry = new Map<string, SharedHostTransport>();
 
+subscribeDeviceIdentityAccount(() => {
+  for (const shared of registry.values()) shared.transport.close();
+  registry.clear();
+});
+
 function publishOwnership(shared: SharedHostTransport): void {
   for (const [id, listener] of shared.ownershipListeners) listener(id === shared.owner);
 }
@@ -26,8 +32,10 @@ function publishOwnership(shared: SharedHostTransport): void {
 /** One WKWebView/RTC control channel per host, shared by every mounted consumer. */
 export function retainHostTransport(
   options: Omit<HostTransportOptions, "bridge">,
+  canOwnWorker = true,
 ): HostTransportLease {
-  let shared = registry.get(options.hostId);
+  const key = `${activeDeviceIdentityAccount()}:${options.hostId}:${options.hostIdentityPublicKey}`;
+  let shared = registry.get(key);
   if (!shared) {
     const bridge = new WorkerBridge();
     shared = {
@@ -37,17 +45,21 @@ export function retainHostTransport(
       owner: null,
       ownershipListeners: new Map(),
     };
-    registry.set(options.hostId, shared);
+    registry.set(key, shared);
   }
   shared.refs += 1;
   const ownerId = Symbol(options.hostId);
-  shared.owner ??= ownerId;
+  if (canOwnWorker) shared.owner ??= ownerId;
   let released = false;
 
   return {
     shared,
     ownerId,
     subscribeOwnership(listener) {
+      if (!canOwnWorker) {
+        listener(false);
+        return () => undefined;
+      }
       shared.ownershipListeners.set(ownerId, listener);
       // A seat can be vacant here. Retaining a lease and subscribing to it are
       // two steps, and when a consumer is swapped for another in the same
@@ -72,7 +84,7 @@ export function retainHostTransport(
       shared.refs -= 1;
       if (shared.refs === 0) {
         shared.transport.close();
-        registry.delete(options.hostId);
+        if (registry.get(key) === shared) registry.delete(key);
         return;
       }
       if (shared.owner === ownerId) {

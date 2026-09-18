@@ -41,6 +41,19 @@ scripts/test-update-probation.sh --self-test
 scripts/test-instance-releases.sh --self-test
 scripts/test-version-skew.sh --self-test
 scripts/chaos-drills.sh --self-test
+scripts/test-connection-canary.sh --self-test
+
+printf '%s\n' "== native connection acceptance harness guards =="
+uv run --project server python scripts/ci/check-hosted-runners.py
+uv run --project server python scripts/ci/test-runners.py
+python3 scripts/ci/test-release-hooks.py
+python3 scripts/ci/test-macos-accounts.py
+python3 scripts/test-udp-chaos-proxy.py
+python3 scripts/test-native-acceptance.py
+python3 mobile/e2e/test-compact-android-build.py
+python3 mobile/e2e/test-android-disk-preflight.py
+python3 mobile/e2e/test-native-runner.py
+python3 scripts/test-release-acceptance.py
 
 printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh
@@ -75,6 +88,12 @@ printf '%s\n' "== daemon tests, diagnostics variant =="
 # The variant dream runs is a real release build of the same tree, so a
 # test that only fails with the feature on must not merge green.
 (cd daemon && cargo test --locked --features diagnostics)
+
+printf '%s\n' "== SCTP stream lifecycle regressions =="
+(cd daemon && cargo test --locked -p webrtc-sctp --lib stream::stream_test::)
+
+printf '%s\n' "== ICE route recovery regressions =="
+(cd daemon && cargo test --locked -p webrtc-ice --lib agent_transport_test::)
 
 printf '%s\n' "== daemon updater end-to-end =="
 scripts/test-update-e2e.sh
@@ -174,7 +193,7 @@ printf '%s\n' "== web lint + browser tests + build =="
   cd web
   bun run lint
   bun run test:unit
-  bun run test:e2e
+  bun run test:e2e --workers="${SPAWN_E2E_WORKERS:-50%}"
   SPAWN_API_PROXY_TARGET="${SPAWN_API_PROXY_TARGET:-http://127.0.0.1:8001}" bun run build
 )
 
@@ -188,7 +207,7 @@ printf '%s\n' "== mobile typecheck + lint + tests =="
 printf '%s\n' "== desktop typecheck + lint + tests =="
 # This local lane exercises the macOS Tauri bundle and daemon linkage. Native
 # Windows daemon, desktop, and PowerShell installer checks run on
-# `windows-latest` in `.github/workflows/windows.yml`.
+# the self-hosted Windows build pool in `.github/workflows/windows.yml`.
 if [[ "$(uname -s)" == "Darwin" ]]; then
   (
     cd desktop

@@ -25,6 +25,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
 import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import {
@@ -47,12 +48,9 @@ import {
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { hosts, sessions, trust } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
-import type { CarriedEndorsement } from "@/lib/hostControl";
+import { hosts, sessions } from "@/lib/api";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
-import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import { viewportInset } from "@/lib/viewport";
 import type { DisplayControlState } from "@/lib/ws";
@@ -222,7 +220,7 @@ export interface TerminalHandle {
 
 export interface TerminalProps {
   sessionId: string;
-  /** When false, keystrokes don't go to the WS; the Composer handles it. */
+  /** When false, the Composer handles keystrokes instead of the terminal input channel. */
   rawInput?: boolean;
   /** On mobile soft keyboards, Return can be reserved for multiline prompts. */
   mobileReturnMode?: MobileReturnMode;
@@ -230,15 +228,12 @@ export interface TerminalProps {
   mobileReturnBytes?: string;
   /** How uploaded images should be handed to the terminal application. */
   imagePasteMode?: ImagePasteMode;
-  /** Server-side shared terminal display ownership changed. */
+  /** Daemon-confirmed terminal display ownership changed. */
   onDisplayControl?: (state: DisplayControlState) => void;
-  /** Claim the shared display on attach (default). Viewers get a dimmed
-   *  terminal with a centered take-control button either way. */
-  autoTakeControl?: boolean;
   /** Foreground (interactive) vs parked in a warm pool. A parked instance
    *  (active=false) stays connected but passive: it never resizes the PTY or
    *  takes control, so it can't disturb another client. Re-activating it
-   *  reclaims control and fits to its container. Default true. */
+   *  focuses its view within the owning device and fits its container. Default true. */
   active?: boolean;
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
   onConnectionInfo?: (info: SessionConnectionInfo) => void;
@@ -259,7 +254,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     imagePasteMode = "deferred",
     onDisplayControl,
     onConnectionInfo,
-    autoTakeControl = true,
     active = true,
     onExit,
   },
@@ -275,15 +269,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const displayOwnerRef = useRef<boolean | null>(null);
   const displayGeometryRef = useRef<TerminalGeometry | null>(null);
   const [controlState, setControlState] = useState<DisplayControlState | null>(null);
-  const firstControlSeenRef = useRef(false);
-  const autoTakeControlRef = useRef(autoTakeControl);
-  autoTakeControlRef.current = autoTakeControl;
   // Foreground/parked state for the warm pool. A parked instance stays
   // connected but never fits or resizes (see fitTerminal), so moving its host
   // into an offscreen park can't churn the PTY geometry.
   const activeRef = useRef(active);
   const activePrevRef = useRef(active);
   const takeControlNowRef = useRef<() => boolean>(() => false);
+  const focusViewRef = useRef<() => boolean>(() => false);
   // GPU renderer for the FOREGROUND terminal only. The DOM renderer rebuilds
   // row elements and forces style/layout/paint after every echo — measurable
   // extra frames of felt keystroke latency. Parked terminals release their
@@ -342,7 +334,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       // Brought to the foreground from a parked state: reclaim control and fit
       // to the now-visible container. Two rAFs let the host's appendChild move
       // and the container's layout settle before we measure + resize.
-      requestAnimationFrame(() => requestAnimationFrame(() => takeControlNowRef.current()));
+      requestAnimationFrame(() => requestAnimationFrame(() => focusViewRef.current()));
       // Catch up on the refreshes the parked quiescence skipped.
       if (scrollbackCacheDirtyRef.current) {
         scheduleScrollbackCacheRefreshRef.current(250);
@@ -871,40 +863,41 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     refreshLiveEdgeRef.current();
   }, []);
 
-  const takeControlNow = useCallback((): boolean => {
-    snapToLiveEdge();
+  const requestDisplayControl = useCallback((operation: "take_control" | "focus_view"): boolean => {
     const term = termRef.current;
     if (!term) return false;
-    displayOwnerRef.current = true;
-    displayGeometryRef.current = null;
-    setControlState((prev) => (prev ? { ...prev, owner: true } : prev)); // optimistic
-    layoutTerminalSurfaceRef.current(false);
+    // Followers may be panning a virtual surface sized for another device.
+    // Measure this viewport without changing the displayed terminal or its lease.
+    const surfaces = [terminalSurfaceRef.current, containerRef.current].filter(
+      (surface): surface is HTMLDivElement => surface !== null,
+    );
+    const styles = surfaces.map((surface) => [surface.style.width, surface.style.height]);
+    const viewport = terminalViewportRef.current;
+    const scroll = { left: viewport?.scrollLeft ?? 0, top: viewport?.scrollTop ?? 0 };
+    let size = { cols: term.cols, rows: term.rows };
     try {
-      fitRef.current?.fit();
-    } catch {
-      // Keep the current size if fit is unavailable.
+      for (const surface of surfaces) {
+        surface.style.width = "100%";
+        surface.style.height = "100%";
+      }
+      size = fitRef.current?.proposeDimensions() ?? size;
+    } finally {
+      surfaces.forEach((surface, index) => {
+        [surface.style.width, surface.style.height] = styles[index];
+      });
+      if (viewport) {
+        viewport.scrollLeft = scroll.left;
+        viewport.scrollTop = scroll.top;
+      }
     }
-    const { cols, rows } = term;
-    const last = lastSizeRef.current;
-    lastSizeRef.current = { cols, rows };
-    if (cols !== last.cols || rows !== last.rows) {
-      invalidateScrollbackForResizeRef.current();
-    }
-    // A WIDTH change owes a history reseed, exactly as notifyResizeIfChanged
-    // enforces for a container fit. Take-control reflows the grid to our own
-    // geometry (a device/focus switch back to this tab is the common trigger),
-    // so committed history must be re-fetched and re-rendered at the new width;
-    // without arming the heal here, that width change silently skips it.
-    if (cols !== last.cols) {
-      historyReseedPendingRef.current = true;
-      resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
-    }
-    markResizeSentRef.current(cols, rows);
-    socketRef.current.sendJson({ type: "take_control", cols, rows });
-    term.focus();
-    return true;
-  }, [snapToLiveEdge]);
+    return socketRef.current.sendJson({ type: operation, cols: size.cols, rows: size.rows });
+  }, []);
+  const takeControlNow = useCallback(
+    () => requestDisplayControl("take_control"),
+    [requestDisplayControl],
+  );
   takeControlNowRef.current = takeControlNow;
+  focusViewRef.current = () => requestDisplayControl("focus_view");
 
   const applyDisplayControl = useCallback(
     (state: DisplayControlState) => {
@@ -916,28 +909,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       displayGeometryRef.current = geometry;
       onDisplayControl?.(state);
 
-      // Opening a terminal claims the shared display by default — but only
-      // off the FIRST state after mount. Reacting to later ownership changes
-      // would make two open tabs steal control from each other forever; a
-      // dimmed viewer re-takes via the centered button instead.
-      const isFirstControl = !firstControlSeenRef.current;
-      firstControlSeenRef.current = true;
-      if (isFirstControl && !state.owner && autoTakeControlRef.current) {
-        setControlState({ ...state, owner: true }); // optimistic; server confirms
-        // The control frame can beat xterm mount; retry briefly rather than
-        // silently staying an optimistic "owner" whose PTY is still sized
-        // for another session (which renders as clipped/garbled output).
-        const attemptTake = (tries: number) => {
-          if (takeControlNowRef.current()) return;
-          if (tries < 30) {
-            requestAnimationFrame(() => attemptTake(tries + 1));
-          } else {
-            setControlState(state); // give up: reflect the real viewer state
-          }
-        };
-        requestAnimationFrame(() => attemptTake(0));
-        return;
-      }
       setControlState(state);
 
       requestAnimationFrame(() => {
@@ -1063,11 +1034,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     );
   };
 
-  // Signed-signaling trust inputs. Terminal only receives sessionId, so it
-  // derives the account, the session's host, and that host's server-claimed key
-  // and fingerprint (all react-query cached and shared with the pages). The
-  // claimed values are untrusted; the local pin gate decides how to use them.
-  const { user: authUser } = useAuth();
   const sessionIdentityQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -1080,52 +1046,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     enabled: signalingHostId !== null,
     staleTime: 30_000,
   });
-  const signalingAccountId = authUser?.id ?? null;
-  // Liveness for the trust capability. The epoch ends the moment the signed-in
-  // account changes, so a negotiation that spans a logout or account switch
-  // must abort instead of completing under the previous account's pin and
-  // signing identity.
-  const liveAccountIdRef = useRef<string | null>(signalingAccountId);
-  liveAccountIdRef.current = signalingAccountId;
-  const claimedHostPublicKey = hostIdentityQuery.data?.host_public_key ?? null;
-  // Trust can only be evaluated once the account and hostId are known, and the
-  // first connection must not race the host record: until the claimed key
-  // query settles (success or error — a keyless host legitimately resolves to
-  // null), the socket stays disabled. Connecting earlier would both reach a
-  // pinned host before its pin is checked and tear the connection down again
-  // the moment the claimed key lands, killing anything in flight on it.
-  const signalingIdentityKnown =
-    signalingAccountId !== null &&
-    signalingHostId !== null &&
-    (hostIdentityQuery.isSuccess || hostIdentityQuery.isError);
-  const accountEndorsementsQuery = useQuery({
-    queryKey: ["account-endorsements", signalingAccountId],
-    queryFn: () => trust.accountEndorsements(),
-    enabled: signalingIdentityKnown,
-    staleTime: 5 * 60_000,
-  });
-  const resolveTrust = useCallback(
-    (): Promise<SignedRtcTrustDecision> =>
-      resolveSignedRtcTrust({
-        accountId: signalingAccountId as string,
-        hostId: signalingHostId as string,
-        claimedHostPublicKey,
-        isActive: () => liveAccountIdRef.current === signalingAccountId,
-      }),
-    [signalingAccountId, signalingHostId, claimedHostPublicKey],
-  );
-  const loadCarriedEndorsements = useCallback(async (): Promise<CarriedEndorsement[]> => {
-    const accountId = signalingAccountId;
-    if (!accountId) return [];
-    const edges = accountEndorsementsQuery.data ?? [];
-    return edges.map((edge) => ({
-      account_id: accountId,
-      endorser_public_key: edge.endorser_public_key,
-      endorsed_public_key: edge.endorsed_public_key,
-      endorsed_device_id: edge.endorsed_device_id,
-      signature: edge.signature,
-    }));
-  }, [accountEndorsementsQuery.data, signalingAccountId]);
 
   flushLiveTerminalWritesRef.current = () => {
     if (liveTerminalWriteIdleTimerRef.current) {
@@ -1225,12 +1145,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     scheduleLiveTerminalWritesRef.current();
   };
 
+  const daemonConnection = useDaemonConnection(signalingHostId);
   const socket = useSessionSocket({
+    connection: daemonConnection,
     sessionId,
-    enabled: socketInitialSize !== null && signalingIdentityKnown,
-    active,
-    resolveSignedRtcTrust: signalingIdentityKnown ? resolveTrust : undefined,
-    loadCarriedEndorsements: signalingIdentityKnown ? loadCarriedEndorsements : undefined,
+    sessionStatus: sessionIdentityQuery.data,
+    enabled:
+      socketInitialSize !== null &&
+      daemonConnection !== null &&
+      sessionIdentityQuery.data?.status !== "exited" &&
+      sessionIdentityQuery.data?.status !== "killed",
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {
@@ -1482,6 +1406,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       onExit?.(code, sig);
     },
   });
+  useEffect(() => {
+    if (
+      socket.dcOpen &&
+      active &&
+      document.hasFocus() &&
+      containerRef.current?.contains(document.activeElement)
+    ) {
+      focusViewRef.current();
+    }
+  }, [socket.dcOpen, active]);
 
   // Stash the socket in a ref so the once-on-mount bootstrap useEffect can
   // reach it without re-running every render.
@@ -2968,6 +2902,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (!rawInput) return;
     const enc = new TextEncoder();
     onDataDisposableRef.current = term.onData((d) => {
+      if (displayOwnerRef.current !== true || !socket.dcOpen) return;
       const filtered = stripDeviceAttributeResponses(d);
       const mapped = rewriteMobileReturn(
         filtered,
@@ -2978,7 +2913,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) {
-        socket.sendBinary(enc.encode(withAttachments));
+        if (!socket.sendBinary(enc.encode(withAttachments))) return;
       }
       if (latencyHudRef.current && withAttachments === d && /^[\x20-\x7e]$/.test(d)) {
         latencyHudRef.current.noteKeystroke(performance.now());
@@ -3047,7 +2982,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         if (displayOwnerRef.current === true) {
           socket.sendJson({ type: "resize", cols, rows });
         } else {
-          socket.sendJson({ type: "take_control", cols, rows });
+          socket.sendJson({ type: "focus_view", cols, rows });
         }
       },
       fit: () => {
@@ -3276,7 +3211,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           endUploadTrack(uploadId);
         }
       },
-      focus: () => termRef.current?.focus(),
+      focus: () => {
+        focusViewRef.current();
+        termRef.current?.focus();
+      },
       submit: () => {
         snapToLiveEdge();
         const payload = appendAttachmentsForSubmit("\r");
@@ -3370,6 +3308,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     <div
       role="application"
       aria-label="Session terminal"
+      aria-busy={!socket.dcOpen}
+      onFocusCapture={() => {
+        focusViewRef.current();
+      }}
       className="relative size-full touch-none bg-[var(--color-terminal-bg)]"
       onPasteCapture={onPasteCapture}
       onDragEnter={onDragEnter}
@@ -3449,8 +3391,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           data-testid="terminal-reconnect-banner"
           className="pointer-events-none absolute inset-x-2 top-2 z-20 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-center text-xs text-foreground shadow-lg backdrop-blur"
         >
-          Reconnecting to {hostIdentityQuery.data?.name ?? "host"} — keystrokes are sent once the
-          channel is back ({socket.queuedInputCount} queued)
+          Connection paused. Your terminal output is still available to copy.
         </div>
       )}
       {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
@@ -3559,13 +3500,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         className="hidden"
         onChange={onFileInputChange}
       />
-      {/* Viewer mode: another session owns the shared display. Dim the
-          terminal (output stays visible underneath) and put take-control
-          front and center; input is blocked until control is claimed. */}
+      {/* Followers keep selectable output and explicitly request control. */}
       {controlState && !controlState.owner && (
-        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2.5 bg-background/60 backdrop-blur-[1px]">
+        <div className="absolute inset-x-2 top-2 z-30 flex items-center justify-center gap-2.5 rounded-md border border-border bg-background/95 px-3 py-2">
           <span className="rounded bg-popover/90 px-2 py-0.5 text-xs text-muted-foreground ring-1 ring-border">
-            Another session has control
+            Another view has control
             {typeof controlState.cols === "number" && typeof controlState.rows === "number"
               ? ` · ${controlState.cols}x${controlState.rows}`
               : ""}

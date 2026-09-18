@@ -67,9 +67,9 @@ class SessionSignalChannel implements SignalChannel {
 
   constructor(private readonly sessionId: string) {
     this.socket = new ReconnectingSocket({
-      url: () => buildBrowserSocketUrl(sessionId),
+      url: (baseUrl) => buildBrowserSocketUrl(sessionId, baseUrl),
       protocol: SESSION_SIGNAL_PROTOCOL,
-      authorization: () => authToken.get(),
+      authorization: () => authToken.snapshot(),
       watchdogMs: 80_000,
       watchdogFrameTypes: ["ping"],
       reconnectDelayMs: signalReconnectDelay,

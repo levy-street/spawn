@@ -324,8 +324,18 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   const api = (globalThis.spawnWorker = { state });
   const encoder = new TextEncoder();
 
+  function scopedMessage(message) {
+    return state.mode === "session" &&
+      message.type !== "diagnostic" &&
+      !Object.prototype.hasOwnProperty.call(message, "attachmentId")
+      ? { ...message, attachmentId: state.rtcSessionId }
+      : message;
+  }
+
   api.post = (message) => {
-    globalThis.ReactNativeWebView?.postMessage(JSON.stringify({ v: BRIDGE_VERSION, ...message }));
+    globalThis.ReactNativeWebView?.postMessage(
+      JSON.stringify({ v: BRIDGE_VERSION, ...scopedMessage(message) }),
+    );
   };
 
   api.error = (code, message, retryable = false, detail) => {
@@ -341,7 +351,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   const latestTelemetry = new Map();
   let telemetryTimer = null;
   api.telemetry = (message) => {
-    latestTelemetry.set(message.type, message);
+    // Capture before batching: a replacement may be current by flush time.
+    latestTelemetry.set(message.type, scopedMessage(message));
     if (telemetryTimer !== null) return;
     telemetryTimer = setTimeout(() => {
       telemetryTimer = null;
@@ -595,6 +606,24 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   api.fitTerminal = fitTerminal;
+  api.preferredTerminalSize = () => {
+    const terminal = state.term;
+    const fit = state.fitAddon;
+    if (!terminal || !fit) return { cols: state.cols, rows: state.rows };
+    const previous = terminal.options.fontSize;
+    try {
+      terminal.options.fontSize = state.fontSize;
+      const size = fit.proposeDimensions();
+      return size
+        ? {
+            cols: clamp(size.cols, GRID_BOUNDS.minCols, GRID_BOUNDS.maxCols),
+            rows: clamp(size.rows, GRID_BOUNDS.minRows, GRID_BOUNDS.maxRows),
+          }
+        : { cols: state.cols, rows: state.rows };
+    } finally {
+      terminal.options.fontSize = previous;
+    }
+  };
 
   let fitTimer = null;
   function scheduleFit() {
@@ -957,6 +986,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
         });
         return true;
       case "focus":
+        api.focusDisplayView?.();
         refocusTerminal();
         return true;
       case "blur":
@@ -1037,6 +1067,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   bridgeTarget.addEventListener("message", listener);
 
   api.sendPty = (bytes) => {
+    if (!api.sessionReady?.() || state.displayOwner !== true) return false;
     if (!state.pty || state.pty.readyState !== "open") return false;
     for (let offset = 0; offset < bytes.byteLength; offset += MAX_INPUT_BYTES) {
       state.pty.send(bytes.slice(offset, offset + MAX_INPUT_BYTES));
@@ -1134,6 +1165,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     historyReady: false,
   };
   const session = {
+    generation: 0,
     ready: false,
     bootstrapStarted: false,
     bootstrapCount: 0,
@@ -1159,6 +1191,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   api.sessionReady = () => session.ready;
 
   function resetGates() {
+    session.generation += 1;
     for (const key of Object.keys(gates)) gates[key] = false;
     session.ready = false;
     session.bootstrapStarted = false;
@@ -1302,7 +1335,9 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     if (session.writeInFlight || session.writeBytes === 0 || session.stale || !state.term) return;
     session.writeInFlight = true;
     const wasAtBottom = api.scrollState().atBottom;
+    const generation = session.generation;
     state.term.write(takeWriteBatch(), () => {
+      if (generation !== session.generation) return;
       session.writeInFlight = false;
       if (state.follow && wasAtBottom) state.term.scrollToBottom();
       api.emitScroll();
@@ -1311,10 +1346,11 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   api.receivePty = (value) => {
+    const generation = session.generation;
     session.ptyTail = session.ptyTail
       .then(async () => {
         const bytes = await api.bytesFromMessage(value);
-        if (!bytes) return;
+        if (!bytes || generation !== session.generation) return;
         session.ptyOffset += bytes.byteLength;
         const entry = { bytes, offsetAfter: session.ptyOffset };
         if (!session.ready) {
@@ -1329,7 +1365,13 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
           enqueueWrite(bytes);
         }
       })
-      .catch((error) => api.error("pty_decode", error.message, true));
+      .catch((error) => {
+        if (generation === session.generation) {
+          api.error("pty_decode", error.message, true);
+          api.failSessionChannel?.();
+        }
+      });
+    return session.ptyTail;
   };
 
   function uuidBytes(value) {
@@ -1398,6 +1440,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     history.rendering = true;
     if (history.operation === "snapshot") state.term.reset();
     const finish = () => {
+      if (session.history !== history) return;
       let barrier = Number.isSafeInteger(anchor) ? anchor : null;
       for (const entry of session.preboot) {
         if (barrier !== null && entry.offsetAfter <= barrier) {
@@ -1430,14 +1473,21 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     // is exactly what goes missing. History first, then scroll what it
     // occupies up into scrollback, then the screen on a clean viewport.
     const storied = parseStoriedReplay(replay);
-    const writeReplay = storied
+    const renderReplay = storied
       ? () =>
-          state.term.write(storied.history, () =>
-            state.term.write(flushViewportIntoScrollback(), () =>
-              state.term.write(storied.screen, finish),
-            ),
+          state.term.write(
+            storied.history,
+            () =>
+              session.history === history &&
+              state.term.write(
+                flushViewportIntoScrollback(),
+                () => session.history === history && state.term.write(storied.screen, finish),
+              ),
           )
       : () => state.term.write(replay, finish);
+    const writeReplay = () => {
+      if (session.history === history) renderReplay();
+    };
     if (history.operation === "history" && session.bootstrapCount > 0) {
       // Restore the character sets, margins, origin mode and autowrap before
       // clearing: the previous screen's tail sets the app's scroll region and
@@ -1726,7 +1776,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     return false;
   }
 
-  function receiveCtlValue(value) {
+  function receiveCtlValue(value, generation) {
     if (typeof value === "string") {
       if (new TextEncoder().encode(value).byteLength > 16 * 1024) return;
       let message;
@@ -1749,7 +1799,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       return;
     }
     return api.bytesFromMessage(value).then((bytes) => {
-      if (bytes) {
+      if (bytes && generation === session.generation) {
         const frame = decodeSpct(bytes);
         if (frame) acceptReplayChunk(frame);
       }
@@ -1757,9 +1807,16 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   api.receiveSessionCtl = (value) => {
+    const generation = session.generation;
     session.ctlTail = session.ctlTail
-      .then(() => receiveCtlValue(value))
-      .catch((error) => api.error("ctl_decode", error.message, true));
+      .then(() => generation === session.generation && receiveCtlValue(value, generation))
+      .catch((error) => {
+        if (generation === session.generation) {
+          api.error("ctl_decode", error.message, true);
+          api.failSessionChannel?.();
+        }
+      });
+    return session.ctlTail;
   };
 
   api.sendResize = (cols, rows) => {
@@ -1778,21 +1835,13 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
    * the PTY and redraws, so the next frame is rendered for this screen instead
    * of whatever desk the session was last read from.
    */
-  api.takeDisplayControl = () => {
-    if (!state.term) return false;
-    session.claiming = true;
-    state.displayOwner = true;
-    state.displayGeometry = null;
-    try {
-      api.fitTerminal();
-    } finally {
-      session.claiming = false;
-    }
-    return sendCtlText(crypto.randomUUID(), "take_control", {
-      cols: state.cols,
-      rows: state.rows,
-    });
-  };
+  function requestDisplayControl(operation) {
+    if (!session.ready || !state.term) return false;
+    const dimensions = api.preferredTerminalSize?.() ?? { cols: state.cols, rows: state.rows };
+    return sendCtlText(crypto.randomUUID(), operation, dimensions);
+  }
+  api.takeDisplayControl = () => requestDisplayControl("take_control");
+  api.focusDisplayView = () => requestDisplayControl("focus_view");
 
   function handleDisplayState(message) {
     const owner = message.owner === true;
@@ -1811,16 +1860,6 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     // A frame that lands before the grid exists is recorded but not acted on,
     // so the claim below still happens off the first frame that can carry it.
     if (!state.term) return;
-    // Opening a terminal claims the display, matching the web client. Only off
-    // the first frame, though: reacting to later ownership changes would have
-    // two open viewers steal control from each other forever. A follower re-takes
-    // it deliberately, from the banner.
-    const first = !session.displaySeen;
-    session.displaySeen = true;
-    if (!owner && first) {
-      api.takeDisplayControl();
-      return;
-    }
     api.fitTerminal();
   }
 
@@ -1844,8 +1883,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   api.requestReplay = requestReplay;
 
   function waitForBufferedAmount() {
-    if (!state.ctl || state.ctl.bufferedAmount <= 256 * 1024) return Promise.resolve();
-    state.ctl.bufferedAmountLowThreshold = 128 * 1024;
+    if (!state.ctl || state.ctl.bufferedAmount <= 128 * 1024) return Promise.resolve();
+    state.ctl.bufferedAmountLowThreshold = 64 * 1024;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error("Upload channel remained backpressured.")),
@@ -1959,7 +1998,19 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     ) {
       throw new Error("Upload bridge chunk length or final flag mismatch.");
     }
-    await waitForBufferedAmount();
+    const generation = session.generation;
+    const channel = state.ctl;
+    const isCurrent = () =>
+      generation === session.generation &&
+      channel === state.ctl &&
+      session.uploads.get(upload.uploadId) === upload;
+    try {
+      await waitForBufferedAmount();
+    } catch (error) {
+      if (!isCurrent()) return;
+      throw error;
+    }
+    if (!isCurrent()) return;
     const frame = encodeUploadChunk(upload.uploadId, message.sequence, message.last, payload);
     if (!frame || !state.ctl || state.ctl.readyState !== "open")
       throw new Error("Upload channel closed.");
@@ -1981,196 +2032,741 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
 // biome-ignore-all lint: This source executes inside WKWebView, not the React Native runtime.
 (() => {
   "use strict";
-  const api = globalThis.spawnWorker;
-  const state = api.state;
-  const host = { binding: false, channel: false, hello: false };
-  const HOST_HELLO_BRIDGE_ID = "$host.hello";
-  const HOST_STREAM_BRIDGE_PREFIX = "$host.stream:";
-  const STREAM_COMMAND_PREFIX = "$host.stream.";
-  const MAX_FRAME_BYTES = 16 * 1024;
-  const MAX_CHUNK_BYTES = 8 * 1024;
-  const BUFFERED_HIGH_WATER = 256 * 1024;
-  const STREAM_TIMEOUT_MS = 60_000;
+  const root = globalThis.spawnWorker;
+  function createHostProtocol(api) {
+    const state = api.state;
+    const host = { binding: false, channel: false, hello: false };
+    const HOST_HELLO_BRIDGE_ID = "$host.hello";
+    const HOST_STREAM_BRIDGE_PREFIX = "$host.stream:";
+    const STREAM_COMMAND_PREFIX = "$host.stream.";
+    const MAX_FRAME_BYTES = 16 * 1024;
+    const MAX_CHUNK_BYTES = 8 * 1024;
+    const BUFFERED_HIGH_WATER = 32 * 1024;
+    const STREAM_TIMEOUT_MS = 60_000;
 
-  function checkReady() {
-    if (host.binding && host.channel && host.hello) api.post({ type: "state", state: "ready" });
-  }
-
-  function postResponse(requestId, ok, result, error) {
-    api.post({
-      type: "host-response",
-      requestId,
-      ok,
-      ...(result === undefined ? {} : { result }),
-      ...(error === undefined ? {} : { error }),
-    });
-  }
-
-  function encodeFrame(frame) {
-    const text = JSON.stringify(frame);
-    if (new TextEncoder().encode(text).byteLength > MAX_FRAME_BYTES) {
-      throw new Error("Host-control frame exceeds 16 KiB.");
+    function checkReady() {
+      if (host.binding && host.channel && host.hello) api.post({ type: "state", state: "ready" });
     }
-    return text;
-  }
 
-  function sendFrame(frame) {
-    if (!state.ctl || state.ctl.readyState !== "open") {
-      throw new Error("Host-control channel is not ready.");
+    function postResponse(requestId, ok, result, error) {
+      api.post({
+        type: "host-response",
+        requestId,
+        ok,
+        ...(result === undefined ? {} : { result }),
+        ...(error === undefined ? {} : { error }),
+      });
     }
-    state.ctl.send(encodeFrame(frame));
-  }
 
-  async function waitForWritable() {
-    const channel = state.ctl;
-    if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
-    if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
-    channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        channel.removeEventListener("bufferedamountlow", onWritable);
-        reject(new Error("Host stream backpressure timed out."));
-      }, STREAM_TIMEOUT_MS);
-      const onWritable = () => {
-        clearTimeout(timer);
-        resolve();
+    function encodeFrame(frame) {
+      const text = JSON.stringify(frame);
+      if (new TextEncoder().encode(text).byteLength > MAX_FRAME_BYTES) {
+        throw new Error("Host-control frame exceeds 16 KiB.");
+      }
+      return text;
+    }
+
+    function sendFrame(frame) {
+      if (!state.ctl || state.ctl.readyState !== "open") {
+        throw new Error("Host-control channel is not ready.");
+      }
+      return state.ctl.send(encodeFrame(frame));
+    }
+
+    async function waitForWritable() {
+      const channel = state.ctl;
+      if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
+      if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
+      channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          channel.removeEventListener("bufferedamountlow", onWritable);
+          channel.removeEventListener("close", onClose);
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error("Host stream backpressure timed out."));
+        }, STREAM_TIMEOUT_MS);
+        const onWritable = () => {
+          if (channel.bufferedAmount > BUFFERED_HIGH_WATER) return;
+          cleanup();
+          resolve();
+        };
+        const onClose = () => {
+          cleanup();
+          reject(new Error("Host-control channel closed."));
+        };
+        channel.addEventListener("bufferedamountlow", onWritable);
+        channel.addEventListener("close", onClose, { once: true });
+        onWritable();
+      });
+      if (channel.readyState !== "open") throw new Error("Host-control channel is not ready.");
+    }
+
+    function streamFrame(type, payload) {
+      if (!payload || typeof payload.stream_id !== "string" || payload.stream_id.length === 0) {
+        throw new Error("Host stream command is missing its stream ID.");
+      }
+      if (type === "chunk") {
+        if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 0) {
+          throw new Error("Host stream chunk sequence is invalid.");
+        }
+        if (typeof payload.bytes_b64 !== "string") {
+          throw new Error("Host stream chunk bytes are invalid.");
+        }
+        const bytes = api.decodeBase64(payload.bytes_b64);
+        if (bytes.byteLength === 0 || bytes.byteLength > MAX_CHUNK_BYTES) {
+          throw new Error("Host stream chunk exceeds 8 KiB.");
+        }
+      } else if (type === "end") {
+        if (
+          !Number.isSafeInteger(payload.length) ||
+          payload.length < 0 ||
+          typeof payload.sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/.test(payload.sha256)
+        ) {
+          throw new Error("Host stream end frame is invalid.");
+        }
+      } else if (type === "ack") {
+        if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 1) {
+          throw new Error("Host stream acknowledgement is invalid.");
+        }
+      }
+      return {
+        version: 1,
+        type: `stream.${type}`,
+        stream_id: payload.stream_id,
+        ...(type === "chunk"
+          ? { sequence: payload.sequence, bytes_b64: payload.bytes_b64 }
+          : type === "end"
+            ? { length: payload.length, sha256: payload.sha256 }
+            : type === "ack"
+              ? { sequence: payload.sequence }
+              : {}),
       };
-      channel.addEventListener("bufferedamountlow", onWritable, { once: true });
-    });
-    if (channel.readyState !== "open") throw new Error("Host-control channel is not ready.");
-  }
+    }
 
-  function streamFrame(type, payload) {
-    if (!payload || typeof payload.stream_id !== "string" || payload.stream_id.length === 0) {
-      throw new Error("Host stream command is missing its stream ID.");
+    async function sendHostMessage(message) {
+      try {
+        if (message.type === "host-cancel") {
+          await sendFrame({ version: 1, type: "cancel", request_id: message.requestId });
+          return;
+        }
+        if (message.type !== "host-request") return;
+        if (message.operation.startsWith(STREAM_COMMAND_PREFIX)) {
+          const type = message.operation.slice(STREAM_COMMAND_PREFIX.length);
+          if (!["ack", "cancel", "chunk", "end"].includes(type)) {
+            throw new Error("Unknown host stream command.");
+          }
+          if (type === "chunk" || type === "end") await waitForWritable();
+          await sendFrame(streamFrame(type, message.payload));
+          postResponse(message.requestId, true, { sent: true });
+          return;
+        }
+        await sendFrame({
+          version: 1,
+          type: "request",
+          request_id: message.requestId,
+          operation: message.operation,
+          ...(message.payload === undefined ? {} : { payload: message.payload }),
+        });
+      } catch (error) {
+        postResponse(message.requestId, false, undefined, {
+          code: "host_send_failed",
+          detail: error instanceof Error ? error.message : "Host-control send failed.",
+        });
+      }
     }
-    if (type === "chunk") {
-      if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 0) {
-        throw new Error("Host stream chunk sequence is invalid.");
+
+    api.resetHostGeneration = () => {
+      host.binding = false;
+      host.channel = false;
+      host.hello = false;
+    };
+
+    api.hostBindingAccepted = () => {
+      host.binding = true;
+      checkReady();
+    };
+
+    api.hostChannelOpened = () => {
+      host.channel = true;
+      checkReady();
+    };
+
+    api.receiveHostCtl = (value) => {
+      if (typeof value !== "string") {
+        api.error("host_binary", "Unexpected host-control binary frame.", false);
+        return;
       }
-      if (typeof payload.bytes_b64 !== "string") {
-        throw new Error("Host stream chunk bytes are invalid.");
+      if (new TextEncoder().encode(value).byteLength > MAX_FRAME_BYTES) {
+        api.error("host_frame_size", "Host-control frame exceeds 16 KiB.", false);
+        return;
       }
-      const bytes = api.decodeBase64(payload.bytes_b64);
-      if (bytes.byteLength === 0 || bytes.byteLength > MAX_CHUNK_BYTES) {
-        throw new Error("Host stream chunk exceeds 8 KiB.");
+      let message;
+      try {
+        message = JSON.parse(value);
+      } catch {
+        api.error("host_json", "Host-control frame is not valid JSON.", false);
+        return;
       }
-    } else if (type === "end") {
-      if (
-        !Number.isSafeInteger(payload.length) ||
-        payload.length < 0 ||
-        typeof payload.sha256 !== "string" ||
-        !/^[0-9a-f]{64}$/.test(payload.sha256)
-      ) {
-        throw new Error("Host stream end frame is invalid.");
+      if (message?.version !== 1) {
+        api.error("host_version", "Host-control frame has an unsupported version.", false);
+        return;
       }
-    } else if (type === "ack") {
-      if (!Number.isSafeInteger(payload.sequence) || payload.sequence < 1) {
-        throw new Error("Host stream acknowledgement is invalid.");
+      if (message.type === "hello" && message.protocol === "spawn.host.ctl") {
+        postResponse(HOST_HELLO_BRIDGE_ID, true, message);
+        host.hello = true;
+        checkReady();
+        return;
       }
-    }
-    return {
-      version: 1,
-      type: `stream.${type}`,
-      stream_id: payload.stream_id,
-      ...(type === "chunk"
-        ? { sequence: payload.sequence, bytes_b64: payload.bytes_b64 }
-        : type === "end"
-          ? { length: payload.length, sha256: payload.sha256 }
-          : type === "ack"
-            ? { sequence: payload.sequence }
-            : {}),
+      if (typeof message.type === "string" && message.type.startsWith("stream.")) {
+        if (typeof message.stream_id !== "string") {
+          api.error("host_stream", "Host stream frame is missing its stream ID.", false);
+          return;
+        }
+        postResponse(`${HOST_STREAM_BRIDGE_PREFIX}${message.stream_id}`, true, message);
+        return;
+      }
+      if (message.type !== "response" || typeof message.request_id !== "string") return;
+      postResponse(message.request_id, message.ok === true, message.result, message.error);
+    };
+
+    api.handleHostMessage = (message) => {
+      void sendHostMessage(message);
     };
   }
+  root.createHostProtocol = createHostProtocol;
+  createHostProtocol(root);
+})();
 
-  async function sendHostMessage(message) {
-    try {
-      if (message.type === "host-cancel") {
-        sendFrame({ version: 1, type: "cancel", request_id: message.requestId });
+// biome-ignore-all lint: This source executes inside WebView, not React Native.
+(() => {
+  "use strict";
+  const api = globalThis.spawnWorker;
+  const consumers = new Map();
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  function post(id, message) {
+    const entry = consumers.get(id);
+    let sequence;
+    if (entry && message.type === "host-response") {
+      const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+      if (entry.unreceived + bytes > 2 * 1024 * 1024 || entry.receipts.size >= 1024) {
+        post(id, {
+          type: "error",
+          code: "host_consumer_receive_limit",
+          message: "Host tool receive queue is full.",
+          retryable: false,
+        });
+        close(id);
         return;
       }
-      if (message.type !== "host-request") return;
-      if (message.operation.startsWith(STREAM_COMMAND_PREFIX)) {
-        const type = message.operation.slice(STREAM_COMMAND_PREFIX.length);
-        if (!["ack", "cancel", "chunk", "end"].includes(type)) {
-          throw new Error("Unknown host stream command.");
+      sequence = ++entry.receiveSequence;
+      entry.unreceived += bytes;
+      entry.receipts.set(sequence, bytes);
+    }
+    api.post({
+      type: "host-consumer-event",
+      consumerId: id,
+      message,
+      ...(sequence === undefined ? {} : { sequence }),
+    });
+  }
+
+  function close(id) {
+    const entry = consumers.get(id);
+    if (!entry) return;
+    consumers.delete(id);
+    clearTimeout(entry.timer);
+    entry.dc.onclose = entry.dc.onerror = entry.dc.onmessage = entry.dc.onopen = null;
+    entry.dc.removeEventListener("bufferedamountlow", entry.onBuffered);
+    entry.dc.close();
+    for (const item of entry.queue.splice(0)) item.reject(new Error("Host consumer closed."));
+    entry.queued = 0;
+    entry.receipts.clear();
+    entry.unreceived = 0;
+    entry.channel.dispatchEvent(new Event("close"));
+    post(id, { type: "state", state: "reconnecting" });
+  }
+
+  function drain(id) {
+    const entry = consumers.get(id);
+    if (!entry) return;
+    entry.timer = null;
+    if (api.state.pc?.connectionState !== "connected" || entry.dc.readyState !== "open") {
+      close(id);
+      return;
+    }
+    // A bounded queue and native buffer for this consumer. Service one frame
+    // per turn so bulk work yields to terminal channels and sibling tools.
+    if (entry.queue.length && entry.dc.bufferedAmount <= 32 * 1024) {
+      const item = entry.queue.shift();
+      entry.queued -= item.bytes;
+      try {
+        entry.dc.send(item.text);
+        item.resolve();
+      } catch (error) {
+        item.reject(error);
+        close(id);
+        return;
+      }
+      entry.channel.dispatchEvent(new Event("bufferedamountlow"));
+    }
+    if (entry.queue.length) entry.timer = setTimeout(() => drain(id), 4);
+  }
+
+  function open(id) {
+    if (consumers.has(id)) return;
+    if (
+      !uuid.test(id) ||
+      consumers.size >= 32 ||
+      api.state.mode !== "host" ||
+      api.state.pc?.connectionState !== "connected" ||
+      api.state.ctl?.readyState !== "open"
+    ) {
+      post(id, {
+        type: "error",
+        code: "host_consumer_unavailable",
+        message: "Host connection is not ready for another tool.",
+        retryable: false,
+      });
+      return;
+    }
+    const dc = api.state.pc.createDataChannel(`spawn.host.ctl/${id}`, { ordered: true });
+    const entry = {
+      dc,
+      queue: [],
+      queued: 0,
+      timer: null,
+      channel: null,
+      protocol: null,
+      receiveSequence: 0,
+      unreceived: 0,
+      receipts: new Map(),
+      onBuffered: null,
+    };
+    const channel = new EventTarget();
+    Object.defineProperties(channel, {
+      readyState: { get: () => (consumers.get(id) === entry ? dc.readyState : "closed") },
+      bufferedAmount: { get: () => entry.queued + dc.bufferedAmount },
+      bufferedAmountLowThreshold: {
+        get: () => dc.bufferedAmountLowThreshold,
+        set: (value) => {
+          dc.bufferedAmountLowThreshold = value;
+        },
+      },
+    });
+    channel.send = (text) =>
+      new Promise((resolve, reject) => {
+        const bytes = new TextEncoder().encode(text).byteLength;
+        if (
+          channel.readyState !== "open" ||
+          bytes > 64 * 1024 ||
+          entry.queued + bytes > 256 * 1024 ||
+          entry.queue.length >= 1024
+        ) {
+          reject(new Error("Host consumer send queue is unavailable."));
+          return;
         }
-        if (type === "chunk" || type === "end") await waitForWritable();
-        sendFrame(streamFrame(type, message.payload));
-        postResponse(message.requestId, true, { sent: true });
-        return;
+        entry.queue.push({ text, bytes, resolve, reject });
+        entry.queued += bytes;
+        if (entry.timer === null) entry.timer = setTimeout(() => drain(id), 0);
+      });
+    entry.channel = channel;
+    const protocol = {
+      state: { ctl: channel },
+      decodeBase64: api.decodeBase64,
+      post: (message) => {
+        if (consumers.get(id) === entry) post(id, message);
+      },
+      error: (code, message) => {
+        if (consumers.get(id) !== entry) return;
+        post(id, { type: "error", code, message, retryable: false });
+        close(id);
+      },
+    };
+    api.createHostProtocol(protocol);
+    entry.protocol = protocol;
+    consumers.set(id, entry);
+    protocol.hostBindingAccepted();
+    dc.onopen = () => {
+      if (consumers.get(id) === entry) protocol.hostChannelOpened();
+    };
+    dc.onmessage = ({ data }) => {
+      if (consumers.get(id) === entry) protocol.receiveHostCtl(data);
+    };
+    dc.onclose = dc.onerror = () => close(id);
+    entry.onBuffered = () => channel.dispatchEvent(new Event("bufferedamountlow"));
+    dc.addEventListener("bufferedamountlow", entry.onBuffered);
+  }
+
+  api.closeHostConsumers = () => {
+    for (const id of [...consumers.keys()]) close(id);
+  };
+  api.handleHostConsumerMessage = (message) => {
+    if (message.type === "host-consumer-open") {
+      try {
+        open(message.consumerId);
+      } catch {
+        post(message.consumerId, {
+          type: "error",
+          code: "host_consumer_open",
+          message: "Host tool channel could not open.",
+          retryable: false,
+        });
       }
-      sendFrame({
-        version: 1,
-        type: "request",
-        request_id: message.requestId,
-        operation: message.operation,
-        ...(message.payload === undefined ? {} : { payload: message.payload }),
-      });
-    } catch (error) {
-      postResponse(message.requestId, false, undefined, {
-        code: "host_send_failed",
-        detail: error instanceof Error ? error.message : "Host-control send failed.",
-      });
+      return true;
+    }
+    if (message.type === "host-consumer-close") {
+      close(message.consumerId);
+      return true;
+    }
+    if (message.type === "host-consumer-command") {
+      consumers.get(message.consumerId)?.protocol.handleHostMessage(message.command);
+      return true;
+    }
+    if (message.type === "host-consumer-received") {
+      const entry = consumers.get(message.consumerId);
+      const bytes = entry?.receipts.get(message.sequence);
+      if (bytes !== undefined) {
+        entry.receipts.delete(message.sequence);
+        entry.unreceived -= bytes;
+      }
+      return true;
+    }
+    return false;
+  };
+})();
+
+// biome-ignore-all lint: This source executes inside WKWebView, not the React Native runtime.
+(() => {
+  "use strict";
+  const api = globalThis.spawnWorker;
+  const state = api.state;
+  const MAX_FRAME = 64 * 1024;
+  const MAX_QUEUE = 256 * 1024;
+  const MAX_RECEIVE = 2 * 1024 * 1024;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const attached = new Map();
+  let view = null;
+  let timer = null;
+  let cursor = 0;
+  const sizeOf = (value) =>
+    typeof value === "string" ? new TextEncoder().encode(value).byteLength : value.byteLength;
+
+  function postEvent(attachmentId, channel, event, extra = {}) {
+    api.post({ type: "pair-event", attachmentId, channel, event, ...extra });
+  }
+  function command(attachmentId, channel, event, extra = {}) {
+    api.post({ type: "pair-command", attachmentId, channel, event, ...extra });
+  }
+
+  function detach(id) {
+    const entry = attached.get(id);
+    if (!entry) return;
+    attached.delete(id);
+    for (const [kind, item] of entry) {
+      item.dc.onclose = null;
+      item.dc.onerror = null;
+      item.dc.onmessage = null;
+      item.dc.close();
+      item.queue.length = 0;
+      postEvent(id, kind, "close");
     }
   }
 
-  api.resetHostGeneration = () => {
-    host.binding = false;
-    host.channel = false;
-    host.hello = false;
-  };
-
-  api.hostBindingAccepted = () => {
-    host.binding = true;
-    checkReady();
-  };
-
-  api.hostChannelOpened = () => {
-    host.channel = true;
-    checkReady();
-  };
-
-  api.receiveHostCtl = (value) => {
-    if (typeof value !== "string") {
-      api.error("host_binary", "Unexpected host-control binary frame.", false);
-      return;
-    }
-    if (new TextEncoder().encode(value).byteLength > MAX_FRAME_BYTES) {
-      api.error("host_frame_size", "Host-control frame exceeds 16 KiB.", false);
-      return;
-    }
-    let message;
-    try {
-      message = JSON.parse(value);
-    } catch {
-      api.error("host_json", "Host-control frame is not valid JSON.", false);
-      return;
-    }
-    if (message?.version !== 1) {
-      api.error("host_version", "Host-control frame has an unsupported version.", false);
-      return;
-    }
-    if (message.type === "hello" && message.protocol === "spawn.host.ctl") {
-      postResponse(HOST_HELLO_BRIDGE_ID, true, message);
-      host.hello = true;
-      checkReady();
-      return;
-    }
-    if (typeof message.type === "string" && message.type.startsWith("stream.")) {
-      if (typeof message.stream_id !== "string") {
-        api.error("host_stream", "Host stream frame is missing its stream ID.", false);
-        return;
+  // One bounded queue per channel. Visit every ready channel each round so a
+  // paste or upload cannot monopolize another terminal's input.
+  function drain() {
+    timer = null;
+    const all = [...attached.entries()].flatMap(([id, channels]) =>
+      [...channels.entries()].map(([kind, item]) => ({ id, kind, item })),
+    );
+    if (!all.length) return;
+    let pending = false;
+    for (let n = 0; n < all.length; n++) {
+      const { id, kind, item } = all[(cursor + n) % all.length];
+      const next = item.queue[0];
+      if (!next) continue;
+      if (item.dc.readyState !== "open" || state.pc?.connectionState !== "connected") {
+        detach(id);
+        continue;
       }
-      postResponse(`${HOST_STREAM_BRIDGE_PREFIX}${message.stream_id}`, true, message);
+      if (item.dc.bufferedAmount <= 32 * 1024) {
+        try {
+          item.dc.send(next.value);
+          item.queue.shift();
+          item.queued -= next.bytes;
+          postEvent(id, kind, "ack", { sequence: next.sequence, bytes: next.bytes });
+        } catch {
+          detach(id);
+        }
+      }
+      pending ||= item.queue.length > 0;
+    }
+    cursor = (cursor + 1) % all.length;
+    if (pending) timer = setTimeout(drain, 4);
+  }
+
+  function attach(message) {
+    const { attachmentId: id, sessionId, viewId } = message;
+    if (
+      !uuid.test(id) ||
+      !uuid.test(sessionId) ||
+      !uuid.test(viewId) ||
+      state.mode !== "host" ||
+      state.pc?.connectionState !== "connected" ||
+      state.ctl?.readyState !== "open" ||
+      attached.size >= 128
+    ) {
+      postEvent(id, "ctl", "close");
       return;
     }
-    if (message.type !== "response" || typeof message.request_id !== "string") return;
-    postResponse(message.request_id, message.ok === true, message.result, message.error);
-  };
+    if (attached.has(id)) return;
+    const entry = new Map();
+    attached.set(id, entry);
+    try {
+      for (const kind of ["pty", "ctl"]) {
+        const dc = state.pc.createDataChannel(`spawn.${kind}/${sessionId}/${viewId}/${id}`, {
+          ordered: true,
+        });
+        const item = {
+          dc,
+          queue: [],
+          queued: 0,
+          unreceived: 0,
+          receiveSequence: 0,
+          sendSequence: 0,
+          receipts: new Map(),
+          pendingBytes: 0,
+          pendingMessages: 0,
+          tail: Promise.resolve(),
+        };
+        entry.set(kind, item);
+        dc.binaryType = "arraybuffer";
+        dc.onopen = () => {
+          if (attached.get(id) === entry) postEvent(id, kind, "open");
+        };
+        dc.onclose = dc.onerror = () => detach(id);
+        dc.onmessage = ({ data }) => {
+          const pendingBytes =
+            typeof data === "string" ? sizeOf(data) : (data.byteLength ?? data.size);
+          if (
+            !Number.isFinite(pendingBytes) ||
+            pendingBytes > MAX_FRAME ||
+            item.pendingBytes + item.unreceived + pendingBytes > MAX_RECEIVE ||
+            item.pendingMessages + item.receipts.size >= 1024
+          ) {
+            detach(id);
+            return;
+          }
+          item.pendingBytes += pendingBytes;
+          item.pendingMessages++;
+          item.tail = item.tail
+            .then(async () => {
+              if (attached.get(id) !== entry) return;
+              const binary = typeof data !== "string";
+              const value = binary ? await api.bytesFromMessage(data) : data;
+              if (attached.get(id) !== entry) return;
+              item.pendingBytes -= pendingBytes;
+              item.pendingMessages--;
+              const bytes = sizeOf(value);
+              if (
+                bytes > MAX_FRAME ||
+                item.unreceived + bytes > MAX_RECEIVE ||
+                item.receipts.size >= 1024
+              ) {
+                detach(id);
+                return;
+              }
+              const sequence = ++item.receiveSequence;
+              item.unreceived += bytes;
+              item.receipts.set(sequence, bytes);
+              postEvent(id, kind, "data", {
+                data: binary ? api.encodeBase64(value) : value,
+                binary,
+                sequence,
+                bytes,
+              });
+            })
+            .catch(() => detach(id));
+        };
+      }
+    } catch {
+      detach(id);
+    }
+  }
 
-  api.handleHostMessage = (message) => {
-    void sendHostMessage(message);
+  function receiveCommand(message) {
+    const item = attached.get(message.attachmentId)?.get(message.channel);
+    if (!item) return;
+    if (message.event === "close") return detach(message.attachmentId);
+    if (message.event === "received") {
+      const bytes = item.receipts.get(message.sequence);
+      if (bytes !== undefined) {
+        item.receipts.delete(message.sequence);
+        item.unreceived -= bytes;
+      }
+      return;
+    }
+    if (message.event !== "send") return;
+    if (
+      message.sequence !== item.sendSequence + 1 ||
+      typeof message.data !== "string" ||
+      message.data.length > MAX_FRAME * 2
+    )
+      return detach(message.attachmentId);
+    const value = message.binary ? api.decodeBase64(message.data) : message.data;
+    const bytes = sizeOf(value);
+    if (bytes > MAX_FRAME || item.queued + bytes > MAX_QUEUE || item.queue.length >= 1024)
+      return detach(message.attachmentId);
+    item.sendSequence = message.sequence;
+    item.queued += bytes;
+    item.queue.push({ value, bytes, sequence: message.sequence });
+    if (timer === null) timer = setTimeout(drain, 0);
+  }
+
+  class ViewChannel extends EventTarget {
+    constructor(id, kind) {
+      super();
+      this.id = id;
+      this.kind = kind;
+      this.label = `spawn.${kind}`;
+      this.readyState = "connecting";
+      this.binaryType = "arraybuffer";
+      this.bufferedAmount = 0;
+      this.bufferedAmountLowThreshold = 128 * 1024;
+      this.sequence = 0;
+      this.receipts = new Map();
+    }
+    fire(name, event = new Event(name)) {
+      this[`on${name}`]?.(event);
+      this.dispatchEvent(event);
+    }
+    send(value) {
+      if (this.readyState !== "open") throw new Error("Terminal connection is paused.");
+      const binary = typeof value !== "string";
+      const bytes = binary
+        ? value instanceof ArrayBuffer
+          ? new Uint8Array(value)
+          : new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+        : value;
+      const length = sizeOf(bytes);
+      if (
+        length > MAX_FRAME ||
+        this.bufferedAmount + length > MAX_QUEUE ||
+        this.receipts.size >= 1024
+      )
+        throw new Error("Terminal channel is busy.");
+      const sequence = ++this.sequence;
+      this.bufferedAmount += length;
+      this.receipts.set(sequence, length);
+      command(this.id, this.kind, "send", {
+        binary,
+        sequence,
+        data: binary ? api.encodeBase64(bytes) : bytes,
+      });
+    }
+    close() {
+      if (this.readyState === "closed") return;
+      this.readyState = "closed";
+      this.bufferedAmount = 0;
+      this.receipts.clear();
+      command(this.id, this.kind, "close");
+      this.fire("close");
+    }
+    receive(message) {
+      if (this.readyState === "closed") return;
+      if (message.event === "close") return this.close();
+      if (message.event === "open") {
+        this.readyState = "open";
+        this.fire("open");
+      } else if (message.event === "ack") {
+        const bytes = this.receipts.get(message.sequence);
+        if (bytes === undefined) return;
+        this.receipts.delete(message.sequence);
+        this.bufferedAmount -= bytes;
+        if (this.bufferedAmount <= this.bufferedAmountLowThreshold) this.fire("bufferedamountlow");
+      } else if (message.event === "data") {
+        const data = message.binary ? api.decodeBase64(message.data).buffer : message.data;
+        const event = new MessageEvent("message", { data });
+        this.dispatchEvent(event);
+        Promise.resolve(this.onmessage?.(event))
+          .then(() => {
+            if (this.readyState === "open")
+              command(this.id, this.kind, "received", { sequence: message.sequence });
+          })
+          .catch(() => this.close());
+      }
+    }
+  }
+
+  function closeView() {
+    if (!view) return;
+    const old = view;
+    view = null;
+    for (const dc of [old.pty, old.ctl]) {
+      dc.onclose = null;
+      dc.onmessage = null;
+      dc.close();
+    }
+    api.resetSessionGeneration?.();
+  }
+
+  function openView(message) {
+    closeView();
+    state.stopped = false;
+    api.resetSessionGeneration?.();
+    const id = message.attachmentId;
+    const current = { id, pty: new ViewChannel(id, "pty"), ctl: new ViewChannel(id, "ctl") };
+    view = current;
+    state.pty = current.pty;
+    state.ctl = current.ctl;
+    state.rtcSessionId = id;
+    for (const kind of ["pty", "ctl"]) {
+      current[kind].onopen = () =>
+        api.sessionChannelOpened?.(kind === "pty" ? "ptyOpen" : "ctlOpen");
+      current[kind].onclose = () => {
+        if (view !== current) return;
+        closeView();
+        api.post({ type: "state", state: "reconnecting" });
+      };
+      current[kind].onmessage = ({ data }) =>
+        kind === "pty" ? api.receivePty?.(data) : api.receiveSessionCtl?.(data);
+    }
+    api.sessionGate?.("bindingAccepted");
+  }
+
+  api.failSessionChannel = () => {
+    closeView();
+    api.post({ type: "state", state: "reconnecting" });
+  };
+  api.closePairChannels = () => {
+    for (const id of [...attached.keys()]) detach(id);
+    clearTimeout(timer);
+    timer = null;
+    closeView();
+  };
+  api.handlePairMessage = (message) => {
+    if (message.type === "pair-attach") {
+      attach(message);
+      return true;
+    }
+    if (message.type === "pair-command") {
+      receiveCommand(message);
+      return true;
+    }
+    if (message.type === "pair-view" && state.mode === "session") {
+      openView(message);
+      return true;
+    }
+    if (message.type === "pair-event") {
+      if (view?.id === message.attachmentId) view[message.channel]?.receive(message);
+      return true;
+    }
+    return false;
   };
 })();
 
@@ -2187,7 +2783,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   function protocolTuple() {
     return state.mode === "session"
       ? { scopeType: "session", protocol: "spawn.pty", protocolVersion: 2 }
-      : { scopeType: "host", protocol: "spawn.host.ctl", protocolVersion: 1 };
+      : { scopeType: "host", protocol: "spawn.host.ctl", protocolVersion: 2 };
   }
 
   /** The two signalling channels bind a peer differently, and only the session
@@ -2256,6 +2852,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       if (!pc || pc.connectionState !== "connected") return;
       try {
         const stats = await pc.getStats();
+        // A stats promise can settle after teardown or a replacement peer.
+        if (pc !== state.pc || pc.connectionState !== "connected") return;
         let selected = null;
         const records = new Map();
         stats.forEach((entry) => {
@@ -2282,7 +2880,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       } catch {
         // Stats are diagnostic only; an older WebKit must not affect the channel.
       } finally {
-        scheduleStats();
+        // Diagnostics must never publish readiness or rearm an old peer's timer.
+        if (pc === state.pc && pc.connectionState === "connected") scheduleStats();
       }
     }, 5_000);
   }
@@ -2334,6 +2933,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   async function startPeer(message) {
+    if (state.mode !== "host") throw new Error("Terminal views attach to the daemon connection.");
     if (state.pc?.connectionState === "connected" && message.forceRebuild !== true) return;
     if (state.pc && state.rtcSessionId === message.rtcSessionId) return;
     teardown(false);
@@ -2351,17 +2951,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       iceTransportPolicy: relayOnly ? "relay" : "all",
     });
     state.pc = pc;
-    if (state.mode === "session") {
-      state.pty = pc.createDataChannel("spawn.pty", CHANNEL_OPTIONS);
-      state.ctl = pc.createDataChannel("spawn.ctl", CHANNEL_OPTIONS);
-      configureChannel(state.pty, "pty");
-      configureChannel(state.ctl, "ctl");
-      api.resetSessionGeneration?.();
-    } else {
-      state.ctl = pc.createDataChannel("spawn.host.ctl", CHANNEL_OPTIONS);
-      configureChannel(state.ctl, "ctl");
-      api.resetHostGeneration?.();
-    }
+    state.ctl = pc.createDataChannel("spawn.host.ctl", CHANNEL_OPTIONS);
+    configureChannel(state.ctl, "ctl");
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
       const frame = { type: "rtc.candidate", ...outerTuple(), candidate: candidate.toJSON() };
@@ -2373,6 +2964,10 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       else state.pendingLocalCandidates.push(frame);
     };
     pc.onconnectionstatechange = () => {
+      if (pc !== state.pc) return;
+      if (["failed", "disconnected"].includes(pc.connectionState)) {
+        api.post({ type: "state", state: "connecting" });
+      }
       if (pc.connectionState === "failed") void restartPeer();
       if (pc.connectionState === "disconnected") {
         clearTimeout(state.disconnectTimer);
@@ -2382,6 +2977,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
         clearTimeout(state.restartTimer);
         state.restartTimer = null;
         scheduleStats();
+        api.hostChannelOpened?.();
       }
     };
     api.post({ type: "state", state: "connecting" });
@@ -2488,7 +3084,10 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   function teardown(sendClose) {
-    if (sendClose && state.rtcSessionId && state.bindingNonce) {
+    api.resetHostGeneration?.();
+    api.closeHostConsumers?.();
+    api.closePairChannels?.();
+    if (state.mode === "host" && sendClose && state.rtcSessionId && state.bindingNonce) {
       emitSignal({ type: "rtc.close", ...outerTuple() });
     }
     clearTimeout(state.disconnectTimer);
@@ -2515,6 +3114,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   api.handleTransportMessage = async (message) => {
+    if (api.handleHostConsumerMessage?.(message)) return;
+    if (api.handlePairMessage?.(message)) return;
     switch (message.type) {
       case "connect":
         await startPeer(message);

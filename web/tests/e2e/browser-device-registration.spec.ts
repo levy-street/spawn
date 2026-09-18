@@ -10,6 +10,13 @@ test("removing this device is seamless: the key dies, a fresh one takes its plac
   const fingerprint = page.getByTestId("browser-fingerprint");
   await expect(fingerprint).toHaveText(/^SHA256:/);
   await expect(page.getByText("This device", { exact: true })).toBeVisible();
+  const connectionCount = () =>
+    page.evaluate(() =>
+      (
+        globalThis as typeof globalThis & { __spawnHostMock: { count(): number } }
+      ).__spawnHostMock.count(),
+    );
+  await expect.poll(connectionCount).toBe(1);
 
   const before = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -48,6 +55,9 @@ test("removing this device is seamless: the key dies, a fresh one takes its plac
   await expect(fingerprint).not.toHaveText(before.fingerprint, { timeout: 15_000 });
   await expect(fingerprint).toHaveText(/^SHA256:/);
   await expect(page.getByTestId("device-row").getByText("This device")).toBeVisible();
+  // Replacing this device retires its app-owned connection and authenticates
+  // a successor with the new key, even while no terminal is mounted.
+  await expect.poll(connectionCount).toBe(2);
   await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
 
   const afterReplace = await page.evaluate(async (userId) => {
@@ -86,7 +96,9 @@ test("removing this device is seamless: the key dies, a fresh one takes its plac
   // browser"; the Access UX removed that dead end — registration simply
   // re-runs and the browser reappears as an ordinary device.
   await page.reload();
-  await openSettings(page, "access");
+  // A replacement key is an unapproved device. Use the neutral host list so
+  // the workspace approval dialog does not cover the Settings button.
+  await openSettings(page, "access", undefined, "/legion");
   await expect(fingerprint).toHaveText(/^SHA256:/);
   await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toHaveCount(0);

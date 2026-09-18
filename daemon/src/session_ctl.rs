@@ -125,6 +125,10 @@ pub enum ControlOperation {
         cols: u16,
         rows: u16,
     },
+    FocusView {
+        cols: u16,
+        rows: u16,
+    },
     UploadStart {
         capability: Uuid,
         agent_generation: u64,
@@ -217,6 +221,7 @@ impl ControlRequest {
             }
             ControlOperation::Snapshot { lines, .. } => *lines == 0 || *lines > MAX_HISTORY_LINES,
             ControlOperation::Resize { cols, rows }
+            | ControlOperation::FocusView { cols, rows }
             | ControlOperation::TakeControl { cols, rows } => invalid_size(*cols, *rows),
             ControlOperation::Scroll { lines } => {
                 *lines == 0 || !(-MAX_SCROLL_LINES..=MAX_SCROLL_LINES).contains(lines)
@@ -268,6 +273,7 @@ impl ControlRequest {
             ControlOperation::UploadStart { .. } => "upload_start",
             ControlOperation::UploadCancel { .. } => "upload_cancel",
             ControlOperation::TakeControl { .. } => "take_control",
+            ControlOperation::FocusView { .. } => "focus_view",
             ControlOperation::HistorySubscribe => "history_subscribe",
         }
     }
@@ -756,6 +762,9 @@ struct DisplayState {
     viewers: HashMap<String, ViewerEntry>,
     order: Vec<String>,
     owner: Option<String>,
+    // Connection loss does not transfer a live session to another device.
+    // This small lease lives with the session and is removed with its backend.
+    owner_device: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 }
@@ -764,7 +773,17 @@ struct ViewerEntry {
     display: DisplaySender,
 }
 
+fn viewer_device(viewer: &str) -> Option<&str> {
+    let key = viewer.strip_prefix("pair/")?.split('/').next()?;
+    (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())).then_some(key)
+}
+
 impl SessionControlHub {
+    #[cfg(test)]
+    pub(crate) async fn lock_input_owners_for_test(&self) -> impl Drop + '_ {
+        self.inner.lock().await
+    }
+
     pub async fn transaction(&self, session_id: Uuid) -> Arc<Mutex<()>> {
         self.transactions
             .lock()
@@ -864,7 +883,19 @@ impl SessionControlHub {
                 .as_ref()
                 .is_none_or(|id| !state.viewers.contains_key(id))
             {
-                state.owner = state.order.first().cloned();
+                state.owner = state
+                    .order
+                    .iter()
+                    .find(|id| {
+                        state
+                            .owner_device
+                            .as_deref()
+                            .is_none_or(|key| viewer_device(id) == Some(key))
+                    })
+                    .cloned();
+                if let Some(owner) = &state.owner {
+                    state.owner_device = viewer_device(owner).map(str::to_owned);
+                }
             }
         }
         self.broadcast(session_id).await;
@@ -895,9 +926,18 @@ impl SessionControlHub {
             state.viewers.remove(viewer_id);
             state.order.retain(|id| id != viewer_id);
             if state.owner.as_deref() == Some(viewer_id) {
-                state.owner = state.order.first().cloned();
+                state.owner = state
+                    .order
+                    .iter()
+                    .find(|id| {
+                        state
+                            .owner_device
+                            .as_deref()
+                            .is_none_or(|key| viewer_device(id) == Some(key))
+                    })
+                    .cloned();
             }
-            if state.viewers.is_empty() {
+            if state.viewers.is_empty() && state.owner_device.is_none() {
                 states.remove(&session_id);
                 false
             } else {
@@ -977,6 +1017,29 @@ impl SessionControlHub {
             .is_some_and(|state| state.viewers.contains_key(viewer_id))
     }
 
+    /// Check ownership and write input under the same lock as ownership changes.
+    /// The closure must be synchronous; replay transactions never block typing.
+    pub async fn with_input_owner<T>(
+        &self,
+        session_id: Uuid,
+        viewer_id: &str,
+        write: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let states = self.inner.lock().await;
+        let state = states.get(&session_id)?;
+        (state.owner.as_deref() == Some(viewer_id)).then(write)
+    }
+
+    pub async fn may_focus(&self, session_id: Uuid, viewer_id: &str) -> bool {
+        let states = self.inner.lock().await;
+        states.get(&session_id).is_some_and(|state| {
+            state.viewers.contains_key(viewer_id)
+                && (state.owner.as_deref() == Some(viewer_id)
+                    || viewer_device(viewer_id)
+                        .is_some_and(|key| state.owner_device.as_deref() == Some(key)))
+        })
+    }
+
     pub async fn take_control(
         &self,
         session_id: Uuid,
@@ -996,6 +1059,7 @@ impl SessionControlHub {
                 || state.cols != Some(cols)
                 || state.rows != Some(rows);
             state.owner = Some(viewer_id.to_string());
+            state.owner_device = viewer_device(viewer_id).map(str::to_owned);
             state.cols = Some(cols);
             state.rows = Some(rows);
             changed
@@ -1044,6 +1108,8 @@ impl SessionControlHub {
                         kind: "event",
                         event: "display_state",
                         owner: state.owner.as_deref() == Some(viewer_id),
+                        same_device: viewer_device(viewer_id)
+                            .is_some_and(|key| state.owner_device.as_deref() == Some(key)),
                         cols: state.cols,
                         rows: state.rows,
                         viewers,
@@ -1069,6 +1135,7 @@ struct DisplayEvent<'a> {
     kind: &'static str,
     event: &'a str,
     owner: bool,
+    same_device: bool,
     cols: Option<u16>,
     rows: Option<u16>,
     viewers: usize,
@@ -1372,6 +1439,65 @@ mod tests {
             .borrow()
             .as_ref()
             .is_some_and(|text| text.contains("\"owner\":true") && text.contains("\"viewers\":1")));
+    }
+
+    #[tokio::test]
+    async fn device_control_survives_reconnect_without_stealing_or_promoting_other_devices() {
+        let hub = SessionControlHub::default();
+        let session = Uuid::new_v4();
+        let a = format!("pair/{}/first", "a".repeat(64));
+        let b = format!("pair/{}/first", "b".repeat(64));
+        let a2 = format!("pair/{}/second", "a".repeat(64));
+        for viewer in [&a, &b, &a2] {
+            hub.register(session, viewer.clone(), watch::channel(None).0)
+                .await;
+        }
+        assert!(hub.is_owner(session, &a).await);
+        assert!(hub.may_focus(session, &a2).await);
+        assert!(!hub.may_focus(session, &b).await);
+        assert_eq!(hub.with_input_owner(session, &b, || 7).await, None);
+        assert_eq!(hub.with_input_owner(session, &a, || 7).await, Some(7));
+
+        hub.unregister(session, &a).await;
+        assert!(hub.is_owner(session, &a2).await);
+        hub.unregister(session, &a2).await;
+        assert!(!hub.is_owner(session, &b).await);
+        assert_eq!(hub.update_size(session, &b, 120, 40).await, None);
+
+        // Reattaching restores this device's existing lease.
+        hub.register(session, a.clone(), watch::channel(None).0)
+            .await;
+        assert!(hub.is_owner(session, &a).await);
+        // An explicit takeover replaces the lease. A later reconnect cannot undo it.
+        hub.take_control(session, &b, 100, 30).await;
+        hub.unregister(session, &a).await;
+        hub.register(session, a.clone(), watch::channel(None).0)
+            .await;
+        assert!(!hub.may_focus(session, &a).await);
+        assert!(hub.is_owner(session, &b).await);
+        hub.remove_session(session).await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn device_lease_survives_the_last_view_and_remains_session_scoped() {
+        let hub = SessionControlHub::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let a = format!("pair/{}/view", "a".repeat(64));
+        let b = format!("pair/{}/view", "b".repeat(64));
+        hub.register(first, a.clone(), watch::channel(None).0).await;
+        hub.unregister(first, &a).await;
+        hub.register(first, b.clone(), watch::channel(None).0).await;
+        hub.register(second, b.clone(), watch::channel(None).0)
+            .await;
+        assert!(!hub.is_owner(first, &b).await);
+        assert!(hub.is_owner(second, &b).await);
+        hub.take_control(first, &b, 80, 24).await;
+        assert!(hub.is_owner(first, &b).await);
+        hub.remove_session(first).await;
+        hub.remove_session(second).await;
+        assert_eq!(hub.retained_counts().await, (0, 0));
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, waitFor } from "@testing-library/react-native";
+import { act, cleanup, render, waitFor } from "@testing-library/react-native";
 import { AppState, type AppStateStatus } from "react-native";
 
 import { AlertPresenter, pinUndeliveredToast } from "@/components/alerts/alert-presenter";
@@ -73,9 +73,11 @@ const ALERT: AlertEvent = {
 
 describe("AlertPresenter", () => {
   let priorAppState: AppStateStatus;
+  let queryClient: QueryClient;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     priorAppState = AppState.currentState;
     Object.defineProperty(AppState, "currentState", {
       configurable: true,
@@ -85,7 +87,9 @@ describe("AlertPresenter", () => {
     useAlertStore.getState().clear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await cleanup();
+    queryClient.clear();
     Object.defineProperty(AppState, "currentState", {
       configurable: true,
       value: priorAppState,
@@ -95,7 +99,6 @@ describe("AlertPresenter", () => {
   });
 
   it("routes one toast, deduplicates it, and suppresses the current session", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const onOpenSession = jest.fn();
     useAlertStore.getState().receive(ALERT, 1_000);
 
@@ -154,7 +157,6 @@ describe("AlertPresenter", () => {
   });
 
   it("turns the alerts-socket undelivered event into a toast", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData<HostOut>(qk.host("host-1"), {
       id: "host-1",
       name: "office-mac",

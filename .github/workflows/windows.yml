@@ -1,21 +1,16 @@
 name: Windows
 
-# windows-check builds the Windows daemon for real (cargo check/clippy/test plus
-# a release build and a desktop crate check) on windows-latest, which bills at
-# 2x. It used to run on an unfiltered `push:` *and* `pull_request:`, so every
-# feature-branch push spent those minutes twice — once for each event — and did
-# it even when the change was a README.
-#
-# Filtering by path rather than by branch is deliberate. Gating to `master`
-# would be cheaper still, but it would also take the Windows signal after the
-# merge rather than before it, and it would break `windows-package`: that job
-# reads `github.event.head_commit.message` for `[package]`, which exists only on
-# a push event, and it is the only way to reach the rehearsal from a branch
-# because `workflow_dispatch` cannot see this workflow off the default branch.
-# Dropping `pull_request:` removes the double-run; a PR branch still gets full
-# pre-merge coverage from its own pushes.
+# windows-check runs native daemon checks/tests, a release build, desktop crate
+# checks and an isolated installer smoke. Standard hosted compute is free for
+# this public repository. Every master push needs a result: release compares
+# against the deployed baseline, which may include earlier undeployed daemon
+# changes even when this push only changes web files. PRs remain path-filtered.
+# Dispatch with --ref BRANCH for both checks and unsigned packaging before merge.
 "on":
   push:
+    branches:
+      - master
+  pull_request:
     paths:
       - "daemon/**"
       - "desktop/**"
@@ -64,6 +59,23 @@ jobs:
       - name: Test daemon
         working-directory: daemon
         run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Repeat shared session closure
+        if: ${{ !cancelled() }}
+        working-directory: daemon
+        run: |
+          for ($iteration = 1; $iteration -le 20; $iteration++) {
+            cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Test SCTP stream lifecycle
+        working-directory: daemon
+        run: "cargo test --locked -p webrtc-sctp --lib stream::stream_test:: --target x86_64-pc-windows-msvc"
+
+      - name: Test ICE route recovery
+        working-directory: daemon
+        run: "cargo test --locked -p webrtc-ice --lib agent_transport_test:: --target x86_64-pc-windows-msvc"
 
       # A plain crate check does not invoke tauri-cli or bundle an application;
       # WebView2 SDK installation belongs to the separate packaging workflow.
@@ -121,15 +133,9 @@ jobs:
   # UNSIGNED: it is a validation build, never a release artifact, and
   # publish-desktop.sh refuses a setup EXE with no certificate table.
   #
-  # Packaging is a release build of the whole application, so it is asked for
-  # rather than automatic: a manual dispatch, or `[package]` in the commit
-  # subject. `prebuilt.yml` gates its Windows build for the same reason — these
-  # minutes are billed and doubled. Running it on every master push would buy
-  # very little: `desktop.yml` hard-fails on a packaging regression at release
-  # time anyway, and the rehearsal's real job is to prove the path and hand out
-  # a test installer before a release, both of which are deliberate acts.
-  # `[package]` is what reaches it from a branch, since `workflow_dispatch`
-  # cannot see this workflow off the default branch.
+  # Packaging is explicitly requested with workflow_dispatch (including a
+  # branch ref) or `[package]` in a master push commit message. This produces an
+  # unsigned test installer; desktop.yml owns signed release packaging.
   windows-package:
     name: windows-package (unsigned rehearsal)
     if: >-

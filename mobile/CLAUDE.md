@@ -60,12 +60,32 @@ scripts/, docs/   build helpers and app-specific notes
   `protocol.required` frame, which is what routes into the update path. Read
   "The wire protocols" in `docs/RELEASE.md` before changing one.
 - Tests colocate in the nearest `__tests__/` directory (jest).
+- `e2e/NATIVE_ACCEPTANCE.md` describes the GitHub-hosted iOS simulator and Android
+  emulator acceptance job. Its controller and RTC observation hook enter only a
+  disposable build copy, using the actual app providers and native WebViews.
+  The Android job removes generated build directories after preserving the APK
+  and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
+  Its hosted disk preflight reclaims only named unused tools on the disposable
+  Ubuntu runner when less than 40 GiB is free and measures build/emulator headroom
+  without recursively scanning tool trees. Local machines are refused;
+  `e2e/test-android-disk-preflight.py` tests these boundaries.
+  `e2e/test-native-runner.py` checks bounded installation, diagnostics and failure
+  reporting. These checks run through the root test matrix.
+  The restored-login regression uses the real AuthGate and verifies that the
+  controller does not retire an already-restored account during process relaunch.
+  Production routes and assets must never import this controller.
 
 ## Conventions
 
 - Style only with `@/theme` tokens and the `ui/` primitives — no raw hex
   values, no inline magic numbers.
 - Biome is the linter (`biome.json`).
+- After login, use `adoptAuthenticatedAccount` in `data/queries/auth.ts` to clear
+  prior account data and seed the new account while retaining mounted query
+  observers, including disabled ones; removing them can strand `AuthGate`.
+  The new account is seeded synchronously; the returned promise settles the
+  active query reset. Acceptance automation awaits it before device registration
+  so stale readiness cannot race native secure-storage operations.
 - Anything that touches the native layer — a dependency with native code, a
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.
@@ -86,11 +106,56 @@ reach. `scripts/dev.sh` clears `EXPO_PUBLIC_API_URL` before starting Metro for
 the same reason — set, it outranks that derivation and would point a local app
 at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
 
+- Device transport: `terminal/DaemonConnections.tsx` mounts the persistent
+  host workers under the authenticated app. `transport/host-transport-registry.ts`
+  scopes them by account and host identity; `session-transport.ts` owns only
+  view attachments. Host-tool surfaces own separate consumer channels;
+  `worker/worker-host-consumers.js` isolates their queues and protocol failures
+  from the root and sibling consumers. `worker/worker-pair.js` proxies terminal
+  channels through the native bridge. Rebuild `worker.html` and `worker-html.ts` with
+  `node src/terminal/worker/build-worker.mjs` after worker source edits.
+  Read `docs/DEVICE_CONNECTIONS.md` before changing lifecycle or control rules.
+  Native surfaces check the three-second background deadline on foreground as
+  well as in the timer callback, because the runtime can pause background timers.
+  Native close retires the root synchronously; its delayed WebView acknowledgement
+  must not close a replacement connection opened on the same bridge.
+  Root initialization waits for the owning WebView document to load, including
+  early approval/pin-change retries. A retired document rejects its readiness
+  waiters; a stale owner's load event cannot activate a replacement worker.
+  Native acceptance selects an iPhone runtime matching the active Xcode simulator
+  SDK; an explicit `--device UUID` opts into another installed runtime.
+  It warms Settings before timed background cases and foregrounds the disposable
+  app directly with `simctl launch` to avoid URL confirmation dialogs. A single
+  background cycle returns to the app within one native command, keeping fixture
+  HTTP/polling outside the measured interval. The short case requests immediate
+  return and still requires real callbacks proving a nonzero gap below three
+  seconds with the original parent; slow OS transitions fail that gate.
+  The bounded lifecycle journal retains actual callbacks through suspension; missing,
+  reordered or replaced observations fail
+  acceptance rather than depending on diagnostic HTTP delivery.
+  The interrupted-upload case holds its source after the first transmitted chunk
+  until measured background retirement; releasing that source must not resume the
+  old upload. A slow OS transition cannot accidentally complete the test upload.
+
 ## Before calling a change done
 
 ```bash
 npm run ci                    # typecheck + lint + jest
+bash e2e/build-native-acceptance.sh ios /tmp/spawn-native-ios  # local fixture required
 ```
+
+The native command requires Xcode (or use `android` with the Android SDK), an
+authenticated loopback acceptance fixture, and the environment described in
+`e2e/NATIVE_ACCEPTANCE.md`. `.github/workflows/native-acceptance.yml` runs both
+platforms against an exact candidate commit with real UDP relay faults. Jest,
+Metro exports, Expo Go, and generated native projects do not satisfy that gate.
+Fixture preparation copies the daemon pair and exposes build configuration;
+the native runner activates live accounts, daemon and sessions only after app
+installation. Startup and liveness failures fail evidence without restarting
+fixture processes.
+After fixture readiness, app boot has a separate 180-second deadline. Local
+startup diagnostics and validated-device failure captures remain available
+when the acceptance control channel cannot report an error.
 
 ## Keeping this file true
 

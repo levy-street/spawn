@@ -161,11 +161,8 @@ def test_deploy_signing_key_gate_and_unsigned_override_warning_are_pinned():
     assert "release signing key is missing or unreadable" in source
     assert "daemons will refuse unsigned manifests" in source
     assert "SPAWN_DEPLOY_PREBUILTS=0 overrides the daemon release gate" in source
-    assert "manifest.json.sig.tmp" in source
-    assert (
-        "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json' && mv "
-        in source
-    )
+    # Atomic publication and interrupted-transfer recovery run against the
+    # real shell function and verifier in test_prebuilt_publication.py.
 
 
 def test_release_key_parser_accepts_daemon_rotation_list(tmp_path: Path):

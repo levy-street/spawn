@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/deploy-prod.sh [ssh-host] [--api-proxy-target URL] [--allow-branch]
+Usage: scripts/deploy-prod.sh [ssh-host] --acceptance-evidence FILE [--resume] [--api-proxy-target URL] [--allow-branch]
 
 Deploy the remote version of the current branch to a production host.
 
@@ -12,6 +12,16 @@ The script uses the caller's SSH config, so [ssh-host] can be an alias from
 current branch has commits that have not been pushed to the configured remote.
 
 Options:
+  --acceptance-evidence FILE
+                          acceptance.json from the release-acceptance artifact.
+                          Required for every deploy, including --allow-branch.
+                          Its candidate and baseline must match the fetched
+                          target and the current public production release.
+  --resume                Retry a partial deploy using its ORIGINAL evidence.
+                          Also accepts the candidate server with the baseline
+                          or candidate daemon tree. Other releases are refused.
+                          Mobile changes still compare against that original
+                          baseline, so an interrupted OTA is not skipped.
   --api-proxy-target URL  Where the deployed web app proxies /api and /ws.
                           Default: http://127.0.0.1:8001. This is baked into
                           the build, so it MUST be passed as a flag -- an
@@ -25,6 +35,8 @@ Environment:
   SPAWN_DEPLOY_HOST       SSH host alias/name. Overridden by [ssh-host].
   SPAWN_DEPLOY_PATH       Repo path on the remote host. Default: /opt/spawn
   SPAWN_DEPLOY_REMOTE     Git remote to deploy from. Default: origin
+  SPAWN_RELEASE_ACCEPTANCE
+                          Alternative to --acceptance-evidence FILE.
   SPAWN_DEPLOY_SERVICES   Space-separated systemd services to restart.
                           Default: spawn-server spawn-web
   SPAWN_DEPLOY_SUDO       Command prefix for systemctl. Default: sudo -n
@@ -110,6 +122,8 @@ fi
 host=""
 proxy_target_flag=""
 allow_branch=0
+resume=0
+acceptance_evidence="${SPAWN_RELEASE_ACCEPTANCE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
@@ -118,6 +132,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allow-branch)
       allow_branch=1
+      shift
+      ;;
+    --resume)
+      resume=1
+      shift
+      ;;
+    --acceptance-evidence)
+      [[ $# -ge 2 ]] || die "--acceptance-evidence needs a file"
+      acceptance_evidence="$2"
+      shift 2
+      ;;
+    --acceptance-evidence=*)
+      acceptance_evidence="${1#*=}"
       shift
       ;;
     --api-proxy-target)
@@ -247,6 +274,22 @@ prebuilt_variant_entries=()
 
 target_commit="$(git rev-parse "$remote_ref")"
 target_tree="$(git rev-parse "$remote_ref:daemon")"
+# A branch flag and the emergency prebuilt override cannot waive acceptance.
+# Snapshot the evidence so preparation and the final gate use the same transition.
+[[ -n "$acceptance_evidence" && -f "$acceptance_evidence" ]] ||
+  die "matching release acceptance evidence is required; download acceptance.json from release-acceptance and pass --acceptance-evidence FILE"
+cp -- "$acceptance_evidence" "$prebuilt_tmp/acceptance.json"
+acceptance_evidence="$prebuilt_tmp/acceptance.json"
+acceptance_args=(--evidence "$acceptance_evidence" --candidate "$target_commit")
+[[ "$resume" == "0" ]] || acceptance_args+=(--resume)
+python3 "$script_dir/check-release-acceptance.py" "${acceptance_args[@]}" ||
+  die "release acceptance evidence was refused; no production changes were made"
+accepted_baseline="$(python3 - "$acceptance_evidence" <<'PY'
+import json, sys
+with open(sys.argv[1]) as evidence:
+    print(json.load(evidence)["baseline_commit"])
+PY
+)"
 host_probe_env="$(quote_env SPAWN_DEPLOY_PATH "$remote_path")"
 host_current_commit="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
 set -euo pipefail
@@ -256,7 +299,9 @@ REMOTE
 )" || die "could not read the production checkout before deployment"
 host_manifest_json="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
 set -euo pipefail
-cat "$SPAWN_DEPLOY_PATH/daemon/target/prebuilt/manifest.json" 2>/dev/null || true
+prebuilt="$SPAWN_DEPLOY_PATH/daemon/target/prebuilt"
+if [[ -e "$prebuilt/current" || -L "$prebuilt/current" ]]; then prebuilt="$prebuilt/current"; fi
+cat "$prebuilt/manifest.json" 2>/dev/null || true
 REMOTE
 )" || die "could not read the production prebuilt manifest before deployment"
 host_manifest_tree="$(manifest_tree_from_json "$host_manifest_json" 2>/dev/null || true)"
@@ -314,6 +359,7 @@ printf 'deploy-prod: baking API proxy target %s\n' "$api_proxy_target"
 env_prefix="$(
   quote_env SPAWN_DEPLOY_PATH "$remote_path"
   quote_env SPAWN_DEPLOY_BRANCH "$branch"
+  quote_env SPAWN_DEPLOY_TARGET_COMMIT "$target_commit"
   quote_env SPAWN_DEPLOY_REMOTE "$remote"
   quote_env SPAWN_DEPLOY_SERVICES "$services"
   quote_env SPAWN_DEPLOY_SUDO "$sudo_cmd"
@@ -359,6 +405,8 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$SPAWN_DEPLOY_PATH i
 git fetch --prune "$SPAWN_DEPLOY_REMOTE" "$SPAWN_DEPLOY_BRANCH"
 target="$SPAWN_DEPLOY_REMOTE/$SPAWN_DEPLOY_BRANCH"
 git rev-parse --verify --quiet "$target" >/dev/null || die "remote branch $target does not exist"
+[[ "$(git rev-parse "$target")" == "$SPAWN_DEPLOY_TARGET_COMMIT" ]] ||
+  die "remote branch moved after acceptance validation; rerun with evidence for the new commit"
 
 if git show-ref --verify --quiet "refs/heads/$SPAWN_DEPLOY_BRANCH"; then
   read -r _ local_only < <(git rev-list --left-right --count "$target...$SPAWN_DEPLOY_BRANCH")
@@ -368,7 +416,7 @@ if git show-ref --verify --quiet "refs/heads/$SPAWN_DEPLOY_BRANCH"; then
 fi
 
 old_rev="$(git rev-parse --short HEAD)"
-git checkout -B "$SPAWN_DEPLOY_BRANCH" "$target"
+git checkout -B "$SPAWN_DEPLOY_BRANCH" "$SPAWN_DEPLOY_TARGET_COMMIT"
 new_rev="$(git rev-parse --short HEAD)"
 printf 'remote deploy: updated %s from %s to %s\n' "$SPAWN_DEPLOY_BRANCH" "$old_rev" "$new_rev"
 
@@ -509,13 +557,18 @@ fi
 
 printf 'remote deploy: services updated\n'
 REMOTE
+# Downloading/verifying prebuilts and staging this script can take minutes.
+# A direct deploy can overlap the serialized GitHub release workflow, so check
+# the public baseline once more at the last boundary before checkout/build.
+if ! python3 "$script_dir/check-release-acceptance.py" "${acceptance_args[@]}"; then
+  ssh "$host" "rm -f '$remote_script'" || true
+  die "release acceptance evidence changed or its baseline advanced during preparation; no production services were changed"
+fi
 ssh "$host" "${env_prefix}bash '$remote_script'; rc=\$?; rm -f '$remote_script'; exit \$rc"
 
-# Publish the exact release snapshot verified before deployment. Binaries land
-# through temporary names. The manifest and detached signature are copied to
-# temporary paths and renamed atomically, with the signature made live last.
-# A reader may briefly see a manifest/signature mismatch, which is safe: the
-# daemon rejects it and retries rather than trusting an unsigned identity.
+# Upload the entire signed release into an unpublished generation. Only a
+# verified complete snapshot may replace the current pointer; interrupted
+# transfers leave the previous manifest and every binary intact for --resume.
 prebuilts_published=0
 publish_prebuilts() {
   if [[ "$prebuilt_setting" != "1" ]]; then
@@ -526,43 +579,6 @@ publish_prebuilts() {
     printf 'deploy-prod: prebuilt publish skipped (%s)\n' "$prebuilt_reason"
     return
   fi
-
-  local pair target triple dest spawnd_asset worker_asset
-  local spawnd_name worker_name spawnd_tmp worker_tmp mode
-  for pair in "${PREBUILT_TARGETS[@]}"; do
-    target="${pair%%:*}"
-    triple="${pair##*:}"
-    dest="$remote_path/daemon/target/prebuilt/$target"
-    spawnd_asset="$(prebuilt_asset_name "$target" "$triple" spawnd)"
-    worker_asset="$(prebuilt_asset_name "$target" "$triple" spawn-worker)"
-    spawnd_name="$(prebuilt_installed_name "$target" spawnd)"
-    worker_name="$(prebuilt_installed_name "$target" spawn-worker)"
-    spawnd_tmp="$spawnd_name.tmp"
-    worker_tmp="$worker_name.tmp"
-    mode="$(prebuilt_file_mode "$target")"
-    if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
-      ssh "$host" "mkdir -p '$dest'"
-      scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$spawnd_tmp"
-      scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$worker_tmp"
-      ssh "$host" "chmod '$mode' '$dest/$spawnd_tmp' '$dest/$worker_tmp' && mv '$dest/$spawnd_tmp' '$dest/$spawnd_name' && mv '$dest/$worker_tmp' '$dest/$worker_name'"
-      printf 'deploy-prod: published %s prebuilt to %s\n' "$target" "$host"
-    fi
-    # The variant pairs live one directory down, under the target they were
-    # cut for, and install under the plain names: a variant replaces the
-    # daemon, it does not sit beside it.
-    local variant
-    for variant in "${PREBUILT_VARIANTS[@]}"; do
-      spawnd_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawnd "$variant")"
-      worker_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawn-worker "$variant")"
-      if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
-        ssh "$host" "mkdir -p '$dest/$variant'"
-        scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$variant/$spawnd_tmp"
-        scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$variant/$worker_tmp"
-        ssh "$host" "chmod '$mode' '$dest/$variant/$spawnd_tmp' '$dest/$variant/$worker_tmp' && mv '$dest/$variant/$spawnd_tmp' '$dest/$variant/$spawnd_name' && mv '$dest/$variant/$worker_tmp' '$dest/$variant/$worker_name'"
-        printf 'deploy-prod: published %s %s variant to %s\n' "$target" "$variant" "$host"
-      fi
-    done
-  done
 
   local manifest="$prebuilt_tmp/manifest.json"
   local signature="$prebuilt_tmp/manifest.json.sig"
@@ -576,10 +592,58 @@ publish_prebuilts() {
     "$manifest" "$signature" "$release_signing_key_file" ||
     die "could not sign the verified prebuilt manifest"
   local prebuilt_root="$remote_path/daemon/target/prebuilt"
-  ssh "$host" "mkdir -p '$prebuilt_root'"
-  scp -q "$manifest" "$host:$prebuilt_root/manifest.json.tmp"
-  scp -q "$signature" "$host:$prebuilt_root/manifest.json.sig.tmp"
-  ssh "$host" "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json' && mv '$prebuilt_root/manifest.json.sig.tmp' '$prebuilt_root/manifest.json.sig'"
+  local stage
+  stage="$(ssh "$host" "mkdir -p '$prebuilt_root/releases' && mktemp -d '$prebuilt_root/releases/.staging-XXXXXXXX'")"
+  [[ "$stage" == "$prebuilt_root/releases/.staging-"* && "$stage" != *$'\n'* ]] ||
+    die "remote snapshot staging path was invalid"
+  ssh "$host" "chmod 0755 '$stage'"
+
+  local pair target triple dest spawnd_asset worker_asset
+  local spawnd_name worker_name spawnd_tmp worker_tmp mode
+  for pair in "${PREBUILT_TARGETS[@]}"; do
+    target="${pair%%:*}"
+    triple="${pair##*:}"
+    dest="$stage/$target"
+    spawnd_asset="$(prebuilt_asset_name "$target" "$triple" spawnd)"
+    worker_asset="$(prebuilt_asset_name "$target" "$triple" spawn-worker)"
+    spawnd_name="$(prebuilt_installed_name "$target" spawnd)"
+    worker_name="$(prebuilt_installed_name "$target" spawn-worker)"
+    spawnd_tmp="$spawnd_name.tmp"
+    worker_tmp="$worker_name.tmp"
+    mode="$(prebuilt_file_mode "$target")"
+    if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
+      ssh "$host" "mkdir -p '$dest'"
+      scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$spawnd_tmp"
+      scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$worker_tmp"
+      ssh "$host" "chmod '$mode' '$dest/$spawnd_tmp' '$dest/$worker_tmp' && mv '$dest/$spawnd_tmp' '$dest/$spawnd_name' && mv '$dest/$worker_tmp' '$dest/$worker_name'"
+      printf 'deploy-prod: staged %s prebuilt on %s\n' "$target" "$host"
+    fi
+    # The variant pairs live one directory down, under the target they were
+    # cut for, and install under the plain names: a variant replaces the
+    # daemon, it does not sit beside it.
+    local variant
+    for variant in "${PREBUILT_VARIANTS[@]}"; do
+      spawnd_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawnd "$variant")"
+      worker_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawn-worker "$variant")"
+      if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
+        ssh "$host" "mkdir -p '$dest/$variant'"
+        scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$variant/$spawnd_tmp"
+        scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$variant/$worker_tmp"
+        ssh "$host" "chmod '$mode' '$dest/$variant/$spawnd_tmp' '$dest/$variant/$worker_tmp' && mv '$dest/$variant/$spawnd_tmp' '$dest/$variant/$spawnd_name' && mv '$dest/$variant/$worker_tmp' '$dest/$variant/$worker_name'"
+        printf 'deploy-prod: staged %s %s variant on %s\n' "$target" "$variant" "$host"
+      fi
+    done
+  done
+
+  scp -q "$manifest" "$host:$stage/manifest.json"
+  scp -q "$signature" "$host:$stage/manifest.json.sig"
+  local manifest_sha signature_sha
+  read -r manifest_sha signature_sha < <(python3 - "$manifest" "$signature" <<'PYHASH'
+import hashlib, pathlib, sys
+print(*(hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() for path in sys.argv[1:]))
+PYHASH
+)
+  ssh "$host" "'$remote_path/server/.venv/bin/python' '$remote_path/scripts/activate-prebuilt.py' '$prebuilt_root' '$stage' '$release_tree' '$manifest_sha' '$signature_sha'"
   prebuilts_published=1
   printf 'deploy-prod: published signed prebuilt manifest for daemon tree %s (key %s; %d release pair(s), %d variant pair(s))\n' \
     "$release_tree" "$release_key_id" \
@@ -679,8 +743,9 @@ printf '\n'
 # The channel is never guessed. Publishing a dev build to the production
 # channel would push it to every phone in the field, so an origin this script
 # does not recognise prints the command instead of running it.
-if git cat-file -e "$host_current_commit^{commit}" 2>/dev/null &&
-  ! git diff --quiet "$host_current_commit" "$target_commit" -- mobile; then
+# A failed attempt may already have advanced the remote checkout. The accepted
+# baseline records what the entire release owes, including an unfinished OTA.
+if ! git diff --quiet "$accepted_baseline" "$target_commit" -- mobile; then
   mobile_channel="${SPAWN_DEPLOY_MOBILE_CHANNEL:-}"
   if [[ -z "$mobile_channel" && "$public_origin" == "https://spawnd.dev" && "$branch" == "master" ]]; then
     mobile_channel="production"

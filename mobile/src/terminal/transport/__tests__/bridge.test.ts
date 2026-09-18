@@ -7,10 +7,53 @@ import {
   serializeNativeMessage,
   serializeWorkerMessage,
   TERMINAL_BRIDGE_VERSION,
+  WorkerBridge,
   WorkerEventCoalescer,
 } from "@/terminal/transport/bridge";
 
 describe("terminal worker bridge", () => {
+  test("a loading document cannot receive commands until its own load completes", async () => {
+    const bridge = new WorkerBridge();
+    const sender = jest.fn();
+    const detach = bridge.attach(sender, false);
+    const ready = jest.fn();
+    const waiting = bridge.whenReady().then(ready);
+    bridge.setReady(jest.fn(), true);
+    await Promise.resolve();
+    expect(ready).not.toHaveBeenCalled();
+    expect(() => bridge.send({ v: 1, type: "close" })).toThrow("not ready");
+    expect(sender).not.toHaveBeenCalled();
+    bridge.setReady(sender, true);
+    await waiting;
+    bridge.send({ v: 1, type: "close" });
+    expect(sender).toHaveBeenCalledTimes(1);
+    detach();
+  });
+
+  test("document retirement rejects waiters and stale owners cannot activate a replacement", async () => {
+    const bridge = new WorkerBridge();
+    const outgoing = jest.fn();
+    const incoming = jest.fn();
+    const detachOld = bridge.attach(outgoing, false);
+    const retired = bridge.whenReady().catch((error: unknown) => error);
+    const detachNew = bridge.attach(incoming, false);
+    expect(await retired).toEqual(new BridgeProtocolError("Terminal worker document was retired."));
+    const ready = jest.fn();
+    const waiting = bridge.whenReady().then(ready);
+    detachOld();
+    bridge.setReady(outgoing, true);
+    await Promise.resolve();
+    expect(ready).not.toHaveBeenCalled();
+    bridge.setReady(incoming, true);
+    await waiting;
+    bridge.setReady(incoming, false);
+    const reloading = bridge.whenReady().catch((error: unknown) => error);
+    detachNew();
+    expect(await reloading).toEqual(
+      new BridgeProtocolError("Terminal worker document was retired."),
+    );
+  });
+
   test("serializes and parses messages in both directions", () => {
     const native = { v: TERMINAL_BRIDGE_VERSION, type: "focus" } as const;
     const worker = { v: TERMINAL_BRIDGE_VERSION, type: "title", title: "shell" } as const;

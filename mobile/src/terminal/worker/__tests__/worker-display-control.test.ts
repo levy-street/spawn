@@ -97,18 +97,16 @@ function sentOperations(send: jest.Mock): { operation: string; cols?: number; ro
 }
 
 describe("session worker display control", () => {
-  test("claims the shared display at this phone's own grid on the first frame", async () => {
+  test("opening a view preserves the owning device and its geometry", async () => {
     const instance = harness();
     await runWorker(instance, async (worker) => {
       worker.receiveSessionCtl?.(displayEvent(false, 120, 40));
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(sentOperations(worker.state.ctl.send)).toEqual([
-        { operation: "take_control", cols: 53, rows: 30 },
-      ]);
-      expect(worker.state.displayOwner).toBe(true);
-      expect(worker.state.displayGeometry).toBeNull();
+      expect(sentOperations(worker.state.ctl.send)).toEqual([]);
+      expect(worker.state.displayOwner).toBe(false);
+      expect(worker.state.displayGeometry).toEqual({ cols: 120, rows: 40 });
       expect(worker.post).toHaveBeenCalledWith({
         type: "display",
         owner: false,

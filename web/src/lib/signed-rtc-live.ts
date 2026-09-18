@@ -21,7 +21,7 @@ export type SignedRtcRoute =
       readonly scopeType: "host";
       readonly scopeId: string;
       readonly protocol: "spawn.host.ctl";
-      readonly protocolVersion: 1;
+      readonly protocolVersion: 1 | 2;
     };
 
 /**
@@ -87,7 +87,9 @@ export class SignedRtcLiveSession {
     if (
       !(
         (scopeType === "session" && protocol === "spawn.pty" && protocolVersion === 2) ||
-        (scopeType === "host" && protocol === "spawn.host.ctl" && protocolVersion === 1)
+        (scopeType === "host" &&
+          protocol === "spawn.host.ctl" &&
+          (protocolVersion === 1 || protocolVersion === 2))
       )
     ) {
       throw new SignedRtcLiveError(

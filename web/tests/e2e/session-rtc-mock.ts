@@ -159,6 +159,7 @@ export async function installSessionRtcMock(
 
       class FakeDataChannel {
         label: string;
+        historyIndex: number;
         ordered: boolean;
         maxPacketLifeTime: number | null;
         maxRetransmits: number | null;
@@ -183,15 +184,16 @@ export async function installSessionRtcMock(
         }
 
         constructor(label: string, init?: RTCDataChannelInit) {
-          this.label = label;
+          this.label = label.split("/")[0];
+          this.historyIndex = state.ptyChannels.length;
           this.ordered = init?.ordered ?? true;
           this.maxPacketLifeTime = init?.maxPacketLifeTime ?? null;
           this.maxRetransmits = init?.maxRetransmits ?? null;
-          if (label === "spawn.ctl" && state.stallUploadBackpressure) {
-            this.bufferedAmount = 2 * 1024 * 1024;
+          state.channels.set(this.label, this);
+          if (this.label === "spawn.pty") {
+            state.ptyChannels.push(this);
+            state.activePtyChannel = this;
           }
-          state.channels.set(label, this);
-          if (label === "spawn.pty") state.ptyChannels.push(this);
         }
 
         send(value: string | ArrayBuffer | ArrayBufferView | Blob) {
@@ -297,6 +299,7 @@ export async function installSessionRtcMock(
           if (request.kind !== "request") return;
           const operation = String(request.operation);
           if (operation === "upload_start") {
+            if (state.stallUploadBackpressure) this.bufferedAmount = 2 * 1024 * 1024;
             const uploadId = String(request.request_id);
             const existing = state.uploads.get(uploadId);
             if (!existing) {
@@ -331,7 +334,7 @@ export async function installSessionRtcMock(
               ),
             );
           } else if (operation === "history") {
-            const selected = state.connections === 1 ? state.history : state.secondHistory;
+            const selected = this.historyIndex === 1 ? state.history : state.secondHistory;
             queueMicrotask(() => replyReplay(this, request, selected));
           } else if (operation === "snapshot") {
             if (state.autoSnapshot) {
@@ -414,6 +417,13 @@ export async function installSessionRtcMock(
         }
       }
 
+      (window as unknown as { __spawnSessionMock: unknown }).__spawnSessionMock = {
+        makeChannel: (label: string, init?: RTCDataChannelInit) => new FakeDataChannel(label, init),
+        peerCreated: () => {
+          state.connections++;
+        },
+        openChannels: state.openChannels,
+      };
       class FakePeerConnection {
         localDescription: RTCSessionDescriptionInit | null = null;
         remoteDescription: RTCSessionDescriptionInit | null = null;

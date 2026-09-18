@@ -37,9 +37,10 @@ When a piece is behind, the user sees the recovery that fits that piece:
   native runtime is too old, it sends the user to the App Store instead
 
 The daemon part of `/api/release` exists only when
-`daemon/target/prebuilt/manifest.json` is valid and every listed binary is
-present with the advertised hash. Deploy writes this file atomically after the
-binaries:
+the selected prebuilt generation's `manifest.json` is valid and every listed
+binary is present with the advertised hash. Deploy atomically selects a complete
+generation through `daemon/target/prebuilt/current`; a legacy flat prebuilt
+directory remains readable until the first selection:
 
 ```json
 {
@@ -166,9 +167,9 @@ release commit and daemon tree, the version, the committer-timestamp
 `release_counter`, the signing key id, both binary hashes for every
 published target, and — under `variants` — the version and both hashes of
 every variant build published beside them (see "The diagnostics variant").
-`deploy-prod.sh` publishes the manifest atomically and then
-the signature atomically, last; a daemon never installs from an unsigned or
-badly signed manifest.
+`deploy-prod.sh` atomically selects the complete verified snapshot, including
+the manifest, signature and all binary pairs. A daemon never installs from an
+unsigned or badly signed manifest.
 
 Windows adds a separate, layered publisher proof. CI Authenticode-signs and
 RFC 3161 timestamps `spawnd-x86_64-pc-windows-msvc.exe` and
@@ -316,11 +317,9 @@ output is `NotSigned`, names it `...-setup.UNSIGNED.exe`, and uploads it for
 seven days. That installer exists so the Windows handoff matrix can be run
 before the signing identity does, and it is never a release artifact:
 `publish-desktop.sh` refuses any Windows setup EXE with no Authenticode
-certificate table, whatever it is called. Packaging is a full release build on
-billed, doubled Windows minutes, so it is asked for rather than automatic: a
-manual dispatch, or `[package]` in the commit subject — the latter being the
-only way to reach it from a branch while `workflow_dispatch` cannot see the
-workflow off the default branch.
+certificate table, whatever it is called. Packaging is a full release build,
+so it is requested explicitly: dispatch the existing Windows workflow with
+`--ref <branch>`, or put `[package]` in a master push commit subject.
 
 The private key is a 32-byte Ed25519 seed stored as one line of unpadded
 base64url at
@@ -531,8 +530,75 @@ everything looks fine.
 `.github/workflows/release.yml` runs on every push to `master`. It calls
 `release-plan.sh` first and gates every job on the answer, so a docs-only push
 finishes in seconds and a daemon-only push deploys without touching the phone.
-The order inside it is the forced one described above: prebuilts land before
-the server that advertises them, and the OTA goes after the server is up.
+Before any deployment, `acceptance.yml` requires passing iOS simulator, Android
+emulator and isolated-canary reports for the exact candidate commit and the
+currently published baseline from `/api/release`. It also waits for successful
+Linux tests and, when relevant sources changed, Windows checks on that master
+commit. Missing, skipped, failed or stale evidence prevents deployment.
+Windows runs on every master push, because even a web-only push can include
+undeployed daemon changes relative to production. Windows checks for pull
+requests remain path-filtered; manual dispatch still enables unsigned packaging.
+PR acceptance supplies review evidence; master acceptance runs again for the
+commit that will actually ship.
+
+The native jobs build disposable locally signed Release apps containing a test-only
+driver around the real app transport and WebViews. A private UDP TURN path
+proves actual packet loss and outage. The canary runs baseline holdback,
+candidate soak, live update/recovery and failed-start rollback with real
+worker-owned sessions. See `docs/DEVICE_CONNECTIONS.md` and
+`docs/CONNECTION_CANARY.md` for the assertions and limitations. This gate uses
+isolated hosts and simulator/emulator evidence; it does not claim a physical
+radio handover test or a selective rollout to production users.
+
+The `release-acceptance` artifact contains `acceptance.json`, the validated
+reports used by deployment. Direct deploys require the same artifact through
+`--acceptance-evidence FILE` (or `SPAWN_RELEASE_ACCEPTANCE`). Deployment validates
+the target commit and the current public baseline before the first SSH call,
+then rechecks immediately before executing the staged remote script. A baseline
+change to an unrelated release during preparation stops deployment.
+`--allow-branch` does not waive acceptance.
+
+If deployment fails after updating services, retry the **same candidate with
+the original acceptance.json** and `--resume`. This also accepts the candidate's
+clean server identity with either its baseline daemon tree or its candidate
+daemon tree. It still rejects any third server commit, unknown daemon tree,
+dirty server or incomplete acceptance evidence. Both preflight checks use a
+snapshot of the same evidence. The original baseline remains the comparison for
+the mobile OTA, even if the remote checkout already advanced, so a failed OTA
+is still owed on retry. The public server/daemon identities verify how far that
+transition reached; the retry repeats deployment and publication for the same
+candidate rather than inferring that all release steps completed.
+
+```bash
+scripts/deploy-prod.sh <ssh-host> --resume --acceptance-evidence /path/to/original/acceptance.json
+```
+
+The release workflow passes `--resume` with its own acceptance artifact. Use
+**Re-run failed jobs** to retain that run's original plan and evidence. Starting
+a fresh workflow recalculates the plan from production and cannot reconstruct
+an earlier unfinished mobile release; use the explicit retry above when the
+original workflow is unavailable. Resume does not authorize a newer commit:
+if master has advanced, select and push an exact-candidate recovery branch and
+use the existing explicit `--allow-branch` procedure.
+
+The script verifies prebuilts before changing services, restarts server/web,
+then publishes and verifies the signed daemon manifest. The OTA goes last.
+The interval between service restart and manifest publication is one of the
+partial states the scoped retry handles.
+
+Prebuilt uploads land in a unique `daemon/target/prebuilt/releases/.staging-*`
+directory, including every binary, variant, manifest and detached signature.
+`scripts/activate-prebuilt.py` checks the transferred manifest/signature against
+the locally signed bytes and verifies every binary through the server's manifest
+validator. It then renames the completed directory and atomically replaces the
+`daemon/target/prebuilt/current` symlink. The server resolves that pointer once
+per request. A failed upload or activation leaves either the complete previous
+release or the complete candidate visible, so `--resume` needs no exception for
+a missing or corrupt daemon identity. The first publication preserves the old
+flat directory as the fallback until the pointer is installed. Previous
+generations and abandoned stages are retained for recovery; this script does
+not garbage-collect them. Rollback must select a complete compatible generation,
+not copy individual binaries across generations.
 
 It is **armed**, as of 2026-08-31. What that means, precisely, is worth stating
 once rather than rediscovering during an incident.
@@ -565,19 +631,16 @@ What is configured, so it can be audited rather than guessed:
 | `SPAWN_RELEASE_SIGNING_KEY` | The offline daemon release key, per the trade above. |
 | vars `SPAWN_DEPLOY_HOSTNAME`, `SPAWN_DEPLOY_USER` | The prod host and account. |
 
-**The pipeline has never run.** `workflow_dispatch` cannot see a workflow that
-is not on the default branch, so `release.yml` cannot be exercised before the
-merge that puts it there — the first real run is the merge itself, and it wants
-watching rather than assuming. The same is true of `desktop.yml` and
-`windows.yml`.
+The master pipeline has completed production releases. New acceptance stages
+must establish their own candidate evidence; earlier successful releases do
+not validate a changed workflow or native build.
 
 ### Things that will bite you off master
 
 `workflow_dispatch` only sees workflows that exist on the **default branch**.
-`windows.yml` and `desktop.yml` are not on master yet, so from a feature branch
-they cannot be dispatched at all; `[package]` in a commit subject is the only
-trigger that reaches `windows-package` from a branch. Merging is what fixes
-this, and it fixes it for good.
+New branch-only workflows therefore need a pull-request trigger for their first
+rehearsal. Dispatch `windows.yml` with `--ref <branch>` for unsigned packaging
+evidence from a branch; `[package]` in a master push also requests packaging.
 
 Windows signing is restricted to `master` by the `windows-code-signing`
 environment's branch policy, so **a branch build can never be Authenticode
@@ -595,13 +658,16 @@ the supported way to stage a dev host.
 Deployment is over SSH, from a coding agent, using the script in this repo:
 
 ```bash
-scripts/deploy-prod.sh <ssh-host>     # pulls, migrates, restarts spawn-server + spawn-web
+scripts/deploy-prod.sh <ssh-host> --acceptance-evidence /path/to/acceptance.json
 ```
 
 The script refuses to run when the release would not be what it looks like:
 
 - a dirty checkout or unpushed commits
 - a branch other than master (`--allow-branch` to deploy one on purpose)
+- absent or invalid connection acceptance evidence, including evidence for a
+  different candidate or a baseline that is no longer deployed (except the
+  exact candidate's partial deployment explicitly selected with `--resume`)
 - an inherited `SPAWN_API_PROXY_TARGET` — the target is baked into the web
   build at build time, and an inherited value is indistinguishable from an
   intended one. Pass `--api-proxy-target URL` when you mean a non-default
@@ -1046,7 +1112,7 @@ after all five pairs are staged does the operator render and sign the offline
 Ed25519 manifest. Never modify a PE after Authenticode signing or construct the
 manifest from pre-signing hashes.
 
-When CI cannot run (out of credits, broken runner), the release goes stale and
+When GitHub-hosted CI cannot run (unavailable capacity or a broken runner), the release goes stale and
 the deploy will refuse — correctly. Refresh it by hand from the **pushed**
 master commit. Build Darwin and Linux as before:
 
@@ -1155,16 +1221,16 @@ diagnostics variant".
 ### The Linux compatibility floor
 
 **glibc 2.35 — Ubuntu 22.04.** Hosts older than that get no prebuilt and fall
-back to a source install. It is set in one place, `.github/workflows/prebuilt.yml`
-(`runs-on: ubuntu-22.04`), because CI is what publishes the rolling release on
-every daemon change; the recipe above only exists for when CI cannot run, and it
-matches that base deliberately.
+back to a source install. `.github/workflows/prebuilt.yml` uses the standard
+`ubuntu-22.04` and `ubuntu-22.04-arm` runners for native builds on that base.
+The manual recipe uses the same base when hosted capacity is unavailable.
 
 Do not build the Linux binaries on an older base to "support more hosts". It
 works, and that is the problem: the hand-built release quietly admits hosts
 CI does not, they install and update happily, and the next ordinary CI build
 takes their prebuilt away again with nothing in the failure to explain why.
-Lowering the floor is a change to `prebuilt.yml` and to this section, together.
+Changing the floor requires updating the workflow runner labels, manual recipe
+and this section together.
 
 Build Windows on a real x86_64 Windows 11 or Server machine with Visual Studio
 Build Tools' “Desktop development with C++” workload and stable Rust MSVC:

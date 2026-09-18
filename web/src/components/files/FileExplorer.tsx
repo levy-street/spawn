@@ -39,6 +39,7 @@ import { FileIcon } from "@/components/files/file-icon";
 import { FilePreviewCard } from "@/components/files/file-preview-card";
 import { FileViewerDialog } from "@/components/files/file-viewer-dialog";
 import { type PreviewPlacement, previewPlacement } from "@/components/files/preview-placement";
+import { useDaemonConnections } from "@/components/hosts/DaemonConnectionsProvider";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -56,7 +57,6 @@ import {
 import { Popover } from "@/components/ui/popover";
 import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
 import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/hostControl";
 import {
   isPathWithin,
@@ -71,7 +71,7 @@ import {
 import { deriveFileCapabilities } from "@/lib/preview/capabilities";
 import { classifyFile } from "@/lib/preview/file-kinds";
 import { previewCache } from "@/lib/preview/preview-cache";
-import { resolveSignedRtcTrust, SIGNED_RTC_REFUSAL_DETAIL } from "@/lib/signed-rtc-trust";
+import { SIGNED_RTC_REFUSAL_DETAIL } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
 
@@ -183,12 +183,7 @@ export const FileExplorer = forwardRef<
   const [pageCursors, setPageCursors] = useState<Record<string, number[]>>({});
   const uploadDirRef = useRef<string | null>(null);
   const initialAppliedRef = useRef(false);
-  const { user } = useAuth();
-  // Liveness for the destination-channel trust capability: a transfer that
-  // spans a logout or account switch must abort rather than complete under the
-  // previous account's pin and signing identity.
-  const liveAccountIdRef = useRef<string | null>(user?.id ?? null);
-  liveAccountIdRef.current = user?.id ?? null;
+  const daemonConnections = useDaemonConnections();
   const {
     client: hostControl,
     state: hostControlState,
@@ -691,23 +686,10 @@ export const FileExplorer = forwardRef<
       destDir: string;
     }) => {
       if (!hostControl) throw new Error("Source host is not connected");
-      // The destination channel must honour the same pin gate as the source:
-      // a pinned host is never reached over a raw path, file transfer included.
-      // Without an account we cannot consult the pin store, so fail closed
-      // rather than silently transferring over an unverified connection.
-      const accountId = user?.id;
-      if (!accountId) throw new Error("Not signed in; cannot verify the destination host");
+      const sharedConnection = daemonConnections.get(destHostId);
+      if (!sharedConnection) throw new Error("Destination host is not connected");
       return (async () => {
-        const destHost = await hosts.get(destHostId);
-        const destination = new HostControlClient(destHostId, {
-          resolveSignedRtcTrust: () =>
-            resolveSignedRtcTrust({
-              accountId,
-              hostId: destHostId,
-              claimedHostPublicKey: destHost.host_public_key ?? null,
-              isActive: () => liveAccountIdRef.current === accountId,
-            }),
-        });
+        const destination = new HostControlClient(destHostId, { sharedConnection });
         try {
           await destination.waitUntilReady();
           const home = await destination.home();

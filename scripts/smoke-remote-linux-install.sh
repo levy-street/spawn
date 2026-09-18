@@ -10,8 +10,12 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-binary="daemon/target/prebuilt/linux-x86_64/spawnd"
-worker_binary="daemon/target/prebuilt/linux-x86_64/spawn-worker"
+prebuilt="daemon/target/prebuilt"
+if [[ -e "$prebuilt/current" || -L "$prebuilt/current" ]]; then
+  prebuilt="$(cd "$prebuilt/current" && pwd -P)"
+fi
+binary="$prebuilt/linux-x86_64/spawnd"
+worker_binary="$prebuilt/linux-x86_64/spawn-worker"
 if [[ ! -x "$binary" ]]; then
   printf 'smoke-remote-linux-install: missing %s\n' "$binary" >&2
   exit 1

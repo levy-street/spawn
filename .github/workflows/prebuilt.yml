@@ -6,8 +6,8 @@ name: prebuilt
 # Dreamhome AI Key Vault certificate. One workflow owns the rolling
 # `prebuilt-latest` release: the per-platform build jobs upload artifacts and a
 # single publish job assembles them, so the jobs never race to delete+recreate
-# the same release. Gated to daemon changes so it rarely spends macOS/arm minutes
-# (billed on private repos; free entirely once the repo is public).
+# the same release. Gated to daemon changes to avoid unnecessary builds.
+# Standard hosted compute is free for this public repository.
 "on":
   push:
     branches:
@@ -52,21 +52,15 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
-      # Runs the full daemon suite on real macOS — this is what catches
-      # macOS-only regressions like the sun_path socket bug before they ship.
-      # Non-blocking for now: the worker integration tests set a long temp
-      # SPAWND_WORKER_DIR that itself overflows sun_path on macOS, so this is
-      # expected red until those tests are hardened (tracked follow-up). Kept
-      # visible so we get the signal; flip to a hard gate once green.
+      # Native macOS failures must block publication. Keep test diagnostics
+      # visible even if a later test stalls before Rust prints its summary.
       - name: Test on macOS
         working-directory: daemon
-        continue-on-error: true
-        # Bounded for the same reason it is non-blocking: this step is signal,
-        # not a gate, and a wedged test must not starve the build steps of the
-        # job's 40-minute budget (observed: an upload test hung ~37 minutes on
-        # the runner and the release never built).
-        timeout-minutes: 10
-        run: cargo test --locked
+        timeout-minutes: 20
+        env:
+          TMPDIR: /private/tmp
+          RUST_BACKTRACE: "1"
+        run: cargo test --locked -- --nocapture
 
       - name: Build arm64 (aarch64-apple-darwin)
         working-directory: daemon

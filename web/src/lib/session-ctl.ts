@@ -17,11 +17,11 @@ export const SESSION_CTL_MAX_REPLAY_CHUNKS = Math.ceil(
 export const SESSION_CTL_MAX_OUTSTANDING_REQUESTS = 128;
 export const SESSION_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 export const SESSION_CTL_UPLOAD_CHUNK_BYTES = 48 * 1024;
-export const SESSION_CTL_UPLOAD_BUFFER_HIGH_WATER = 256 * 1024;
-export const SESSION_CTL_UPLOAD_BUFFER_LOW_WATER = 128 * 1024;
+export const SESSION_CTL_UPLOAD_BUFFER_HIGH_WATER = 128 * 1024;
+export const SESSION_CTL_UPLOAD_BUFFER_LOW_WATER = 64 * 1024;
 export const SESSION_PTY_INPUT_CHUNK_BYTES = 16 * 1024;
-export const SESSION_PTY_INPUT_BUFFER_HIGH_WATER = 256 * 1024;
-export const SESSION_PTY_INPUT_BUFFER_LOW_WATER = 128 * 1024;
+export const SESSION_PTY_INPUT_BUFFER_HIGH_WATER = 128 * 1024;
+export const SESSION_PTY_INPUT_BUFFER_LOW_WATER = 64 * 1024;
 
 const CHUNK_HEADER_BYTES = 28;
 const CHUNK_MAGIC = [0x53, 0x50, 0x43, 0x54]; // SPCT
@@ -33,6 +33,7 @@ export type SessionCtlOperation =
   | "scroll"
   | "redraw"
   | "take_control"
+  | "focus_view"
   | "upload_start"
   | "upload_cancel"
   | "upload_complete"
@@ -65,6 +66,7 @@ export interface SessionCtlDisplayEvent {
   kind: "event";
   event: "display_state";
   owner: boolean;
+  same_device?: boolean;
   cols: number | null;
   rows: number | null;
   viewers: number;
@@ -182,7 +184,10 @@ export function sessionPtyInputChunks(bytes: Uint8Array): Uint8Array[] {
 
 /** Send as many ordered chunks as the channel can currently accept. The
  * returned byte offset lets the caller queue the exact unsent remainder. */
-export function writeSessionPtyInput(channel: RTCDataChannel, bytes: Uint8Array): number {
+export function writeSessionPtyInput(
+  channel: Pick<RTCDataChannel, "readyState" | "bufferedAmount" | "send">,
+  bytes: Uint8Array,
+): number {
   let offset = 0;
   for (const chunk of sessionPtyInputChunks(bytes)) {
     if (
@@ -413,14 +418,31 @@ export class SessionCtlRequestTracker {
 /** Serializes asynchronous decodes so ordered DataChannel messages stay ordered. */
 export class OrderedAsyncQueue {
   #tail: Promise<void> = Promise.resolve();
+  #bytes = 0;
+  #messages = 0;
+  constructor(
+    readonly maxBytes = 2 * 1024 * 1024,
+    readonly maxMessages = 1024,
+  ) {}
 
   enqueue<T>(
     decode: () => T | Promise<T>,
     deliver: (value: T) => void | Promise<void>,
+    bytes = 0,
   ): Promise<void> {
-    const completion = this.#tail.then(async () => deliver(await decode()));
+    if (this.#bytes + bytes > this.maxBytes || this.#messages >= this.maxMessages) {
+      return Promise.reject(new Error("Terminal decode queue is full"));
+    }
+    this.#bytes += bytes;
+    this.#messages++;
+    const completion = this.#tail
+      .then(async () => deliver(await decode()))
+      .finally(() => {
+        this.#bytes -= bytes;
+        this.#messages--;
+      });
     this.#tail = completion.catch(() => {});
-    return this.#tail;
+    return completion;
   }
 }
 
@@ -887,6 +909,7 @@ function isSessionCtlOperation(value: unknown): value is SessionCtlOperation {
     value === "scroll" ||
     value === "redraw" ||
     value === "take_control" ||
+    value === "focus_view" ||
     value === "upload_start" ||
     value === "upload_cancel" ||
     value === "upload_complete" ||

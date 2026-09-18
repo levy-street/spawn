@@ -22,7 +22,7 @@ export function displayControlSummary(display: DisplayControlState): string {
     display.cols === null || display.rows === null
       ? "another viewer's size"
       : `${display.cols}×${display.rows}`;
-  return `Sized by another viewer · ${size}`;
+  return `Another view has control · ${size}`;
 }
 
 /**
@@ -57,7 +57,7 @@ export function DisplayControlBar({
         {displayControlSummary(display)}
       </Text>
       <Pressable
-        accessibilityLabel="Take control of the terminal size"
+        accessibilityLabel="Take control of the terminal"
         accessibilityRole="button"
         hitSlop={theme.space(2)}
         onPress={() => {

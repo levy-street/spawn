@@ -76,12 +76,12 @@ check_tree() {
     return 1
   fi
   expected_files="$(printf '%s\n' \
-    "$session" "$host" "$adapter" "$adapter_test" "$host_test" | sort)"
+    "$host" "$adapter" "$adapter_test" "$host_test" | sort)"
   [[ "$actual_files" == "$expected_files" ]] \
     || { fail 'production RemoteDescription capability file inventory changed'; return 1; }
 
-  # Pin the RTCPeerConnection construction surface too. Exactly two non-test
-  # sites build the peer; the common adapter only receives a Pick<> of it and
+  # Pin the RTCPeerConnection construction surface too. Exactly one non-test
+  # site builds the shared peer; the common adapter only receives a Pick<> of it and
   # never constructs one, so it is deliberately absent from this inventory.
   local actual_pc expected_pc pc_status
   set +e
@@ -92,17 +92,17 @@ check_tree() {
     fail "RTCPeerConnection inventory scan failed (rg exit $pc_status)"
     return 1
   fi
-  expected_pc="$(printf '%s\n' "$session" "$host" | sort)"
+  expected_pc="$(printf '%s\n' "$host" | sort)"
   [[ "$actual_pc" == "$expected_pc" ]] \
     || { fail 'production RTCPeerConnection construction inventory changed'; return 1; }
 
   require_count "$root" "$adapter" 'setRemote' 2 || return 1
   require_count "$root" "$adapter" 'RemoteDescription' 2 || return 1
-  require_count "$root" "$session" 'setRemote' 1 || return 1
-  require_count "$root" "$session" 'RemoteDescription' 1 || return 1
+  require_count "$root" "$session" 'setRemote' 0 || return 1
+  require_count "$root" "$session" 'RemoteDescription' 0 || return 1
   require_count "$root" "$host" 'setRemote' 1 || return 1
   require_count "$root" "$host" 'RemoteDescription' 1 || return 1
-  require_count "$root" "$session" 'new RTCPeerConnection' 1 || return 1
+  require_count "$root" "$session" 'new RTCPeerConnection' 0 || return 1
   require_count "$root" "$host" 'new RTCPeerConnection' 1 || return 1
 
   require_count "$root" "$adapter" \
@@ -110,7 +110,7 @@ check_tree() {
   require_count "$root" "$adapter" 'await peer.setRemoteDescription({' 1 || return 1
   require_count "$root" "$adapter" 'sdp: verified.transcript.sdp' 1 || return 1
   require_count "$root" "$session" \
-    '.setRemoteDescription({ type: "answer", sdp: msg.sdp })' 1 || return 1
+    '.setRemoteDescription({ type: "answer", sdp: msg.sdp })' 0 || return 1
   require_count "$root" "$host" \
     '.setRemoteDescription({ type: "answer", sdp: message.sdp })' 1 || return 1
 
@@ -128,12 +128,12 @@ check_tree() {
   fi
 
   require_count "$root" "$adapter" 'const verified = await verifyRtcSignalWire(' 2 || return 1
-  require_count "$root" "$session" '.verifyAndApplyAnswer(' 1 || return 1
+  require_count "$root" "$session" '.verifyAndApplyAnswer(' 0 || return 1
   require_count "$root" "$host" '.verifyAndApplyAnswer(' 1 || return 1
   # Two signed construction sites since the connection stream (8d2c960): the
   # initial offer and the ICE-restart offer, both inside the signed-mode branch
   # with the same binding tuple; the restart aborts the previous session first.
-  require_count "$root" "$session" 'new SignedRtcLiveSession(' 2 || return 1
+  require_count "$root" "$session" 'new SignedRtcLiveSession(' 0 || return 1
   require_count "$root" "$host" 'new SignedRtcLiveSession(' 2 || return 1
 
   if grep -Fq 'sdp: frame.sdp' "$root/$adapter"; then

@@ -269,8 +269,16 @@ def prebuilt_root(*, repo_root: Path | None = None) -> Path:
     # Unit tests historically replace REPO_ROOT. Preserve that seam unless a
     # genuinely custom SPAWN_PREBUILT_DIR was supplied.
     if configured is not None and Path(configured) != default:
-        return Path(configured)
-    return root / "daemon" / "target" / "prebuilt"
+        base = Path(configured)
+    else:
+        base = root / "daemon" / "target" / "prebuilt"
+    current = base / "current"
+    # Resolve once per request so a concurrent publication cannot mix a
+    # generation's manifest with another generation's binaries. Legacy flat
+    # releases remain readable until the first complete snapshot is activated.
+    if current.is_symlink() or current.exists():
+        return current.resolve()
+    return base
 
 
 def _manifest_path_for_root(*, repo_root: Path | None = None) -> Path:

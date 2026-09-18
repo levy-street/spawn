@@ -45,6 +45,7 @@ export interface BaseUrlCandidates {
 
 let runtimeOverride: string | null | undefined;
 let loadingOverride: Promise<string | null> | null = null;
+let persistingOverride: Promise<void> = Promise.resolve();
 
 function normalizeAbsoluteBaseUrl(value: string): string {
   const trimmed = value.trim().replace(/\/+$/, "");
@@ -108,6 +109,8 @@ export function resolveBaseUrl({
 async function loadOverride(): Promise<string | null> {
   if (runtimeOverride !== undefined) return runtimeOverride;
   loadingOverride ??= AsyncStorage.getItem(API_URL_STORAGE_KEY).then((stored) => {
+    // A cold read cannot undo a server selected while native storage was busy.
+    if (runtimeOverride !== undefined) return runtimeOverride;
     runtimeOverride = stored === null ? null : normalizeAbsoluteBaseUrl(stored);
     return runtimeOverride;
   });
@@ -129,11 +132,14 @@ export async function setBaseUrl(value: string | null): Promise<void> {
   const normalized = value === null ? null : normalizeAbsoluteBaseUrl(value);
   runtimeOverride = normalized;
   loadingOverride = Promise.resolve(normalized);
-  if (normalized === null) {
-    await AsyncStorage.removeItem(API_URL_STORAGE_KEY);
-  } else {
-    await AsyncStorage.setItem(API_URL_STORAGE_KEY, normalized);
-  }
+  const write = persistingOverride
+    .catch(() => undefined)
+    .then(async () => {
+      if (normalized === null) await AsyncStorage.removeItem(API_URL_STORAGE_KEY);
+      else await AsyncStorage.setItem(API_URL_STORAGE_KEY, normalized);
+    });
+  persistingOverride = write;
+  await write;
 }
 
 export const apiConfig = {

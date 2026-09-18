@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook, waitFor } from "@testing-library/react-native";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 import { getHost, updateHost } from "@/data/api/endpoints/hosts";
 import type { HostOut, HostUpdateOut } from "@/data/api/schemas/hosts";
@@ -31,10 +31,17 @@ const current: HostUpdateOut = {
   requested_at: null,
 };
 
+const queryClients: QueryClient[] = [];
+
 function harness() {
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, staleTime: 0 } },
+    defaultOptions: {
+      queries: { retry: false, staleTime: 0 },
+      // MutationCache.clear() does not destroy its mutations' GC timers.
+      mutations: { gcTime: Infinity },
+    },
   });
+  queryClients.push(queryClient);
   function Wrapper({ children }: PropsWithChildren) {
     return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
   }
@@ -43,6 +50,11 @@ function harness() {
 
 describe("host daemon update queries", () => {
   beforeEach(() => jest.clearAllMocks());
+  afterEach(async () => {
+    await cleanup();
+    for (const queryClient of queryClients.splice(0)) queryClient.clear();
+    jest.useRealTimers();
+  });
 
   it("posts the update and patches both host cache shapes", async () => {
     const host = makeHost({ update: { ...updating, state: "available" } });

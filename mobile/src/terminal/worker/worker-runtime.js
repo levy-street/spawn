@@ -68,8 +68,18 @@
   const api = (globalThis.spawnWorker = { state });
   const encoder = new TextEncoder();
 
+  function scopedMessage(message) {
+    return state.mode === "session" &&
+      message.type !== "diagnostic" &&
+      !Object.prototype.hasOwnProperty.call(message, "attachmentId")
+      ? { ...message, attachmentId: state.rtcSessionId }
+      : message;
+  }
+
   api.post = (message) => {
-    globalThis.ReactNativeWebView?.postMessage(JSON.stringify({ v: BRIDGE_VERSION, ...message }));
+    globalThis.ReactNativeWebView?.postMessage(
+      JSON.stringify({ v: BRIDGE_VERSION, ...scopedMessage(message) }),
+    );
   };
 
   api.error = (code, message, retryable = false, detail) => {
@@ -85,7 +95,8 @@
   const latestTelemetry = new Map();
   let telemetryTimer = null;
   api.telemetry = (message) => {
-    latestTelemetry.set(message.type, message);
+    // Capture before batching: a replacement may be current by flush time.
+    latestTelemetry.set(message.type, scopedMessage(message));
     if (telemetryTimer !== null) return;
     telemetryTimer = setTimeout(() => {
       telemetryTimer = null;
@@ -339,6 +350,24 @@
   }
 
   api.fitTerminal = fitTerminal;
+  api.preferredTerminalSize = () => {
+    const terminal = state.term;
+    const fit = state.fitAddon;
+    if (!terminal || !fit) return { cols: state.cols, rows: state.rows };
+    const previous = terminal.options.fontSize;
+    try {
+      terminal.options.fontSize = state.fontSize;
+      const size = fit.proposeDimensions();
+      return size
+        ? {
+            cols: clamp(size.cols, GRID_BOUNDS.minCols, GRID_BOUNDS.maxCols),
+            rows: clamp(size.rows, GRID_BOUNDS.minRows, GRID_BOUNDS.maxRows),
+          }
+        : { cols: state.cols, rows: state.rows };
+    } finally {
+      terminal.options.fontSize = previous;
+    }
+  };
 
   let fitTimer = null;
   function scheduleFit() {
@@ -701,6 +730,7 @@
         });
         return true;
       case "focus":
+        api.focusDisplayView?.();
         refocusTerminal();
         return true;
       case "blur":
@@ -781,6 +811,7 @@
   bridgeTarget.addEventListener("message", listener);
 
   api.sendPty = (bytes) => {
+    if (!api.sessionReady?.() || state.displayOwner !== true) return false;
     if (!state.pty || state.pty.readyState !== "open") return false;
     for (let offset = 0; offset < bytes.byteLength; offset += MAX_INPUT_BYTES) {
       state.pty.send(bytes.slice(offset, offset + MAX_INPUT_BYTES));

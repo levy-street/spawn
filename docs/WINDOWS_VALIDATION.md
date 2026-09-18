@@ -40,8 +40,8 @@ and are **not in this tree**; the code paths named beside them — `windows_task
 `windows-package` builds and bundles the desktop app on `windows-latest` with
 no credentials, asserts its own output is `NotSigned`, and uploads
 `SPAWN-D_<version>_windows-x86_64-setup.UNSIGNED.exe` for seven days. Trigger it
-by dispatching the Windows workflow, or by putting `[package]` in a commit
-subject, then download the artifact from the run.
+by dispatching the Windows workflow with `--ref <branch>`, or by putting
+`[package]` in a master push commit subject, then download the artifact from the run.
 
 Windows will treat it exactly as it treats any unsigned installer, which is
 itself worth observing once: SmartScreen's unsigned path is the experience

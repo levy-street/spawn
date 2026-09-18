@@ -19,6 +19,29 @@ fn create_test_stream() -> Stream {
     )
 }
 
+#[tokio::test]
+async fn reset_while_reader_waits_for_reassembly_lock_is_not_lost() {
+    let stream = create_test_stream();
+    let queue = stream.reassembly_queue.lock().await;
+    let mut bytes = [0; 16];
+    let mut read = Box::pin(stream.read(&mut bytes));
+    // Poll until the reader has checked shutdown and is blocked on the queue.
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    // The remote-reset path publishes these two actions without taking the
+    // reassembly mutex. A notification after the initial check must wake read.
+    stream.read_shutdown.store(true, Ordering::SeqCst);
+    stream.read_notifier.notify_waiters();
+    drop(queue);
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), read)
+        .await
+        .expect("remote reset was lost while the reader waited for its queue");
+    assert_eq!(result.unwrap(), 0);
+}
+
 #[test]
 fn test_stream_buffered_amount() -> Result<()> {
     let s = create_test_stream();

@@ -2,6 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
+import { DaemonConnectionsProvider } from "@/components/hosts/DaemonConnectionsProvider";
 import { ReleaseWatcher } from "@/components/release/ReleaseWatcher";
 import { LiveTerminalProvider } from "@/components/terminal/LiveTerminalProvider";
 import { useViewportInset } from "@/lib/viewport";
@@ -55,7 +56,9 @@ export function AppProviders({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={client}>
       <ReleaseWatcher />
-      <LiveTerminalProvider>{children}</LiveTerminalProvider>
+      <DaemonConnectionsProvider>
+        <LiveTerminalProvider>{children}</LiveTerminalProvider>
+      </DaemonConnectionsProvider>
     </QueryClientProvider>
   );
 }

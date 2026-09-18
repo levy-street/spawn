@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { AppState, Image, StyleSheet } from "react-native";
 import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import { subscribeRetirementReason } from "@/data/realtime/lifecycle";
+import { deviceIdentityGeneration, subscribeDeviceIdentityAccount } from "@/lib/crypto/identity";
 import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
+import { createHostConsumerTransport } from "@/terminal/transport/host-transport";
 import { retainHostTransport } from "@/terminal/transport/host-transport-registry";
 import type {
   HostTransport,
@@ -20,17 +22,29 @@ import terminalWorkerAsset from "../../assets/terminal/worker.html";
 const USE_FILE_WORKER_FALLBACK = false;
 
 export interface HostTransportSurfaceProps extends Omit<HostTransportOptions, "bridge"> {
+  /** The authenticated app retains the root; tool surfaces own child channels. */
+  connectionOwner?: boolean;
   onTransport(transport: HostTransport): void;
   onStateChange?(state: TransportState): void;
   onError?(error: TransportError): void;
   onDiagnostic?(diagnostic: WorkerDiagnostic): void;
 }
 
-export function HostTransportSurface({
+export function HostTransportSurface(props: HostTransportSurfaceProps): React.JSX.Element {
+  const generation = useSyncExternalStore(
+    subscribeDeviceIdentityAccount,
+    deviceIdentityGeneration,
+    deviceIdentityGeneration,
+  );
+  return <HostTransportInstance key={generation} {...props} />;
+}
+
+function HostTransportInstance({
   hostId,
   hostIdentityPublicKey,
   forceRelay,
   openSignal,
+  connectionOwner = false,
   onTransport,
   onStateChange,
   onError,
@@ -51,14 +65,23 @@ export function HostTransportSurface({
       }),
     [forceRelay, hostId, hostIdentityPublicKey, openSignal],
   );
-  const { bridge, transport } = lease.shared;
+  const { bridge, transport: rootTransport } = lease.shared;
+  const transport = useMemo(
+    () =>
+      connectionOwner
+        ? rootTransport
+        : createHostConsumerTransport({ hostId, hostIdentityPublicKey, bridge }, rootTransport),
+    [bridge, connectionOwner, hostId, hostIdentityPublicKey, rootTransport],
+  );
   const [ownsWorker, setOwnsWorker] = useState(lease.shared.owner === lease.ownerId);
+  const sendToWorker = useCallback((raw: string) => webViewRef.current?.postMessage(raw), []);
 
   useEffect(() => lease.subscribeOwnership(setOwnsWorker), [lease]);
   useEffect(() => {
     if (!ownsWorker) return;
-    return bridge.attach((raw) => webViewRef.current?.postMessage(raw));
-  }, [bridge, ownsWorker]);
+    workerLoaded.current = false;
+    return bridge.attach(sendToWorker, false);
+  }, [bridge, ownsWorker, sendToWorker]);
 
   useEffect(() => {
     callbacks.current.onTransport(transport);
@@ -67,21 +90,25 @@ export function HostTransportSurface({
       transport.on("error", (error) => callbacks.current.onError?.(error)),
       transport.on("diagnostic", (diagnostic) => callbacks.current.onDiagnostic?.(diagnostic)),
     ];
+    callbacks.current.onStateChange?.(transport.state);
+    if (transport !== rootTransport) void transport.open().catch(() => {});
     return () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
+      if (transport !== rootTransport) transport.close();
       lease.release();
     };
-  }, [lease, transport]);
+  }, [lease, rootTransport, transport]);
 
   useEffect(() => {
-    transport.prepare?.();
+    if (!ownsWorker) return;
+    rootTransport.prepare?.();
     return subscribeRetirementReason((reason) => {
-      if (reason === "interface-change") transport.networkChanged?.();
+      if (reason === "interface-change") rootTransport.networkChanged?.();
     });
-  }, [transport]);
+  }, [ownsWorker, rootTransport]);
 
   const openTransport = useCallback((): void => {
-    void transport.open().catch((error: unknown) => {
+    void rootTransport.open().catch((error: unknown) => {
       // A coded rejection (device_not_trusted above all) keeps its code:
       // rewrapping it generically is what hid the approval ceremony.
       callbacks.current.onError?.({
@@ -90,34 +117,45 @@ export function HostTransportSurface({
         retryable: true,
       });
     });
-  }, [transport]);
+  }, [rootTransport]);
 
   useEffect(() => {
     let backgroundTimer: ReturnType<typeof setTimeout> | null = null;
+    let backgroundDeadline: number | null = null;
+    const retireBackground = () => {
+      if (backgroundDeadline === null || Date.now() < backgroundDeadline) return;
+      backgroundDeadline = null;
+      backgroundTimer = null;
+      retiredForBackground.current = true;
+      rootTransport.close();
+    };
     const subscription = AppState.addEventListener("change", (nextState) => {
       if (nextState === "inactive") return;
       if (nextState === "background") {
-        if (!workerLoaded.current || backgroundTimer !== null) return;
-        backgroundTimer = setTimeout(() => {
-          backgroundTimer = null;
-          retiredForBackground.current = true;
-          transport.close();
-        }, 3_000);
+        if (!workerLoaded.current || backgroundDeadline !== null || retiredForBackground.current)
+          return;
+        backgroundDeadline = Date.now() + 3_000;
+        backgroundTimer = setTimeout(retireBackground, 3_000);
         return;
       }
       if (backgroundTimer !== null) {
         clearTimeout(backgroundTimer);
         backgroundTimer = null;
       }
+      // Native runtimes can pause timers in the background. Retire an expired
+      // connection before foreground reopening even if its timer never ran.
+      if (backgroundDeadline !== null && Date.now() >= backgroundDeadline) retireBackground();
+      backgroundDeadline = null;
       if (!retiredForBackground.current || !workerLoaded.current) return;
       retiredForBackground.current = false;
       openTransport();
     });
     return () => {
       if (backgroundTimer !== null) clearTimeout(backgroundTimer);
+      backgroundDeadline = null;
       subscription.remove();
     };
-  }, [openTransport, transport]);
+  }, [openTransport, rootTransport]);
 
   const handleMessage = (event: WebViewMessageEvent): void => {
     try {
@@ -164,12 +202,21 @@ export function HostTransportSurface({
       onMessage={handleMessage}
       onLoad={() => {
         workerLoaded.current = true;
-        if (AppState.currentState === "active") openTransport();
-        else retiredForBackground.current = true;
+        if (AppState.currentState === "active") {
+          bridge.setReady(sendToWorker, true);
+          openTransport();
+        } else {
+          // An approval retry may already be awaiting this document. Retire it
+          // before releasing readiness so loading behind the app cannot open RTC.
+          rootTransport.close();
+          retiredForBackground.current = true;
+          bridge.setReady(sendToWorker, true);
+        }
       }}
       onContentProcessDidTerminate={() => {
         workerLoaded.current = false;
-        transport.close();
+        rootTransport.close();
+        bridge.setReady(sendToWorker, false);
         webViewRef.current?.reload();
       }}
     />

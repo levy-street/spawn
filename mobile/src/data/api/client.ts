@@ -1,5 +1,5 @@
 import type { ZodType } from "zod";
-import { authToken } from "@/data/api/auth-token";
+import { type AuthTokenSnapshot, authToken } from "@/data/api/auth-token";
 import { CLIENT_INSTANCE_ID } from "@/data/api/client-instance";
 import { getBaseUrl } from "@/data/api/config";
 
@@ -23,6 +23,8 @@ export type ApiRequestInit<T> = RequestInit & {
   schema?: ZodType<T>;
   timeoutMs?: number;
   auth?: boolean;
+  /** This successful response establishes the login consumed by auth mutations. */
+  replaceSession?: boolean;
   responseType?: ResponseType;
   onResponse?: (response: Response) => unknown | Promise<unknown>;
 };
@@ -43,11 +45,12 @@ function emitUnauthenticated(): void {
 }
 
 /** Make a non-HTTP authentication refusal follow the same signed-out path. */
-export async function reportUnauthenticated(): Promise<void> {
-  const token = await authToken.get().catch(() => null);
-  if (token !== null) unauthenticatedEmitted = false;
-  await authToken.clear();
-  emitUnauthenticated();
+export async function reportUnauthenticated(expected?: AuthTokenSnapshot): Promise<void> {
+  const credentials = expected ?? (await authToken.snapshot());
+  if (await authToken.clearIfCurrent(credentials)) {
+    if (credentials.token !== null) unauthenticatedEmitted = false;
+    emitUnauthenticated();
+  }
 }
 
 function shouldSetContentType(body: BodyInit | null | undefined): boolean {
@@ -81,6 +84,7 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
     schema,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     auth = true,
+    replaceSession = false,
     responseType = "json",
     onResponse,
     headers: requestedHeaders,
@@ -97,7 +101,9 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const token = auth ? await authToken.get() : null;
+    const baseUrl = await getBaseUrl();
+    const credentials = await authToken.snapshot(baseUrl, auth);
+    const token = auth ? credentials.token : null;
     if (token !== null) unauthenticatedEmitted = false;
     const headers = new Headers(requestedHeaders);
     if (!headers.has("Accept")) headers.set("Accept", "application/json");
@@ -113,7 +119,7 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
 
     let response: Response;
     try {
-      response = await fetch(`${await getBaseUrl()}${path}`, {
+      response = await fetch(`${baseUrl}${path}`, {
         ...requestInit,
         headers,
         signal: controller.signal,
@@ -134,23 +140,36 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
     // Sliding sessions can arrive on any authenticated response, not only on
     // login. Capture before parsing either success or error so the native
     // bearer stays in lockstep with the server's session cookie.
-    await authToken.captureFromResponse(response);
+    const captured = await authToken.captureFromResponse(response, credentials, replaceSession);
+    const responseCredentials = captured ?? credentials;
+    const finish = async <Result>(result: Result): Promise<Result> => {
+      if (replaceSession && !(await authToken.isCurrent(responseCredentials, "identity"))) {
+        // Check after body parsing too: an old login must not reach mutation
+        // success handlers and seed its previous account into the query cache.
+        throw new ApiError(
+          0,
+          "auth_changed",
+          "Authentication changed while the request was running",
+        );
+      }
+      return result;
+    };
     await onResponse?.(response);
     if (!response.ok) {
       if (response.status === 401 && auth) {
         if (!unauthenticatedEmitted) {
-          await reportUnauthenticated();
+          await reportUnauthenticated(credentials);
         }
       }
       throw await apiErrorFromResponse(response);
     }
-    if (response.status === 204) return undefined as T;
-    if (responseType === "response") return response as T;
-    if (responseType === "text") return (await response.text()) as T;
-    if (responseType === "arrayBuffer") return (await response.arrayBuffer()) as T;
+    if (response.status === 204) return finish(undefined as T);
+    if (responseType === "response") return finish(response as T);
+    if (responseType === "text") return finish((await response.text()) as T);
+    if (responseType === "arrayBuffer") return finish((await response.arrayBuffer()) as T);
 
     const body: unknown = await response.json();
-    if (!schema) return body as T;
+    if (!schema) return finish(body as T);
     const result = schema.safeParse(body);
     if (!result.success) {
       console.error("Spawn API schema mismatch", { path, issues: result.error.issues });
@@ -158,7 +177,7 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
         issues: result.error.issues,
       });
     }
-    return result.data;
+    return finish(result.data);
   } finally {
     clearTimeout(timeout);
     callerSignal?.removeEventListener("abort", abortFromCaller);
