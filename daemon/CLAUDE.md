@@ -371,6 +371,12 @@ and bounded stream-ID reservations rather than reusing IDs before SCTP reset
 completes. Native daemon tests exercise 256 host consumers on one live parent
 and require all consumer state to be released after parent close.
 
+Set `SPAWND_RTC_TEST_TRACE=1` to capture WebRTC/SCTP diagnostics in the shared
+session lifecycle regression. On a failed unknown-session refusal, the test
+also reports both peers' channel states without changing its deadline.
+Windows CI repeats this regression twenty times after the full suite to expose
+intermittent channel-close failures without enabling timing-altering trace logs.
+
 Native Windows CI additionally gates every binary, test/example target, and
 cfg-specific lint path:
 

@@ -164,6 +164,32 @@ class NativeRunnerSetup(unittest.TestCase):
         self.runner.perform("foreground", {})
         self.runner.simctl.assert_called_once_with("launch", DEVICE, module.APP_ID)
 
+    def test_background_cycle_returns_to_app_before_reporting_to_fixture(self):
+        self.runner.device = DEVICE
+        order = []
+        self.runner.simctl = Mock(side_effect=lambda *args: order.append(args))
+        self.runner.launch = Mock(side_effect=lambda: order.append("foreground"))
+        with patch.object(module.time, "sleep", side_effect=lambda duration: order.append(duration)):
+            self.runner.perform("background-cycle", {"durationMs": 0})
+        self.assertEqual(order, [("launch", DEVICE, "com.apple.Preferences"), 0, "foreground"])
+        self.runner.control.assert_not_called()
+
+    def test_long_background_cycle_retains_requested_delay(self):
+        self.runner.device = DEVICE
+        self.runner.simctl = Mock()
+        with patch.object(module.time, "sleep") as sleep:
+            self.runner.perform("background-cycle", {"durationMs": 5000})
+        sleep.assert_called_once_with(5)
+        self.runner.launch.assert_called_once()
+
+    def test_invalid_background_duration_refuses_before_any_native_effect(self):
+        self.runner.simctl = Mock()
+        for value in (-1, 30001, float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.runner.perform("background-cycle", {"durationMs": value})
+        self.runner.simctl.assert_not_called()
+        self.runner.launch.assert_not_called()
+
     def test_missing_sdk_runtime_fails_before_boot_install_or_fixture_start(self):
         calls = []
 

@@ -41,6 +41,10 @@ earlier undeployed daemon changes; pull-request Windows checks are path-filtered
 To retry a partial deployment, `deploy-prod.sh --resume` retains the original
 acceptance evidence and accepts only the tested baseline/candidate identities;
 see `docs/RELEASE.md` for the exact-candidate retry procedure.
+Daemon publication stages a complete signed snapshot under prebuilt `releases/`;
+`scripts/activate-prebuilt.py` verifies it before atomically switching `current`.
+The API resolves that pointer once per request; interrupted uploads leave the
+previous release readable and resumable. Legacy flat releases remain supported.
 
 ## spawn has two frontends. A change to one is a change to both
 

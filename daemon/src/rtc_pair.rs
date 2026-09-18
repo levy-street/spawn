@@ -952,6 +952,14 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_sessions_share_one_peer_and_teardown_is_local() {
+        if std::env::var_os("SPAWND_RTC_TEST_TRACE").is_some() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    "spawnd::rtc=debug,webrtc=debug,webrtc_sctp=debug,webrtc_data=debug",
+                )
+                .with_test_writer()
+                .try_init();
+        }
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;
         let registry = SessionRegistry::new();
@@ -1123,13 +1131,40 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
+        let refused = tokio::time::timeout(Duration::from_secs(3), async {
             while missing.ready_state() != RTCDataChannelState::Closed {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("unknown local session refused");
+        .await;
+        if refused.is_err() {
+            eprintln!(
+                "unknown session channel {} is {:?}; client peer is {:?}",
+                missing.id(),
+                missing.ready_state(),
+                pc.connection_state()
+            );
+            let peers = sessions
+                .host_peers
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for peer in peers {
+                eprintln!("daemon peer state: {:?}", peer.pc.connection_state());
+                if let Ok(stats) =
+                    tokio::time::timeout(Duration::from_secs(2), peer.pc.get_stats()).await
+                {
+                    for report in stats.reports.values() {
+                        if let webrtc::stats::StatsReportType::DataChannel(channel) = report {
+                            eprintln!("daemon channel: {channel:?}");
+                        }
+                    }
+                }
+            }
+        }
+        refused.expect("unknown local session refused");
         assert_eq!(pc.connection_state(), RTCPeerConnectionState::Connected);
         sessions.invalidate_trust_and_close_all().await;
         assert!(sessions.peers.lock().await.is_empty());

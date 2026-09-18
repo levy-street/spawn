@@ -37,9 +37,10 @@ When a piece is behind, the user sees the recovery that fits that piece:
   native runtime is too old, it sends the user to the App Store instead
 
 The daemon part of `/api/release` exists only when
-`daemon/target/prebuilt/manifest.json` is valid and every listed binary is
-present with the advertised hash. Deploy writes this file atomically after the
-binaries:
+the selected prebuilt generation's `manifest.json` is valid and every listed
+binary is present with the advertised hash. Deploy atomically selects a complete
+generation through `daemon/target/prebuilt/current`; a legacy flat prebuilt
+directory remains readable until the first selection:
 
 ```json
 {
@@ -166,9 +167,9 @@ release commit and daemon tree, the version, the committer-timestamp
 `release_counter`, the signing key id, both binary hashes for every
 published target, and — under `variants` — the version and both hashes of
 every variant build published beside them (see "The diagnostics variant").
-`deploy-prod.sh` publishes the manifest atomically and then
-the signature atomically, last; a daemon never installs from an unsigned or
-badly signed manifest.
+`deploy-prod.sh` atomically selects the complete verified snapshot, including
+the manifest, signature and all binary pairs. A daemon never installs from an
+unsigned or badly signed manifest.
 
 Windows adds a separate, layered publisher proof. CI Authenticode-signs and
 RFC 3161 timestamps `spawnd-x86_64-pc-windows-msvc.exe` and
@@ -584,6 +585,20 @@ The script verifies prebuilts before changing services, restarts server/web,
 then publishes and verifies the signed daemon manifest. The OTA goes last.
 The interval between service restart and manifest publication is one of the
 partial states the scoped retry handles.
+
+Prebuilt uploads land in a unique `daemon/target/prebuilt/releases/.staging-*`
+directory, including every binary, variant, manifest and detached signature.
+`scripts/activate-prebuilt.py` checks the transferred manifest/signature against
+the locally signed bytes and verifies every binary through the server's manifest
+validator. It then renames the completed directory and atomically replaces the
+`daemon/target/prebuilt/current` symlink. The server resolves that pointer once
+per request. A failed upload or activation leaves either the complete previous
+release or the complete candidate visible, so `--resume` needs no exception for
+a missing or corrupt daemon identity. The first publication preserves the old
+flat directory as the fallback until the pointer is installed. Previous
+generations and abandoned stages are retained for recovery; this script does
+not garbage-collect them. Rollback must select a complete compatible generation,
+not copy individual binaries across generations.
 
 It is **armed**, as of 2026-08-31. What that means, precisely, is worth stating
 once rather than rediscovering during an incident.

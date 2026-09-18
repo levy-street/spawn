@@ -277,15 +277,20 @@ class Runner:
                 pass
 
     def perform(self, action: str, payload: dict) -> dict:
-        if action == "background":
+        if action in {"background", "background-cycle"}:
+            duration = float(payload.get("durationMs", 0)) / 1000
+            if not 0 <= duration <= 30:
+                raise ValueError("Native background duration must be between 0 and 30000 ms")
             if self.args.platform == "android":
                 self.adb("shell", "input", "keyevent", "KEYCODE_HOME")
             else:
                 self.simctl("launch", self.device, "com.apple.Preferences")
-            duration = float(payload.get("durationMs", 0)) / 1000
-            if not 0 <= duration <= 30:
-                raise ValueError("Native background duration must be between 0 and 30000 ms")
             time.sleep(duration)
+            if action == "background-cycle":
+                # Keep fixture HTTP acknowledgements and polling outside the
+                # measured interval. The app's actual lifecycle journal still
+                # must prove background -> active within the product deadline.
+                self.launch()
         elif action == "foreground":
             # Activate the existing app directly. iOS URL activation can stop
             # at an OS "Open in" confirmation instead of resuming the app.

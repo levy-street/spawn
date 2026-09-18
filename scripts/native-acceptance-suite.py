@@ -353,9 +353,8 @@ async def exercise(fixture: Any) -> None:
             before = await snapshot()
             started = time.monotonic()
             await fixture.command(
-                "background", {"durationMs": milliseconds}, native=True
+                "background-cycle", {"durationMs": milliseconds}, native=True
             )
-            await fixture.command("foreground", native=True)
             after = await wait_ready()
             await echo()
 
@@ -402,7 +401,10 @@ async def exercise(fixture: Any) -> None:
                 "live_peers": after["peer"]["livePeerCount"],
             }
 
-        await case("background_short", lambda: background(500))
+        # OS activation itself takes time. Immediately request foreground for
+        # the short case; accept it only if real callbacks prove a nonzero gap
+        # below three seconds and the original parent survives unchanged.
+        await case("background_short", lambda: background(0))
         await case("background_retire", lambda: background(5000))
 
         async def restart() -> dict[str, Any]:

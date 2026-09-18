@@ -299,7 +299,9 @@ REMOTE
 )" || die "could not read the production checkout before deployment"
 host_manifest_json="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
 set -euo pipefail
-cat "$SPAWN_DEPLOY_PATH/daemon/target/prebuilt/manifest.json" 2>/dev/null || true
+prebuilt="$SPAWN_DEPLOY_PATH/daemon/target/prebuilt"
+if [[ -e "$prebuilt/current" || -L "$prebuilt/current" ]]; then prebuilt="$prebuilt/current"; fi
+cat "$prebuilt/manifest.json" 2>/dev/null || true
 REMOTE
 )" || die "could not read the production prebuilt manifest before deployment"
 host_manifest_tree="$(manifest_tree_from_json "$host_manifest_json" 2>/dev/null || true)"
@@ -564,11 +566,9 @@ if ! python3 "$script_dir/check-release-acceptance.py" "${acceptance_args[@]}"; 
 fi
 ssh "$host" "${env_prefix}bash '$remote_script'; rc=\$?; rm -f '$remote_script'; exit \$rc"
 
-# Publish the exact release snapshot verified before deployment. Binaries land
-# through temporary names. The manifest and detached signature are copied to
-# temporary paths and renamed atomically, with the signature made live last.
-# A reader may briefly see a manifest/signature mismatch, which is safe: the
-# daemon rejects it and retries rather than trusting an unsigned identity.
+# Upload the entire signed release into an unpublished generation. Only a
+# verified complete snapshot may replace the current pointer; interrupted
+# transfers leave the previous manifest and every binary intact for --resume.
 prebuilts_published=0
 publish_prebuilts() {
   if [[ "$prebuilt_setting" != "1" ]]; then
@@ -579,43 +579,6 @@ publish_prebuilts() {
     printf 'deploy-prod: prebuilt publish skipped (%s)\n' "$prebuilt_reason"
     return
   fi
-
-  local pair target triple dest spawnd_asset worker_asset
-  local spawnd_name worker_name spawnd_tmp worker_tmp mode
-  for pair in "${PREBUILT_TARGETS[@]}"; do
-    target="${pair%%:*}"
-    triple="${pair##*:}"
-    dest="$remote_path/daemon/target/prebuilt/$target"
-    spawnd_asset="$(prebuilt_asset_name "$target" "$triple" spawnd)"
-    worker_asset="$(prebuilt_asset_name "$target" "$triple" spawn-worker)"
-    spawnd_name="$(prebuilt_installed_name "$target" spawnd)"
-    worker_name="$(prebuilt_installed_name "$target" spawn-worker)"
-    spawnd_tmp="$spawnd_name.tmp"
-    worker_tmp="$worker_name.tmp"
-    mode="$(prebuilt_file_mode "$target")"
-    if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
-      ssh "$host" "mkdir -p '$dest'"
-      scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$spawnd_tmp"
-      scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$worker_tmp"
-      ssh "$host" "chmod '$mode' '$dest/$spawnd_tmp' '$dest/$worker_tmp' && mv '$dest/$spawnd_tmp' '$dest/$spawnd_name' && mv '$dest/$worker_tmp' '$dest/$worker_name'"
-      printf 'deploy-prod: published %s prebuilt to %s\n' "$target" "$host"
-    fi
-    # The variant pairs live one directory down, under the target they were
-    # cut for, and install under the plain names: a variant replaces the
-    # daemon, it does not sit beside it.
-    local variant
-    for variant in "${PREBUILT_VARIANTS[@]}"; do
-      spawnd_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawnd "$variant")"
-      worker_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawn-worker "$variant")"
-      if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
-        ssh "$host" "mkdir -p '$dest/$variant'"
-        scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$variant/$spawnd_tmp"
-        scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$variant/$worker_tmp"
-        ssh "$host" "chmod '$mode' '$dest/$variant/$spawnd_tmp' '$dest/$variant/$worker_tmp' && mv '$dest/$variant/$spawnd_tmp' '$dest/$variant/$spawnd_name' && mv '$dest/$variant/$worker_tmp' '$dest/$variant/$worker_name'"
-        printf 'deploy-prod: published %s %s variant to %s\n' "$target" "$variant" "$host"
-      fi
-    done
-  done
 
   local manifest="$prebuilt_tmp/manifest.json"
   local signature="$prebuilt_tmp/manifest.json.sig"
@@ -629,10 +592,58 @@ publish_prebuilts() {
     "$manifest" "$signature" "$release_signing_key_file" ||
     die "could not sign the verified prebuilt manifest"
   local prebuilt_root="$remote_path/daemon/target/prebuilt"
-  ssh "$host" "mkdir -p '$prebuilt_root'"
-  scp -q "$manifest" "$host:$prebuilt_root/manifest.json.tmp"
-  scp -q "$signature" "$host:$prebuilt_root/manifest.json.sig.tmp"
-  ssh "$host" "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json' && mv '$prebuilt_root/manifest.json.sig.tmp' '$prebuilt_root/manifest.json.sig'"
+  local stage
+  stage="$(ssh "$host" "mkdir -p '$prebuilt_root/releases' && mktemp -d '$prebuilt_root/releases/.staging-XXXXXXXX'")"
+  [[ "$stage" == "$prebuilt_root/releases/.staging-"* && "$stage" != *$'\n'* ]] ||
+    die "remote snapshot staging path was invalid"
+  ssh "$host" "chmod 0755 '$stage'"
+
+  local pair target triple dest spawnd_asset worker_asset
+  local spawnd_name worker_name spawnd_tmp worker_tmp mode
+  for pair in "${PREBUILT_TARGETS[@]}"; do
+    target="${pair%%:*}"
+    triple="${pair##*:}"
+    dest="$stage/$target"
+    spawnd_asset="$(prebuilt_asset_name "$target" "$triple" spawnd)"
+    worker_asset="$(prebuilt_asset_name "$target" "$triple" spawn-worker)"
+    spawnd_name="$(prebuilt_installed_name "$target" spawnd)"
+    worker_name="$(prebuilt_installed_name "$target" spawn-worker)"
+    spawnd_tmp="$spawnd_name.tmp"
+    worker_tmp="$worker_name.tmp"
+    mode="$(prebuilt_file_mode "$target")"
+    if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
+      ssh "$host" "mkdir -p '$dest'"
+      scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$spawnd_tmp"
+      scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$worker_tmp"
+      ssh "$host" "chmod '$mode' '$dest/$spawnd_tmp' '$dest/$worker_tmp' && mv '$dest/$spawnd_tmp' '$dest/$spawnd_name' && mv '$dest/$worker_tmp' '$dest/$worker_name'"
+      printf 'deploy-prod: staged %s prebuilt on %s\n' "$target" "$host"
+    fi
+    # The variant pairs live one directory down, under the target they were
+    # cut for, and install under the plain names: a variant replaces the
+    # daemon, it does not sit beside it.
+    local variant
+    for variant in "${PREBUILT_VARIANTS[@]}"; do
+      spawnd_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawnd "$variant")"
+      worker_asset="$(prebuilt_variant_asset_name "$target" "$triple" spawn-worker "$variant")"
+      if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
+        ssh "$host" "mkdir -p '$dest/$variant'"
+        scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$variant/$spawnd_tmp"
+        scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$variant/$worker_tmp"
+        ssh "$host" "chmod '$mode' '$dest/$variant/$spawnd_tmp' '$dest/$variant/$worker_tmp' && mv '$dest/$variant/$spawnd_tmp' '$dest/$variant/$spawnd_name' && mv '$dest/$variant/$worker_tmp' '$dest/$variant/$worker_name'"
+        printf 'deploy-prod: staged %s %s variant on %s\n' "$target" "$variant" "$host"
+      fi
+    done
+  done
+
+  scp -q "$manifest" "$host:$stage/manifest.json"
+  scp -q "$signature" "$host:$stage/manifest.json.sig"
+  local manifest_sha signature_sha
+  read -r manifest_sha signature_sha < <(python3 - "$manifest" "$signature" <<'PYHASH'
+import hashlib, pathlib, sys
+print(*(hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() for path in sys.argv[1:]))
+PYHASH
+)
+  ssh "$host" "'$remote_path/server/.venv/bin/python' '$remote_path/scripts/activate-prebuilt.py' '$prebuilt_root' '$stage' '$release_tree' '$manifest_sha' '$signature_sha'"
   prebuilts_published=1
   printf 'deploy-prod: published signed prebuilt manifest for daemon tree %s (key %s; %d release pair(s), %d variant pair(s))\n' \
     "$release_tree" "$release_key_id" \

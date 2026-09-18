@@ -39,6 +39,10 @@ tests/          pytest; test_<module>.py mirrors the module it covers
   and `/install.ps1`. Prebuilt API paths stay extensionless; canonical Windows
   files and download filenames keep `.exe` (`spawnd.exe`,
   `spawn-worker.exe`).
+  `release.prebuilt_root()` pins the atomic `current` pointer to one immutable
+  published generation per request, with legacy flat-directory compatibility.
+  All manifest and binary reads use this resolver; publication never mutates
+  the previous generation or paths retained by in-flight downloads.
 - A new websocket frame: the matching `ws/` module — daemon frames in
   `ws/daemon.py`, browser frames in `ws/browser.py`. The daemon side of the
   wire lives in `daemon/src/`; change both sides in the same commit. The

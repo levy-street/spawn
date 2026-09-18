@@ -189,7 +189,8 @@ avoids a race where a fast upload finishes while iOS is still moving the app int
 the background; the product's upload coordinator and transports remain real.
 
 The native runner consumes `GET /__acceptance/native-command`: `background`
-(optional `durationMs` up to 30000), `foreground`, `relaunch`, `screenshot`
+(optional `durationMs` up to 30000), `background-cycle` (the same delay followed
+by immediate foreground activation before reporting completion), `foreground`, `relaunch`, `screenshot`
 (optional `name`), and `finish` (`status:"passed"|"failed"`, optional `reason`).
 It exits with the fixture's finish verdict. HTTP control stays outside the UDP
 proxy, so a broken RTC path remains observable and recoverable by the suite.
@@ -237,3 +238,9 @@ The build follows the official [Expo local native build commands](https://docs.e
 and [Android Emulator Runner configuration](https://github.com/ReactiveCircus/android-emulator-runner).
 Apple documents the application identifier's role in the
 [default keychain access group](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps).
+
+The short-background case uses one `background-cycle` command with no added
+sleep, removing fixture acknowledgements and polling from the interval. It still
+requires retained native callbacks proving a nonzero background interval below
+three seconds and the same peer afterward. Long cases keep their five-second
+delay. A slow native activation still fails the short-case gate.
