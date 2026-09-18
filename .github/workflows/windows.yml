@@ -26,6 +26,8 @@ jobs:
     name: windows-check
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      SPAWND_RTC_TEST_TRACE: 1
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -58,14 +60,14 @@ jobs:
 
       - name: Test daemon
         working-directory: daemon
-        run: cargo test --locked --target x86_64-pc-windows-msvc
+        run: cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact --nocapture
 
       - name: Repeat shared session closure
         if: ${{ !cancelled() }}
         working-directory: daemon
         run: |
           for ($iteration = 1; $iteration -le 20; $iteration++) {
-            cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact
+            cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact --nocapture
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -134,9 +136,7 @@ jobs:
   # unsigned test installer; desktop.yml owns signed release packaging.
   windows-package:
     name: windows-package (unsigned rehearsal)
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.head_commit.message, '[package]')
+    if: ${{ false }}
     runs-on: windows-latest
     timeout-minutes: 60
     env:

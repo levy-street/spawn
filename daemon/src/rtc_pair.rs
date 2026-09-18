@@ -955,7 +955,7 @@ mod tests {
         if std::env::var_os("SPAWND_RTC_TEST_TRACE").is_some() {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
-                    "spawnd::rtc=debug,webrtc=debug,webrtc_sctp=debug,webrtc_data=debug",
+                    "warn",
                 )
                 .with_test_writer()
                 .try_init();
