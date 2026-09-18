@@ -50,13 +50,13 @@ jobs:
 
       - name: Test daemon
         working-directory: daemon
-        run: cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact --nocapture
+        run: cargo test --locked --target x86_64-pc-windows-msvc
 
       - name: Repeat shared session closure
         if: ${{ !cancelled() }}
         working-directory: daemon
         run: |
           for ($iteration = 1; $iteration -le 20; $iteration++) {
-            cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact --nocapture
+            cargo test --locked --target x86_64-pc-windows-msvc --bin spawnd rtc::pair::tests::multiple_sessions_share_one_peer_and_teardown_is_local -- --exact
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }

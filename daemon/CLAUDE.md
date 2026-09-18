@@ -1,7 +1,7 @@
 # Working agreements for daemon/
 
-This diagnostic branch runs the shared-peer Windows case without a logging
-subscriber. Temporary direct stderr diagnostics capture only SCTP read, write
+This diagnostic branch runs the full Windows daemon suite before repeating
+the shared-peer case, without a logging subscriber or uncaptured output. Temporary direct stderr diagnostics capture only SCTP read, write
 and inbound errors, after they occur. Its workflow output is diagnostic
 evidence, not a full Windows validation.
 
