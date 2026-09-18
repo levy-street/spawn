@@ -92,6 +92,9 @@ printf '%s\n' "== daemon tests, diagnostics variant =="
 printf '%s\n' "== SCTP stream lifecycle regressions =="
 (cd daemon && cargo test --locked -p webrtc-sctp --lib stream::stream_test::)
 
+printf '%s\n' "== ICE route recovery regressions =="
+(cd daemon && cargo test --locked -p webrtc-ice --lib agent_transport_test::)
+
 printf '%s\n' "== daemon updater end-to-end =="
 scripts/test-update-e2e.sh
 

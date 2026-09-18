@@ -66,9 +66,11 @@ tests/           integration tests (worker_e2e.rs), and
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
-                 and a read/reset missed-notification fix, and webrtc 0.17.2
+                 and a read/reset missed-notification fix, webrtc-ice 0.17.2
+                 with temporary UDP route errors treated as datagram loss
+                 (ice/PATCHES.md), and webrtc 0.17.2
                  with closed-channel registry pruning (webrtc/PATCHES.md).
-                 SCTP is a workspace member so its regression tests use the
+                 SCTP and ICE are workspace members so their tests use the
                  daemon's Cargo.lock; webrtc is excluded to avoid resolving
                  its optional OpenSSL features. Native daemon regressions
                  cover its patch; default cargo commands select only spawnd
@@ -350,6 +352,7 @@ cargo clippy --locked --all-targets --features diagnostics -- -D warnings
 cargo test --locked
 cargo test --locked --features diagnostics
 cargo test --locked -p webrtc-sctp --lib stream::stream_test::
+cargo test --locked -p webrtc-ice --lib agent_transport_test::
 cargo build --locked --profile diagnostics --features diagnostics
 ```
 
@@ -363,6 +366,12 @@ its notification waiter before checking shutdown or awaiting the reassembly
 queue lock: a remote reset uses `notify_waiters`, so registering afterward can
 lose the notification and strand a closed channel's reader. The regression
 holds that queue lock and resets the stream while the reader is waiting.
+
+ICE route recovery tests also run in Linux and Windows CI. Typed temporary
+network-unreachable errors drop the UDP datagram so SCTP can retransmit after
+ICE recovery; they must not close the shared association. Other IO errors
+and explicit connection closure still fail. The tests inject the route error
+and require the next datagram to reach a real receiver on the same connection.
 
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed

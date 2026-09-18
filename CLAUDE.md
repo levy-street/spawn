@@ -115,7 +115,9 @@ local startup diagnostics and scoped device captures preserve setup failures.
 Every workflow uses standard GitHub-hosted runners, as mapped in
 `docs/CI_RUNNERS.md`. `scripts/ci/check-hosted-runners.py` rejects paid runner
 sizes, self-hosted labels and unreviewed dynamic runner expressions. Runner and
-disk regressions run in `scripts/test-all.sh`. Signing environments,
+disk regressions run in `scripts/test-all.sh`. Vendored ICE route recovery
+regressions run there and in native Windows CI using the daemon's lockfile.
+Signing environments,
 exact-commit checks and release evidence remain required.
 Linux CI uses disposable PostgreSQL 16 and Redis 7 fixtures and a networkless
 systemd VM. `SPAWN_E2E_WORKERS=2` leaves resources for the browser test server.

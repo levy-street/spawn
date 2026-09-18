@@ -73,6 +73,10 @@ jobs:
         working-directory: daemon
         run: "cargo test --locked -p webrtc-sctp --lib stream::stream_test:: --target x86_64-pc-windows-msvc"
 
+      - name: Test ICE route recovery
+        working-directory: daemon
+        run: "cargo test --locked -p webrtc-ice --lib agent_transport_test:: --target x86_64-pc-windows-msvc"
+
       # A plain crate check does not invoke tauri-cli or bundle an application;
       # WebView2 SDK installation belongs to the separate packaging workflow.
       - name: Check desktop crate

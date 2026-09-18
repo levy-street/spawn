@@ -6,7 +6,7 @@ description = "spawn daemon — runs CLI coding agents on a host on behalf of a 
 license = "MIT OR Apache-2.0"
 
 [workspace]
-members = ["vendor/sctp"]
+members = ["vendor/sctp", "vendor/ice"]
 exclude = ["vendor/webrtc"]
 default-members = ["."]
 resolver = "2"
@@ -128,6 +128,9 @@ webrtc-sctp = { path = "vendor/sctp" }
 # Keep closed channels out of the shared parent's live registry, retaining
 # cumulative close stats and stream-ID reservations. See vendor/webrtc/PATCHES.md.
 webrtc = { path = "vendor/webrtc" }
+# A temporary unreachable UDP route during ICE restart is packet loss, not
+# the end of the DTLS/SCTP association. See vendor/ice/PATCHES.md.
+webrtc-ice = { path = "vendor/ice" }
 
 [profile.release]
 lto = "thin"
