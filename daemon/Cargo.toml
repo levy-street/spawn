@@ -5,6 +5,12 @@ edition = "2021"
 description = "spawn daemon — runs CLI coding agents on a host on behalf of a spawn server"
 license = "MIT OR Apache-2.0"
 
+[workspace]
+members = ["vendor/sctp", "vendor/ice"]
+exclude = ["vendor/webrtc"]
+default-members = ["."]
+resolver = "2"
+
 [lib]
 name = "spawnd"
 path = "src/lib.rs"
@@ -115,9 +121,16 @@ tempfile = "3"
 tokio = { version = "1.42", features = ["test-util"] }
 
 # Remove this override after a published webrtc-sctp release contains the
-# receiver zero-window re-admission fix from webrtc-rs/rtc#201.
+# receiver zero-window re-admission fix from webrtc-rs/rtc#201 and the stream
+# reset notification fix documented in CLAUDE.md.
 [patch.crates-io]
 webrtc-sctp = { path = "vendor/sctp" }
+# Keep closed channels out of the shared parent's live registry, retaining
+# cumulative close stats and stream-ID reservations. See vendor/webrtc/PATCHES.md.
+webrtc = { path = "vendor/webrtc" }
+# A temporary unreachable UDP route during ICE restart is packet loss, not
+# the end of the DTLS/SCTP association. See vendor/ice/PATCHES.md.
+webrtc-ice = { path = "vendor/ice" }
 
 [profile.release]
 lto = "thin"

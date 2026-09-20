@@ -72,7 +72,13 @@ describe("deviceIdentity", () => {
   test("reset clears identity and dependent registration state", async () => {
     setDeviceIdentityAccount(ACCOUNT_ID);
     await deviceIdentity.ensure();
+    const generation = identityModule.deviceIdentityGeneration();
+    const changed = jest.fn();
+    const unsubscribe = identityModule.subscribeDeviceIdentityAccount(changed);
     await deviceIdentity.reset();
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(identityModule.deviceIdentityGeneration()).toBe(generation + 1);
+    unsubscribe();
     expect(values.size).toBe(0);
     await expect(deviceIdentity.ensure()).rejects.toMatchObject({ code: "IDENTITY_ABSENT" });
   });

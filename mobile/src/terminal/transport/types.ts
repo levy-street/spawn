@@ -103,6 +103,8 @@ export interface UploadHandle {
 }
 
 export interface WorkerEndpoint {
+  /** Native documents must finish loading before initialization can be sent. */
+  whenReady?(): Promise<void>;
   send(message: import("@/terminal/transport/bridge").NativeToWorkerMessage): void;
   onMessage(
     fn: (message: import("@/terminal/transport/bridge").WorkerToNativeMessage) => void,
@@ -125,13 +127,8 @@ export interface SessionTransportOptions {
   theme: TerminalTheme;
   bridge: WorkerEndpoint;
   fontSize?: number;
-  forceRelay?: boolean;
-  openSignal?: (sessionId: string) => SignalChannelLike;
-  loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
-  /** Enables the trust preflight; without it an unapproved device only learns from the watchdog. */
+  /** The daemon whose persistent connection owns this terminal attachment. */
   hostId?: string;
-  probeTrust?: (hostId: string) => Promise<DeviceHostTrust>;
-  probeTrustResult?: (hostId: string) => Promise<DeviceHostTrustResult>;
   /** Defaults to {@link CONNECT_TIMEOUT_MS}; lower values support deterministic tests. */
   connectTimeoutMs?: number;
 }
@@ -139,7 +136,8 @@ export interface SessionTransportOptions {
 export interface SessionTransport {
   readonly sessionId: string;
   readonly state: TransportState;
-  /** Starts identity, trust, endorsements and signalling before WKWebView finishes loading. */
+  readonly daemonState?: TransportState;
+  /** Retains the app-owned daemon connection before the terminal WebView loads. */
   prepare?(): void;
   networkChanged?(): void;
   open(): Promise<void>;
@@ -285,6 +283,7 @@ export interface HostTransportOptions {
 
 export interface HostTransport {
   readonly hostId: string;
+  readonly lastError?: TransportError | null;
   readonly state: TransportState;
   /** Null until this RTC generation's hello frame is decoded. */
   readonly capabilities?: HostCapabilities | null;
@@ -484,3 +483,9 @@ export function iceServersNeedRefresh(
   }
   return false;
 }
+
+export const CONNECT_TIMEOUT_MS = 25_000;
+export const CONNECT_TIMEOUT_MESSAGE =
+  "The host did not answer in time. It may be offline, or it may not have approved this device.";
+export const LOST_CONNECTION_MESSAGE =
+  "SPAWN D lost the connection to this host and could not restore it.";

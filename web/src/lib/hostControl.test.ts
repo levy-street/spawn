@@ -300,9 +300,17 @@ afterEach(() => {
 });
 
 describe("HostControlClient", () => {
-  test("signed HostControl applies only the host-signed transcript SDP", async () => {
+  test.each([
+    { version: 1, supportsSessions: true },
+    { version: 2, supportsSessions: true },
+    { version: 2, supportsSessions: false },
+  ])("signed host handshake %o applies authenticated SDP and required capabilities", async ({
+    version,
+    supportsSessions,
+  }) => {
     const signed = await signedRtcTrust();
     const client = new HostControlClient(hostId, {
+      deviceConnection: version === 2,
       resolveSignedRtcTrust: async () => ({ mode: "signed", capability: signed.trust }),
     });
     client.connect();
@@ -314,6 +322,7 @@ describe("HostControlClient", () => {
       ice_servers: [{ urls: ["turn:relay.example"] }],
       ice_transport_policy: "relay",
       ...metadata,
+      protocol_version: version,
     });
     const offer = await waitForSentFrame(ws, "rtc.offer");
     expect(offer).toHaveProperty("signed_envelope");
@@ -330,7 +339,7 @@ describe("HostControlClient", () => {
         protocol: HOST_CONTROL_PROTOCOL,
         transcript: {
           signalKind: "answer",
-          protocolVersion: 1,
+          protocolVersion: version,
           sessionId: offer.session_id,
           scopeType: "host",
           scopeId: hostId,
@@ -347,11 +356,51 @@ describe("HostControlClient", () => {
       signed_envelope: signedEnvelope,
       sdp: rawRelaySdp,
       ...metadata,
+      protocol_version: version,
+      binding_nonce: "c".repeat(32),
+      binding_generation: 9,
     });
     await waitFor(() => pc.remoteDescription !== null);
 
     expect(pc.remoteDescription).toEqual({ type: "answer", sdp: verifiedSdp });
     expect(pc.remoteDescription.sdp).not.toBe(rawRelaySdp);
+    if (version === 2) {
+      pc.channel.onopen?.();
+      pc.channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "hello",
+          protocol: HOST_CONTROL_PROTOCOL,
+          capabilities: supportsSessions ? ["session.transport.v1"] : ["ping"],
+        }),
+      );
+      if (!supportsSessions) {
+        expect(client.getState()).not.toBe("ready");
+        expect(client.getConnectionError()).toContain("Update SPAWN D");
+        expect(pc.channel.closed).toBe(true);
+        client.close();
+        return;
+      }
+      expect(client.getState()).toBe("ready");
+      pc.connectionState = "disconnected";
+      window.dispatchEvent(new Event("online"));
+      await waitFor(() => ws.sent.some((frame) => JSON.parse(frame).ice_restart === true));
+      const restart = ws.sent
+        .map((frame) => JSON.parse(frame))
+        .find((frame) => frame.ice_restart === true);
+      expect(restart).toMatchObject({
+        session_id: offer.session_id,
+        protocol_version: 2,
+        binding_nonce: "c".repeat(32),
+        binding_generation: 9,
+        signed_envelope: expect.any(String),
+      });
+      expect(restart).not.toHaveProperty("sdp");
+      expect(FakePeerConnection.instances).toHaveLength(1);
+      pc.connectionState = "connected";
+      pc.onconnectionstatechange?.();
+      expect(client.getState()).toBe("ready");
+    }
     client.close();
   });
 

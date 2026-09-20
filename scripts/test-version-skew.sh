@@ -174,7 +174,9 @@ run_cell() {
     update_test_start_server 1
     update_test_wait_host "$UPDATE_TREE_B" current "" 60 >/dev/null
     expected_tree="$UPDATE_TREE_B"
-    cmp -s "$UPDATE_BIN_DIR/spawnd" "$UPDATE_ARTIFACTS/new/spawnd" \
+    # Store-aware daemons select an immutable release; bin/ can deliberately
+    # retain the original pair. Verify both binaries selected by this instance.
+    update_test_installed_is new \
       || update_test_die "the old daemon did not install the new release pair"
     printf -v "$result_variable" '%s' "PASS (auto-updated; manifest carried variants)"
   elif [[ "$daemon_generation:$server_generation" == "new:old" ]]; then

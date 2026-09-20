@@ -75,6 +75,23 @@
         "type": "rtc.answer"
       },
       "id": "host-answer"
+    },
+    {
+      "envelope": {
+        "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "protocol": "spawn.host.ctl",
+        "protocol_version": 2,
+        "scope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "scope_type": "host",
+        "sdp": "v=0\r\no=- 461173305954868532 2 IN IP4 127.0.0.1\r\ns=spawn-host\r\nt=0 0\r\na=setup:active\r\n",
+        "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "sender_role": "daemon",
+        "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2b2",
+        "signature": "99aafh_vu06cCWlxBk3WCrI7FSZ2qL4da5Wshfj5RaN6ZSysOn2T2LPalIEa06V0mnvCZ6RH9UTjgEgbnkq2Cw",
+        "signature_algorithm": "ed25519",
+        "type": "rtc.answer"
+      },
+      "id": "device-connection-answer"
     }
   ],
   "wrong_topology_vectors": [
@@ -99,18 +116,18 @@
       "envelope": {
         "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
         "protocol": "spawn.host.ctl",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "scope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
         "scope_type": "host",
         "sdp": "v=0\r\no=- 461173305954868532 2 IN IP4 127.0.0.1\r\ns=spawn-host\r\nt=0 0\r\na=setup:active\r\n",
         "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
         "sender_role": "daemon",
         "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2b2",
-        "signature": "99aafh_vu06cCWlxBk3WCrI7FSZ2qL4da5Wshfj5RaN6ZSysOn2T2LPalIEa06V0mnvCZ6RH9UTjgEgbnkq2Cw",
+        "signature": "mHz3dWa4RP3G53ydDq4cDHBMXXEf1JYClp3Wy41Vm6inMxTKUfVbVImyLzgxjX0XLLER6jsXjGWRt9hDYGzKCw",
         "signature_algorithm": "ed25519",
         "type": "rtc.answer"
       },
-      "id": "host-answer-wrong-version-2"
+      "id": "host-answer-wrong-version-3"
     }
   ]
 }

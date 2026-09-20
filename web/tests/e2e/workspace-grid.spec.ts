@@ -309,6 +309,9 @@ test("on a Mac the terminal keeps ⌥ and the grid answers to ⌃⌥", async ({ 
 
   // ⌥← / ⌥→ are backward-word and forward-word. They go to the shell, and the
   // focus stays exactly where the person left it.
+  await expect(
+    page.getByRole("region", { name: "palette" }).getByLabel("Session terminal"),
+  ).toHaveAttribute("aria-busy", "false");
   await page.keyboard.press("Alt+ArrowLeft");
   await page.keyboard.press("Alt+ArrowRight");
   await expect.poll(() => ptyText(captured)).toContain("\u001bb");

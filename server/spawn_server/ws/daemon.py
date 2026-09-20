@@ -50,7 +50,6 @@ from .close_codes import (
 )
 from .host_signal import (
     HOST_CONTROL_PROTOCOL,
-    HOST_CONTROL_VERSION,
     HOST_DAEMON_PRESENCE_TTL_SECONDS,
     HOST_RTC_SESSION_TTL_SECONDS,
     HOST_RTC_STATUS_ALLOWLIST,
@@ -868,7 +867,8 @@ def _host_rtc_metadata_matches(obj: dict, host_id: str) -> bool:
         obj.get("scope_type") == "host"
         and obj.get("scope_id") == host_id
         and obj.get("protocol") == HOST_CONTROL_PROTOCOL
-        and obj.get("protocol_version") == HOST_CONTROL_VERSION
+        and type(obj.get("protocol_version")) is int
+        and obj.get("protocol_version") in {1, 2}
     )
 
 
@@ -1624,6 +1624,7 @@ async def _process_host_rtc_signal(
         return True
     if not _host_rtc_metadata_matches(signal, conn.host_id):
         return True
+    protocol_version = signal["protocol_version"]
     session_id = _valid_rtc_session_id(signal.get("session_id"))
     if session_id is None:
         return True
@@ -1633,6 +1634,8 @@ async def _process_host_rtc_signal(
         # are forwarded without re-running sanitize — the browser ingress
         # sanitized before dispatch, and the daemon re-caps and re-verifies.
         signed_signal = signed_mode_selected(signal)
+        if protocol_version == 2 and not signed_signal:
+            return True
         try:
             if signed_signal:
                 reject_raw_sdp_in_signed_mode(signal)
@@ -1643,7 +1646,7 @@ async def _process_host_rtc_signal(
                     expected_scope_type="host",
                     expected_scope_id=conn.host_id,
                     expected_protocol=HOST_CONTROL_PROTOCOL,
-                    expected_protocol_version=HOST_CONTROL_VERSION,
+                    expected_protocol_version=protocol_version,
                 )
             elif _valid_rtc_sdp(signal.get("sdp")) is None:
                 return True
@@ -1660,12 +1663,30 @@ async def _process_host_rtc_signal(
             daemon_generation=generation,
             binding_nonce=binding_nonce,
         )
+        if protocol_version == 2 and not conn.supports_device_connections:
+            await remote_browser.send_text(
+                {
+                    "type": "rtc.status",
+                    "session_id": session_id,
+                    "binding_nonce": binding_nonce,
+                    "binding_generation": generation,
+                    "scope_type": "host",
+                    "scope_id": conn.host_id,
+                    "protocol": HOST_CONTROL_PROTOCOL,
+                    "protocol_version": 2,
+                    "status": "failed",
+                    "code": "daemon_update_required",
+                    "message": "Update SPAWN D on this host to share its connection.",
+                }
+            )
+            return True
         if signal.get("ice_restart") is True:
             existing_binding = await broker.rtc_session_for(session_id, daemon=conn)
             if not (
                 existing_binding is not None
                 and existing_binding.scope_type == "host"
                 and existing_binding.scope_id == conn.host_id
+                and existing_binding.protocol_version == protocol_version
                 and existing_binding.browser.route_id == envelope.browser_channel
                 and existing_binding.nonce == binding_nonce
                 and existing_binding.signed_signal == signed_signal
@@ -1680,7 +1701,7 @@ async def _process_host_rtc_signal(
                             "scope_type": "host",
                             "scope_id": conn.host_id,
                             "protocol": HOST_CONTROL_PROTOCOL,
-                            "protocol_version": HOST_CONTROL_VERSION,
+                            "protocol_version": protocol_version,
                             "binding_nonce": binding_nonce,
                             "binding_generation": signal.get("binding_generation"),
                             "status": "unavailable",
@@ -1698,7 +1719,7 @@ async def _process_host_rtc_signal(
             scope_type="host",
             scope_id=conn.host_id,
             protocol=HOST_CONTROL_PROTOCOL,
-            protocol_version=HOST_CONTROL_VERSION,
+            protocol_version=protocol_version,
             binding_nonce=binding_nonce,
             signed_signal=signed_signal,
             ttl_seconds=HOST_RTC_SESSION_TTL_SECONDS,
@@ -1713,7 +1734,7 @@ async def _process_host_rtc_signal(
                         "scope_type": "host",
                         "scope_id": conn.host_id,
                         "protocol": HOST_CONTROL_PROTOCOL,
-                        "protocol_version": HOST_CONTROL_VERSION,
+                        "protocol_version": protocol_version,
                         "binding_nonce": binding_nonce,
                         "status": "failed",
                     },
@@ -1740,6 +1761,7 @@ async def _process_host_rtc_signal(
         binding is None
         or binding.scope_type != "host"
         or binding.scope_id != conn.host_id
+        or binding.protocol_version != protocol_version
         or binding.browser.route_id != envelope.browser_channel
         or signal.get("binding_nonce") != binding.nonce
     ):
@@ -1845,10 +1867,11 @@ def _validated_live_bindings(value: object) -> list[dict[str, object]]:
             "session",
             "spawn.pty",
             2,
-        ) or (scope_type, protocol, protocol_version) == (
-            "host",
-            HOST_CONTROL_PROTOCOL,
-            HOST_CONTROL_VERSION,
+        ) or (
+            scope_type == "host"
+            and protocol == HOST_CONTROL_PROTOCOL
+            and type(protocol_version) is int
+            and protocol_version in {1, 2}
         )
         if not (
             session_id is not None
@@ -2056,6 +2079,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         for field in (
                             "keeps_peers_across_reconnect",
                             "session_ice_policy",
+                            "supports_device_connections",
                             "worker_mismatch",
                         )
                     ):
@@ -2067,6 +2091,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         obj.get("keeps_peers_across_reconnect") is True
                     )
                     conn.session_ice_policy = obj.get("session_ice_policy") is True
+                    conn.supports_device_connections = (
+                        obj.get("supports_device_connections") is True
+                    )
                     live_bindings = _validated_live_bindings(obj.get("live_bindings"))
                     # Reserve a durable generation without touching the active
                     # database or Redis owner. Only the later CAS promotion is

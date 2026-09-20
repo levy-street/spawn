@@ -39,6 +39,10 @@ tests/          pytest; test_<module>.py mirrors the module it covers
   and `/install.ps1`. Prebuilt API paths stay extensionless; canonical Windows
   files and download filenames keep `.exe` (`spawnd.exe`,
   `spawn-worker.exe`).
+  `release.prebuilt_root()` pins the atomic `current` pointer to one immutable
+  published generation per request, with legacy flat-directory compatibility.
+  All manifest and binary reads use this resolver; publication never mutates
+  the previous generation or paths retained by in-flight downloads.
 - A new websocket frame: the matching `ws/` module — daemon frames in
   `ws/daemon.py`, browser frames in `ws/browser.py`. The daemon side of the
   wire lives in `daemon/src/`; change both sides in the same commit. The
@@ -57,6 +61,13 @@ does not dispatch installers or run an agent auto-update scheduler. Historical
 policies remain stored but inactive. Do not restore these effects from a
 server-side flag: `docs/DAEMON_COMMAND_AUTHORITY.md` records the endpoint
 authorization and durable-state requirements for their replacement.
+
+- Shared device RTC uses `/ws/host?rtc_version=2` with the existing
+  `spawn.host.v1` websocket subprotocol. Relay only signed host-v2 envelopes;
+  preserve the exact binding tuple through offers, resume, and close. Legacy
+  host-v1 and session-v2 routes remain supported. The daemon advertises
+  `supports_device_connections`; an old daemon must produce an explicit update
+  refusal. Session channel attachment never becomes a server signaling route.
 
 ## Before calling a change done
 

@@ -37,6 +37,7 @@ src/
                  legacy launch, and collecting releases nothing runs — see
                  "Where a daemon's binaries live"
   <feature>.rs   one module per concern: run.rs (register + main loop),
+                 rtc_pair.rs (shared device connections and session-channel admission),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
                  release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs,
@@ -65,6 +66,14 @@ tests/           integration tests (worker_e2e.rs), and
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
+                 and a read/reset missed-notification fix, webrtc-ice 0.17.2
+                 with temporary UDP route errors treated as datagram loss
+                 (ice/PATCHES.md), and webrtc 0.17.2
+                 with closed-channel registry pruning (webrtc/PATCHES.md).
+                 SCTP and ICE are workspace members so their tests use the
+                 daemon's Cargo.lock; webrtc is excluded to avoid resolving
+                 its optional OpenSSL features. Native daemon regressions
+                 cover its patch; default cargo commands select only spawnd
 ```
 
 ## Where things go
@@ -313,6 +322,19 @@ the release pair. "The diagnostics variant" in `docs/RELEASE.md` has the
 operator's side, including the one-time step for a daemon built before the
 updater knew about variants.
 
+- Shared device RTC lives in `rtc_pair.rs`: signed host-v2 admission owns
+  the peer; local registry attachments reuse the session protocol and own only
+  channels. Fence every effect by parent trust/binding and worker generation.
+  `session_ctl.rs` retains the controlling device's lease until explicit take
+  or session removal; `focus_view` only moves control within that device.
+  See `docs/DEVICE_CONNECTIONS.md` for the lifecycle and compatibility contract.
+
+`host_control::install` returns a `Lifetime` handle with only `is_retired` and
+`retire`. Pair retirement fences those handles before removal from the host
+map becomes observable, then performs asynchronous channel cleanup. The
+protected-content guard pins that narrow exported surface; it exposes no
+content or server publication capability.
+
 ## Before calling a change done
 
 ```bash
@@ -329,8 +351,40 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --features diagnostics -- -D warnings
 cargo test --locked
 cargo test --locked --features diagnostics
+cargo test --locked -p webrtc-sctp --lib stream::stream_test::
+cargo test --locked -p webrtc-ice --lib agent_transport_test::
 cargo build --locked --profile diagnostics --features diagnostics
 ```
+
+Upload admission tests coordinate async tasks with a Tokio barrier; blocking
+filesystem pauses use release guards so a failed assertion cannot strand a
+worker during runtime shutdown. The same-owner case runs on a single-thread
+executor and has a bounded completion deadline.
+
+The SCTP stream tests also run in Linux and Windows CI. `read_sctp` registers
+its notification waiter before checking shutdown or awaiting the reassembly
+queue lock: a remote reset uses `notify_waiters`, so registering afterward can
+lose the notification and strand a closed channel's reader. The regression
+holds that queue lock and resets the stream while the reader is waiting.
+
+ICE route recovery tests also run in Linux and Windows CI. Typed temporary
+network-unreachable errors drop the UDP datagram so SCTP can retransmit after
+ICE recovery; they must not close the shared association. Other IO errors
+and explicit connection closure still fail. The tests inject the route error
+and require the next datagram to reach a real receiver on the same connection.
+
+Stored channel handlers capture their channel weakly, including `on_open`
+handlers that may never fire. The vendored WebRTC registry prunes closed
+channels on each local or remote admission, preserving cumulative close stats
+and bounded stream-ID reservations rather than reusing IDs before SCTP reset
+completes. Native daemon tests exercise 256 host consumers on one live parent
+and require all consumer state to be released after parent close.
+
+Set `SPAWND_RTC_TEST_TRACE=1` to capture WebRTC/SCTP diagnostics in the shared
+session lifecycle regression. On a failed unknown-session refusal, the test
+also reports both peers' channel states without changing its deadline.
+Windows CI repeats this regression twenty times after the full suite to expose
+intermittent channel-close failures without enabling timing-altering trace logs.
 
 Native Windows CI additionally gates every binary, test/example target, and
 cfg-specific lint path:

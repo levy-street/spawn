@@ -59,6 +59,7 @@ jest.mock("@/terminal/transport/session-transport", () => ({
 
 jest.mock("@/terminal/transport/host-transport", () => ({
   createHostTransport: jest.fn(() => mockHostTransport),
+  createHostConsumerTransport: jest.fn(() => mockHostTransport),
 }));
 
 jest.mock("@/theme", () => {

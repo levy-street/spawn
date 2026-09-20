@@ -23,6 +23,7 @@
     historyReady: false,
   };
   const session = {
+    generation: 0,
     ready: false,
     bootstrapStarted: false,
     bootstrapCount: 0,
@@ -48,6 +49,7 @@
   api.sessionReady = () => session.ready;
 
   function resetGates() {
+    session.generation += 1;
     for (const key of Object.keys(gates)) gates[key] = false;
     session.ready = false;
     session.bootstrapStarted = false;
@@ -191,7 +193,9 @@
     if (session.writeInFlight || session.writeBytes === 0 || session.stale || !state.term) return;
     session.writeInFlight = true;
     const wasAtBottom = api.scrollState().atBottom;
+    const generation = session.generation;
     state.term.write(takeWriteBatch(), () => {
+      if (generation !== session.generation) return;
       session.writeInFlight = false;
       if (state.follow && wasAtBottom) state.term.scrollToBottom();
       api.emitScroll();
@@ -200,10 +204,11 @@
   }
 
   api.receivePty = (value) => {
+    const generation = session.generation;
     session.ptyTail = session.ptyTail
       .then(async () => {
         const bytes = await api.bytesFromMessage(value);
-        if (!bytes) return;
+        if (!bytes || generation !== session.generation) return;
         session.ptyOffset += bytes.byteLength;
         const entry = { bytes, offsetAfter: session.ptyOffset };
         if (!session.ready) {
@@ -218,7 +223,13 @@
           enqueueWrite(bytes);
         }
       })
-      .catch((error) => api.error("pty_decode", error.message, true));
+      .catch((error) => {
+        if (generation === session.generation) {
+          api.error("pty_decode", error.message, true);
+          api.failSessionChannel?.();
+        }
+      });
+    return session.ptyTail;
   };
 
   function uuidBytes(value) {
@@ -287,6 +298,7 @@
     history.rendering = true;
     if (history.operation === "snapshot") state.term.reset();
     const finish = () => {
+      if (session.history !== history) return;
       let barrier = Number.isSafeInteger(anchor) ? anchor : null;
       for (const entry of session.preboot) {
         if (barrier !== null && entry.offsetAfter <= barrier) {
@@ -319,14 +331,21 @@
     // is exactly what goes missing. History first, then scroll what it
     // occupies up into scrollback, then the screen on a clean viewport.
     const storied = parseStoriedReplay(replay);
-    const writeReplay = storied
+    const renderReplay = storied
       ? () =>
-          state.term.write(storied.history, () =>
-            state.term.write(flushViewportIntoScrollback(), () =>
-              state.term.write(storied.screen, finish),
-            ),
+          state.term.write(
+            storied.history,
+            () =>
+              session.history === history &&
+              state.term.write(
+                flushViewportIntoScrollback(),
+                () => session.history === history && state.term.write(storied.screen, finish),
+              ),
           )
       : () => state.term.write(replay, finish);
+    const writeReplay = () => {
+      if (session.history === history) renderReplay();
+    };
     if (history.operation === "history" && session.bootstrapCount > 0) {
       // Restore the character sets, margins, origin mode and autowrap before
       // clearing: the previous screen's tail sets the app's scroll region and
@@ -615,7 +634,7 @@
     return false;
   }
 
-  function receiveCtlValue(value) {
+  function receiveCtlValue(value, generation) {
     if (typeof value === "string") {
       if (new TextEncoder().encode(value).byteLength > 16 * 1024) return;
       let message;
@@ -638,7 +657,7 @@
       return;
     }
     return api.bytesFromMessage(value).then((bytes) => {
-      if (bytes) {
+      if (bytes && generation === session.generation) {
         const frame = decodeSpct(bytes);
         if (frame) acceptReplayChunk(frame);
       }
@@ -646,9 +665,16 @@
   }
 
   api.receiveSessionCtl = (value) => {
+    const generation = session.generation;
     session.ctlTail = session.ctlTail
-      .then(() => receiveCtlValue(value))
-      .catch((error) => api.error("ctl_decode", error.message, true));
+      .then(() => generation === session.generation && receiveCtlValue(value, generation))
+      .catch((error) => {
+        if (generation === session.generation) {
+          api.error("ctl_decode", error.message, true);
+          api.failSessionChannel?.();
+        }
+      });
+    return session.ctlTail;
   };
 
   api.sendResize = (cols, rows) => {
@@ -667,21 +693,13 @@
    * the PTY and redraws, so the next frame is rendered for this screen instead
    * of whatever desk the session was last read from.
    */
-  api.takeDisplayControl = () => {
-    if (!state.term) return false;
-    session.claiming = true;
-    state.displayOwner = true;
-    state.displayGeometry = null;
-    try {
-      api.fitTerminal();
-    } finally {
-      session.claiming = false;
-    }
-    return sendCtlText(crypto.randomUUID(), "take_control", {
-      cols: state.cols,
-      rows: state.rows,
-    });
-  };
+  function requestDisplayControl(operation) {
+    if (!session.ready || !state.term) return false;
+    const dimensions = api.preferredTerminalSize?.() ?? { cols: state.cols, rows: state.rows };
+    return sendCtlText(crypto.randomUUID(), operation, dimensions);
+  }
+  api.takeDisplayControl = () => requestDisplayControl("take_control");
+  api.focusDisplayView = () => requestDisplayControl("focus_view");
 
   function handleDisplayState(message) {
     const owner = message.owner === true;
@@ -700,16 +718,6 @@
     // A frame that lands before the grid exists is recorded but not acted on,
     // so the claim below still happens off the first frame that can carry it.
     if (!state.term) return;
-    // Opening a terminal claims the display, matching the web client. Only off
-    // the first frame, though: reacting to later ownership changes would have
-    // two open viewers steal control from each other forever. A follower re-takes
-    // it deliberately, from the banner.
-    const first = !session.displaySeen;
-    session.displaySeen = true;
-    if (!owner && first) {
-      api.takeDisplayControl();
-      return;
-    }
     api.fitTerminal();
   }
 
@@ -733,8 +741,8 @@
   api.requestReplay = requestReplay;
 
   function waitForBufferedAmount() {
-    if (!state.ctl || state.ctl.bufferedAmount <= 256 * 1024) return Promise.resolve();
-    state.ctl.bufferedAmountLowThreshold = 128 * 1024;
+    if (!state.ctl || state.ctl.bufferedAmount <= 128 * 1024) return Promise.resolve();
+    state.ctl.bufferedAmountLowThreshold = 64 * 1024;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error("Upload channel remained backpressured.")),
@@ -848,7 +856,19 @@
     ) {
       throw new Error("Upload bridge chunk length or final flag mismatch.");
     }
-    await waitForBufferedAmount();
+    const generation = session.generation;
+    const channel = state.ctl;
+    const isCurrent = () =>
+      generation === session.generation &&
+      channel === state.ctl &&
+      session.uploads.get(upload.uploadId) === upload;
+    try {
+      await waitForBufferedAmount();
+    } catch (error) {
+      if (!isCurrent()) return;
+      throw error;
+    }
+    if (!isCurrent()) return;
     const frame = encodeUploadChunk(upload.uploadId, message.sequence, message.last, payload);
     if (!frame || !state.ctl || state.ctl.readyState !== "open")
       throw new Error("Upload channel closed.");

@@ -18,7 +18,7 @@ An envelope is one JSON object containing exactly these fields:
 | `sender_identity_public_key` | canonical 43-character Ed25519 public-key wire value |
 | `intended_peer_identity_public_key` | canonical 43-character Ed25519 public-key wire value |
 | `protocol` | `spawn.pty` for an agent scope or `spawn.host.ctl` for a host scope |
-| `protocol_version` | exact `2` for `spawn.pty`; exact `1` for `spawn.host.ctl` |
+| `protocol_version` | exact `2` for `spawn.pty`; `1` for legacy host control or `2` for the shared device connection on `spawn.host.ctl` |
 | `session_id` | exact 36-character lowercase-hyphenated canonical UUID transcript text |
 | `scope_type` | `agent` or `host` |
 | `scope_id` | exact 36-character lowercase-hyphenated canonical UUID transcript text |
@@ -28,7 +28,7 @@ An envelope is one JSON object containing exactly these fields:
 
 An offer is browser-signed and an answer is daemon-signed. Protocol, scope, and
 protocol version must follow the exact current mapping above. A correctly
-signed agent version 1 or host version 2 envelope is still invalid. Unknown,
+signed agent version 1 or host version 3 envelope is still invalid. Host version 2 requires signed signaling and multiplexes locally authorized session channels. Unknown,
 missing, duplicate, or additional fields; non-integral or out-of-range
 versions; mismatched kind/role or protocol/scope/version tuples; malformed
 keys/signatures; and over-bound input are rejected. Parsers cap the complete

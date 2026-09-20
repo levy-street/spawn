@@ -104,6 +104,13 @@ from the catalogue. Every claim about spawnd survives a diff against
   anything, so the product runs as "SPAWN D on Mac" — the device that
   possessed the computer — and never as a second device of its own.
 
+- Device transport: `DaemonConnectionsProvider` owns one signed host connection
+  per registered device and host. Identity replacement retires its connections.
+  `lib/daemon-connection.ts` shares it across tabs with
+  Web Locks and BroadcastChannel; terminal hooks and host/file consumers own
+  channels only. Never create a peer or signaling websocket in a terminal.
+  Read `docs/DEVICE_CONNECTIONS.md` before changing attachment or control rules.
+
 ## Before calling a change done
 
 ```bash
@@ -114,6 +121,8 @@ npm run test:e2e              # Playwright, when the change warrants it
 
 An end-to-end test that starts another Next server gives it its own disposable
 `SPAWN_NEXT_DIST_DIR`. Sharing `.next` overwrites the running suite's build.
+Use `SPAWN_NEXT_TSCONFIG_PATH` with a disposable config copy as well, so Next's
+generated type paths never rewrite the tracked `tsconfig.json`.
 
 ## Keeping this file true
 

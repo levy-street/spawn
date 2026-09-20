@@ -1,5 +1,13 @@
 import * as Clipboard from "expo-clipboard";
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useSyncExternalStore,
+} from "react";
 import {
   AppState,
   Image,
@@ -11,6 +19,7 @@ import {
 import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import { createKeyboardFitGate } from "@/components/terminal-ui/keyboard-fit-gate";
 import { subscribeRetirementReason } from "@/data/realtime/lifecycle";
+import { deviceIdentityGeneration, subscribeDeviceIdentityAccount } from "@/lib/crypto/identity";
 import {
   BridgeProtocolError,
   TERMINAL_BRIDGE_VERSION,
@@ -71,14 +80,23 @@ interface SelectionWaiter {
 }
 
 export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
+  function TerminalSurface(props, ref) {
+    const generation = useSyncExternalStore(
+      subscribeDeviceIdentityAccount,
+      deviceIdentityGeneration,
+      deviceIdentityGeneration,
+    );
+    return <TerminalSurfaceInstance key={generation} {...props} ref={ref} />;
+  },
+);
+
+const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
   function TerminalSurface(
     {
       sessionId,
       hostIdentityPublicKey,
       initialSize,
       fontSize,
-      forceRelay,
-      openSignal,
       hostId,
       style,
       onTransport,
@@ -139,19 +157,15 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
           theme: initialTheme.current,
           bridge,
           ...(fontSize === undefined ? {} : { fontSize }),
-          ...(forceRelay === undefined ? {} : { forceRelay }),
-          ...(openSignal === undefined ? {} : { openSignal }),
           ...(hostId === undefined ? {} : { hostId }),
         }),
       [
         bridge,
         fontSize,
-        forceRelay,
         hostId,
         hostIdentityPublicKey,
         initialSize.cols,
         initialSize.rows,
-        openSignal,
         sessionId,
       ],
     );
@@ -228,27 +242,38 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
 
     useEffect(() => {
       let backgroundTimer: ReturnType<typeof setTimeout> | null = null;
+      let backgroundDeadline: number | null = null;
+      const retireBackground = () => {
+        if (backgroundDeadline === null || Date.now() < backgroundDeadline) return;
+        backgroundDeadline = null;
+        backgroundTimer = null;
+        retiredForBackground.current = true;
+        transport.close();
+      };
       const subscription = AppState.addEventListener("change", (nextState) => {
         if (nextState === "inactive") return;
         if (nextState === "background") {
-          if (!workerLoaded.current || backgroundTimer !== null) return;
-          backgroundTimer = setTimeout(() => {
-            backgroundTimer = null;
-            retiredForBackground.current = true;
-            transport.close();
-          }, 3_000);
+          if (!workerLoaded.current || backgroundDeadline !== null || retiredForBackground.current)
+            return;
+          backgroundDeadline = Date.now() + 3_000;
+          backgroundTimer = setTimeout(retireBackground, 3_000);
           return;
         }
         if (backgroundTimer !== null) {
           clearTimeout(backgroundTimer);
           backgroundTimer = null;
         }
+        // Native runtimes can pause timers in the background. Retire an expired
+        // connection before foreground reopening even if its timer never ran.
+        if (backgroundDeadline !== null && Date.now() >= backgroundDeadline) retireBackground();
+        backgroundDeadline = null;
         if (!retiredForBackground.current || !workerLoaded.current) return;
         retiredForBackground.current = false;
         openTransport();
       });
       return () => {
         if (backgroundTimer !== null) clearTimeout(backgroundTimer);
+        backgroundDeadline = null;
         subscription.remove();
       };
     }, [openTransport, transport]);

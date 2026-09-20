@@ -87,3 +87,20 @@ describe("a terminal blocked on this device's approval", () => {
     expect(screen.queryByText("Approve this device")).toBeNull();
   });
 });
+
+test("shared host reconnect leaves copying available and keeps Retry at host level", async () => {
+  await render(
+    <ThemeProvider>
+      <ConnectionStateOverlay
+        hasEverBeenReady
+        sharedConnectionUnavailable
+        onRetry={jest.fn()}
+        state="failed"
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByText("Connection paused")).toBeOnTheScreen();
+  expect(screen.getByText("Your terminal output is still available to copy.")).toBeOnTheScreen();
+  expect(screen.queryByText("Retry")).toBeNull();
+  expect(screen.getByTestId("connection-state-failed").props["pointerEvents"]).toBe("none");
+});

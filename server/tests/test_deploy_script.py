@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -144,6 +147,10 @@ set -euo pipefail
 while [[ "${{1:-}}" == "-o" ]]; do shift 2; done
 printf '%s\\n' "$1" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-host.log"
 printf '%s\\n' "$2" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-command.log"
+if [[ -n "${{SPAWN_TEST_ADVANCE_CHECKOUT:-}}" && ! -f "$SPAWN_DEPLOY_TEST_LOG_DIR/branch-advanced" ]]; then
+  git -C "$SPAWN_TEST_ADVANCE_CHECKOUT" push origin master
+  touch "$SPAWN_DEPLOY_TEST_LOG_DIR/branch-advanced"
+fi
 script="$SPAWN_DEPLOY_TEST_LOG_DIR/remote-script.sh"
 cat > "$script"
 HOME={str(remote_home)!r} bash -lc "export PATH={str(remote_home / '.local' / 'bin')!r}:\\$PATH; $2" < "$script"
@@ -166,6 +173,18 @@ printf '%s\\n' "$*" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/gh.log"
 exit 1
 """,
     )
+    # Existing deploy cases isolate the prevalidated acceptance result, just as
+    # SSH/HTTP are isolated here. The real validator's malformed/stale/skipped
+    # evidence cases live in scripts/test-release-acceptance.py.
+    _write_executable(
+        fakebin / "python3",
+        "#!/usr/bin/env bash\n"
+        'if [[ "${1:-}" == */scripts/check-release-acceptance.py ]]; then\n'
+        '  printf "%s\\n" "$*" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/acceptance.log"\n'
+        '  exit "${SPAWN_TEST_REJECT_ACCEPTANCE:-0}"\n'
+        "fi\n"
+        f'exec {shutil.which("python3")!r} "$@"\n',
+    )
     return fakebin
 
 
@@ -174,10 +193,18 @@ def _deploy_env(tmp_path: Path, fakebin: Path, remote: Path, **overrides: str) -
     # The deploy refuses an inherited SPAWN_API_PROXY_TARGET by design; a dev
     # shell running this suite must not trip every test into that refusal.
     env.pop("SPAWN_API_PROXY_TARGET", None)
+    acceptance = tmp_path / "acceptance.json"
+    acceptance.write_text(
+        json.dumps({
+            "fixture": "prevalidated acceptance",
+            "baseline_commit": _git(["rev-parse", "HEAD"], remote).stdout.strip(),
+        }) + "\n"
+    )
     env.update(
         {
             "PATH": f"{fakebin}:{env['PATH']}",
             "SPAWN_DEPLOY_TEST_LOG_DIR": str(tmp_path / "logs"),
+            "SPAWN_RELEASE_ACCEPTANCE": str(acceptance),
             "SPAWN_DEPLOY_PATH": str(remote),
             "SPAWN_DEPLOY_SUDO": "",
             # Prebuilt publishing pulls a real GitHub release and scp's to the
@@ -528,3 +555,185 @@ def test_deploy_allows_non_master_branch_with_explicit_flag(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert "SPAWN_DEPLOY_BRANCH=feat/side" in _log(tmp_path, "ssh-command.log")
+
+
+@pytest.mark.parametrize("allow_branch", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_deploy_acceptance_refusal_precedes_any_ssh_even_with_overrides(
+    tmp_path: Path, allow_branch: bool, missing: bool
+):
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    if allow_branch:
+        _push_side_branch(local)
+    env = _deploy_env(tmp_path, fakebin, remote, SPAWN_TEST_REJECT_ACCEPTANCE="1")
+    if missing:
+        env.pop("SPAWN_RELEASE_ACCEPTANCE")
+    args = [str(DEPLOY_SCRIPT), "prod"] + (["--allow-branch"] if allow_branch else [])
+    result = _run(args, local, env=env)
+    assert result.returncode != 0
+    assert "acceptance evidence" in result.stderr
+    assert _log(tmp_path, "ssh-host.log") == ""
+    assert _log(tmp_path, "scp.log") == ""
+    assert _log(tmp_path, "systemctl.log") == ""
+
+
+def test_deploy_refuses_branch_advance_after_local_acceptance_validation(tmp_path: Path):
+    origin, local, remote = _init_repo(tmp_path)
+    original = _git(["rev-parse", "HEAD"], remote).stdout.strip()
+    writer = tmp_path / "concurrent-writer"
+    assert _run(["git", "clone", str(origin), str(writer)], tmp_path).returncode == 0
+    _git(["config", "user.name", "Concurrent writer"], writer)
+    _git(["config", "user.email", "writer@example.com"], writer)
+    (writer / "README.md").write_text("not accepted yet\n")
+    _git(["commit", "-am", "unvalidated concurrent commit"], writer)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(tmp_path, fakebin, remote, SPAWN_TEST_ADVANCE_CHECKOUT=str(writer))
+    result = _deploy(local, env)
+    assert result.returncode != 0
+    assert "remote branch moved after acceptance validation" in result.stderr
+    assert _git(["rev-parse", "HEAD"], remote).stdout.strip() == original
+    assert _log(tmp_path, "systemctl.log") == ""
+    assert f"--candidate {original}" in _log(tmp_path, "acceptance.log")
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_deploy_rechecks_public_baseline_after_preparation(tmp_path: Path, resume: bool):
+    _origin, local, remote = _init_repo(tmp_path)
+    baseline = _git(["rev-parse", "HEAD"], local).stdout.strip()
+    (local / "README.md").write_text("concurrent release\n")
+    _git(["commit", "-am", "other release"], local)
+    advanced = _git(["rev-parse", "HEAD"], local).stdout.strip()
+    (local / "README.md").write_text("accepted candidate\n")
+    _git(["commit", "-am", "candidate"], local)
+    _git(["push", "origin", "master"], local)
+    candidate = _git(["rev-parse", "HEAD"], local).stdout.strip()
+    tree = _git(["rev-parse", f"{baseline}:daemon"], local).stdout.strip()
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(tmp_path, fakebin, remote)
+    public = tmp_path / "public-release.json"
+    public.write_text(
+        json.dumps({"server": {"commit": baseline, "dirty": False}, "daemon": {"tree": tree}})
+    )
+    advanced_public = tmp_path / "advanced-release.json"
+    advanced_public.write_text(
+        json.dumps({"server": {"commit": advanced, "dirty": False}, "daemon": {"tree": tree}})
+    )
+
+    # Run the real validator. Only its public HTTP response is replaced; stale
+    # evidence must fail because the production baseline changed, not because
+    # a test stub decides that the second invocation should return an error.
+    validator = tmp_path / "validator-driver.py"
+    validator.write_text(
+        "import importlib.util, io, json, os, sys\n"
+        "from pathlib import Path\n"
+        "spec = importlib.util.spec_from_file_location('gate', sys.argv[1])\n"
+        "gate = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(gate)\n"
+        "gate.ROOT = Path(os.environ['SPAWN_TEST_GATE_ROOT'])\n"
+        "def public(url, **kwargs):\n"
+        "    assert url == 'https://spawnd.dev/api/release', url\n"
+        "    data = Path(os.environ['SPAWN_TEST_PUBLIC_RELEASE']).read_bytes()\n"
+        "    with open(os.environ['SPAWN_DEPLOY_TEST_LOG_DIR'] + '/baseline.log', 'a') as log:\n"
+        "        log.write(json.loads(data)['server']['commit'] + '\\n')\n"
+        "    return io.BytesIO(data)\n"
+        "gate.urllib.request.urlopen = public\n"
+        "sys.argv = sys.argv[1:]\n"
+        "gate.main()\n"
+    )
+    python = shlex.quote(shutil.which("python3"))
+    _write_executable(
+        fakebin / "python3",
+        "#!/usr/bin/env bash\n"
+        'if [[ "${1:-}" == */scripts/check-release-acceptance.py ]]; then\n'
+        f'  exec {python} {shlex.quote(str(validator))} "$@"\n'
+        "fi\n"
+        f'exec {python} "$@"\n',
+    )
+    env.update(SPAWN_TEST_GATE_ROOT=str(local), SPAWN_TEST_PUBLIC_RELEASE=str(public))
+    reports = {}
+    native_cases = (
+        "shared_transport",
+        "background_short",
+        "background_retire",
+        "process_restart",
+        "relay_udp_outage",
+        "relay_udp_loss",
+        "upload_interruption",
+        "identity_retirement",
+    )
+    for name, kind, cases in (
+        ("ios", "native_simulator", native_cases),
+        ("android", "native_emulator", native_cases),
+        (
+            "canary",
+            "isolated_canary",
+            (
+                "baseline_holdback",
+                "candidate_soak",
+                "update_recovery",
+                "startup_rollback",
+            ),
+        ),
+    ):
+        reports[name] = {
+            "schema_version": 1,
+            "candidate_commit": candidate,
+            "baseline_commit": baseline,
+            "status": "passed",
+            "evidence_kind": kind,
+            "platform": name,
+            "physical_device": False,
+            "source_clean": True,
+            "cleanup_passed": True,
+            "cleanup_complete": True,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "completed_at": "2026-01-01T00:10:00+00:00",
+            "cases": [
+                {"id": case, "status": "passed", "metrics": {"soak_seconds": 120, "samples": 5}}
+                for case in cases
+            ],
+        }
+    Path(env["SPAWN_RELEASE_ACCEPTANCE"]).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "candidate_commit": candidate,
+                "baseline_commit": baseline,
+                "status": "passed",
+                "reports": reports,
+            }
+        )
+    )
+
+    # Another release finishes during staging. The target ref does not move,
+    # so the existing target-commit guard alone cannot detect this change.
+    ssh = fakebin / "ssh"
+    marker = 'script="$SPAWN_DEPLOY_TEST_LOG_DIR/remote-script.sh"'
+    advance = (
+        'if [[ "$2" == "cat > "* && ! -f "$SPAWN_DEPLOY_TEST_LOG_DIR/baseline-advanced" ]]; then\n'
+        f"  git -C {shlex.quote(str(remote))} fetch origin master\n"
+        f"  git -C {shlex.quote(str(remote))} checkout -B master {advanced}\n"
+        f"  cp {shlex.quote(str(advanced_public))} {shlex.quote(str(public))}\n"
+        '  touch "$SPAWN_DEPLOY_TEST_LOG_DIR/baseline-advanced"\n'
+        "fi\n"
+    )
+    ssh.write_text(ssh.read_text().replace(marker, advance + marker))
+    result = _run([str(DEPLOY_SCRIPT), "prod", *(["--resume"] if resume else [])], local, env=env)
+    assert result.returncode != 0
+    assert "production does not match the acceptance baseline" in result.stderr
+    assert "baseline advanced during preparation" in result.stderr
+    assert _log(tmp_path, "baseline.log").splitlines() == [baseline, advanced]
+    assert _git(["rev-parse", "HEAD"], remote).stdout.strip() == advanced
+    assert _log(tmp_path, "systemctl.log") == ""
+    # The only remote write from the refused deploy was its staged temp script.
+    commands = _log(tmp_path, "ssh-command.log").splitlines()
+    staged = next(
+        command.removeprefix("cat > ").strip("'")
+        for command in commands
+        if command.startswith("cat > ")
+    )
+    assert not Path(staged).exists()

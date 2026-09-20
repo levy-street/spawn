@@ -92,6 +92,7 @@ export interface ConnectionStateOverlayProps {
   state: TransportState;
   error?: TransportError | null;
   hasEverBeenReady: boolean;
+  sharedConnectionUnavailable?: boolean;
   onRetry: () => void;
   /** Offered only for a trust failure, where retrying cannot help on its own. */
   onDeviceTrust?: () => void;
@@ -111,6 +112,7 @@ export function ConnectionStateOverlay({
   state,
   error,
   hasEverBeenReady,
+  sharedConnectionUnavailable = false,
   onRetry,
   onDeviceTrust,
   awaitingApproval = false,
@@ -121,9 +123,11 @@ export function ConnectionStateOverlay({
   const untrusted = error?.code === DEVICE_NOT_TRUSTED_CODE || awaitingApproval;
   const retryable = state === "failed" || state === "closed" || error?.retryable === true;
   const compact = hasEverBeenReady;
+  const paused = compact && sharedConnectionUnavailable && !untrusted;
 
   return (
     <View
+      pointerEvents={paused ? "none" : "auto"}
       accessibilityLiveRegion="polite"
       accessibilityRole={state === "failed" ? "alert" : "summary"}
       style={[
@@ -151,15 +155,19 @@ export function ConnectionStateOverlay({
       >
         {compact ? <CompactStateGlyph busy={copy.busy} state={state} /> : null}
         <View style={[styles.copy, { alignItems: compact ? "flex-start" : "center" }]}>
-          <Text variant="label">{awaitingApproval ? "Waiting for approval" : copy.title}</Text>
+          <Text variant="label">
+            {paused ? "Connection paused" : awaitingApproval ? "Waiting for approval" : copy.title}
+          </Text>
           <Text
             color="mutedForeground"
             style={compact ? undefined : styles.centeredCopy}
             variant="caption"
           >
-            {awaitingApproval
-              ? "This host has not approved this device yet. It reconnects on its own the moment it does."
-              : (error?.message ?? copy.detail)}
+            {paused
+              ? "Your terminal output is still available to copy."
+              : awaitingApproval
+                ? "This host has not approved this device yet. It reconnects on its own the moment it does."
+                : (error?.message ?? copy.detail)}
           </Text>
         </View>
       </View>
@@ -169,7 +177,7 @@ export function ConnectionStateOverlay({
             Approve this device
           </Button>
         ) : null}
-        {retryable ? (
+        {retryable && !sharedConnectionUnavailable ? (
           <Button onPress={onRetry} size="sm" variant="outline">
             Retry
           </Button>

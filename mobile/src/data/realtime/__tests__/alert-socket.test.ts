@@ -1,7 +1,14 @@
 import { ALERT_PROTOCOL, AlertSocketClient, parseAlertFrame } from "@/data/realtime/alert-socket";
 
 jest.mock("@/data/api/auth-token", () => ({
-  authToken: { get: jest.fn(async () => "secret-token") },
+  authToken: {
+    snapshot: jest.fn(async () => ({
+      baseUrl: "https://spawn.test",
+      token: "secret-token",
+      revision: 0,
+      identity: 0,
+    })),
+  },
 }));
 
 class FakeWebSocket {

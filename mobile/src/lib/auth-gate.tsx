@@ -11,6 +11,7 @@ import { authToken } from "@/data/api/auth-token";
 import { ApiError, subscribeUnauthenticated } from "@/data/api/client";
 import { useAuthConfigQuery, useAuthHostsQuery, useMeQuery } from "@/data/queries/auth";
 import { clearDeviceIdentityAccount, setDeviceIdentityAccount } from "@/lib/crypto/identity";
+import { DaemonConnections } from "@/terminal/DaemonConnections";
 import { spacing, useTheme } from "@/theme";
 
 export const AUTH_GATE_DESTINATIONS = {
@@ -412,6 +413,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
   return (
     <AuthenticatedAccountContext.Provider value={{ accountId, ready: accountReady }}>
       <View style={styles.root}>
+        {accountReady && accountId !== null && (
+          <DaemonConnections key={accountId} accountId={accountId} />
+        )}
         {children}
         {bootstrap.status === "error" ? (
           <View style={[styles.overlay, { backgroundColor: theme.colors.background }]}>

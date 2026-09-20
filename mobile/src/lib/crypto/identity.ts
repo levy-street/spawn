@@ -39,6 +39,18 @@ interface StoredIdentityV1 {
 }
 
 let activeAccountId: string | null = null;
+let identityGeneration = 0;
+const accountListeners = new Set<() => void>();
+
+/** A replaced signing key requires fresh workers even within the same account. */
+export function deviceIdentityGeneration(): number {
+  return identityGeneration;
+}
+
+export function subscribeDeviceIdentityAccount(listener: () => void): () => void {
+  accountListeners.add(listener);
+  return () => accountListeners.delete(listener);
+}
 let identityLock: Promise<void> = Promise.resolve();
 const resetHandlers = new Set<(accountId: string) => Promise<void>>();
 
@@ -61,11 +73,18 @@ export function deviceRegistrationStorageKey(accountId: string): string {
 }
 
 export function setDeviceIdentityAccount(accountId: string): void {
-  activeAccountId = parseCanonicalUuid(accountId);
+  const next = parseCanonicalUuid(accountId);
+  if (next === activeAccountId) return;
+  activeAccountId = next;
+  identityGeneration++;
+  for (const listener of accountListeners) listener();
 }
 
 export function clearDeviceIdentityAccount(): void {
+  if (activeAccountId === null) return;
   activeAccountId = null;
+  identityGeneration++;
+  for (const listener of accountListeners) listener();
 }
 
 /** The account the identity is currently bound to, or null when signed out. */
@@ -315,7 +334,9 @@ export const deviceIdentity = {
           "Device identity could not be reset completely",
         );
       }
-      activeAccountId = null;
+      if (activeAccountId === accountId) {
+        clearDeviceIdentityAccount();
+      }
     });
   },
 };

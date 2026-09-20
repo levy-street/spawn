@@ -85,6 +85,7 @@ test.beforeAll(async () => {
         // Two dev servers sharing .next overwrite each other's manifests and
         // compiled routes, leaving the rest of the suite in a refresh loop.
         SPAWN_NEXT_DIST_DIR: ".next",
+        SPAWN_NEXT_TSCONFIG_PATH: "tsconfig.json",
       },
       stdio: ["ignore", log, log],
     },

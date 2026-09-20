@@ -38,6 +38,9 @@ const nextConfig: NextConfig = {
   // out. Unset at runtime, so a started server always reads .next — the swap
   // renames the staged build into place.
   distDir: process.env.SPAWN_NEXT_DIST_DIR || ".next",
+  // A disposable smoke build must not let Next rewrite the tracked tsconfig
+  // when it adds the build's generated type paths.
+  typescript: { tsconfigPath: process.env.SPAWN_NEXT_TSCONFIG_PATH || "tsconfig.json" },
   // Keep Next rooted in this workspace even when a parent directory contains
   // an unrelated npm lockfile.
   outputFileTracingRoot: path.resolve(process.cwd()),

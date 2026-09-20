@@ -262,6 +262,31 @@ struct Context {
     shutdown: CancellationToken,
 }
 
+/// Effect permission is retired synchronously, before asynchronous channel
+/// cleanup. Shared peers keep weak handles so closing one consumer stays local.
+pub(crate) struct Lifetime {
+    publications: Arc<PublicationFence>,
+    status_publication_fence: Arc<StdMutex<()>>,
+    closed: Arc<AtomicBool>,
+    shutdown: CancellationToken,
+}
+
+impl Lifetime {
+    pub(crate) fn is_retired(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn retire(&self) {
+        let _publication = self
+            .status_publication_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closed.store(true, Ordering::Release);
+        self.publications.close();
+        self.shutdown.cancel();
+    }
+}
+
 impl Context {
     async fn spawn_session_task<F>(&self, task: F) -> bool
     where
@@ -418,6 +443,9 @@ impl Context {
     }
 
     async fn handle_normal(&self, frame: QueuedFrame) -> bool {
+        if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return false;
+        }
         let QueuedFrame {
             arrival_order,
             value,
@@ -437,6 +465,9 @@ impl Context {
     }
 
     async fn handle_fast(&self, frame: QueuedFrame) -> bool {
+        if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return false;
+        }
         let QueuedFrame {
             arrival_order,
             value,
@@ -1886,14 +1917,21 @@ pub(crate) fn install(
     dc: Arc<RTCDataChannel>,
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
-) {
-    let message_dc = Arc::clone(&dc);
+) -> Arc<Lifetime> {
+    // Stored handlers must not own their channel: close does not clear them.
+    let message_dc = Arc::downgrade(&dc);
     let context_slot = Arc::new(Mutex::new(None::<Context>));
     let publications = Arc::new(PublicationFence::default());
     let status_publication_fence = Arc::new(StdMutex::new(()));
     let shutdown = CancellationToken::new();
     let context_shutdown = shutdown.child_token();
     let closed = Arc::new(AtomicBool::new(false));
+    let lifetime = Arc::new(Lifetime {
+        publications: Arc::clone(&publications),
+        status_publication_fence: Arc::clone(&status_publication_fence),
+        closed: Arc::clone(&closed),
+        shutdown: shutdown.clone(),
+    });
     let arrivals = Arc::new(StdMutex::new(ArrivalArbiter::default()));
     let (normal_tx, normal_rx) = mpsc::channel::<QueuedFrame>(MAX_NORMAL_QUEUE);
     let (fast_tx, fast_rx) = mpsc::channel::<QueuedFrame>(MAX_FAST_QUEUE);
@@ -1903,12 +1941,13 @@ pub(crate) fn install(
     let message_arrivals = Arc::clone(&arrivals);
     let message_closed = Arc::clone(&closed);
     dc.on_message(Box::new(move |message: DataChannelMessage| {
-        let dc = Arc::clone(&message_dc);
+        let dc = message_dc.upgrade();
         let normal_tx = normal_tx.clone();
         let fast_tx = fast_tx.clone();
         let arrivals = Arc::clone(&message_arrivals);
         let closed = Arc::clone(&message_closed);
         Box::pin(async move {
+            let Some(dc) = dc else { return };
             if closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1950,7 +1989,7 @@ pub(crate) fn install(
         })
     }));
 
-    let open_dc = Arc::clone(&dc);
+    let open_dc = Arc::downgrade(&dc);
     let open_context = Arc::clone(&context_slot);
     let open_publications = Arc::clone(&publications);
     let open_status_publication_fence = Arc::clone(&status_publication_fence);
@@ -1960,7 +1999,7 @@ pub(crate) fn install(
     let open_normal_rx = Arc::clone(&normal_rx);
     let open_fast_rx = Arc::clone(&fast_rx);
     dc.on_open(Box::new(move || {
-        let dc = Arc::clone(&open_dc);
+        let dc = open_dc.upgrade();
         let context_slot = Arc::clone(&open_context);
         let publications = Arc::clone(&open_publications);
         let status_publication_fence = Arc::clone(&open_status_publication_fence);
@@ -1972,6 +2011,7 @@ pub(crate) fn install(
         let normal_rx = Arc::clone(&open_normal_rx);
         let fast_rx = Arc::clone(&open_fast_rx);
         Box::pin(async move {
+            let Some(dc) = dc else { return };
             let files = match files {
                 Some(files) => files,
                 None => match HostFileService::discover().await {
@@ -2098,6 +2138,7 @@ pub(crate) fn install(
             // so an old daemon on a Mac correctly offers nothing extra and a
             // future Linux daemon lights up with no client change.
             let mut capabilities = vec![
+                "session.transport.v1",
                 "ping",
                 "fs.home",
                 "fs.list",
@@ -2169,26 +2210,13 @@ pub(crate) fn install(
     }));
 
     let close_context = Arc::clone(&context_slot);
-    let close_publications = publications;
-    let close_status_publication_fence = status_publication_fence;
-    let close_shutdown = shutdown;
-    let close_closed = Arc::clone(&closed);
+    let close_lifetime = Arc::clone(&lifetime);
     dc.on_close(Box::new(move || {
         let context_slot = Arc::clone(&close_context);
-        let publications = Arc::clone(&close_publications);
-        let status_publication_fence = Arc::clone(&close_status_publication_fence);
-        let shutdown = close_shutdown.clone();
-        let closed = Arc::clone(&close_closed);
+        let lifetime = Arc::clone(&close_lifetime);
         Box::pin(async move {
             let deadline = tokio::time::Instant::now() + session_close_timeout();
-            {
-                let _publication = status_publication_fence
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                publications.close();
-                closed.store(true, Ordering::Release);
-                shutdown.cancel();
-            }
+            lifetime.retire();
             let context = match tokio::time::timeout_at(deadline, context_slot.lock()).await {
                 Ok(mut context_slot) => context_slot.take(),
                 Err(_) => None,
@@ -2198,6 +2226,7 @@ pub(crate) fn install(
             }
         })
     }));
+    lifetime
 }
 
 fn close_with_deadline_later(dc: Arc<RTCDataChannel>) {

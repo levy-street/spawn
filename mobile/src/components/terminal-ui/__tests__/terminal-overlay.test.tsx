@@ -372,7 +372,7 @@ describe("terminal overlay display control", () => {
     );
 
     expect(screen.getByTestId("terminal-display-control")).toBeTruthy();
-    expect(screen.getByText("Sized by another viewer · 120×40")).toBeTruthy();
+    expect(screen.getByText("Another view has control · 120×40")).toBeTruthy();
 
     await act(() => {
       fireEvent.press(screen.getByTestId("terminal-take-control"));

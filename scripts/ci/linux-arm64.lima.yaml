@@ -1,0 +1,55 @@
+# Dedicated VM: never reuse the operator's Colima instance or Docker context.
+minimumLimaVersion: "2.2.0"
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 6GiB
+disk: 12GiB
+images:
+  - location: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img
+    arch: aarch64
+    # Verified against Canonical's signed SHA256SUMS on 2026-09-13.
+    digest: sha256:2f0247f26207ac18a40df74fa8dc20f714f88330a333dd3df8bd3c7cf2c2b448
+mounts: []
+containerd:
+  system: false
+  user: false
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+portForwards:
+  - guestIP: 0.0.0.0
+    guestPortRange: [1, 65535]
+    proto: any
+    ignore: true
+rosetta:
+  enabled: false
+  binfmt: false
+user:
+  name: ci-vm-admin
+  uid: 1000
+  home: /home/ci-vm-admin
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      test "$(uname -m)" = aarch64
+      export DEBIAN_FRONTEND=noninteractive
+      if ! command -v docker >/dev/null; then
+        apt-get update
+        apt-get install -y --no-install-recommends docker.io
+        apt-get clean
+      fi
+      systemctl enable --now docker
+      # This is the VM operator, never the container's job identity.
+      usermod -aG docker ci-vm-admin
+probes:
+  - mode: readiness
+    description: Native ARM64 Docker daemon
+    script: |
+      #!/bin/bash
+      set -eu
+      test "$(uname -m)" = aarch64
+      sudo docker info | grep -q 'Architecture: aarch64'

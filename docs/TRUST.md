@@ -520,19 +520,21 @@ What moves where, and the regressions we accept:
   The daemon arbitrates multi-viewer display state; the REST and browser/server
   control-plane paths are removed so dimensions, scroll deltas, and viewport
   event timing do not become operator metadata.
-- **Multi-viewer / multi-device** → daemon fans out to N browser peers
-  directly. Cost: upstream bandwidth from residential hosts; realistic N
-  is small.
+- **Multi-viewer / multi-device** → one authenticated peer per device and
+  daemon, with separate terminal/control attachments for each view. Same-origin
+  browser tabs share their device's peer. Different devices retain separate
+  connections and require explicit takeover of another device's terminal
+  control. Cost: upstream output fanout; realistic N is small.
 - **File upload** → a bounded/chunked/cancellable `spawn.ctl` stream, bound to
   a fresh channel capability and exact session-worker generation. Stable upload
   UUIDs make bounded retries resumable/idempotent; exact length and SHA-256 are
   checked before an atomic no-clobber commit beneath the worker-retained cwd.
   Paths and detailed results remain endpoint-to-browser only. This also removes
   base64-over-JSON overhead and the server memory spike.
-- **Host filesystem operations** → a host-scoped browser↔daemon WebRTC
-  connection with a `spawn.host.ctl` DataChannel. It exists independently of
-  any session, because the file browser must work on a host with no running
-  session. The server authorizes the browser for the host and relays only
+- **Host filesystem operations** → consumer channels on the shared signed
+  host-v2 device connection (`spawn.host.ctl/<consumer UUID>`). The connection
+  exists independently of any session, so files work with no terminal open.
+  Legacy clients can still use the host-v1 connection. The server authorizes the browser for the host and relays only
   signaling/ICE; paths, entry names/sizes/mtimes, file bytes, and operation
   errors stay on the DataChannel. Cross-host transfer is browser-mediated
   between two such channels, so the control plane never buffers the file.

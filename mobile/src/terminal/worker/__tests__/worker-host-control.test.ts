@@ -36,8 +36,8 @@ describe("offline host-control worker", () => {
     );
   });
 
-  test("keeps host writes under the 256 KiB SCTP high-water mark", () => {
-    expect(TERMINAL_WORKER_HTML).toContain("const BUFFERED_HIGH_WATER = 256 * 1024");
+  test("keeps host writes under the 32 KiB SCTP high-water mark", () => {
+    expect(TERMINAL_WORKER_HTML).toContain("const BUFFERED_HIGH_WATER = 32 * 1024");
     expect(TERMINAL_WORKER_HTML).toContain("channel.bufferedAmount <= BUFFERED_HIGH_WATER");
     expect(TERMINAL_WORKER_HTML).toContain('"bufferedamountlow"');
     expect(TERMINAL_WORKER_HTML).toContain("const STREAM_TIMEOUT_MS = 60_000");
@@ -54,11 +54,11 @@ describe("offline host-control worker", () => {
       state: {
         ctl: {
           readyState: "open",
-          bufferedAmount: 256 * 1024 + 1,
+          bufferedAmount: 32 * 1024 + 1,
           bufferedAmountLowThreshold: 0,
           send,
-          addEventListener: jest.fn((_type: string, listener: () => void) => {
-            writable = listener;
+          addEventListener: jest.fn((type: string, listener: () => void) => {
+            if (type === "bufferedamountlow") writable = listener;
           }),
           removeEventListener: jest.fn(),
         },

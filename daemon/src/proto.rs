@@ -137,6 +137,7 @@ pub enum Outbound {
         /// while both paths validate, a hostile server picks the weaker one).
         /// Old servers ignore the unknown field.
         supports_account_chains: bool,
+        supports_device_connections: bool,
     },
     /// The keepalive, optionally carrying two meter readings. Buckets, never
     /// percentages: see `host_metrics` for why the server is given a coarse
@@ -727,6 +728,7 @@ mod daemon_update_wire_tests {
             existing_sessions: Vec::new(),
             spec: None,
             supports_account_chains: true,
+            supports_device_connections: true,
         })
         .unwrap();
         assert_eq!(value["type"], "register");
@@ -752,6 +754,7 @@ mod daemon_update_wire_tests {
             existing_sessions: Vec::new(),
             spec: None,
             supports_account_chains: true,
+            supports_device_connections: true,
         })
         .unwrap();
         assert!(without_tree.get("daemon_tree").is_none());

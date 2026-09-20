@@ -1,11 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import {
-  getBrowserHostPinRevision,
-  subscribeToBrowserHostPinChanges,
-} from "@/lib/browser-host-pins";
-import type { CarriedEndorsement } from "@/lib/hostControl";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DaemonChannel } from "@/lib/daemon-channel";
+import type { DaemonConnection } from "@/lib/daemon-connection";
 import {
   DirectSessionUploadError,
   decodeSessionCtlChunk,
@@ -21,8 +18,6 @@ import {
   SESSION_CTL_UPLOAD_BUFFER_HIGH_WATER,
   SESSION_CTL_UPLOAD_BUFFER_LOW_WATER,
   SESSION_CTL_UPLOAD_CHUNK_BYTES,
-  SESSION_PTY_INPUT_BUFFER_HIGH_WATER,
-  SESSION_PTY_INPUT_BUFFER_LOW_WATER,
   type SessionCtlOperation,
   SessionCtlRequestTracker,
   type SessionCtlResponse,
@@ -34,46 +29,22 @@ import {
   slicePtyChunkAfterAnchor,
   writeSessionPtyInput,
 } from "@/lib/session-ctl";
-import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
-import type { SignedRtcRefusalReason, SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
-import {
-  backoffDelay,
-  buildSessionWsUrl,
-  type DisplayControlState,
-  iceServersNeedRefresh,
-  notifySocketUnauthorized,
-  parseInbound,
-  RTC_LATCH_TIMEOUT_MS,
-  rtcBindingFrameMatches,
-  SIGNAL_SILENCE_SUSPECT_MS,
-  SPAWN_WS_SUBPROTOCOL,
-  sanitizeIceServers,
-  sessionRtcTuple,
-  socketCloseAction,
-  watchSuspendResume,
-} from "@/lib/ws";
+import type { SignedRtcRefusalReason } from "@/lib/signed-rtc-trust";
+import type { DisplayControlState } from "@/lib/ws";
 
 /**
- * Lifecycle hook for the per-session browser WS.
+ * Attach one terminal view to the app-owned daemon connection.
  *
- * Manages connect, reconnect (linear backoff up to 10s), and surface state
+ * Manages channel attachment, bounded retry, replay, and surface state
  * via callbacks.  The caller is responsible for actually wiring `onData` to
  * the xterm.js instance (we keep this hook framework-agnostic so it could
  * also maintain local replay state).
  */
 export interface UseSessionSocketOptions {
+  connection?: DaemonConnection | null;
   sessionId: string;
+  sessionStatus?: { status: string; exit_code: number | null } | null;
   enabled?: boolean;
-  /** Foreground panes collect transport stats; parked warm panes keep the
-   * connection but stay computationally quiet. */
-  active?: boolean;
-  /** Resolve, once per RTC generation, whether this host requires signed
-   * signaling, may use raw (unpinned TOFU first-contact), or must be refused.
-   * Absence keeps every generation unsigned. */
-  resolveSignedRtcTrust?: () => Promise<SignedRtcTrustDecision>;
-  /** Account endorsement edges to carry on the offer so a daemon that does not
-   * directly pin this browser can admit it via a chain to an anchor (§3). */
-  loadCarriedEndorsements?: () => Promise<CarriedEndorsement[]>;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
    *  chunk; every terminal byte arrives over the DataChannel. */
@@ -150,14 +121,11 @@ type RtcState = {
   sessionId: string | null;
   sessionGeneration: number;
   rtcGeneration: number;
-  pc: RTCPeerConnection | null;
-  ptyDc: RTCDataChannel | null;
-  ctlDc: RTCDataChannel | null;
+  ptyDc: DaemonChannel | null;
+  ctlDc: DaemonChannel | null;
   rtcSessionId: string | null;
   ptyOpen: boolean;
   ctlOpen: boolean;
-  bindingNonce: string | null;
-  bindingGeneration: number | null;
   open: boolean;
   /** Cumulative PTY bytes received over this session's DataChannel. */
   bytesReceived: number;
@@ -166,54 +134,20 @@ type RtcState = {
 const RTC_CONNECT_TIMEOUT_MS = 10_000;
 // Covers a full connect plus one retry cycle before an early upload gives up.
 const UPLOAD_READY_WAIT_MS = 20_000;
-const RTC_DISCONNECTED_GRACE_MS = 5_000;
-const RTC_ICE_RESTART_TIMEOUT_MS = 10_000;
-const RTC_CONFIG_REFRESH_TIMEOUT_MS = 2_000;
-const RTC_RESUME_TIMEOUT_MS = 3_000;
-const SIGNAL_WATCHDOG_MS = 80_000;
-// Retry failed WebRTC attempts with backoff; there is no content fallback.
-const RTC_RETRY_BASE_DELAY_MS = 5_000;
-const RTC_RETRY_MAX_DELAY_MS = 60_000;
-// Keystrokes typed before the DataChannel opens are held briefly and flushed
-// on open. Cap the buffer so a dead channel cannot grow it without bound.
+// Only healthy-channel backpressure can queue input; disconnect and control
+// loss discard it. Leave headroom beneath the bounded channel proxy.
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
 const MAX_PENDING_INPUT_AGE_MS = 30_000;
 
 function newRtcSessionId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
-}
-
-type FillRandomBytes = (bytes: Uint8Array) => void;
-
-/** Generate an authority-binding identity, or fail closed without a CSPRNG. */
-export function newRtcBindingNonce(fillRandomBytes?: FillRandomBytes | null): string | null {
-  const fill =
-    fillRandomBytes === undefined
-      ? typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function"
-        ? (bytes: Uint8Array) => {
-            crypto.getRandomValues(bytes);
-          }
-        : null
-      : fillRandomBytes;
-  if (!fill) return null;
-  const bytes = new Uint8Array(16);
-  try {
-    fill(bytes);
-  } catch {
-    return null;
-  }
-  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return crypto.randomUUID();
 }
 
 export function useSessionSocket({
+  connection = null,
   sessionId,
+  sessionStatus = null,
   enabled = true,
-  active = true,
-  resolveSignedRtcTrust,
-  loadCarriedEndorsements,
   initialSize = null,
   onData,
   onHistory,
@@ -230,6 +164,7 @@ export function useSessionSocket({
   // shared readiness gate, and the initial replay has completed.
   const [dcOpen, setDcOpen] = useState(false);
   const [connInfo, setConnInfo] = useState<ConnInfo>(EMPTY_CONN_INFO);
+  const displayOwnerRef = useRef(false);
   const [queuedInputCount, setQueuedInputCount] = useState(0);
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. A refusal is terminal (no auto-retry).
@@ -238,7 +173,6 @@ export function useSessionSocket({
   // (signed, host pin matched), "first_contact" (signed TOFU on the claimed
   // key), or "raw" (unsigned legacy path). Null until a decision is made.
   const [signalingTrust, setSignalingTrust] = useState<SignalingTrustLevel | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
   const sessionGenerationRef = useRef(0);
   const rtcGenerationRef = useRef(0);
@@ -248,14 +182,11 @@ export function useSessionSocket({
     sessionId: null,
     sessionGeneration: 0,
     rtcGeneration: 0,
-    pc: null,
     ptyDc: null,
     ctlDc: null,
     rtcSessionId: null,
     ptyOpen: false,
     ctlOpen: false,
-    bindingNonce: null,
-    bindingGeneration: null,
     open: false,
     bytesReceived: 0,
   });
@@ -286,28 +217,6 @@ export function useSessionSocket({
     uploadReadyWaitersRef.current.clear();
     for (const waiter of waiters) waiter();
   }, []);
-  const pendingRemoteRtcCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  // Per-offer trust resolution reads the latest resolver through this ref: a
-  // change of resolver identity (e.g. the server's claimed host key arriving)
-  // must inform the NEXT offer, not tear down a live connection.
-  const resolveSignedRtcTrustRef = useRef(resolveSignedRtcTrust);
-  resolveSignedRtcTrustRef.current = resolveSignedRtcTrust;
-  // A trust refusal stops reconnecting on purpose — retrying against an
-  // unverifiable host would be the wrong kind of persistence. But the copy on
-  // screen tells the reader that re-possessing the host brings the pane back,
-  // and with the warm terminal pool keeping panes mounted across navigation,
-  // nothing here ever noticed that they had. Local trust changes now move a
-  // revision, and this connect effect lists it as a dependency: approving a
-  // pin tears the effect down and runs it again with a fresh
-  // `reconnectStopped`, so the pane reconnects instead of waiting for a
-  // full page reload.
-  const hostPinRevision = useSyncExternalStore(
-    subscribeToBrowserHostPinChanges,
-    getBrowserHostPinRevision,
-    () => 0,
-  );
-  const loadCarriedEndorsementsRef = useRef(loadCarriedEndorsements);
-  loadCarriedEndorsementsRef.current = loadCarriedEndorsements;
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
     sessionId,
@@ -358,262 +267,122 @@ export function useSessionSocket({
     schedule();
   }, []);
 
-  // `hostPinRevision` is a re-run trigger, not a value this effect reads: local
-  // trust changed, so the connection has to be decided again — including the
-  // refusal that set `reconnectStopped` and would otherwise never be revisited.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: re-run trigger, not a read
+  const viewId = useRef(newRtcSessionId());
+  const lastExit = useRef<string | null>(null);
   useEffect(() => {
-    const sessionGeneration = sessionGenerationRef.current + 1;
-    sessionGenerationRef.current = sessionGeneration;
+    const status = sessionStatus?.status;
+    if (!status) return;
+    handlersRef.current.onStatus?.(status);
+    if (status === "exited" || status === "killed") {
+      if (lastExit.current !== sessionId) {
+        lastExit.current = sessionId;
+        handlersRef.current.onExit?.(sessionStatus?.exit_code ?? null, null);
+      }
+    } else {
+      lastExit.current = null;
+    }
+  }, [sessionId, sessionStatus?.status, sessionStatus?.exit_code]);
+  useEffect(() => {
+    const sessionGeneration = ++sessionGenerationRef.current;
+    activeSessionIdRef.current = enabled && connection ? sessionId : null;
     pendingInputRef.current.clear();
-    if (pendingInputExpiryTimerRef.current) clearTimeout(pendingInputExpiryTimerRef.current);
-    pendingInputExpiryTimerRef.current = null;
+    displayOwnerRef.current = false;
     setQueuedInputCount(0);
-    sendControlRef.current = () => false;
-    sendPtyInputRef.current = () => false;
-    uploadRef.current = async () => {
-      throw new Error("Direct session upload channel is not ready.");
-    };
-    settleUploadReadiness(false);
-    cancelUploadsRef.current(new Error("Session upload generation changed."));
-    cancelUploadsRef.current = () => {};
-    activeSessionIdRef.current = enabled && sessionId ? sessionId : null;
-    setV3(false);
+    setV3(Boolean(connection));
     setDcOpen(false);
-    setSignalingTrust(null);
-    if (!enabled || !sessionId) return;
+    if (!enabled || !sessionId || !connection) {
+      setState("idle");
+      return;
+    }
     let cancelled = false;
-    let reconnectStopped = false;
-    let attempt = 0;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let signalWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
-    let rtcStartInFlight = false;
-    let rtcStartLatchedAt = 0;
-    let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let rtcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null;
-    let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
-    let rtcIceRestartTimer: ReturnType<typeof setTimeout> | null = null;
-    let rtcResumeTimer: ReturnType<typeof setTimeout> | null = null;
-    let rtcConfigRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-    let rtcConfigRefreshResolve: (() => void) | null = null;
-    let iceRestartInFlight = false;
-    let iceRestartLatchedAt = 0;
-    let resumeInFlight = false;
-    /** When the server was last heard on the current socket, whatever kind of
-     * frame it was. A socket claiming OPEN with nothing heard for longer than
-     * `SIGNAL_SILENCE_SUSPECT_MS` is a corpse a sleep left behind. */
-    let lastSignalFrameAt = 0;
     let rtcRetryAttempts = 0;
-    let lastRtcIceServers: RTCIceServer[] | null = null;
-    /** The deployment's answer to "is there a direct path?", from `rtc.config`. */
-    let lastRtcTransportPolicy: RTCIceTransportPolicy = "all";
-    let signedRtcSession: SignedRtcLiveSession | null = null;
-    let signedRtcRequired = false;
-    let signedRtcDecisionForBinding: SignedRtcTrustDecision | null = null;
-    let prefetchedTrustDecision: Promise<SignedRtcTrustDecision> | null = null;
-    let blockCurrentLocalCandidates: (() => void) | null = null;
-    let releaseCurrentLocalCandidates: (() => void) | null = null;
-
+    let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtcConnectTimer: ReturnType<typeof setTimeout> | null = null;
     const isCurrentSessionGeneration = () => sessionGenerationRef.current === sessionGeneration;
     const isActiveSessionGeneration = () => !cancelled && isCurrentSessionGeneration();
     const currentHandlers = () =>
       isActiveSessionGeneration() && handlersRef.current.sessionId === sessionId
         ? handlersRef.current
         : null;
-
-    const resolveTrustDecision = async (): Promise<SignedRtcTrustDecision> => {
-      const resolveTrust = resolveSignedRtcTrustRef.current;
-      if (!resolveTrust) return { mode: "unpinned" };
-      try {
-        return await resolveTrust();
-      } catch {
-        return { mode: "refuse", reason: "pin_storage_error" };
-      }
-    };
-    const prefetchTrustDecision = () => {
-      if (resolveSignedRtcTrustRef.current) {
-        prefetchedTrustDecision ??= resolveTrustDecision();
-      }
-    };
-
-    const sendJsonOverWs = (msg: unknown) => {
-      if (!isCurrentSessionGeneration()) return false;
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-      ws.send(JSON.stringify(msg));
-      return true;
-    };
-    const boundSessionRtcTuple = sessionRtcTuple(sessionId);
-
     const clearRtcConnectTimer = () => {
       if (rtcConnectTimer) clearTimeout(rtcConnectTimer);
       rtcConnectTimer = null;
     };
 
-    const clearRtcDisconnectedTimer = () => {
-      if (rtcDisconnectedTimer) clearTimeout(rtcDisconnectedTimer);
-      rtcDisconnectedTimer = null;
-    };
-
-    const clearRtcIceRestartTimer = () => {
-      if (rtcIceRestartTimer) clearTimeout(rtcIceRestartTimer);
-      rtcIceRestartTimer = null;
-      iceRestartInFlight = false;
-    };
-
-    const clearRtcResumeTimer = () => {
-      if (rtcResumeTimer) clearTimeout(rtcResumeTimer);
-      rtcResumeTimer = null;
-      resumeInFlight = false;
-    };
-
-    const finishRtcConfigRefresh = () => {
-      if (rtcConfigRefreshTimer) clearTimeout(rtcConfigRefreshTimer);
-      rtcConfigRefreshTimer = null;
-      const resolve = rtcConfigRefreshResolve;
-      rtcConfigRefreshResolve = null;
-      resolve?.();
-    };
-
-    const cleanupRtc = (signal = true, retry = false, expectedRtcGeneration?: number) => {
+    const cleanupRtc = (_signal = true, retry = false, expectedRtcGeneration?: number) => {
       const rtc = rtcRef.current;
       if (
-        rtc.sessionId !== sessionId ||
         rtc.sessionGeneration !== sessionGeneration ||
         (expectedRtcGeneration !== undefined && rtc.rtcGeneration !== expectedRtcGeneration)
-      ) {
+      )
         return;
-      }
-      const rtcSessionId = rtc.rtcSessionId;
-      const bindingNonce = rtc.bindingNonce;
       clearRtcConnectTimer();
-      clearRtcDisconnectedTimer();
-      clearRtcIceRestartTimer();
-      clearRtcResumeTimer();
-      if (signal && rtcSessionId && bindingNonce) {
-        sendJsonOverWs({
-          type: "rtc.close",
-          session_id: rtcSessionId,
-          binding_nonce: bindingNonce,
-          ...boundSessionRtcTuple,
-        });
-      }
       rtcRef.current = {
         sessionId: null,
         sessionGeneration: 0,
         rtcGeneration: 0,
-        pc: null,
         ptyDc: null,
         ctlDc: null,
         rtcSessionId: null,
         ptyOpen: false,
         ctlOpen: false,
-        bindingNonce: null,
-        bindingGeneration: null,
         open: false,
         bytesReceived: 0,
       };
-      signedRtcSession?.abort();
-      signedRtcSession = null;
-      signedRtcRequired = false;
-      signedRtcDecisionForBinding = null;
-      try {
-        rtc.ptyDc?.close();
-        rtc.ctlDc?.close();
-      } catch {
-        // ignore
-      }
-      try {
-        rtc.pc?.close();
-      } catch {
-        // ignore
-      }
+      rtc.ptyDc?.close();
+      rtc.ctlDc?.close();
       sendControlRef.current = () => false;
       sendPtyInputRef.current = () => false;
+      displayOwnerRef.current = false;
       uploadRef.current = async () => {
         throw new Error("Direct session upload channel is not ready.");
       };
       settleUploadReadiness(false);
       cancelUploadsRef.current(new Error("Direct session upload channel closed."));
       cancelUploadsRef.current = () => {};
-      pendingRemoteRtcCandidatesRef.current = [];
-      blockCurrentLocalCandidates = null;
-      releaseCurrentLocalCandidates = null;
-      rtcStartInFlight = false;
+      pendingInputRef.current.clear();
+      updateQueuedInputState();
       if (isCurrentSessionGeneration()) setDcOpen(false);
       if (retry) scheduleRtcRetry();
     };
-
-    // Retry transient WebRTC failures without opening a content fallback.
     const scheduleRtcRetry = () => {
-      if (!isActiveSessionGeneration() || rtcRetryTimer || !lastRtcIceServers) return;
-      const delay = Math.min(
-        RTC_RETRY_MAX_DELAY_MS,
-        RTC_RETRY_BASE_DELAY_MS * 2 ** rtcRetryAttempts,
-      );
-      rtcRetryAttempts += 1;
+      if (
+        !isActiveSessionGeneration() ||
+        rtcRetryTimer ||
+        connection.getSnapshot().state !== "ready"
+      )
+        return;
+      const delay = Math.min(10_000, 500 * 2 ** rtcRetryAttempts++);
+      setState("connecting");
       rtcRetryTimer = setTimeout(() => {
         rtcRetryTimer = null;
-        if (!isActiveSessionGeneration() || rtcRef.current.pc) return;
-        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-        if (lastRtcIceServers) void startRtcWithLatest();
+        startRtc();
       }, delay);
     };
-
-    const startRtc = async (iceServers: RTCIceServer[]) => {
-      if (!isActiveSessionGeneration()) return;
-      if (rtcStartInFlight) {
-        // Held past its deadline, the latch marks an attempt frozen mid-await
-        // (a trust read or createOffer that a suspend left never settling),
-        // not one still working — and honouring it would turn every retry
-        // entry into a no-op forever. Tear the husk down and start over.
-        if (Date.now() - rtcStartLatchedAt < RTC_LATCH_TIMEOUT_MS) return;
-        cleanupRtc(false);
-      }
-      if (rtcRef.current.pc) return;
-      if (typeof RTCPeerConnection === "undefined") return;
-      rtcStartInFlight = true;
-      rtcStartLatchedAt = Date.now();
-      const rtcGeneration = rtcGenerationRef.current + 1;
-      rtcGenerationRef.current = rtcGeneration;
-      const rtcSessionId = newRtcSessionId();
-      const bindingNonce = newRtcBindingNonce();
-      if (!bindingNonce) {
-        rtcStartInFlight = false;
-        lastRtcIceServers = null;
-        const ws = wsRef.current;
-        if (ws?.readyState === WebSocket.OPEN) {
-          ws.close(1002, "Secure RTC binding identity is unavailable");
-        }
+    const startRtc = () => {
+      if (
+        !isActiveSessionGeneration() ||
+        rtcRef.current.ptyDc ||
+        connection.getSnapshot().state !== "ready"
+      )
         return;
-      }
-      // Debug/acceptance hook: force TURN-relay-only ICE to prove sessions
-      // survive networks where no direct path exists (docs/TRUST.md Phase 1).
-      // A relay-only deployment says the same thing for real, in `rtc.config`.
-      const forceRelay =
-        typeof window !== "undefined" &&
-        (window as { __spawnRtcForceRelay?: boolean }).__spawnRtcForceRelay === true;
-      let pc: RTCPeerConnection;
-      let ptyDc: RTCDataChannel;
-      let ctlDc: RTCDataChannel;
+      const rtcGeneration = ++rtcGenerationRef.current;
+      const rtcSessionId = newRtcSessionId();
+      const suffix = `${sessionId}/${viewId.current}/${rtcSessionId}`;
+      let ptyDc: DaemonChannel;
+      let ctlDc: DaemonChannel;
       try {
-        pc = new RTCPeerConnection({
-          iceServers: sanitizeIceServers(iceServers),
-          iceTransportPolicy: forceRelay ? "relay" : lastRtcTransportPolicy,
-          iceCandidatePoolSize: 1,
-        });
-        // Omitting both partial-reliability fields is intentional: both session
-        // channels are fully reliable as well as ordered, and the daemon rejects
-        // unordered, lifetime-limited, or retransmit-limited peers.
-        const reliableOrderedChannel: RTCDataChannelInit = { ordered: true };
-        ptyDc = pc.createDataChannel("spawn.pty", reliableOrderedChannel);
-        ctlDc = pc.createDataChannel("spawn.ctl", reliableOrderedChannel);
+        ptyDc = connection.createChannel(`spawn.pty/${suffix}`);
+        try {
+          ctlDc = connection.createChannel(`spawn.ctl/${suffix}`);
+        } catch (error) {
+          ptyDc.close();
+          throw error;
+        }
       } catch {
-        rtcStartInFlight = false;
         scheduleRtcRetry();
         return;
       }
-      const pendingLocalCandidates: RTCIceCandidateInit[] = [];
       const pendingControlTexts: string[] = [];
       const requests = new SessionCtlRequestTracker();
       type UploadMessage = NonNullable<ReturnType<typeof parseSessionCtlUploadResponse>>;
@@ -647,7 +416,6 @@ export function useSessionSocket({
       let bootstrapPtyAnchor: number | null = null;
       let bootstrapRequestedOffset: number | null = null;
       let initialHistoryRequestId: string | null = null;
-      let offerSent = false;
       const isCurrentRtcGeneration = () => {
         const current = rtcRef.current;
         return (
@@ -956,14 +724,11 @@ export function useSessionSocket({
         sessionId,
         sessionGeneration,
         rtcGeneration,
-        pc,
         ptyDc,
         ctlDc,
         rtcSessionId,
         ptyOpen: false,
         ctlOpen: false,
-        bindingNonce,
-        bindingGeneration: null,
         open: false,
         bytesReceived: 0,
       };
@@ -973,7 +738,13 @@ export function useSessionSocket({
       };
 
       const flushPendingInput = () => {
-        if (!isCurrentRtcGeneration() || ptyDc.readyState !== "open") return;
+        if (
+          !isCurrentRtcGeneration() ||
+          ptyDc.readyState !== "open" ||
+          !displayOwnerRef.current ||
+          connection.getSnapshot().state !== "ready"
+        )
+          return;
         const queued = pendingInputRef.current.take(sessionGeneration, MAX_PENDING_INPUT_AGE_MS);
         for (let index = 0; index < queued.length; index += 1) {
           const entry = queued[index];
@@ -994,13 +765,18 @@ export function useSessionSocket({
             break;
           }
         }
-        ptyDc.bufferedAmountLowThreshold = SESSION_PTY_INPUT_BUFFER_LOW_WATER;
+        ptyDc.bufferedAmountLowThreshold = 64 * 1024;
         updateQueuedInputState();
         if (pendingInputRef.current.count(sessionGeneration) > 0) armPendingInputExpiry();
       };
 
       sendPtyInputRef.current = (bytes) => {
-        if (!isCurrentRtcGeneration()) return false;
+        if (
+          !isCurrentRtcGeneration() ||
+          !displayOwnerRef.current ||
+          connection.getSnapshot().state !== "ready"
+        )
+          return false;
         const alreadyQueued = pendingInputRef.current.count(sessionGeneration) > 0;
         const sent = alreadyQueued ? 0 : sendPtyChunks(bytes);
         const accepted =
@@ -1009,13 +785,13 @@ export function useSessionSocket({
         updateQueuedInputState();
         if (pendingInputRef.current.count(sessionGeneration) > 0) {
           armPendingInputExpiry();
-          if (ptyDc.bufferedAmount <= SESSION_PTY_INPUT_BUFFER_HIGH_WATER) {
+          if (ptyDc.bufferedAmount <= 128 * 1024) {
             setTimeout(flushPendingInput, 0);
           }
         }
         return accepted;
       };
-      ptyDc.bufferedAmountLowThreshold = SESSION_PTY_INPUT_BUFFER_LOW_WATER;
+      ptyDc.bufferedAmountLowThreshold = 64 * 1024;
       ptyDc.onbufferedamountlow = flushPendingInput;
 
       const markReady = () => {
@@ -1036,7 +812,10 @@ export function useSessionSocket({
         // Only now is the upload context fully valid (channels open, server
         // ready, bootstrap done): release uploads that were waiting for it.
         settleUploadReadiness(true);
-        if (isCurrentSessionGeneration()) setDcOpen(true);
+        if (isCurrentSessionGeneration()) {
+          setDcOpen(true);
+          setState("open");
+        }
         flushPendingInput();
       };
 
@@ -1214,7 +993,8 @@ export function useSessionSocket({
         operation: SessionCtlOperation,
         parameters: Record<string, unknown> = {},
       ): boolean => {
-        if (!ctlDc || !isCurrentRtcGeneration()) return false;
+        if (!ctlDc || !isCurrentRtcGeneration() || connection.getSnapshot().state !== "ready")
+          return false;
         const requestId = newSessionCtlRequestId();
         const text = makeSessionCtlRequest(requestId, operation, parameters);
         if (!text) return false;
@@ -1234,55 +1014,6 @@ export function useSessionSocket({
         return true;
       };
       sendControlRef.current = sendControl;
-
-      const sendRtcCandidate = (candidate: RTCIceCandidateInit) =>
-        sendJsonOverWs({
-          type: "rtc.candidate",
-          session_id: rtcSessionId,
-          binding_nonce: bindingNonce,
-          ...(rtcRef.current.bindingGeneration !== null
-            ? { binding_generation: rtcRef.current.bindingGeneration }
-            : {}),
-          ...boundSessionRtcTuple,
-          candidate,
-        });
-      blockCurrentLocalCandidates = () => {
-        offerSent = false;
-      };
-      releaseCurrentLocalCandidates = () => {
-        offerSent = true;
-        for (const candidate of pendingLocalCandidates.splice(0)) sendRtcCandidate(candidate);
-      };
-
-      pc.onicecandidate = (event) => {
-        if (!event.candidate || !isCurrentRtcGeneration()) return;
-        const candidate = event.candidate.toJSON();
-        if (offerSent) sendRtcCandidate(candidate);
-        else pendingLocalCandidates.push(candidate);
-      };
-      pc.onconnectionstatechange = () => {
-        if (!isCurrentRtcGeneration()) return;
-        if (pc.connectionState === "connected") {
-          clearRtcDisconnectedTimer();
-          clearRtcIceRestartTimer();
-          return;
-        }
-        if (pc.connectionState === "disconnected") {
-          if (!rtcDisconnectedTimer) {
-            rtcDisconnectedTimer = setTimeout(() => {
-              if (
-                rtcRef.current.rtcSessionId === rtcSessionId &&
-                pc.connectionState === "disconnected"
-              ) {
-                void restartIce("disconnected");
-              }
-            }, RTC_DISCONNECTED_GRACE_MS);
-          }
-          return;
-        }
-        if (pc.connectionState === "failed") void restartIce("failed");
-        else if (pc.connectionState === "closed") cleanupRtc(false, true, rtcGeneration);
-      };
 
       ptyDc.onopen = () => {
         const current = rtcRef.current;
@@ -1317,12 +1048,17 @@ export function useSessionSocket({
         if (!isCurrentRtcGeneration()) return;
         const data = event.data;
         if (!(data instanceof ArrayBuffer) && !(data instanceof Blob)) return;
-        void ptyMessages.enqueue(
-          async () => new Uint8Array(data instanceof Blob ? await data.arrayBuffer() : data),
-          (bytes) => {
-            if (isCurrentRtcGeneration()) deliverPtyChunk(bytes);
-          },
-        );
+        void ptyMessages
+          .enqueue(
+            async () => new Uint8Array(data instanceof Blob ? await data.arrayBuffer() : data),
+            (bytes) => {
+              if (isCurrentRtcGeneration()) deliverPtyChunk(bytes);
+            },
+            data instanceof Blob ? data.size : data.byteLength,
+          )
+          .catch(() => {
+            if (isCurrentRtcGeneration()) cleanupRtc(true, true, rtcGeneration);
+          });
       };
 
       if (ctlDc) {
@@ -1355,727 +1091,110 @@ export function useSessionSocket({
           ) {
             return;
           }
-          void controlMessages.enqueue(
-            async () =>
-              data instanceof Blob
-                ? new Uint8Array(await data.arrayBuffer())
-                : data instanceof ArrayBuffer
-                  ? new Uint8Array(data)
-                  : data,
-            (decoded) => {
-              if (!isCurrentRtcGeneration()) return;
-              if (typeof decoded !== "string") {
-                deliverControlBinary(decoded);
-                return;
-              }
-              const message = parseSessionCtlText(decoded);
-              if (!message) return;
-              if (message.kind === "event") {
-                if (message.event === "ready") {
-                  uploadCapability = message.upload_capability;
-                  uploadSessionGeneration = message.agent_generation;
-                  serverReady = true;
-                  startBootstrap();
+          void controlMessages
+            .enqueue(
+              async () =>
+                data instanceof Blob
+                  ? new Uint8Array(await data.arrayBuffer())
+                  : data instanceof ArrayBuffer
+                    ? new Uint8Array(data)
+                    : data,
+              (decoded) => {
+                if (!isCurrentRtcGeneration()) return;
+                if (typeof decoded !== "string") {
+                  deliverControlBinary(decoded);
                   return;
                 }
-                if (message.event === "history_delta" || message.event === "history_wipe") {
-                  // Committed-line deltas reach this client but nothing
-                  // consumes them: history lives in the live terminal's own
-                  // buffer, fed by the byte stream itself. Swallow the events
-                  // so they cannot fall through to the display-control
-                  // parser. Teaching the daemon not to stream them at all is
-                  // a follow-up (bandwidth, not correctness).
+                const message = parseSessionCtlText(decoded);
+                if (!message) return;
+                if (message.kind === "event") {
+                  if (message.event === "ready") {
+                    uploadCapability = message.upload_capability;
+                    uploadSessionGeneration = message.agent_generation;
+                    serverReady = true;
+                    startBootstrap();
+                    return;
+                  }
+                  if (message.event === "history_delta" || message.event === "history_wipe") {
+                    // Committed-line deltas reach this client but nothing
+                    // consumes them: history lives in the live terminal's own
+                    // buffer, fed by the byte stream itself. Swallow the events
+                    // so they cannot fall through to the display-control
+                    // parser. Teaching the daemon not to stream them at all is
+                    // a follow-up (bandwidth, not correctness).
+                    return;
+                  }
+                  if (message.event === "history_gap") {
+                    recoverFromPtyGap(rtcRef.current.bytesReceived);
+                    return;
+                  }
+                  if (message.event === "pty_gap") {
+                    recoverFromPtyGap(message.offset);
+                    return;
+                  }
+                  displayOwnerRef.current = message.owner;
+                  if (!message.owner) {
+                    pendingInputRef.current.clear();
+                    updateQueuedInputState();
+                  }
+                  currentHandlers()?.onDisplayControl?.({
+                    owner: message.owner,
+                    sameDevice: message.same_device === true,
+                    cols: message.cols,
+                    rows: message.rows,
+                    viewers: message.viewers,
+                  });
                   return;
                 }
-                if (message.event === "history_gap") {
-                  recoverFromPtyGap(rtcRef.current.bytesReceived);
-                  return;
+                if (!deliverUploadMessage(message)) {
+                  acceptTrackedResult(requests.acceptResponse(message));
                 }
-                if (message.event === "pty_gap") {
-                  recoverFromPtyGap(message.offset);
-                  return;
-                }
-                currentHandlers()?.onDisplayControl?.({
-                  owner: message.owner,
-                  cols: message.cols,
-                  rows: message.rows,
-                  viewers: message.viewers,
-                });
-                return;
-              }
-              if (!deliverUploadMessage(message)) {
-                acceptTrackedResult(requests.acceptResponse(message));
-              }
-            },
-          );
+              },
+              typeof data === "string"
+                ? new TextEncoder().encode(data).byteLength
+                : data instanceof Blob
+                  ? data.size
+                  : data.byteLength,
+            )
+            .catch(() => {
+              if (isCurrentRtcGeneration()) cleanupRtc(true, true, rtcGeneration);
+            });
         };
       }
 
-      try {
-        // The trust read began beside the WebSocket handshake. Consume that
-        // work here so IndexedDB latency is not serialized behind rtc.config.
-        let signedRtcDecision: SignedRtcTrustDecision = { mode: "unpinned" };
-        if (resolveSignedRtcTrustRef.current) {
-          const decisionPromise = prefetchedTrustDecision ?? resolveTrustDecision();
-          prefetchedTrustDecision = null;
-          signedRtcDecision = await decisionPromise;
-          if (!isCurrentRtcGeneration()) return;
-        }
-        if (signedRtcDecision.mode === "refuse") {
-          // The host identity could not be verified against a local pin. Refuse
-          // outright: never fall back to a raw, unauthenticated path, and do not
-          // auto-retry until the local trust state changes.
-          setSignedRtcRefusal(signedRtcDecision.reason);
-          setState("error");
-          reconnectStopped = true;
-          lastRtcIceServers = null;
-          cleanupRtc(true, false, rtcGeneration);
-          return;
-        }
-        setSignedRtcRefusal(null);
-        signedRtcRequired = signedRtcDecision.mode === "signed";
-        signedRtcDecisionForBinding = signedRtcDecision;
-        setSignalingTrust(
-          signedRtcDecision.mode === "signed"
-            ? signedRtcDecision.hostVerified
-              ? "verified"
-              : "first_contact"
-            : "raw",
-        );
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        if (!isCurrentRtcGeneration()) return;
-        const nextSignedRtcSession =
-          signedRtcDecision.mode === "signed"
-            ? new SignedRtcLiveSession(
-                {
-                  scopeType: "session",
-                  scopeId: sessionId,
-                  protocol: "spawn.pty",
-                  protocolVersion: 2,
-                },
-                rtcSessionId,
-                signedRtcDecision.capability,
-              )
-            : null;
-        const carrier = nextSignedRtcSession
-          ? await nextSignedRtcSession.createOffer(offer.sdp ?? "")
-          : { sdp: offer.sdp };
-        if (!isCurrentRtcGeneration()) return;
-        // A device the host does not directly pin carries its account endorsement
-        // edges so the daemon can admit it via a chain to an anchor (§3).
-        // Best-effort: on failure the offer still goes and a directly-pinned
-        // device is admitted exactly as before.
-        let carried: CarriedEndorsement[] = [];
-        const loadCarried = loadCarriedEndorsementsRef.current;
-        if (nextSignedRtcSession && loadCarried) {
-          try {
-            carried = await loadCarried();
-          } catch {
-            carried = [];
-          }
-          if (!isCurrentRtcGeneration()) return;
-        }
-        signedRtcSession = nextSignedRtcSession;
-        const offerFrame: Record<string, unknown> = {
-          type: "rtc.offer",
-          session_id: rtcSessionId,
-          binding_nonce: bindingNonce,
-          ...boundSessionRtcTuple,
-          ...carrier,
-        };
-        if (carried.length > 0) offerFrame.carried_endorsements = carried;
-        if (!sendJsonOverWs(offerFrame)) {
-          cleanupRtc(false, false, rtcGeneration);
-          return;
-        }
-        releaseCurrentLocalCandidates?.();
-        rtcConnectTimer = setTimeout(() => {
-          if (isCurrentRtcGeneration() && !rtcRef.current.open) {
-            cleanupRtc(true, true, rtcGeneration);
-          }
-        }, RTC_CONNECT_TIMEOUT_MS);
-      } catch {
-        cleanupRtc(true, false, rtcGeneration);
-      } finally {
-        if (isCurrentRtcGeneration()) rtcStartInFlight = false;
-      }
+      rtcConnectTimer = setTimeout(() => {
+        if (isCurrentRtcGeneration() && !rtcRef.current.open) cleanupRtc(true, true, rtcGeneration);
+      }, RTC_CONNECT_TIMEOUT_MS);
     };
-
-    const refreshRtcConfigIfStale = async () => {
-      if (!lastRtcIceServers || !iceServersNeedRefresh(lastRtcIceServers)) return;
-      if (rtcConfigRefreshResolve) {
-        await new Promise<void>((resolve) => {
-          const previous = rtcConfigRefreshResolve;
-          rtcConfigRefreshResolve = () => {
-            previous?.();
-            resolve();
-          };
-        });
+    const sync = () => {
+      if (!isActiveSessionGeneration()) return;
+      const snapshot = connection.getSnapshot();
+      setSignedRtcRefusal(snapshot.refusal);
+      setSignalingTrust(snapshot.trust);
+      setConnInfo(snapshot.info ?? EMPTY_CONN_INFO);
+      if (snapshot.state !== "ready") {
+        pendingInputRef.current.clear();
+        updateQueuedInputState();
+        setDcOpen(false);
+        setState(snapshot.state === "open" ? "connecting" : snapshot.state);
         return;
       }
-      if (!sendJsonOverWs({ type: "rtc.config.request" })) return;
-      await new Promise<void>((resolve) => {
-        rtcConfigRefreshResolve = resolve;
-        rtcConfigRefreshTimer = setTimeout(finishRtcConfigRefresh, RTC_CONFIG_REFRESH_TIMEOUT_MS);
-      });
-    };
-
-    const startRtcWithLatest = async () => {
-      await refreshRtcConfigIfStale();
-      if (!isActiveSessionGeneration() || rtcRef.current.pc || !lastRtcIceServers) return;
-      await startRtc(lastRtcIceServers);
-    };
-
-    const fallBackToFreshRtc = (expectedRtcGeneration: number) => {
-      if (rtcRef.current.rtcGeneration !== expectedRtcGeneration) return;
-      cleanupRtc(true, false, expectedRtcGeneration);
-      prefetchTrustDecision();
-      void startRtcWithLatest();
-    };
-
-    const restartIce = async (_reason: "disconnected" | "failed" | "wake") => {
-      const current = rtcRef.current;
-      if (iceRestartInFlight && Date.now() - iceRestartLatchedAt < RTC_LATCH_TIMEOUT_MS) return;
-      if (!current.pc || !current.rtcSessionId) return;
-      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-      if (!current.bindingNonce || current.bindingGeneration === null) {
-        fallBackToFreshRtc(current.rtcGeneration);
-        return;
-      }
-      const pc = current.pc;
-      const expectedRtcGeneration = current.rtcGeneration;
-      iceRestartInFlight = true;
-      iceRestartLatchedAt = Date.now();
-      await refreshRtcConfigIfStale();
-      if (
-        !isActiveSessionGeneration() ||
-        rtcRef.current.pc !== pc ||
-        rtcRef.current.rtcGeneration !== expectedRtcGeneration ||
-        !lastRtcIceServers
-      ) {
-        clearRtcIceRestartTimer();
-        return;
-      }
-      try {
-        pc.setConfiguration({
-          iceServers: lastRtcIceServers,
-          iceTransportPolicy: lastRtcTransportPolicy,
-        });
-        pendingRemoteRtcCandidatesRef.current = [];
-        blockCurrentLocalCandidates?.();
-        pc.restartIce();
-        const offer = await pc.createOffer({ iceRestart: true });
-        await pc.setLocalDescription(offer);
-        if (rtcRef.current.pc !== pc || rtcRef.current.rtcGeneration !== expectedRtcGeneration) {
-          clearRtcIceRestartTimer();
-          return;
-        }
-        let carrier: { signed_envelope: string } | { sdp: string | undefined };
-        if (signedRtcDecisionForBinding?.mode === "signed") {
-          const nextSignedSession = new SignedRtcLiveSession(
-            {
-              scopeType: "session",
-              scopeId: sessionId,
-              protocol: "spawn.pty",
-              protocolVersion: 2,
-            },
-            current.rtcSessionId,
-            signedRtcDecisionForBinding.capability,
-          );
-          carrier = await nextSignedSession.createOffer(offer.sdp ?? "");
-          signedRtcSession?.abort();
-          signedRtcSession = nextSignedSession;
-        } else {
-          carrier = { sdp: offer.sdp };
-        }
-        const sent = sendJsonOverWs({
-          type: "rtc.offer",
-          session_id: current.rtcSessionId,
-          binding_nonce: current.bindingNonce,
-          binding_generation: current.bindingGeneration,
-          ice_restart: true,
-          ...boundSessionRtcTuple,
-          ...carrier,
-        });
-        if (!sent) throw new Error("signalling socket is unavailable");
-        releaseCurrentLocalCandidates?.();
-        rtcIceRestartTimer = setTimeout(
-          () => fallBackToFreshRtc(expectedRtcGeneration),
-          RTC_ICE_RESTART_TIMEOUT_MS,
-        );
-      } catch {
-        clearRtcIceRestartTimer();
-        fallBackToFreshRtc(expectedRtcGeneration);
-      }
-    };
-
-    const healthyRtc = () => {
-      const current = rtcRef.current;
-      return (
-        current.pc?.connectionState === "connected" &&
-        current.ptyDc?.readyState === "open" &&
-        current.ctlDc?.readyState === "open"
-      );
-    };
-
-    const fallBackFromResume = () => {
-      const expectedRtcGeneration = rtcRef.current.rtcGeneration;
-      clearRtcResumeTimer();
-      cleanupRtc(false, false, expectedRtcGeneration);
-      prefetchTrustDecision();
-      void startRtcWithLatest();
-    };
-
-    const resumeHealthyRtc = () => {
-      const current = rtcRef.current;
-      if (!healthyRtc()) return false;
-      if (!current.rtcSessionId || !current.bindingNonce || current.bindingGeneration === null) {
-        fallBackFromResume();
-        return false;
-      }
-      if (resumeInFlight) return true;
-      resumeInFlight = sendJsonOverWs({
-        type: "rtc.resume",
-        session_id: current.rtcSessionId,
-        binding_nonce: current.bindingNonce,
-        binding_generation: current.bindingGeneration,
-        ...boundSessionRtcTuple,
-      });
-      if (!resumeInFlight) return false;
-      rtcResumeTimer = setTimeout(fallBackFromResume, RTC_RESUME_TIMEOUT_MS);
-      return true;
-    };
-
-    const connect = () => {
-      if (!isActiveSessionGeneration() || reconnectStopped) return;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-      prefetchTrustDecision();
-      let shouldResumeHealthyRtc = healthyRtc();
-      setState("connecting");
-      let ws: WebSocket;
-      try {
-        ws = new WebSocket(buildSessionWsUrl(sessionId), SPAWN_WS_SUBPROTOCOL);
-      } catch {
-        setState("error");
-        scheduleReconnect();
-        return;
-      }
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
-      const isCurrentWs = () => isActiveSessionGeneration() && wsRef.current === ws;
-      let pingSeen = false;
-      const armSignalWatchdog = () => {
-        if (!pingSeen || !isCurrentWs()) return;
-        if (signalWatchdogTimer) clearTimeout(signalWatchdogTimer);
-        signalWatchdogTimer = setTimeout(() => {
-          if (isCurrentWs()) ws.close(4008, "keepalive timeout");
-        }, SIGNAL_WATCHDOG_MS);
-      };
-
-      ws.onopen = () => {
-        if (!isCurrentWs()) return;
-        lastSignalFrameAt = Date.now();
-        if (ws.protocol !== SPAWN_WS_SUBPROTOCOL) {
-          ws.close(1002, "Required terminal signaling protocol was not selected");
-          return;
-        }
-        setV3(true);
+      if (rtcRef.current.open) {
+        setDcOpen(true);
         setState("open");
-      };
-      ws.onmessage = (ev) => {
-        if (!isCurrentWs()) return;
-        lastSignalFrameAt = Date.now();
-        const h = currentHandlers();
-        if (!h) return;
-        if (typeof ev.data === "string") {
-          const msg = parseInbound(ev.data);
-          if (!msg) {
-            if (signedRtcSession) cleanupRtc(true, true, rtcRef.current.rtcGeneration);
-            return;
-          }
-          attempt = 0;
-          if (pingSeen) armSignalWatchdog();
-          if (msg.type === "ping") {
-            pingSeen = true;
-            armSignalWatchdog();
-            if (Number.isFinite(msg.ts)) sendJsonOverWs({ type: "pong", ts: msg.ts });
-          } else if (msg.type === "error") {
-            if (resumeInFlight) fallBackFromResume();
-          } else if (msg.type === "session.exit") {
-            h.onExit?.(msg.exit_code, msg.signal);
-          } else if (msg.type === "session.status") {
-            h.onStatus?.(msg.status);
-            if (msg.status === "running") {
-              rtcRetryAttempts = 0;
-              if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
-              rtcRetryTimer = null;
-              if (!rtcRef.current.pc) void startRtcWithLatest();
-            }
-          } else if (msg.type === "rtc.config") {
-            finishRtcConfigRefresh();
-            if (msg.enabled) {
-              setState("open");
-              if (msg.binding_nonce_required !== true) {
-                ws.close(1002, "RTC binding identity negotiation is required");
-                return;
-              }
-              lastRtcIceServers = sanitizeIceServers(msg.ice_servers ?? []);
-              lastRtcTransportPolicy = msg.ice_transport_policy === "relay" ? "relay" : "all";
-              rtcRetryAttempts = 0;
-              if (shouldResumeHealthyRtc && healthyRtc()) {
-                shouldResumeHealthyRtc = false;
-                resumeHealthyRtc();
-              } else if (!rtcRef.current.pc) {
-                void startRtcWithLatest();
-              } else if (rtcRef.current.pc.connectionState !== "connected") {
-                void restartIce("wake");
-              }
-            } else {
-              lastRtcIceServers = null;
-              cleanupRtc(true, false);
-              setState("disabled");
-            }
-          } else if (msg.type === "rtc.answer") {
-            const current = rtcRef.current;
-            const bindingRequired = true;
-            if (current.pc && signedRtcSession) {
-              const pc = current.pc;
-              const acceptedBinding = {
-                rtcSessionId: current.rtcSessionId,
-                bindingNonce: current.bindingNonce,
-                bindingGeneration: current.bindingGeneration,
-              };
-              const acceptedRtcGeneration = current.rtcGeneration;
-              if (
-                !current.rtcSessionId ||
-                !current.bindingNonce ||
-                current.bindingGeneration === null ||
-                !rtcBindingFrameMatches(
-                  {
-                    rtcSessionId: current.rtcSessionId,
-                    bindingNonce: current.bindingNonce,
-                    bindingGeneration: current.bindingGeneration,
-                    sessionId,
-                  },
-                  msg,
-                )
-              ) {
-                cleanupRtc(true, true, acceptedRtcGeneration);
-                return;
-              }
-              void signedRtcSession
-                .verifyAndApplyAnswer(pc, msg)
-                .then(() => {
-                  const latest = rtcRef.current;
-                  if (
-                    !isCurrentWs() ||
-                    latest.pc !== pc ||
-                    latest.sessionId !== sessionId ||
-                    latest.sessionGeneration !== sessionGeneration ||
-                    latest.rtcGeneration !== acceptedRtcGeneration ||
-                    latest.rtcSessionId !== acceptedBinding.rtcSessionId ||
-                    latest.bindingNonce !== acceptedBinding.bindingNonce ||
-                    latest.bindingGeneration !== acceptedBinding.bindingGeneration
-                  )
-                    return;
-                  if (pc.connectionState === "connected") clearRtcIceRestartTimer();
-                  const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
-                  for (const candidate of pending) {
-                    void pc.addIceCandidate(candidate).catch(() => {});
-                  }
-                })
-                .catch(() => cleanupRtc(true, true, acceptedRtcGeneration));
-            } else if (
-              current.rtcSessionId &&
-              current.bindingNonce &&
-              !signedRtcRequired &&
-              (!bindingRequired || current.bindingGeneration !== null) &&
-              current.pc &&
-              rtcBindingFrameMatches(
-                {
-                  rtcSessionId: current.rtcSessionId,
-                  bindingNonce: current.bindingNonce,
-                  bindingGeneration: current.bindingGeneration,
-                  sessionId,
-                },
-                msg,
-              )
-            ) {
-              const pc = current.pc;
-              const acceptedBinding = {
-                rtcSessionId: current.rtcSessionId,
-                bindingNonce: current.bindingNonce,
-                bindingGeneration: current.bindingGeneration,
-              };
-              const acceptedRtcGeneration = current.rtcGeneration;
-              if (typeof msg.sdp !== "string") {
-                cleanupRtc(true, true, acceptedRtcGeneration);
-                return;
-              }
-              void pc
-                .setRemoteDescription({ type: "answer", sdp: msg.sdp })
-                .then(() => {
-                  const latest = rtcRef.current;
-                  if (
-                    !isCurrentWs() ||
-                    latest.pc !== pc ||
-                    latest.sessionId !== sessionId ||
-                    latest.sessionGeneration !== sessionGeneration ||
-                    latest.rtcGeneration !== acceptedRtcGeneration ||
-                    latest.rtcSessionId !== acceptedBinding.rtcSessionId ||
-                    latest.bindingNonce !== acceptedBinding.bindingNonce ||
-                    latest.bindingGeneration !== acceptedBinding.bindingGeneration
-                  )
-                    return;
-                  if (pc.connectionState === "connected") clearRtcIceRestartTimer();
-                  const pending = pendingRemoteRtcCandidatesRef.current.splice(0);
-                  for (const candidate of pending) {
-                    void pc.addIceCandidate(candidate).catch(() => {});
-                  }
-                })
-                .catch(() => cleanupRtc(true, true, acceptedRtcGeneration));
-            }
-          } else if (msg.type === "rtc.candidate") {
-            const current = rtcRef.current;
-            const bindingRequired = true;
-            if (
-              current.rtcSessionId &&
-              current.bindingNonce &&
-              (!bindingRequired || current.bindingGeneration !== null) &&
-              current.pc &&
-              rtcBindingFrameMatches(
-                {
-                  rtcSessionId: current.rtcSessionId,
-                  bindingNonce: current.bindingNonce,
-                  bindingGeneration: current.bindingGeneration,
-                  sessionId,
-                },
-                msg,
-              )
-            ) {
-              if (current.pc.remoteDescription) {
-                void current.pc.addIceCandidate(msg.candidate).catch(() => {});
-              } else {
-                pendingRemoteRtcCandidatesRef.current.push(msg.candidate);
-              }
-            }
-          } else if (msg.type === "rtc.status") {
-            const current = rtcRef.current;
-            const exactBoundStatus =
-              current.rtcSessionId !== null &&
-              current.bindingNonce !== null &&
-              rtcBindingFrameMatches(
-                {
-                  rtcSessionId: current.rtcSessionId,
-                  bindingNonce: current.bindingNonce,
-                  bindingGeneration: current.bindingGeneration,
-                  sessionId,
-                },
-                msg,
-              );
-            if (
-              exactBoundStatus &&
-              ["resumed", "rebound", "signalling_lost", "connected"].includes(msg.status)
-            ) {
-              rtcRetryAttempts = 0;
-              if (msg.status === "resumed") clearRtcResumeTimer();
-              return;
-            }
-            if (
-              resumeInFlight &&
-              msg.status === "unavailable" &&
-              msg.session_id === current.rtcSessionId &&
-              (msg.binding_nonce === undefined || msg.binding_nonce === current.bindingNonce)
-            ) {
-              fallBackFromResume();
-              return;
-            }
-            if (
-              msg.status === "negotiating" &&
-              current.rtcSessionId === msg.session_id &&
-              current.bindingNonce === msg.binding_nonce &&
-              current.bindingGeneration === null &&
-              typeof msg.binding_generation === "number" &&
-              Number.isSafeInteger(msg.binding_generation) &&
-              msg.binding_generation > 0 &&
-              msg.scope_type === "session" &&
-              msg.scope_id === sessionId &&
-              msg.protocol === "spawn.pty" &&
-              msg.protocol_version === 2
-            ) {
-              rtcRef.current = {
-                ...current,
-                bindingGeneration: msg.binding_generation,
-              };
-              rtcRetryAttempts = 0;
-              return;
-            }
-            const exactPrebindFailure =
-              current.bindingGeneration === null &&
-              current.rtcSessionId === msg.session_id &&
-              current.bindingNonce === msg.binding_nonce &&
-              msg.binding_generation === undefined;
-            if (
-              msg.session_id &&
-              (exactPrebindFailure || exactBoundStatus) &&
-              ["failed", "disabled", "unavailable", "collision"].includes(msg.status)
-            ) {
-              if (iceRestartInFlight && msg.status === "unavailable") {
-                fallBackToFreshRtc(current.rtcGeneration);
-              } else if (msg.status === "disabled") {
-                cleanupRtc(false, false);
-                setState("disabled");
-              } else {
-                cleanupRtc(false, true);
-              }
-            } else if (!["failed", "disabled", "unavailable", "collision"].includes(msg.status)) {
-              rtcRetryAttempts = 0;
-              if (!current.pc) void startRtcWithLatest();
-            }
-          }
-        } else {
-          ws.close(1002, "Binary content is forbidden on the signaling socket");
-        }
-      };
-      ws.onerror = () => {
-        if (!isCurrentWs()) return;
-        setState("error");
-      };
-      ws.onclose = (event) => {
-        if (!isCurrentSessionGeneration() || wsRef.current !== ws) return;
-        if (signalWatchdogTimer) clearTimeout(signalWatchdogTimer);
-        signalWatchdogTimer = null;
-        finishRtcConfigRefresh();
-        clearRtcResumeTimer();
-        const action = socketCloseAction(event.code);
-        if (
-          !healthyRtc() ||
-          action === "unauthorized" ||
-          action === "client_bug" ||
-          action === "client_stale"
-        ) {
-          cleanupRtc(false);
-        }
-        wsRef.current = null;
-        if (action === "unauthorized") {
-          reconnectStopped = true;
-          setState("unauthorized");
-          notifySocketUnauthorized();
-          return;
-        }
-        if (action === "client_stale") {
-          reconnectStopped = true;
-          setState("error");
-          window.dispatchEvent(new CustomEvent("spawn:client-stale", { detail: { hard: true } }));
-          return;
-        }
-        if (action === "client_bug") {
-          reconnectStopped = true;
-          setState("error");
-          console.error("SPAWN D terminal signalling stopped after a client protocol error.");
-          return;
-        }
-        setState("closed");
-        if (action === "reconnect_immediately") {
-          reconnectTimer = setTimeout(connect, 0);
-          return;
-        }
-        scheduleReconnect();
-      };
-    };
-
-    const scheduleReconnect = () => {
-      if (!isActiveSessionGeneration() || reconnectStopped || reconnectTimer) return;
-      const delay = backoffDelay(attempt, { base: 500, cap: 30_000 });
-      attempt = Math.min(attempt + 1, 30);
-      reconnectTimer = setTimeout(connect, delay);
-    };
-
-    const redialNow = () => {
-      const ws = wsRef.current;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-      attempt = 0;
-      if (ws) {
-        wsRef.current = null;
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onerror = null;
-        ws.onclose = null;
-        try {
-          ws.close();
-        } catch {
-          // A replacement socket is opened below either way.
-        }
+      } else {
+        setState("connecting");
+        startRtc();
       }
-      connect();
     };
-
-    const wake = () => {
-      if (!isActiveSessionGeneration() || reconnectStopped) return;
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        redialNow();
-        return;
-      }
-      const pc = rtcRef.current.pc;
-      if (pc?.connectionState === "connected") return;
-      if (Date.now() - lastSignalFrameAt > SIGNAL_SILENCE_SUSPECT_MS) {
-        // OPEN is the socket's claim, not the network's: after a sleep the
-        // TCP side is routinely gone with no onclose ever fired, and every
-        // frame signalled into it "succeeds" into nothing. The server pings
-        // every 25 s, so a live socket is never this quiet — redial, which
-        // also carries fresh TURN credentials in on the new rtc.config.
-        redialNow();
-        return;
-      }
-      if (pc) void restartIce("wake");
-      else void startRtcWithLatest();
-    };
-
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") wake();
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    window.addEventListener("online", wake);
-    window.addEventListener("pageshow", wake);
-    // The desktop shell's webview sleeps and wakes with the machine without
-    // firing any of the three events above; the clock jump is the one signal
-    // that always arrives.
-    const stopSuspendWatch = watchSuspendResume(wake);
-
-    connect();
-
+    const unsubscribe = connection.subscribe(sync);
+    sync();
     return () => {
       cancelled = true;
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      window.removeEventListener("online", wake);
-      window.removeEventListener("pageshow", wake);
-      stopSuspendWatch();
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (signalWatchdogTimer) clearTimeout(signalWatchdogTimer);
+      unsubscribe();
       if (rtcRetryTimer) clearTimeout(rtcRetryTimer);
-      clearRtcIceRestartTimer();
-      clearRtcResumeTimer();
-      finishRtcConfigRefresh();
-      if (isCurrentSessionGeneration() && wsRef.current) {
-        const ws = wsRef.current;
-        try {
-          cleanupRtc(true);
-          wsRef.current = null;
-          ws.onopen = null;
-          ws.onmessage = null;
-          ws.onerror = null;
-          ws.onclose = null;
-          ws.close(1000, "unmount");
-        } catch {
-          // ignore
-        }
-      }
-      pendingInputRef.current.clear();
+      clearRtcConnectTimer();
+      cleanupRtc(false);
       if (pendingInputExpiryTimerRef.current) clearTimeout(pendingInputExpiryTimerRef.current);
       pendingInputExpiryTimerRef.current = null;
       if (isCurrentSessionGeneration()) activeSessionIdRef.current = null;
@@ -2083,116 +1202,27 @@ export function useSessionSocket({
   }, [
     sessionId,
     enabled,
-    hostPinRevision,
+    connection,
     settleUploadReadiness,
-    armPendingInputExpiry,
     updateQueuedInputState,
+    armPendingInputExpiry,
   ]);
-
-  const [pageVisible, setPageVisible] = useState(
-    () => typeof document === "undefined" || !document.hidden,
-  );
-  useEffect(() => {
-    const onVisibilityChange = () => setPageVisible(!document.hidden);
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
-  }, []);
-
-  // Poll WebRTC stats while the channel is up: the selected candidate pair
-  // tells us whether bytes flow direct, via STUN-discovered addresses, or
-  // through the TURN relay — plus the live round-trip time.
-  useEffect(() => {
-    if (!dcOpen) {
-      setConnInfo(EMPTY_CONN_INFO);
-      return;
-    }
-    if (!active || !pageVisible) return;
-    let cancelled = false;
-    const poll = async () => {
-      const observed = rtcRef.current;
-      const pc = observed.pc;
-      if (!pc) return;
-      let stats: RTCStatsReport;
-      try {
-        stats = await pc.getStats();
-      } catch {
-        return;
-      }
-      if (
-        rtcRef.current.pc !== pc ||
-        rtcRef.current.sessionId !== observed.sessionId ||
-        rtcRef.current.sessionGeneration !== observed.sessionGeneration ||
-        rtcRef.current.rtcGeneration !== observed.rtcGeneration
-      ) {
-        return;
-      }
-      interface PairStats {
-        id: string;
-        type: string;
-        localCandidateId?: string;
-        remoteCandidateId?: string;
-        currentRoundTripTime?: number;
-        state?: string;
-        nominated?: boolean;
-        selectedCandidatePairId?: string;
-      }
-      const reports: PairStats[] = [];
-      stats.forEach((report) => {
-        reports.push(report as unknown as PairStats);
-      });
-      const selectedPairId = reports.find(
-        (r) => r.type === "transport" && r.selectedCandidatePairId,
-      )?.selectedCandidatePairId;
-      const pair = reports.find(
-        (r) =>
-          r.type === "candidate-pair" &&
-          (selectedPairId ? r.id === selectedPairId : r.state === "succeeded" && r.nominated),
-      );
-      if (!pair || cancelled) return;
-      const local = (pair.localCandidateId ? stats.get(pair.localCandidateId) : null) as {
-        candidateType?: string;
-        protocol?: string;
-      } | null;
-      const remote = (pair.remoteCandidateId ? stats.get(pair.remoteCandidateId) : null) as {
-        candidateType?: string;
-      } | null;
-      const types = [local?.candidateType, remote?.candidateType];
-      const kind = types.includes("relay")
-        ? "relay"
-        : types.includes("srflx") || types.includes("prflx")
-          ? "stun"
-          : "direct";
-      setConnInfo({
-        kind,
-        rttMs:
-          typeof pair.currentRoundTripTime === "number"
-            ? Math.max(1, Math.round(pair.currentRoundTripTime * 1000))
-            : null,
-        protocol: local?.protocol ?? null,
-      });
-    };
-    void poll();
-    const timer = setInterval(() => void poll(), 5_000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [dcOpen, active, pageVisible]);
 
   const sendBinary = useCallback(
     (bytes: Uint8Array | string) => {
       if (activeSessionIdRef.current !== sessionId) return false;
       const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
       const rtc = rtcRef.current;
-      if (rtc.open && rtc.ptyDc?.readyState === "open") {
+      if (
+        connection?.getSnapshot().state === "ready" &&
+        rtc.open &&
+        rtc.ptyDc?.readyState === "open"
+      ) {
         return sendPtyInputRef.current(buf);
       }
-      const accepted = pendingInputRef.current.enqueue(sessionGenerationRef.current, buf);
-      updateQueuedInputState();
-      if (accepted) armPendingInputExpiry();
-      return accepted;
+      return false;
     },
-    [armPendingInputExpiry, sessionId, updateQueuedInputState],
+    [connection, sessionId],
   );
 
   const sendJson = useCallback(
@@ -2202,8 +1232,8 @@ export function useSessionSocket({
         const payload = msg as Record<string, unknown>;
         const type = payload.type;
         const operation =
-          type === "take_control"
-            ? "take_control"
+          type === "take_control" || type === "focus_view"
+            ? type
             : type === "resize" || type === "scroll" || type === "redraw" || type === "snapshot"
               ? type
               : null;
@@ -2212,10 +1242,7 @@ export function useSessionSocket({
           return sendControlRef.current(operation, parameters);
         }
       }
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-      ws.send(JSON.stringify(msg));
-      return true;
+      return false;
     },
     [sessionId],
   );

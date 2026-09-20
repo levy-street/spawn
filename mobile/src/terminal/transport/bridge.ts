@@ -26,7 +26,34 @@ export interface SignalTranscriptRequest {
 
 type NativeMessage = { v: typeof TERMINAL_BRIDGE_VERSION };
 
+export interface PairAttachment {
+  attachmentId: string;
+  sessionId: string;
+  viewId: string;
+}
+export interface PairChannelMessage {
+  attachmentId: string;
+  channel: "pty" | "ctl";
+  event: "open" | "data" | "close" | "ack" | "send" | "received";
+  data?: string;
+  binary?: boolean;
+  sequence?: number;
+  bytes?: number;
+}
+
 export type NativeToWorkerMessage =
+  | (NativeMessage & { type: "host-consumer-open" | "host-consumer-close"; consumerId: string })
+  | (NativeMessage & { type: "host-consumer-received"; consumerId: string; sequence: number })
+  | (NativeMessage & {
+      type: "host-consumer-command";
+      consumerId: string;
+      command:
+        | { type: "host-request"; requestId: string; operation: string; payload?: unknown }
+        | { type: "host-cancel"; requestId: string };
+    })
+  | (NativeMessage & PairAttachment & { type: "pair-attach" })
+  | (NativeMessage & PairAttachment & { type: "pair-view" })
+  | (NativeMessage & PairChannelMessage & { type: "pair-command" | "pair-event" })
   | (NativeMessage & {
       type: "init";
       mode: "session" | "host";
@@ -108,9 +135,20 @@ export type NativeToWorkerMessage =
   | (NativeMessage & { type: "host-cancel"; requestId: string })
   | (NativeMessage & { type: "close" });
 
-type WorkerMessage = { v: typeof TERMINAL_BRIDGE_VERSION };
+type WorkerMessage = {
+  v: typeof TERMINAL_BRIDGE_VERSION;
+  /** Session events remain bound to the attachment that emitted them. */
+  attachmentId?: string | null;
+};
 
 export type WorkerToNativeMessage =
+  | (WorkerMessage & {
+      type: "host-consumer-event";
+      consumerId: string;
+      message: unknown;
+      sequence?: number;
+    })
+  | (WorkerMessage & PairChannelMessage & { type: "pair-command" | "pair-event" })
   | (WorkerMessage & { type: "ready"; renderer: "webgl" | "dom" | null })
   | (WorkerMessage & { type: "state"; state: TransportState; gate?: string })
   | (WorkerMessage & { type: "signal-frame"; frame: unknown })
@@ -226,6 +264,14 @@ export function parseWorkerMessage(raw: string): WorkerToNativeMessage {
 }
 
 const NATIVE_MESSAGE_TYPES = new Set([
+  "host-consumer-open",
+  "host-consumer-close",
+  "host-consumer-command",
+  "host-consumer-received",
+  "pair-attach",
+  "pair-view",
+  "pair-command",
+  "pair-event",
   "init",
   "connect",
   "signal-frame",
@@ -254,6 +300,9 @@ const NATIVE_MESSAGE_TYPES = new Set([
 ]);
 
 const WORKER_MESSAGE_TYPES = new Set([
+  "host-consumer-event",
+  "pair-command",
+  "pair-event",
   "ready",
   "state",
   "display",
@@ -318,16 +367,52 @@ type WorkerListener = (message: WorkerToNativeMessage) => void;
 export class WorkerBridge {
   readonly #listeners = new Set<WorkerListener>();
   #sender: ((raw: string) => void) | null = null;
+  #ready = false;
+  #readiness: Promise<void> | null = null;
+  #resolveReady: (() => void) | null = null;
+  #rejectReady: ((error: Error) => void) | null = null;
 
-  attach(sender: (raw: string) => void): () => void {
+  attach(sender: (raw: string) => void, ready = true): () => void {
+    this.#clearReadiness();
     this.#sender = sender;
+    this.#ready = ready;
     return () => {
-      if (this.#sender === sender) this.#sender = null;
+      if (this.#sender !== sender) return;
+      this.#sender = null;
+      this.#ready = false;
+      this.#clearReadiness();
     };
+  }
+
+  setReady(sender: (raw: string) => void, ready: boolean): void {
+    // A late load event from the outgoing owner cannot activate its successor.
+    if (this.#sender !== sender) return;
+    this.#ready = ready;
+    if (ready) this.#resolveReady?.();
+    else this.#clearReadiness();
+  }
+
+  whenReady(): Promise<void> {
+    if (!this.#sender)
+      return Promise.reject(new BridgeProtocolError("Terminal worker is not attached."));
+    if (this.#ready) return Promise.resolve();
+    this.#readiness ??= new Promise<void>((resolve, reject) => {
+      this.#resolveReady = resolve;
+      this.#rejectReady = reject;
+    });
+    return this.#readiness;
+  }
+
+  #clearReadiness(): void {
+    this.#rejectReady?.(new BridgeProtocolError("Terminal worker document was retired."));
+    this.#readiness = null;
+    this.#resolveReady = null;
+    this.#rejectReady = null;
   }
 
   send(message: NativeToWorkerMessage): void {
     if (!this.#sender) throw new BridgeProtocolError("Terminal worker is not attached.");
+    if (!this.#ready) throw new BridgeProtocolError("Terminal worker document is not ready.");
     this.#sender(serializeNativeMessage(message));
   }
 

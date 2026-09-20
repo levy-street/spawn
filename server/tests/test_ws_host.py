@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from spawn_server import auth
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
@@ -31,7 +33,7 @@ from spawn_server.ws.host import (
 )
 
 
-def _signed_host_wire(signal_type: str, session_id: str, host_id: str) -> str:
+def _signed_host_wire(signal_type: str, session_id: str, host_id: str, version: int = 1) -> str:
     vectors = json.loads(
         (Path(__file__).parents[2] / "proto" / "signed-signal-wire-v1-vectors.json").read_text()
     )["vectors"]
@@ -39,6 +41,7 @@ def _signed_host_wire(signal_type: str, session_id: str, host_id: str) -> str:
     envelope.update(
         {
             "type": signal_type,
+            "protocol_version": version,
             "session_id": session_id,
             "scope_id": host_id,
             "sender_role": "browser" if signal_type == "rtc.offer" else "daemon",
@@ -192,16 +195,18 @@ def _json_messages(ws: FakeWebSocket) -> list[dict[str, Any]]:
     return [json.loads(item) for item in ws.sent_text]
 
 
-def _metadata(host_id: str) -> dict[str, object]:
+def _metadata(host_id: str, version: int = HOST_CONTROL_VERSION) -> dict[str, object]:
     return {
         "scope_type": "host",
         "scope_id": host_id,
         "protocol": HOST_CONTROL_PROTOCOL,
-        "protocol_version": HOST_CONTROL_VERSION,
+        "protocol_version": version,
     }
 
 
-async def _start_daemon(user_id: str, host_id: str) -> tuple[FakeWebSocket, asyncio.Task[None]]:
+async def _start_daemon(
+    user_id: str, host_id: str, *, shared: bool = True
+) -> tuple[FakeWebSocket, asyncio.Task[None]]:
     socket = FakeWebSocket(
         authorization=f"Bearer {auth.issue_daemon_token(host_id, user_id)}",
         subprotocols=["spawn.control.v3"],
@@ -214,6 +219,7 @@ async def _start_daemon(user_id: str, host_id: str) -> tuple[FakeWebSocket, asyn
             "os": "linux",
             "arch": "x86_64",
             "version": "test",
+            "supports_device_connections": shared,
         }
     )
     await _wait_until(
@@ -384,6 +390,35 @@ async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     }
     assert await broker.rtc_session_for("zero-agent-session") is None
     await _stop_daemon(daemon_socket, daemon_task)
+
+
+async def test_device_connection_reports_an_old_daemon_without_forwarding_the_offer(client):
+    user_id, token = await _signup(client, "shared-rtc-old-daemon@example.com")
+    host_id = await _create_host(user_id, "old-daemon")
+    daemon_socket, daemon_task = await _start_daemon(user_id, host_id, shared=False)
+    browser = FakeWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(host_ws(browser, host_id=host_id, rtc_version=2))
+    try:
+        await _wait_until(lambda: bool(browser.sent_text))
+        session_id = str(uuid.uuid4())
+        browser.queue_text(
+            {
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "signed_envelope": _signed_host_wire("rtc.offer", session_id, host_id, 2),
+                **_metadata(host_id, 2),
+            }
+        )
+        await _wait_until(
+            lambda: any(
+                frame.get("code") == "daemon_update_required" for frame in _json_messages(browser)
+            )
+        )
+        assert not any(frame.get("type") == "rtc.offer" for frame in _json_messages(daemon_socket))
+    finally:
+        browser.queue_disconnect()
+        await asyncio.wait_for(task, timeout=1)
+        await _stop_daemon(daemon_socket, daemon_task)
 
 
 async def test_pending_host_rtc_binding_expires_with_status(client, monkeypatch):
@@ -699,17 +734,23 @@ async def test_host_ice_restart_reuses_live_binding_and_unknown_is_unavailable(c
     await asyncio.gather(browser_task, _stop_daemon(daemon_socket, daemon_task))
 
 
-async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgrade(client):
+@pytest.mark.parametrize("version", [1, 2])
+async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgrade(
+    client, version
+):
     user_id, token = await _signup(client, "host-rtc-signed-relay@example.com")
     host_id = await _create_host(user_id, "signed-answer-host")
     session_id = str(uuid.uuid4())
-    offer_wire = _signed_host_wire("rtc.offer", session_id, host_id)
-    answer_wire = _signed_host_wire("rtc.answer", session_id, host_id)
+    offer_wire = _signed_host_wire("rtc.offer", session_id, host_id, version)
+    answer_wire = _signed_host_wire("rtc.answer", session_id, host_id, version)
     daemon_socket, daemon_task = await _start_daemon(user_id, host_id)
     browser_socket = FakeWebSocket(authorization=f"Bearer {token}")
-    browser_task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
+    browser_task = asyncio.create_task(
+        host_ws(browser_socket, host_id=host_id, rtc_version=version)
+    )  # type: ignore[arg-type]
     try:
         await _wait_until(lambda: bool(browser_socket.sent_text))
+        assert _json_messages(browser_socket)[0]["protocol_version"] == version
         offers_before = sum(
             message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket)
         )
@@ -718,7 +759,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "type": "rtc.offer",
                 "session_id": session_id,
                 "signed_envelope": None,
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         browser_socket.queue_text(
@@ -727,7 +768,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "session_id": session_id,
                 "signed_envelope": None,
                 "sdp": "v=0\r\nraw downgrade",
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         await asyncio.sleep(0.02)
@@ -736,12 +777,35 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
             == offers_before
         )
 
+        if version == 2:
+            # v2 never accepts a raw offer, including its very first offer.
+            browser_socket.queue_text(
+                {
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "sdp": "v=0\r\n",
+                    **_metadata(host_id, version),
+                }
+            )
+            browser_socket.queue_text(
+                {
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "signed_envelope": _signed_host_wire("rtc.offer", session_id, host_id, 1),
+                    **_metadata(host_id, version),
+                }
+            )
+            await asyncio.sleep(0.02)
+            assert (
+                sum(message.get("type") == "rtc.offer" for message in _json_messages(daemon_socket))
+                == offers_before
+            )
         browser_socket.queue_text(
             {
                 "type": "rtc.offer",
                 "session_id": session_id,
                 "signed_envelope": offer_wire,
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         await _wait_until(
@@ -766,7 +830,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "type": "rtc.answer",
                 "session_id": session_id,
                 "binding_nonce": binding_nonce,
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         daemon_socket.queue_text(
@@ -775,7 +839,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "session_id": session_id,
                 "binding_nonce": binding_nonce,
                 "signed_envelope": None,
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         daemon_socket.queue_text(
@@ -785,7 +849,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "binding_nonce": binding_nonce,
                 "signed_envelope": None,
                 "sdp": "v=0\r\nraw downgrade",
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         daemon_socket.queue_text(
@@ -794,7 +858,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "session_id": session_id,
                 "binding_nonce": binding_nonce,
                 "sdp": "v=0\r\nraw downgrade",
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         daemon_socket.queue_text(
@@ -803,7 +867,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "session_id": session_id,
                 "binding_nonce": binding_nonce,
                 "signed_envelope": answer_wire,
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         await _wait_until(
@@ -830,7 +894,7 @@ async def test_host_signed_offer_answer_survive_all_relays_and_refuse_raw_downgr
                 "session_id": str(uuid.uuid4()),
                 "signed_envelope": offer_wire,
                 "sdp": "v=0\r\nsubstitute",
-                **_metadata(host_id),
+                **_metadata(host_id, version),
             }
         )
         await asyncio.sleep(0.02)

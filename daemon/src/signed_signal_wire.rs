@@ -295,11 +295,11 @@ fn validate_tuple(
     transcript: &SignedSignalTranscript,
 ) -> Result<(), SignedRtcWireError> {
     protocol.validate_scope(transcript.scope_type())?;
-    let exact_version = match protocol {
-        RtcProtocol::Session => 2,
-        RtcProtocol::Host => 1,
+    let accepted = match protocol {
+        RtcProtocol::Session => transcript.protocol_version() == 2,
+        RtcProtocol::Host => matches!(transcript.protocol_version(), 1 | 2),
     };
-    if transcript.protocol_version() != exact_version {
+    if !accepted {
         return Err(SignedRtcWireError::InconsistentTuple(
             "protocol_version does not match the current protocol",
         ));
@@ -487,7 +487,7 @@ mod tests {
     fn shared_wire_vectors_sign_and_verify_in_rust() {
         let golden = golden();
         assert_eq!(golden.format, "spawn-signed-signal-wire-v1");
-        assert_eq!(golden.vectors.len(), 2);
+        assert_eq!(golden.vectors.len(), 3);
         let signing_key = SigningKey::from_bytes(&decode_hex_32(&golden.signing_seed_hex));
         let sender = public_key_from_wire(&golden.sender_public_key_wire).unwrap();
         let intended = public_key_from_wire(&golden.intended_peer_public_key_wire).unwrap();
@@ -517,7 +517,7 @@ mod tests {
         let sender = public_key_from_wire(&golden.sender_public_key_wire).unwrap();
         let intended = public_key_from_wire(&golden.intended_peer_public_key_wire).unwrap();
         for (index, vector) in golden.vectors.iter().enumerate() {
-            let other = &golden.vectors[1 - index].envelope;
+            let other = &golden.vectors[if index == 0 { 1 } else { 0 }].envelope;
             for field in &golden.mutation_fields {
                 let mutated = mutate(&vector.envelope, field, other);
                 let wire = serde_json::to_string(&mutated).unwrap();

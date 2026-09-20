@@ -220,13 +220,13 @@ export class AlertSocketClient {
   private readonly unsubscribeMessage: () => void;
 
   constructor(
-    url: () => string | Promise<string>,
+    url: (baseUrl?: string) => string | Promise<string>,
     createWebSocket?: (url: string, protocol: string) => WebSocket,
   ) {
     this.socket = new ReconnectingSocket({
       url,
       protocol: ALERT_PROTOCOL,
-      ...(createWebSocket ? {} : { authorization: () => authToken.get() }),
+      ...(createWebSocket ? {} : { authorization: () => authToken.snapshot() }),
       watchdogFrameTypes: ["alerts.ping"],
       ...(createWebSocket ? { createWebSocket } : {}),
     });
