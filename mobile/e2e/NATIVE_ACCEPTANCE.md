@@ -32,6 +32,13 @@ that account rather than resetting the ready identity during device registration
 Fresh logins and account switches still use the normal account-adoption path;
 registration waits for the expected account to be ready.
 
+Identity retirement repeats five account-switch round trips after replacing the
+revoked identity. Every round verifies that the second account has no hosts or
+first-account attachments, then remounts both sessions and host tools and checks
+terminal input after returning to the first account. The report records
+`account_switch_rounds`. Repeated navigation and WebView removal exercise the
+Android draw-pass crash fixed by Reanimated 4.1.7; a terminated app fails the case.
+
 ## Build isolation
 
 `prepare-native-acceptance.mjs` copies `mobile/` into a **new directory outside

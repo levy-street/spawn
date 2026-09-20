@@ -132,6 +132,10 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   waiters; a stale owner's load event cannot activate a replacement worker.
   Native acceptance selects an iPhone runtime matching the active Xcode simulator
   SDK; an explicit `--device UUID` opts into another installed runtime.
+  Identity retirement repeats five account-switch round trips with live WebViews,
+  checking account isolation and fresh terminal input after every return. This
+  also exercises native view removal during navigation; Reanimated 4.1.7 or newer
+  in the supported 4.1 line is required for its Android draw-pass mounting fix.
   It warms Settings before timed background cases and foregrounds the disposable
   app directly with `simctl launch` to avoid URL confirmation dialogs. A single
   background cycle returns to the app within one native command, keeping fixture
