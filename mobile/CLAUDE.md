@@ -136,6 +136,9 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   checking account isolation and fresh terminal input after every return. This
   also exercises native view removal during navigation; Reanimated 4.1.7 or newer
   in the supported 4.1 line is required for its Android draw-pass mounting fix.
+  The acceptance driver mirrors the app's complete sign-out cleanup, including
+  connection-state reset, account-query clearing and navigation to login, before
+  adopting another account.
   It warms Settings before timed background cases and foregrounds the disposable
   app directly with `simctl launch` to avoid URL confirmation dialogs. A single
   background cycle returns to the app within one native command, keeping fixture

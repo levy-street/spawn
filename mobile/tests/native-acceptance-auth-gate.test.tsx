@@ -1,6 +1,7 @@
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { act, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
+import { AppState } from "react-native";
 import { authToken } from "@/data/api/auth-token";
 import { setBaseUrl } from "@/data/api/config";
 import { useLoginMutation, useMeQuery } from "@/data/queries/auth";
@@ -35,9 +36,11 @@ jest.mock("expo-font", () => ({ useFonts: () => [true, null] }));
 jest.mock("expo-splash-screen", () => ({ hideAsync: async () => {} }));
 jest.mock("expo-system-ui", () => ({ setBackgroundColorAsync: async () => {} }));
 jest.mock("expo-router", () => ({
+  router: { replace: jest.fn() },
   usePathname: () => "/workspaces",
   useRouter: () => ({ replace: jest.fn() }),
 }));
+jest.mock("@/lib/push", () => ({ unregisterForPushNotifications: jest.fn(async () => {}) }));
 jest.mock(
   "react-native-safe-area-context",
   () => require("react-native-safe-area-context/jest/mock").default,
@@ -312,6 +315,93 @@ test("normal login retains real AuthGate queries across delayed login and config
     client.clear();
     fetch.mockRestore();
     await authToken.clear();
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  }
+});
+
+test("repeated native account switches clear the previous account before installing its replacement token", async () => {
+  jest.useFakeTimers();
+  const previousAppState = AppState.currentState;
+  AppState.currentState = "active";
+  await setBaseUrl("http://127.0.0.1:18100");
+  await authToken.clear();
+  const other = { ...USER, id: "22222222-2222-4222-8222-222222222222", email: "other@example.com" };
+  let client!: QueryClient;
+  let account = { accountId: null as string | null, ready: false };
+  let command: { id: string; action: string; payload: { account: string } } | null = null;
+  const events: Array<{ type: string; status: string; commandId?: string }> = [];
+  const priorAccountCache: unknown[] = [];
+  let bootstrapped = false;
+  const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/__acceptance/bootstrap") {
+      if (bootstrapped) priorAccountCache.push(client.getQueryData(["previous-account-private"]));
+      bootstrapped = true;
+      return response({
+        accountId: USER.id,
+        bearerToken: "fixture-a",
+        candidateCommit: "candidate",
+        secondAccount: { accountId: other.id, bearerToken: "fixture-b" },
+      });
+    }
+    if (path === "/__acceptance/event") {
+      events.push(JSON.parse(String(init?.body)));
+      return response(null);
+    }
+    if (path === "/__acceptance/device") return response({ approved: true });
+    if (path === "/__acceptance/command") {
+      const next = command;
+      command = null;
+      return response(next);
+    }
+    if (path === "/api/auth/logout") return new Response(null, { status: 204 });
+    if (path === "/api/auth/config") return response(CONFIG);
+    if (path === "/api/hosts") return response([]);
+    if (path === "/api/me") {
+      const token = new Headers(init?.headers).get("Authorization");
+      if (token === "Bearer fixture-a") return response({ user: USER });
+      if (token === "Bearer fixture-b") return response({ user: other });
+      return response({ detail: "not signed in" }, 401);
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  });
+  function Observe() {
+    client = useQueryClient();
+    account = useAuthenticatedAccount();
+    return null;
+  }
+  const view = await render(
+    <AppProviders>
+      <AuthGate>
+        <Observe />
+        <NativeAcceptanceController />
+      </AuthGate>
+    </AppProviders>,
+  );
+  try {
+    await waitFor(() =>
+      expect(events).toContainEqual(expect.objectContaining({ type: "boot", status: "passed" })),
+    );
+    for (const [index, next] of ["b", "a", "b", "a"].entries()) {
+      client.setQueryData(["previous-account-private"], { owner: account.accountId });
+      const id = `switch-${index}`;
+      command = { id, action: "switch-account", payload: { account: next } };
+      await waitFor(
+        () => expect(events.find((event) => event.commandId === id)?.status).toBe("passed"),
+        { timeout: 5_000 },
+      );
+      expect(account).toEqual({ accountId: next === "a" ? USER.id : other.id, ready: true });
+      // Inspect at the next bootstrap, before account adoption could hide stale
+      // data by clearing it later. The UI's sign-out action already does this.
+      expect(priorAccountCache).toEqual(Array(index + 1).fill(undefined));
+    }
+  } finally {
+    await view.unmount();
+    client.clear();
+    fetch.mockRestore();
+    await authToken.clear();
+    AppState.currentState = previousAppState;
     jest.clearAllTimers();
     jest.useRealTimers();
   }

@@ -31,6 +31,10 @@ after validating its account with the API. It lets the real AuthGate restore
 that account rather than resetting the ready identity during device registration.
 Fresh logins and account switches still use the normal account-adoption path;
 registration waits for the expected account to be ready.
+Sign-out and account switches perform the same successful-logout cleanup as the
+app's sign-out controls: reset connection state, clear account queries, and route
+to login before installing another account's token. Calling only the logout API
+leaves cached account data alive and does not represent the app's sign-out flow.
 
 Identity retirement repeats five account-switch round trips after replacing the
 revoked identity. Every round verifies that the second account has no hosts or
