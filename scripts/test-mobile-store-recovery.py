@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Regression coverage for skipped ancestors and original-release identity."""
 import copy
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
@@ -51,6 +53,31 @@ class RecoveryTests(unittest.TestCase):
                 recovery.plan_from_log(log({**plan, **change}), SHA)
         with self.assertRaises(ValueError):
             recovery.plan_from_log(log(plan) + "\n" + log(plan), SHA)
+
+    def test_new_and_old_cli_capture_logs_without_printing_private_ansi(self):
+        plan = {"from": BASE, "to": SHA, "mobile_native_build": "yes"}
+        log = "\x1b[31mprivate command output\x1b[0m\n" + json.dumps(plan, indent=2)
+        for modern in (True, False):
+            with self.subTest(modern=modern):
+                def cli(*args):
+                    if args == ("gh", "api", "--help"):
+                        return "--allow-escape-sequences" if modern else "old CLI help"
+                    self.assertEqual(args[:3], ("gh", "api", "repos/levy-street/spawn/actions/jobs/123/logs"))
+                    if ("--allow-escape-sequences" in args) != modern:
+                        raise subprocess.CalledProcessError(1, args, stderr="private CLI response")
+                    return log
+                output = io.StringIO()
+                with patch.object(recovery, "run", side_effect=cli), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                    actual = recovery.plan_from_log(recovery.read_plan_log(123), SHA)
+                self.assertEqual(actual, plan)
+                self.assertEqual(output.getvalue(), "")
+
+    def test_log_download_failure_names_stage_without_exposing_response(self):
+        error = subprocess.CalledProcessError(1, ["gh"], output="private raw log", stderr="private signed URL")
+        with patch.object(recovery, "run", side_effect=["--allow-escape-sequences", error]):
+            with self.assertRaises(ValueError) as raised:
+                recovery.read_plan_log(123)
+        self.assertEqual(str(raised.exception), "Could not download the original release plan log; no store operation allowed")
 
     def test_current_deployment_must_match_and_acceptance_remains_required(self):
         with patch.object(recovery.gate, "validate_aggregate") as validate:
