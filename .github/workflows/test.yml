@@ -20,6 +20,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  recovery-prerequisite-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/diagnose/store-recovery-prerequisites'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: tools
+      - name: Read original release prerequisites without production secrets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util, re, subprocess, tempfile
+          from pathlib import Path
+          p = Path('tools/scripts/check-mobile-store-recovery.py').resolve()
+          spec = importlib.util.spec_from_file_location('recovery', p)
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          original = m.run
+          def trace(*args):
+              print('Read-only command:', ' '.join(args), flush=True)
+              try:
+                  result = original(*args)
+                  print('Command succeeded', flush=True)
+                  return result
+              except subprocess.CalledProcessError as error:
+                  # Never disclose response bodies or signed redirect URLs.
+                  status = re.findall(r'HTTP [0-9]{3}', error.stderr or '')
+                  print('Exit:', error.returncode, 'HTTP statuses:', status, flush=True)
+                  raise SystemExit('Read-only prerequisite failed')
+          m.run = trace
+          release = m.api('actions/runs/35514440361')
+          candidate = m.validate_run(release)
+          jobs = m.api(f"actions/runs/35514440361/attempts/{release['run_attempt']}/jobs?per_page=100")
+          job = m.required_job(jobs['jobs'], 'what does this owe')
+          plan = m.plan_from_log(m.run('gh', 'api', f"repos/{m.REPOSITORY}/actions/jobs/{job['id']}/logs"), candidate)
+          m.run('git', 'merge-base', '--is-ancestor', candidate, 'HEAD')
+          with tempfile.TemporaryDirectory() as directory:
+              m.run('gh', 'run', 'download', '35514440361', '--repo', m.REPOSITORY,
+                    '--name', 'release-acceptance', '--dir', directory)
+              evidence = m.gate.read_json(Path(directory) / 'acceptance.json')
+              deployed, tree = m.gate.production_identity('https://spawnd.dev')
+              expected = m.run('git', 'rev-parse', f'{candidate}:daemon').strip()
+              m.validate_identity(candidate, plan['from'], evidence, deployed, tree, expected)
+          m.gate.wait_ci(m.REPOSITORY, candidate, windows=m.gate.requires_windows(candidate, plan['from']), timeout=30)
+          print('All read-only prerequisites passed')
+          PY
   test:
     if: github.event_name != 'workflow_dispatch' || inputs.arm64_only != true
     runs-on: ubuntu-24.04
