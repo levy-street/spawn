@@ -783,9 +783,9 @@ describe("approveBrowserHostPin Host ID seeding", () => {
   test("announces a revision when trust changes, so a refused pane can retry", async () => {
     const factory = new IDBFactory();
     const seen: number[] = [];
-    const unsubscribe = subscribeToBrowserHostPinChanges(() =>
-      seen.push(getBrowserHostPinRevision()),
-    );
+    const unsubscribe = subscribeToBrowserHostPinChanges((changed) => {
+      if (changed) seen.push(getBrowserHostPinRevision());
+    });
     try {
       const before = getBrowserHostPinRevision();
       await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
@@ -819,12 +819,13 @@ describe("approveBrowserHostPin Host ID seeding", () => {
     expect(bound?.hostIds).toEqual([HOST_ID, OTHER_HOST_ID]);
   });
 
-  test("replayed gossip for an approved host does not restart connection subscribers", async () => {
+  test("replayed gossip reconfirms trust without changing its revision or age", async () => {
     const factory = new IDBFactory();
     const seen: number[] = [];
-    const unsubscribe = subscribeToBrowserHostPinChanges(() =>
-      seen.push(getBrowserHostPinRevision()),
-    );
+    const reconfirmed: number[] = [];
+    const unsubscribe = subscribeToBrowserHostPinChanges((changed) => {
+      (changed ? seen : reconfirmed).push(getBrowserHostPinRevision());
+    });
     try {
       const first = await approveBrowserHostPin(
         { ...approvalInput(), hostIds: [HOST_ID] },
@@ -840,6 +841,7 @@ describe("approveBrowserHostPin Host ID seeding", () => {
         ).toEqual(first);
       }
       expect(seen).toHaveLength(1);
+      expect(reconfirmed).toEqual([seen[0], seen[0], seen[0]]);
       await approveBrowserHostPin(
         { ...approvalInput(), hostIds: [OTHER_HOST_ID] },
         options(factory),

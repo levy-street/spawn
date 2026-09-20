@@ -700,31 +700,33 @@ function mergeHostIds(existing: readonly string[], seed: readonly string[]): str
  * connect because no pin matched has no way to learn that the operator has
  * since re-possessed the host — so it stays dead while the copy on screen tells
  * the reader that re-possessing will bring it back. Callers subscribe to this
- * and re-run their trust decision when it moves.
+ * and re-run their trust decision when it moves. Reconfirming an unchanged pin
+ * notifies with changed=false so refused roots can recover from device approval
+ * without restarting healthy or already-recovering roots.
  *
  * Deliberately page-local: it reports what *this* page did, which is the case
  * the warm terminal pool keeps mounted across navigation. Another tab's
  * approval is not observed here, and reloading still picks it up.
  */
 let hostPinRevision = 0;
-const hostPinListeners = new Set<() => void>();
+const hostPinListeners = new Set<(changed: boolean) => void>();
 
 export function getBrowserHostPinRevision(): number {
   return hostPinRevision;
 }
 
-export function subscribeToBrowserHostPinChanges(listener: () => void): () => void {
+export function subscribeToBrowserHostPinChanges(listener: (changed: boolean) => void): () => void {
   hostPinListeners.add(listener);
   return () => {
     hostPinListeners.delete(listener);
   };
 }
 
-function announceBrowserHostPinChange(): void {
-  hostPinRevision += 1;
+function announceBrowserHostPinChange(changed = true): void {
+  if (changed) hostPinRevision += 1;
   for (const listener of [...hostPinListeners]) {
     try {
-      listener();
+      listener(changed);
     } catch {
       // A bad subscriber must not stop the others from hearing about it.
     }
@@ -805,9 +807,9 @@ export async function approveBrowserHostPin(
       };
       return { nextRecord: created, result: { pin: publicPin(created), changed: true } };
     });
-    // Workspace remounts replay signed gossip. An unchanged approval must not
-    // retire every shared connection as though trust had actually changed.
-    if (approved.changed) announceBrowserHostPinChange();
+    // Reconfirmed trust can unblock a refused connection after device approval,
+    // but must not retire healthy connections when workspace gossip repeats.
+    announceBrowserHostPinChange(approved.changed);
     return approved.pin;
   } finally {
     database.close();

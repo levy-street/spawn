@@ -111,8 +111,8 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
 
   useEffect(
     () =>
-      subscribeToBrowserHostPinChanges(() => {
-        for (const connection of owned.current.values()) connection.retry();
+      subscribeToBrowserHostPinChanges((changed) => {
+        for (const connection of owned.current.values()) connection.retry(!changed);
       }),
     [],
   );

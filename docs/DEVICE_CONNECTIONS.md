@@ -66,10 +66,12 @@ physical peer. Recovery creates fresh attachments and host consumers, so delayed
 old dispatches cannot resume. Upload and file-write uncertainty continues to use
 the existing reconciliation flows and stable operation IDs.
 
-Reprocessing an already-active host approval does not notify connection owners
-or renew its approval timestamp. Workspace navigation can replay signed host
-introductions; only a real local trust or routing-binding change triggers the
-trust-change listeners. New approvals, revocations and resets remain visible.
+Reprocessing an already-active host approval does not restart healthy or recovering
+connections or renew its approval timestamp. It can retry a refused root after
+device approval; the browser owner checks its current state so repeated requests
+from different tabs cannot restart recovery. Workspace navigation can replay signed
+host introductions; only a real local trust or routing-binding change restarts a
+healthy connection. New approvals, revocations and resets remain visible.
 
 Opening a running session uses fresh session/host list metadata when available,
 preserving its original cache timestamp. Authentication, attachment authorization

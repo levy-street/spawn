@@ -90,7 +90,11 @@ describe("host pin trust decisions", () => {
     const store = createHostPinStore(persistence);
     const changed = jest.fn();
     const save = jest.spyOn(persistence, "save");
-    const unsubscribe = subscribeHostPinChanges(changed);
+    const reconfirmed = jest.fn();
+    const unsubscribe = subscribeHostPinChanges((didChange) => {
+      if (didChange) changed();
+      else reconfirmed();
+    });
     const approval = { accountId: ACCOUNT_ID, serverOrigin: ORIGIN, hostPublicKey: HOST_KEY };
     try {
       const first = await store.approveExact({ ...approval, hostId: HOST_ID, approvedAtMs: 10 });
@@ -98,6 +102,7 @@ describe("host pin trust decisions", () => {
         expect(await store.approveExact({ ...approval, approvedAtMs: 20 })).toEqual(first);
       }
       expect(changed).toHaveBeenCalledTimes(1);
+      expect(reconfirmed).toHaveBeenCalledTimes(3);
       expect(save).toHaveBeenCalledTimes(1);
       await store.approveExact({ ...approval, hostId: "11111111-2222-4333-8444-555555555556" });
       expect(changed).toHaveBeenCalledTimes(2);

@@ -5,6 +5,7 @@ jest.mock("@/terminal/transport/daemon-trust", () => ({
 }));
 
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
+import { createHostPinStore, type HostPin } from "@/data/trust/host-pins";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
 import { decodeBridgeBytes, encodeBridgeBytes } from "@/terminal/transport/bridge";
 import { HOST_FILE_MAX_BYTES, HOST_STREAM_CHUNK_BYTES } from "@/terminal/transport/host-ctl-codec";
@@ -18,6 +19,7 @@ jest.mock("@/terminal/transport/signed-signalling", () => ({
 }));
 
 jest.mock("@/lib/crypto/bootstrap", () => ({
+  ...jest.requireActual("@/lib/crypto/bootstrap"),
   randomBytes: jest.fn((length: number) => new Uint8Array(length)),
 }));
 
@@ -202,6 +204,59 @@ async function readyTransport(options?: {
   }
   return { bridge, signal, transport };
 }
+
+test("reconfirmed trust preserves a ready root and retries a refused root only once", async () => {
+  const pins: HostPin[] = [];
+  const store = createHostPinStore({
+    load: async () => pins,
+    save: async (pin) => {
+      pins.splice(0, pins.length, pin);
+    },
+    deleteAccount: async () => {
+      pins.length = 0;
+    },
+  });
+  const approval = {
+    accountId: "00000000-0000-4000-8000-000000000001",
+    serverOrigin: "https://spawn.example",
+    hostPublicKey: "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+    hostId: "00112233-4455-6677-8899-aabbccddeeff",
+  };
+  await store.approveExact(approval);
+  const { bridge, signal, transport } = await readyTransport();
+  const count = (type: string) => bridge.sent.filter((message) => message.type === type).length;
+  try {
+    const initialMessages = bridge.sent.length;
+    await store.approveExact(approval);
+    await flush();
+    expect(transport.state).toBe("ready");
+    expect(bridge.sent).toHaveLength(initialMessages);
+    const request = transport.request("fs.read", { path: "~/notes.txt" });
+    respond(bridge, await waitForRequest(bridge, "fs.read"), { stillAttached: true });
+    await expect(request).resolves.toEqual({ stillAttached: true });
+
+    signal.emitState("failed");
+    expect(transport.state).toBe("failed");
+    signal.state = "open";
+    await store.approveExact(approval);
+    await flush();
+    expect(transport.state).toBe("connecting");
+    expect(count("init")).toBe(2);
+    const closes = count("close");
+    await store.approveExact(approval);
+    await store.approveExact(approval);
+    await flush();
+    expect(count("init")).toBe(2);
+    expect(count("close")).toBe(closes);
+
+    // A genuine trust change still fences a recovering root immediately.
+    await store.revokeExact(approval);
+    await flush();
+    expect(count("close")).toBeGreaterThan(closes);
+  } finally {
+    transport.close();
+  }
+});
 
 async function beginRead(
   bridge: FakeBridge,

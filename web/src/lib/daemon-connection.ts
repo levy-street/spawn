@@ -24,7 +24,7 @@ export interface DaemonConnection {
   getSnapshot(): DaemonSnapshot;
   subscribe(listener: () => void): () => void;
   createChannel(label: string): DaemonChannel;
-  retry(): void;
+  retry(onlyIfFailed?: boolean): void;
 }
 const INITIAL: DaemonSnapshot = {
   state: "idle",
@@ -174,8 +174,8 @@ export class SharedDaemonConnection implements DaemonConnection {
     return channel;
   }
 
-  retry(): void {
-    this.post({ type: "retry", owner: this.owner ?? undefined });
+  retry(onlyIfFailed = false): void {
+    this.post({ type: onlyIfFailed ? "retry-refused" : "retry", owner: this.owner ?? undefined });
   }
 
   close(): void {
@@ -376,8 +376,10 @@ export class SharedDaemonConnection implements DaemonConnection {
       return;
     }
     if (message.owner !== this.leader) return;
-    if (message.type === "retry") {
-      root.retryConnection();
+    if (message.type === "retry" || message.type === "retry-refused") {
+      // Check at the owner: a follower's error snapshot can be stale, and
+      // another tab may already have started the approval retry.
+      if (message.type === "retry" || root.getState() === "error") root.retryConnection();
       return;
     }
     if (message.epoch !== this.epoch) return;

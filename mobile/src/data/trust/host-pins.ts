@@ -9,15 +9,15 @@ const DATABASE_NAME = "spawn-trust.db";
 const MAX_PINS = 256;
 const MAX_HOST_IDS = 8;
 const MAX_ORIGIN_LENGTH = 512;
-const pinListeners = new Set<() => void>();
-export function subscribeHostPinChanges(listener: () => void): () => void {
+const pinListeners = new Set<(changed: boolean) => void>();
+export function subscribeHostPinChanges(listener: (changed: boolean) => void): () => void {
   pinListeners.add(listener);
   return () => pinListeners.delete(listener);
 }
-function pinsChanged(): void {
+function pinsChanged(changed = true): void {
   for (const listener of [...pinListeners]) {
     try {
-      listener();
+      listener(changed);
     } catch {
       /* A consumer cannot undo a durable trust decision. */
     }
@@ -221,9 +221,10 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
       ) {
         throw new PinStoreError("PIN_CONFLICT", "Host ID is already bound to another key");
       }
-      // Replaying an existing approval is not a trust change. Keep its age and
-      // avoid the notification that would retire every shared host connection.
+      // Preserve age and healthy connections. A refused connection can retry
+      // after remote device approval even when this local pin was unchanged.
       if (exact?.state === "active" && (hostId === undefined || exact.hostIds.includes(hostId))) {
+        pinsChanged(false);
         return copyPin(exact);
       }
       if (exact?.state !== "active" && counts.active >= MAX_PINS) {

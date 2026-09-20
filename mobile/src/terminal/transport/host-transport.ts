@@ -216,7 +216,8 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#prepared = true;
     this.#lastError = null;
     const epoch = ++this.#prepareEpoch;
-    this.#pinUnsubscribe ??= subscribeHostPinChanges(() => {
+    this.#pinUnsubscribe ??= subscribeHostPinChanges((changed) => {
+      if (!changed && this.#state !== "failed") return;
       this.close();
       void this.open().catch(() => {});
     });
