@@ -495,7 +495,7 @@ printf '%s\n' "smoke-local-browser-live: driving real browser flow"
     bun - <<'JS'
 import { chromium, expect } from "@playwright/test";
 import { existsSync, readFileSync } from "node:fs";
-import { measureSessionOpenings } from "./scripts/measure-session-opening.mjs";
+import { measureSessionOpenings, seedKnownHostGossip } from "./scripts/measure-session-opening.mjs";
 
 const webUrl = process.env.SPAWN_LIVE_WEB_URL;
 const email = process.env.SPAWN_LIVE_EMAIL;
@@ -571,6 +571,7 @@ async function endorseLiveDevice(page) {
     throw new Error(`endorsing the live browser failed: ${posted.status()} ${await posted.text()}`);
   }
   console.log(`live browser device ${device.id} endorsed by the pinned anchor`);
+  return device;
 }
 
 // Deliberately a browser with its ordinary settings: every one of them hides
@@ -637,7 +638,8 @@ try {
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForURL((url) => !url.pathname.startsWith("/login"), { timeout: 15_000 });
 
-  await endorseLiveDevice(page);
+  const liveDevice = await endorseLiveDevice(page);
+  await seedKnownHostGossip(page, accountId, liveDevice.id);
 
   // The workspace and its first shell session already exist — created through
   // the same API the launcher calls, so the live flow starts at the surface

@@ -221,6 +221,11 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
       ) {
         throw new PinStoreError("PIN_CONFLICT", "Host ID is already bound to another key");
       }
+      // Replaying an existing approval is not a trust change. Keep its age and
+      // avoid the notification that would retire every shared host connection.
+      if (exact?.state === "active" && (hostId === undefined || exact.hostIds.includes(hostId))) {
+        return copyPin(exact);
+      }
       if (exact?.state !== "active" && counts.active >= MAX_PINS) {
         throw new PinStoreError("PIN_LIMIT", "Host pin capacity has been reached");
       }

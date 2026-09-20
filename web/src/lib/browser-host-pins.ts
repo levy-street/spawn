@@ -747,9 +747,13 @@ export async function approveBrowserHostPin(
       );
       if (existing?.state === "active") {
         const merged = mergeHostIds(existing.hostIds, seedHostIds);
-        if (merged.length === existing.hostIds.length) return { result: publicPin(existing) };
+        if (
+          merged.length === existing.hostIds.length &&
+          merged.every((id, index) => id === existing.hostIds[index])
+        )
+          return { result: { pin: publicPin(existing), changed: false } };
         const updated: StoredBrowserHostPinV1 = { ...existing, hostIds: merged };
-        return { nextRecord: updated, result: publicPin(updated) };
+        return { nextRecord: updated, result: { pin: publicPin(updated), changed: true } };
       }
 
       const now = checkedNow(options);
@@ -776,7 +780,7 @@ export async function approveBrowserHostPin(
           revokedAtMs: null,
           state: "active",
         };
-        return { nextRecord: reactivated, result: publicPin(reactivated) };
+        return { nextRecord: reactivated, result: { pin: publicPin(reactivated), changed: true } };
       }
       if (
         records.filter((record) => record.state === "active").length >= BROWSER_HOST_PIN_MAX_RECORDS
@@ -799,10 +803,12 @@ export async function approveBrowserHostPin(
         state: "active",
         version: BROWSER_HOST_PIN_STORAGE_VERSION,
       };
-      return { nextRecord: created, result: publicPin(created) };
+      return { nextRecord: created, result: { pin: publicPin(created), changed: true } };
     });
-    announceBrowserHostPinChange();
-    return approved;
+    // Workspace remounts replay signed gossip. An unchanged approval must not
+    // retire every shared connection as though trust had actually changed.
+    if (approved.changed) announceBrowserHostPinChange();
+    return approved.pin;
   } finally {
     database.close();
   }
