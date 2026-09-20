@@ -30,6 +30,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
 import { AgentSwitcher } from "@/components/workspace/agent-switcher";
 import { ApiError, type Session, sessions, type Workspace, workspaces } from "@/lib/api";
+import { cachedListItem } from "@/lib/cached-list-item";
 import { remove as removeTile } from "@/lib/grid";
 import { sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
@@ -63,6 +64,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
+    ...cachedListItem<Session>(queryClient, ["sessions"], sessionId),
     refetchInterval: 5_000,
     retry: false,
   });

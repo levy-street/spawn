@@ -63,6 +63,8 @@ scripts/, docs/   build helpers and app-specific notes
 - `e2e/NATIVE_ACCEPTANCE.md` describes the GitHub-hosted iOS simulator and Android
   emulator acceptance job. Its controller and RTC observation hook enter only a
   disposable build copy, using the actual app providers and native WebViews.
+  Opening measurements separate renderer, channel, replay paint and confirmed
+  input readiness for never-viewed and reopened sessions on a ready parent.
   The Android job removes generated build directories after preserving the APK
   and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
   Its hosted disk preflight reclaims only named unused tools on the disposable
@@ -114,6 +116,9 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   from the root and sibling consumers. `worker/worker-pair.js` proxies terminal
   channels through the native bridge. Rebuild `worker.html` and `worker-html.ts` with
   `node src/terminal/worker/build-worker.mjs` after worker source edits.
+  Terminal preparation opens session channels while its renderer loads; a bounded
+  native queue holds attachment-scoped events until the renderer can consume them.
+  It never grants readiness or input control before replay and daemon confirmation.
   Read `docs/DEVICE_CONNECTIONS.md` before changing lifecycle or control rules.
   Native surfaces check the three-second background deadline on foreground as
   well as in the timer callback, because the runtime can pause background timers.

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react-native";
+import { act, render, screen } from "@testing-library/react-native";
 import { StyleSheet, type ViewStyle } from "react-native";
 
 import { ConnectionStateOverlay } from "@/components/terminal-ui/connection-status";
@@ -25,16 +25,40 @@ describe("the connection banner over a terminal that has been ready", () => {
     expect(style.bottom).toBe(0);
   });
 
-  test("the first connection still takes the whole surface, with no rule of its own", async () => {
-    await render(
+  test("a slow first attachment shows its status after the grace period", async () => {
+    jest.useFakeTimers();
+    const view = await render(
       <ThemeProvider>
         <ConnectionStateOverlay hasEverBeenReady={false} onRetry={jest.fn()} state="connecting" />
       </ThemeProvider>,
     );
 
+    expect(screen.queryByTestId("connection-state-connecting")).toBeNull();
+    await act(() => jest.advanceTimersByTime(240));
     const style = bannerStyle("connection-state-connecting");
     expect(style.borderTopWidth).toBe(0);
     expect(style.position).toBe("absolute");
+    await view.unmount();
+    jest.useRealTimers();
+  });
+
+  test("a first attachment that finishes promptly never flashes a connecting screen", async () => {
+    jest.useFakeTimers();
+    const view = await render(
+      <ThemeProvider>
+        <ConnectionStateOverlay hasEverBeenReady={false} onRetry={jest.fn()} state="connecting" />
+      </ThemeProvider>,
+    );
+    await act(() => jest.advanceTimersByTime(120));
+    await view.rerender(
+      <ThemeProvider>
+        <ConnectionStateOverlay hasEverBeenReady onRetry={jest.fn()} state="ready" />
+      </ThemeProvider>,
+    );
+    await act(() => jest.advanceTimersByTime(500));
+    expect(screen.queryByTestId("connection-state-connecting")).toBeNull();
+    await view.unmount();
+    jest.useRealTimers();
   });
 });
 

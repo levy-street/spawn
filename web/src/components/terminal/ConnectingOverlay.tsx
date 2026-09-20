@@ -12,10 +12,6 @@ import { cn } from "@/lib/utils";
 const ENTER_DELAY_MS = 240;
 /** Matches the leave animation below; the node unmounts once it has played. */
 const LEAVE_MS = 260;
-/** How long the "channel open" beat holds before the overlay clears out. Long
- *  enough to read as an outcome rather than a flicker, short enough that the
- *  shell's first prompt is never left waiting behind it. */
-const SECURED_HOLD_MS = 420;
 /** A connect that has not landed by here is not "about to" — say so. */
 const SLOW_AFTER_MS = 8_000;
 
@@ -184,19 +180,6 @@ export function ConnectingOverlay({
   const stage = stageFor(socketState, v3, dcOpen, refusal, hostOffline);
   const secured = stage === "secured";
 
-  // The secured beat is deliberately held: the padlock closing is the one
-  // moment in this overlay worth watching, and without the hold it would last
-  // exactly as long as the fade that removes it.
-  const [held, setHeld] = useState(false);
-  useEffect(() => {
-    if (!secured) {
-      setHeld(false);
-      return;
-    }
-    const timer = setTimeout(() => setHeld(true), SECURED_HOLD_MS);
-    return () => clearTimeout(timer);
-  }, [secured]);
-
   const [slow, setSlow] = useState(false);
   useEffect(() => {
     if (secured) return;
@@ -204,7 +187,9 @@ export function ConnectingOverlay({
     return () => clearTimeout(timer);
   }, [secured]);
 
-  const done = painted || held;
+  // A ready, empty shell is ready too. Never introduce a success-animation
+  // hold after the transport has already completed its initial replay.
+  const done = painted || secured;
 
   // Arm, then leave. The entry timer is cancelled by `done`, so a connection
   // that lands inside the entry delay never mounts the card at all.

@@ -66,6 +66,21 @@ physical peer. Recovery creates fresh attachments and host consumers, so delayed
 old dispatches cannot resume. Upload and file-write uncertainty continues to use
 the existing reconciliation flows and stable operation IDs.
 
+Opening a running session uses fresh session/host list metadata when available,
+preserving its original cache timestamp. Authentication, attachment authorization
+and control ownership still come from the shared transport and daemon. Mobile
+starts the session channels while its terminal WebView loads; up to 512 events
+and 2 MiB of encoded data wait for that renderer. Retirement, queue overflow or
+account changes discard that attachment's pending events. Both channel proxies
+also retain bounded data received before the native channel-open event, then
+deliver it in order after open. In particular, an early daemon `ready` frame
+must not be discarded and force a ten-second attachment retry.
+
+Fast initial attachments have a 240 ms connecting-notice grace period. Readiness,
+replay completion and daemon-confirmed input control remain independent gates;
+the grace period cannot enable input. Errors and recovery remain visible, and
+host-wide failures include the host name in both clients.
+
 A session remembers its controlling device in supervisor memory even when that
 device has no attached views; the lease does not survive a supervisor restart.
 Viewing and reconnecting from another device do not resize the terminal
@@ -87,7 +102,9 @@ Behavioral coverage belongs in daemon native WebRTC tests, the browser connectio
 manager tests, mobile worker/transport tests, and `smoke-local-browser-live.sh`.
 The live smoke checks signed shell output, input, uploads, same-device tab reuse,
 typing in a second session during an 8 MiB upload, and owner handover against an
-isolated API and daemon. Native mobile lifecycle, real network transitions,
+isolated API and daemon. It also measures first and repeat opens of three running
+sessions, checking initial output, input, no connecting flash, exactly one
+attachment on first open, and no replacement peer or ICE offer. Native mobile lifecycle, real network transitions,
 and platform release gates still require their own
 runtime evidence before release.
 

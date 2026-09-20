@@ -87,6 +87,76 @@ async function settle() {
   for (let i = 0; i < 4; i++) await Promise.resolve();
 }
 
+test("ready arriving before open waits for the channel and returns its receive credit", async () => {
+  const posted: Frame[] = [];
+  const view = load("session", (frame) => posted.push(frame));
+  view.handlePairMessage?.({ type: "pair-view", attachmentId: a, sessionId, viewId });
+  const message = {
+    type: "pair-event",
+    attachmentId: a,
+    channel: "ctl",
+    event: "data",
+    data: '{"event":"ready"}',
+    binary: false,
+    sequence: 1,
+  };
+  view.handlePairMessage?.(message);
+  await settle();
+  expect(view.receiveSessionCtl).not.toHaveBeenCalled();
+  expect(posted).toEqual([]);
+  view.handlePairMessage?.({ type: "pair-event", attachmentId: a, channel: "ctl", event: "open" });
+  await settle();
+  expect(view.sessionChannelOpened).toHaveBeenCalledWith("ctlOpen");
+  expect(view.receiveSessionCtl).toHaveBeenCalledWith(message.data);
+  expect(posted).toContainEqual(expect.objectContaining({ event: "received", sequence: 1 }));
+  view.handlePairMessage?.({ type: "pair-event", attachmentId: a, channel: "ctl", event: "open" });
+  expect(view.receiveSessionCtl).toHaveBeenCalledTimes(1);
+  view.closePairChannels?.();
+});
+
+test("retiring an unopened attachment discards its buffered ready frame", async () => {
+  const view = load("session", () => {});
+  view.handlePairMessage?.({ type: "pair-view", attachmentId: a, sessionId, viewId });
+  view.handlePairMessage?.({
+    type: "pair-event",
+    attachmentId: a,
+    channel: "ctl",
+    event: "data",
+    data: "old ready",
+    binary: false,
+    sequence: 1,
+  });
+  view.handlePairMessage?.({ type: "pair-view", attachmentId: b, sessionId, viewId });
+  for (const attachmentId of [a, b]) {
+    view.handlePairMessage?.({ type: "pair-event", attachmentId, channel: "ctl", event: "open" });
+  }
+  await settle();
+  expect(view.receiveSessionCtl).not.toHaveBeenCalled();
+  view.closePairChannels?.();
+});
+
+test("early messages cannot grow without a byte or message bound", () => {
+  for (const data of ["x".repeat(64 * 1024), ""]) {
+    const posted: Frame[] = [];
+    const view = load("session", (frame) => posted.push(frame));
+    view.handlePairMessage?.({ type: "pair-view", attachmentId: a, sessionId, viewId });
+    for (let sequence = 1; sequence <= 1025; sequence++) {
+      view.handlePairMessage?.({
+        type: "pair-event",
+        attachmentId: a,
+        channel: "ctl",
+        event: "data",
+        data,
+        binary: false,
+        sequence,
+      });
+    }
+    expect(posted).toContainEqual(expect.objectContaining({ attachmentId: a, event: "close" }));
+    expect(view.receiveSessionCtl).not.toHaveBeenCalled();
+    view.closePairChannels?.();
+  }
+});
+
 test("two terminal workers share one peer; retiring one attachment leaves the other usable", async () => {
   jest.useFakeTimers();
   const views = new Map<string, Harness>();

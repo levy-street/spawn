@@ -110,6 +110,130 @@ afterEach(() => {
 });
 
 describe("session channels on the shared daemon connection", () => {
+  test("first-open channel setup overlaps renderer loading without allowing early input", async () => {
+    const { bridge, transport } = view();
+    transport.prepare?.();
+    const attachment = commands.find((message) => message.type === "pair-attach");
+    if (!attachment) throw new Error("channels did not start during renderer loading");
+    expect(bridge.sent).toEqual([]);
+    const events = ["pty", "ctl"].map((channel) => ({
+      v: 1,
+      type: "pair-event",
+      attachmentId: attachment.attachmentId,
+      channel,
+      event: "open",
+    }));
+    for (const event of events) root.shared.bridge.receive(JSON.stringify(event));
+    transport.write(Uint8Array.of(1));
+    expect(bridge.sent).toEqual([]);
+    const opening = transport.open();
+    expect(bridge.sent.map((message) => message.type)).toEqual([
+      "init",
+      "pair-view",
+      "pair-event",
+      "pair-event",
+    ]);
+    expect(bridge.sent.slice(2)).toEqual(events);
+    expect(commands.filter((message) => message.type === "pair-attach")).toHaveLength(1);
+    bridge.emit({ v: 1, type: "state", state: "ready" });
+    await opening;
+    transport.write(Uint8Array.of(2));
+    expect(bridge.sent.some((message) => message.type === "input")).toBe(false);
+    bridge.emit({ v: 1, type: "display", owner: true, viewers: 1 });
+    transport.write(Uint8Array.of(3));
+    expect(bridge.sent.at(-1)?.type).toBe("input");
+  });
+
+  test("parent loss discards all events buffered for a renderer that has not loaded", async () => {
+    const { bridge, transport } = view();
+    transport.prepare?.();
+    const attachment = commands.find((message) => message.type === "pair-attach");
+    if (!attachment) throw new Error("missing attachment");
+    const old = {
+      v: 1,
+      type: "pair-event",
+      attachmentId: attachment.attachmentId,
+      channel: "pty",
+      event: "open",
+    };
+    root.shared.bridge.receive(JSON.stringify(old));
+    state("connecting");
+    state("ready");
+    root.shared.bridge.receive(JSON.stringify(old));
+    const opening = transport.open();
+    expect(bridge.sent).not.toContainEqual(old);
+    const current = bridge.sent.find((message) => message.type === "pair-view");
+    expect(current?.attachmentId).not.toBe(attachment.attachmentId);
+    bridge.emit({ v: 1, type: "state", state: "ready" });
+    await opening;
+  });
+
+  test("an unloaded view bounds its queue and closing it cancels preparation retries", () => {
+    jest.useFakeTimers();
+    try {
+      const { bridge, transport } = view();
+      transport.prepare?.();
+      const attachment = commands.find((message) => message.type === "pair-attach");
+      if (!attachment) throw new Error("missing attachment");
+      const event = {
+        v: 1,
+        type: "pair-event",
+        attachmentId: attachment.attachmentId,
+        channel: "pty",
+        event: "open",
+      };
+      for (let index = 0; index <= 512; index++) {
+        root.shared.bridge.receive(JSON.stringify(event));
+      }
+      expect(commands).toContainEqual(
+        expect.objectContaining({
+          type: "pair-command",
+          attachmentId: attachment.attachmentId,
+          event: "close",
+        }),
+      );
+      expect(
+        bridge.sent.every((message) => message.type === "pair-event" && message.event === "close"),
+      ).toBe(true);
+      transport.close();
+      const count = commands.length;
+      jest.advanceTimersByTime(30_000);
+      expect(commands).toHaveLength(count);
+      expect(mockClose).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("an unloaded view bounds UTF-8 bytes independently of message count", () => {
+    const { transport } = view();
+    transport.prepare?.();
+    const attachment = commands.find((message) => message.type === "pair-attach");
+    if (!attachment) throw new Error("missing attachment");
+    for (let sequence = 1; sequence <= 35; sequence++) {
+      root.shared.bridge.receive(
+        JSON.stringify({
+          v: 1,
+          type: "pair-event",
+          attachmentId: attachment.attachmentId,
+          channel: "ctl",
+          event: "data",
+          binary: false,
+          sequence,
+          data: "界".repeat(20 * 1024),
+        }),
+      );
+    }
+    expect(commands).toContainEqual(
+      expect.objectContaining({
+        type: "pair-command",
+        attachmentId: attachment.attachmentId,
+        event: "close",
+      }),
+    );
+    expect(mockClose).not.toHaveBeenCalled();
+  });
+
   test("multiple views attach without negotiating or closing the daemon connection", async () => {
     const a = await readyTransport(),
       b = await readyTransport();

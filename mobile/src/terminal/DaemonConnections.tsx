@@ -60,7 +60,7 @@ function DaemonSurface({
       {(failure || (wasReady.current && state !== "ready")) && (
         <View style={styles.row}>
           <Text style={styles.copy}>
-            {failure ?? `Reconnecting to ${name}. Terminal input is paused.`}
+            {failure ? `${name}: ${failure}` : `Reconnecting to ${name}. Terminal input is paused.`}
           </Text>
           <Button
             accessibilityLabel={`Retry connection to ${name}`}

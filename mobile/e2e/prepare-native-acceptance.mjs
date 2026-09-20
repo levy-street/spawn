@@ -158,11 +158,30 @@ if (hostSurface.split(receive).length !== 2)
   throw new Error("Host worker bridge changed; review the acceptance observation hook.");
 writeFileSync(
   hostSurfacePath,
-  `import { captureNativePeerStats } from '@/terminal/NativeAcceptanceController';\n${hostSurface}`.replace(
+  `import { captureNativePeerStats, captureNativeOpening } from '@/terminal/NativeAcceptanceController';\n${hostSurface}`.replace(
     receive,
     `const probe = JSON.parse(event.nativeEvent.data);
       if (probe.type === 'native-acceptance-peer') {
         captureNativePeerStats(hostId, probe.snapshot); return;
+      }
+      if (probe.type === 'native-acceptance-opening') {
+        captureNativeOpening(probe.sessionId, probe.phase); return;
+      }
+      ${receive}`,
+  ),
+);
+const terminalPath = join(target, "src/terminal/TerminalSurface.tsx");
+const terminal = readFileSync(terminalPath, "utf8");
+if (terminal.split(receive).length !== 2)
+  throw new Error("Terminal bridge changed; review the opening timing hook.");
+writeFileSync(
+  terminalPath,
+  `import { captureNativeOpening } from '@/terminal/NativeAcceptanceController';\n${terminal}`.replace(
+    receive,
+    `const probe = JSON.parse(event.nativeEvent.data);
+      if (probe.type === 'ready') captureNativeOpening(sessionId, 'renderer_ms');
+      if (probe.type === 'native-acceptance-content') {
+        captureNativeOpening(sessionId, 'first_content_ms'); return;
       }
       ${receive}`,
   ),
@@ -175,7 +194,32 @@ const probe = readFileSync(join(target, "e2e/native-peer-probe.js"), "utf8").rep
   }),
 );
 const htmlPath = join(target, "assets/terminal/worker.html");
-const html = readFileSync(htmlPath, "utf8").replace("</head>", `<script>${probe}</script></head>`);
+const contentProbe = `<script>
+(() => {
+  const api = globalThis.spawnWorker;
+  const post = api.post;
+  let observed = false;
+  api.post = (message) => {
+    post(message);
+    if (message.type !== 'state' || message.state !== 'ready' || observed) return;
+    observed = true;
+    // Check actual xterm content after it has had a frame to paint the replay.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const buffer = api.state.term?.buffer.active;
+      if (!buffer) return;
+      for (let row = 0; row < buffer.length; row++) {
+        if (buffer.getLine(row)?.translateToString().includes('native-ready')) {
+          globalThis.ReactNativeWebView?.postMessage(JSON.stringify({type:'native-acceptance-content'}));
+          break;
+        }
+      }
+    }));
+  };
+})();
+</script>`;
+const html = readFileSync(htmlPath, "utf8")
+  .replace("</head>", `<script>${probe}</script></head>`)
+  .replace("</body>", `${contentProbe}</body>`);
 writeFileSync(htmlPath, html);
 writeFileSync(
   join(target, "src/terminal/worker/worker-html.ts"),

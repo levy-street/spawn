@@ -42,6 +42,9 @@ type ScrollListener = (scroll: ScrollState) => void;
 type DiagnosticListener = (diagnostic: WorkerDiagnostic) => void;
 type DisplayListener = (display: DisplayControlState) => void;
 type ConnectionInfoListener = (info: ConnectionInfo) => void;
+type PairEvent = Extract<WorkerToNativeMessage, { type: "pair-command" | "pair-event" }>;
+const MAX_PENDING_VIEW_EVENTS = 512;
+const MAX_PENDING_VIEW_EVENT_BYTES = 2 * 1024 * 1024;
 function newUuid(): string {
   const bytes = randomBytes(16);
   bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
@@ -58,6 +61,8 @@ class WebViewSessionTransport implements SessionTransport {
   #lease: HostTransportLease | null = null;
   #attachmentId: string | null = null;
   #workerStarted = false;
+  #pendingViewEvents: PairEvent[] = [];
+  #pendingViewBytes = 0;
   #displayOwner = false;
   #lastError: TransportError | null = null;
   #inputSequence = 0;
@@ -95,6 +100,43 @@ class WebViewSessionTransport implements SessionTransport {
       false,
     );
     this.#setState("connecting");
+    const shared = this.#lease.shared;
+    this.#subscriptions.push(
+      shared.bridge.onMessage((message) => {
+        if (activeDeviceIdentityAccount() !== this.#accountId) return;
+        if (message.type === "pair-event" && message.attachmentId === this.#attachmentId) {
+          if (!this.#workerStarted) {
+            // Open the channels while the terminal document loads. Receive
+            // credits stay outstanding until that document consumes the data;
+            // this additional native queue is bounded and attachment-scoped.
+            const bytes = new TextEncoder().encode(message.data ?? "").byteLength;
+            if (
+              this.#pendingViewEvents.length >= MAX_PENDING_VIEW_EVENTS ||
+              this.#pendingViewBytes + bytes > MAX_PENDING_VIEW_EVENT_BYTES
+            ) {
+              this.#retryAttachment();
+              return;
+            }
+            this.#pendingViewEvents.push(message);
+            this.#pendingViewBytes += bytes;
+          } else {
+            try {
+              this.options.bridge.send(message);
+            } catch {
+              this.#retryAttachment();
+            }
+          }
+        } else if (message.type === "connection-info") {
+          for (const listener of this.#connectionInfoListeners) listener(message.info);
+        }
+      }),
+      shared.transport.on("state", () => this.#syncConnection()),
+      shared.transport.on("error", (error) => {
+        this.#lastError = error;
+        this.#emitError(error);
+      }),
+    );
+    this.#syncConnection();
   }
   networkChanged(): void {
     // The app-owned daemon surface handles network changes once for every view.
@@ -132,28 +174,8 @@ class WebViewSessionTransport implements SessionTransport {
         fontSize: this.options.fontSize ?? terminalMetrics.fontSize,
         skipLoopbackProbe: true,
       });
-      this.#subscriptions.push(
-        shared.bridge.onMessage((message) => {
-          if (activeDeviceIdentityAccount() !== this.#accountId) return;
-          if (message.type === "pair-event" && message.attachmentId === this.#attachmentId) {
-            try {
-              this.options.bridge.send(message);
-            } catch {
-              this.#retryAttachment();
-            }
-          } else if (message.type === "connection-info") {
-            for (const listener of this.#connectionInfoListeners) listener(message.info);
-          }
-        }),
-      );
-      this.#subscriptions.push(shared.transport.on("state", () => this.#syncConnection()));
-      this.#subscriptions.push(
-        shared.transport.on("error", (error) => {
-          this.#lastError = error;
-          this.#emitError(error);
-        }),
-      );
-      this.#syncConnection();
+      if (this.#attachmentId) this.#startView();
+      else this.#syncConnection();
     } catch (error) {
       this.#rejectOpen?.(error instanceof Error ? error : new Error("Terminal bridge failed."));
       this.close();
@@ -276,7 +298,7 @@ class WebViewSessionTransport implements SessionTransport {
   }
 
   #syncConnection(): void {
-    if (!this.#workerStarted || !this.#lease) return;
+    if (!this.#lease) return;
     if (activeDeviceIdentityAccount() !== this.#accountId) {
       this.close();
       return;
@@ -305,7 +327,7 @@ class WebViewSessionTransport implements SessionTransport {
     this.#attachmentId = attachment.attachmentId;
     this.#setState("connecting");
     try {
-      this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "pair-view", ...attachment });
+      if (this.#workerStarted) this.#startView();
       this.#lease.shared.bridge.send({
         v: TERMINAL_BRIDGE_VERSION,
         type: "pair-attach",
@@ -319,6 +341,23 @@ class WebViewSessionTransport implements SessionTransport {
       this.#retryAttachment();
     }
   }
+  #startView(): void {
+    const attachmentId = this.#attachmentId;
+    if (!attachmentId) return;
+    this.options.bridge.send({
+      v: TERMINAL_BRIDGE_VERSION,
+      type: "pair-view",
+      attachmentId,
+      sessionId: this.sessionId,
+      viewId: this.#viewId,
+    });
+    const pending = this.#pendingViewEvents.splice(0);
+    this.#pendingViewBytes = 0;
+    for (const message of pending) {
+      if (this.#attachmentId !== attachmentId) break;
+      this.options.bridge.send(message);
+    }
+  }
   #detach(): void {
     clearTimeout(this.#retry ?? undefined);
     this.#retry = null;
@@ -326,6 +365,8 @@ class WebViewSessionTransport implements SessionTransport {
     this.#deadline = null;
     const id = this.#attachmentId;
     this.#attachmentId = null;
+    this.#pendingViewEvents.splice(0);
+    this.#pendingViewBytes = 0;
     this.#displayOwner = false;
     this.#uploadCoordinator.close();
     if (!id) return;
@@ -354,7 +395,7 @@ class WebViewSessionTransport implements SessionTransport {
   }
   #retryAttachment(): void {
     this.#detach();
-    if (!this.#workerStarted) return;
+    if (!this.#lease) return;
     this.#setState("reconnecting");
     this.#retry = setTimeout(() => {
       this.#retry = null;
