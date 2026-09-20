@@ -606,6 +606,12 @@ original app separately. Newer master tooling does not change the app being
 built. It shares the `release` concurrency group, so it cannot overlap another
 release or recovery operation.
 
+Original plan logs may contain coloured command output. The prerequisite helper
+detects GitHub CLI's `--allow-escape-sequences` option and enables it only for
+the captured log download; it never prints the raw log or CLI error response.
+Only the uncoloured plan JSON is parsed, with the same candidate and native-build
+requirements. Older GitHub CLI versions remain supported.
+
 `inspect` reports candidate build and submission IDs and statuses without
 credentials, signed download URLs or private logs. Inspect first: an earlier
 all-platform command can create an Android build before iOS credential setup

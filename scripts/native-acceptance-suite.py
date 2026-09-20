@@ -770,8 +770,6 @@ async def exercise(fixture: Any) -> None:
                 "revoked device identity was reused",
             )
             await echo()
-            await fixture.command("switch-account", {"account": "b"})
-
             async def other_retired() -> bool:
                 state = await snapshot()
                 return all(
@@ -782,35 +780,42 @@ async def exercise(fixture: Any) -> None:
                     ]
                 )
 
-            await eventually(
-                other_retired,
-                message="second account retained first-account attachments",
-            )
-            other = await snapshot()
-            require(
-                other["accountReady"]
-                and other["accountId"] == fixture.second_account_id,
-                "second account did not become the authenticated owner",
-            )
-            require(
-                all(
-                    item.get("state") in {"closed", "unmounted", "idle"}
-                    for item in [
-                        *other.get("sessions", {}).values(),
-                        *other.get("tools", []),
-                    ]
-                ),
-                "second account retained first-account attachments",
-            )
-            token_b = await fixture.account_token(fixture.second_account_id)
-            require(
-                await fixture.request("GET", "/api/hosts", token=token_b) == [],
-                "second fixture account unexpectedly has a host",
-            )
-            await fixture.command("switch-account", {"account": "a"})
-            await fixture.command("mount", {"sessions": ["a", "b"], "tools": 2})
-            await wait_ready()
-            await echo()
+            # Exercise repeated native navigator transitions while authenticated
+            # WebViews are removed and recreated. A draw-pass mounting crash used
+            # to terminate Android here instead of replying to switch-account.
+            account_switch_rounds = 5
+            for _ in range(account_switch_rounds):
+                await fixture.command("switch-account", {"account": "b"})
+
+                await eventually(
+                    other_retired,
+                    message="second account retained first-account attachments",
+                )
+                other = await snapshot()
+                require(
+                    other["accountReady"]
+                    and other["accountId"] == fixture.second_account_id,
+                    "second account did not become the authenticated owner",
+                )
+                require(
+                    all(
+                        item.get("state") in {"closed", "unmounted", "idle"}
+                        for item in [
+                            *other.get("sessions", {}).values(),
+                            *other.get("tools", []),
+                        ]
+                    ),
+                    "second account retained first-account attachments",
+                )
+                token_b = await fixture.account_token(fixture.second_account_id)
+                require(
+                    await fixture.request("GET", "/api/hosts", token=token_b) == [],
+                    "second fixture account unexpectedly has a host",
+                )
+                await fixture.command("switch-account", {"account": "a"})
+                await fixture.command("mount", {"sessions": ["a", "b"], "tools": 2})
+                await wait_ready()
+                await echo()
             await fixture.command("sign-out")
 
             async def signed_out_retired() -> bool:
@@ -843,6 +848,7 @@ async def exercise(fixture: Any) -> None:
                 "replacement_device_id": replacement["deviceId"],
                 "revoked_reconnect": refused,
                 "closed_peer_samples": closed_samples,
+                "account_switch_rounds": account_switch_rounds,
                 "shell_pids": initial_pids,
             }
 

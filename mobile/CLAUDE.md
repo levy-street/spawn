@@ -40,6 +40,7 @@ src/
   terminal/       terminal surface components
   theme/          design tokens — every colour, spacing, and type value
 assets/           icons and splash
+patches/          versioned native dependency fixes applied by npm postinstall
 e2e/, tests/      end-to-end and fixture suites
 scripts/, docs/   build helpers and app-specific notes
 ```
@@ -94,6 +95,10 @@ scripts/, docs/   build helpers and app-specific notes
 - Anything that touches the native layer — a dependency with native code, a
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.
+- `npm ci` applies `patches/` with `patch-package --error-on-fail` before any
+  native build. Keep patched dependencies pinned and retain the upstream source
+  and removal condition in `docs/native-dependency-patches.md`. Expo fingerprints
+  include this directory; a native patch requires a store build.
 
 ## Running it against a local server
 
@@ -132,6 +137,15 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   waiters; a stale owner's load event cannot activate a replacement worker.
   Native acceptance selects an iPhone runtime matching the active Xcode simulator
   SDK; an explicit `--device UUID` opts into another installed runtime.
+  Identity retirement repeats five account-switch round trips with live WebViews,
+  checking account isolation and fresh terminal input after every return. This
+  also exercises native view removal during navigation; Reanimated 4.1.7 or newer
+  in the supported 4.1 line is required for its Android draw-pass mounting fix.
+  The screens 4.16.0 patch also prevents a stale pull-to-refresh drawing index
+  when nested screens are removed during account switching.
+  The acceptance driver mirrors the app's complete sign-out cleanup, including
+  connection-state reset, account-query clearing and navigation to login, before
+  adopting another account.
   It warms Settings before timed background cases and foregrounds the disposable
   app directly with `simctl launch` to avoid URL confirmation dialogs. A single
   background cycle returns to the app within one native command, keeping fixture

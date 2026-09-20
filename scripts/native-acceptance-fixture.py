@@ -847,6 +847,47 @@ class Fixture:
         self.closed.set()
 
 
+async def finish_cleanup(fixture: Fixture, server: Any, server_task: Any) -> None:
+    async def cleanup() -> None:
+        cleanup_error = None
+        try:
+            await fixture.close()
+        except Exception as error:
+            cleanup_error = error
+        finally:
+            if server is not None:
+                server.should_exit = True
+            if server_task is not None:
+                await server_task
+            # Finish disconnect writes before deleting this fixture's database.
+            shutil.rmtree(fixture.scratch)
+            evidence_path = fixture.output / "evidence.json"
+            if evidence_path.exists():
+                evidence = json.loads(evidence_path.read_text())
+                evidence["cleanup_passed"] = cleanup_error is None
+                if cleanup_error is not None:
+                    evidence.update(
+                        status="failed", failure_reason=f"cleanup: {cleanup_error}"
+                    )
+                write_json(evidence_path, evidence)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    # The runner can finish collecting evidence while automatic cleanup is still
+    # stopping workers. Its subsequent SIGTERM must not interrupt that cleanup or
+    # leave a passed report without proof that the fixture was removed.
+    cleanup_task = asyncio.create_task(cleanup())
+    interrupted = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            interrupted = True
+    cleanup_task.result()
+    if interrupted:
+        raise asyncio.CancelledError
+
+
 async def run(args: argparse.Namespace) -> None:
     if args.client_host not in {"127.0.0.1", "10.0.2.2"}:
         raise ValueError(
@@ -1027,29 +1068,7 @@ async def run(args: argparse.Namespace) -> None:
             fixture.fail(f"fixture setup interrupted ({type(error).__name__})")
         raise
     finally:
-        cleanup_error = None
-        try:
-            await fixture.close()
-        except Exception as error:
-            cleanup_error = error
-        finally:
-            if server is not None:
-                server.should_exit = True
-            if task is not None:
-                await task
-            # Finish disconnect writes before deleting this fixture's database.
-            shutil.rmtree(fixture.scratch)
-            evidence_path = fixture.output / "evidence.json"
-            if evidence_path.exists():
-                evidence = json.loads(evidence_path.read_text())
-                evidence["cleanup_passed"] = cleanup_error is None
-                if cleanup_error is not None:
-                    evidence.update(
-                        status="failed", failure_reason=f"cleanup: {cleanup_error}"
-                    )
-                write_json(evidence_path, evidence)
-        if cleanup_error is not None:
-            raise cleanup_error
+        await finish_cleanup(fixture, server, task)
 
 
 def main() -> None:

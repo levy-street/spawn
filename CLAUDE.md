@@ -116,6 +116,8 @@ their daemon only after app installation. Unexpected fixture process exits
 permanently fail acceptance; they are not silently restarted.
 After fixture readiness, native app boot has a separate 180-second budget;
 local startup diagnostics and scoped device captures preserve setup failures.
+Fixture shutdown defers cancellation until worker/API cleanup and its evidence
+write finish; the workflow still enforces a bounded cleanup deadline.
 
 Every workflow uses standard GitHub-hosted runners, as mapped in
 `docs/CI_RUNNERS.md`. `scripts/ci/check-hosted-runners.py` rejects paid runner

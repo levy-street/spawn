@@ -30,6 +30,17 @@ def api(path):
     return json.loads(run("gh", "api", f"repos/{REPOSITORY}/{path}"))
 
 
+def read_plan_log(job_id):
+    # Newer gh versions reject ANSI in raw responses even when stdout is a
+    # pipe. Permit it only for this captured log: never echo it or the CLI's
+    # response/error bodies. The parser below accepts only uncoloured JSON.
+    flags = ["--allow-escape-sequences"] if "--allow-escape-sequences" in run("gh", "api", "--help") else []
+    try:
+        return run("gh", "api", f"repos/{REPOSITORY}/actions/jobs/{job_id}/logs", *flags)
+    except subprocess.CalledProcessError:
+        raise ValueError("Could not download the original release plan log; no store operation allowed") from None
+
+
 def validate_run(release):
     require(release.get("repository", {}).get("full_name") == REPOSITORY,
             "Release belongs to another repository")
@@ -98,7 +109,7 @@ def main():
         "server, web, daemon manifest and the phone",
     ):
         required_job(jobs["jobs"], name)
-    log = run("gh", "api", f"repos/{REPOSITORY}/actions/jobs/{plan_job['id']}/logs")
+    log = read_plan_log(plan_job["id"])
     plan = plan_from_log(log, candidate)
     run("git", "merge-base", "--is-ancestor", candidate, "HEAD")
     with tempfile.TemporaryDirectory() as directory:

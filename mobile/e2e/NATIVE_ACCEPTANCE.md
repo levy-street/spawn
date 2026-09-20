@@ -31,6 +31,22 @@ after validating its account with the API. It lets the real AuthGate restore
 that account rather than resetting the ready identity during device registration.
 Fresh logins and account switches still use the normal account-adoption path;
 registration waits for the expected account to be ready.
+Sign-out and account switches perform the same successful-logout cleanup as the
+app's sign-out controls: reset connection state, clear account queries, and route
+to login before installing another account's token. Calling only the logout API
+leaves cached account data alive and does not represent the app's sign-out flow.
+
+Identity retirement repeats five account-switch round trips after replacing the
+revoked identity. Every round verifies that the second account has no hosts or
+first-account attachments, then remounts both sessions and host tools and checks
+terminal input after returning to the first account. The report records
+`account_switch_rounds`. Repeated navigation and WebView removal exercise the
+Android draw-pass crash fixed by Reanimated 4.1.7 and the pull-to-refresh drawing
+index crash addressed by the screens 4.16.0 patch; a terminated app fails the case.
+The disposable build runs the same `npm ci` postinstall patching as store builds.
+Fixture shutdown finishes worker/API cleanup and records its result even if the
+runner sends SIGTERM after the cases finish. Cancellation is deferred until this
+cleanup completes; the workflow's existing cleanup deadline still applies.
 
 ## Build isolation
 

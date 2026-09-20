@@ -3,6 +3,7 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { useQueryClient } from "@tanstack/react-query";
 import Constants from "expo-constants";
+import { router } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import { AppState, Platform, StyleSheet, Text, View } from "react-native";
 import { authToken } from "@/data/api/auth-token";
@@ -10,6 +11,7 @@ import { getBaseUrl } from "@/data/api/config";
 import { getMe } from "@/data/api/endpoints/account";
 import { logOut } from "@/data/api/endpoints/auth";
 import { adoptAuthenticatedAccount } from "@/data/queries/auth";
+import { useConnectionStore } from "@/data/stores/connection";
 import { ensureDeviceRegistered } from "@/data/trust/registration";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
 import { encodeBase64Url, encodeHex } from "@/lib/crypto/bytes";
@@ -284,6 +286,15 @@ export function NativeAcceptanceController(): React.JSX.Element {
       // otherwise the gate can retire the account during native storage I/O.
       if (!restored) await adoptAuthenticatedAccount(queryClient, me.user);
     };
+    const signOut = async () => {
+      await logOut();
+      // Match the app's complete sign-out flow before installing another token.
+      // Leaving old account queries alive lets the gate briefly reopen its host
+      // with the replacement account's credentials during the next login.
+      useConnectionStore.getState().reset();
+      queryClient.clear();
+      router.replace("/login");
+    };
     const perform = async ({ action, payload = {} }: Command): Promise<unknown> => {
       const key = payload["session"] === "b" ? "b" : "a";
       switch (action) {
@@ -476,13 +487,13 @@ export function NativeAcceptanceController(): React.JSX.Element {
           return snapshot();
         }
         case "sign-out":
-          await logOut();
+          await signOut();
           await until(() => !accountRef.current.ready, "Account did not retire.");
           return snapshot();
         case "switch-account": {
           if (payload["account"] !== "a" && payload["account"] !== "b")
             throw new Error("Only fixture accounts a and b are allowed.");
-          await logOut();
+          await signOut();
           await until(() => !accountRef.current.ready, "Previous account did not retire.");
           current = await control<Bootstrap>("/__acceptance/bootstrap");
           if (current.candidateCommit !== build?.candidateCommit)
