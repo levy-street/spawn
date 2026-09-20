@@ -1,6 +1,6 @@
 "use client";
 
-import { Lock, LockOpen, PlugZap, ShieldAlert, Unplug } from "lucide-react";
+import { LoaderCircle, Lock, LockOpen, PlugZap, ShieldAlert, Unplug } from "lucide-react";
 import { useEffect, useState } from "react";
 import { REFUSAL_DETAIL } from "@/components/terminal/ConnectionChip";
 import type { SocketState } from "@/components/terminal/useSessionSocket";
@@ -167,6 +167,7 @@ export function ConnectingOverlay({
   painted,
   hostName = null,
   hostOffline = false,
+  sharedConnectionReady = false,
 }: {
   socketState: SocketState;
   v3: boolean;
@@ -176,6 +177,7 @@ export function ConnectingOverlay({
   painted: boolean;
   hostName?: string | null;
   hostOffline?: boolean;
+  sharedConnectionReady?: boolean;
 }) {
   const stage = stageFor(socketState, v3, dcOpen, refusal, hostOffline);
   const secured = stage === "secured";
@@ -208,6 +210,20 @@ export function ConnectingOverlay({
   }, [done, entered]);
 
   if (!entered || gone) return null;
+  if (sharedConnectionReady && done) return null;
+
+  if (sharedConnectionReady && (stage === "reaching" || stage === "securing")) {
+    return (
+      <div
+        aria-hidden
+        data-testid="terminal-opening-status"
+        className="pointer-events-none absolute inset-x-0 bottom-0 z-[6] flex items-center gap-2 border-t border-border bg-popover px-3 py-2 text-xs text-muted-foreground"
+      >
+        <LoaderCircle className="size-3.5 animate-spin" />
+        <span>{slow ? "Opening terminal is taking longer than usual." : "Opening terminal"}</span>
+      </div>
+    );
+  }
 
   const view = viewFor(stage, hostName, refusal, slow);
   const Icon = view.icon;

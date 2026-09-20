@@ -53,6 +53,7 @@ python3 scripts/test-native-acceptance.py
 python3 mobile/e2e/test-compact-android-build.py
 python3 mobile/e2e/test-android-disk-preflight.py
 python3 mobile/e2e/test-native-runner.py
+node --test mobile/e2e/instrument-worker.test.mjs
 python3 scripts/test-release-acceptance.py
 
 printf '%s\n' "== no server terminal content guard =="

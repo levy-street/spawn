@@ -98,6 +98,7 @@ export interface ConnectionStateOverlayProps {
   error?: TransportError | null;
   hasEverBeenReady: boolean;
   sharedConnectionUnavailable?: boolean;
+  sharedConnectionReady?: boolean;
   onRetry: () => void;
   /** Offered only for a trust failure, where retrying cannot help on its own. */
   onDeviceTrust?: () => void;
@@ -118,6 +119,7 @@ export function ConnectionStateOverlay({
   error,
   hasEverBeenReady,
   sharedConnectionUnavailable = false,
+  sharedConnectionReady = false,
   onRetry,
   onDeviceTrust,
   awaitingApproval = false,
@@ -140,10 +142,13 @@ export function ConnectionStateOverlay({
   }, [transient]);
   if (state === "ready") return null;
   if (transient && !showConnecting) return null;
-  const copy = connectionCopy(state);
+  const openingOnReadyHost = transient && sharedConnectionReady;
+  const copy = openingOnReadyHost
+    ? { ...connectionCopy(state), title: "Opening terminal", detail: "Loading terminal output." }
+    : connectionCopy(state);
   const untrusted = error?.code === DEVICE_NOT_TRUSTED_CODE || awaitingApproval;
   const retryable = state === "failed" || state === "closed" || error?.retryable === true;
-  const compact = hasEverBeenReady;
+  const compact = hasEverBeenReady || openingOnReadyHost;
   const paused = compact && sharedConnectionUnavailable && !untrusted;
 
   return (

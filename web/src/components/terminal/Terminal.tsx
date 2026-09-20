@@ -24,6 +24,7 @@ import {
   useImperativeHandle,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
 import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
@@ -1150,6 +1151,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   };
 
   const daemonConnection = useDaemonConnection(signalingHostId);
+  const subscribeDaemon = useCallback(
+    (listener: () => void) => daemonConnection?.subscribe(listener) ?? (() => {}),
+    [daemonConnection],
+  );
+  const daemonReady = useSyncExternalStore(
+    subscribeDaemon,
+    () => daemonConnection?.getSnapshot().state === "ready",
+    () => false,
+  );
   const socket = useSessionSocket({
     connection: daemonConnection,
     sessionId,
@@ -3367,6 +3377,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           terminal's own black: the overlay explains the wait, and gets out of
           the way the moment output arrives. */}
       <ConnectingOverlay
+        sharedConnectionReady={daemonReady}
         socketState={socket.state}
         v3={socket.v3}
         dcOpen={socket.dcOpen}

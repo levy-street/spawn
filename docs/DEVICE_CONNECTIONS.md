@@ -76,7 +76,9 @@ also retain bounded data received before the native channel-open event, then
 deliver it in order after open. In particular, an early daemon `ready` frame
 must not be discarded and force a ten-second attachment retry.
 
-Fast initial attachments have a 240 ms connecting-notice grace period. Readiness,
+Fast initial attachments have a 240 ms connecting-notice grace period. A slower
+initial render on an already-ready host shows a compact opening status, while
+host setup, failures and recovery retain their connection messages. Readiness,
 replay completion and daemon-confirmed input control remain independent gates;
 the grace period cannot enable input. Errors and recovery remain visible, and
 host-wide failures include the host name in both clients.

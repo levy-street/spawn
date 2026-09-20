@@ -439,7 +439,7 @@ try:
 except urllib.error.HTTPError as error:
     raise SystemExit(f"workspace create failed: {error.code} {error.read().decode()}")
 latency_fixtures = []
-for index in range(3):
+for index in range(4):
     req = urllib.request.Request(
         f"{base_url}/api/workspaces",
         data=json.dumps({"name": f"session latency {index}", "first_session": {"host_id": host_id, "cwd": cwd}}).encode(),

@@ -515,6 +515,7 @@ export function TerminalOverlay({
           awaitingApproval={awaitingApproval}
           error={connectionError}
           hasEverBeenReady={hasEverBeenReady}
+          sharedConnectionReady={transportRef.current?.daemonState === "ready"}
           sharedConnectionUnavailable={
             transportRef.current?.daemonState !== undefined &&
             transportRef.current.daemonState !== "ready"

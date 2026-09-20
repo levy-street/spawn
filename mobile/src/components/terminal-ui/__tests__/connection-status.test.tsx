@@ -60,6 +60,29 @@ describe("the connection banner over a terminal that has been ready", () => {
     await view.unmount();
     jest.useRealTimers();
   });
+
+  test("a slower first render on a ready host shows a compact opening status", async () => {
+    jest.useFakeTimers();
+    const view = await render(
+      <ThemeProvider>
+        <ConnectionStateOverlay
+          sharedConnectionReady
+          hasEverBeenReady={false}
+          onRetry={jest.fn()}
+          state="connecting"
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.queryByTestId("connection-state-connecting")).toBeNull();
+    await act(() => jest.advanceTimersByTime(500));
+    expect(screen.getByText("Opening terminal")).toBeOnTheScreen();
+    const style = bannerStyle("connection-state-connecting");
+    expect(style.borderTopWidth).toBe(1);
+    expect(style.bottom).toBe(0);
+    expect(style.top).toBeUndefined();
+    await view.unmount();
+    jest.useRealTimers();
+  });
 });
 
 describe("a terminal blocked on this device's approval", () => {

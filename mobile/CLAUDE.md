@@ -65,6 +65,9 @@ scripts/, docs/   build helpers and app-specific notes
   disposable build copy, using the actual app providers and native WebViews.
   Opening measurements separate renderer, channel, replay paint and confirmed
   input readiness for never-viewed and reopened sessions on a ready parent.
+  `e2e/instrument-worker.mjs` inserts fixture probes at real document boundaries
+  and parses every script before compilation; its Node regression uses the
+  generated worker, including the HTML strings inside bundled xterm code.
   The Android job removes generated build directories after preserving the APK
   and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
   Its hosted disk preflight reclaims only named unused tools on the disposable
