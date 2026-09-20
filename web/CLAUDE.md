@@ -31,7 +31,9 @@ src/
   middleware.ts   request middleware (+ its test beside it)
 tests/e2e/        Playwright end-to-end specs
 scripts/          build wrappers (next-with-proxy-target.mjs) and helpers
-                  (og-shots.mjs renders SEO pages' OG images from a dev server)
+                  (og-shots.mjs renders SEO pages' OG images from a dev server;
+                  measure-session-opening.mjs records first/repeat terminal
+                  navigation timings in the isolated live browser smoke)
 public/           static assets (og/ holds the per-page OG images)
 ```
 

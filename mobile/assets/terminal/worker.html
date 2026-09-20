@@ -2640,6 +2640,9 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       this.bufferedAmountLowThreshold = 128 * 1024;
       this.sequence = 0;
       this.receipts = new Map();
+      this.earlyReceive = [];
+      this.earlyReceiveBytes = 0;
+      this.drainingEarlyReceive = false;
     }
     fire(name, event = new Event(name)) {
       this[`on${name}`]?.(event);
@@ -2674,6 +2677,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       this.readyState = "closed";
       this.bufferedAmount = 0;
       this.receipts.clear();
+      this.earlyReceive.splice(0);
+      this.earlyReceiveBytes = 0;
       command(this.id, this.kind, "close");
       this.fire("close");
     }
@@ -2681,8 +2686,19 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       if (this.readyState === "closed") return;
       if (message.event === "close") return this.close();
       if (message.event === "open") {
+        if (this.readyState !== "connecting") return;
         this.readyState = "open";
-        this.fire("open");
+        this.drainingEarlyReceive = true;
+        try {
+          this.fire("open");
+          while (this.readyState === "open" && this.earlyReceive.length) {
+            const next = this.earlyReceive.shift();
+            this.earlyReceiveBytes -= sizeOf(next.data ?? "");
+            this.deliver(next);
+          }
+        } finally {
+          this.drainingEarlyReceive = false;
+        }
       } else if (message.event === "ack") {
         const bytes = this.receipts.get(message.sequence);
         if (bytes === undefined) return;
@@ -2690,16 +2706,30 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
         this.bufferedAmount -= bytes;
         if (this.bufferedAmount <= this.bufferedAmountLowThreshold) this.fire("bufferedamountlow");
       } else if (message.event === "data") {
-        const data = message.binary ? api.decodeBase64(message.data).buffer : message.data;
-        const event = new MessageEvent("message", { data });
-        this.dispatchEvent(event);
-        Promise.resolve(this.onmessage?.(event))
-          .then(() => {
-            if (this.readyState === "open")
-              command(this.id, this.kind, "received", { sequence: message.sequence });
-          })
-          .catch(() => this.close());
+        // A native ready frame can precede the channel's open event. Deliver
+        // it after open so bootstrap and receive-credit acknowledgements have
+        // the same ordering on every platform.
+        if (this.readyState === "connecting" || this.drainingEarlyReceive) {
+          const bytes = sizeOf(message.data ?? "");
+          if (this.earlyReceiveBytes + bytes > MAX_RECEIVE || this.earlyReceive.length >= 1024) {
+            this.close();
+            return;
+          }
+          this.earlyReceive.push(message);
+          this.earlyReceiveBytes += bytes;
+        } else this.deliver(message);
       }
+    }
+    deliver(message) {
+      const data = message.binary ? api.decodeBase64(message.data).buffer : message.data;
+      const event = new MessageEvent("message", { data });
+      this.dispatchEvent(event);
+      Promise.resolve(this.onmessage?.(event))
+        .then(() => {
+          if (this.readyState === "open")
+            command(this.id, this.kind, "received", { sequence: message.sequence });
+        })
+        .catch(() => this.close());
     }
   }
 

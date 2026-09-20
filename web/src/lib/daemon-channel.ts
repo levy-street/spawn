@@ -19,6 +19,7 @@ export type DaemonChannel = Pick<
 
 export type ChannelBytes = string | ArrayBuffer;
 const MAX_QUEUED_BYTES = 256 * 1024;
+const MAX_EARLY_RECEIVE_BYTES = 2 * 1024 * 1024;
 
 /** A bounded channel proxy. Acknowledgements release queue credit, never imply a command executed. */
 export class RemoteDaemonChannel extends EventTarget implements DaemonChannel {
@@ -34,6 +35,9 @@ export class RemoteDaemonChannel extends EventTarget implements DaemonChannel {
   private sequence = 0;
   private pending = new Map<number, number>();
   private sendTail = Promise.resolve();
+  private earlyReceive: ChannelBytes[] = [];
+  private earlyReceiveBytes = 0;
+  private drainingEarlyReceive = false;
 
   constructor(
     readonly label: string,
@@ -95,11 +99,46 @@ export class RemoteDaemonChannel extends EventTarget implements DaemonChannel {
   opened(): void {
     if (this.readyState !== "connecting") return;
     this.readyState = "open";
-    this.emit("open");
+    this.drainingEarlyReceive = true;
+    try {
+      this.emit("open");
+      while (this.readyState === "open" && this.earlyReceive.length > 0) {
+        const data = this.earlyReceive.shift();
+        if (data === undefined) break;
+        this.earlyReceiveBytes -= this.receiveSize(data);
+        this.deliver(data);
+      }
+    } finally {
+      this.drainingEarlyReceive = false;
+    }
   }
 
   receive(data: ChannelBytes): void {
-    if (this.readyState !== "open") return;
+    if (this.readyState === "closed") return;
+    // Native RTC can deliver the daemon's ready frame before its queued open
+    // event. Dropping that frame stalls bootstrap until the connect timeout.
+    // Preserve ordering without declaring the channel or session ready early.
+    if (this.readyState === "connecting" || this.drainingEarlyReceive) {
+      const size = this.receiveSize(data);
+      if (
+        this.earlyReceiveBytes + size > MAX_EARLY_RECEIVE_BYTES ||
+        this.earlyReceive.length >= 1024
+      ) {
+        this.close();
+        return;
+      }
+      this.earlyReceive.push(data);
+      this.earlyReceiveBytes += size;
+      return;
+    }
+    this.deliver(data);
+  }
+
+  private receiveSize(data: ChannelBytes): number {
+    return typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
+  }
+
+  private deliver(data: ChannelBytes): void {
     const event = new MessageEvent("message", { data });
     this.onmessage?.call(this as unknown as RTCDataChannel, event);
     this.dispatchEvent(event);
@@ -109,6 +148,8 @@ export class RemoteDaemonChannel extends EventTarget implements DaemonChannel {
     if (this.readyState === "closed") return;
     this.readyState = "closed";
     this.pending.clear();
+    this.earlyReceive.splice(0);
+    this.earlyReceiveBytes = 0;
     this.bufferedAmount = 0;
     this.emit("close");
   }

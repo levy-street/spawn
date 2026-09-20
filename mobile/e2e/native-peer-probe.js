@@ -26,6 +26,19 @@
     }
   }
   function observeChannel(record, channel) {
+    const sessionId = /^spawn\.(?:pty|ctl)\/([^/]+)\//.exec(channel.label)?.[1];
+    if (sessionId) {
+      const phase = (name) =>
+        globalThis.ReactNativeWebView?.postMessage(
+          JSON.stringify({
+            type: "native-acceptance-opening",
+            sessionId,
+            phase: name,
+          }),
+        );
+      phase("attachment_created_ms");
+      channel.addEventListener("open", () => phase("channel_open_ms"));
+    }
     const stats = { channel, receivedBytes: 0, sentBytes: 0 };
     record.channels.push(stats);
     channel.addEventListener("message", ({ data }) => {

@@ -783,9 +783,9 @@ describe("approveBrowserHostPin Host ID seeding", () => {
   test("announces a revision when trust changes, so a refused pane can retry", async () => {
     const factory = new IDBFactory();
     const seen: number[] = [];
-    const unsubscribe = subscribeToBrowserHostPinChanges(() =>
-      seen.push(getBrowserHostPinRevision()),
-    );
+    const unsubscribe = subscribeToBrowserHostPinChanges((changed) => {
+      if (changed) seen.push(getBrowserHostPinRevision());
+    });
     try {
       const before = getBrowserHostPinRevision();
       await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
@@ -817,6 +817,64 @@ describe("approveBrowserHostPin Host ID seeding", () => {
       options(factory),
     );
     expect(bound?.hostIds).toEqual([HOST_ID, OTHER_HOST_ID]);
+  });
+
+  test("replayed gossip reconfirms trust without changing its revision or age", async () => {
+    const factory = new IDBFactory();
+    const seen: number[] = [];
+    const reconfirmed: number[] = [];
+    const unsubscribe = subscribeToBrowserHostPinChanges((changed) => {
+      (changed ? seen : reconfirmed).push(getBrowserHostPinRevision());
+    });
+    try {
+      const first = await approveBrowserHostPin(
+        { ...approvalInput(), hostIds: [HOST_ID] },
+        options(factory),
+      );
+      // Each workspace remount consumes the same signed introduction again.
+      for (let index = 0; index < 3; index++) {
+        expect(
+          await approveBrowserHostPin(
+            { ...approvalInput(), reactivateRevoked: false },
+            options(factory, 9_000),
+          ),
+        ).toEqual(first);
+      }
+      expect(seen).toHaveLength(1);
+      expect(reconfirmed).toEqual([seen[0], seen[0], seen[0]]);
+      await approveBrowserHostPin(
+        { ...approvalInput(), hostIds: [OTHER_HOST_ID] },
+        options(factory),
+      );
+      expect(seen).toHaveLength(2);
+      await revokeBrowserHostPin(revokeInput(), options(factory));
+      expect(seen).toHaveLength(3);
+      await expect(
+        approveBrowserHostPin({ ...approvalInput(), reactivateRevoked: false }, options(factory)),
+      ).rejects.toMatchObject({ code: "revoked_pin" });
+      expect(seen).toHaveLength(3);
+      await approveBrowserHostPin(approvalInput(), options(factory));
+      expect(seen).toHaveLength(4);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  test("a new alias at capacity is a real change even though the count stays the same", async () => {
+    const factory = new IDBFactory();
+    const hostIds = Array.from(
+      { length: 8 },
+      (_, index) => `00000000-0000-4000-8000-${String(index + 10).padStart(12, "0")}`,
+    );
+    await approveBrowserHostPin({ ...approvalInput(), hostIds }, options(factory));
+    const before = getBrowserHostPinRevision();
+    const updated = await approveBrowserHostPin(
+      { ...approvalInput(), hostIds: [OTHER_HOST_ID] },
+      options(factory),
+    );
+    expect(updated.hostIds).toHaveLength(8);
+    expect(updated.hostIds).toContain(OTHER_HOST_ID);
+    expect(getBrowserHostPinRevision()).toBe(before + 1);
   });
 
   test("skips a malformed Host ID rather than failing the whole approval", async () => {

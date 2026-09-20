@@ -15,6 +15,7 @@ need bun
 need cargo
 need curl
 need python3
+need rg
 need uv
 
 tmp_dir="$(mktemp -d)"
@@ -437,11 +438,23 @@ try:
         created = json.loads(response.read().decode())
 except urllib.error.HTTPError as error:
     raise SystemExit(f"workspace create failed: {error.code} {error.read().decode()}")
+latency_fixtures = []
+for index in range(4):
+    req = urllib.request.Request(
+        f"{base_url}/api/workspaces",
+        data=json.dumps({"name": f"session latency {index}", "first_session": {"host_id": host_id, "cwd": cwd}}).encode(),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        fixture = json.loads(response.read().decode())
+    latency_fixtures.append({"workspace_id": fixture["workspace"]["id"], "session_id": fixture["session"]["id"]})
 print(
     json.dumps(
         {
             "workspace_id": created["workspace"]["id"],
             "session_id": created["session"]["id"],
+            "latency_fixtures": latency_fixtures,
         }
     )
 )
@@ -449,6 +462,7 @@ PY
 )"
 workspace_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["workspace_id"])' <<<"$live_ids")"
 live_session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])' <<<"$live_ids")"
+latency_fixtures="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["latency_fixtures"]))' <<<"$live_ids")"
 
 printf '%s\n' "smoke-local-browser-live: starting web server on $web_url"
 cp "$repo_root/web/tsconfig.json" "$repo_root/web/$web_tsconfig"
@@ -472,6 +486,7 @@ printf '%s\n' "smoke-local-browser-live: driving real browser flow"
     SPAWN_LIVE_PASSWORD="$password" \
     SPAWN_LIVE_WORKSPACE_ID="$workspace_id" \
     SPAWN_LIVE_SESSION_ID="$live_session_id" \
+    SPAWN_LIVE_LATENCY_FIXTURES="$latency_fixtures" \
     SPAWN_LIVE_UPLOAD_PATH="$upload_path" \
     SPAWN_LIVE_ACCOUNT_ID="$account_id" \
     SPAWN_LIVE_ANCHOR_DEVICE_ID="$anchor_device_id" \
@@ -480,6 +495,7 @@ printf '%s\n' "smoke-local-browser-live: driving real browser flow"
     bun - <<'JS'
 import { chromium, expect } from "@playwright/test";
 import { existsSync, readFileSync } from "node:fs";
+import { measureSessionOpenings, seedKnownHostGossip } from "./scripts/measure-session-opening.mjs";
 
 const webUrl = process.env.SPAWN_LIVE_WEB_URL;
 const email = process.env.SPAWN_LIVE_EMAIL;
@@ -555,6 +571,7 @@ async function endorseLiveDevice(page) {
     throw new Error(`endorsing the live browser failed: ${posted.status()} ${await posted.text()}`);
   }
   console.log(`live browser device ${device.id} endorsed by the pinned anchor`);
+  return device;
 }
 
 // Deliberately a browser with its ordinary settings: every one of them hides
@@ -568,6 +585,9 @@ try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   await context.addInitScript(() => {
     globalThis.__spawnRtcEvents = [];
+    globalThis.__spawnRtcEvents.push = function (event) {
+      return Array.prototype.push.call(this, { at: performance.now(), ...event });
+    };
     const OriginalRTCPeerConnection = globalThis.RTCPeerConnection;
     if (!OriginalRTCPeerConnection) return;
 
@@ -586,7 +606,14 @@ try {
         channel.addEventListener("message", (event) => {
           const size =
             typeof event.data === "string" ? event.data.length : event.data?.byteLength || 0;
-          globalThis.__spawnRtcEvents.push({ type: "dc.message", label, size });
+          let frame = {};
+          if (typeof event.data === "string") {
+            try {
+              const parsed = JSON.parse(event.data);
+              frame = { kind: parsed.kind, event: parsed.event, operation: parsed.operation };
+            } catch {}
+          }
+          globalThis.__spawnRtcEvents.push({ type: "dc.message", label, size, ...frame });
         });
         const send = channel.send.bind(channel);
         channel.send = (data) => {
@@ -595,6 +622,11 @@ try {
           return send(data);
         };
         return channel;
+      }
+
+      createOffer(...args) {
+        globalThis.__spawnRtcEvents.push({ type: "pc.offer" });
+        return super.createOffer(...args);
       }
     };
   });
@@ -606,7 +638,8 @@ try {
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForURL((url) => !url.pathname.startsWith("/login"), { timeout: 15_000 });
 
-  await endorseLiveDevice(page);
+  const liveDevice = await endorseLiveDevice(page);
+  await seedKnownHostGossip(page, accountId, liveDevice.id);
 
   // The workspace and its first shell session already exist — created through
   // the same API the launcher calls, so the live flow starts at the surface
@@ -746,6 +779,7 @@ try {
   if (connectionCounts[0] !== 1 || connectionCounts[1] !== 0) {
     throw new Error(`tabs did not share one peer: ${JSON.stringify(connectionCounts)}`);
   }
+  await measureSessionOpenings(page, JSON.parse(process.env.SPAWN_LIVE_LATENCY_FIXTURES));
   await page.close();
   await expect.poll(() => secondPage.evaluate(() =>
     (globalThis.__spawnRtcEvents || []).filter((event) => event.type === "pc.created").length),
@@ -763,6 +797,8 @@ try {
 }
 JS
 ) >"$browser_log" 2>&1
+
+rg '^session-open-timing:' "$browser_log"
 
 grep -Fx "uploaded from live browser" "$upload_path" >/dev/null
 

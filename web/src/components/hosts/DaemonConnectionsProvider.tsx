@@ -111,8 +111,8 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
 
   useEffect(
     () =>
-      subscribeToBrowserHostPinChanges(() => {
-        for (const connection of owned.current.values()) connection.retry();
+      subscribeToBrowserHostPinChanges((changed) => {
+        for (const connection of owned.current.values()) connection.retry(!changed);
       }),
     [],
   );
@@ -152,7 +152,11 @@ function DaemonNotice({ connection, name }: { connection: DaemonConnection; name
       role="status"
       className="pointer-events-auto mx-auto flex max-w-xl items-center gap-3 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-xs shadow-lg"
     >
-      <span>{snapshot.error ?? `Reconnecting to ${name}. Terminal input is paused.`}</span>
+      <span>
+        {snapshot.error
+          ? `${name}: ${snapshot.error}`
+          : `Reconnecting to ${name}. Terminal input is paused.`}
+      </span>
       <button
         type="button"
         aria-label={`Retry connection to ${name}`}

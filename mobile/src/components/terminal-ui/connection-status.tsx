@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { ConnectionChannel } from "@/components/terminal-ui/connection-channel";
 import type { BadgeVariant } from "@/components/ui/badge";
@@ -8,6 +9,10 @@ import { Text } from "@/components/ui/text";
 import { DEVICE_NOT_TRUSTED_CODE } from "@/data/trust/device-trust";
 import type { TransportError, TransportState } from "@/terminal/transport/types";
 import { borderWidth, layer, useTheme } from "@/theme";
+
+// Match the browser's first-attachment grace period. Readiness and input gates
+// stay in the transport; fast attachments should not flash a full-screen card.
+const CONNECTING_NOTICE_DELAY_MS = 240;
 
 interface ConnectionCopy {
   title: string;
@@ -93,6 +98,7 @@ export interface ConnectionStateOverlayProps {
   error?: TransportError | null;
   hasEverBeenReady: boolean;
   sharedConnectionUnavailable?: boolean;
+  sharedConnectionReady?: boolean;
   onRetry: () => void;
   /** Offered only for a trust failure, where retrying cannot help on its own. */
   onDeviceTrust?: () => void;
@@ -113,16 +119,36 @@ export function ConnectionStateOverlay({
   error,
   hasEverBeenReady,
   sharedConnectionUnavailable = false,
+  sharedConnectionReady = false,
   onRetry,
   onDeviceTrust,
   awaitingApproval = false,
 }: ConnectionStateOverlayProps): React.JSX.Element | null {
   const theme = useTheme();
+  const transient =
+    !hasEverBeenReady &&
+    !error &&
+    !awaitingApproval &&
+    !sharedConnectionUnavailable &&
+    (state === "idle" || state === "connecting" || state === "signalling");
+  const [showConnecting, setShowConnecting] = useState(false);
+  useEffect(() => {
+    if (!transient) {
+      setShowConnecting(false);
+      return;
+    }
+    const timer = setTimeout(() => setShowConnecting(true), CONNECTING_NOTICE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [transient]);
   if (state === "ready") return null;
-  const copy = connectionCopy(state);
+  if (transient && !showConnecting) return null;
+  const openingOnReadyHost = transient && sharedConnectionReady;
+  const copy = openingOnReadyHost
+    ? { ...connectionCopy(state), title: "Opening terminal", detail: "Loading terminal output." }
+    : connectionCopy(state);
   const untrusted = error?.code === DEVICE_NOT_TRUSTED_CODE || awaitingApproval;
   const retryable = state === "failed" || state === "closed" || error?.retryable === true;
-  const compact = hasEverBeenReady;
+  const compact = hasEverBeenReady || openingOnReadyHost;
   const paused = compact && sharedConnectionUnavailable && !untrusted;
 
   return (

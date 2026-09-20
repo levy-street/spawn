@@ -50,6 +50,18 @@ interface Probe {
   snapshot: Record<string, unknown>;
 }
 const probes = new Map<string, Probe>();
+const openings = new Map<
+  string,
+  { startedAt: number; kind: string; phases: Record<string, number> }
+>();
+const openedSessions = new Set<string>();
+// Fixture-only timestamps use the native clock, including WebView bridge arrival.
+// No payload, credentials or terminal contents enter the report.
+export function captureNativeOpening(sessionId: string, phase: string): void {
+  const opening = openings.get(sessionId);
+  if (opening && opening.phases[phase] === undefined)
+    opening.phases[phase] = Date.now() - opening.startedAt;
+}
 export function captureNativePeerStats(hostId: string, snapshot: Record<string, unknown>): void {
   probes.set(hostId, { receivedAt: Date.now(), snapshot });
 }
@@ -239,6 +251,7 @@ export function NativeAcceptanceController(): React.JSX.Element {
         ? Date.now() - (probes.get(current.hostId)?.receivedAt ?? 0)
         : null,
       uploads: Object.fromEntries(uploads.current),
+      openings: Object.fromEntries(openings),
     });
     const register = async () => {
       setDeviceIdentityAccount(current.accountId);
@@ -285,6 +298,16 @@ export function NativeAcceptanceController(): React.JSX.Element {
           const count = Number(payload["tools"] ?? 2);
           if (!Number.isInteger(count) || count < 0 || count > 2)
             throw new Error("Invalid tool count.");
+          for (const key of wanted) {
+            if (mounted.current.includes(String(key))) continue;
+            const id = key === "a" ? current.sessionA : current.sessionB;
+            openings.set(id, {
+              startedAt: Date.now(),
+              kind: openedSessions.has(id) ? "repeat-open" : "first-open",
+              phases: {},
+            });
+            openedSessions.add(id);
+          }
           setSelection(wanted as string[]);
           setToolCount(count);
           await until(
@@ -587,9 +610,21 @@ export function NativeAcceptanceController(): React.JSX.Element {
             initialSize={{ cols: 80, rows: 24 }}
             style={styles.terminal}
             onTransport={(transport) => sessions.current.set(key, transport)}
-            onDisplayChange={(display) => owners.current.set(key, display.owner)}
+            onDisplayChange={(display) => {
+              owners.current.set(key, display.owner);
+              if (display.owner && sessions.current.get(key)?.state === "ready")
+                captureNativeOpening(
+                  key === "a" ? bootstrap.sessionA : bootstrap.sessionB,
+                  "input_ready_ms",
+                );
+            }}
             onStateChange={(state) => {
               if (state !== "ready") owners.current.set(key, false);
+              else {
+                const id = key === "a" ? bootstrap.sessionA : bootstrap.sessionB;
+                captureNativeOpening(id, "transport_ready_ms");
+                if (owners.current.get(key)) captureNativeOpening(id, "input_ready_ms");
+              }
               void event("transport", { session: key, state }).catch(() => {});
             }}
             onError={(error) => {

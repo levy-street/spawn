@@ -10,7 +10,7 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { LatencyHud, latencyHudEnabled } from "./latency-hud";
 import { PredictiveEcho } from "./predictive-echo";
 import "@xterm/xterm/css/xterm.css";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -24,6 +24,7 @@ import {
   useImperativeHandle,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
 import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
@@ -48,7 +49,8 @@ import {
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { hosts, sessions } from "@/lib/api";
+import { type Host, hosts, type Session, sessions } from "@/lib/api";
+import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
@@ -1034,10 +1036,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     );
   };
 
+  const queryClient = useQueryClient();
   const sessionIdentityQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
     staleTime: 30_000,
+    ...cachedListItem<Session>(queryClient, ["sessions"], sessionId),
   });
   const signalingHostId = sessionIdentityQuery.data?.host_id ?? null;
   const hostIdentityQuery = useQuery({
@@ -1045,6 +1049,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     queryFn: () => hosts.get(signalingHostId as string),
     enabled: signalingHostId !== null,
     staleTime: 30_000,
+    ...cachedListItem<Host>(queryClient, ["hosts"], signalingHostId ?? ""),
   });
 
   flushLiveTerminalWritesRef.current = () => {
@@ -1146,6 +1151,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   };
 
   const daemonConnection = useDaemonConnection(signalingHostId);
+  const subscribeDaemon = useCallback(
+    (listener: () => void) => daemonConnection?.subscribe(listener) ?? (() => {}),
+    [daemonConnection],
+  );
+  const daemonReady = useSyncExternalStore(
+    subscribeDaemon,
+    () => daemonConnection?.getSnapshot().state === "ready",
+    () => false,
+  );
   const socket = useSessionSocket({
     connection: daemonConnection,
     sessionId,
@@ -3308,6 +3322,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     <div
       role="application"
       aria-label="Session terminal"
+      data-session-id={sessionId}
+      data-input-ready={socket.dcOpen && controlState?.owner === true}
       aria-busy={!socket.dcOpen}
       onFocusCapture={() => {
         focusViewRef.current();
@@ -3361,6 +3377,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           terminal's own black: the overlay explains the wait, and gets out of
           the way the moment output arrives. */}
       <ConnectingOverlay
+        sharedConnectionReady={daemonReady}
         socketState={socket.state}
         v3={socket.v3}
         dcOpen={socket.dcOpen}

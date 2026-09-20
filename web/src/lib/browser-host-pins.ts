@@ -700,31 +700,33 @@ function mergeHostIds(existing: readonly string[], seed: readonly string[]): str
  * connect because no pin matched has no way to learn that the operator has
  * since re-possessed the host — so it stays dead while the copy on screen tells
  * the reader that re-possessing will bring it back. Callers subscribe to this
- * and re-run their trust decision when it moves.
+ * and re-run their trust decision when it moves. Reconfirming an unchanged pin
+ * notifies with changed=false so refused roots can recover from device approval
+ * without restarting healthy or already-recovering roots.
  *
  * Deliberately page-local: it reports what *this* page did, which is the case
  * the warm terminal pool keeps mounted across navigation. Another tab's
  * approval is not observed here, and reloading still picks it up.
  */
 let hostPinRevision = 0;
-const hostPinListeners = new Set<() => void>();
+const hostPinListeners = new Set<(changed: boolean) => void>();
 
 export function getBrowserHostPinRevision(): number {
   return hostPinRevision;
 }
 
-export function subscribeToBrowserHostPinChanges(listener: () => void): () => void {
+export function subscribeToBrowserHostPinChanges(listener: (changed: boolean) => void): () => void {
   hostPinListeners.add(listener);
   return () => {
     hostPinListeners.delete(listener);
   };
 }
 
-function announceBrowserHostPinChange(): void {
-  hostPinRevision += 1;
+function announceBrowserHostPinChange(changed = true): void {
+  if (changed) hostPinRevision += 1;
   for (const listener of [...hostPinListeners]) {
     try {
-      listener();
+      listener(changed);
     } catch {
       // A bad subscriber must not stop the others from hearing about it.
     }
@@ -747,9 +749,13 @@ export async function approveBrowserHostPin(
       );
       if (existing?.state === "active") {
         const merged = mergeHostIds(existing.hostIds, seedHostIds);
-        if (merged.length === existing.hostIds.length) return { result: publicPin(existing) };
+        if (
+          merged.length === existing.hostIds.length &&
+          merged.every((id, index) => id === existing.hostIds[index])
+        )
+          return { result: { pin: publicPin(existing), changed: false } };
         const updated: StoredBrowserHostPinV1 = { ...existing, hostIds: merged };
-        return { nextRecord: updated, result: publicPin(updated) };
+        return { nextRecord: updated, result: { pin: publicPin(updated), changed: true } };
       }
 
       const now = checkedNow(options);
@@ -776,7 +782,7 @@ export async function approveBrowserHostPin(
           revokedAtMs: null,
           state: "active",
         };
-        return { nextRecord: reactivated, result: publicPin(reactivated) };
+        return { nextRecord: reactivated, result: { pin: publicPin(reactivated), changed: true } };
       }
       if (
         records.filter((record) => record.state === "active").length >= BROWSER_HOST_PIN_MAX_RECORDS
@@ -799,10 +805,12 @@ export async function approveBrowserHostPin(
         state: "active",
         version: BROWSER_HOST_PIN_STORAGE_VERSION,
       };
-      return { nextRecord: created, result: publicPin(created) };
+      return { nextRecord: created, result: { pin: publicPin(created), changed: true } };
     });
-    announceBrowserHostPinChange();
-    return approved;
+    // Reconfirmed trust can unblock a refused connection after device approval,
+    // but must not retire healthy connections when workspace gossip repeats.
+    announceBrowserHostPinChange(approved.changed);
+    return approved.pin;
   } finally {
     database.close();
   }

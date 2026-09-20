@@ -17,6 +17,15 @@ Maestro service is unnecessary. These tests cover the transport acceptance
 boundary; they do not replace user interface navigation tests or physical
 handset evidence.
 
+The shared-transport case establishes the host first, then selects each existing
+session for the first time and reopens a detached surface. `opening_measurements`
+records selection-to-renderer, channel creation/open, actual replay content after
+two animation frames, transport readiness and daemon-confirmed input readiness.
+All timestamps use native bridge arrival time on the same device clock; network
+conditions are local UDP TURN without injected faults during these measurements.
+These are native surface-selection timings, excluding navigation animation and
+metadata fetching. Browser navigation is measured separately by the live smoke.
+
 On process relaunch, the controller reuses an identical stored fixture token
 after validating its account with the API. It lets the real AuthGate restore
 that account rather than resetting the ready identity during device registration.

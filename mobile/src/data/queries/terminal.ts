@@ -4,6 +4,7 @@ import { getHost } from "@/data/api/endpoints/hosts";
 import { getSession, patchSession, restartSession } from "@/data/api/endpoints/sessions";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
+import { cachedListItem } from "@/data/cached-list-item";
 import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
 
@@ -16,16 +17,19 @@ export interface TerminalData {
 }
 
 export function useTerminalData(sessionId: string): TerminalData {
+  const queryClient = useQueryClient();
   const sessionQuery = useQuery({
     queryKey: qk.session(sessionId),
     queryFn: () => getSession(sessionId),
     enabled: sessionId.length > 0,
+    ...cachedListItem<SessionOut>(queryClient, qk.sessions(), sessionId),
   });
   const hostId = sessionQuery.data?.host_id ?? "";
   const hostQuery = useQuery({
     queryKey: qk.host(hostId),
     queryFn: () => getHost(hostId),
     enabled: hostId.length > 0,
+    ...cachedListItem<HostOut>(queryClient, qk.hosts(), hostId),
   });
 
   return {

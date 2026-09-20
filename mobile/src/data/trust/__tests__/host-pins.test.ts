@@ -4,6 +4,7 @@ import {
   type HostPin,
   type HostPinPersistence,
   hostPinRecordCounts,
+  subscribeHostPinChanges,
 } from "@/data/trust/host-pins";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
 import { deriveEd25519PublicKey } from "@/lib/crypto/ed25519";
@@ -83,6 +84,35 @@ describe("host pin trust decisions", () => {
         phoneIdentityAvailable: true,
       }),
     ).resolves.toMatchObject({ status: "match" });
+  });
+
+  test("repeated active approvals do not write or restart connections; real changes notify", async () => {
+    const store = createHostPinStore(persistence);
+    const changed = jest.fn();
+    const save = jest.spyOn(persistence, "save");
+    const reconfirmed = jest.fn();
+    const unsubscribe = subscribeHostPinChanges((didChange) => {
+      if (didChange) changed();
+      else reconfirmed();
+    });
+    const approval = { accountId: ACCOUNT_ID, serverOrigin: ORIGIN, hostPublicKey: HOST_KEY };
+    try {
+      const first = await store.approveExact({ ...approval, hostId: HOST_ID, approvedAtMs: 10 });
+      for (let index = 0; index < 3; index++) {
+        expect(await store.approveExact({ ...approval, approvedAtMs: 20 })).toEqual(first);
+      }
+      expect(changed).toHaveBeenCalledTimes(1);
+      expect(reconfirmed).toHaveBeenCalledTimes(3);
+      expect(save).toHaveBeenCalledTimes(1);
+      await store.approveExact({ ...approval, hostId: "11111111-2222-4333-8444-555555555556" });
+      expect(changed).toHaveBeenCalledTimes(2);
+      await store.revokeExact(approval);
+      expect(changed).toHaveBeenCalledTimes(3);
+      await store.approveExact(approval);
+      expect(changed).toHaveBeenCalledTimes(4);
+    } finally {
+      unsubscribe();
+    }
   });
 
   test("distinguishes mismatch, missing, revoked, and missing identities", async () => {

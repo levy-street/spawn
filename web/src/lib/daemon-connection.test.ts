@@ -78,6 +78,7 @@ class Channel {
 }
 class Root {
   state: HostControlState = "idle";
+  retryCalls = 0;
   generation = crypto.randomUUID();
   readonly channels: Channel[] = [];
   readonly listeners = new Set<() => void>();
@@ -119,6 +120,7 @@ class Root {
     return { kind: "direct", rttMs: 1, protocol: "udp" };
   }
   retryConnection() {
+    this.retryCalls++;
     this.setState("connecting");
   }
   createDeviceChannel(label: string) {
@@ -202,6 +204,41 @@ test("tabs and terminal views reuse one daemon peer; detaching a view preserves 
   expect(roots[0].closed).toBe(false);
   expect(b.readyState).toBe("open");
   expect(roots[0].channels[0].readyState).toBe("closed");
+});
+
+test("reconfirmed trust preserves healthy roots and retries a refused owner only once", async () => {
+  const owner = connect(),
+    follower = connect();
+  await until(() => follower.getSnapshot().state === "ready");
+  const channel = follower.createChannel(label());
+  await until(() => channel.readyState === "open");
+  owner.retry(true);
+  follower.retry(true);
+  await Bun.sleep(10);
+  expect(roots[0].retryCalls).toBe(0);
+  expect(channel.readyState).toBe("open");
+  channel.send("still attached");
+  await until(() => roots[0].channels[0].sent.length === 1);
+
+  roots[0].setState("error");
+  await until(() => follower.getSnapshot().state === "error");
+  // Several tabs can replay the approval before they receive the recovery
+  // snapshot. The owner must arbitrate using its current state.
+  follower.retry(true);
+  follower.retry(true);
+  owner.retry(true);
+  await until(() => follower.getSnapshot().state === "connecting");
+  await Bun.sleep(10);
+  expect(roots[0].retryCalls).toBe(1);
+  follower.retry(true);
+  await Bun.sleep(10);
+  expect(roots[0].retryCalls).toBe(1);
+
+  roots[0].setState("ready");
+  await until(() => follower.getSnapshot().state === "ready");
+  follower.retry();
+  await until(() => roots[0].retryCalls === 2);
+  expect(roots[0].state).toBe("connecting");
 });
 
 test("owner handover fences old channels and rejects delayed snapshots from the former owner", async () => {
