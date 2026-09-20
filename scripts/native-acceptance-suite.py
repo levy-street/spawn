@@ -321,10 +321,31 @@ async def exercise(fixture: Any) -> None:
         )
 
         async def shared() -> dict[str, Any]:
+            async def measured_snapshot() -> dict[str, Any] | None:
+                state = await snapshot()
+                phases = ("renderer_ms", "attachment_created_ms", "channel_open_ms",
+                          "first_content_ms", "transport_ready_ms", "input_ready_ms")
+                measurements = state.get("openings", {})
+                if len(measurements) != 2:
+                    return None
+                for measurement in measurements.values():
+                    values = measurement.get("phases", {})
+                    if not all(type(values.get(key)) in (int, float)
+                               and math.isfinite(values[key]) and values[key] >= 0
+                               for key in phases):
+                        return None
+                return state
+
+            # Establish the parent first; neither existing session has been viewed.
+            await fixture.command("mount", {"sessions": [], "tools": 2})
+            await fixture.command("mount", {"sessions": ["a"], "tools": 2})
+            await echo("a")
             await fixture.command("mount", {"sessions": ["a", "b"], "tools": 2})
-            first = await wait_ready()
+            await wait_ready()
             await echo("a")
             await echo("b")
+            first = await eventually(measured_snapshot, timeout=5,
+                                     message="first-open timing evidence is incomplete")
             for tool in (0, 1):
                 await fixture.command(
                     "host-request",
@@ -334,6 +355,9 @@ async def exercise(fixture: Any) -> None:
             await echo("b")
             await fixture.command("mount", {"sessions": ["a", "b"], "tools": 2})
             second = await wait_ready()
+            await echo("a")
+            second = await eventually(measured_snapshot, timeout=5,
+                                      message="repeat-open timing evidence is incomplete")
             require(
                 first["peer"]["workerId"] == second["peer"]["workerId"]
                 and first["peer"]["createdPeerCount"]
@@ -344,6 +368,12 @@ async def exercise(fixture: Any) -> None:
             return {
                 "shell_pids": self_ids,
                 "live_peers": second["peer"]["livePeerCount"],
+                "opening_measurements": {
+                    "network": "native WebViews over local UDP TURN; no injected delay",
+                    "start": "native session selection; authenticated host already ready",
+                    "first": first["openings"],
+                    "reopened": second["openings"],
+                },
             }
 
         await case("shared_transport", shared)

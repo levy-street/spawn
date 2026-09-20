@@ -63,6 +63,8 @@ scripts/, docs/   build helpers and app-specific notes
 - `e2e/NATIVE_ACCEPTANCE.md` describes the GitHub-hosted iOS simulator and Android
   emulator acceptance job. Its controller and RTC observation hook enter only a
   disposable build copy, using the actual app providers and native WebViews.
+  Opening measurements separate renderer, channel, replay paint and confirmed
+  input readiness for never-viewed and reopened sessions on a ready parent.
   The Android job removes generated build directories after preserving the APK
   and metadata; `e2e/test-compact-android-build.py` checks cleanup boundaries.
   Its hosted disk preflight reclaims only named unused tools on the disposable
