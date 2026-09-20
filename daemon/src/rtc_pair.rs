@@ -230,17 +230,11 @@ impl RtcSessions {
         Ok(true)
     }
 
-    /// Called under admission: a new authenticated connection fences the old
-    /// one before it is admitted, including after browser owner handover.
-    #[cfg(test)]
-    pub(super) async fn retire_device_pair(&self, device_key: [u8; 32]) {
-        let retired = self.take_device_pair(device_key).await;
-        self.close_retired_host_peers(retired).await;
-    }
-
     /// Remove every host peer paired with `device_key` from the host map,
-    /// retiring each as it leaves. Returns them for the caller to close once
-    /// it holds no lock a transport close could stall.
+    /// retiring each as it leaves: a new authenticated connection fences the
+    /// old one before it is admitted, including after browser owner handover.
+    /// Returns them for the caller to close once it holds no lock a transport
+    /// close could stall.
     pub(super) async fn take_device_pair(
         &self,
         device_key: [u8; 32],
@@ -261,6 +255,9 @@ impl RtcSessions {
             .collect()
     }
 
+    /// The retirement a test can wait on: the pair sessions close, then the
+    /// transport, inline. Production closes them in tracked tasks.
+    #[cfg(test)]
     pub(super) async fn close_retired_host_peers(
         &self,
         retired: Vec<(String, super::HostRtcPeer)>,
@@ -1193,6 +1190,64 @@ mod tests {
         }
     }
 
+    /// The offer that replaces a device's connection is answered while the
+    /// connection it replaces is still closing. Against a device that has
+    /// gone, that close can wait for as long as the device does, and it must
+    /// hold up neither this device's answer nor anyone else's admission.
+    #[tokio::test]
+    async fn device_offer_is_answered_while_the_superseded_transport_close_stalls() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let first = connect_pair(&sessions, &registry, [9; 32]).await;
+        let first_id = sessions
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("the first pair is admitted");
+        let gate = sessions
+            .stall_effect(&first_id, TestEffectPoint::HostTransportClose)
+            .await;
+
+        // `connect_pair` returns only once the successor is connected, so the
+        // answer went out while the first connection's close was held here.
+        let successor = connect_pair(&sessions, &registry, [9; 32]).await;
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .expect("the superseded transport close is reached");
+        assert_eq!(
+            successor.connection_state(),
+            RTCPeerConnectionState::Connected
+        );
+        {
+            let hosts = sessions.host_peers.lock().await;
+            assert_eq!(hosts.len(), 1);
+            assert!(!hosts.contains_key(&first_id));
+        }
+        assert_eq!(
+            sessions.peer_admission.charged(),
+            1,
+            "the superseded pair's slot returned before its close"
+        );
+        assert_eq!(sessions.admission_gauge().await.host_closing, 1);
+
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sessions.admission_gauge().await.host_closing != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the superseded close settles once released");
+        sessions.close_all().await;
+        for pc in [first, successor] {
+            let _ = pc.close().await;
+        }
+    }
+
     #[tokio::test]
     async fn device_handover_replaces_only_the_same_device_connection() {
         let sessions = RtcSessions::new();
@@ -1258,7 +1313,8 @@ mod tests {
         let guard = closer.lock().await;
         let retire_sessions = sessions.clone();
         let retiring = tokio::spawn(async move {
-            retire_sessions.retire_device_pair([7; 32]).await;
+            let retired = retire_sessions.take_device_pair([7; 32]).await;
+            retire_sessions.close_retired_host_peers(retired).await;
         });
         tokio::time::timeout(Duration::from_secs(3), async {
             while !sessions.host_peers.lock().await.is_empty() {

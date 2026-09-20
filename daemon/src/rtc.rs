@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -88,11 +88,36 @@ const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace period for a connected peer that reports `Disconnected` (transient
 /// network blips) before the daemon closes it.
 const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
-/// How long a peer's teardown may run before the operator hears about it.
-/// The teardown keeps going; this only names a peer whose transport close or
-/// callback fence has stopped answering, so a stuck peer is visible while it
-/// is one peer and not once it is a hundred.
+/// How long a peer's teardown may run before the operator hears about it,
+/// and how often they hear about it after that. The teardown keeps going;
+/// this only names a peer whose transport close or callback fence has stopped
+/// answering, so a stuck peer is visible while it is one peer and not once it
+/// is a hundred, and stays visible for as long as it is stuck.
 const RTC_TEARDOWN_WATCHDOG: Duration = Duration::from_secs(30);
+const RTC_TEARDOWN_REMINDER: Duration = Duration::from_secs(300);
+
+/// Await a teardown, calling `stalled` with the time it has been pending once
+/// it outlives the watchdog and again at every reminder after that. The
+/// teardown is never abandoned: a transport that stops answering is a leak to
+/// find, and cancelling its close would hide it behind a half-closed peer
+/// connection. Returns the output with how long it took.
+async fn settle_with_watchdog<T>(
+    teardown: impl Future<Output = T>,
+    mut stalled: impl FnMut(Duration),
+) -> (T, Duration) {
+    tokio::pin!(teardown);
+    let started = tokio::time::Instant::now();
+    let mut next = RTC_TEARDOWN_WATCHDOG;
+    loop {
+        tokio::select! {
+            output = &mut teardown => return (output, started.elapsed()),
+            () = tokio::time::sleep_until(started + next) => {
+                stalled(started.elapsed());
+                next += RTC_TEARDOWN_REMINDER;
+            }
+        }
+    }
+}
 // Exercise the production grace in real-peer tests too: a shorter test-only
 // deadline can reap a partial peer before its negative probes reach the gate
 // on a loaded runner, so the test never exercises the boundary it asserts.
@@ -150,6 +175,9 @@ pub struct RtcSessions {
     uploads: UploadHub,
     peer_cleanup_tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
     closing_peers: Arc<Mutex<HashMap<(String, String), RtcPeer>>>,
+    /// Host peers whose transport close is still running after they left the
+    /// host map. They are in no map, so they are counted.
+    host_closing: Arc<AtomicUsize>,
     peer_admission: RtcPeerAdmission,
     api: Arc<OnceLock<webrtc::api::API>>,
     signaling: RtcWsSender,
@@ -281,14 +309,17 @@ impl RtcPeerAdmission {
 }
 
 impl RtcSessions {
-    /// Write the cap's state to the heartbeat, where `spawnd status` reads it.
-    async fn publish_admission_gauge(&self) {
+    /// The cap as it stands. Read by the control-connection heartbeat, which
+    /// writes it to the state file for `spawnd status` — off every RTC lock,
+    /// because that write is an fsync.
+    pub async fn admission_gauge(&self) -> crate::state::RtcPeerGauge {
         let closing = self.closing_peers.lock().await.len();
-        crate::state::active_rtc_peers(crate::state::RtcPeerGauge {
-            admitted: self.peer_admission.charged(),
+        crate::state::RtcPeerGauge {
+            in_use: self.peer_admission.charged(),
             closing,
+            host_closing: self.host_closing.load(Ordering::Acquire),
             cap: MAX_RTC_PEERS,
-        });
+        }
     }
 }
 
@@ -389,6 +420,22 @@ fn retire_host_peer(peer: &HostRtcPeer) {
         pair.retire();
     }
     peer.admission.retire();
+}
+
+/// One host transport close in flight, for the gauge.
+struct HostClosing<'a>(&'a AtomicUsize);
+
+impl<'a> HostClosing<'a> {
+    fn begin(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for HostClosing<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1088,7 +1135,6 @@ impl RtcSessions {
             anyhow::bail!("rtc session admission rejected");
         }
         drop(_admission);
-        self.publish_admission_gauge().await;
 
         install_ice_handler(&pc, binding.signaling.clone(), self.signaling.clone());
         #[cfg(test)]
@@ -1273,10 +1319,11 @@ impl RtcSessions {
         }
         // The previous connection for this device leaves the host map here,
         // under the admission lock, so the new one is the only pair for the
-        // device from the first observable moment. Its transport closes after
-        // the lock is released: every offer on this daemon serializes on that
-        // lock, and a close waiting on a remote that will never answer must
-        // not stall them all.
+        // device from the first observable moment. Its transport closes in a
+        // tracked task once the lock is released: every offer on this daemon
+        // serializes on that lock, this offer's answer is queued behind this
+        // function, and a close waiting on a device that will never answer
+        // must stall neither.
         let superseded = match &admission.pair {
             Some(pair) => self.take_device_pair(pair.device_key).await,
             None => Vec::new(),
@@ -1302,8 +1349,7 @@ impl RtcSessions {
             }
         };
         drop(_admission);
-        self.publish_admission_gauge().await;
-        self.close_retired_host_peers(superseded).await;
+        self.spawn_host_closes(superseded).await;
         if !admitted {
             let _ = pc.close().await;
             anyhow::bail!("host rtc session admission rejected");
@@ -1428,36 +1474,67 @@ impl RtcSessions {
         }
     }
 
-    /// Close a host peer's transport, naming it in the journal if the close
-    /// outlives the teardown watchdog. The close is never abandoned: a
-    /// transport that stops answering is a leak to find, and cancelling the
-    /// close would hide it behind a half-closed peer connection. The peer's
-    /// admission slot is already back in the cap by the time this runs.
+    /// Close a host peer's transport, naming it in the journal while the
+    /// close outlives the teardown watchdog. The peer's admission slot is
+    /// already back in the cap by the time this runs; while it runs the peer
+    /// is counted in the gauge's `host_closing`.
     async fn close_host_transport(&self, signal_id: &str, pc: &Arc<RTCPeerConnection>) {
-        self.publish_admission_gauge().await;
+        let _counted = HostClosing::begin(&self.host_closing);
         #[cfg(test)]
         self.pause_effect(signal_id, TestEffectPoint::HostTransportClose)
             .await;
-        let started = tokio::time::Instant::now();
-        let close = pc.close();
-        tokio::pin!(close);
-        tokio::select! {
-            result = &mut close => {
-                let _ = result;
-            }
-            () = tokio::time::sleep(RTC_TEARDOWN_WATCHDOG) => {
-                tracing::warn!(
-                    signal_id,
-                    watchdog_secs = RTC_TEARDOWN_WATCHDOG.as_secs(),
-                    "host rtc peer transport close still pending; its admission slot was returned when it left the host map"
-                );
-                let _ = close.await;
-                tracing::info!(
-                    signal_id,
-                    elapsed_secs = started.elapsed().as_secs(),
-                    "host rtc peer transport close settled late"
-                );
-            }
+        let (result, elapsed) = settle_with_watchdog(pc.close(), |pending| {
+            tracing::warn!(
+                signal_id,
+                pending_secs = pending.as_secs(),
+                "host rtc peer transport close still pending; its admission slot was returned when it left the host map"
+            );
+        })
+        .await;
+        let _ = result;
+        if elapsed >= RTC_TEARDOWN_WATCHDOG {
+            tracing::info!(
+                signal_id,
+                elapsed_secs = elapsed.as_secs(),
+                "host rtc peer transport close settled late"
+            );
+        }
+    }
+
+    /// Close retired host peers in tracked tasks: their pair sessions first,
+    /// then their transports. Returns one receiver per peer that completes
+    /// when that peer's close settles, for a caller that wants to wait a
+    /// bounded time for them.
+    async fn spawn_host_closes(
+        &self,
+        retired: Vec<(String, HostRtcPeer)>,
+    ) -> Vec<oneshot::Receiver<()>> {
+        let mut settled = Vec::with_capacity(retired.len());
+        let mut tasks = self.peer_cleanup_tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+        for (signal_id, peer) in retired {
+            let (done_tx, done_rx) = oneshot::channel();
+            settled.push(done_rx);
+            let sessions = self.clone();
+            tasks.spawn(async move {
+                sessions.close_pair_sessions(&peer.pc).await;
+                sessions.close_host_transport(&signal_id, &peer.pc).await;
+                let _ = done_tx.send(());
+            });
+        }
+        settled
+    }
+
+    /// Close retired host peers in tracked tasks and wait for them until
+    /// `deadline`. Whatever is still closing afterwards is counted in the
+    /// gauge and named by the watchdog; nothing here waits for it.
+    async fn close_host_peers_until(
+        &self,
+        retired: Vec<(String, HostRtcPeer)>,
+        deadline: tokio::time::Instant,
+    ) {
+        for settled in self.spawn_host_closes(retired).await {
+            let _ = tokio::time::timeout_at(deadline, settled).await;
         }
     }
 
@@ -1960,13 +2037,11 @@ impl RtcSessions {
         );
         let closing_peers = Arc::clone(&self.closing_peers);
         let closing_key = (signal_id.to_string(), peer.generation.clone());
-        let admission = peer.admission.clone();
         {
             let mut tasks = self.peer_cleanup_tasks.lock().await;
             while tasks.try_join_next().is_some() {}
             let signal_id = signal_id.to_string();
-            let settled_admission = admission.clone();
-            let settled_sessions = self.clone();
+            let admission = peer.admission.clone();
             tasks.spawn(async move {
                 let pc = Arc::clone(&peer.pc);
                 let closing_pc = Arc::clone(&pc);
@@ -1995,29 +2070,35 @@ impl RtcSessions {
                         transport_settled.store(true, Ordering::Release);
                     }
                 };
-                // Neither half is ever abandoned: a transport that stops
-                // answering is a leak to find, and cancelling its close would
-                // hide it behind a half-closed peer connection. The watchdog
-                // only names it.
                 let teardown = async { tokio::join!(close_transport, cleanup) };
                 tokio::pin!(teardown);
-                let started = tokio::time::Instant::now();
-                tokio::select! {
-                    ((), ()) = &mut teardown => {}
-                    () = tokio::time::sleep(RTC_TEARDOWN_WATCHDOG) => {
+                // The slot is charged for the close deadline at most. This
+                // task is the one thing nothing cancels, so the deadline
+                // release lives here and not with a caller whose own future
+                // may be dropped. Whatever the teardown is still waiting on
+                // past the deadline — a device that will never acknowledge a
+                // transport close, a callback that never lets go of the fence
+                // — is a peer to find in the journal, not a reason to refuse
+                // the next offer. Neither half is ever abandoned.
+                if let Err(_elapsed) = tokio::time::timeout_at(upload_deadline, &mut teardown).await
+                {
+                    admission.retire();
+                    let (((), ()), elapsed) = settle_with_watchdog(&mut teardown, |pending| {
                         tracing::warn!(
                             %session_id,
                             signal_id,
                             transport_pending = !transport_settled.load(Ordering::Acquire),
                             cleanup_pending = !cleanup_settled.load(Ordering::Acquire),
-                            watchdog_secs = RTC_TEARDOWN_WATCHDOG.as_secs(),
+                            pending_secs = pending.as_secs(),
                             "rtc peer teardown still pending; its admission slot was returned at its close deadline"
                         );
-                        let ((), ()) = teardown.await;
+                    })
+                    .await;
+                    if elapsed >= RTC_TEARDOWN_WATCHDOG {
                         tracing::info!(
                             %session_id,
                             signal_id,
-                            elapsed_secs = started.elapsed().as_secs(),
+                            elapsed_secs = elapsed.as_secs(),
                             "rtc peer teardown settled late"
                         );
                     }
@@ -2030,19 +2111,11 @@ impl RtcSessions {
                     closing.remove(&closing_key);
                 }
                 drop(closing);
-                settled_admission.retire();
-                settled_sessions.publish_admission_gauge().await;
+                admission.retire();
                 let _ = done_tx.send(());
             });
         }
         let _ = tokio::time::timeout_at(upload_deadline, done_rx).await;
-        // The slot is charged for the close deadline at most. Whatever the
-        // teardown is still waiting on past this point — a remote that will
-        // never acknowledge a transport close, a callback that never lets go
-        // of the fence — is a peer to find in the journal, not a reason to
-        // refuse the next offer.
-        admission.retire();
-        self.publish_admission_gauge().await;
     }
 
     #[cfg(test)]
@@ -2124,9 +2197,8 @@ impl RtcSessions {
                 peers.remove(&signal_id);
             }
         }
-        for (signal_id, peer) in host_peers {
-            self.close_host_transport(&signal_id, &peer.pc).await;
-        }
+        self.close_host_peers_until(host_peers.into_iter().collect(), upload_teardown_deadline())
+            .await;
     }
 
     /// Linearize credential invalidation against both session and host RTC
@@ -2152,17 +2224,18 @@ impl RtcSessions {
 
         // Remove host peers from admission immediately as well. Close their
         // transports alongside the more involved session cleanup so neither
-        // class delays fail-closed publication for the other.
+        // class delays fail-closed publication for the other — and, since the
+        // admission lock is held for the whole of this function and every
+        // offer on the daemon waits on it, wait for those closes only until
+        // the teardown deadline. A host transport that never answers is
+        // counted and named; it does not hold the lock.
         let host_peers = {
             let mut hosts = self.host_peers.lock().await;
             hosts.values().for_each(retire_host_peer);
             std::mem::take(&mut *hosts)
         };
-        let close_hosts = async move {
-            for (signal_id, peer) in host_peers {
-                self.close_host_transport(&signal_id, &peer.pc).await;
-            }
-        };
+        let close_hosts = self
+            .close_host_peers_until(host_peers.into_iter().collect(), upload_teardown_deadline());
         let (_, ()) = tokio::join!(self.close_all(), close_hosts);
     }
 

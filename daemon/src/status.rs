@@ -395,8 +395,8 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
         if let Some(peers) = instance.rtc_peers {
             let _ = writeln!(
                 text,
-                "  peers        {} of {} admitted · {} closing",
-                peers.admitted, peers.cap, peers.closing
+                "  peers        {} of {} in use · {} closing · {} host closing",
+                peers.in_use, peers.cap, peers.closing, peers.host_closing
             );
         }
         let _ = writeln!(
@@ -476,8 +476,9 @@ mod tests {
             release: None,
             worker_mismatch,
             rtc_peers: Some(crate::state::RtcPeerGauge {
-                admitted: 3,
+                in_use: 3,
                 closing: 1,
+                host_closing: 0,
                 cap: 128,
             }),
         }
@@ -533,8 +534,9 @@ mod tests {
                 },
                 sessions: 2,
                 rtc_peers: Some(crate::state::RtcPeerGauge {
-                    admitted: 5,
+                    in_use: 5,
                     closing: 1,
+                    host_closing: 2,
                     cap: 128,
                 }),
                 version: "0.4.2+gabc.diagnostics".into(),
@@ -572,7 +574,7 @@ mod tests {
         // names what it is pointed at; the command's own build is one line
         // at the end, never mistaken for either.
         assert!(plain.contains("  sessions     2 running\n"));
-        assert!(plain.contains("  peers        5 of 128 admitted · 1 closing\n"));
+        assert!(plain.contains("  peers        5 of 128 in use · 1 closing · 2 host closing\n"));
         assert!(plain.contains("  version      0.4.2+gabc.diagnostics · up to date\n"));
         assert!(plain.contains(
             "  release      0.4.2+gabc.diagnostics-1234abcd (diagnostics) · /Users/x/.local/lib/spawn/releases/0.4.2+gabc.diagnostics-1234abcd\n"
@@ -587,8 +589,9 @@ mod tests {
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["host"], "mac-studio");
         assert_eq!(json["instances"][0]["sessions"], 2);
-        assert_eq!(json["instances"][0]["rtc_peers"]["admitted"], 5);
+        assert_eq!(json["instances"][0]["rtc_peers"]["in_use"], 5);
         assert_eq!(json["instances"][0]["rtc_peers"]["closing"], 1);
+        assert_eq!(json["instances"][0]["rtc_peers"]["host_closing"], 2);
         assert_eq!(json["instances"][0]["rtc_peers"]["cap"], 128);
         assert_eq!(json["instances"][0]["service"]["running"], true);
         assert_eq!(json["instances"][0]["browser_pins"], 3);

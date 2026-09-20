@@ -339,17 +339,28 @@ The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never
 returns it. A slot returns when its owner leaves the live map — for a session
 peer, once its close deadline passes or its teardown settles, whichever is
-first; for a host peer, the moment it leaves the host map, under that lock,
-before its transport close begins. Never tie a slot to a clone of the peer
-dropping: clones live on in the closing-peer map, the fenced cleanup task, and
-stored callbacks for as long as a remote that will never answer keeps a
-transport close pending, and that is how dream refused every offer for a day
-with `capacity exhausted` while its status said `connected`. A transport close
-is never abandoned either — a peer still tearing down after
-`RTC_TEARDOWN_WATCHDOG` is named in the journal — and no path awaits one while
-holding the admission lock. The cap is published to the heartbeat as
-`rtc_peers` on every admission and retirement; `spawnd status` prints it as
-the `peers` line, so a leak shows while it is one peer.
+first, released from inside the tracked cleanup task, which nothing cancels;
+for a host peer, the moment it leaves the host map, under that lock, before
+its transport close begins. Never tie a slot to a clone of the peer dropping:
+clones live on in the closing-peer map, the fenced cleanup task, and stored
+callbacks for as long as a remote that will never answer keeps a transport
+close pending, and that is how dream refused every offer for a day with
+`capacity exhausted` while its status said `connected`.
+
+The owning teardown of a mapped peer never abandons its transport close: a
+session teardown past its deadline and every host close keep running in a
+tracked task, and `settle_with_watchdog` names one still pending at
+`RTC_TEARDOWN_WATCHDOG` and every `RTC_TEARDOWN_REMINDER` after. (A duplicate
+close of a peer some other teardown owns is bounded by that peer's deadline.)
+No path awaits a transport close while holding the admission lock, which
+every offer serializes on: a superseded pair closes in a tracked task after
+the lock drops, and trust invalidation waits for host closes only until the
+teardown deadline. The cap is read by the control-connection heartbeat every
+30 s and written to the state file as `rtc_peers` (`in_use`, `closing`,
+`host_closing`, `cap`); `spawnd status` prints it as the `peers` line, so a
+leak — of slots, or of peers that never finish closing — shows while it is
+one peer. Never write the state file from the RTC path: that write is an
+fsync, and the offer path waits on the locks it would run under.
 
 ## Before calling a change done
 

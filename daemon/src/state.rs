@@ -52,15 +52,17 @@ pub struct StateFile {
     pub rtc_peers: Option<RtcPeerGauge>,
 }
 
-/// How full the RTC peer cap is: slots charged by peers in the live maps and
-/// by closing peers still inside their close deadline, against the cap; and
-/// how many peers are still tearing down, whether or not they hold a slot.
-/// Written on every admission and retirement, so `spawnd status` can show a
-/// leak while it is still small.
+/// How full the RTC peer cap is. `in_use` is the slots charged, by peers in
+/// the live maps and by closing peers still inside their close deadline;
+/// `closing` is session peers still tearing down and `host_closing` host
+/// peers whose transport close is still running, whether or not either still
+/// holds a slot. Written by the control-connection heartbeat, so a leak shows
+/// in `spawnd status` while it is still small.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcPeerGauge {
-    pub admitted: usize,
+    pub in_use: usize,
     pub closing: usize,
+    pub host_closing: usize,
     pub cap: usize,
 }
 

@@ -287,9 +287,11 @@ uploads settle, whichever is first, so a burst of stalled churn stays inside
 the global peer cap without a teardown that never settles costing the cap a
 slot for good (the 2026-09-19 dream outage: every offer refused with
 `capacity exhausted` for a day while 128 reaped peers waited on browsers that
-had already gone). A teardown still pending after the thirty-second watchdog
-is named in the journal, and the heartbeat's `rtc_peers` gauge shows the cap
-in `spawnd status`.
+had already gone). The deadline release lives inside the tracked cleanup
+task, which nothing cancels. A teardown still pending after the thirty-second
+watchdog is named in the journal, and every five minutes after; the
+control-connection heartbeat writes the cap, closing peers, and host closes
+in flight to the state file as `rtc_peers` for `spawnd status`.
 Teardown also reschedules retained post-publication unlink/fsync cleanup; a
 failure stays charged and a later session/generation teardown retries it.
 

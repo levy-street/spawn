@@ -987,6 +987,7 @@ async fn serve_one_connection_with_loader(
     }
     tracing::info!(%ws_url, "ws connected");
     crate::state::active_connected(registry.ids().len());
+    crate::state::active_rtc_peers(rtc_sessions.admission_gauge().await);
 
     let (write_half, read_half) = stream.split();
 
@@ -1062,6 +1063,7 @@ async fn serve_one_connection_with_loader(
     // Heartbeat task: also functions as the keepalive. If the write side
     // can't reach the channel (sender_task died) we know the WS is dead.
     let hb_tx = out_tx.clone();
+    let gauge_sessions = rtc_sessions.clone();
     let mut heartbeat_task = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         let mut ping = tokio::time::interval(WS_PING_INTERVAL);
@@ -1083,6 +1085,10 @@ async fn serve_one_connection_with_loader(
                     }
                 }
                 _ = heartbeat.tick() => {
+                    // The RTC peer cap, for `spawnd status`. Written here,
+                    // on no RTC lock, because the state file write is an
+                    // fsync and the offer path serializes on those locks.
+                    crate::state::active_rtc_peers(gauge_sessions.admission_gauge().await);
                     let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
                     let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
                         cpu_bucket,
