@@ -41,7 +41,12 @@ revoked identity. Every round verifies that the second account has no hosts or
 first-account attachments, then remounts both sessions and host tools and checks
 terminal input after returning to the first account. The report records
 `account_switch_rounds`. Repeated navigation and WebView removal exercise the
-Android draw-pass crash fixed by Reanimated 4.1.7; a terminated app fails the case.
+Android draw-pass crash fixed by Reanimated 4.1.7 and the pull-to-refresh drawing
+index crash addressed by the screens 4.16.0 patch; a terminated app fails the case.
+The disposable build runs the same `npm ci` postinstall patching as store builds.
+Fixture shutdown finishes worker/API cleanup and records its result even if the
+runner sends SIGTERM after the cases finish. Cancellation is deferred until this
+cleanup completes; the workflow's existing cleanup deadline still applies.
 
 ## Build isolation
 

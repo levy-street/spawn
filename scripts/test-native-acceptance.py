@@ -100,8 +100,60 @@ class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
         )
 
     def tearDown(self):
-        shutil.rmtree(self.fixture.scratch)
+        if self.fixture.scratch.exists():
+            shutil.rmtree(self.fixture.scratch)
         self.output.cleanup()
+
+    async def test_shutdown_during_cleanup_still_joins_api_and_records_cleanup(self):
+        entered, release, api_stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        server = SimpleNamespace(should_exit=False)
+        evidence = self.fixture.output / "evidence.json"
+        evidence.write_text(json.dumps({"status": "passed"}))
+
+        async def close():
+            entered.set()
+            await release.wait()
+
+        async def serve():
+            while not server.should_exit:
+                await asyncio.sleep(0)
+            self.assertTrue(self.fixture.scratch.exists())
+            api_stopped.set()
+
+        self.fixture.close = AsyncMock(side_effect=close)
+        server_task = asyncio.create_task(serve())
+        cleanup_task = asyncio.create_task(
+            fixture_module.finish_cleanup(self.fixture, server, server_task)
+        )
+        await asyncio.wait_for(entered.wait(), 1)
+        # Each SIGTERM calls current.cancel(), including while cleanup is active.
+        for _ in range(2):
+            cleanup_task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(cleanup_task.done())
+            self.assertNotIn("cleanup_passed", json.loads(evidence.read_text()))
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(cleanup_task, 1)
+        self.assertTrue(server_task.done())
+        self.assertTrue(api_stopped.is_set())
+        self.assertFalse(self.fixture.scratch.exists())
+        self.assertEqual(json.loads(evidence.read_text()), {
+            "status": "passed", "cleanup_passed": True,
+        })
+
+    async def test_cleanup_failure_still_fails_evidence_and_stops_api(self):
+        self.fixture.close = AsyncMock(side_effect=RuntimeError("worker remained"))
+        server = SimpleNamespace(should_exit=False)
+        evidence = self.fixture.output / "evidence.json"
+        evidence.write_text(json.dumps({"status": "passed"}))
+        with self.assertRaisesRegex(RuntimeError, "worker remained"):
+            await fixture_module.finish_cleanup(self.fixture, server, None)
+        self.assertTrue(server.should_exit)
+        self.assertFalse(self.fixture.scratch.exists())
+        report = json.loads(evidence.read_text())
+        self.assertFalse(report["cleanup_passed"])
+        self.assertEqual(report["status"], "failed")
 
     def test_events_reject_non_objects_and_missing_type(self):
         for invalid in ([], None, "event", {}, {"type": []}):
