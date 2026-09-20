@@ -58,6 +58,12 @@ jobs:
                   detail = error.stderr or ''
                   categories = [word for word in ('redirect', 'JSON', 'json', 'invalid character', 'unexpected', 'EOF', 'timeout', 'certificate', 'TLS', 'status', 'Forbidden', 'denied', 'Bad Gateway', 'unsupported', 'Content-Type', 'Location', 'host', 'parse', 'URL', 'token', 'authentication') if word in detail]
                   print('Exit:', error.returncode, 'HTTP statuses:', status, 'Categories:', categories, 'Detail length:', len(detail), flush=True)
+                  expected = 'the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway\n'
+                  if args[-1].endswith('/logs') and detail == expected:
+                      print('Confirmed GitHub CLI escape-sequence refusal; capture-only retry', flush=True)
+                      result = original(*args, '--allow-escape-sequences')
+                      print('Capture-only retry succeeded; raw log withheld', flush=True)
+                      return result
                   raise SystemExit('Read-only prerequisite failed')
           m.run = trace
           release = m.api('actions/runs/35514440361')
