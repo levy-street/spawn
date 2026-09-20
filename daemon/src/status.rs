@@ -32,6 +32,10 @@ struct InstanceStatus {
     connection: String,
     service: crate::service::ServiceStatus,
     sessions: usize,
+    /// The RTC peer cap as the live daemon last reported it; absent without a
+    /// live daemon, or from one that predates the gauge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtc_peers: Option<crate::state::RtcPeerGauge>,
     /// The build this instance runs: its live daemon's, else the release it
     /// is pointed at, else — with neither — this command's own.
     version: String,
@@ -185,6 +189,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     let heartbeat = build.state.as_ref();
     let connection = connection_text(dir, heartbeat);
     let sessions = heartbeat.map_or(0, |state| state.sessions);
+    let rtc_peers = build.live().and_then(|state| state.rtc_peers);
     let update = release_state(&server, build.tree.as_deref()).await;
     let host_key = crate::creds::host_identity(&stored)?.map(|identity| identity.fingerprint);
     let running = build.live().map(|state| RunningBuild {
@@ -214,6 +219,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         connection,
         service: crate::service::status(dir),
         sessions,
+        rtc_peers,
         version: build.version,
         update,
         host_key,
@@ -386,6 +392,13 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
         };
         let _ = writeln!(text, "  service      {service}");
         let _ = writeln!(text, "  sessions     {} running", instance.sessions);
+        if let Some(peers) = instance.rtc_peers {
+            let _ = writeln!(
+                text,
+                "  peers        {} of {} admitted · {} closing",
+                peers.admitted, peers.cap, peers.closing
+            );
+        }
         let _ = writeln!(
             text,
             "  version      {} · {}",
@@ -462,6 +475,11 @@ mod tests {
             exe: exe.map(str::to_owned),
             release: None,
             worker_mismatch,
+            rtc_peers: Some(crate::state::RtcPeerGauge {
+                admitted: 3,
+                closing: 1,
+                cap: 128,
+            }),
         }
     }
 
@@ -514,6 +532,11 @@ mod tests {
                     stderr_log: None,
                 },
                 sessions: 2,
+                rtc_peers: Some(crate::state::RtcPeerGauge {
+                    admitted: 5,
+                    closing: 1,
+                    cap: 128,
+                }),
                 version: "0.4.2+gabc.diagnostics".into(),
                 update: "up to date".into(),
                 host_key: Some("SHA256:Yr0kQmVd12345678".into()),
@@ -548,6 +571,8 @@ mod tests {
         // The version line is the instance's daemon, and the release line
         // names what it is pointed at; the command's own build is one line
         // at the end, never mistaken for either.
+        assert!(plain.contains("  sessions     2 running\n"));
+        assert!(plain.contains("  peers        5 of 128 admitted · 1 closing\n"));
         assert!(plain.contains("  version      0.4.2+gabc.diagnostics · up to date\n"));
         assert!(plain.contains(
             "  release      0.4.2+gabc.diagnostics-1234abcd (diagnostics) · /Users/x/.local/lib/spawn/releases/0.4.2+gabc.diagnostics-1234abcd\n"
@@ -562,6 +587,9 @@ mod tests {
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["host"], "mac-studio");
         assert_eq!(json["instances"][0]["sessions"], 2);
+        assert_eq!(json["instances"][0]["rtc_peers"]["admitted"], 5);
+        assert_eq!(json["instances"][0]["rtc_peers"]["closing"], 1);
+        assert_eq!(json["instances"][0]["rtc_peers"]["cap"], 128);
         assert_eq!(json["instances"][0]["service"]["running"], true);
         assert_eq!(json["instances"][0]["browser_pins"], 3);
         assert_eq!(json["instances"][0]["version"], "0.4.2+gabc.diagnostics");

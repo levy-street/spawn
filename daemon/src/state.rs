@@ -46,6 +46,22 @@ pub struct StateFile {
     /// state in which the daemon refuses new sessions.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_mismatch: bool,
+    /// The RTC peer cap as the daemon last saw it. Absent from a daemon that
+    /// predates the gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_peers: Option<RtcPeerGauge>,
+}
+
+/// How full the RTC peer cap is: slots charged by peers in the live maps and
+/// by closing peers still inside their close deadline, against the cap; and
+/// how many peers are still tearing down, whether or not they hold a slot.
+/// Written on every admission and retirement, so `spawnd status` can show a
+/// leak while it is still small.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RtcPeerGauge {
+    pub admitted: usize,
+    pub closing: usize,
+    pub cap: usize,
 }
 
 pub struct StateStore {
@@ -68,6 +84,12 @@ pub fn active_connected(sessions: usize) {
 pub fn active_disconnected(kind: &str, detail: &str, sessions: usize) {
     if let Some(store) = ACTIVE_STATE.get() {
         store.disconnected(kind, detail, sessions);
+    }
+}
+
+pub fn active_rtc_peers(gauge: RtcPeerGauge) {
+    if let Some(store) = ACTIVE_STATE.get() {
+        store.rtc_peers(gauge);
     }
 }
 
@@ -126,7 +148,19 @@ impl StateStore {
                 exe: crate::install::running_exe().map(|exe| exe.display().to_string()),
                 release: provenance.release_id().map(str::to_owned),
                 worker_mismatch: false,
+                rtc_peers: None,
             }),
+        }
+    }
+
+    pub fn rtc_peers(&self, gauge: RtcPeerGauge) {
+        let mut state = self.state.lock().expect("state heartbeat lock");
+        if state.rtc_peers == Some(gauge) {
+            return;
+        }
+        state.rtc_peers = Some(gauge);
+        if let Err(error) = write_atomic(&self.path, &state) {
+            tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }
     }
 

@@ -281,9 +281,15 @@ lifetime, and no warning offers retry. Control-channel teardown publishes
 cancellation and viewer removal immediately. Every callback for that peer
 shares an immutable
 first-close deadline, including delayed sender, state, duplicate, invalid, and
-replacement paths. The tracked cleanup owns the RTC admission token until
-transport, fence, registries, and uploads actually settle, so map removal does
-not free capacity and stalled churn remains inside the global peer cap.
+replacement paths. The tracked cleanup keeps the peer's RTC admission slot
+charged until that deadline passes or transport, fence, registries, and
+uploads settle, whichever is first, so a burst of stalled churn stays inside
+the global peer cap without a teardown that never settles costing the cap a
+slot for good (the 2026-09-19 dream outage: every offer refused with
+`capacity exhausted` for a day while 128 reaped peers waited on browsers that
+had already gone). A teardown still pending after the thirty-second watchdog
+is named in the journal, and the heartbeat's `rtc_peers` gauge shows the cap
+in `spawnd status`.
 Teardown also reschedules retained post-publication unlink/fsync cleanup; a
 failure stays charged and a later session/generation teardown retries it.
 
@@ -295,8 +301,9 @@ session/generation retry, zero temp/FD/operation residue, idempotent
 publication, and barrier-controlled same/different-owner concurrent starts
 with exactly one preparation/temp and no slot replacement. Deterministic paused-time RTC tests prove delayed duplicate,
 sender, and state closes cannot gain a new deadline, and a stalled cleanup
-retains its admission slot across peer-map removal and replacement churn until
-zero residue. A real paired-WebRTC regression drives the actual PTY and control
+retains its admission slot across peer-map removal only until its close
+deadline, then returns it exactly once, with settlement returning nothing a
+second time. A real paired-WebRTC regression drives the actual PTY and control
 sender loops to failure, stalls their DataChannel-close path, then proves a
 delayed duplicate and peer-state close reuse the sender's original deadline;
 both labels settle with no peer, closing-registry, sink, task, or admission

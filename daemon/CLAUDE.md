@@ -335,6 +335,22 @@ map becomes observable, then performs asynchronous channel cleanup. The
 protected-content guard pins that narrow exported surface; it exposes no
 content or server publication capability.
 
+The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
+session or host peer; a pair session inherits its host peer's slot and never
+returns it. A slot returns when its owner leaves the live map — for a session
+peer, once its close deadline passes or its teardown settles, whichever is
+first; for a host peer, the moment it leaves the host map, under that lock,
+before its transport close begins. Never tie a slot to a clone of the peer
+dropping: clones live on in the closing-peer map, the fenced cleanup task, and
+stored callbacks for as long as a remote that will never answer keeps a
+transport close pending, and that is how dream refused every offer for a day
+with `capacity exhausted` while its status said `connected`. A transport close
+is never abandoned either — a peer still tearing down after
+`RTC_TEARDOWN_WATCHDOG` is named in the journal — and no path awaits one while
+holding the admission lock. The cap is published to the heartbeat as
+`rtc_peers` on every admission and retirement; `spawnd status` prints it as
+the `peers` line, so a leak shows while it is one peer.
+
 ## Before calling a change done
 
 ```bash

@@ -232,30 +232,42 @@ impl RtcSessions {
 
     /// Called under admission: a new authenticated connection fences the old
     /// one before it is admitted, including after browser owner handover.
+    #[cfg(test)]
     pub(super) async fn retire_device_pair(&self, device_key: [u8; 32]) {
-        let retired = {
-            let mut hosts = self.host_peers.lock().await;
-            let ids = hosts
-                .iter()
-                .filter(|(_, peer)| {
-                    peer.pair
-                        .as_ref()
-                        .is_some_and(|pair| pair.device_key == device_key)
-                })
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| hosts.remove(&id))
-                .inspect(|peer| {
-                    if let Some(pair) = &peer.pair {
-                        pair.retire();
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        for peer in retired {
+        let retired = self.take_device_pair(device_key).await;
+        self.close_retired_host_peers(retired).await;
+    }
+
+    /// Remove every host peer paired with `device_key` from the host map,
+    /// retiring each as it leaves. Returns them for the caller to close once
+    /// it holds no lock a transport close could stall.
+    pub(super) async fn take_device_pair(
+        &self,
+        device_key: [u8; 32],
+    ) -> Vec<(String, super::HostRtcPeer)> {
+        let mut hosts = self.host_peers.lock().await;
+        let ids = hosts
+            .iter()
+            .filter(|(_, peer)| {
+                peer.pair
+                    .as_ref()
+                    .is_some_and(|pair| pair.device_key == device_key)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| hosts.remove(&id).map(|peer| (id, peer)))
+            .inspect(|(_, peer)| super::retire_host_peer(peer))
+            .collect()
+    }
+
+    pub(super) async fn close_retired_host_peers(
+        &self,
+        retired: Vec<(String, super::HostRtcPeer)>,
+    ) {
+        for (signal_id, peer) in retired {
             self.close_pair_sessions(&peer.pc).await;
-            let _ = peer.pc.close().await;
+            self.close_host_transport(&signal_id, &peer.pc).await;
         }
     }
 
@@ -457,7 +469,7 @@ impl RtcSessions {
                 offer_key: Some(pair.device_key),
                 remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                 restart_lock: Arc::new(Mutex::new(())),
-                _admission_permit: Arc::clone(&parent._admission_permit),
+                admission: parent.admission.inherit(),
                 fence: Arc::clone(&fence),
             };
             self.peers.lock().await.insert(id.clone(), child.clone());
@@ -1014,6 +1026,11 @@ mod tests {
         })
         .await
         .expect("only the first attachment retires");
+        assert_eq!(
+            sessions.peer_admission.charged(),
+            1,
+            "an attachment rides on its host peer's slot and never returns it"
+        );
         assert_eq!(pc.connection_state(), RTCPeerConnectionState::Connected);
         second.send(&Bytes::from_static(b"second")).await.unwrap();
         assert_eq!(

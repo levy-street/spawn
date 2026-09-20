@@ -88,6 +88,11 @@ const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace period for a connected peer that reports `Disconnected` (transient
 /// network blips) before the daemon closes it.
 const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
+/// How long a peer's teardown may run before the operator hears about it.
+/// The teardown keeps going; this only names a peer whose transport close or
+/// callback fence has stopped answering, so a stuck peer is visible while it
+/// is one peer and not once it is a hundred.
+const RTC_TEARDOWN_WATCHDOG: Duration = Duration::from_secs(30);
 // Exercise the production grace in real-peer tests too: a shorter test-only
 // deadline can reap a partial peer before its negative probes reach the gate
 // on a loaded runner, so the test never exercises the boundary it asserts.
@@ -207,21 +212,83 @@ impl Default for RtcPeerAdmission {
     }
 }
 
+/// One slot of the peer cap.
+///
+/// The slot is returned by `release`, which the owning peer's teardown calls
+/// once its close deadline passes — not by the last clone of the peer
+/// dropping. Clones of a peer ride along in the closing-peer map, the fenced
+/// cleanup task, and stored callbacks, and any of those may outlive the
+/// deadline by as long as a remote that will never answer keeps a transport
+/// close pending. None of them may keep the slot charged: that is how dream
+/// refused every offer for a day with `capacity exhausted` while its own
+/// status said `connected`. Dropping the last holder still returns the slot,
+/// so an exit path that never reaches teardown cannot strand it either.
 struct RtcPeerAdmissionPermit {
-    _permit: OwnedSemaphorePermit,
+    permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+impl RtcPeerAdmissionPermit {
+    fn release(&self) {
+        self.permit
+            .lock()
+            .expect("rtc admission permit lock")
+            .take();
+    }
+}
+
+/// How a peer relates to the cap. A session or host peer charged one slot
+/// and returns it at teardown; a pair session rides on its host peer's slot
+/// and never returns it — only the host peer does, when it leaves the host
+/// map.
+#[derive(Clone)]
+enum AdmissionSlot {
+    Owned(Arc<RtcPeerAdmissionPermit>),
+    Inherited(Arc<RtcPeerAdmissionPermit>),
+}
+
+impl AdmissionSlot {
+    fn inherit(&self) -> Self {
+        match self {
+            Self::Owned(permit) | Self::Inherited(permit) => Self::Inherited(Arc::clone(permit)),
+        }
+    }
+
+    /// Return the slot to the cap if this peer owns it. Idempotent.
+    fn retire(&self) {
+        if let Self::Owned(permit) = self {
+            permit.release();
+        }
+    }
 }
 
 impl RtcPeerAdmission {
-    fn try_acquire(&self) -> Option<Arc<RtcPeerAdmissionPermit>> {
+    fn try_acquire(&self) -> Option<AdmissionSlot> {
         Arc::clone(&self.slots)
             .try_acquire_owned()
             .ok()
-            .map(|permit| Arc::new(RtcPeerAdmissionPermit { _permit: permit }))
+            .map(|permit| {
+                AdmissionSlot::Owned(Arc::new(RtcPeerAdmissionPermit {
+                    permit: std::sync::Mutex::new(Some(permit)),
+                }))
+            })
     }
 
-    #[cfg(test)]
+    /// Slots currently charged: peers in the live maps plus closing peers
+    /// still inside their close deadline.
     fn charged(&self) -> usize {
         MAX_RTC_PEERS - self.slots.available_permits()
+    }
+}
+
+impl RtcSessions {
+    /// Write the cap's state to the heartbeat, where `spawnd status` reads it.
+    async fn publish_admission_gauge(&self) {
+        let closing = self.closing_peers.lock().await.len();
+        crate::state::active_rtc_peers(crate::state::RtcPeerGauge {
+            admitted: self.peer_admission.charged(),
+            closing,
+            cap: MAX_RTC_PEERS,
+        });
     }
 }
 
@@ -246,6 +313,7 @@ impl PeerCloseCoordinator {
 enum TestEffectPoint {
     CloseAllSnapshot,
     ControlRequest,
+    HostTransportClose,
     PtyInput,
     PtySink,
     Ready,
@@ -309,7 +377,18 @@ struct HostRtcPeer {
     pc: Arc<RTCPeerConnection>,
     binding: HostRtcBinding,
     pair: Option<Arc<pair::PairContext>>,
-    _admission_permit: Arc<RtcPeerAdmissionPermit>,
+    admission: AdmissionSlot,
+}
+
+/// Everything that happens the moment a host peer leaves the host map, under
+/// the map lock: its pair stops admitting attachments and its admission slot
+/// goes back to the cap. The transport close that follows may take as long as
+/// an unreachable remote makes it; nothing about admission waits for it.
+fn retire_host_peer(peer: &HostRtcPeer) {
+    if let Some(pair) = &peer.pair {
+        pair.retire();
+    }
+    peer.admission.retire();
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -374,7 +453,7 @@ struct RtcPeer {
     offer_key: Option<[u8; 32]>,
     remote_ufrags: Arc<Mutex<HashSet<String>>>,
     restart_lock: Arc<Mutex<()>>,
-    _admission_permit: Arc<RtcPeerAdmissionPermit>,
+    admission: AdmissionSlot,
     /// Replacement sets `active` false, closes the PC, then takes this write
     /// lock. Every callback holds a read lock while touching its backend, so
     /// `close_for_session` does not return until old-generation work has drained.
@@ -996,7 +1075,7 @@ impl RtcSessions {
                         offer_key,
                         remote_ufrags: Arc::new(Mutex::new(HashSet::from([remote_ufrag]))),
                         restart_lock: Arc::new(Mutex::new(())),
-                        _admission_permit: admission_permit,
+                        admission: admission_permit,
                         fence: Arc::clone(&fence),
                     },
                 );
@@ -1009,6 +1088,7 @@ impl RtcSessions {
             anyhow::bail!("rtc session admission rejected");
         }
         drop(_admission);
+        self.publish_admission_gauge().await;
 
         install_ice_handler(&pc, binding.signaling.clone(), self.signaling.clone());
         #[cfg(test)]
@@ -1191,9 +1271,16 @@ impl RtcSessions {
             let _ = pc.close().await;
             anyhow::bail!("credential trust changed during host RTC negotiation");
         }
-        if let Some(pair) = &admission.pair {
-            self.retire_device_pair(pair.device_key).await;
-        }
+        // The previous connection for this device leaves the host map here,
+        // under the admission lock, so the new one is the only pair for the
+        // device from the first observable moment. Its transport closes after
+        // the lock is released: every offer on this daemon serializes on that
+        // lock, and a close waiting on a remote that will never answer must
+        // not stall them all.
+        let superseded = match &admission.pair {
+            Some(pair) => self.take_device_pair(pair.device_key).await,
+            None => Vec::new(),
+        };
         let admitted = {
             let mut hosts = self.host_peers.lock().await;
             if hosts.contains_key(&signal_id)
@@ -1208,17 +1295,19 @@ impl RtcSessions {
                         pc: Arc::clone(&pc),
                         binding: binding.clone(),
                         pair: admission.pair.clone(),
-                        _admission_permit: admission_permit,
+                        admission: admission_permit,
                     },
                 );
                 true
             }
         };
+        drop(_admission);
+        self.publish_admission_gauge().await;
+        self.close_retired_host_peers(superseded).await;
         if !admitted {
             let _ = pc.close().await;
             anyhow::bail!("host rtc session admission rejected");
         }
-        drop(_admission);
 
         install_host_ice_handler(
             &pc,
@@ -1326,20 +1415,49 @@ impl RtcSessions {
                 .get(signal_id)
                 .is_some_and(|peer| Arc::ptr_eq(&peer.pc, pc))
             {
-                peers.remove(signal_id).inspect(|peer| {
-                    if let Some(pair) = &peer.pair {
-                        pair.retire();
-                    }
-                })
+                peers.remove(signal_id).inspect(retire_host_peer)
             } else {
                 None
             }
         };
         if let Some(peer) = removed {
             self.close_pair_sessions(&peer.pc).await;
-            let _ = peer.pc.close().await;
+            self.close_host_transport(signal_id, &peer.pc).await;
         } else {
-            let _ = pc.close().await;
+            self.close_host_transport(signal_id, pc).await;
+        }
+    }
+
+    /// Close a host peer's transport, naming it in the journal if the close
+    /// outlives the teardown watchdog. The close is never abandoned: a
+    /// transport that stops answering is a leak to find, and cancelling the
+    /// close would hide it behind a half-closed peer connection. The peer's
+    /// admission slot is already back in the cap by the time this runs.
+    async fn close_host_transport(&self, signal_id: &str, pc: &Arc<RTCPeerConnection>) {
+        self.publish_admission_gauge().await;
+        #[cfg(test)]
+        self.pause_effect(signal_id, TestEffectPoint::HostTransportClose)
+            .await;
+        let started = tokio::time::Instant::now();
+        let close = pc.close();
+        tokio::pin!(close);
+        tokio::select! {
+            result = &mut close => {
+                let _ = result;
+            }
+            () = tokio::time::sleep(RTC_TEARDOWN_WATCHDOG) => {
+                tracing::warn!(
+                    signal_id,
+                    watchdog_secs = RTC_TEARDOWN_WATCHDOG.as_secs(),
+                    "host rtc peer transport close still pending; its admission slot was returned when it left the host map"
+                );
+                let _ = close.await;
+                tracing::info!(
+                    signal_id,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "host rtc peer transport close settled late"
+                );
+            }
         }
     }
 
@@ -1372,18 +1490,14 @@ impl RtcSessions {
                 .get(&signal.signal_id)
                 .is_some_and(|peer| peer.binding == binding)
             {
-                peers.remove(&signal.signal_id).inspect(|peer| {
-                    if let Some(pair) = &peer.pair {
-                        pair.retire();
-                    }
-                })
+                peers.remove(&signal.signal_id).inspect(retire_host_peer)
             } else {
                 None
             }
         };
         if let Some(peer) = peer {
             self.close_pair_sessions(&peer.pc).await;
-            let _ = peer.pc.close().await;
+            self.close_host_transport(&signal.signal_id, &peer.pc).await;
         }
     }
 
@@ -1846,24 +1960,68 @@ impl RtcSessions {
         );
         let closing_peers = Arc::clone(&self.closing_peers);
         let closing_key = (signal_id.to_string(), peer.generation.clone());
+        let admission = peer.admission.clone();
         {
             let mut tasks = self.peer_cleanup_tasks.lock().await;
             while tasks.try_join_next().is_some() {}
+            let signal_id = signal_id.to_string();
+            let settled_admission = admission.clone();
+            let settled_sessions = self.clone();
             tasks.spawn(async move {
                 let pc = Arc::clone(&peer.pc);
                 let closing_pc = Arc::clone(&pc);
                 let closing_generation = peer.generation.clone();
+                let session_id = peer.session.session_id();
                 let transport = peer.clone();
-                let cleanup = async move {
-                    let _lifecycle = peer.channels.fail().await;
-                    let _drained = peer.fence.write().await;
-                    peer.control.remove_direct_sink(&upload_viewer_id).await;
-                    controls.unregister_viewer(&upload_viewer_id).await;
-                    uploads
-                        .cancel_viewer_and_wait(peer.session, &upload_viewer_id)
-                        .await;
+                let transport_settled = Arc::new(AtomicBool::new(false));
+                let cleanup_settled = Arc::new(AtomicBool::new(false));
+                let cleanup = {
+                    let cleanup_settled = Arc::clone(&cleanup_settled);
+                    async move {
+                        let _lifecycle = peer.channels.fail().await;
+                        let _drained = peer.fence.write().await;
+                        peer.control.remove_direct_sink(&upload_viewer_id).await;
+                        controls.unregister_viewer(&upload_viewer_id).await;
+                        uploads
+                            .cancel_viewer_and_wait(peer.session, &upload_viewer_id)
+                            .await;
+                        cleanup_settled.store(true, Ordering::Release);
+                    }
                 };
-                let ((), ()) = tokio::join!(pair::close_session_transport(&transport), cleanup);
+                let close_transport = {
+                    let transport_settled = Arc::clone(&transport_settled);
+                    async move {
+                        pair::close_session_transport(&transport).await;
+                        transport_settled.store(true, Ordering::Release);
+                    }
+                };
+                // Neither half is ever abandoned: a transport that stops
+                // answering is a leak to find, and cancelling its close would
+                // hide it behind a half-closed peer connection. The watchdog
+                // only names it.
+                let teardown = async { tokio::join!(close_transport, cleanup) };
+                tokio::pin!(teardown);
+                let started = tokio::time::Instant::now();
+                tokio::select! {
+                    ((), ()) = &mut teardown => {}
+                    () = tokio::time::sleep(RTC_TEARDOWN_WATCHDOG) => {
+                        tracing::warn!(
+                            %session_id,
+                            signal_id,
+                            transport_pending = !transport_settled.load(Ordering::Acquire),
+                            cleanup_pending = !cleanup_settled.load(Ordering::Acquire),
+                            watchdog_secs = RTC_TEARDOWN_WATCHDOG.as_secs(),
+                            "rtc peer teardown still pending; its admission slot was returned at its close deadline"
+                        );
+                        let ((), ()) = teardown.await;
+                        tracing::info!(
+                            %session_id,
+                            signal_id,
+                            elapsed_secs = started.elapsed().as_secs(),
+                            "rtc peer teardown settled late"
+                        );
+                    }
+                }
                 let mut closing = closing_peers.lock().await;
                 if closing.get(&closing_key).is_some_and(|current| {
                     current.generation == closing_generation
@@ -1871,10 +2029,20 @@ impl RtcSessions {
                 }) {
                     closing.remove(&closing_key);
                 }
+                drop(closing);
+                settled_admission.retire();
+                settled_sessions.publish_admission_gauge().await;
                 let _ = done_tx.send(());
             });
         }
         let _ = tokio::time::timeout_at(upload_deadline, done_rx).await;
+        // The slot is charged for the close deadline at most. Whatever the
+        // teardown is still waiting on past this point — a remote that will
+        // never acknowledge a transport close, a callback that never lets go
+        // of the fence — is a peer to find in the journal, not a reason to
+        // refuse the next offer.
+        admission.retire();
+        self.publish_admission_gauge().await;
     }
 
     #[cfg(test)]
@@ -1900,11 +2068,7 @@ impl RtcSessions {
     pub async fn close_all(&self) {
         let host_peers = {
             let mut hosts = self.host_peers.lock().await;
-            for peer in hosts.values() {
-                if let Some(pair) = &peer.pair {
-                    pair.retire();
-                }
-            }
+            hosts.values().for_each(retire_host_peer);
             std::mem::take(&mut *hosts)
         };
         #[cfg(test)]
@@ -1960,8 +2124,8 @@ impl RtcSessions {
                 peers.remove(&signal_id);
             }
         }
-        for (_, peer) in host_peers {
-            let _ = peer.pc.close().await;
+        for (signal_id, peer) in host_peers {
+            self.close_host_transport(&signal_id, &peer.pc).await;
         }
     }
 
@@ -1991,16 +2155,12 @@ impl RtcSessions {
         // class delays fail-closed publication for the other.
         let host_peers = {
             let mut hosts = self.host_peers.lock().await;
-            for peer in hosts.values() {
-                if let Some(pair) = &peer.pair {
-                    pair.retire();
-                }
-            }
+            hosts.values().for_each(retire_host_peer);
             std::mem::take(&mut *hosts)
         };
         let close_hosts = async move {
-            for (_, peer) in host_peers {
-                let _ = peer.pc.close().await;
+            for (signal_id, peer) in host_peers {
+                self.close_host_transport(&signal_id, &peer.pc).await;
             }
         };
         let (_, ()) = tokio::join!(self.close_all(), close_hosts);
@@ -4682,7 +4842,7 @@ mod tests {
                 offer_key: None,
                 remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                 restart_lock: Arc::new(Mutex::new(())),
-                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                admission: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
             },
         );
@@ -4705,7 +4865,7 @@ mod tests {
                     protocol: HOST_CONTROL_LABEL.to_owned(),
                     protocol_version: RTC_PROTOCOL_VERSION,
                 },
-                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                admission: sessions.peer_admission.try_acquire().unwrap(),
             },
         );
         let cleanup_gate = sessions
@@ -6175,7 +6335,7 @@ mod tests {
                 offer_key: None,
                 remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                 restart_lock: Arc::new(Mutex::new(())),
-                _admission_permit: admission_permit,
+                admission: admission_permit,
                 fence: Arc::clone(&fence),
             },
         );
@@ -6362,8 +6522,14 @@ mod tests {
         }
     }
 
+    /// The regression behind a day of `capacity exhausted` on dream: a peer
+    /// whose teardown never settles — here, a callback that never lets go of
+    /// the fence; there, a transport close waiting on a browser that had
+    /// already gone — must not keep its slot. The slot is charged for the
+    /// close deadline, which bounds a burst of churn, and not a moment
+    /// longer.
     #[tokio::test(start_paused = true)]
-    async fn stalled_peer_cleanup_retains_the_global_admission_slot_until_settlement() {
+    async fn stalled_peer_cleanup_returns_the_admission_slot_at_its_close_deadline() {
         let registry = SessionRegistry::new();
         let session_id = Uuid::new_v4();
         let (session, _commands) = insert_test_worker(&registry, session_id);
@@ -6379,26 +6545,31 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
+        // Inside the close deadline the closing peer still holds its slot.
+        assert_eq!(sessions.closing_peers.lock().await.len(), 1);
+        assert_eq!(sessions.peer_admission.charged(), 1);
+
         tokio::time::advance(Duration::from_millis(101)).await;
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
+        // Past it, the teardown is still stuck on the fence and the peer is
+        // still closing — and the slot is back in the cap.
         assert!(!sessions.peers.lock().await.contains_key(signal_id));
         assert_eq!(sessions.closing_peers.lock().await.len(), 1);
-        assert_eq!(sessions.peer_admission.charged(), 1);
+        assert_eq!(sessions.peer_cleanup_task_count().await, 1);
+        assert_eq!(sessions.peer_admission.charged(), 0);
 
         let mut replacement_permits = Vec::new();
         while let Some(permit) = sessions.peer_admission.try_acquire() {
             replacement_permits.push(permit);
         }
-        assert_eq!(replacement_permits.len(), MAX_RTC_PEERS - 1);
-        for _ in 0..(MAX_RTC_PEERS * 2) {
-            assert!(
-                sessions.peer_admission.try_acquire().is_none(),
-                "stalled invalid/replacement churn exceeded the RTC peer cap"
-            );
-        }
-        assert_eq!(sessions.peer_admission.charged(), MAX_RTC_PEERS);
+        assert_eq!(
+            replacement_permits.len(),
+            MAX_RTC_PEERS,
+            "a stuck teardown must not cost the cap a slot"
+        );
+        assert!(sessions.peer_admission.try_acquire().is_none());
 
         drop(blocked_effect);
         for _ in 0..32 {
@@ -6409,11 +6580,76 @@ mod tests {
         }
         assert_eq!(sessions.peer_cleanup_task_count().await, 0);
         assert!(sessions.closing_peers.lock().await.is_empty());
-        // Replacement peers still own every other slot; the closing peer's
-        // slot is the single permit released by actual cleanup completion.
-        assert_eq!(sessions.peer_admission.charged(), MAX_RTC_PEERS - 1);
+        // Settlement returns nothing a second time: the cap holds exactly the
+        // replacements, and not one more.
+        assert_eq!(sessions.peer_admission.charged(), MAX_RTC_PEERS);
+        assert!(
+            sessions.peer_admission.try_acquire().is_none(),
+            "a settled teardown must not return its slot twice"
+        );
         drop(replacement_permits);
         assert_eq!(sessions.peer_admission.charged(), 0);
+    }
+
+    /// A host peer's slot goes back to the cap when it leaves the host map,
+    /// before its transport close — which may wait on a device that will
+    /// never answer — has done anything at all.
+    #[tokio::test]
+    async fn host_peer_returns_its_admission_slot_when_it_leaves_the_host_map() {
+        let sessions = RtcSessions::new();
+        let signal_id = "host-transport-stalls";
+        let pc = Arc::new(
+            APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        sessions.host_peers.lock().await.insert(
+            signal_id.to_owned(),
+            HostRtcPeer {
+                pair: None,
+                pc: Arc::clone(&pc),
+                binding: HostRtcBinding {
+                    host_id: Uuid::new_v4(),
+                    binding_nonce: "0".repeat(32),
+                    binding_generation: 1,
+                    protocol: HOST_CONTROL_LABEL.to_owned(),
+                    protocol_version: RTC_PROTOCOL_VERSION,
+                },
+                admission: sessions.peer_admission.try_acquire().unwrap(),
+            },
+        );
+        assert_eq!(sessions.peer_admission.charged(), 1);
+        let gate = sessions
+            .stall_effect(signal_id, TestEffectPoint::HostTransportClose)
+            .await;
+
+        let closing = tokio::spawn({
+            let sessions = sessions.clone();
+            let pc = Arc::clone(&pc);
+            async move { sessions.close_host_if_same(signal_id, &pc).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .expect("the transport close is reached");
+
+        // Held before `pc.close()`: the peer has left the map and its slot is
+        // already free, with the transport close not yet begun.
+        assert!(sessions.host_peers.lock().await.is_empty());
+        assert_eq!(sessions.peer_admission.charged(), 0);
+        assert!(!closing.is_finished());
+
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .expect("the transport close settles")
+            .unwrap();
+        assert_eq!(sessions.peer_admission.charged(), 0);
+        assert!(
+            sessions.peer_admission.try_acquire().is_some(),
+            "the cap admits again after the host peer is gone"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6598,7 +6834,7 @@ mod tests {
                 offer_key: None,
                 remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                 restart_lock: Arc::new(Mutex::new(())),
-                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                admission: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::clone(&fence),
             },
         );
@@ -6675,7 +6911,7 @@ mod tests {
                 offer_key: None,
                 remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                 restart_lock: Arc::new(Mutex::new(())),
-                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                admission: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
             },
         );
@@ -6726,7 +6962,7 @@ mod tests {
                 offer_key: None,
                 remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                 restart_lock: Arc::new(Mutex::new(())),
-                _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                admission: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
             },
         );
@@ -7935,7 +8171,7 @@ mod tests {
                     offer_key: None,
                     remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                     restart_lock: Arc::new(Mutex::new(())),
-                    _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                    admission: sessions.peer_admission.try_acquire().unwrap(),
                     fence: Arc::clone(&old_fence),
                 },
             ),
@@ -7953,7 +8189,7 @@ mod tests {
                     offer_key: None,
                     remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
                     restart_lock: Arc::new(Mutex::new(())),
-                    _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
+                    admission: sessions.peer_admission.try_acquire().unwrap(),
                     fence: current_fence,
                 },
             ),
