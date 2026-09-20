@@ -271,14 +271,57 @@ fn test_pending_base_queue_out_of_bounce() -> Result<()> {
 
 // NOTE: TSN is not used in pendingQueue in the actual usage.
 //       Following tests use TSN field as a chunk ID.
+/// Room in the queue only comes back when the peer acknowledges what is in
+/// flight. When it never does, a writer waits forever holding the writer
+/// lock, and a stream shutdown's zero-length reset chunk waits behind it —
+/// which is what kept a peer connection close from ever finishing. Closing
+/// the queue, as the association does when it closes, releases both.
+#[tokio::test]
+async fn test_pending_queue_close_releases_a_writer_waiting_on_a_silent_peer() -> Result<()> {
+    let pq = std::sync::Arc::new(PendingQueue::with_limit(64));
+    pq.push(make_data_chunk(0, false, NO_FRAGMENT)).await?;
+    let mut big = make_data_chunk(1, false, NO_FRAGMENT);
+    big.user_data = Bytes::from(vec![0u8; 60]);
+
+    let writer = tokio::spawn({
+        let pq = std::sync::Arc::clone(&pq);
+        async move { pq.append(vec![big]).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!writer.is_finished(), "the writer waits for room");
+
+    let reset = tokio::spawn({
+        let pq = std::sync::Arc::clone(&pq);
+        async move {
+            let mut c = make_data_chunk(2, false, NO_FRAGMENT);
+            c.user_data = Bytes::new();
+            pq.push(c).await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !reset.is_finished(),
+        "the zero-length reset waits behind the writer's lock"
+    );
+
+    pq.close();
+    assert!(matches!(writer.await.unwrap(), Err(Error::ErrStreamClosed)));
+    assert!(matches!(reset.await.unwrap(), Err(Error::ErrStreamClosed)));
+    assert!(matches!(
+        pq.push(make_data_chunk(3, false, NO_FRAGMENT)).await,
+        Err(Error::ErrStreamClosed)
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_pending_queue_push_and_pop() -> Result<()> {
     let pq = PendingQueue::new();
-    pq.push(make_data_chunk(0, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(0, false, NO_FRAGMENT)).await?;
     assert_eq!(pq.get_num_bytes(), 10, "total bytes mismatch");
-    pq.push(make_data_chunk(1, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(1, false, NO_FRAGMENT)).await?;
     assert_eq!(pq.get_num_bytes(), 20, "total bytes mismatch");
-    pq.push(make_data_chunk(2, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(2, false, NO_FRAGMENT)).await?;
     assert_eq!(pq.get_num_bytes(), 30, "total bytes mismatch");
 
     for i in 0..3 {
@@ -294,9 +337,9 @@ async fn test_pending_queue_push_and_pop() -> Result<()> {
 
     assert_eq!(pq.get_num_bytes(), 0, "total bytes mismatch");
 
-    pq.push(make_data_chunk(3, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(3, false, NO_FRAGMENT)).await?;
     assert_eq!(pq.get_num_bytes(), 10, "total bytes mismatch");
-    pq.push(make_data_chunk(4, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(4, false, NO_FRAGMENT)).await?;
     assert_eq!(pq.get_num_bytes(), 20, "total bytes mismatch");
 
     for i in 3..5 {
@@ -319,13 +362,13 @@ async fn test_pending_queue_push_and_pop() -> Result<()> {
 async fn test_pending_queue_unordered_wins() -> Result<()> {
     let pq = PendingQueue::new();
 
-    pq.push(make_data_chunk(0, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(0, false, NO_FRAGMENT)).await?;
     assert_eq!(10, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(1, true, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(1, true, NO_FRAGMENT)).await?;
     assert_eq!(20, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(2, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(2, false, NO_FRAGMENT)).await?;
     assert_eq!(30, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(3, true, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(3, true, NO_FRAGMENT)).await?;
     assert_eq!(40, pq.get_num_bytes(), "total bytes mismatch");
 
     let c = pq.peek();
@@ -368,12 +411,12 @@ async fn test_pending_queue_unordered_wins() -> Result<()> {
 #[tokio::test]
 async fn test_pending_queue_fragments() -> Result<()> {
     let pq = PendingQueue::new();
-    pq.push(make_data_chunk(0, false, FRAG_BEGIN)).await;
-    pq.push(make_data_chunk(1, false, FRAG_MIDDLE)).await;
-    pq.push(make_data_chunk(2, false, FRAG_END)).await;
-    pq.push(make_data_chunk(3, true, FRAG_BEGIN)).await;
-    pq.push(make_data_chunk(4, true, FRAG_MIDDLE)).await;
-    pq.push(make_data_chunk(5, true, FRAG_END)).await;
+    pq.push(make_data_chunk(0, false, FRAG_BEGIN)).await?;
+    pq.push(make_data_chunk(1, false, FRAG_MIDDLE)).await?;
+    pq.push(make_data_chunk(2, false, FRAG_END)).await?;
+    pq.push(make_data_chunk(3, true, FRAG_BEGIN)).await?;
+    pq.push(make_data_chunk(4, true, FRAG_MIDDLE)).await?;
+    pq.push(make_data_chunk(5, true, FRAG_END)).await?;
 
     let expects = vec![3, 4, 5, 0, 1, 2];
 
@@ -395,7 +438,7 @@ async fn test_pending_queue_fragments() -> Result<()> {
 #[tokio::test]
 async fn test_pending_queue_selection_persistence() -> Result<()> {
     let pq = PendingQueue::new();
-    pq.push(make_data_chunk(0, false, FRAG_BEGIN)).await;
+    pq.push(make_data_chunk(0, false, FRAG_BEGIN)).await?;
 
     let c = pq.peek();
     assert!(c.is_some(), "peek error");
@@ -405,9 +448,9 @@ async fn test_pending_queue_selection_persistence() -> Result<()> {
     let result = pq.pop(beginning_fragment, unordered);
     assert!(result.is_some(), "should not error: {}", 0);
 
-    pq.push(make_data_chunk(1, true, NO_FRAGMENT)).await;
-    pq.push(make_data_chunk(2, false, FRAG_MIDDLE)).await;
-    pq.push(make_data_chunk(3, false, FRAG_END)).await;
+    pq.push(make_data_chunk(1, true, NO_FRAGMENT)).await?;
+    pq.push(make_data_chunk(2, false, FRAG_MIDDLE)).await?;
+    pq.push(make_data_chunk(3, false, FRAG_END)).await?;
 
     let expects = vec![2, 3, 1];
 

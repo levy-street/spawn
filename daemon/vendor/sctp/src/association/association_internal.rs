@@ -270,6 +270,9 @@ impl AssociationInternal {
     pub(crate) async fn close(&mut self) -> Result<()> {
         if self.get_state() != AssociationState::Closed {
             self.set_state(AssociationState::Closed);
+            // Writers waiting for room the peer will never grant return now,
+            // and release the writer lock stream shutdowns queue behind.
+            self.pending_queue.close();
 
             log::debug!("[{}] closing association..", self.name);
 
@@ -1802,7 +1805,7 @@ impl AssociationInternal {
             ..Default::default()
         };
 
-        self.pending_queue.push(c).await;
+        self.pending_queue.push(c).await?;
         self.awake_write_loop();
 
         Ok(())

@@ -69,8 +69,19 @@ pub(super) async fn close_session_transport(peer: &RtcPeer) {
         }
         pair.handler.lock().await.take();
     } else {
-        let _ = peer.pc.close().await;
+        stop_then_close(&peer.pc).await;
     }
+}
+
+/// Close a peer connection the daemon owns the teardown of. The SCTP
+/// association stops first: `RTCPeerConnection::close` begins with a shutdown
+/// of every data channel, and against a peer that has stopped acknowledging
+/// those shutdowns wait behind a writer that will never get room. A closed
+/// association releases that writer (the vendored sctp patch) and the
+/// shutdowns bail on state, so the close settles without the peer's help.
+pub(super) async fn stop_then_close(pc: &RTCPeerConnection) {
+    let _ = pc.sctp().stop().await;
+    let _ = pc.close().await;
 }
 
 // webrtc invokes on_data_channel before attaching the SCTP stream. Closing
@@ -255,16 +266,25 @@ impl RtcSessions {
             .collect()
     }
 
-    /// The retirement a test can wait on: the pair sessions close, then the
-    /// transport, inline. Production closes them in tracked tasks.
+    /// Whether `pc` is a host peer in the map right now — the connection a
+    /// device currently has, as opposed to one it had.
+    async fn host_pc_is_admitted(&self, pc: &Arc<RTCPeerConnection>) -> bool {
+        self.host_peers
+            .lock()
+            .await
+            .values()
+            .any(|peer| Arc::ptr_eq(&peer.pc, pc))
+    }
+
+    /// The retirement a test can wait on: each retired peer closes inline.
+    /// Production closes them in tracked tasks.
     #[cfg(test)]
     pub(super) async fn close_retired_host_peers(
         &self,
         retired: Vec<(String, super::HostRtcPeer)>,
     ) {
         for (signal_id, peer) in retired {
-            self.close_pair_sessions(&peer.pc).await;
-            self.close_host_transport(&signal_id, &peer.pc).await;
+            self.close_retired_host_peer(&signal_id, &peer).await;
         }
     }
 
@@ -423,6 +443,24 @@ impl RtcSessions {
             parent.binding.binding_generation, parent.binding.binding_nonce
         );
         let existing = self.peers.lock().await.get(&id).cloned();
+        let existing = match existing {
+            // The device re-attaches the view it had on the connection this
+            // one superseded, with the same attachment id — the mobile client
+            // keeps its ids across a reconnect — while that connection's
+            // children are still closing in the tracked task. Finish this
+            // child's teardown here, bounded by its close deadline and
+            // serialized with that task on the session closer, and admit the
+            // attachment as new. A child of *this* connection is a duplicate
+            // and stays refused below.
+            Some(child)
+                if !Arc::ptr_eq(&child.pc, pc) && !self.host_pc_is_admitted(&child.pc).await =>
+            {
+                self.close(&id, &child.generation, child.session.session_id())
+                    .await;
+                None
+            }
+            existing => existing,
+        };
         let child = if let Some(child) = existing {
             anyhow::ensure!(
                 Arc::ptr_eq(&child.pc, pc)
@@ -850,6 +888,15 @@ mod tests {
         session: Uuid,
     ) -> (Arc<RTCDataChannel>, Arc<RTCDataChannel>) {
         let suffix = format!("{session}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        attach_labelled(pc, &suffix).await
+    }
+
+    /// Attach with a caller-chosen `session/view/attachment` suffix, so a
+    /// test can re-attach exactly what a reconnecting device re-attaches.
+    async fn attach_labelled(
+        pc: &Arc<RTCPeerConnection>,
+        suffix: &str,
+    ) -> (Arc<RTCDataChannel>, Arc<RTCDataChannel>) {
         let pty = pc
             .create_data_channel(&format!("spawn.pty/{suffix}"), None)
             .await
@@ -1246,6 +1293,93 @@ mod tests {
         for pc in [first, successor] {
             let _ = pc.close().await;
         }
+    }
+
+    /// The mobile client keeps its view and attachment ids across a
+    /// reconnect. When its new connection supersedes the old one while the
+    /// old one's children have not yet closed, re-attaching the same view
+    /// must be admitted — not refused as a stale attachment until those
+    /// children happen to leave the map.
+    #[tokio::test]
+    async fn device_reattaches_the_same_view_while_the_superseded_pair_is_still_closing() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let suffix = format!("{session_id}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let first = connect_pair(&sessions, &registry, [11; 32]).await;
+        let (_first_pty, _first_ctl) = attach_labelled(&first, &suffix).await;
+        let first_id = sessions
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("the first pair is admitted");
+        // Hold the superseded connection's close before it touches its
+        // children, so the old child is still in the map when the device
+        // re-attaches.
+        let gate = sessions
+            .stall_effect(&first_id, TestEffectPoint::HostRetire)
+            .await;
+
+        let successor = connect_pair(&sessions, &registry, [11; 32]).await;
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .expect("the superseded close is held");
+        assert_eq!(
+            sessions.peers.lock().await.len(),
+            1,
+            "the old child is still resident"
+        );
+
+        let (_pty, _ctl) = attach_labelled(&successor, &suffix).await;
+        // Take the host map before the peer map, as the daemon does, and hold
+        // neither past the assertions: `close_all` below needs both.
+        let successor_pc = {
+            let hosts = sessions.host_peers.lock().await;
+            assert_eq!(hosts.len(), 1);
+            Arc::clone(&hosts.values().next().unwrap().pc)
+        };
+        {
+            let children = sessions.peers.lock().await;
+            assert_eq!(
+                children.len(),
+                1,
+                "the re-attachment replaced the old child"
+            );
+            assert!(
+                Arc::ptr_eq(&children.values().next().unwrap().pc, &successor_pc),
+                "the resident child belongs to the successor"
+            );
+        }
+
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sessions.admission_gauge().await.host_closing != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the superseded close settles once released");
+        sessions.close_all().await;
+        for pc in [first, successor] {
+            let _ = pc.close().await;
+        }
+        worker.abort();
     }
 
     #[tokio::test]

@@ -77,9 +77,9 @@ pub fn install_active(store: Arc<StateStore>) {
     let _ = ACTIVE_STATE.set(store);
 }
 
-pub fn active_connected(sessions: usize) {
+pub fn active_connected(sessions: usize, rtc_peers: RtcPeerGauge) {
     if let Some(store) = ACTIVE_STATE.get() {
-        store.connected(sessions);
+        store.connected(sessions, rtc_peers);
     }
 }
 
@@ -177,12 +177,13 @@ impl StateStore {
         }
     }
 
-    pub fn connected(&self, sessions: usize) {
+    pub fn connected(&self, sessions: usize, rtc_peers: RtcPeerGauge) {
         let mut state = self.state.lock().expect("state heartbeat lock");
         state.connected = true;
         state.connected_at = Some(now_rfc3339());
         state.last_error = None;
         state.sessions = sessions;
+        state.rtc_peers = Some(rtc_peers);
         if let Err(error) = write_atomic(&self.path, &state) {
             tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }

@@ -65,8 +65,12 @@ tests/           integration tests (worker_e2e.rs), and
                  skips otherwise
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
-                 currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
-                 and a read/reset missed-notification fix, webrtc-ice 0.17.2
+                 currently webrtc-sctp 0.17.2 plus the #822 re-admission fix,
+                 a read/reset missed-notification fix, and closing the
+                 association closing its pending queue (a writer waiting on a
+                 silent peer gets `ErrStreamClosed` instead of holding the
+                 stream shutdowns, and so the peer connection close, forever),
+                 webrtc-ice 0.17.2
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
                  with closed-channel registry pruning (webrtc/PATCHES.md).
@@ -348,14 +352,25 @@ close pending, and that is how dream refused every offer for a day with
 `capacity exhausted` while its status said `connected`.
 
 The owning teardown of a mapped peer never abandons its transport close: a
-session teardown past its deadline and every host close keep running in a
-tracked task, and `settle_with_watchdog` names one still pending at
-`RTC_TEARDOWN_WATCHDOG` and every `RTC_TEARDOWN_REMINDER` after. (A duplicate
-close of a peer some other teardown owns is bounded by that peer's deadline.)
-No path awaits a transport close while holding the admission lock, which
-every offer serializes on: a superseded pair closes in a tracked task after
-the lock drops, and trust invalidation waits for host closes only until the
-teardown deadline. The cap is read by the control-connection heartbeat every
+session teardown past its deadline and every close of a host peer that was
+in the map run in a tracked cleanup task (`spawn_host_closes` →
+`close_retired_host_peer`), and `settle_with_watchdog` names one still
+pending at `RTC_TEARDOWN_WATCHDOG` and every `RTC_TEARDOWN_REMINDER` after.
+A duplicate close of a transport some other teardown owns — a reaper firing
+for a pc already leaving — is bounded by the teardown deadline and neither
+counted nor watched. No path awaits a transport close while holding the
+admission lock, which every offer serializes on, or ahead of an answer: a
+superseded pair closes in a tracked task after the lock drops, and trust
+invalidation waits for host closes only until the teardown deadline. A
+device re-attaching a view of its superseded connection (the mobile client
+keeps its attachment ids across a reconnect) finishes that child's teardown
+inline, bounded by the child's deadline, and is admitted as new. Every
+transport close the daemon owns stops the SCTP association before
+`RTCPeerConnection::close` (`pair::stop_then_close`): the close begins with
+a shutdown of each data channel, and against a peer that stopped
+acknowledging those wait behind a writer that never gets room; the closed
+association releases the writer and the shutdowns bail on state. The cap is
+read by the control-connection heartbeat every
 30 s and written to the state file as `rtc_peers` (`in_use`, `closing`,
 `host_closing`, `cap`); `spawnd status` prints it as the `peers` line, so a
 leak — of slots, or of peers that never finish closing — shows while it is

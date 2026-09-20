@@ -986,8 +986,7 @@ async fn serve_one_connection_with_loader(
         }
     }
     tracing::info!(%ws_url, "ws connected");
-    crate::state::active_connected(registry.ids().len());
-    crate::state::active_rtc_peers(rtc_sessions.admission_gauge().await);
+    crate::state::active_connected(registry.ids().len(), rtc_sessions.admission_gauge().await);
 
     let (write_half, read_half) = stream.split();
 

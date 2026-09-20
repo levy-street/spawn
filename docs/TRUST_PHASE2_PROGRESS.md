@@ -291,7 +291,14 @@ had already gone). The deadline release lives inside the tracked cleanup
 task, which nothing cancels. A teardown still pending after the thirty-second
 watchdog is named in the journal, and every five minutes after; the
 control-connection heartbeat writes the cap, closing peers, and host closes
-in flight to the state file as `rtc_peers` for `spawnd status`.
+in flight to the state file as `rtc_peers` for `spawnd status`. The stall
+itself was found in the vendored SCTP crate: a writer waiting for pending-queue
+room that only the peer's acknowledgement returns held the writer lock
+forever once the peer went silent, and the stream shutdowns `pc.close()`
+begins with queued behind it. Closing the association now closes that queue
+(the writer gets `ErrStreamClosed`), and every transport close the daemon
+owns stops the association before `pc.close()`, so a teardown settles without
+the peer's help.
 Teardown also reschedules retained post-publication unlink/fsync cleanup; a
 failure stays charged and a later session/generation teardown retries it.
 
