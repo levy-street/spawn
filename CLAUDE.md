@@ -41,6 +41,11 @@ earlier undeployed daemon changes; pull-request Windows checks are path-filtered
 To retry a partial deployment, `deploy-prod.sh --resume` retains the original
 acceptance evidence and accepts only the tested baseline/candidate identities;
 see `docs/RELEASE.md` for the exact-candidate retry procedure.
+For an unfinished native store release after deployment, dispatch
+`mobile-store-recovery.yml` on master with the original `release_run` and
+`operation=inspect` first. It retains the original plan and acceptance identity,
+uses the protected production Expo token, and refuses duplicate builds or
+submissions. `docs/RELEASE.md` documents the per-platform recovery operations.
 Daemon publication stages a complete signed snapshot under prebuilt `releases/`;
 `scripts/activate-prebuilt.py` verifies it before atomically switching `current`.
 The API resolves that pointer once per request; interrupted uploads leave the

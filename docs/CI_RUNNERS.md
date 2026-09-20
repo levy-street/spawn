@@ -6,6 +6,12 @@ The repository cache limit remains the included 10 GiB. Artifact storage and
 other repositories have their own billing rules; free compute is not a claim
 about the organization's entire bill.
 
+`mobile-store-recovery.yml` uses standard Ubuntu 24.04, the master-only
+`production` environment and the same serial release concurrency group as
+`release.yml`. It operates on the original deployed app checkout; recovery tools
+come from reviewed master. EAS still provides the native store builds, with its
+own existing quota and signing credentials.
+
 | Work | Runner |
 | --- | --- |
 | Full Linux suite, isolated canary and acceptance coordination | Ubuntu 24.04 |

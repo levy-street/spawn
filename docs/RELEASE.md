@@ -581,6 +581,66 @@ original workflow is unavailable. Resume does not authorize a newer commit:
 if master has advanced, select and push an exact-candidate recovery branch and
 use the existing explicit `--allow-branch` procedure.
 
+#### Recover native store builds after deployment
+
+Store jobs use an explicit status condition plus successful plan/deployment
+requirements. Otherwise GitHub's implicit `success()` can skip them when an
+optional ancestor, such as an unchanged daemon's prebuilt job, was skipped.
+A final store-result check fails a release that owed native builds but did not
+complete that job. This does not make a successful OTA proof of store delivery.
+
+If the server/web/OTA deployment succeeded but store builds were skipped or
+failed, use the original release run, not a freshly calculated release plan:
+
+```bash
+gh workflow run mobile-store-recovery.yml --ref master \
+  -f release_run=<original-release-run-id> -f operation=inspect
+```
+
+The protected workflow checks the completed original master release, its
+authenticated plan's `mobile_native_build=yes`, successful deployment and
+exact-source CI, and the original native/canary acceptance artifact. Production
+must still serve that candidate's clean server and daemon identities, and the
+candidate must be an ancestor of the reviewed recovery tools. It checks out the
+original app separately. Newer master tooling does not change the app being
+built. It shares the `release` concurrency group, so it cannot overlap another
+release or recovery operation.
+
+`inspect` reports candidate build and submission IDs and statuses without
+credentials, signed download URLs or private logs. Inspect first: an earlier
+all-platform command can create an Android build before iOS credential setup
+fails, leaving no printed Android URL and no automatic submission. Then choose
+one operation per dispatch:
+
+| Operation | Effect |
+| --- | --- |
+| `inspect-ios-signing` | Validate the app's current certificate/profile against Apple, without mutation |
+| `repair-ios-signing` | Repair only the confirmed missing-certificate incident described below |
+| `build-ios`, `build-android` | Build the missing platform with frozen credentials and schedule its store submission |
+| `submit-ios`, `submit-android` | Submit the explicit `build_id` of an already finished candidate build |
+
+Builds refuse an existing finished or active candidate build. Submissions refuse
+an existing successful or active submission. Failed/cancelled attempts remain
+visible and can be retried without resetting remote build numbers. Unknown
+states fail closed. Scheduling returns before EAS finishes: run `inspect` until
+both platform builds **and their store submissions** are `FINISHED`. A finished
+submission means delivery to TestFlight or Play internal testing, not approval
+for public store release. Inspect failures by their IDs in the Expo dashboard.
+
+The iOS repair is deliberately scoped to SPAWN D's existing Expo project,
+`dev.spawnd`, Apple team `9RT4S4TGA3`, profile `2D3KV7W353` and missing
+certificate serial `7A832823DD0BC96E0EC0DD073BBB0BB`. It authenticates with the
+stored App Store Connect key, prefers a valid existing team certificate, and
+creates one only when none is reusable. It creates a separately named profile,
+reassigns this app, preserves the original profile, and verifies the resulting
+association against Apple. It never revokes a certificate or deletes a profile.
+Other incidents, concurrent changes, capacity limits and failed verification
+stop the operation. A partial credential assignment requires inspection; it is
+not automatically retried. EAS CLI `24.7.0` and Apple SDK `2.2.1` are pinned for
+this private API path; changing either requires source review and regression
+validation. The non-mutating store inspection remains available if Apple
+credential inspection fails.
+
 The script verifies prebuilts before changing services, restarts server/web,
 then publishes and verifies the signed daemon manifest. The OTA goes last.
 The interval between service restart and manifest publication is one of the

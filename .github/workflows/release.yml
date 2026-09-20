@@ -278,7 +278,13 @@ jobs:
   mobile-store-build:
     name: TestFlight and Play
     needs: [plan, deploy]
-    if: needs.plan.outputs.mobile_native_build == 'yes'
+    # An optional prebuilt job may be skipped further up the dependency chain.
+    # Override implicit success(), but still require this deployment to succeed.
+    if: >-
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      needs.deploy.result == 'success' &&
+      needs.plan.outputs.mobile_native_build == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: production
@@ -308,12 +314,28 @@ jobs:
           # to fetch it — a bare `npx eas` cannot determine an executable.
           npx --yes eas-cli build --platform all --profile production --non-interactive --auto-submit
 
+  verify-mobile-store-build:
+    name: require the owed store builds
+    needs: [plan, mobile-store-build]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.mobile_native_build == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuse a successful release with missing store builds
+        env:
+          STORE_RESULT: ${{ needs.mobile-store-build.result }}
+        run: test "$STORE_RESULT" = success
+
   # desktop.yml builds and signs the app on the same push. Promoting those
   # artifacts needs the offline Tauri updater key, which signs latest.json.
   desktop-publish:
     name: publish the desktop app
     needs: [plan, deploy]
-    if: needs.plan.outputs.desktop_publish == 'true'
+    if: >-
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      needs.deploy.result == 'success' &&
+      needs.plan.outputs.desktop_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: production

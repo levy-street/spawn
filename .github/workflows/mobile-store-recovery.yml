@@ -1,0 +1,80 @@
+name: recover mobile stores
+run-name: Mobile stores ${{ inputs.operation }} for release ${{ inputs.release_run }}
+
+"on":
+  workflow_dispatch:
+    inputs:
+      release_run:
+        description: Original completed master release run that owed native builds
+        required: true
+        type: string
+      operation:
+        description: Inspect first; build only missing platforms; submit an explicit existing build
+        required: true
+        type: choice
+        default: inspect
+        options:
+          - inspect
+          - inspect-ios-signing
+          - repair-ios-signing
+          - build-ios
+          - build-android
+          - submit-ios
+          - submit-android
+      build_id:
+        description: Required only for submit operations (never selects latest implicitly)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Check out reviewed recovery tools
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: tools
+      - name: Verify original plan, acceptance, source CI and public deployment
+        id: original
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ inputs.release_run }}
+        run: python3 tools/scripts/check-mobile-store-recovery.py "$RELEASE_RUN"
+      - name: Check out the original deployed app
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.original.outputs.candidate }}
+          persist-credentials: false
+          path: candidate
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: candidate/mobile/package-lock.json
+      - name: Install original mobile dependencies and pinned recovery SDK
+        run: |
+          npm ci --prefix candidate/mobile
+          npm install --prefix "$RUNNER_TEMP/eas-recovery" --no-audit --no-fund eas-cli@24.7.0
+      - name: Perform the scoped store operation
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_NO_CAPABILITY_SYNC: "1"
+          CANDIDATE: ${{ steps.original.outputs.candidate }}
+          OPERATION: ${{ inputs.operation }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          node tools/scripts/recover-mobile-stores.cjs "$OPERATION" \
+            "$RUNNER_TEMP/eas-recovery/node_modules/eas-cli" \
+            "$GITHUB_WORKSPACE/candidate/mobile" "$CANDIDATE" "$BUILD_ID"
