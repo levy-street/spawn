@@ -246,10 +246,7 @@ impl RtcSessions {
     /// old one before it is admitted, including after browser owner handover.
     /// Returns them for the caller to close once it holds no lock a transport
     /// close could stall.
-    pub(super) async fn take_device_pair(
-        &self,
-        device_key: [u8; 32],
-    ) -> Vec<(String, super::HostRtcPeer)> {
+    pub(super) async fn take_device_pair(&self, device_key: [u8; 32]) -> Vec<super::RetiredHost> {
         let mut hosts = self.host_peers.lock().await;
         let ids = hosts
             .iter()
@@ -260,53 +257,56 @@ impl RtcSessions {
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        ids.into_iter()
-            .filter_map(|id| hosts.remove(&id).map(|peer| (id, peer)))
-            .inspect(|(_, peer)| super::retire_host_peer(peer))
-            .collect()
+        let mut retired = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(peer) = hosts.remove(&id) else {
+                continue;
+            };
+            super::retire_host_peer(&peer);
+            // Its attachments leave the peer map here too, under the same
+            // locks, so the device's re-attachments — the mobile client keeps
+            // its attachment ids across a reconnect — never find a stale
+            // child, and the old transport feeds no PTY past this point.
+            let children = self.detach_pair_children(&peer.pc).await;
+            retired.push(super::RetiredHost {
+                signal_id: id,
+                peer,
+                children,
+            });
+        }
+        drop(hosts);
+        // The server's binding for the superseded connection counts against
+        // its per-host and per-browser caps until it hears otherwise, and a
+        // browser's shared connection never sends `rtc.close`. Tell it now,
+        // so a device reconnecting all day never fills those caps.
+        for host in &retired {
+            self.send_or_defer_status(super::host_status_frame(
+                host.signal_id.clone(),
+                &host.peer.binding,
+                "failed",
+                Some("superseded by a newer connection from this device"),
+            ))
+            .await;
+        }
+        retired
     }
 
-    /// Whether `pc` is a host peer in the map right now — the connection a
-    /// device currently has, as opposed to one it had.
-    async fn host_pc_is_admitted(&self, pc: &Arc<RTCPeerConnection>) -> bool {
-        self.host_peers
-            .lock()
-            .await
-            .values()
-            .any(|peer| Arc::ptr_eq(&peer.pc, pc))
-    }
-
-    /// The retirement a test can wait on: each retired peer closes inline.
-    /// Production closes them in tracked tasks.
+    /// The retirement a test can wait on: each retired peer tears down
+    /// inline. Production runs the same teardown in tracked tasks.
     #[cfg(test)]
-    pub(super) async fn close_retired_host_peers(
-        &self,
-        retired: Vec<(String, super::HostRtcPeer)>,
-    ) {
-        for (signal_id, peer) in retired {
-            self.close_retired_host_peer(&signal_id, &peer).await;
+    pub(super) async fn close_retired_host_peers(&self, retired: Vec<super::RetiredHost>) {
+        for host in retired {
+            self.close_retired_host_peer(host).await;
         }
     }
 
+    /// Take a host peer's attachments out of service and settle them, each
+    /// until its own deadline — what a retired host peer's tracked teardown
+    /// does before its transport close, callable on its own by a test.
+    #[cfg(test)]
     pub(super) async fn close_pair_sessions(&self, pc: &Arc<RTCPeerConnection>) {
-        let children = self
-            .peers
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, peer)| peer.pair_channels.is_some() && Arc::ptr_eq(&peer.pc, pc))
-            .map(|(id, peer)| (id.clone(), peer.clone()))
-            .collect::<Vec<_>>();
-        // Stop every child before waiting for any one child's cleanup.
-        for (_, peer) in &children {
-            peer.active.store(false, Ordering::Release);
-            peer.channels.stop();
-            peer.close.initiate();
-        }
-        for (id, peer) in children {
-            self.close(&id, &peer.generation, peer.session.session_id())
-                .await;
-        }
+        let children = self.detach_pair_children(pc).await;
+        self.settle_detached_peers(children).await;
     }
 
     pub(super) fn install_pair_channels(
@@ -443,24 +443,6 @@ impl RtcSessions {
             parent.binding.binding_generation, parent.binding.binding_nonce
         );
         let existing = self.peers.lock().await.get(&id).cloned();
-        let existing = match existing {
-            // The device re-attaches the view it had on the connection this
-            // one superseded, with the same attachment id — the mobile client
-            // keeps its ids across a reconnect — while that connection's
-            // children are still closing in the tracked task. Finish this
-            // child's teardown here, bounded by its close deadline and
-            // serialized with that task on the session closer, and admit the
-            // attachment as new. A child of *this* connection is a duplicate
-            // and stays refused below.
-            Some(child)
-                if !Arc::ptr_eq(&child.pc, pc) && !self.host_pc_is_admitted(&child.pc).await =>
-            {
-                self.close(&id, &child.generation, child.session.session_id())
-                    .await;
-                None
-            }
-            existing => existing,
-        };
         let child = if let Some(child) = existing {
             anyhow::ensure!(
                 Arc::ptr_eq(&child.pc, pc)
@@ -831,10 +813,11 @@ mod tests {
         pc.set_local_description(offer).await.unwrap();
         gathered.recv().await;
         let (tx, mut rx) = mpsc::channel(128);
+        let signal_id = Uuid::new_v4().to_string();
         sessions
             .handle_device_offer(
                 HostRtcSignal {
-                    signal_id: Uuid::new_v4().to_string(),
+                    signal_id: signal_id.clone(),
                     binding_nonce: Some("a".repeat(32)),
                     binding_generation: Some(1),
                     scope_type: Some("host".into()),
@@ -870,7 +853,9 @@ mod tests {
                                 let candidate = serde_json::from_value(value["candidate"].clone()).unwrap();
                                 if answered { pc.add_ice_candidate(candidate).await.unwrap(); } else { pending.push(candidate); }
                             }
-                            Some("rtc.status") => assert_ne!(value["status"], "failed"),
+                            Some("rtc.status") if value["session_id"] == signal_id => {
+                                assert_ne!(value["status"], "failed")
+                            }
                             _ => {}
                         }
                     }
@@ -989,7 +974,9 @@ mod tests {
                                 let candidate = serde_json::from_value(value["candidate"].clone()).unwrap();
                                 if answered { pc.add_ice_candidate(candidate).await.unwrap(); } else { candidates.push(candidate); }
                             }
-                            Some("rtc.status") => assert_ne!(value["status"], "failed"),
+                            Some("rtc.status") if value["session_id"] == signal_id => {
+                                assert_ne!(value["status"], "failed")
+                            }
                             _ => {}
                         }
                     }
@@ -1295,6 +1282,177 @@ mod tests {
         }
     }
 
+    /// An offer the daemon refuses — here, a signal id the peer map already
+    /// holds, checked before anything else is touched — must not cost the
+    /// device the connection it already has.
+    #[tokio::test]
+    async fn a_refused_device_offer_leaves_the_existing_connection_alone() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let first = connect_pair(&sessions, &registry, [13; 32]).await;
+        let (_pty, _ctl) = attach(&first, session_id).await;
+        let (first_id, first_pair) = {
+            let hosts = sessions.host_peers.lock().await;
+            let (id, peer) = hosts.iter().next().expect("the first pair is admitted");
+            (id.clone(), Arc::clone(peer.pair.as_ref().unwrap()))
+        };
+        let colliding_id = sessions
+            .peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("the attachment is resident");
+        let host_id = sessions.registered_host_id.lock().await.unwrap();
+
+        let colliding = Arc::new(
+            webrtc::api::APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        colliding
+            .create_data_channel(HOST_CONTROL_LABEL, None)
+            .await
+            .unwrap();
+        let offer = colliding.create_offer(None).await.unwrap();
+        let mut gathered = colliding.gathering_complete_promise().await;
+        colliding.set_local_description(offer).await.unwrap();
+        gathered.recv().await;
+        let (tx, mut rx) = mpsc::channel(16);
+        sessions
+            .handle_device_offer(
+                HostRtcSignal {
+                    signal_id: colliding_id,
+                    binding_nonce: Some("a".repeat(32)),
+                    binding_generation: Some(1),
+                    scope_type: Some("host".into()),
+                    scope_id: Some(host_id),
+                    protocol: Some(HOST_CONTROL_LABEL.into()),
+                    protocol_version: Some(2),
+                },
+                colliding.local_description().await.unwrap().sdp,
+                vec![],
+                None,
+                false,
+                [13; 32],
+                registry.clone(),
+                tx,
+                Arc::new(|sdp| Ok(json!({"sdp": sdp}).to_string())),
+            )
+            .await;
+        let status = rx.recv().await.expect("the refused offer is answered");
+        let status: Value = serde_json::from_str(status.as_str()).unwrap();
+        assert_eq!(status["type"], "rtc.status");
+        assert_eq!(status["status"], "failed");
+
+        {
+            let hosts = sessions.host_peers.lock().await;
+            assert_eq!(hosts.len(), 1);
+            assert!(
+                hosts.contains_key(&first_id),
+                "the existing connection stays"
+            );
+        }
+        assert!(
+            !first_pair.retired.load(Ordering::Acquire),
+            "the existing pair was not retired by a refused offer"
+        );
+        assert_eq!(
+            sessions.peers.lock().await.len(),
+            1,
+            "the existing attachment stays"
+        );
+        assert_eq!(sessions.peer_admission.charged(), 1);
+        assert_eq!(first.connection_state(), RTCPeerConnectionState::Connected);
+        sessions.close_all().await;
+        let _ = first.close().await;
+        let _ = colliding.close().await;
+        worker.abort();
+    }
+
+    /// A superseded device connection leaves the server's host map only when
+    /// the server hears about it; the browser's shared connection never sends
+    /// `rtc.close`. The daemon says `failed` for it as it takes the pair.
+    #[tokio::test]
+    async fn taking_a_device_pair_tells_the_server_the_superseded_connection_failed() {
+        let sessions = RtcSessions::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        sessions.signaling.install(tx);
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let pc = Arc::new(
+            webrtc::api::APIBuilder::new()
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let pair = Arc::new(PairContext {
+            device_key: [5; 32],
+            registry: SessionRegistry::new(),
+            out_tx,
+            trust_epoch: 0,
+            ice_restart: false,
+            remote_ufrags: Mutex::new(HashSet::new()),
+            restart: Mutex::new(()),
+            retired: AtomicBool::new(false),
+            host_channels: std::sync::Mutex::new(Vec::new()),
+        });
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "c".repeat(32),
+            binding_generation: 1,
+            protocol: HOST_CONTROL_LABEL.to_owned(),
+            protocol_version: 2,
+        };
+        sessions.host_peers.lock().await.insert(
+            "superseded-pair".to_owned(),
+            HostRtcPeer {
+                pair: Some(Arc::clone(&pair)),
+                pc: Arc::clone(&pc),
+                binding: binding.clone(),
+                admission: sessions.peer_admission.try_acquire().unwrap(),
+            },
+        );
+
+        let retired = sessions.take_device_pair([5; 32]).await;
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].signal_id, "superseded-pair");
+        assert!(pair.retired.load(Ordering::Acquire));
+        assert_eq!(sessions.peer_admission.charged(), 0);
+        let frame = rx
+            .try_recv()
+            .expect("the server hears about the superseded pair");
+        let value: Value = serde_json::from_str(frame.as_str()).unwrap();
+        assert_eq!(value["type"], "rtc.status");
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["session_id"], "superseded-pair");
+        assert_eq!(value["scope_type"], "host");
+        assert_eq!(value["binding_nonce"], binding.binding_nonce);
+        assert_eq!(
+            value["message"],
+            "superseded by a newer connection from this device"
+        );
+        sessions.close_retired_host_peers(retired).await;
+        let _ = pc.close().await;
+    }
+
     /// The mobile client keeps its view and attachment ids across a
     /// reconnect. When its new connection supersedes the old one while the
     /// old one's children have not yet closed, re-attaching the same view
@@ -1340,11 +1498,13 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
             .await
             .expect("the superseded close is held");
-        assert_eq!(
-            sessions.peers.lock().await.len(),
-            1,
-            "the old child is still resident"
+        // The old child left the peer map with its pair, before its teardown
+        // (held here) has done anything; only the closing map still has it.
+        assert!(
+            sessions.peers.lock().await.is_empty(),
+            "a superseded pair's attachment is not resident"
         );
+        assert_eq!(sessions.closing_peers.lock().await.len(), 1);
 
         let (_pty, _ctl) = attach_labelled(&successor, &suffix).await;
         // Take the host map before the peer map, as the daemon does, and hold
@@ -1443,8 +1603,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(hello["type"], "hello");
-        let closer = sessions.session_closer(binding).await;
-        let guard = closer.lock().await;
+        // Hold the attachment's callback fence so its terminal cleanup cannot
+        // settle; retirement must fence the host consumers regardless.
+        let child_fence = sessions
+            .peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .map(|child| Arc::clone(&child.fence))
+            .expect("the attachment is resident");
+        let blocked_cleanup = child_fence.read().await;
         let retire_sessions = sessions.clone();
         let retiring = tokio::spawn(async move {
             let retired = retire_sessions.take_device_pair([7; 32]).await;
@@ -1457,10 +1626,14 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!retiring.is_finished());
+        assert_eq!(
+            sessions.closing_peers.lock().await.len(),
+            1,
+            "the attachment's cleanup is still pending"
+        );
         host.send_text(json!({"version":1,"type":"request","request_id":"after-retire","operation":"fs.home","payload":{}}).to_string()).await.unwrap();
         let response = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
-        drop(guard);
+        drop(blocked_cleanup);
         retiring.await.unwrap();
         let _ = pc.close().await;
         worker.abort();

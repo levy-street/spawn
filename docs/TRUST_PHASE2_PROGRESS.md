@@ -298,7 +298,15 @@ forever once the peer went silent, and the stream shutdowns `pc.close()`
 begins with queued behind it. Closing the association now closes that queue
 (the writer gets `ErrStreamClosed`), and every transport close the daemon
 owns stops the association before `pc.close()`, so a teardown settles without
-the peer's help.
+the peer's help. Exactly one teardown owns a peer (a claim on its close
+coordinator); a duplicate close never touches the transport, since
+`RTCPeerConnection::close` is not cancel-safe and a duplicate dropped at a
+deadline would make the owner's close a silent no-op. A host peer's
+attachments leave the peer map with it, under the same locks, so a device
+re-attaching the same view never finds a stale child. The daemon tells the
+server `failed` for every peer it retires on its own — reaped, or superseded
+by the same device — so the server's per-host and per-browser binding caps
+never fill with peers only the daemon knows are gone.
 Teardown also reschedules retained post-publication unlink/fsync cleanup; a
 failure stays charged and a later session/generation teardown retries it.
 

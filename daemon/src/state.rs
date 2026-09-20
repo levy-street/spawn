@@ -89,12 +89,6 @@ pub fn active_disconnected(kind: &str, detail: &str, sessions: usize) {
     }
 }
 
-pub fn active_rtc_peers(gauge: RtcPeerGauge) {
-    if let Some(store) = ACTIVE_STATE.get() {
-        store.rtc_peers(gauge);
-    }
-}
-
 pub fn active_heartbeat(sessions: usize) {
     if let Some(store) = ACTIVE_STATE.get() {
         store.heartbeat(sessions);
@@ -155,17 +149,6 @@ impl StateStore {
         }
     }
 
-    pub fn rtc_peers(&self, gauge: RtcPeerGauge) {
-        let mut state = self.state.lock().expect("state heartbeat lock");
-        if state.rtc_peers == Some(gauge) {
-            return;
-        }
-        state.rtc_peers = Some(gauge);
-        if let Err(error) = write_atomic(&self.path, &state) {
-            tracing::warn!(%error, "could not write SPAWN D heartbeat state");
-        }
-    }
-
     pub fn worker_mismatch(&self, mismatch: bool) {
         let mut state = self.state.lock().expect("state heartbeat lock");
         if state.worker_mismatch == mismatch {
@@ -199,6 +182,15 @@ impl StateStore {
             at: now_rfc3339(),
         });
         state.sessions = sessions;
+        if let Err(error) = write_atomic(&self.path, &state) {
+            tracing::warn!(%error, "could not write SPAWN D heartbeat state");
+        }
+    }
+
+    pub fn heartbeat_with_peers(&self, sessions: usize, rtc_peers: RtcPeerGauge) {
+        let mut state = self.state.lock().expect("state heartbeat lock");
+        state.sessions = sessions;
+        state.rtc_peers = Some(rtc_peers);
         if let Err(error) = write_atomic(&self.path, &state) {
             tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }

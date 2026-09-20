@@ -339,6 +339,21 @@ map becomes observable, then performs asynchronous channel cleanup. The
 protected-content guard pins that narrow exported surface; it exposes no
 content or server publication capability.
 
+Exactly one teardown owns a peer: the first caller to `claim` its
+`PeerCloseCoordinator` takes it out of service (`take_out_of_service`) and
+settles it (`settle_detached_peer`); a later close of the same peer finds it
+out of the live map and does nothing. In particular it never touches the
+transport: `RTCPeerConnection::close` marks the connection closed before it
+does anything, so a duplicate close dropped at a deadline would turn the
+owner's close into a silent no-op and leak the sockets. When a host peer
+leaves the host map — reaped, closed by the server, or superseded by the
+same device — its attachments leave the peer map with it, under the same
+locks (`detach_pair_children`), so a device re-attaching the same view never
+finds a stale child and the old transport feeds no PTY past that moment; the
+tracked task settles them and then closes the transport. A device offer is
+checked for collisions before the device's working connection is taken, so
+a refused offer never costs the device the connection it has.
+
 The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never
 returns it. A slot returns when its owner leaves the live map — for a session
@@ -369,9 +384,18 @@ transport close the daemon owns stops the SCTP association before
 `RTCPeerConnection::close` (`pair::stop_then_close`): the close begins with
 a shutdown of each data channel, and against a peer that stopped
 acknowledging those wait behind a writer that never gets room; the closed
-association releases the writer and the shutdowns bail on state. The cap is
-read by the control-connection heartbeat every
-30 s and written to the state file as `rtc_peers` (`in_use`, `closing`,
+association releases the writer and the shutdowns bail on state. Every
+retirement the daemon starts on its own — the reaper's never-connected,
+failed, and stayed-disconnected closes, and a device connection superseded
+by a newer one — tells the server `failed` for that binding first
+(`reap_session_peer`, `reap_host_peer`, `take_device_pair`): the server's
+own per-host, per-browser, and per-user binding caps free a binding on that
+status, a browser's shared connection never sends `rtc.close`, and a binding
+the server keeps for a peer only this daemon knows is gone would otherwise
+count until its TTL or this daemon's next registration. The cap is
+read by the daemon's own 30 s state timer in `run.rs` — not the control
+connection's, since peers keep opening and closing through a server outage
+— and written to the state file as `rtc_peers` (`in_use`, `closing`,
 `host_closing`, `cap`); `spawnd status` prints it as the `peers` line, so a
 leak — of slots, or of peers that never finish closing — shows while it is
 one peer. Never write the state file from the RTC path: that write is an
@@ -393,7 +417,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --features diagnostics -- -D warnings
 cargo test --locked
 cargo test --locked --features diagnostics
-cargo test --locked -p webrtc-sctp --lib stream::stream_test::
+cargo test --locked -p webrtc-sctp --lib -- stream::stream_test:: queue::queue_test::
 cargo test --locked -p webrtc-ice --lib agent_transport_test::
 cargo build --locked --profile diagnostics --features diagnostics
 ```

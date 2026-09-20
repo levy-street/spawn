@@ -93,7 +93,7 @@ printf '%s\n' "== daemon tests, diagnostics variant =="
 (cd daemon && cargo test --locked --features diagnostics)
 
 printf '%s\n' "== SCTP stream lifecycle regressions =="
-(cd daemon && cargo test --locked -p webrtc-sctp --lib stream::stream_test::)
+(cd daemon && cargo test --locked -p webrtc-sctp --lib -- stream::stream_test:: queue::queue_test::)
 
 printf '%s\n' "== ICE route recovery regressions =="
 (cd daemon && cargo test --locked -p webrtc-ice --lib agent_transport_test::)
