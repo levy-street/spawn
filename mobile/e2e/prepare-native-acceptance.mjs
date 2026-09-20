@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { instrumentWorkerHtml } from "./instrument-worker.mjs";
 
 const source = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const [destination, platform] = process.argv.slice(2);
@@ -194,7 +195,7 @@ const probe = readFileSync(join(target, "e2e/native-peer-probe.js"), "utf8").rep
   }),
 );
 const htmlPath = join(target, "assets/terminal/worker.html");
-const contentProbe = `<script>
+const contentProbe = `
 (() => {
   const api = globalThis.spawnWorker;
   const post = api.post;
@@ -216,10 +217,8 @@ const contentProbe = `<script>
     }));
   };
 })();
-</script>`;
-const html = readFileSync(htmlPath, "utf8")
-  .replace("</head>", `<script>${probe}</script></head>`)
-  .replace("</body>", `${contentProbe}</body>`);
+`;
+const html = instrumentWorkerHtml(readFileSync(htmlPath, "utf8"), probe, contentProbe);
 writeFileSync(htmlPath, html);
 writeFileSync(
   join(target, "src/terminal/worker/worker-html.ts"),
