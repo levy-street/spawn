@@ -55,6 +55,8 @@ python3 mobile/e2e/test-android-disk-preflight.py
 python3 mobile/e2e/test-native-runner.py
 node --test mobile/e2e/instrument-worker.test.mjs
 python3 scripts/test-release-acceptance.py
+uv run --project server python scripts/test-mobile-store-recovery.py
+node --test scripts/repair-ios-signing.test.cjs scripts/recover-mobile-stores.test.cjs
 
 printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh
