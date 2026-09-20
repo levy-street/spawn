@@ -3313,6 +3313,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       role="application"
       aria-label="Session terminal"
       data-session-id={sessionId}
+      data-input-ready={socket.dcOpen && controlState?.owner === true}
       aria-busy={!socket.dcOpen}
       onFocusCapture={() => {
         focusViewRef.current();

@@ -16,7 +16,7 @@ export async function measureSessionOpenings(page, fixtures) {
     await link.evaluate((node, sessionId) => {
       node.addEventListener("pointerdown", () => {
         const start = performance.now();
-        const result = { start, sessionId, rendererMs: null, contentMs: null, readyMs: null, connecting: false };
+        const result = { start, sessionId, rendererMs: null, contentMs: null, readyMs: null, inputMs: null, connecting: false };
         globalThis.__spawnOpenTiming = result;
         const observe = () => {
           if (globalThis.__spawnOpenTiming !== result) return;
@@ -25,9 +25,10 @@ export async function measureSessionOpenings(page, fixtures) {
             if (terminal.querySelector(".xterm") && result.rendererMs === null) result.rendererMs = performance.now() - start;
             if (terminal.querySelector(".xterm-rows")?.textContent.includes("browser-live-ready") && result.contentMs === null) result.contentMs = performance.now() - start;
             if (terminal.getAttribute("aria-busy") === "false" && result.readyMs === null) result.readyMs = performance.now() - start;
+            if (terminal.getAttribute("data-input-ready") === "true" && result.inputMs === null) result.inputMs = performance.now() - start;
             if (terminal.querySelector('[data-testid="terminal-connecting"]')) result.connecting = true;
           }
-          if ((result.contentMs === null || result.readyMs === null) && performance.now() - start < 20_000) requestAnimationFrame(observe);
+          if ((result.contentMs === null || result.inputMs === null) && performance.now() - start < 20_000) requestAnimationFrame(observe);
         };
         requestAnimationFrame(observe);
       }, { once: true });
@@ -37,7 +38,7 @@ export async function measureSessionOpenings(page, fixtures) {
     await expect(terminal).toHaveAttribute("aria-busy", "false", { timeout: 20_000 });
     await expect.poll(() => page.evaluate(() => {
       const result = globalThis.__spawnOpenTiming;
-      return Boolean(result && result.contentMs !== null && result.readyMs !== null);
+      return Boolean(result && result.contentMs !== null && result.inputMs !== null);
     }), { timeout: 20_000 }).toBe(true);
     const observed = await page.evaluate(() => {
       const result = globalThis.__spawnOpenTiming;
@@ -45,7 +46,8 @@ export async function measureSessionOpenings(page, fixtures) {
       return {
         renderer_ms: result.rendererMs,
         first_content_ms: result.contentMs,
-        input_gate_ms: result.readyMs,
+        transport_ready_ms: result.readyMs,
+        input_ready_ms: result.inputMs,
         connecting_shown: result.connecting,
         channels: channels.map((event) => ({ type: event.type, channel: event.label.split("/")[0], elapsed_ms: event.at - result.start, ...(event.operation ? { operation: event.operation } : {}), ...(event.event ? { event: event.event } : {}) })),
       };
@@ -56,7 +58,7 @@ export async function measureSessionOpenings(page, fixtures) {
       index < fixtures.length ? 2 : 0,
     );
     expect(observed.first_content_ms).toBeLessThan(5_000);
-    expect(observed.input_gate_ms).toBeLessThan(5_000);
+    expect(observed.input_ready_ms).toBeLessThan(5_000);
     expect(observed.connecting_shown).toBe(false);
     await terminal.click();
     const marker = `latency-proof-${index}`;
