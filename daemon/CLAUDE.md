@@ -408,10 +408,14 @@ next registration. `unavailable`, not `failed`: to a device `failed` on its
 active binding is a refusal of its offer and it drops its trust verdict,
 while `unavailable` is a connection that is gone, answered with a new one.
 A status deferred for want of channel room is retried from the control
-connection's heartbeat; at reconnect a deferred status is replayed only for
-a binding the server kept (a peer resident at registration) or when it says
-`connected` — registration's live bindings already told the server what
-survives. The cap is
+connection's heartbeat once registration's replay has run; at reconnect a
+deferred status is replayed only for a binding the server kept (a peer
+resident at registration) or when it says `connected` — registration's live
+bindings already told the server what survives. In the deferred map a
+terminal status always wins: a replayed `connected` never overwrites the
+`unavailable` deferred after it. A retired host peer's association stops
+before its attachments settle, so their channel closes are not each held
+to their deadline by the writer the silent peer left stuck. The cap is
 read by the daemon's own 30 s state timer in `run.rs` — not the control
 connection's, since peers keep opening and closing through a server outage
 — and written to the state file as `rtc_peers` (`in_use`, `closing`,

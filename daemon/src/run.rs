@@ -602,9 +602,9 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         loop {
             interval.tick().await;
             // Sessions and the RTC peer cap, for `spawnd status`. Written
-            // here, on the daemon's own clock and no RTC lock: peers keep
-            // opening and closing through a server outage, the state file
-            // write is an fsync, and the offer path waits on those locks.
+            // here, on the daemon's own clock and off the offer path: peers
+            // keep opening and closing through a server outage, and the
+            // state file write is an fsync.
             state_store.heartbeat(
                 state_registry.ids().len(),
                 Some(state_rtc_sessions.admission_gauge().await),
@@ -6444,7 +6444,7 @@ async fn handle_session_restart(
         let binding = snapshot.binding();
         tracing::info!(daemon_pid, %session_id, phase = "closing_peers", "session restart progress");
         rtc_sessions
-            .close_for_session(session_id, binding.generation())
+            .close_for_session(session_id, binding.generation(), "session restarting")
             .await;
         tracing::info!(daemon_pid, %session_id, phase = "peers_closed", "session restart progress");
         if let Some(control) = registry.control_for_binding(binding) {
@@ -6632,7 +6632,9 @@ async fn spawn_exit_forwarder(
     });
     let transition = registry.lock_generation_transition(session_id).await;
     let removed = registry.remove_if_generation(session_id, generation);
-    rtc_sessions.close_for_session(session_id, generation).await;
+    rtc_sessions
+        .close_for_session(session_id, generation, "session ended")
+        .await;
     drop(transition);
     if removed.is_none() {
         tracing::debug!(%session_id, generation, "ignoring stale session exit");
@@ -6694,7 +6696,7 @@ async fn register_attached(
     if let Some(previous) = registry.binding_for(session_id) {
         let _ = registry.remove_if_generation(session_id, previous.generation());
         rtc_sessions
-            .close_for_session(session_id, previous.generation())
+            .close_for_session(session_id, previous.generation(), "session replaced")
             .await;
     }
     let generation = registry.insert(launched.handle);

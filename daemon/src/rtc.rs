@@ -189,6 +189,9 @@ pub struct RtcSessions {
     api: Arc<OnceLock<webrtc::api::API>>,
     signaling: RtcWsSender,
     deferred_statuses: Arc<Mutex<HashMap<String, Outbound>>>,
+    /// Set once registration's replay has pruned what the server dropped;
+    /// cleared with the control connection. The heartbeat flush waits for it.
+    deferred_pruned: Arc<AtomicBool>,
     #[cfg(test)]
     peer_insert_attempted: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -266,10 +269,7 @@ struct RtcPeerAdmissionPermit {
 
 impl RtcPeerAdmissionPermit {
     fn release(&self) {
-        self.permit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        self.take_over();
     }
 
     fn take_over(&self) -> Option<OwnedSemaphorePermit> {
@@ -340,9 +340,10 @@ impl RtcPeerAdmission {
 }
 
 impl RtcSessions {
-    /// The cap as it stands. Read by the control-connection heartbeat, which
-    /// writes it to the state file for `spawnd status` — off every RTC lock,
-    /// because that write is an fsync.
+    /// The cap as it stands. Read by the daemon's own state timer (and once
+    /// at connect), which writes it to the state file for `spawnd status`.
+    /// The read takes the closing-map lock for a moment; the write, an fsync,
+    /// happens on that timer and never on the offer path.
     pub async fn admission_gauge(&self) -> crate::state::RtcPeerGauge {
         let closing = self.closing_peers.lock().await.len();
         crate::state::RtcPeerGauge {
@@ -479,9 +480,24 @@ struct TeardownSettlement {
     key: (String, String),
     pc: Arc<RTCPeerConnection>,
     done: Option<oneshot::Sender<()>>,
+    paid: bool,
 }
 
 impl TeardownSettlement {
+    /// The normal exit: everything paid in order, the closing map taken
+    /// properly, and `done` sent only once the peer is out of it.
+    async fn settle(mut self) {
+        self.admission.retire();
+        {
+            let mut closing = self.closing_peers.lock().await;
+            Self::leave_closing_map(&mut closing, &self.key, &self.pc);
+        }
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+        self.paid = true;
+    }
+
     fn leave_closing_map(
         closing: &mut HashMap<(String, String), RtcPeer>,
         key: &(String, String),
@@ -497,25 +513,43 @@ impl TeardownSettlement {
 }
 
 impl Drop for TeardownSettlement {
+    /// The unwind path only: a panic in the task. The slot returns at once;
+    /// the closing map is taken if it is free, else from a task, which then
+    /// says `done` — never before the peer has left the map.
     fn drop(&mut self) {
+        if self.paid {
+            return;
+        }
         self.admission.retire();
+        let done = self.done.take();
         match self.closing_peers.try_lock() {
-            Ok(mut closing) => Self::leave_closing_map(&mut closing, &self.key, &self.pc),
+            Ok(mut closing) => {
+                Self::leave_closing_map(&mut closing, &self.key, &self.pc);
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
             Err(_) => {
-                // Contended: finish from a task rather than block a Drop.
                 let closing_peers = Arc::clone(&self.closing_peers);
                 let key = self.key.clone();
                 let pc = Arc::clone(&self.pc);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let mut closing = closing_peers.lock().await;
-                        Self::leave_closing_map(&mut closing, &key, &pc);
-                    });
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.spawn(async move {
+                            let mut closing = closing_peers.lock().await;
+                            Self::leave_closing_map(&mut closing, &key, &pc);
+                            drop(closing);
+                            if let Some(done) = done {
+                                let _ = done.send(());
+                            }
+                        });
+                    }
+                    Err(_) => tracing::error!(
+                        signal_id = %self.key.0,
+                        "an rtc cleanup task unwound with no runtime to finish its bookkeeping"
+                    ),
                 }
             }
-        }
-        if let Some(done) = self.done.take() {
-            let _ = done.send(());
         }
     }
 }
@@ -895,6 +929,7 @@ impl RtcSessions {
 
     pub fn clear_ws_sender(&self) {
         self.signaling.clear();
+        self.deferred_pruned.store(false, Ordering::Release);
     }
 
     pub async fn live_bindings(&self) -> Vec<LiveRtcBinding> {
@@ -904,10 +939,7 @@ impl RtcSessions {
             .filter(|(_, peer)| peer.pair_channels.is_none())
             .map(|(signal_id, peer)| LiveRtcBinding {
                 session_id: signal_id.clone(),
-                binding_nonce: peer
-                    .generation
-                    .split_once(':')
-                    .map_or_else(String::new, |(_, nonce)| nonce.to_string()),
+                binding_nonce: generation_nonce(&peer.generation).to_string(),
                 binding_generation: peer
                     .generation
                     .split_once(':')
@@ -941,8 +973,14 @@ impl RtcSessions {
     /// Retry every status that was deferred for want of channel room. Runs
     /// on the control connection's heartbeat: a status deferred while
     /// connected is only ever sent again from here, and a terminal one is
-    /// what frees the server's binding.
+    /// what frees the server's binding. Waits for registration's replay,
+    /// which prunes what the server dropped at reconcile; until then a
+    /// deferred terminal status may be for a binding the server no longer
+    /// has.
     pub async fn flush_deferred_statuses(&self) {
+        if !self.deferred_pruned.load(Ordering::Acquire) {
+            return;
+        }
         let pending = std::mem::take(&mut *self.deferred_statuses.lock().await);
         for (_, frame) in pending {
             self.send_or_defer_status(frame).await;
@@ -963,22 +1001,17 @@ impl RtcSessions {
             .collect::<HashSet<_>>();
         let pending = std::mem::take(&mut *self.deferred_statuses.lock().await);
         for (signal_id, frame) in pending {
-            let connected =
-                matches!(&frame, Outbound::RtcStatus { status, .. } if status == "connected");
-            if connected || live.contains(&signal_id) {
+            if !status_is_terminal(&frame) || live.contains(&signal_id) {
                 self.send_or_defer_status(frame).await;
             }
         }
+        self.deferred_pruned.store(true, Ordering::Release);
         let peers = self.peers.lock().await.clone();
         for (signal_id, peer) in peers {
             if peer.pair_channels.is_none() && peer.channels.ready() {
-                let nonce = peer
-                    .generation
-                    .split_once(':')
-                    .map_or("", |(_, nonce)| nonce);
                 self.send_or_defer_status(session_status_frame(
                     &signal_id,
-                    nonce,
+                    generation_nonce(&peer.generation),
                     peer.session.session_id(),
                     "connected",
                     None,
@@ -1006,7 +1039,7 @@ impl RtcSessions {
             _ => return false,
         };
         let Some(sender) = self.signaling.load() else {
-            self.deferred_statuses.lock().await.insert(key, frame);
+            self.defer_status(key, frame).await;
             return true;
         };
         let Ok(text) = serde_json::to_string(&frame) else {
@@ -1016,9 +1049,23 @@ impl RtcSessions {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_))
             | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.deferred_statuses.lock().await.insert(key, frame);
+                self.defer_status(key, frame).await;
                 true
             }
+        }
+    }
+
+    /// Hold a status for the next chance to send it. A terminal status always
+    /// replaces what is held for the binding; a non-terminal one never
+    /// replaces a terminal one — a replayed `connected` must not clobber the
+    /// `unavailable` that frees the server's binding.
+    async fn defer_status(&self, key: String, frame: Outbound) {
+        let mut pending = self.deferred_statuses.lock().await;
+        let keep_existing = pending
+            .get(&key)
+            .is_some_and(|existing| status_is_terminal(existing) && !status_is_terminal(&frame));
+        if !keep_existing {
+            pending.insert(key, frame);
         }
     }
 
@@ -1474,10 +1521,19 @@ impl RtcSessions {
             }
         }
         // A slot from the cap if one is free; failing that, the slot the
-        // device's own superseded connection holds, once that is taken below.
+        // device's own superseded connection holds, once that is taken below
+        // — checked here, before a peer connection is built for nothing.
         let mut admission_permit = self.peer_admission.try_acquire();
-        if admission_permit.is_none() && admission.pair.is_none() {
-            anyhow::bail!("rtc session admission capacity exhausted");
+        if admission_permit.is_none() {
+            let device_has_pair = match &admission.pair {
+                Some(pair) => self.host_peers.lock().await.values().any(|peer| {
+                    peer.pair
+                        .as_ref()
+                        .is_some_and(|held| held.device_key == pair.device_key)
+                }),
+                None => false,
+            };
+            anyhow::ensure!(device_has_pair, "rtc session admission capacity exhausted");
         }
         warn_if_no_udp_turn(&ice_servers);
         let api = self.api.get().context("WebRTC API was not initialized")?;
@@ -1525,7 +1581,13 @@ impl RtcSessions {
                 .find_map(|host| host.peer.admission.transfer());
         }
         let Some(admission_permit) = admission_permit else {
+            // Unreachable while a mapped host peer always holds its slot;
+            // still, what was taken is closed, not dropped.
             drop(_admission);
+            for host in &superseded {
+                host.peer.admission.retire();
+            }
+            self.spawn_host_closes(superseded).await;
             let _ = pc.close().await;
             anyhow::bail!("rtc session admission capacity exhausted");
         };
@@ -1763,6 +1825,12 @@ impl RtcSessions {
         if !retired.children_detached {
             children.extend(self.detach_pair_children(&retired.peer.pc).await);
         }
+        // The association stops before the attachments settle: each one's
+        // channel close queues behind whatever writer the peer left stuck,
+        // and only the closed association lets that writer go. Otherwise
+        // every attachment waits out its whole deadline against a silent
+        // peer. The transport close below stops it again, harmlessly.
+        let _ = retired.peer.pc.sctp().stop().await;
         self.settle_detached_peers(children).await;
         self.close_host_transport(&retired.signal_id, &retired.peer.pc)
             .await;
@@ -2006,25 +2074,37 @@ impl RtcSessions {
         reason: &str,
     ) {
         let announce = peer.pair_channels.is_none().then(|| {
-            let nonce = peer
-                .generation
-                .split_once(':')
-                .map_or("", |(_, nonce)| nonce);
             session_status_frame(
                 signal_id,
-                nonce,
+                generation_nonce(&peer.generation),
                 peer.session.session_id(),
                 "unavailable",
                 Some(reason),
             )
         });
-        if self.detach_peer(signal_id, &peer).await {
-            if let Some(frame) = announce {
-                self.send_or_defer_status(frame).await;
-            }
-            self.settle_detached_peer(signal_id, peer, upload_deadline)
-                .await;
+        self.detach_announce_settle(signal_id, peer, upload_deadline, announce)
+            .await;
+    }
+
+    /// The claim, the word to the server, and the awaited settle, in that
+    /// order: the announcement goes out only if this call is the one that
+    /// claims the peer. Returns whether it was.
+    async fn detach_announce_settle(
+        &self,
+        signal_id: &str,
+        peer: RtcPeer,
+        upload_deadline: tokio::time::Instant,
+        announce: Option<Outbound>,
+    ) -> bool {
+        if !self.detach_peer(signal_id, &peer).await {
+            return false;
         }
+        if let Some(frame) = announce {
+            self.send_or_defer_status(frame).await;
+        }
+        self.settle_detached_peer(signal_id, peer, upload_deadline)
+            .await;
+        true
     }
 
     /// Close `pc`, removing its map entry only if the entry still refers to
@@ -2142,13 +2222,8 @@ impl RtcSessions {
                 .cloned()
         };
         if let Some(peer) = peer {
-            if self.detach_peer(signal_id, &peer).await {
-                if let Some(frame) = announce {
-                    self.send_or_defer_status(frame).await;
-                }
-                self.settle_detached_peer(signal_id, peer, upload_deadline)
-                    .await;
-            }
+            self.detach_announce_settle(signal_id, peer, upload_deadline, announce)
+                .await;
             let mut peers = self.peers.lock().await;
             if peers.get(signal_id).is_some_and(|current| {
                 current.generation == generation && Arc::ptr_eq(&current.pc, pc)
@@ -2185,26 +2260,21 @@ impl RtcSessions {
         } else {
             tracing::debug!(%session_id, signal_id, status, "session peer status");
         }
-        let (current, close) = {
-            let peers = self.peers.lock().await;
-            let current = peers.get(signal_id).filter(|current| {
+        let current = self
+            .peers
+            .lock()
+            .await
+            .get(signal_id)
+            .is_some_and(|current| {
                 current.generation == generation
                     && Arc::ptr_eq(&current.pc, pc)
                     && current.session.session_id() == session_id
             });
-            (
-                current.is_some(),
-                current.map(|peer| Arc::clone(&peer.close)),
-            )
-        };
         if !current {
             // Not the resident peer any more: whoever replaced or removed it
             // owns its teardown and its transport close.
             channels.stop();
             active.store(false, Ordering::Release);
-            if let Some(close) = close {
-                self.schedule_close_if_same(signal_id, generation, pc, &close);
-            }
             return false;
         }
         let _ = out_tx;
@@ -2307,7 +2377,7 @@ impl RtcSessions {
 
     /// Close peers attached to one concrete backend generation. A replacement
     /// using the same UUID is deliberately not matched.
-    pub async fn close_for_session(&self, session_id: Uuid, generation: u64) {
+    pub async fn close_for_session(&self, session_id: Uuid, generation: u64, reason: &str) {
         let session = SessionBinding::new(session_id, generation);
         let closing = {
             let peers = self.peers.lock().await;
@@ -2341,7 +2411,7 @@ impl RtcSessions {
         let _closing = closer.lock().await;
         for (signal_id, peer, peer_deadline) in closing {
             let pc = Arc::clone(&peer.pc);
-            self.retire_session_peer_announcing(&signal_id, peer, peer_deadline, "session ended")
+            self.retire_session_peer_announcing(&signal_id, peer, peer_deadline, reason)
                 .await;
             let mut peers = self.peers.lock().await;
             if peers
@@ -2499,6 +2569,7 @@ impl RtcSessions {
                     key: closing_key,
                     pc: Arc::clone(&pc),
                     done: Some(done_tx),
+                    paid: false,
                 };
                 #[cfg(test)]
                 if injected_panic {
@@ -2565,7 +2636,7 @@ impl RtcSessions {
                     )
                     .await;
                 }
-                drop(settlement);
+                settlement.settle().await;
             });
         }
         let _ = tokio::time::timeout_at(upload_deadline, done_rx).await;
@@ -4918,6 +4989,16 @@ fn host_status_frame(
         status: status.to_string(),
         message: message.map(str::to_string),
     }
+}
+
+/// The binding nonce inside a peer's `"<generation>:<nonce>"` string.
+fn generation_nonce(generation: &str) -> &str {
+    generation.split_once(':').map_or("", |(_, nonce)| nonce)
+}
+
+/// Whether a status ends a binding as far as the server is concerned.
+fn status_is_terminal(frame: &Outbound) -> bool {
+    matches!(frame, Outbound::RtcStatus { status, .. } if status != "connected")
 }
 
 fn session_status_frame(
@@ -7344,7 +7425,7 @@ mod tests {
             insert_synthetic_peer(&sessions, signal_id, &generation, session, control).await;
 
         sessions
-            .close_for_session(session_id, session.generation())
+            .close_for_session(session_id, session.generation(), "session ended")
             .await;
         let frame = rx
             .try_recv()
@@ -7358,11 +7439,48 @@ mod tests {
         assert!(!sessions.peers.lock().await.contains_key(signal_id));
     }
 
+    /// Under sustained backpressure a replayed `connected` must not clobber
+    /// the `unavailable` deferred after it: the terminal status is what frees
+    /// the server's binding.
+    #[tokio::test]
+    async fn a_replayed_status_never_clobbers_a_newer_terminal_one() {
+        let sessions = RtcSessions::new();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(WsOutbound::json("{}".to_owned())).unwrap();
+        sessions.signaling.install(tx);
+        let nonce = "a".repeat(32);
+        let session_id = Uuid::new_v4();
+        let status =
+            |status: &str| session_status_frame("contended", &nonce, session_id, status, None);
+        let held = |sessions: &RtcSessions| {
+            let pending = sessions.deferred_statuses.try_lock().unwrap();
+            match pending.get("contended") {
+                Some(Outbound::RtcStatus { status, .. }) => status.clone(),
+                _ => String::new(),
+            }
+        };
+
+        sessions.send_or_defer_status(status("connected")).await;
+        assert_eq!(held(&sessions), "connected");
+        sessions.send_or_defer_status(status("unavailable")).await;
+        assert_eq!(held(&sessions), "unavailable");
+        // The replay of the older `connected` arrives after it.
+        sessions.send_or_defer_status(status("connected")).await;
+        assert_eq!(held(&sessions), "unavailable");
+        sessions.send_or_defer_status(status("failed")).await;
+        assert_eq!(
+            held(&sessions),
+            "failed",
+            "a terminal status replaces a terminal one"
+        );
+    }
+
     /// A status deferred for want of channel room is sent again from the
     /// control connection's heartbeat, not only at the next reconnect.
     #[tokio::test]
     async fn a_status_deferred_under_backpressure_is_flushed_while_connected() {
         let sessions = RtcSessions::new();
+        sessions.deferred_pruned.store(true, Ordering::Release);
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(WsOutbound::json("{}".to_owned())).unwrap();
         sessions.signaling.install(tx);
@@ -8551,7 +8669,7 @@ mod tests {
             .remove_if_generation(session_id, old.generation())
             .expect("remove launch binding");
         sessions
-            .close_for_session(session_id, old.generation())
+            .close_for_session(session_id, old.generation(), "session ended")
             .await;
         drop(transition);
         drop(old_handle);
@@ -8679,7 +8797,7 @@ mod tests {
             .remove_if_generation(session_id, current.generation())
             .expect("remove exited worker");
         sessions
-            .close_for_session(session_id, current.generation())
+            .close_for_session(session_id, current.generation(), "session ended")
             .await;
         drop(transition);
         if let Some(replay_after_exit) = exited_handle.replay(1 << 20) {
@@ -8877,7 +8995,7 @@ mod tests {
             .remove_if_generation(session_id, old.generation())
             .is_some());
         sessions
-            .close_for_session(session_id, old.generation())
+            .close_for_session(session_id, old.generation(), "session ended")
             .await;
         let (current, _current_commands) = insert_test_worker(&registry, session_id);
         drop(transition);
@@ -8957,7 +9075,7 @@ mod tests {
             .remove_if_generation(session_id, old.generation())
             .is_some());
         sessions
-            .close_for_session(session_id, old.generation())
+            .close_for_session(session_id, old.generation(), "session ended")
             .await;
         let (current, _current_commands) = insert_test_worker(&registry, session_id);
         drop(transition);
@@ -9052,7 +9170,7 @@ mod tests {
         let closing_sessions = sessions.clone();
         let close = tokio::spawn(async move {
             closing_sessions
-                .close_for_session(session_id, old.generation())
+                .close_for_session(session_id, old.generation(), "session ended")
                 .await;
         });
         tokio::task::yield_now().await;
