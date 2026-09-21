@@ -290,7 +290,7 @@ slot for good (the 2026-09-19 dream outage: every offer refused with
 had already gone). The deadline release lives inside the tracked cleanup
 task, which nothing cancels. A teardown still pending after the thirty-second
 watchdog is named in the journal, and every five minutes after; the
-control-connection heartbeat writes the cap, closing peers, and host closes
+daemon's own 30 s state timer writes the cap, closing peers, and host closes
 in flight to the state file as `rtc_peers` for `spawnd status`. The stall
 itself was found in the vendored SCTP crate: a writer waiting for pending-queue
 room that only the peer's acknowledgement returns held the writer lock
@@ -304,9 +304,10 @@ coordinator); a duplicate close never touches the transport, since
 deadline would make the owner's close a silent no-op. A host peer's
 attachments leave the peer map with it, under the same locks, so a device
 re-attaching the same view never finds a stale child. The daemon tells the
-server `failed` for every peer it retires on its own — reaped, or superseded
-by the same device — so the server's per-host and per-browser binding caps
-never fill with peers only the daemon knows are gone.
+server `unavailable` for every peer it retires on its own — reaped, or
+superseded by the same device — so the server's per-host and per-browser
+binding caps never fill with peers only the daemon knows are gone; not
+`failed`, which a device reads as a refusal of its offer.
 Teardown also reschedules retained post-publication unlink/fsync cleanup; a
 failure stays charged and a later session/generation teardown retries it.
 

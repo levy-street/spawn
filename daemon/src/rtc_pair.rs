@@ -272,6 +272,7 @@ impl RtcSessions {
                 signal_id: id,
                 peer,
                 children,
+                children_detached: true,
             });
         }
         drop(hosts);
@@ -283,7 +284,7 @@ impl RtcSessions {
             self.send_or_defer_status(super::host_status_frame(
                 host.signal_id.clone(),
                 &host.peer.binding,
-                "failed",
+                "unavailable",
                 Some("superseded by a newer connection from this device"),
             ))
             .await;
@@ -489,7 +490,21 @@ impl RtcSessions {
                 admission: parent.admission.inherit(),
                 fence: Arc::clone(&fence),
             };
-            self.peers.lock().await.insert(id.clone(), child.clone());
+            {
+                // The reaper and the server's close take a pair without the
+                // admission lock this attach holds. Once the pair is retired,
+                // its attachments have already been swept from the map; an
+                // attachment landing after that sweep would sit on a dead
+                // transport with nothing to reap it. The retire flag is set
+                // before the sweep, and this check runs under the same lock
+                // the sweep takes, so one of the two always sees the other.
+                let mut peers = self.peers.lock().await;
+                anyhow::ensure!(
+                    !pair.retired.load(Ordering::Acquire),
+                    "retired device connection"
+                );
+                peers.insert(id.clone(), child.clone());
+            }
             let handler = session_data_channel_handler(
                 pc,
                 self.clone(),
@@ -1441,7 +1456,7 @@ mod tests {
             .expect("the server hears about the superseded pair");
         let value: Value = serde_json::from_str(frame.as_str()).unwrap();
         assert_eq!(value["type"], "rtc.status");
-        assert_eq!(value["status"], "failed");
+        assert_eq!(value["status"], "unavailable");
         assert_eq!(value["session_id"], "superseded-pair");
         assert_eq!(value["scope_type"], "host");
         assert_eq!(value["binding_nonce"], binding.binding_nonce);

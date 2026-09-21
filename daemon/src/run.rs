@@ -592,7 +592,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         task_breakaway_denied,
     ));
     crate::state::install_active(Arc::clone(&state_store));
-    state_store.heartbeat(0);
+    state_store.heartbeat(0, None);
     let rtc_sessions = RtcSessions::new();
     let state_registry = registry.clone();
     let state_rtc_sessions = rtc_sessions.clone();
@@ -605,9 +605,9 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             // here, on the daemon's own clock and no RTC lock: peers keep
             // opening and closing through a server outage, the state file
             // write is an fsync, and the offer path waits on those locks.
-            state_store.heartbeat_with_peers(
+            state_store.heartbeat(
                 state_registry.ids().len(),
-                state_rtc_sessions.admission_gauge().await,
+                Some(state_rtc_sessions.admission_gauge().await),
             );
         }
     });

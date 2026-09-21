@@ -350,9 +350,11 @@ leaves the host map — reaped, closed by the server, or superseded by the
 same device — its attachments leave the peer map with it, under the same
 locks (`detach_pair_children`), so a device re-attaching the same view never
 finds a stale child and the old transport feeds no PTY past that moment; the
-tracked task settles them and then closes the transport. A device offer is
-checked for collisions before the device's working connection is taken, so
-a refused offer never costs the device the connection it has.
+tracked task settles them and then closes the transport; and an attach that
+was in flight when its pair was retired is refused under the peer-map lock
+(`attach_pair_channel`), so no attachment lands after the sweep. A device
+offer is checked for collisions before the device's working connection is
+taken, so a refused offer never costs the device the connection it has.
 
 The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never
@@ -378,8 +380,8 @@ admission lock, which every offer serializes on, or ahead of an answer: a
 superseded pair closes in a tracked task after the lock drops, and trust
 invalidation waits for host closes only until the teardown deadline. A
 device re-attaching a view of its superseded connection (the mobile client
-keeps its attachment ids across a reconnect) finishes that child's teardown
-inline, bounded by the child's deadline, and is admitted as new. Every
+keeps its attachment ids across a reconnect) finds nothing stale: the old
+attachment left the peer map when its pair was superseded. Every
 transport close the daemon owns stops the SCTP association before
 `RTCPeerConnection::close` (`pair::stop_then_close`): the close begins with
 a shutdown of each data channel, and against a peer that stopped
@@ -387,12 +389,17 @@ acknowledging those wait behind a writer that never gets room; the closed
 association releases the writer and the shutdowns bail on state. Every
 retirement the daemon starts on its own — the reaper's never-connected,
 failed, and stayed-disconnected closes, and a device connection superseded
-by a newer one — tells the server `failed` for that binding first
-(`reap_session_peer`, `reap_host_peer`, `take_device_pair`): the server's
-own per-host, per-browser, and per-user binding caps free a binding on that
-status, a browser's shared connection never sends `rtc.close`, and a binding
-the server keeps for a peer only this daemon knows is gone would otherwise
-count until its TTL or this daemon's next registration. The cap is
+by a newer one — tells the server `unavailable` for that binding, once it
+has claimed the peer (`reap_session_peer`, `reap_host_peer`,
+`take_device_pair`): the server's own per-host, per-browser, and per-user
+binding caps free a binding on that status, a browser's shared connection
+never sends `rtc.close`, and a binding the server keeps for a peer only this
+daemon knows is gone would otherwise count until its TTL or this daemon's
+next registration. `unavailable`, not `failed`: to a device `failed` on its
+active binding is a refusal of its offer and it drops its trust verdict,
+while `unavailable` is a connection that is gone, answered with a new one.
+A deferred terminal status is dropped at reconnect — registration's live
+bindings already told the server what survives. The cap is
 read by the daemon's own 30 s state timer in `run.rs` — not the control
 connection's, since peers keep opening and closing through a server outage
 — and written to the state file as `rtc_peers` (`in_use`, `closing`,
