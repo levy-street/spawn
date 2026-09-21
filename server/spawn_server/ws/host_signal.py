@@ -31,9 +31,9 @@ MAX_HOST_RTC_SESSIONS_PER_DAEMON = 64
 MAX_SESSION_RTC_SESSIONS_PER_USER = 64
 MAX_SESSION_RTC_SESSIONS_PER_BROWSER = 16
 MAX_HOST_SIGNAL_ENVELOPE_BYTES = 1200 * 1024
-# The statuses that end a binding: the server forgets it on any of these,
-# whichever side says so.
-HOST_RTC_TERMINAL_STATUSES = frozenset({"failed", "unavailable", "expired"})
+# The statuses that end a binding, host or session scope: the server forgets
+# it on any of these, whichever side says so.
+RTC_TERMINAL_STATUSES = frozenset({"failed", "unavailable", "expired"})
 HOST_RTC_STATUS_ALLOWLIST = frozenset(
     {
         "connected",

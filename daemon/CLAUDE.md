@@ -360,9 +360,12 @@ signing — has superseded it already, and the device reconnects). The
 superseding connection takes the superseded pair's slot when the cap is
 full (`AdmissionSlot::transfer`, `SlotDisposition::Keep`), so a device
 reconnecting at the cap is never refused for want of the slot its own old
-connection held. A cleanup task pays its debts on every exit, a panic's
-unwind included (`TeardownSettlement`): the slot back to the cap and the
-peer out of the closing map.
+connection held. A cleanup task pays its debts from one exit, a panic in
+the teardown caught and logged (`TeardownSettlement`): the slot back to the
+cap and the peer out of the closing map. A peer is identified by its close
+coordinator (`RtcPeer::close`), the one handle unique to a peer: a pair's
+attachments share their host's transport and generation, so a lookup or
+removal by transport would take a view re-attached under the same id.
 
 The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never

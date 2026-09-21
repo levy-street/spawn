@@ -1593,6 +1593,100 @@ mod tests {
         worker.abort();
     }
 
+    /// The attachment that replaced a claimed child is a different peer under
+    /// the same id, on the same transport and generation as the old one.
+    /// When the old child's close settles, it takes itself out of the map —
+    /// not the replacement.
+    #[tokio::test]
+    async fn a_claimed_childs_settle_leaves_its_replacement_resident() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let suffix = format!("{session_id}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let first = connect_pair(&sessions, &registry, [18; 32]).await;
+        let (_first_pty, _first_ctl) = attach_labelled(&first, &suffix).await;
+        let (child_id, claimed_child) = sessions
+            .peers
+            .lock()
+            .await
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .next()
+            .expect("the attachment is resident");
+        // A callback-owned close claimed the child; its settle is still to
+        // come.
+        assert!(claimed_child.close.claim());
+        let first_id = sessions
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("the first pair is admitted");
+        let gate = sessions
+            .stall_effect(&first_id, TestEffectPoint::HostRetire)
+            .await;
+
+        let successor = connect_pair(&sessions, &registry, [18; 32]).await;
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .expect("the superseded teardown is held");
+        let (_pty, _ctl) = attach_labelled(&successor, &suffix).await;
+        let replacement = sessions
+            .peers
+            .lock()
+            .await
+            .get(&child_id)
+            .cloned()
+            .expect("the replacement is resident");
+        assert!(
+            !Arc::ptr_eq(&replacement.close, &claimed_child.close),
+            "the replacement is a peer of its own"
+        );
+
+        // The claimed child's owner settles it now.
+        let deadline = claimed_child.close.initiate();
+        sessions
+            .close_if_same_until_announcing(
+                &child_id,
+                &claimed_child.generation,
+                &claimed_child.close,
+                deadline,
+                None,
+            )
+            .await;
+        let resident = sessions.peers.lock().await.get(&child_id).cloned();
+        assert!(
+            resident.is_some_and(|peer| Arc::ptr_eq(&peer.close, &replacement.close)),
+            "the replacement survives the old child's settle"
+        );
+        assert!(
+            replacement.active.load(Ordering::Acquire),
+            "and is still in service"
+        );
+
+        gate.release.notify_one();
+        sessions.close_all().await;
+        for pc in [first, successor] {
+            let _ = pc.close().await;
+        }
+        worker.abort();
+    }
+
     /// The mobile client keeps its view and attachment ids across a
     /// reconnect. When its new connection supersedes the old one while the
     /// old one's children have not yet closed, re-attaching the same view

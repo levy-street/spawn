@@ -2274,7 +2274,45 @@ async def test_daemon_terminal_host_status_frees_the_binding(client):
         if await broker.rtc_session_for(session_id) is None:
             break
         await asyncio.sleep(0.01)
-    assert await broker.rtc_session_for(session_id) is None, "the host binding is freed on the daemon's word"
+    assert await broker.rtc_session_for(session_id) is None, (
+        "the host binding is freed on the daemon's word"
+    )
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_daemon_terminal_status_for_a_forgotten_binding_is_a_no_op(client):
+    """A daemon says goodbye for every peer it ever admitted. For a binding the
+    server no longer holds — dropped at reconcile, freed on the browser's word,
+    expired — that goodbye is nothing to act on and nothing the daemon did
+    wrong, so it earns no `invalid_frame`."""
+    user_id, _ = await _signup(client, "ws-daemon-forgotten-status@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text({"type": "register", "version": "rtc-test"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
+    frame = {
+        "type": "rtc.status",
+        "session_id": "host-binding-forgotten",
+        "binding_nonce": "c" * 32,
+        "scope_type": "host",
+        "scope_id": host_id,
+        "protocol": "spawn.host.ctl",
+        "protocol_version": 2,
+    }
+    ws.queue_text({**frame, "status": "unavailable", "message": "stayed disconnected"})
+    # Error frames are rate-limited to one a second: had the goodbye earned
+    # one, the error for this frame would be swallowed, and the only error
+    # seen would name `rtc.status`.
+    ws.queue_text({"type": "no.such.frame"})
+    await _wait_until(lambda: any(item.get("type") == "error" for item in _sent_json(ws)))
+    assert [item for item in _sent_json(ws) if item.get("type") == "error"] == [
+        {"type": "error", "code": "unknown_frame", "frame_type": "no.such.frame"}
+    ], "no error for the goodbye"
 
     ws.queue_disconnect()
     await asyncio.wait_for(task, timeout=1)
