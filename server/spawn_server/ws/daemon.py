@@ -2801,8 +2801,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         # never sends `rtc.close`, and a binding kept for a peer
                         # only the daemon knows is gone would count against the
                         # per-host, per-daemon and per-browser caps until its TTL.
+                        # By the binding's identity, not its browser: a resume
+                        # that rebound the browser while the routing above
+                        # awaited must not turn the daemon's word into a no-op.
                         if binding.scope_type == "host" and status_value in RTC_TERMINAL_STATUSES:
-                            await broker.unregister_rtc_session(session_id, binding.browser)
+                            await broker.unregister_rtc_binding(binding)
                     else:
                         await errors.send("invalid_frame", ftype)
 

@@ -1689,6 +1689,67 @@ mod tests {
         worker.abort();
     }
 
+    /// A retired host peer never handed to its tracked close — a path that
+    /// returned early between taking it and closing it — closes itself from
+    /// the drop path: its attachments, claimed and in the closing map since
+    /// it was taken, settle, and its transport closes.
+    #[tokio::test]
+    async fn a_retired_host_peer_dropped_unclosed_closes_from_the_drop_path() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let device = connect_pair(&sessions, &registry, [19; 32]).await;
+        let (_pty, _ctl) = attach(&device, session_id).await;
+        let (host_id, host_pc) = {
+            let hosts = sessions.host_peers.lock().await;
+            let (id, peer) = hosts.iter().next().expect("the pair is admitted");
+            (id.clone(), Arc::clone(&peer.pc))
+        };
+        assert_eq!(sessions.peers.lock().await.len(), 1);
+
+        let retired = sessions
+            .take_host_if_same(&host_id, &host_pc)
+            .await
+            .expect("taken");
+        assert_eq!(
+            sessions.closing_peers.lock().await.len(),
+            1,
+            "the attachment is claimed and closing from the moment its host was taken"
+        );
+        drop(retired);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sessions.closing_peers.lock().await.is_empty()
+                    && sessions.admission_gauge().await.host_closing == 0
+                    && host_pc.connection_state() == RTCPeerConnectionState::Closed
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped retired host closed itself: attachment settled, transport closed");
+        assert!(sessions.host_peers.lock().await.is_empty());
+        sessions.close_all().await;
+        let _ = device.close().await;
+        worker.abort();
+    }
+
     /// The mobile client keeps its view and attachment ids across a
     /// reconnect. When its new connection supersedes the old one while the
     /// old one's children have not yet closed, re-attaching the same view

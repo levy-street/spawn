@@ -2299,6 +2299,95 @@ async def test_daemon_terminal_host_status_frees_the_binding(client):
     await asyncio.wait_for(task, timeout=1)
 
 
+async def test_daemon_terminal_host_status_frees_a_binding_resumed_meanwhile(client, monkeypatch):
+    """The routing of a daemon's goodbye to the browser awaits ownership checks
+    and a publish. A device resuming its signalling on a new socket in that
+    window rebinds the binding's browser; the goodbye still frees the binding,
+    which is named by its identity, not by the socket that held it."""
+    user_id, _ = await _signup(client, "ws-daemon-resumed-status@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+    broker = get_broker()
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text({"type": "register", "version": "rtc-test"})
+    await _wait_until(lambda: any(item.get("type") == "registered" for item in _sent_json(ws)))
+    live_daemon = broker.get_daemon_for_host(host_id)
+    assert live_daemon is not None and live_daemon.host_generation is not None
+    nonce = "e" * 32
+    first_browser = RedisBrowserConn(
+        user_id=user_id,
+        host_id=host_id,
+        channel=browser_signal_channel(nonce),
+        daemon_connection_id=live_daemon.id,
+        daemon_generation=live_daemon.host_generation,
+        binding_nonce=nonce,
+    )
+    session_id = "host-binding-resumed"
+    assert await broker.register_rtc_session(
+        session_id,
+        first_browser,
+        daemon=live_daemon,
+        scope_type="host",
+        scope_id=host_id,
+        protocol="spawn.host.ctl",
+        protocol_version=2,
+        binding_nonce=nonce,
+    )
+
+    second_browser = RedisBrowserConn(
+        user_id=user_id,
+        host_id=host_id,
+        channel=browser_signal_channel(nonce) + ":resumed",
+        daemon_connection_id=live_daemon.id,
+        daemon_generation=live_daemon.host_generation,
+        binding_nonce=nonce,
+    )
+
+    async def resume_while_routing(conn, binding, payload):
+        await broker.orphan_rtc_sessions_for_browser(first_browser, grace_seconds=60)
+        resumed = await broker.resume_rtc_session(
+            session_id,
+            second_browser,
+            binding_nonce=nonce,
+            binding_generation=binding.daemon_generation,
+            scope_type="host",
+            scope_id=host_id,
+            protocol="spawn.host.ctl",
+            protocol_version=2,
+        )
+        assert resumed is not None and resumed.browser is second_browser
+        return True
+
+    from spawn_server.ws import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "_route_rtc_payload_if_owner", resume_while_routing)
+    ws.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": session_id,
+            "binding_nonce": nonce,
+            "scope_type": "host",
+            "scope_id": host_id,
+            "protocol": "spawn.host.ctl",
+            "protocol_version": 2,
+            "status": "unavailable",
+            "message": "stayed disconnected",
+        }
+    )
+    for _ in range(100):
+        if await broker.rtc_session_for(session_id) is None:
+            break
+        await asyncio.sleep(0.01)
+    assert await broker.rtc_session_for(session_id) is None, (
+        "the goodbye freed the binding the resume had rebound"
+    )
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
 async def test_daemon_terminal_status_for_a_forgotten_binding_is_a_no_op(client):
     """A daemon says goodbye for every peer it ever admitted. For a binding the
     server no longer holds — dropped at reconcile, freed on the browser's word,

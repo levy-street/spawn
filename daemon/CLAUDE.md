@@ -368,6 +368,10 @@ attachments share their host's transport and generation, so a lookup or
 removal by transport would take a view re-attached under the same id. The
 closing map is keyed by that coordinator too (`closing_key`), so two peers
 under one id and generation are two closing peers, each found and counted.
+A host peer taken out of the host map (`RetiredHost`) is handed to its
+tracked close through `into_parts`; dropped before that, it closes itself
+from the drop path, so its claimed attachments never sit in the closing
+map for good.
 
 The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never
@@ -425,13 +429,16 @@ want of channel room, is retried from the control connection's heartbeat
 once registration's replay has run; at reconnect a deferred terminal
 status is replayed only for a binding the register frame carried (the
 server kept exactly those), and a deferred `connected` never is — the
-replay says `connected` for every peer that is. A peer leaving service
-forgets the `connected` held for it. The three terminal statuses are
+replay says `connected` for every peer that is. A binding holds at most
+one live status and one goodbye (`DeferredStatuses`, two slots, a plain
+mutex — nothing on the status path awaits): a live status sent clears the
+live slot, a goodbye sent clears both, a peer leaving service forgets its
+live slot, and a status that goes straight through flushes the rest at
+once, the heartbeat being the backstop. The three terminal statuses are
 named on both sides (`TERMINAL_RTC_STATUSES` here, `RTC_TERMINAL_STATUSES`
 in the server), and the server takes a goodbye for a binding it no longer
-holds as a no-op. In the deferred map a
-terminal status always wins: a replayed `connected` never overwrites the
-`unavailable` deferred after it. A retired host peer's association stops
+holds as a no-op, and forgets a binding by its identity rather than by the
+browser socket that held it when the goodbye was read. A retired host peer's association stops
 before its attachments settle, so their channel closes are not each held
 to their deadline by the writer the silent peer left stuck. The cap is
 read by the daemon's own 30 s state timer in `run.rs` — not the control

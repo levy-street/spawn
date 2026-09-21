@@ -3,7 +3,7 @@
 //! The central websocket remains the authenticated, content-free control and
 //! signaling plane. Raw PTY input/output and replay are endpoint-only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -188,7 +188,7 @@ pub struct RtcSessions {
     peer_admission: RtcPeerAdmission,
     api: Arc<OnceLock<webrtc::api::API>>,
     signaling: RtcWsSender,
-    deferred_statuses: Arc<Mutex<HashMap<String, Outbound>>>,
+    deferred_statuses: Arc<std::sync::Mutex<HashMap<String, DeferredStatuses>>>,
     /// Set once this connection's registration is acknowledged and its
     /// replay has pruned what the server dropped; cleared with the control
     /// connection. No status goes out before it — the server refuses frames
@@ -556,13 +556,54 @@ enum SlotDisposition {
 
 /// A host peer that has left the host map, with the attachments taken out of
 /// service as it left. Its awaited teardown — settling those attachments,
-/// then the transport close — runs in a tracked cleanup task.
+/// then the transport close — runs in a tracked cleanup task, which takes
+/// it through `into_parts`. Dropped before that, it closes itself: the
+/// attachments are claimed and in the closing map from the moment it was
+/// taken, and a path that returned early between taking it and closing it
+/// must not leave them there for good.
 struct RetiredHost {
     signal_id: String,
     peer: HostRtcPeer,
     /// Complete: taken as the peer left the host map, after which nothing
     /// attaches to it.
     children: Vec<(String, RtcPeer)>,
+    sessions: RtcSessions,
+    handed_off: bool,
+}
+
+impl RetiredHost {
+    /// What the tracked close takes; nothing is left for the drop path.
+    fn into_parts(mut self) -> (String, HostRtcPeer, Vec<(String, RtcPeer)>) {
+        self.handed_off = true;
+        (
+            std::mem::take(&mut self.signal_id),
+            self.peer.clone(),
+            std::mem::take(&mut self.children),
+        )
+    }
+}
+
+impl Drop for RetiredHost {
+    fn drop(&mut self) {
+        if self.handed_off {
+            return;
+        }
+        tracing::error!(
+            signal_id = %self.signal_id,
+            "retired host rtc peer dropped before its close was spawned; closing it from here"
+        );
+        let host = RetiredHost {
+            signal_id: std::mem::take(&mut self.signal_id),
+            peer: self.peer.clone(),
+            children: std::mem::take(&mut self.children),
+            sessions: self.sessions.clone(),
+            handed_off: true,
+        };
+        let sessions = self.sessions.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { sessions.close_retired_host_peer(host).await });
+        }
+    }
 }
 
 /// One host peer tearing down after leaving the host map, for the gauge.
@@ -934,37 +975,52 @@ impl RtcSessions {
         live
     }
 
-    /// Retry every status that was deferred for want of channel room. Runs
-    /// on the control connection's heartbeat: a status deferred while
-    /// connected is only ever sent again from here, and a terminal one is
-    /// what frees the server's binding. Waits for registration's replay,
-    /// which prunes what the server dropped at reconcile; until then a
-    /// deferred terminal status may be for a binding the server no longer
-    /// has.
+    fn deferred(&self) -> std::sync::MutexGuard<'_, HashMap<String, DeferredStatuses>> {
+        self.deferred_statuses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Retry every status held for want of channel room. Runs on the control
+    /// connection's heartbeat as the backstop; a status that goes straight
+    /// through flushes the rest at once, since the channel has room again.
+    /// Waits for registration's ack, which prunes what the server dropped
+    /// at reconcile; until then a held goodbye may be for a binding the
+    /// server no longer has.
     pub async fn flush_deferred_statuses(&self) {
         if !self.deferred_pruned.load(Ordering::Acquire) {
             return;
         }
-        let pending = std::mem::take(&mut *self.deferred_statuses.lock().await);
-        for (_, frame) in pending {
-            self.send_or_defer_status(frame).await;
+        self.flush_pending();
+    }
+
+    fn flush_pending(&self) {
+        let pending = std::mem::take(&mut *self.deferred());
+        for (key, slot) in pending {
+            for frame in slot.drain() {
+                if !self.send_now(&frame) {
+                    self.deferred().entry(key.clone()).or_default().hold(frame);
+                }
+            }
         }
     }
 
-    /// After registration: replay what still matters, then say `connected`
-    /// for every peer that is. `registered` names the bindings the register
-    /// frame carried — the server kept exactly those and dropped the rest —
-    /// so a deferred terminal status is replayed only for one of them (a
-    /// peer reaped between the frame and its ack is among them, and the
-    /// server still holds its binding). A deferred `connected` is not
-    /// replayed: the pass below says it for every peer that is connected,
-    /// and for any other it would only earn an `invalid_frame`.
+    /// After registration: replay the goodbyes that still matter, then say
+    /// `connected` for every peer that is. `registered` names the bindings
+    /// the register frame carried — the server kept exactly those and
+    /// dropped the rest — so a held goodbye is replayed only for one of them
+    /// (a peer reaped between the frame and its ack is among them, and the
+    /// server still holds its binding). A held live status is not: the pass
+    /// below says `connected` for every peer that is connected, and for any
+    /// other it would only earn an `invalid_frame`.
     pub async fn reannounce_live_statuses(&self, registered: &HashSet<String>) {
-        let pending = std::mem::take(&mut *self.deferred_statuses.lock().await);
+        let pending = std::mem::take(&mut *self.deferred());
         self.deferred_pruned.store(true, Ordering::Release);
-        for (signal_id, frame) in pending {
-            if status_is_terminal(&frame) && registered.contains(&signal_id) {
-                self.send_or_defer_status(frame).await;
+        for (signal_id, slot) in pending {
+            if let Some(goodbye) = slot.goodbye {
+                if registered.contains(&signal_id) {
+                    self.send_or_defer_status(goodbye).await;
+                }
             }
         }
         let peers = self.peers.lock().await.clone();
@@ -994,59 +1050,59 @@ impl RtcSessions {
         }
     }
 
+    /// Send `frame` now if this connection is registered and its channel has
+    /// room. No status goes out before registration is acknowledged: the
+    /// server refuses frames before `register`, and one refused would be one
+    /// never held.
+    fn send_now(&self, frame: &Outbound) -> bool {
+        if !self.deferred_pruned.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(sender) = self.signaling.load() else {
+            return false;
+        };
+        let Ok(text) = serde_json::to_string(frame) else {
+            return true;
+        };
+        sender.try_send(WsOutbound::json(text)).is_ok()
+    }
+
+    /// Send a status, or hold it for the next chance. Nothing here awaits:
+    /// a status is on its way or held by the time this returns.
     async fn send_or_defer_status(&self, frame: Outbound) -> bool {
         let key = match &frame {
             Outbound::RtcStatus { session_id, .. } => session_id.clone(),
             _ => return false,
         };
-        let sender = match self.signaling.load() {
-            Some(sender) if self.deferred_pruned.load(Ordering::Acquire) => sender,
-            _ => {
-                self.defer_status(key, frame).await;
-                return true;
-            }
-        };
-        let Ok(text) = serde_json::to_string(&frame) else {
-            return false;
-        };
-        match sender.try_send(WsOutbound::json(text)) {
-            Ok(()) => {
-                // Whatever was held for this binding is older than what just
-                // went out, and a later flush must not send it after this —
-                // unless it is a terminal status and this was not. The
-                // heartbeat's flush takes what is held before it sends, and a
-                // peer reaped in between deferred its goodbye behind the
-                // flush's back; that goodbye is what frees the server's
-                // binding, and it stays.
-                let mut pending = self.deferred_statuses.lock().await;
-                let keep_held = pending
-                    .get(&key)
-                    .is_some_and(|held| status_is_terminal(held) && !status_is_terminal(&frame));
-                if !keep_held {
+        if !self.send_now(&frame) {
+            self.defer_status(key, frame);
+            return true;
+        }
+        // What went out supersedes what was held: a live status the live
+        // slot, a goodbye both. The channel has room, so whatever else is
+        // held goes now rather than at the next heartbeat.
+        let more = {
+            let mut pending = self.deferred();
+            if let Some(slot) = pending.get_mut(&key) {
+                slot.live = None;
+                if status_is_terminal(&frame) {
+                    slot.goodbye = None;
+                }
+                if slot.is_empty() {
                     pending.remove(&key);
                 }
-                true
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
-            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.defer_status(key, frame).await;
-                true
-            }
+            !pending.is_empty()
+        };
+        if more {
+            self.flush_pending();
         }
+        true
     }
 
-    /// Hold a status for the next chance to send it. A terminal status always
-    /// replaces what is held for the binding; a non-terminal one never
-    /// replaces a terminal one — a replayed `connected` must not clobber the
-    /// `unavailable` that frees the server's binding.
-    async fn defer_status(&self, key: String, frame: Outbound) {
-        let mut pending = self.deferred_statuses.lock().await;
-        let keep_existing = pending
-            .get(&key)
-            .is_some_and(|existing| status_is_terminal(existing) && !status_is_terminal(&frame));
-        if !keep_existing {
-            pending.insert(key, frame);
-        }
+    /// Hold a status for the next chance to send it, in its slot.
+    fn defer_status(&self, key: String, frame: Outbound) {
+        self.deferred().entry(key).or_default().hold(frame);
     }
 
     fn capture_trust_epoch(&self) -> u64 {
@@ -1580,10 +1636,10 @@ impl RtcSessions {
         };
         let admitted = {
             let mut hosts = self.host_peers.lock().await;
-            if hosts.contains_key(&signal_id)
-                || hosts.len() >= MAX_HOST_RTC_PEERS
-                || self.peers.lock().await.contains_key(&signal_id)
-            {
+            // A collision was refused above under the admission lock, which
+            // every inserter into either map takes; the host cap is all
+            // that is left to ask.
+            if hosts.len() >= MAX_HOST_RTC_PEERS {
                 false
             } else {
                 hosts.insert(
@@ -1761,12 +1817,14 @@ impl RtcSessions {
         // on the host map has to wait for a sweep of up to a hundred
         // attachments.
         drop(hosts);
-        self.forget_deferred_non_terminal(signal_id).await;
+        self.forget_held_live_status(signal_id);
         let children = self.detach_pair_children(&peer.pc).await;
         Some(RetiredHost {
             signal_id: signal_id.to_string(),
             peer,
             children,
+            sessions: self.clone(),
+            handed_off: false,
         })
     }
 
@@ -1848,10 +1906,10 @@ impl RtcSessions {
     /// lock — and is counted in the gauge's `host_closing` throughout.
     async fn close_retired_host_peer(&self, retired: RetiredHost) {
         let _counted = HostClosing::begin(&self.host_closing);
+        let (signal_id, peer, children) = retired.into_parts();
         #[cfg(test)]
-        self.pause_effect(&retired.signal_id, TestEffectPoint::HostRetire)
+        self.pause_effect(&signal_id, TestEffectPoint::HostRetire)
             .await;
-        let children = retired.children;
         // The association stops before the attachments settle: each one's
         // channel close queues behind whatever writer the peer left stuck,
         // and only the closed association lets that writer go. Otherwise
@@ -1860,18 +1918,18 @@ impl RtcSessions {
         settle_with_watchdog(
             tokio::time::Instant::now(),
             async {
-                let _ = retired.peer.pc.sctp().stop().await;
+                let _ = peer.pc.sctp().stop().await;
             },
             |pending| {
                 tracing::warn!(
-                    signal_id = %retired.signal_id,
+                    signal_id = %signal_id,
                     pending_secs = pending.as_secs(),
                     "host rtc peer association stop still pending; its admission slot was returned when it left the host map"
                 );
             },
             |elapsed| {
                 tracing::info!(
-                    signal_id = %retired.signal_id,
+                    signal_id = %signal_id,
                     elapsed_secs = elapsed.as_secs(),
                     "host rtc peer association stop settled late"
                 );
@@ -1879,8 +1937,7 @@ impl RtcSessions {
         )
         .await;
         self.settle_detached_peers(children).await;
-        self.close_host_transport(&retired.signal_id, &retired.peer.pc)
-            .await;
+        self.close_host_transport(&signal_id, &peer.pc).await;
     }
 
     /// Close a host peer's transport, naming it in the journal while the
@@ -2490,13 +2547,13 @@ impl RtcSessions {
             .remove_generation_until(session, upload_deadline)
             .await;
         Announcements {
-            frames: announcements,
+            frames: announcements.into(),
             sessions: self.clone(),
         }
     }
 
     /// Send statuses a caller held back until the moment was right.
-    async fn announce_statuses(&self, frames: Vec<Outbound>) {
+    async fn announce_statuses(&self, frames: impl IntoIterator<Item = Outbound>) {
         for frame in frames {
             self.send_or_defer_status(frame).await;
         }
@@ -2509,20 +2566,18 @@ impl RtcSessions {
 /// server's bindings, only mistime it.
 #[must_use = "call `send` once the session's exit or replacement is on the wire"]
 pub struct Announcements {
-    frames: Vec<Outbound>,
+    frames: VecDeque<Outbound>,
     sessions: RtcSessions,
 }
 
 impl Announcements {
-    /// Each frame leaves the guard only once it is on its way, so a caller
-    /// dropped mid-way — the dispatch loop torn down on a lost connection —
-    /// hands what is left to the drop path rather than losing it. A frame
-    /// dropped mid-send goes twice at worst, which the server takes as a
-    /// no-op.
+    /// A status is sent or held by the time `send_or_defer_status` returns
+    /// — nothing in it awaits — so no caller is dropped between two frames,
+    /// and each leaves the guard as it goes. The drop path is for a caller
+    /// that never gets here.
     pub async fn send(mut self) {
-        while let Some(frame) = self.frames.first().cloned() {
+        while let Some(frame) = self.frames.pop_front() {
             self.sessions.send_or_defer_status(frame).await;
-            self.frames.remove(0);
         }
     }
 
@@ -2575,7 +2630,7 @@ impl RtcSessions {
         if !self.take_out_of_service(signal_id, peer) {
             return false;
         }
-        self.forget_deferred_non_terminal(signal_id).await;
+        self.forget_held_live_status(signal_id);
         self.closing_peers.lock().await.insert(
             closing_key(&peer.close),
             ClosingPeer {
@@ -2586,17 +2641,18 @@ impl RtcSessions {
         true
     }
 
-    /// Forget a status held for `signal_id` unless it is terminal: a peer
-    /// leaving service has no `connected` left to say, and one replayed for
-    /// a binding the server freed on the browser's word would only earn an
-    /// `invalid_frame` — rate-limited, hiding the next real error.
-    async fn forget_deferred_non_terminal(&self, signal_id: &str) {
-        let mut pending = self.deferred_statuses.lock().await;
-        if pending
-            .get(signal_id)
-            .is_some_and(|held| !status_is_terminal(held))
-        {
-            pending.remove(signal_id);
+    /// Forget the live status held for `signal_id`: a peer leaving service
+    /// has no `connected` left to say, and one replayed for a binding the
+    /// server freed on the browser's word would only earn an
+    /// `invalid_frame` — rate-limited, hiding the next real error. A goodbye
+    /// held for it stays.
+    fn forget_held_live_status(&self, signal_id: &str) {
+        let mut pending = self.deferred();
+        if let Some(slot) = pending.get_mut(signal_id) {
+            slot.live = None;
+            if slot.is_empty() {
+                pending.remove(signal_id);
+            }
         }
     }
 
@@ -2628,7 +2684,7 @@ impl RtcSessions {
             }
         }
         for (id, _) in &detached {
-            self.forget_deferred_non_terminal(id).await;
+            self.forget_held_live_status(id);
         }
         let mut closing = self.closing_peers.lock().await;
         for (id, peer) in &detached {
@@ -5112,6 +5168,37 @@ fn status_is_terminal(frame: &Outbound) -> bool {
     )
 }
 
+/// What a binding holds for the next chance to send: at most one live
+/// status — the latest `connected` — and one goodbye. Two slots, so a
+/// goodbye and a stale live status never compete for one, and what orders
+/// them is the slots themselves: a live status sent clears the live slot, a
+/// goodbye sent clears both, a peer leaving service forgets its live slot,
+/// and a reconnect replays goodbyes alone.
+#[derive(Default)]
+struct DeferredStatuses {
+    live: Option<Outbound>,
+    goodbye: Option<Outbound>,
+}
+
+impl DeferredStatuses {
+    fn hold(&mut self, frame: Outbound) {
+        if status_is_terminal(&frame) {
+            self.goodbye = Some(frame);
+        } else {
+            self.live = Some(frame);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.live.is_none() && self.goodbye.is_none()
+    }
+
+    /// In send order: the live status, then the goodbye.
+    fn drain(self) -> impl Iterator<Item = Outbound> {
+        self.live.into_iter().chain(self.goodbye)
+    }
+}
+
 fn session_status_frame(
     signal_id: &str,
     binding_nonce: &str,
@@ -7574,8 +7661,9 @@ mod tests {
         let status =
             |status: &str| session_status_frame("contended", &nonce, session_id, status, None);
         let held = |sessions: &RtcSessions| {
-            let pending = sessions.deferred_statuses.try_lock().unwrap();
-            match pending.get("contended") {
+            let pending = sessions.deferred();
+            let slot = pending.get("contended");
+            match slot.and_then(|slot| slot.goodbye.as_ref().or(slot.live.as_ref())) {
                 Some(Outbound::RtcStatus { status, .. }) => status.clone(),
                 _ => String::new(),
             }
@@ -7612,7 +7700,7 @@ mod tests {
         let status =
             |status: &str| session_status_frame("drained", &nonce, session_id, status, None);
         sessions.send_or_defer_status(status("connected")).await;
-        assert_eq!(sessions.deferred_statuses.lock().await.len(), 1);
+        assert_eq!(sessions.deferred().len(), 1);
 
         let _filler = rx.recv().await;
         sessions.send_or_defer_status(status("unavailable")).await;
@@ -7622,7 +7710,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(sent.as_str()).unwrap();
         assert_eq!(value["status"], "unavailable");
         assert!(
-            sessions.deferred_statuses.lock().await.is_empty(),
+            sessions.deferred().is_empty(),
             "the older deferred status is gone"
         );
         sessions.flush_deferred_statuses().await;
@@ -7672,7 +7760,7 @@ mod tests {
             ))
             .await;
         assert!(rx.try_recv().is_err(), "held until registration");
-        assert_eq!(sessions.deferred_statuses.lock().await.len(), 1);
+        assert_eq!(sessions.deferred().len(), 1);
 
         sessions
             .reannounce_live_statuses(&HashSet::from(["early".to_owned()]))
@@ -7680,7 +7768,7 @@ mod tests {
         let sent: serde_json::Value =
             serde_json::from_str(rx.try_recv().expect("replayed after the ack").as_str()).unwrap();
         assert_eq!(sent["status"], "unavailable");
-        assert!(sessions.deferred_statuses.lock().await.is_empty());
+        assert!(sessions.deferred().is_empty());
     }
 
     /// A peer leaving service has no `connected` left to say: what was held
@@ -7702,9 +7790,7 @@ mod tests {
             insert_synthetic_peer(&sessions, signal_id, &generation, session, control).await;
         let status =
             |status: &str| session_status_frame(signal_id, &nonce, session_id, status, None);
-        sessions
-            .defer_status(signal_id.to_owned(), status("connected"))
-            .await;
+        sessions.defer_status(signal_id.to_owned(), status("connected"));
         let peer = sessions
             .peers
             .lock()
@@ -7714,21 +7800,17 @@ mod tests {
             .expect("resident");
         assert!(sessions.detach_peer(signal_id, &peer).await);
         assert!(
-            sessions.deferred_statuses.lock().await.is_empty(),
+            sessions.deferred().is_empty(),
             "the held `connected` is gone with the peer"
         );
-        sessions
-            .defer_status(signal_id.to_owned(), status("unavailable"))
-            .await;
+        sessions.defer_status(signal_id.to_owned(), status("unavailable"));
         // A second detach claims nothing and forgets nothing.
         assert!(!sessions.detach_peer(signal_id, &peer).await);
         assert!(
             sessions
-                .deferred_statuses
-                .lock()
-                .await
+                .deferred()
                 .get(signal_id)
-                .is_some_and(status_is_terminal),
+                .is_some_and(|slot| slot.goodbye.is_some()),
             "a goodbye held for it stays"
         );
         let _ = close.initiate();
@@ -7812,9 +7894,7 @@ mod tests {
         // What a flush holds in hand: a `connected` taken from the map ...
         let in_flight = status("connected");
         // ... and what a reaper deferred while the flush held it.
-        sessions
-            .defer_status("raced".to_owned(), status("unavailable"))
-            .await;
+        sessions.defer_status("raced".to_owned(), status("unavailable"));
 
         sessions.send_or_defer_status(in_flight).await;
         let sent: serde_json::Value = serde_json::from_str(
@@ -7826,11 +7906,9 @@ mod tests {
         assert_eq!(sent["status"], "connected");
         assert!(
             sessions
-                .deferred_statuses
-                .lock()
-                .await
+                .deferred()
                 .get("raced")
-                .is_some_and(status_is_terminal),
+                .is_some_and(|slot| slot.goodbye.is_some()),
             "the goodbye deferred meanwhile is still held"
         );
         sessions.flush_deferred_statuses().await;
@@ -7839,12 +7917,11 @@ mod tests {
         assert_eq!(sent["status"], "unavailable");
     }
 
-    /// A caller dropped in the middle of sending its announcements — the
-    /// dispatch loop torn down on a lost connection — loses none of them:
-    /// each leaves the guard only once it is on its way, and the drop path
-    /// sends the rest.
+    /// A caller that never sends its announcements — an early return, a
+    /// task dropped — hands them to the drop path, which sends them; and a
+    /// caller that does send leaves nothing for it.
     #[tokio::test]
-    async fn announcements_dropped_mid_send_still_send_the_rest() {
+    async fn announcements_never_sent_go_from_the_drop_path() {
         let sessions = RtcSessions::new();
         sessions.deferred_pruned.store(true, Ordering::Release);
         let (tx, mut rx) = mpsc::channel(4);
@@ -7852,21 +7929,10 @@ mod tests {
         let nonce = "a".repeat(32);
         let session_id = Uuid::new_v4();
         let status = |id: &str| session_status_frame(id, &nonce, session_id, "unavailable", None);
-        let announcements = Announcements {
-            frames: vec![status("first"), status("second")],
+        drop(Announcements {
+            frames: vec![status("first"), status("second")].into(),
             sessions: sessions.clone(),
-        };
-        // The first frame goes out, then the send blocks on the deferred map
-        // this test holds; dropping it there is the caller's cancellation.
-        let held = sessions.deferred_statuses.lock().await;
-        let mut send = Box::pin(announcements.send());
-        tokio::select! {
-            biased;
-            _ = &mut send => panic!("the send cannot finish while the map is held"),
-            _ = tokio::task::yield_now() => {}
-        }
-        drop(send);
-        drop(held);
+        });
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -7875,11 +7941,53 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(frame.as_str()).unwrap();
             sent.push(value["session_id"].as_str().unwrap().to_owned());
         }
-        assert!(sent.contains(&"first".to_owned()), "{sent:?}");
-        assert!(
-            sent.contains(&"second".to_owned()),
-            "the frame after the cancellation still went: {sent:?}"
+        assert_eq!(sent, ["first", "second"]);
+
+        Announcements {
+            frames: vec![status("third")].into(),
+            sessions: sessions.clone(),
+        }
+        .send()
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(rx.try_recv().expect("sent").as_str()).unwrap();
+        assert_eq!(value["session_id"], "third");
+        assert!(rx.try_recv().is_err(), "sent once, not again on drop");
+    }
+
+    /// A status that goes straight through means the channel has room: what
+    /// else is held goes with it, not at the next heartbeat.
+    #[tokio::test]
+    async fn a_status_sent_through_flushes_what_else_is_held() {
+        let sessions = RtcSessions::new();
+        sessions.deferred_pruned.store(true, Ordering::Release);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(WsOutbound::json("{}".to_owned())).unwrap();
+        sessions.signaling.install(tx);
+        let nonce = "a".repeat(32);
+        let session_id = Uuid::new_v4();
+        let status = |id: &str| session_status_frame(id, &nonce, session_id, "unavailable", None);
+        sessions.send_or_defer_status(status("held")).await;
+        assert_eq!(sessions.deferred().len(), 1, "no room: held");
+
+        let _filler = rx.recv().await;
+        let (wide_tx, mut wide_rx) = mpsc::channel(4);
+        sessions.signaling.install(wide_tx);
+        sessions.send_or_defer_status(status("through")).await;
+        let mut sent = Vec::new();
+        while let Ok(frame) = wide_rx.try_recv() {
+            let value: serde_json::Value = serde_json::from_str(frame.as_str()).unwrap();
+            sent.push(value["session_id"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(
+            sent,
+            ["through", "held"],
+            "the held goodbye followed at once"
         );
+        assert!(sessions.deferred().is_empty());
     }
 
     /// A status deferred for want of channel room is sent again from the
@@ -7900,7 +8008,7 @@ mod tests {
             Some("stayed disconnected"),
         );
         assert!(sessions.send_or_defer_status(frame).await);
-        assert_eq!(sessions.deferred_statuses.lock().await.len(), 1);
+        assert_eq!(sessions.deferred().len(), 1);
 
         let _filler = rx.recv().await;
         sessions.flush_deferred_statuses().await;
@@ -7908,7 +8016,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(sent.as_str()).unwrap();
         assert_eq!(value["session_id"], "backpressured");
         assert_eq!(value["status"], "unavailable");
-        assert!(sessions.deferred_statuses.lock().await.is_empty());
+        assert!(sessions.deferred().is_empty());
     }
 
     /// At reconnect, a deferred terminal status is replayed for a binding
@@ -7935,25 +8043,19 @@ mod tests {
                 Some("attach failed"),
             )
         };
-        {
-            let mut pending = sessions.deferred_statuses.lock().await;
-            pending.insert(resident.to_owned(), deferred(resident));
-            pending.insert("long-gone".to_owned(), deferred("long-gone"));
-            pending.insert(
-                "reaped-before-the-ack".to_owned(),
-                deferred("reaped-before-the-ack"),
-            );
-            pending.insert(
-                "stale-connected".to_owned(),
-                session_status_frame(
-                    "stale-connected",
-                    &"a".repeat(32),
-                    session_id,
-                    "connected",
-                    None,
-                ),
-            );
+        for id in [resident, "long-gone", "reaped-before-the-ack"] {
+            sessions.defer_status(id.to_owned(), deferred(id));
         }
+        sessions.defer_status(
+            "stale-connected".to_owned(),
+            session_status_frame(
+                "stale-connected",
+                &"a".repeat(32),
+                session_id,
+                "connected",
+                None,
+            ),
+        );
         let (tx, mut rx) = mpsc::channel(8);
         sessions.signaling.install(tx);
         sessions.deferred_pruned.store(true, Ordering::Release);

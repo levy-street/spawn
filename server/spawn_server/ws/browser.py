@@ -389,6 +389,9 @@ async def browser_ws(
                     if route is None:
                         continue
                     if binding is None:
+                        # Not `failed`, though it ends a binding too: to the
+                        # clients it is a refusal of an offer, and an offer they
+                        # already abandoned has none to refuse.
                         if (
                             signal.get("type") == "rtc.status"
                             and signal.get("status") in {"unavailable", "expired"}

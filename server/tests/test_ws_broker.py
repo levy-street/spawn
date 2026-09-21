@@ -53,6 +53,72 @@ async def _accept_owner(broker: Broker, daemon: DaemonConn, generation: int = 1)
 
 
 @pytest.mark.asyncio
+async def test_unregister_rtc_binding_survives_a_browser_resume():
+    """A daemon's goodbye names a binding, not the browser socket that held it
+    when the goodbye was read: a resume that rebound the browser meanwhile
+    must not turn the goodbye into a no-op. A goodbye for a binding that is
+    no longer the one named is a no-op."""
+    broker = Broker()
+    daemon = DaemonConn("resume-host", "owner", FakeWS())  # type: ignore[arg-type]
+    daemon.host_generation = 3
+    daemon.keeps_peers_across_reconnect = True
+    first_browser = BrowserConn("owner", "pty", FakeWS())  # type: ignore[arg-type]
+    assert await broker.register_rtc_session(
+        "binding-resumed",
+        first_browser,
+        daemon=daemon,
+        scope_type="session",
+        scope_id="pty",
+        protocol="spawn.pty",
+        protocol_version=2,
+        binding_nonce="b" * 32,
+        now=100,
+    )
+    read_by_the_daemon_handler = await broker.rtc_session_for("binding-resumed", daemon=daemon)
+    assert read_by_the_daemon_handler is not None
+
+    await broker.orphan_rtc_sessions_for_browser(first_browser, grace_seconds=60, now=110)
+    second_browser = BrowserConn("owner", "pty", FakeWS())  # type: ignore[arg-type]
+    resumed = await broker.resume_rtc_session(
+        "binding-resumed",
+        second_browser,
+        binding_nonce="b" * 32,
+        binding_generation=3,
+        scope_type="session",
+        scope_id="pty",
+        protocol="spawn.pty",
+        protocol_version=2,
+        now=120,
+    )
+    assert resumed is not None and resumed.browser is second_browser
+
+    # By browser, the goodbye read before the resume frees nothing ...
+    await broker.unregister_rtc_session("binding-resumed", first_browser)
+    assert await broker.rtc_session_for("binding-resumed") is not None
+    # ... by identity, it frees the binding whoever holds it now.
+    assert await broker.unregister_rtc_binding(read_by_the_daemon_handler)
+    assert await broker.rtc_session_for("binding-resumed") is None
+
+    other_daemon = DaemonConn("resume-host", "owner", FakeWS())  # type: ignore[arg-type]
+    other_daemon.host_generation = 4
+    assert await broker.register_rtc_session(
+        "binding-resumed",
+        second_browser,
+        daemon=other_daemon,
+        scope_type="session",
+        scope_id="pty",
+        protocol="spawn.pty",
+        protocol_version=2,
+        binding_nonce="c" * 32,
+        now=130,
+    )
+    assert not await broker.unregister_rtc_binding(read_by_the_daemon_handler), (
+        "a goodbye for the binding that was frees nothing of the binding that is"
+    )
+    assert await broker.rtc_session_for("binding-resumed") is not None
+
+
+@pytest.mark.asyncio
 async def test_rtc_orphan_rebind_expiry_resume_and_user_isolation():
     broker = Broker()
     old_daemon = DaemonConn("orphan-host", "owner", FakeWS())  # type: ignore[arg-type]

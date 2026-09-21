@@ -711,6 +711,24 @@ class Broker:
                 if self._retire_rtc_binding_locked(current):
                     self._rtc_sessions.pop(session_id, None)
 
+    async def unregister_rtc_binding(self, expected: RtcSessionBinding) -> bool:
+        """Forget the binding `expected` names: the same binding still, whoever
+        its browser is now. A daemon's word about a peer it retired must not
+        turn into a no-op because the device resumed its signalling on a new
+        socket while that word was in flight."""
+        async with self._lock:
+            current = self._rtc_sessions.get(expected.session_id)
+            if (
+                current is None
+                or current.daemon is not expected.daemon
+                or self.rtc_binding_tuple(current) != self.rtc_binding_tuple(expected)
+            ):
+                return False
+            if not self._retire_rtc_binding_locked(current):
+                return False
+            self._rtc_sessions.pop(expected.session_id, None)
+            return True
+
     async def unregister_rtc_sessions_for(
         self, conn: BrowserConn | HostBrowserConn | RedisBrowserConn
     ) -> list[RtcSessionBinding]:
