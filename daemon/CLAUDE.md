@@ -382,8 +382,7 @@ in the map run in a tracked cleanup task (`spawn_host_closes` →
 `close_retired_host_peer`), and `settle_with_watchdog` names one still
 pending at `RTC_TEARDOWN_WATCHDOG` and every `RTC_TEARDOWN_REMINDER` after.
 A duplicate close of a transport some other teardown owns — a reaper firing
-for a pc already leaving — is bounded by the teardown deadline and neither
-counted nor watched. No path awaits a transport close while holding the
+for a pc already leaving — does nothing at all. No path awaits a transport close while holding the
 admission lock, which every offer serializes on, or ahead of an answer: a
 superseded pair closes in a tracked task after the lock drops, and trust
 invalidation waits for host closes only until the teardown deadline. A
@@ -396,11 +395,15 @@ a shutdown of each data channel, and against a peer that stopped
 acknowledging those wait behind a writer that never gets room; the closed
 association releases the writer and the shutdowns bail on state. Every
 retirement the daemon starts on its own — the reaper's never-connected,
-failed, and stayed-disconnected closes, a session that ended or was
-replaced, and a device connection superseded by a newer one — tells the
-server `unavailable` for that binding, once it has claimed the peer
-(`reap_session_peer`, `retire_session_peer_announcing`, `reap_host_peer`,
-`take_device_pair`): the server's own per-host, per-browser, and per-user
+failed, and stayed-disconnected closes, a session that ended, was replaced,
+or is restarting, and a device connection superseded by a newer one — tells
+the server `unavailable` for that binding, once it has claimed the peer
+(`reap_session_peer`, `close_for_session`, `reap_host_peer`,
+`take_device_pair`). A session close hands its announcements back for the
+caller in `run.rs` to send once the exit or the replacement is on the wire:
+sent earlier, a device re-offers into a session that is not running, is
+refused with `failed`, and reads that as the host dropping it. The server's
+own per-host, per-browser, and per-user
 binding caps free a binding on that status, a browser's shared connection
 never sends `rtc.close`, and a binding the server keeps for a peer only this
 daemon knows is gone would otherwise count until its TTL or this daemon's
@@ -409,9 +412,12 @@ active binding is a refusal of its offer and it drops its trust verdict,
 while `unavailable` is a connection that is gone, answered with a new one.
 A status deferred for want of channel room is retried from the control
 connection's heartbeat once registration's replay has run; at reconnect a
-deferred status is replayed only for a binding the server kept (a peer
-resident at registration) or when it says `connected` — registration's live
-bindings already told the server what survives. In the deferred map a
+deferred terminal status is replayed only for a binding the register frame
+carried (the server kept exactly those), and a deferred `connected` never
+is — the replay says `connected` for every peer that is. One race is
+accepted: a status for a binding the server retired on its own a moment
+earlier (a browser's close still in flight) earns a rate-limited warning on
+both sides and nothing else. In the deferred map a
 terminal status always wins: a replayed `connected` never overwrites the
 `unavailable` deferred after it. A retired host peer's association stops
 before its attachments settle, so their channel closes are not each held
