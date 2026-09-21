@@ -1070,6 +1070,7 @@ async fn serve_one_connection_with_loader(
     // Heartbeat task: also functions as the keepalive. If the write side
     // can't reach the channel (sender_task died) we know the WS is dead.
     let hb_tx = out_tx.clone();
+    let flush_sessions = rtc_sessions.clone();
     let mut heartbeat_task = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         let mut ping = tokio::time::interval(WS_PING_INTERVAL);
@@ -1091,6 +1092,9 @@ async fn serve_one_connection_with_loader(
                     }
                 }
                 _ = heartbeat.tick() => {
+                    // A status deferred for want of channel room is retried
+                    // here; a terminal one is what frees the server's binding.
+                    flush_sessions.flush_deferred_statuses().await;
                     let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
                     let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
                         cpu_bucket,

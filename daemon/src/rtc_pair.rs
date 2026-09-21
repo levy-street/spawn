@@ -247,8 +247,10 @@ impl RtcSessions {
     /// Returns them for the caller to close once it holds no lock a transport
     /// close could stall.
     pub(super) async fn take_device_pair(&self, device_key: [u8; 32]) -> Vec<super::RetiredHost> {
-        let mut hosts = self.host_peers.lock().await;
-        let ids = hosts
+        let ids = self
+            .host_peers
+            .lock()
+            .await
             .iter()
             .filter(|(_, peer)| {
                 peer.pair
@@ -259,23 +261,15 @@ impl RtcSessions {
             .collect::<Vec<_>>();
         let mut retired = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(peer) = hosts.remove(&id) else {
-                continue;
-            };
-            super::retire_host_peer(&peer);
-            // Its attachments leave the peer map here too, under the same
-            // locks, so the device's re-attachments — the mobile client keeps
-            // its attachment ids across a reconnect — never find a stale
-            // child, and the old transport feeds no PTY past this point.
-            let children = self.detach_pair_children(&peer.pc).await;
-            retired.push(super::RetiredHost {
-                signal_id: id,
-                peer,
-                children,
-                children_detached: true,
-            });
+            // The slot stays with the retired peer for the superseding
+            // connection to take; the caller returns whatever it leaves.
+            if let Some(host) = self
+                .take_host_where(&id, |_| true, super::SlotDisposition::Keep)
+                .await
+            {
+                retired.push(host);
+            }
         }
-        drop(hosts);
         // The server's binding for the superseded connection counts against
         // its per-host and per-browser caps until it hears otherwise, and a
         // browser's shared connection never sends `rtc.close`. Tell it now,
@@ -1297,6 +1291,34 @@ mod tests {
         }
     }
 
+    /// At the cap, a device's reconnect takes the slot its own superseded
+    /// connection holds rather than being refused for want of it.
+    #[tokio::test]
+    async fn a_device_reconnecting_at_the_cap_takes_its_own_slot() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let first = connect_pair(&sessions, &registry, [21; 32]).await;
+        let mut filler = Vec::new();
+        while let Some(slot) = sessions.peer_admission.try_acquire() {
+            filler.push(slot);
+        }
+        assert_eq!(filler.len(), MAX_RTC_PEERS - 1);
+
+        // `connect_pair` returns only once the successor is connected; at the
+        // cap that is only possible on the first connection's slot.
+        let successor = connect_pair(&sessions, &registry, [21; 32]).await;
+        assert_eq!(sessions.host_peers.lock().await.len(), 1);
+        assert_eq!(sessions.peer_admission.charged(), MAX_RTC_PEERS);
+        assert!(sessions.peer_admission.try_acquire().is_none());
+
+        drop(filler);
+        sessions.close_all().await;
+        for pc in [first, successor] {
+            let _ = pc.close().await;
+        }
+    }
+
     /// An offer the daemon refuses — here, a signal id the peer map already
     /// holds, checked before anything else is touched — must not cost the
     /// device the connection it already has.
@@ -1404,9 +1426,10 @@ mod tests {
 
     /// A superseded device connection leaves the server's host map only when
     /// the server hears about it; the browser's shared connection never sends
-    /// `rtc.close`. The daemon says `failed` for it as it takes the pair.
+    /// `rtc.close`. The daemon says `unavailable` for it as it takes the pair
+    /// — not `failed`, which the device would read as a refusal.
     #[tokio::test]
-    async fn taking_a_device_pair_tells_the_server_the_superseded_connection_failed() {
+    async fn taking_a_device_pair_tells_the_server_the_superseded_connection_is_unavailable() {
         let sessions = RtcSessions::new();
         let (tx, mut rx) = mpsc::channel(8);
         sessions.signaling.install(tx);
@@ -1450,6 +1473,17 @@ mod tests {
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].signal_id, "superseded-pair");
         assert!(pair.retired.load(Ordering::Acquire));
+        // The slot stays with the taken pair for a successor to take over;
+        // taking it over moves it, and only dropping the new owner returns it.
+        assert_eq!(sessions.peer_admission.charged(), 1);
+        let taken = retired[0]
+            .peer
+            .admission
+            .transfer()
+            .expect("the superseded pair's slot moves to its successor");
+        assert_eq!(sessions.peer_admission.charged(), 1);
+        assert!(retired[0].peer.admission.transfer().is_none());
+        drop(taken);
         assert_eq!(sessions.peer_admission.charged(), 0);
         let frame = rx
             .try_recv()

@@ -354,7 +354,15 @@ tracked task settles them and then closes the transport; and an attach that
 was in flight when its pair was retired is refused under the peer-map lock
 (`attach_pair_channel`), so no attachment lands after the sweep. A device
 offer is checked for collisions before the device's working connection is
-taken, so a refused offer never costs the device the connection it has.
+taken, so an offer refused at admission never costs the device the
+connection it has (an offer that fails after admission — negotiation, answer
+signing — has superseded it already, and the device reconnects). The
+superseding connection takes the superseded pair's slot when the cap is
+full (`AdmissionSlot::transfer`, `SlotDisposition::Keep`), so a device
+reconnecting at the cap is never refused for want of the slot its own old
+connection held. A cleanup task pays its debts on every exit, a panic's
+unwind included (`TeardownSettlement`): the slot back to the cap and the
+peer out of the closing map.
 
 The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never
@@ -388,9 +396,10 @@ a shutdown of each data channel, and against a peer that stopped
 acknowledging those wait behind a writer that never gets room; the closed
 association releases the writer and the shutdowns bail on state. Every
 retirement the daemon starts on its own — the reaper's never-connected,
-failed, and stayed-disconnected closes, and a device connection superseded
-by a newer one — tells the server `unavailable` for that binding, once it
-has claimed the peer (`reap_session_peer`, `reap_host_peer`,
+failed, and stayed-disconnected closes, a session that ended or was
+replaced, and a device connection superseded by a newer one — tells the
+server `unavailable` for that binding, once it has claimed the peer
+(`reap_session_peer`, `retire_session_peer_announcing`, `reap_host_peer`,
 `take_device_pair`): the server's own per-host, per-browser, and per-user
 binding caps free a binding on that status, a browser's shared connection
 never sends `rtc.close`, and a binding the server keeps for a peer only this
@@ -398,8 +407,11 @@ daemon knows is gone would otherwise count until its TTL or this daemon's
 next registration. `unavailable`, not `failed`: to a device `failed` on its
 active binding is a refusal of its offer and it drops its trust verdict,
 while `unavailable` is a connection that is gone, answered with a new one.
-A deferred terminal status is dropped at reconnect — registration's live
-bindings already told the server what survives. The cap is
+A status deferred for want of channel room is retried from the control
+connection's heartbeat; at reconnect a deferred status is replayed only for
+a binding the server kept (a peer resident at registration) or when it says
+`connected` — registration's live bindings already told the server what
+survives. The cap is
 read by the daemon's own 30 s state timer in `run.rs` — not the control
 connection's, since peers keep opening and closing through a server outage
 — and written to the state file as `rtc_peers` (`in_use`, `closing`,
