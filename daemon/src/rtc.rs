@@ -374,6 +374,10 @@ impl PeerCloseCoordinator {
         !self.claimed.swap(true, Ordering::AcqRel)
     }
 
+    fn is_claimed(&self) -> bool {
+        self.claimed.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     fn initiated_deadline(&self) -> Option<tokio::time::Instant> {
         self.deadline.get().copied()
@@ -581,24 +585,9 @@ enum SlotDisposition {
 struct RetiredHost {
     signal_id: String,
     peer: HostRtcPeer,
+    /// Complete: taken as the peer left the host map, after which nothing
+    /// attaches to it.
     children: Vec<(String, RtcPeer)>,
-    /// Whether `children` is complete: taken under the host lock, nothing
-    /// could attach to this peer afterwards. Only a peer taken with the
-    /// whole map (`close_all`) leaves it to the teardown to look.
-    children_detached: bool,
-}
-
-impl RetiredHost {
-    /// A host peer taken with the whole map (`close_all`), whose attachments
-    /// the caller deactivates itself; the teardown detaches any it missed.
-    fn from_map((signal_id, peer): (String, HostRtcPeer)) -> Self {
-        Self {
-            signal_id,
-            peer,
-            children: Vec::new(),
-            children_detached: false,
-        }
-    }
 }
 
 /// One host peer tearing down after leaving the host map, for the gauge.
@@ -1043,7 +1032,12 @@ impl RtcSessions {
             return false;
         };
         match sender.try_send(WsOutbound::json(text)) {
-            Ok(()) => true,
+            Ok(()) => {
+                // Whatever was held for this binding is older than what just
+                // went out; a later flush must not send it after this.
+                self.deferred_statuses.lock().await.remove(&key);
+                true
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_))
             | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.defer_status(key, frame).await;
@@ -1746,14 +1740,39 @@ impl RtcSessions {
             SlotDisposition::Release => retire_host_peer(&peer),
             SlotDisposition::Keep => fence_host_peer(&peer),
         }
-        let children = self.detach_pair_children(&peer.pc).await;
+        // The retire flag is set; the sweep needs only the peer-map lock, and
+        // the attach path checks the flag under that same lock. Nothing else
+        // on the host map has to wait for a sweep of up to a hundred
+        // attachments.
         drop(hosts);
+        let children = self.detach_pair_children(&peer.pc).await;
         Some(RetiredHost {
             signal_id: signal_id.to_string(),
             peer,
             children,
-            children_detached: true,
         })
+    }
+
+    /// Take every host peer, each through `take_host_where`, so each leaves
+    /// with its attachments detached and its slot returned.
+    async fn take_all_hosts(&self) -> Vec<RetiredHost> {
+        let ids = self
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut retired = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(host) = self
+                .take_host_where(&id, |_| true, SlotDisposition::Release)
+                .await
+            {
+                retired.push(host);
+            }
+        }
+        retired
     }
 
     async fn take_host_if_same(
@@ -1818,10 +1837,7 @@ impl RtcSessions {
         #[cfg(test)]
         self.pause_effect(&retired.signal_id, TestEffectPoint::HostRetire)
             .await;
-        let mut children = retired.children;
-        if !retired.children_detached {
-            children.extend(self.detach_pair_children(&retired.peer.pc).await);
-        }
+        let children = retired.children;
         // The association stops before the attachments settle: each one's
         // channel close queues behind whatever writer the peer left stuck,
         // and only the closed association lets that writer go. Otherwise
@@ -2345,13 +2361,12 @@ impl RtcSessions {
     /// active binding with an immediate re-offer, which the daemon must
     /// refuse (`failed`) while the session is not running, and the device
     /// reads that refusal as the host dropping it.
-    #[must_use = "send these with announce_statuses once the session's exit or replacement is on the wire"]
     pub async fn close_for_session(
         &self,
         session_id: Uuid,
         generation: u64,
         reason: &str,
-    ) -> Vec<Outbound> {
+    ) -> Announcements {
         let session = SessionBinding::new(session_id, generation);
         let closing = {
             let peers = self.peers.lock().await;
@@ -2424,16 +2439,56 @@ impl RtcSessions {
         self.uploads
             .remove_generation_until(session, upload_deadline)
             .await;
-        announcements
+        Announcements {
+            frames: announcements,
+            sessions: self.clone(),
+        }
     }
 
     /// Send statuses a caller held back until the moment was right.
-    pub async fn announce_statuses(&self, frames: Vec<Outbound>) {
+    async fn announce_statuses(&self, frames: Vec<Outbound>) {
         for frame in frames {
             self.send_or_defer_status(frame).await;
         }
     }
+}
 
+/// Statuses a session close holds back for its caller to send once the
+/// session's exit or replacement is on the wire. Sent on drop if the caller
+/// never does: an early return must not lose the word that frees the
+/// server's bindings, only mistime it.
+#[must_use = "call `send` once the session's exit or replacement is on the wire"]
+pub struct Announcements {
+    frames: Vec<Outbound>,
+    sessions: RtcSessions,
+}
+
+impl Announcements {
+    pub async fn send(mut self) {
+        let frames = std::mem::take(&mut self.frames);
+        self.sessions.announce_statuses(frames).await;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+impl Drop for Announcements {
+    fn drop(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        let frames = std::mem::take(&mut self.frames);
+        let sessions = self.sessions.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { sessions.announce_statuses(frames).await });
+        }
+    }
+}
+
+impl RtcSessions {
     /// Take a peer out of service at once, and in that order: its channels
     /// stop, its callbacks go inactive, its uploads are cancelled, and its
     /// close deadline starts. Nothing here waits on a transport or a fence,
@@ -2443,12 +2498,20 @@ impl RtcSessions {
         if !peer.close.claim() {
             return false;
         }
+        self.fence_peer(signal_id, peer);
+        true
+    }
+
+    /// Stop a peer's effects at once, in this order: its close deadline
+    /// starts, its channels stop, its callbacks go inactive, its uploads are
+    /// cancelled. What a claim does to a peer, and what trust invalidation
+    /// does to every peer before any claim.
+    fn fence_peer(&self, signal_id: &str, peer: &RtcPeer) {
         peer.close.initiate();
         peer.channels.stop();
         peer.active.store(false, Ordering::Release);
         self.uploads
             .cancel_viewer_now(peer.session, &viewer_id(signal_id, &peer.generation));
-        true
     }
 
     async fn detach_peer(&self, signal_id: &str, peer: &RtcPeer) -> bool {
@@ -2645,11 +2708,7 @@ impl RtcSessions {
     }
 
     pub async fn close_all(&self) {
-        let host_peers = {
-            let mut hosts = self.host_peers.lock().await;
-            hosts.values().for_each(retire_host_peer);
-            std::mem::take(&mut *hosts)
-        };
+        let host_peers = self.take_all_hosts().await;
         #[cfg(test)]
         if let Some(gate) = self.slow_close_all_gate.lock().await.take() {
             gate.entered.notify_one();
@@ -2703,11 +2762,8 @@ impl RtcSessions {
                 peers.remove(&signal_id);
             }
         }
-        self.close_host_peers_until(
-            host_peers.into_iter().map(RetiredHost::from_map).collect(),
-            upload_teardown_deadline(),
-        )
-        .await;
+        self.close_host_peers_until(host_peers, upload_teardown_deadline())
+            .await;
     }
 
     /// Linearize credential invalidation against both session and host RTC
@@ -2724,11 +2780,7 @@ impl RtcSessions {
         // later stale peer authorized after credential revocation.
         let peers = self.peers.lock().await.clone();
         for (signal_id, peer) in &peers {
-            peer.channels.stop();
-            peer.active.store(false, Ordering::Release);
-            let _ = peer.close.initiate();
-            self.uploads
-                .cancel_viewer_now(peer.session, &viewer_id(signal_id, &peer.generation));
+            self.fence_peer(signal_id, peer);
         }
 
         // Remove host peers from admission immediately as well. Close their
@@ -2738,15 +2790,8 @@ impl RtcSessions {
         // offer on the daemon waits on it, wait for those closes only until
         // the teardown deadline. A host transport that never answers is
         // counted and named; it does not hold the lock.
-        let host_peers = {
-            let mut hosts = self.host_peers.lock().await;
-            hosts.values().for_each(retire_host_peer);
-            std::mem::take(&mut *hosts)
-        };
-        let close_hosts = self.close_host_peers_until(
-            host_peers.into_iter().map(RetiredHost::from_map).collect(),
-            upload_teardown_deadline(),
-        );
+        let host_peers = self.take_all_hosts().await;
+        let close_hosts = self.close_host_peers_until(host_peers, upload_teardown_deadline());
         let (_, ()) = tokio::join!(self.close_all(), close_hosts);
     }
 
@@ -7414,7 +7459,7 @@ mod tests {
         // session's exit, so the device does not re-offer into the gap.
         assert!(rx.try_recv().is_err());
         assert_eq!(announcements.len(), 1);
-        sessions.announce_statuses(announcements).await;
+        announcements.send().await;
         let frame = rx
             .try_recv()
             .expect("the server hears about the session's peer");
@@ -7460,6 +7505,38 @@ mod tests {
             "failed",
             "a terminal status replaces a terminal one"
         );
+    }
+
+    /// A status that goes straight through clears what was deferred for its
+    /// binding: a later flush must never send an older `connected` after
+    /// the `unavailable` that freed the binding.
+    #[tokio::test]
+    async fn a_status_sent_through_clears_what_was_deferred_for_its_binding() {
+        let sessions = RtcSessions::new();
+        sessions.deferred_pruned.store(true, Ordering::Release);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(WsOutbound::json("{}".to_owned())).unwrap();
+        sessions.signaling.install(tx);
+        let nonce = "a".repeat(32);
+        let session_id = Uuid::new_v4();
+        let status =
+            |status: &str| session_status_frame("drained", &nonce, session_id, status, None);
+        sessions.send_or_defer_status(status("connected")).await;
+        assert_eq!(sessions.deferred_statuses.lock().await.len(), 1);
+
+        let _filler = rx.recv().await;
+        sessions.send_or_defer_status(status("unavailable")).await;
+        let sent = rx
+            .try_recv()
+            .expect("the terminal status went straight through");
+        let value: serde_json::Value = serde_json::from_str(sent.as_str()).unwrap();
+        assert_eq!(value["status"], "unavailable");
+        assert!(
+            sessions.deferred_statuses.lock().await.is_empty(),
+            "the older deferred status is gone"
+        );
+        sessions.flush_deferred_statuses().await;
+        assert!(rx.try_recv().is_err(), "nothing stale follows");
     }
 
     /// A status deferred for want of channel room is sent again from the

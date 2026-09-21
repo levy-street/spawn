@@ -437,7 +437,18 @@ impl RtcSessions {
             "{}:{}",
             parent.binding.binding_generation, parent.binding.binding_nonce
         );
-        let existing = self.peers.lock().await.get(&id).cloned();
+        // A resident child another close already claimed is on its way out
+        // of the map — a callback-owned close, or the sweep it slipped past —
+        // and the device re-attaching the same view must not be refused for
+        // it: it is absent, and this attachment replaces it. Its own teardown
+        // settles through the closing map and removes nothing but itself.
+        let existing = self
+            .peers
+            .lock()
+            .await
+            .get(&id)
+            .filter(|child| !child.close.is_claimed())
+            .cloned();
         let child = if let Some(child) = existing {
             anyhow::ensure!(
                 Arc::ptr_eq(&child.pc, pc)
@@ -1500,6 +1511,86 @@ mod tests {
         );
         sessions.close_retired_host_peers(retired).await;
         let _ = pc.close().await;
+    }
+
+    /// A child another close already claimed can still be resident for its
+    /// settle wait when the pair is superseded; the sweep leaves it to that
+    /// close, and the device re-attaching the same view must not be refused
+    /// for it.
+    #[tokio::test]
+    async fn a_reattach_replaces_a_resident_child_another_close_already_claimed() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let suffix = format!("{session_id}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let first = connect_pair(&sessions, &registry, [17; 32]).await;
+        let (_first_pty, _first_ctl) = attach_labelled(&first, &suffix).await;
+        // A callback-owned close claims the child and is still settling: the
+        // child stays in the map until that close's deadline.
+        let claimed_child = sessions
+            .peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .cloned()
+            .expect("the attachment is resident");
+        assert!(claimed_child.close.claim());
+        // Hold the superseded pair's teardown so its transport does not
+        // close underneath the claimed child before the device re-attaches.
+        let first_id = sessions
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("the first pair is admitted");
+        let gate = sessions
+            .stall_effect(&first_id, TestEffectPoint::HostRetire)
+            .await;
+
+        let successor = connect_pair(&sessions, &registry, [17; 32]).await;
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .expect("the superseded teardown is held");
+        assert_eq!(
+            sessions.peers.lock().await.len(),
+            1,
+            "the sweep left the claimed child to its owner"
+        );
+        let (_pty, _ctl) = attach_labelled(&successor, &suffix).await;
+        {
+            let hosts = sessions.host_peers.lock().await;
+            let peers = sessions.peers.lock().await;
+            assert_eq!(peers.len(), 1);
+            assert!(
+                Arc::ptr_eq(
+                    &peers.values().next().unwrap().pc,
+                    &hosts.values().next().unwrap().pc
+                ),
+                "the resident child is the successor's"
+            );
+        }
+        gate.release.notify_one();
+        sessions.close_all().await;
+        for pc in [first, successor] {
+            let _ = pc.close().await;
+        }
+        worker.abort();
     }
 
     /// The mobile client keeps its view and attachment ids across a

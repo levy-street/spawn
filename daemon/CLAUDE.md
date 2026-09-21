@@ -388,7 +388,9 @@ superseded pair closes in a tracked task after the lock drops, and trust
 invalidation waits for host closes only until the teardown deadline. A
 device re-attaching a view of its superseded connection (the mobile client
 keeps its attachment ids across a reconnect) finds nothing stale: the old
-attachment left the peer map when its pair was superseded. Every
+attachment left the peer map when its pair was superseded, and one another
+close had already claimed, still resident for its settle wait, reads as
+absent and is replaced. Every
 transport close the daemon owns stops the SCTP association before
 `RTCPeerConnection::close` (`pair::stop_then_close`): the close begins with
 a shutdown of each data channel, and against a peer that stopped
@@ -399,15 +401,16 @@ failed, and stayed-disconnected closes, a session that ended, was replaced,
 or is restarting, and a device connection superseded by a newer one — tells
 the server `unavailable` for that binding, once it has claimed the peer
 (`reap_session_peer`, `close_for_session`, `reap_host_peer`,
-`take_device_pair`). A session close hands its announcements back for the
-caller in `run.rs` to send once the exit or the replacement is on the wire:
-sent earlier, a device re-offers into a session that is not running, is
-refused with `failed`, and reads that as the host dropping it. The server's
-own per-host, per-browser, and per-user
-binding caps free a binding on that status, a browser's shared connection
-never sends `rtc.close`, and a binding the server keeps for a peer only this
-daemon knows is gone would otherwise count until its TTL or this daemon's
-next registration. `unavailable`, not `failed`: to a device `failed` on its
+`take_device_pair`). A session close hands its announcements back
+(`Announcements`, sent on drop if never sent) for the caller in `run.rs` to
+send once the exit or the replacement is on the wire: sent earlier, a device
+re-offers into a session that is not running, is refused with `failed`, and
+reads that as the host dropping it. The server frees the binding on that
+status for both scopes — `ws/daemon.py` for host scope, the browser relay
+for session scope — so a binding the server keeps for a peer only this
+daemon knows is gone never counts against its per-host, per-daemon,
+per-browser, and per-user caps until its TTL; a browser's shared connection
+never sends `rtc.close`, so nothing else would free it. `unavailable`, not `failed`: to a device `failed` on its
 active binding is a refusal of its offer and it drops its trust verdict,
 while `unavailable` is a connection that is gone, answered with a new one.
 A status deferred for want of channel room is retried from the control

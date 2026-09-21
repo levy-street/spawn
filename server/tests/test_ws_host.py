@@ -612,6 +612,23 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_truncate
         **_metadata(host_id),
     }
 
+    # The allowlist is checked on a live binding: a terminal status ends the
+    # binding, so it comes last.
+    browser_message_count = len(browser_socket.sent_text)
+    daemon_socket.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": "bound-answer",
+            "binding_nonce": binding_nonce,
+            "status": "secret-endpoint-status",
+            **_metadata(host_id),
+        }
+    )
+    await asyncio.sleep(0.02)
+    assert len(browser_socket.sent_text) == browser_message_count
+    assert "daemon sent non-allowlisted host rtc status" in caplog.text
+    assert "secret-endpoint-status" not in caplog.text
+
     daemon_socket.queue_text(
         {
             "type": "rtc.status",
@@ -632,22 +649,13 @@ async def test_daemon_host_answer_is_session_bound_and_status_detail_is_truncate
     ][-1]
     assert status_message["status"] == "failed"
     assert status_message["message"] == ("safe detail " + "x" * 300)[:256]
-
-    browser_message_count = len(browser_socket.sent_text)
-    daemon_socket.queue_text(
-        {
-            "type": "rtc.status",
-            "session_id": "bound-answer",
-            "binding_nonce": binding_nonce,
-            "status": "secret-endpoint-status",
-            **_metadata(host_id),
-        }
-    )
-    await asyncio.sleep(0.02)
-    assert len(browser_socket.sent_text) == browser_message_count
-    assert "daemon sent non-allowlisted host rtc status" in caplog.text
     assert "safe detail" not in caplog.text
-    assert "secret-endpoint-status" not in caplog.text
+    # A terminal status from the daemon ends the host binding.
+    for _ in range(100):
+        if await get_broker().rtc_session_for("bound-answer") is None:
+            break
+        await asyncio.sleep(0.01)
+    assert await get_broker().rtc_session_for("bound-answer") is None
 
     browser_socket.queue_disconnect()
     await asyncio.gather(browser_task, _stop_daemon(daemon_socket, daemon_task))

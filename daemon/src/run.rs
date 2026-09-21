@@ -6453,13 +6453,15 @@ async fn handle_session_restart(
     // worker-owned signal syscall.
     let transition = registry.lock_generation_transition(session_id).await;
     let current = registry.lifecycle_snapshot(session_id);
-    let mut announcements = Vec::new();
+    let mut announcements = None;
     if let Some(snapshot) = &current {
         let binding = snapshot.binding();
         tracing::info!(daemon_pid, %session_id, phase = "closing_peers", "session restart progress");
-        announcements = rtc_sessions
-            .close_for_session(session_id, binding.generation(), "session restarting")
-            .await;
+        announcements = Some(
+            rtc_sessions
+                .close_for_session(session_id, binding.generation(), "session restarting")
+                .await,
+        );
         tracing::info!(daemon_pid, %session_id, phase = "peers_closed", "session restart progress");
         if let Some(control) = registry.control_for_binding(binding) {
             control.clear_sink().await;
@@ -6516,14 +6518,18 @@ async fn handle_session_restart(
     if worker_backend::socket_exists(session_id) {
         tracing::warn!(daemon_pid, %session_id, phase = "worker_exit_timeout", "session restart stopped");
         send_spawn_failed_exit(session_id, out_tx, "restart timeout").await;
-        rtc_sessions.announce_statuses(announcements).await;
+        if let Some(announcements) = announcements {
+            announcements.send().await;
+        }
         return;
     }
     tracing::info!(daemon_pid, %session_id, phase = "launching_replacement", "session restart progress");
     handle_session_create(create, registry, rtc_sessions, out_tx).await;
     // The replacement is registered (or its failure is on the wire): a device
     // re-offering on this word is not refused for a session that is gone.
-    rtc_sessions.announce_statuses(announcements).await;
+    if let Some(announcements) = announcements {
+        announcements.send().await;
+    }
 }
 
 async fn handle_session_kill(
@@ -6656,7 +6662,7 @@ async fn spawn_exit_forwarder(
     drop(transition);
     if removed.is_none() {
         tracing::debug!(%session_id, generation, "ignoring stale session exit");
-        rtc_sessions.announce_statuses(announcements).await;
+        announcements.send().await;
         return;
     }
     crate::state::active_heartbeat(registry.ids().len());
@@ -6670,7 +6676,7 @@ async fn spawn_exit_forwarder(
     }
     // Only now: a device told `unavailable` before the exit would re-offer
     // into a session that is gone and be refused.
-    rtc_sessions.announce_statuses(announcements).await;
+    announcements.send().await;
 }
 
 /// Adopt a running session worker for this session (spawnd restart / lazy
@@ -6715,12 +6721,14 @@ async fn register_attached(
 
     launched.handle.control.set_sink(out_tx.clone()).await;
     let transition = registry.lock_generation_transition(session_id).await;
-    let mut announcements = Vec::new();
+    let mut announcements = None;
     if let Some(previous) = registry.binding_for(session_id) {
         let _ = registry.remove_if_generation(session_id, previous.generation());
-        announcements = rtc_sessions
-            .close_for_session(session_id, previous.generation(), "session replaced")
-            .await;
+        announcements = Some(
+            rtc_sessions
+                .close_for_session(session_id, previous.generation(), "session replaced")
+                .await,
+        );
     }
     let generation = registry.insert(launched.handle);
     drop(transition);
@@ -6734,7 +6742,9 @@ async fn register_attached(
     }
     // The replacement is registered: a device re-offering on this word finds
     // the session running.
-    rtc_sessions.announce_statuses(announcements).await;
+    if let Some(announcements) = announcements {
+        announcements.send().await;
+    }
 
     tokio::spawn(spawn_exit_forwarder(
         session_id,
