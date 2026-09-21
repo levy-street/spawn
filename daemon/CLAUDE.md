@@ -370,7 +370,8 @@ closing map is keyed by that coordinator too (`closing_key`), so two peers
 under one id and generation are two closing peers, each found and counted.
 A host peer taken out of the host map (`RetiredHost`) is handed to its
 tracked close through `into_parts`; dropped before that, it returns its
-slot and closes itself from the drop path, so its claimed attachments
+slot and closes itself from the drop path, and a panic in that close is
+caught with the attachments settled after it, so its claimed attachments
 never sit in the closing map for good. An attachment's generation is its
 parent binding's plus a sequence of its own (`ATTACHMENT_SEQUENCE`), so the
 viewer id every registry keys on — direct sinks, control viewers, uploads
@@ -436,14 +437,18 @@ status is replayed only for a binding the register frame carried (the
 server kept exactly those), and a deferred `connected` never is — the
 replay says `connected` for every peer that is. A binding holds at most
 one live status and one goodbye (`DeferredStatuses`, two slots, a plain
-mutex — nothing on the status path awaits): a live status sent clears the
+mutex — the status path is synchronous): a live status sent clears the
 live slot, a goodbye sent clears both, a peer leaving service forgets its
-live slot, and a status that goes straight through flushes the rest at
-once, the heartbeat being the backstop. The three terminal statuses are
+live slot, admitting a signal id again forgets everything held for it
+(a predecessor's goodbye is not sent behind its successor's `connected`),
+and a status that goes straight through flushes the rest at once, the
+heartbeat being the backstop. The three terminal statuses are
 named on both sides (`TERMINAL_RTC_STATUSES` here, `RTC_TERMINAL_STATUSES`
 in the server), and the server takes a goodbye for a binding it no longer
-holds as a no-op, and forgets a binding by its identity rather than by the
-browser socket that held it when the goodbye was read. A retired host peer's association stops
+holds as a no-op, forgets a binding by its identity rather than by the
+browser socket that held it when the goodbye was read, and lets a `failed`
+end only a binding that never connected — a refused restart names a live
+pair, which ends on `unavailable` once the device lets go of it. A retired host peer's association stops
 before its attachments settle, so their channel closes are not each held
 to their deadline by the writer the silent peer left stuck. The cap is
 read by the daemon's own 30 s state timer in `run.rs` — not the control

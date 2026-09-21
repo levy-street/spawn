@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -43,6 +44,9 @@ async def _send_or_disconnect(websocket: WebSocket, text: str) -> None:
         await websocket.send_text(text)
     except (OSError, RuntimeError) as exc:
         raise WebSocketDisconnect(code=1006, reason=str(exc)) from exc
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(eq=False)
@@ -129,6 +133,9 @@ class RtcSessionBinding:
     signed_signal: bool = False
     daemon_orphaned_until: float | None = None
     browser_orphaned_until: float | None = None
+    # Whether the daemon has said `connected` for it: a `failed` ends a
+    # binding that never connected — an offer refused — not one that did.
+    connected: bool = False
 
 
 @dataclass(frozen=True)
@@ -799,6 +806,14 @@ class Broker:
             identity not in self._retired_rtc_bindings
             and len(self._retired_rtc_bindings) >= MAX_RTC_BINDING_IDENTITIES
         ):
+            # The binding stays, and counts against its caps, until the
+            # tombstones age out; said here, so a cap that fills for it is
+            # told apart from a daemon that never said goodbye.
+            log.warning(
+                "rtc binding retirement refused: %d tombstones held session=%s",
+                MAX_RTC_BINDING_IDENTITIES,
+                binding.session_id,
+            )
             return False
         self._retired_rtc_bindings[identity] = timestamp + RTC_BINDING_TOMBSTONE_TTL_SECONDS
         self._schedule_rtc_tombstone_cleanup_locked()
@@ -903,6 +918,7 @@ class Broker:
             connected = replace(
                 current,
                 expires_at=time.monotonic() + RTC_CONNECTED_SESSION_TTL_SECONDS,
+                connected=True,
             )
             self._rtc_sessions[session_id] = connected
             return connected

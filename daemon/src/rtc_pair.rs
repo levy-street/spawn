@@ -297,8 +297,7 @@ impl RtcSessions {
                 &host.peer.binding,
                 "unavailable",
                 Some("superseded by a newer connection from this device"),
-            ))
-            .await;
+            ));
         }
         retired
     }
@@ -491,7 +490,7 @@ impl RtcSessions {
                 .lock()
                 .await
                 .values()
-                .filter(|peer| Arc::ptr_eq(&peer.pc, pc))
+                .filter(|peer| Arc::ptr_eq(&peer.pc, pc) && !peer.close.is_claimed())
                 .count();
             anyhow::ensure!(count < MAX_PAIR_SESSIONS, "too many terminal views");
             let session = pair
@@ -1993,6 +1992,59 @@ mod tests {
         for pc in [first, successor] {
             let _ = pc.close().await;
         }
+    }
+
+    /// A panic in a retired host peer's teardown strands nothing: its
+    /// attachments, claimed and in the closing map since it was taken, settle
+    /// regardless, and its transport closes.
+    #[tokio::test]
+    async fn a_panicking_host_teardown_still_settles_its_attachments() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let device = connect_pair(&sessions, &registry, [26; 32]).await;
+        let (_pty, _ctl) = attach(&device, session_id).await;
+        let (host_id, host_pc) = {
+            let hosts = sessions.host_peers.lock().await;
+            let (id, peer) = hosts.iter().next().expect("the pair is admitted");
+            (id.clone(), Arc::clone(&peer.pc))
+        };
+        sessions
+            .injected_cleanup_panics
+            .lock()
+            .await
+            .insert(host_id.clone());
+        sessions.retire_host_if_same(&host_id, &host_pc, None).await;
+        assert_eq!(sessions.closing_peers.lock().await.len(), 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sessions.closing_peers.lock().await.is_empty()
+                    && sessions.admission_gauge().await.host_closing == 0
+                    && host_pc.connection_state() == RTCPeerConnectionState::Closed
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the attachment settled and the transport closed despite the panic");
+        sessions.close_all().await;
+        let _ = device.close().await;
+        worker.abort();
     }
 
     /// The mobile client keeps its view and attachment ids across a

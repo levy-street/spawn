@@ -1101,7 +1101,7 @@ async fn serve_one_connection_with_loader(
                 _ = heartbeat.tick() => {
                     // A status deferred for want of channel room is retried
                     // here; a terminal one is what frees the server's binding.
-                    flush_sessions.flush_deferred_statuses().await;
+                    flush_sessions.flush_deferred_statuses();
                     let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
                     let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
                         cpu_bucket,
@@ -6519,7 +6519,7 @@ async fn handle_session_restart(
         tracing::warn!(daemon_pid, %session_id, phase = "worker_exit_timeout", "session restart stopped");
         send_spawn_failed_exit(session_id, out_tx, "restart timeout").await;
         if let Some(announcements) = announcements {
-            announcements.send().await;
+            announcements.send();
         }
         return;
     }
@@ -6528,7 +6528,7 @@ async fn handle_session_restart(
     // The replacement is registered (or its failure is on the wire): a device
     // re-offering on this word is not refused for a session that is gone.
     if let Some(announcements) = announcements {
-        announcements.send().await;
+        announcements.send();
     }
 }
 
@@ -6662,7 +6662,7 @@ async fn spawn_exit_forwarder(
     drop(transition);
     if removed.is_none() {
         tracing::debug!(%session_id, generation, "ignoring stale session exit");
-        announcements.send().await;
+        announcements.send();
         return;
     }
     crate::state::active_heartbeat(registry.ids().len());
@@ -6676,7 +6676,7 @@ async fn spawn_exit_forwarder(
     }
     // Only now: a device told `unavailable` before the exit would re-offer
     // into a session that is gone and be refused.
-    announcements.send().await;
+    announcements.send();
 }
 
 /// Adopt a running session worker for this session (spawnd restart / lazy
@@ -6743,7 +6743,7 @@ async fn register_attached(
     // The replacement is registered: a device re-offering on this word finds
     // the session running.
     if let Some(announcements) = announcements {
-        announcements.send().await;
+        announcements.send();
     }
 
     tokio::spawn(spawn_exit_forwarder(

@@ -119,6 +119,37 @@ async def test_unregister_rtc_binding_survives_a_browser_resume():
 
 
 @pytest.mark.asyncio
+async def test_unregister_rtc_binding_refused_at_the_tombstone_cap_is_loud(monkeypatch, caplog):
+    """A retirement the tombstone cap refuses keeps the binding, and says so:
+    a cap that fills for it is told apart from a daemon that never said
+    goodbye."""
+    import spawn_server.ws.host_signal as host_signal
+
+    broker = Broker()
+    daemon = DaemonConn("tombstone-host", "owner", FakeWS())  # type: ignore[arg-type]
+    daemon.host_generation = 2
+    browser = BrowserConn("owner", "pty", FakeWS())  # type: ignore[arg-type]
+    assert await broker.register_rtc_session(
+        "binding-tombstoned",
+        browser,
+        daemon=daemon,
+        scope_type="session",
+        scope_id="pty",
+        protocol="spawn.pty",
+        protocol_version=2,
+        binding_nonce="e" * 32,
+        now=100,
+    )
+    binding = await broker.rtc_session_for("binding-tombstoned")
+    assert binding is not None
+    monkeypatch.setattr(host_signal, "MAX_RTC_BINDING_IDENTITIES", 0)
+    with caplog.at_level("WARNING", logger="spawn_server.ws.broker"):
+        assert not await broker.unregister_rtc_binding(binding)
+    assert await broker.rtc_session_for("binding-tombstoned") is not None
+    assert any("retirement refused" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_rtc_orphan_rebind_expiry_resume_and_user_isolation():
     broker = Broker()
     old_daemon = DaemonConn("orphan-host", "owner", FakeWS())  # type: ignore[arg-type]

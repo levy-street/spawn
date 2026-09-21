@@ -2810,7 +2810,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         # hear, and the relay forwards it only for a binding it
                         # still holds. A relay that is gone frees its bindings
                         # when its orphan grace ends.
-                        if binding.scope_type == "host" and status_value in RTC_TERMINAL_STATUSES:
+                        # A `failed` ends a binding that never connected — an
+                        # offer refused. A refused restart names a live pair,
+                        # which the daemon keeps and ends with `unavailable`
+                        # once the device lets go of it; freed on the `failed`,
+                        # its binding would be one the daemon still speaks for.
+                        if (
+                            binding.scope_type == "host"
+                            and status_value in RTC_TERMINAL_STATUSES
+                            and not (status_value == "failed" and binding.connected)
+                        ):
                             await broker.unregister_rtc_binding(binding)
                     else:
                         await errors.send("invalid_frame", ftype)
