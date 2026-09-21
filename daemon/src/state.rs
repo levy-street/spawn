@@ -46,6 +46,26 @@ pub struct StateFile {
     /// state in which the daemon refuses new sessions.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_mismatch: bool,
+    /// The RTC peer cap as the daemon last saw it. Absent from a daemon that
+    /// predates the gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc_peers: Option<RtcPeerGauge>,
+}
+
+/// How full the RTC peer cap is. `in_use` is the slots charged, by peers in
+/// the live maps and by closing peers still inside their close deadline;
+/// `closing` is session peers still tearing down and `host_closing` host
+/// peers still tearing down after leaving the host map, whether or not
+/// either still holds a slot. Written by the daemon's own 30 s state timer
+/// (not the control connection's, since peers keep opening and closing
+/// through a server outage), so a leak shows in `spawnd status` while it is
+/// still small.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RtcPeerGauge {
+    pub in_use: usize,
+    pub closing: usize,
+    pub host_closing: usize,
+    pub cap: usize,
 }
 
 pub struct StateStore {
@@ -59,9 +79,9 @@ pub fn install_active(store: Arc<StateStore>) {
     let _ = ACTIVE_STATE.set(store);
 }
 
-pub fn active_connected(sessions: usize) {
+pub fn active_connected(sessions: usize, rtc_peers: RtcPeerGauge) {
     if let Some(store) = ACTIVE_STATE.get() {
-        store.connected(sessions);
+        store.connected(sessions, rtc_peers);
     }
 }
 
@@ -73,7 +93,7 @@ pub fn active_disconnected(kind: &str, detail: &str, sessions: usize) {
 
 pub fn active_heartbeat(sessions: usize) {
     if let Some(store) = ACTIVE_STATE.get() {
-        store.heartbeat(sessions);
+        store.heartbeat(sessions, None);
     }
 }
 
@@ -126,6 +146,7 @@ impl StateStore {
                 exe: crate::install::running_exe().map(|exe| exe.display().to_string()),
                 release: provenance.release_id().map(str::to_owned),
                 worker_mismatch: false,
+                rtc_peers: None,
             }),
         }
     }
@@ -141,12 +162,13 @@ impl StateStore {
         }
     }
 
-    pub fn connected(&self, sessions: usize) {
+    pub fn connected(&self, sessions: usize, rtc_peers: RtcPeerGauge) {
         let mut state = self.state.lock().expect("state heartbeat lock");
         state.connected = true;
         state.connected_at = Some(now_rfc3339());
         state.last_error = None;
         state.sessions = sessions;
+        state.rtc_peers = Some(rtc_peers);
         if let Err(error) = write_atomic(&self.path, &state) {
             tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }
@@ -167,9 +189,14 @@ impl StateStore {
         }
     }
 
-    pub fn heartbeat(&self, sessions: usize) {
+    /// Write the heartbeat; `rtc_peers` replaces the gauge when given and
+    /// keeps the last one otherwise.
+    pub fn heartbeat(&self, sessions: usize, rtc_peers: Option<RtcPeerGauge>) {
         let mut state = self.state.lock().expect("state heartbeat lock");
         state.sessions = sessions;
+        if let Some(rtc_peers) = rtc_peers {
+            state.rtc_peers = Some(rtc_peers);
+        }
         if let Err(error) = write_atomic(&self.path, &state) {
             tracing::warn!(%error, "could not write SPAWN D heartbeat state");
         }
@@ -606,7 +633,7 @@ mod tests {
     fn the_heartbeat_names_the_running_build_and_its_worker_verdict() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path(), "https://spawnd.dev/");
-        store.heartbeat(0);
+        store.heartbeat(0, None);
         let state = read(dir.path()).unwrap().unwrap();
         assert_eq!(state.tree, crate::version::daemon_tree().map(str::to_owned));
         assert!(state

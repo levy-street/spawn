@@ -592,17 +592,25 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         task_breakaway_denied,
     ));
     crate::state::install_active(Arc::clone(&state_store));
-    state_store.heartbeat(0);
+    state_store.heartbeat(0, None);
+    let rtc_sessions = RtcSessions::new();
     let state_registry = registry.clone();
+    let state_rtc_sessions = rtc_sessions.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         interval.tick().await;
         loop {
             interval.tick().await;
-            state_store.heartbeat(state_registry.ids().len());
+            // Sessions and the RTC peer cap, for `spawnd status`. Written
+            // here, on the daemon's own clock and off the offer path: peers
+            // keep opening and closing through a server outage, and the
+            // state file write is an fsync.
+            state_store.heartbeat(
+                state_registry.ids().len(),
+                Some(state_rtc_sessions.admission_gauge().await),
+            );
         }
     });
-    let rtc_sessions = RtcSessions::new();
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
     // reset it: a key revoked on one control connection stays revoked on every
@@ -986,7 +994,7 @@ async fn serve_one_connection_with_loader(
         }
     }
     tracing::info!(%ws_url, "ws connected");
-    crate::state::active_connected(registry.ids().len());
+    crate::state::active_connected(registry.ids().len(), rtc_sessions.admission_gauge().await);
 
     let (write_half, read_half) = stream.split();
 
@@ -1036,6 +1044,13 @@ async fn serve_one_connection_with_loader(
 
     let update_capability = crate::update::capability();
     let live_bindings = rtc_sessions.live_bindings().await;
+    // What this registration tells the server it has; the server keeps
+    // exactly these and drops the rest, and the replay after the ack prunes
+    // against this list, not the live map at that later moment.
+    let registered_bindings = live_bindings
+        .iter()
+        .map(|binding| binding.session_id.clone())
+        .collect::<std::collections::HashSet<_>>();
     let register = Outbound::Register {
         host_name,
         os: std::env::consts::OS.to_string(),
@@ -1062,6 +1077,7 @@ async fn serve_one_connection_with_loader(
     // Heartbeat task: also functions as the keepalive. If the write side
     // can't reach the channel (sender_task died) we know the WS is dead.
     let hb_tx = out_tx.clone();
+    let flush_sessions = rtc_sessions.clone();
     let mut heartbeat_task = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         let mut ping = tokio::time::interval(WS_PING_INTERVAL);
@@ -1083,6 +1099,9 @@ async fn serve_one_connection_with_loader(
                     }
                 }
                 _ = heartbeat.tick() => {
+                    // A status deferred for want of channel room is retried
+                    // here; a terminal one is what frees the server's binding.
+                    flush_sessions.flush_deferred_statuses();
                     let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
                     let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
                         cpu_bucket,
@@ -1114,6 +1133,7 @@ async fn serve_one_connection_with_loader(
             live_credentials,
             daemon_revoked,
             Arc::clone(&registered_at),
+            registered_bindings,
         );
         tokio::pin!(dispatch_fut);
         tokio::select! {
@@ -1824,6 +1844,7 @@ fn enqueue_rtc_job(
     let _ = sender.send(job);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_loop(
     in_rx: &mut mpsc::Receiver<WsInbound>,
     registry: &SessionRegistry,
@@ -1832,6 +1853,7 @@ async fn dispatch_loop(
     live_credentials: &LiveCredentialSnapshot,
     daemon_revoked: &mut RevocationSet,
     registered_at: Arc<StdMutex<Option<Instant>>>,
+    registered_bindings: std::collections::HashSet<String>,
 ) -> Result<()> {
     let mut rtc_tasks: HashMap<String, mpsc::UnboundedSender<RtcSignalJob>> = HashMap::new();
     // This host's account, as canonical UUID bytes. Used to scope carried
@@ -1898,7 +1920,9 @@ async fn dispatch_loop(
                             ),
                         }
                     }
-                    rtc_sessions.reannounce_live_statuses().await;
+                    rtc_sessions
+                        .reannounce_live_statuses(&registered_bindings)
+                        .await;
                     daemon_account = resolve_daemon_account(proven_account, account_id.as_deref());
                     let newly_revoked = daemon_revoked
                         .absorb(revocation_set_from_wire(revoked_browser_keys.as_deref()));
@@ -3965,6 +3989,7 @@ mod tests {
             &live,
             &mut revoked,
             Arc::new(StdMutex::new(None)),
+            std::collections::HashSet::new(),
         );
         let exercise = async move {
             in_tx
@@ -6428,12 +6453,15 @@ async fn handle_session_restart(
     // worker-owned signal syscall.
     let transition = registry.lock_generation_transition(session_id).await;
     let current = registry.lifecycle_snapshot(session_id);
+    let mut announcements = None;
     if let Some(snapshot) = &current {
         let binding = snapshot.binding();
         tracing::info!(daemon_pid, %session_id, phase = "closing_peers", "session restart progress");
-        rtc_sessions
-            .close_for_session(session_id, binding.generation())
-            .await;
+        announcements = Some(
+            rtc_sessions
+                .close_for_session(session_id, binding.generation(), "session restarting")
+                .await,
+        );
         tracing::info!(daemon_pid, %session_id, phase = "peers_closed", "session restart progress");
         if let Some(control) = registry.control_for_binding(binding) {
             control.clear_sink().await;
@@ -6490,10 +6518,18 @@ async fn handle_session_restart(
     if worker_backend::socket_exists(session_id) {
         tracing::warn!(daemon_pid, %session_id, phase = "worker_exit_timeout", "session restart stopped");
         send_spawn_failed_exit(session_id, out_tx, "restart timeout").await;
+        if let Some(announcements) = announcements {
+            announcements.send();
+        }
         return;
     }
     tracing::info!(daemon_pid, %session_id, phase = "launching_replacement", "session restart progress");
     handle_session_create(create, registry, rtc_sessions, out_tx).await;
+    // The replacement is registered (or its failure is on the wire): a device
+    // re-offering on this word is not refused for a session that is gone.
+    if let Some(announcements) = announcements {
+        announcements.send();
+    }
 }
 
 async fn handle_session_kill(
@@ -6620,10 +6656,13 @@ async fn spawn_exit_forwarder(
     });
     let transition = registry.lock_generation_transition(session_id).await;
     let removed = registry.remove_if_generation(session_id, generation);
-    rtc_sessions.close_for_session(session_id, generation).await;
+    let announcements = rtc_sessions
+        .close_for_session(session_id, generation, "session ended")
+        .await;
     drop(transition);
     if removed.is_none() {
         tracing::debug!(%session_id, generation, "ignoring stale session exit");
+        announcements.send();
         return;
     }
     crate::state::active_heartbeat(registry.ids().len());
@@ -6635,6 +6674,9 @@ async fn spawn_exit_forwarder(
     if let Ok(s) = serde_json::to_string(&exit) {
         let _ = out_tx.send(WsOutbound::json(s)).await;
     }
+    // Only now: a device told `unavailable` before the exit would re-offer
+    // into a session that is gone and be refused.
+    announcements.send();
 }
 
 /// Adopt a running session worker for this session (spawnd restart / lazy
@@ -6679,11 +6721,14 @@ async fn register_attached(
 
     launched.handle.control.set_sink(out_tx.clone()).await;
     let transition = registry.lock_generation_transition(session_id).await;
+    let mut announcements = None;
     if let Some(previous) = registry.binding_for(session_id) {
         let _ = registry.remove_if_generation(session_id, previous.generation());
-        rtc_sessions
-            .close_for_session(session_id, previous.generation())
-            .await;
+        announcements = Some(
+            rtc_sessions
+                .close_for_session(session_id, previous.generation(), "session replaced")
+                .await,
+        );
     }
     let generation = registry.insert(launched.handle);
     drop(transition);
@@ -6694,6 +6739,11 @@ async fn register_attached(
         let _ = out_tx
             .send(WsOutbound::json(serde_json::to_string(&started).unwrap()))
             .await;
+    }
+    // The replacement is registered: a device re-offering on this word finds
+    // the session running.
+    if let Some(announcements) = announcements {
+        announcements.send();
     }
 
     tokio::spawn(spawn_exit_forwarder(

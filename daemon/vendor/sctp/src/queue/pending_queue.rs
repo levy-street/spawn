@@ -6,6 +6,7 @@ use tokio::sync::{Mutex, Semaphore};
 use util::sync::RwLock;
 
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
+use crate::error::{Error, Result};
 
 // TODO: benchmark performance between multiple Atomic+Mutex vs one Mutex<PendingQueueInternal>
 
@@ -50,9 +51,18 @@ impl Default for PendingQueue {
 
 impl PendingQueue {
     pub(crate) fn new() -> Self {
+        Self::with_byte_limit(QUEUE_BYTES_LIMIT)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limit(bytes: usize) -> Self {
+        Self::with_byte_limit(bytes)
+    }
+
+    fn with_byte_limit(bytes: usize) -> Self {
         Self {
             semaphore_lock: Mutex::default(),
-            semaphore: Semaphore::new(QUEUE_BYTES_LIMIT),
+            semaphore: Semaphore::new(bytes),
             unordered_queue: Default::default(),
             ordered_queue: Default::default(),
             queue_len: Default::default(),
@@ -62,15 +72,31 @@ impl PendingQueue {
         }
     }
 
+    /// Close the queue. Every writer waiting for room returns
+    /// `ErrStreamClosed` at once, and nothing is accepted after.
+    ///
+    /// Called when the association closes. Room only ever comes back when
+    /// the peer acknowledges what is in flight; a peer that has stopped
+    /// acknowledging keeps a writer waiting forever — holding the writer
+    /// lock while it does, so a stream shutdown, which queues its zero-length
+    /// reset chunk behind that lock, never runs, and the peer connection
+    /// close that begins with those shutdowns never finishes.
+    pub(crate) fn close(&self) {
+        self.semaphore.close();
+    }
+
     /// Appends a chunk to the back of the pending queue.
-    pub(crate) async fn push(&self, c: ChunkPayloadData) {
+    pub(crate) async fn push(&self, c: ChunkPayloadData) -> Result<()> {
         let user_data_len = c.user_data.len();
 
         {
             let _sem_lock = self.semaphore_lock.lock().await;
-            let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
+            let permits = self
+                .semaphore
+                .acquire_many(user_data_len as u32)
+                .await
+                .map_err(|_| Error::ErrStreamClosed)?;
+            permits.forget();
 
             if c.unordered {
                 let mut unordered_queue = self.unordered_queue.write();
@@ -83,6 +109,7 @@ impl PendingQueue {
 
         self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
         self.queue_len.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Appends chunks to the back of the pending queue.
@@ -90,9 +117,9 @@ impl PendingQueue {
     /// # Panics
     ///
     /// If it's a mix of unordered and ordered chunks.
-    pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) {
+    pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) -> Result<()> {
         if chunks.is_empty() {
-            return;
+            return Ok(());
         }
 
         let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
@@ -104,23 +131,27 @@ impl PendingQueue {
             let permits = self
                 .semaphore
                 .acquire_many(total_user_data_len as u32)
-                .await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
+                .await
+                .map_err(|_| Error::ErrStreamClosed)?;
+            permits.forget();
             self.append_unlimited(chunks, total_user_data_len);
+            Ok(())
         }
     }
 
     // If this is a very large message we append chunks one by one to allow progress while we are appending
-    async fn append_large(&self, chunks: Vec<ChunkPayloadData>) {
+    async fn append_large(&self, chunks: Vec<ChunkPayloadData>) -> Result<()> {
         // lock this for the whole duration
         let _sem_lock = self.semaphore_lock.lock().await;
 
         for chunk in chunks.into_iter() {
             let user_data_len = chunk.user_data.len();
-            let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
+            let permits = self
+                .semaphore
+                .acquire_many(user_data_len as u32)
+                .await
+                .map_err(|_| Error::ErrStreamClosed)?;
+            permits.forget();
 
             if chunk.unordered {
                 let mut unordered_queue = self.unordered_queue.write();
@@ -132,6 +163,7 @@ impl PendingQueue {
             self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
             self.queue_len.fetch_add(1, Ordering::SeqCst);
         }
+        Ok(())
     }
 
     /// Assumes that A) enough permits have been acquired and forget from the semaphore and that the semaphore_lock is held

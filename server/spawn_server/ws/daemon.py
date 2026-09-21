@@ -54,6 +54,7 @@ from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
     HOST_RTC_STATUS_ALLOWLIST,
     RTC_BINDING_ORPHAN_GRACE_SECONDS,
+    RTC_TERMINAL_STATUSES,
     HostOwnerRevocation,
     HostPresenceOwner,
     HostSignalEnvelope,
@@ -2741,6 +2742,19 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     if session_id and isinstance(status_value, str) and len(status_value) <= 64:
                         binding = await broker.rtc_session_for(session_id, daemon=conn)
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
+                            if binding is None and status_value in RTC_TERMINAL_STATUSES:
+                                # A goodbye for a binding this server no longer
+                                # holds — dropped at reconcile, freed on the
+                                # browser's word, expired — is nothing to act on
+                                # and nothing the daemon did wrong: it says
+                                # goodbye for every peer it ever admitted. One
+                                # naming a binding the server does hold, with
+                                # the wrong nonce or scope, is a mismatch still
+                                # worth hearing about.
+                                log.debug(
+                                    "rtc terminal status for a binding the server no longer holds"
+                                )
+                                continue
                             log.warning("rtc status did not match its registered session")
                             await errors.send("invalid_frame", ftype)
                             continue
@@ -2780,6 +2794,33 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             and await broker.mark_rtc_session_connected(session_id, binding) is None
                         ):
                             continue
+                        # A terminal status from the daemon ends the binding here,
+                        # for host scope as the browser relay already does for
+                        # session scope: the daemon is the one side that always
+                        # knows a peer is gone, a browser's shared connection
+                        # never sends `rtc.close`, and a binding kept for a peer
+                        # only the daemon knows is gone would count against the
+                        # per-host, per-daemon and per-browser caps until its TTL.
+                        # By the binding's identity, not its browser: a resume
+                        # that rebound the browser while the routing above
+                        # awaited must not turn the daemon's word into a no-op.
+                        # Host scope only. A session binding is the browser
+                        # relay's to end, after it has relayed the status: a
+                        # `failed` is an offer refused, which the browser must
+                        # hear, and the relay forwards it only for a binding it
+                        # still holds. A relay that is gone frees its bindings
+                        # when its orphan grace ends.
+                        # A `failed` ends a binding that never connected — an
+                        # offer refused. A refused restart names a live pair,
+                        # which the daemon keeps and ends with `unavailable`
+                        # once the device lets go of it; freed on the `failed`,
+                        # its binding would be one the daemon still speaks for.
+                        if (
+                            binding.scope_type == "host"
+                            and status_value in RTC_TERMINAL_STATUSES
+                            and not (status_value == "failed" and binding.connected)
+                        ):
+                            await broker.unregister_rtc_binding(binding)
                     else:
                         await errors.send("invalid_frame", ftype)
 

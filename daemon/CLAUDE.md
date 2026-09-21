@@ -65,8 +65,12 @@ tests/           integration tests (worker_e2e.rs), and
                  skips otherwise
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
-                 currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
-                 and a read/reset missed-notification fix, webrtc-ice 0.17.2
+                 currently webrtc-sctp 0.17.2 plus the #822 re-admission fix,
+                 a read/reset missed-notification fix, and closing the
+                 association closing its pending queue (a writer waiting on a
+                 silent peer gets `ErrStreamClosed` instead of holding the
+                 stream shutdowns, and so the peer connection close, forever),
+                 webrtc-ice 0.17.2
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
                  with closed-channel registry pruning (webrtc/PATCHES.md).
@@ -335,6 +339,126 @@ map becomes observable, then performs asynchronous channel cleanup. The
 protected-content guard pins that narrow exported surface; it exposes no
 content or server publication capability.
 
+Exactly one teardown owns a peer: the first caller to `claim` its
+`PeerCloseCoordinator` takes it out of service (`take_out_of_service`) and
+settles it (`settle_detached_peer`); a later close of the same peer finds it
+out of the live map and does nothing. In particular it never touches the
+transport: `RTCPeerConnection::close` marks the connection closed before it
+does anything, so a duplicate close dropped at a deadline would turn the
+owner's close into a silent no-op and leak the sockets. When a host peer
+leaves the host map — reaped, closed by the server, or superseded by the
+same device — its attachments leave the peer map with it, under the same
+locks (`detach_pair_children`), so a device re-attaching the same view never
+finds a stale child and the old transport feeds no PTY past that moment; the
+tracked task settles them and then closes the transport; and an attach that
+was in flight when its pair was retired is refused under the peer-map lock
+(`attach_pair_channel`), so no attachment lands after the sweep. A device
+offer is checked for collisions before the device's working connection is
+taken, so an offer refused at admission never costs the device the
+connection it has (an offer that fails after admission — negotiation, answer
+signing — has superseded it already, and the device reconnects). The
+superseding connection takes the superseded pair's slot when the cap is
+full (`AdmissionSlot::transfer`, `SlotDisposition::Keep`), so a device
+reconnecting at the cap is never refused for want of the slot its own old
+connection held. A cleanup task pays its debts from one exit, a panic in
+the teardown caught and logged (`TeardownSettlement`): the slot back to the
+cap and the peer out of the closing map. A peer is identified by its close
+coordinator (`RtcPeer::close`), the one handle unique to a peer: a pair's
+attachments share their host's transport and generation, so a lookup or
+removal by transport would take a view re-attached under the same id. The
+closing map is keyed by that coordinator too (`closing_key`), so two peers
+under one id and generation are two closing peers, each found and counted.
+A host peer taken out of the host map (`RetiredHost`) is handed to its
+tracked close through `into_parts`; dropped before that, it returns its
+slot and closes itself from the drop path, and a panic in that close is
+caught with the attachments settled after it, so its claimed attachments
+never sit in the closing map for good. An attachment's generation is its
+parent binding's plus a sequence of its own (`ATTACHMENT_SEQUENCE`), so the
+viewer id every registry keys on — direct sinks, control viewers, uploads
+— is the attachment's alone, and a view re-attached under the same id
+while its old attachment is still closing loses nothing to that
+attachment's late cleanup.
+
+The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
+session or host peer; a pair session inherits its host peer's slot and never
+returns it. A slot returns when its owner leaves the live map — for a session
+peer, once its close deadline passes or its teardown settles, whichever is
+first, released from inside the tracked cleanup task, which nothing cancels;
+for a host peer, the moment it leaves the host map, under that lock, before
+its transport close begins. Never tie a slot to a clone of the peer dropping:
+clones live on in the closing-peer map, the fenced cleanup task, and stored
+callbacks for as long as a remote that will never answer keeps a transport
+close pending, and that is how dream refused every offer for a day with
+`capacity exhausted` while its status said `connected`.
+
+The owning teardown of a mapped peer never abandons its transport close: a
+session teardown past its deadline and every close of a host peer that was
+in the map run in a tracked cleanup task (`spawn_host_closes` →
+`close_retired_host_peer`), and `settle_with_watchdog` names one still
+pending at `RTC_TEARDOWN_WATCHDOG` and every `RTC_TEARDOWN_REMINDER` after.
+A duplicate close of a transport some other teardown owns — a reaper firing
+for a pc already leaving — does nothing at all. No path awaits a transport close while holding the
+admission lock, which every offer serializes on, or ahead of an answer: a
+superseded pair closes in a tracked task after the lock drops, and trust
+invalidation waits for host closes only until the teardown deadline. A
+device re-attaching a view of its superseded connection (the mobile client
+keeps its attachment ids across a reconnect) finds nothing stale: the old
+attachment left the peer map when its pair was superseded, and one another
+close had already claimed, still resident for its settle wait, reads as
+absent and is replaced. Every
+transport close the daemon owns stops the SCTP association before
+`RTCPeerConnection::close` (`pair::stop_then_close`): the close begins with
+a shutdown of each data channel, and against a peer that stopped
+acknowledging those wait behind a writer that never gets room; the closed
+association releases the writer and the shutdowns bail on state. Every
+retirement the daemon starts on its own — the reaper's never-connected,
+failed, and stayed-disconnected closes, a session that ended, was replaced,
+or is restarting, and a device connection superseded by a newer one — tells
+the server `unavailable` for that binding, once it has claimed the peer
+(`reap_session_peer`, `close_for_session`, `retire_host_if_same`,
+`take_device_pair`). A session close hands its announcements back
+(`Announcements`, sent on drop if never sent) for the caller in `run.rs` to
+send once the exit or the replacement is on the wire: sent earlier, a device
+re-offers into a session that is not running, is refused with `failed`, and
+reads that as the host dropping it. The server frees the binding on that
+status for both scopes — `ws/daemon.py` for host scope, the browser relay
+for session scope — so a binding the server keeps for a peer only this
+daemon knows is gone never counts against its per-host, per-daemon,
+per-browser, and per-user caps until its TTL; a browser's shared connection
+never sends `rtc.close`, so nothing else would free it. `unavailable`, not `failed`: to a device `failed` on its
+active binding is a refusal of its offer and it drops its trust verdict,
+while `unavailable` is a connection that is gone, answered with a new one.
+No status goes out before a connection's registration is acknowledged
+(`deferred_pruned`): the server refuses frames before `register`, and one
+refused would be one never deferred. A status deferred for that, or for
+want of channel room, is retried from the control connection's heartbeat
+once registration's replay has run; at reconnect a deferred terminal
+status is replayed only for a binding the register frame carried (the
+server kept exactly those), and a deferred `connected` never is — the
+replay says `connected` for every peer that is. A binding holds at most
+one live status and one goodbye (`DeferredStatuses`, two slots, a plain
+mutex — the status path is synchronous): a live status sent clears the
+live slot, a goodbye sent clears both, a peer leaving service forgets its
+live slot, admitting a signal id again forgets everything held for it
+(a predecessor's goodbye is not sent behind its successor's `connected`),
+and a status that goes straight through flushes the rest at once, the
+heartbeat being the backstop. The three terminal statuses are
+named on both sides (`TERMINAL_RTC_STATUSES` here, `RTC_TERMINAL_STATUSES`
+in the server), and the server takes a goodbye for a binding it no longer
+holds as a no-op, forgets a binding by its identity rather than by the
+browser socket that held it when the goodbye was read, and lets a `failed`
+end only a binding that never connected — a refused restart names a live
+pair, which ends on `unavailable` once the device lets go of it. A retired host peer's association stops
+before its attachments settle, so their channel closes are not each held
+to their deadline by the writer the silent peer left stuck. The cap is
+read by the daemon's own 30 s state timer in `run.rs` — not the control
+connection's, since peers keep opening and closing through a server outage
+— and written to the state file as `rtc_peers` (`in_use`, `closing`,
+`host_closing`, `cap`); `spawnd status` prints it as the `peers` line, so a
+leak — of slots, or of peers that never finish closing — shows while it is
+one peer. Never write the state file from the RTC path: that write is an
+fsync, and the offer path waits on the locks it would run under.
+
 ## Before calling a change done
 
 ```bash
@@ -351,7 +475,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --features diagnostics -- -D warnings
 cargo test --locked
 cargo test --locked --features diagnostics
-cargo test --locked -p webrtc-sctp --lib stream::stream_test::
+cargo test --locked -p webrtc-sctp --lib -- stream::stream_test:: queue::queue_test::
 cargo test --locked -p webrtc-ice --lib agent_transport_test::
 cargo build --locked --profile diagnostics --features diagnostics
 ```

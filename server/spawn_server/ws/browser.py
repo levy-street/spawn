@@ -24,6 +24,7 @@ from .close_codes import (
 )
 from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
+    RTC_TERMINAL_STATUSES,
     HostPresenceOwner,
     HostSignalEnvelope,
     RedisBrowserConn,
@@ -388,6 +389,9 @@ async def browser_ws(
                     if route is None:
                         continue
                     if binding is None:
+                        # Not `failed`, though it ends a binding too: to the
+                        # clients it is a refusal of an offer, and an offer they
+                        # already abandoned has none to refuse.
                         if (
                             signal.get("type") == "rtc.status"
                             and signal.get("status") in {"unavailable", "expired"}
@@ -463,16 +467,14 @@ async def browser_ws(
                             if connected is None:
                                 continue
                             binding = connected
-                        elif status_value in {"failed", "unavailable", "expired"}:
+                        elif status_value in RTC_TERMINAL_STATUSES:
                             await broker.unregister_rtc_session(session_id, route)
                             rtc_routes.pop(session_id, None)
                     else:
                         continue
-                    terminal_status = frame_type == "rtc.status" and signal.get("status") in {
-                        "failed",
-                        "unavailable",
-                        "expired",
-                    }
+                    terminal_status = (
+                        frame_type == "rtc.status" and signal.get("status") in RTC_TERMINAL_STATUSES
+                    )
                     if not terminal_status and not (await broker.rtc_session_is_current(binding)):
                         continue
                     await conn.send_text(signal)
