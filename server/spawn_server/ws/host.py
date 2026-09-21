@@ -38,6 +38,7 @@ from .host_signal import (
     MAX_HOST_RTC_SESSIONS_PER_BROWSER,
     RTC_BINDING_TOMBSTONE_TTL_SECONDS,
     RTC_CONNECTED_SESSION_TTL_SECONDS,
+    RTC_TERMINAL_STATUSES,
     HostPresenceOwner,
     HostSignalEnvelope,
     RedisBrowserConn,
@@ -407,10 +408,7 @@ async def _pump_browser_signals(
                 sessions_lock,
                 tombstones_changed,
                 connected=dispatch_is_active_owner and status_value == "connected",
-                retire=(
-                    not dispatch_is_active_owner
-                    or status_value in {"failed", "unavailable", "expired"}
-                ),
+                retire=(not dispatch_is_active_owner or status_value in RTC_TERMINAL_STATUSES),
             )
 
 

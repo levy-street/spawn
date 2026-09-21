@@ -392,6 +392,9 @@ impl PeerCloseCoordinator {
 enum TestEffectPoint {
     CloseAllSnapshot,
     ControlRequest,
+    /// Under the admission lock, before the device's own pair is taken;
+    /// keyed by the device key in hex.
+    HostAdmissionTake,
     HostRetire,
     HostTransportClose,
     PtyInput,
@@ -592,6 +595,11 @@ impl Drop for RetiredHost {
             signal_id = %self.signal_id,
             "retired host rtc peer dropped before its close was spawned; closing it from here"
         );
+        // A slot kept for a successor to take over (`SlotDisposition::Keep`)
+        // has no taker now; it goes back to the cap here, not when the
+        // transport close — against a device that may never answer — lets
+        // go of the last clone.
+        self.peer.admission.retire();
         let host = RetiredHost {
             signal_id: std::mem::take(&mut self.signal_id),
             peer: self.peer.clone(),
@@ -994,15 +1002,25 @@ impl RtcSessions {
         self.flush_pending();
     }
 
+    /// Under the lock throughout — a send is a `try_send` — so nothing is
+    /// taken out and put back over a goodbye a reaper held meanwhile, or
+    /// brought back after a peer leaving service forgot it. The live status
+    /// goes first; the goodbye follows only once it has.
     fn flush_pending(&self) {
-        let pending = std::mem::take(&mut *self.deferred());
-        for (key, slot) in pending {
-            for frame in slot.drain() {
-                if !self.send_now(&frame) {
-                    self.deferred().entry(key.clone()).or_default().hold(frame);
-                }
+        self.deferred().retain(|_, slot| {
+            if slot.live.as_ref().is_some_and(|frame| self.send_now(frame)) {
+                slot.live = None;
             }
-        }
+            if slot.live.is_none()
+                && slot
+                    .goodbye
+                    .as_ref()
+                    .is_some_and(|frame| self.send_now(frame))
+            {
+                slot.goodbye = None;
+            }
+            !slot.is_empty()
+        });
     }
 
     /// After registration: replay the goodbyes that still matter, then say
@@ -1614,6 +1632,14 @@ impl RtcSessions {
         if admission_permit.is_none() {
             admission_permit = self.peer_admission.try_acquire();
         }
+        #[cfg(test)]
+        if let Some(pair) = &admission.pair {
+            self.pause_effect(
+                &pair::device_key_hex(&pair.device_key),
+                TestEffectPoint::HostAdmissionTake,
+            )
+            .await;
+        }
         let superseded = match &admission.pair {
             Some(pair) => self.take_device_pair(pair.device_key).await,
             None => Vec::new(),
@@ -1623,9 +1649,17 @@ impl RtcSessions {
                 .iter()
                 .find_map(|host| host.peer.admission.transfer());
         }
+        if admission_permit.is_none() {
+            // The device's own connection may have been reaped since the
+            // cap was last asked — the reaper takes it without this lock,
+            // and its slot went back to the cap with nothing here to take
+            // over — so the cap is asked once more before this offer is
+            // refused for a slot that is there.
+            admission_permit = self.peer_admission.try_acquire();
+        }
         let Some(admission_permit) = admission_permit else {
-            // Unreachable while a mapped host peer always holds its slot;
-            // still, what was taken is closed, not dropped.
+            // The cap is full and the device held no slot: what was taken
+            // is closed, not dropped.
             drop(_admission);
             for host in &superseded {
                 host.peer.admission.retire();
@@ -5192,11 +5226,6 @@ impl DeferredStatuses {
     fn is_empty(&self) -> bool {
         self.live.is_none() && self.goodbye.is_none()
     }
-
-    /// In send order: the live status, then the goodbye.
-    fn drain(self) -> impl Iterator<Item = Outbound> {
-        self.live.into_iter().chain(self.goodbye)
-    }
 }
 
 fn session_status_frame(
@@ -7694,7 +7723,6 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(WsOutbound::json("{}".to_owned())).unwrap();
         sessions.signaling.install(tx);
-        sessions.deferred_pruned.store(true, Ordering::Release);
         let nonce = "a".repeat(32);
         let session_id = Uuid::new_v4();
         let status =
@@ -7887,7 +7915,6 @@ mod tests {
         sessions.deferred_pruned.store(true, Ordering::Release);
         let (tx, mut rx) = mpsc::channel(1);
         sessions.signaling.install(tx);
-        sessions.deferred_pruned.store(true, Ordering::Release);
         let nonce = "a".repeat(32);
         let session_id = Uuid::new_v4();
         let status = |status: &str| session_status_frame("raced", &nonce, session_id, status, None);
@@ -7999,7 +8026,6 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(WsOutbound::json("{}".to_owned())).unwrap();
         sessions.signaling.install(tx);
-        sessions.deferred_pruned.store(true, Ordering::Release);
         let frame = session_status_frame(
             "backpressured",
             &"a".repeat(32),

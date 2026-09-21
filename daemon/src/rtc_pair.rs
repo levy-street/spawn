@@ -57,6 +57,23 @@ pub(super) struct SessionChannels {
     channels: Mutex<Vec<Weak<RTCDataChannel>>>,
 }
 
+/// Numbers attachments for the process lifetime; see `attach_pair_channel`.
+static ATTACHMENT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The parent binding's generation an attachment's own generation was built
+/// on: everything before its `#`.
+fn attachment_parent_generation(generation: &str) -> &str {
+    generation
+        .rsplit_once('#')
+        .map_or(generation, |(parent, _)| parent)
+}
+
+/// A device key as the string the test effect gates are keyed by.
+#[cfg(test)]
+pub(super) fn device_key_hex(key: &[u8; 32]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub(super) fn is_session(signal_id: &str) -> bool {
     signal_id.starts_with("pair/")
 }
@@ -433,7 +450,7 @@ impl RtcSessions {
             label.session,
             label.attachment
         );
-        let generation = format!(
+        let parent_generation = format!(
             "{}:{}",
             parent.binding.binding_generation, parent.binding.binding_nonce
         );
@@ -452,13 +469,23 @@ impl RtcSessions {
         let child = if let Some(child) = existing {
             anyhow::ensure!(
                 Arc::ptr_eq(&child.pc, pc)
-                    && child.generation == generation
+                    && attachment_parent_generation(&child.generation) == parent_generation
                     && child.active.load(Ordering::Acquire)
                     && pair.registry.is_current(child.session),
                 "stale attachment"
             );
             child
         } else {
+            // This attachment's own generation: its parent's, and a sequence
+            // no other attachment has. The viewer id every registry keys on
+            // — direct sinks, control viewers, uploads — derives from it, so
+            // a view re-attached under the same id while its old attachment
+            // is still closing registers under a name of its own, and the
+            // old attachment's late cleanup touches nothing of its.
+            let generation = format!(
+                "{parent_generation}#{}",
+                ATTACHMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
             let count = self
                 .peers
                 .lock()
@@ -1748,6 +1775,224 @@ mod tests {
         sessions.close_all().await;
         let _ = device.close().await;
         worker.abort();
+    }
+
+    /// A view re-attached under the same id while its old attachment is
+    /// still closing registers under a name of its own: the old attachment's
+    /// cleanup — direct sink, control viewer, uploads, all keyed by viewer
+    /// id — runs to the end and the replacement keeps what it registered.
+    #[tokio::test]
+    async fn a_replacement_child_keeps_its_registrations_through_the_old_childs_cleanup() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(binding).unwrap();
+        let worker_control = control.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        worker_control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        });
+        let suffix = format!("{session_id}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let first = connect_pair(&sessions, &registry, [23; 32]).await;
+        let (_first_pty, _first_ctl) = attach_labelled(&first, &suffix).await;
+        let (child_id, old_child) = sessions
+            .peers
+            .lock()
+            .await
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .next()
+            .expect("the attachment is resident");
+        let old_viewer = viewer_id(&child_id, &old_child.generation);
+        assert!(
+            control
+                .wait_for_direct_sink(&old_viewer, Duration::from_secs(3))
+                .await
+        );
+        // Its owner takes the old child out of service; the settle comes later.
+        assert!(sessions.detach_peer(&child_id, &old_child).await);
+        let first_id = sessions
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("the first pair is admitted");
+        let gate = sessions
+            .stall_effect(&first_id, TestEffectPoint::HostRetire)
+            .await;
+
+        let successor = connect_pair(&sessions, &registry, [23; 32]).await;
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .expect("the superseded teardown is held");
+        let (_pty, _ctl) = attach_labelled(&successor, &suffix).await;
+        let replacement = sessions
+            .peers
+            .lock()
+            .await
+            .get(&child_id)
+            .cloned()
+            .expect("the replacement is resident");
+        let replacement_viewer = viewer_id(&child_id, &replacement.generation);
+        assert_ne!(replacement_viewer, old_viewer, "a name of its own");
+        assert!(
+            control
+                .wait_for_direct_sink(&replacement_viewer, Duration::from_secs(3))
+                .await,
+            "the replacement registered its sink"
+        );
+
+        // The old child's cleanup runs to the end now.
+        let deadline = old_child.close.initiate();
+        sessions
+            .settle_detached_peer(&child_id, old_child, deadline)
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sessions.closing_peers.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the old child settled");
+        assert!(
+            control
+                .wait_for_direct_sink(&replacement_viewer, Duration::from_millis(200))
+                .await,
+            "the old child's cleanup removed nothing of the replacement's"
+        );
+        assert!(
+            sessions
+                .controls
+                .contains_viewer(session_id, &replacement_viewer)
+                .await
+        );
+        assert!(
+            !sessions
+                .controls
+                .contains_viewer(session_id, &old_viewer)
+                .await
+        );
+
+        gate.release.notify_one();
+        sessions.close_all().await;
+        for pc in [first, successor] {
+            let _ = pc.close().await;
+        }
+        worker.abort();
+    }
+
+    /// A superseded pair keeps its slot for the successor to take over. Dropped
+    /// before its close is spawned — a path that returned early — it returns
+    /// that slot at once, not when its transport close lets go of the last
+    /// clone.
+    #[tokio::test]
+    async fn a_superseded_pair_dropped_unclosed_returns_its_slot_at_once() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let device = connect_pair(&sessions, &registry, [24; 32]).await;
+        let host_id = sessions
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .expect("the pair is admitted");
+        // The transport close never settles while this is held: the slot
+        // could only come back from the drop path.
+        let gate = sessions
+            .stall_effect(&host_id, TestEffectPoint::HostTransportClose)
+            .await;
+        let retired = sessions.take_device_pair([24; 32]).await;
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            sessions.peer_admission.charged(),
+            1,
+            "the slot stays with the retired pair for a successor to take"
+        );
+        drop(retired);
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sessions.peer_admission.charged(),
+            0,
+            "dropped unclosed, the retired pair's slot went back at once"
+        );
+        tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+            .await
+            .expect("the drop path closes the transport");
+        gate.release.notify_one();
+        sessions.close_all().await;
+        let _ = device.close().await;
+    }
+
+    /// At the cap, a device whose own connection is reaped after the cap was
+    /// last asked and before its pair is taken — the reaper takes it without
+    /// the admission lock — is admitted on the slot that reap returned, not
+    /// refused for want of one.
+    #[tokio::test]
+    async fn a_device_whose_pair_was_reaped_under_the_lock_takes_the_freed_slot() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let first = connect_pair(&sessions, &registry, [25; 32]).await;
+        let mut filler = Vec::new();
+        while let Some(slot) = sessions.peer_admission.try_acquire() {
+            filler.push(slot);
+        }
+        assert_eq!(filler.len(), MAX_RTC_PEERS - 1);
+        let (first_id, first_pc) = {
+            let hosts = sessions.host_peers.lock().await;
+            let (id, peer) = hosts.iter().next().expect("the first pair is admitted");
+            (id.clone(), Arc::clone(&peer.pc))
+        };
+        let gate = sessions
+            .stall_effect(
+                &device_key_hex(&[25; 32]),
+                TestEffectPoint::HostAdmissionTake,
+            )
+            .await;
+
+        let successor_sessions = sessions.clone();
+        let successor_registry = registry.clone();
+        let successor = tokio::spawn(async move {
+            connect_pair(&successor_sessions, &successor_registry, [25; 32]).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("the offer reached the take under the lock");
+        // The reaper takes the device's connection meanwhile: its slot goes
+        // back to the cap, and there is no pair left for the offer to take.
+        sessions
+            .retire_host_if_same(&first_id, &first_pc, Some("stayed disconnected"))
+            .await;
+        assert_eq!(sessions.peer_admission.charged(), MAX_RTC_PEERS - 1);
+        gate.release.notify_one();
+
+        let successor = tokio::time::timeout(Duration::from_secs(10), successor)
+            .await
+            .expect("the offer was answered")
+            .expect("admitted on the freed slot, not refused");
+        assert_eq!(sessions.host_peers.lock().await.len(), 1);
+        assert_eq!(sessions.peer_admission.charged(), MAX_RTC_PEERS);
+
+        drop(filler);
+        sessions.close_all().await;
+        for pc in [first, successor] {
+            let _ = pc.close().await;
+        }
     }
 
     /// The mobile client keeps its view and attachment ids across a

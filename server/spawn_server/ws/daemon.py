@@ -2804,6 +2804,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         # By the binding's identity, not its browser: a resume
                         # that rebound the browser while the routing above
                         # awaited must not turn the daemon's word into a no-op.
+                        # Host scope only. A session binding is the browser
+                        # relay's to end, after it has relayed the status: a
+                        # `failed` is an offer refused, which the browser must
+                        # hear, and the relay forwards it only for a binding it
+                        # still holds. A relay that is gone frees its bindings
+                        # when its orphan grace ends.
                         if binding.scope_type == "host" and status_value in RTC_TERMINAL_STATUSES:
                             await broker.unregister_rtc_binding(binding)
                     else:

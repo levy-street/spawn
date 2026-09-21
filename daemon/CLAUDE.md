@@ -369,9 +369,14 @@ removal by transport would take a view re-attached under the same id. The
 closing map is keyed by that coordinator too (`closing_key`), so two peers
 under one id and generation are two closing peers, each found and counted.
 A host peer taken out of the host map (`RetiredHost`) is handed to its
-tracked close through `into_parts`; dropped before that, it closes itself
-from the drop path, so its claimed attachments never sit in the closing
-map for good.
+tracked close through `into_parts`; dropped before that, it returns its
+slot and closes itself from the drop path, so its claimed attachments
+never sit in the closing map for good. An attachment's generation is its
+parent binding's plus a sequence of its own (`ATTACHMENT_SEQUENCE`), so the
+viewer id every registry keys on — direct sinks, control viewers, uploads
+— is the attachment's alone, and a view re-attached under the same id
+while its old attachment is still closing loses nothing to that
+attachment's late cleanup.
 
 The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never
@@ -409,7 +414,7 @@ retirement the daemon starts on its own — the reaper's never-connected,
 failed, and stayed-disconnected closes, a session that ended, was replaced,
 or is restarting, and a device connection superseded by a newer one — tells
 the server `unavailable` for that binding, once it has claimed the peer
-(`reap_session_peer`, `close_for_session`, `reap_host_peer`,
+(`reap_session_peer`, `close_for_session`, `retire_host_if_same`,
 `take_device_pair`). A session close hands its announcements back
 (`Announcements`, sent on drop if never sent) for the caller in `run.rs` to
 send once the exit or the replacement is on the wire: sent earlier, a device
