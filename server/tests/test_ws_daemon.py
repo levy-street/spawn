@@ -2253,6 +2253,23 @@ async def test_daemon_terminal_host_status_frees_the_binding(client):
     )
     assert await broker.rtc_session_for(session_id) is not None
 
+    # A goodbye with the wrong nonce names a binding the server holds under
+    # another identity: a mismatch, reported and acted on not at all.
+    ws.queue_text(
+        {
+            "type": "rtc.status",
+            "session_id": session_id,
+            "binding_nonce": "d" * 32,
+            "scope_type": "host",
+            "scope_id": host_id,
+            "protocol": "spawn.host.ctl",
+            "protocol_version": 2,
+            "status": "unavailable",
+        }
+    )
+    await _wait_until(lambda: any(item.get("code") == "invalid_frame" for item in _sent_json(ws)))
+    assert await broker.rtc_session_for(session_id) is not None, "the wrong nonce frees nothing"
+
     async with get_backend().subscribe_channel(browser_conn.channel) as stream:
         ws.queue_text(
             {

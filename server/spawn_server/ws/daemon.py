@@ -2742,12 +2742,15 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     if session_id and isinstance(status_value, str) and len(status_value) <= 64:
                         binding = await broker.rtc_session_for(session_id, daemon=conn)
                         if binding is None or not _rtc_frame_matches_binding(obj, binding):
-                            if status_value in RTC_TERMINAL_STATUSES:
+                            if binding is None and status_value in RTC_TERMINAL_STATUSES:
                                 # A goodbye for a binding this server no longer
                                 # holds — dropped at reconcile, freed on the
-                                # browser's word, expired, rebound — is nothing
-                                # to act on and nothing the daemon did wrong: it
-                                # says goodbye for every peer it ever admitted.
+                                # browser's word, expired — is nothing to act on
+                                # and nothing the daemon did wrong: it says
+                                # goodbye for every peer it ever admitted. One
+                                # naming a binding the server does hold, with
+                                # the wrong nonce or scope, is a mismatch still
+                                # worth hearing about.
                                 log.debug(
                                     "rtc terminal status for a binding the server no longer holds"
                                 )

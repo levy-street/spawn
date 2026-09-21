@@ -649,6 +649,7 @@ mod tests {
         let pc = connect_pair(&sessions, &registry, [8; 32]).await;
         let (signal_tx, mut signal_rx) = mpsc::channel(128);
         sessions.signaling.install(signal_tx);
+        sessions.deferred_pruned.store(true, Ordering::Release);
         let signal_sink = tokio::spawn(async move { while signal_rx.recv().await.is_some() {} });
         let peer = sessions
             .host_peers
@@ -1444,6 +1445,7 @@ mod tests {
         let sessions = RtcSessions::new();
         let (tx, mut rx) = mpsc::channel(8);
         sessions.signaling.install(tx);
+        sessions.deferred_pruned.store(true, Ordering::Release);
         let (out_tx, _out_rx) = mpsc::channel(8);
         let pc = Arc::new(
             webrtc::api::APIBuilder::new()
@@ -1817,6 +1819,7 @@ mod tests {
         // connect_pair's signaling receiver has gone away; install a live sink.
         let (signal_tx, mut signal_rx) = mpsc::channel(128);
         sessions.signaling.install(signal_tx);
+        sessions.deferred_pruned.store(true, Ordering::Release);
         let signal_sink = tokio::spawn(async move { while signal_rx.recv().await.is_some() {} });
         let (_pty, _ctl) = attach(&pc, id).await;
         let host = pc

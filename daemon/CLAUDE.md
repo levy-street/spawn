@@ -365,7 +365,9 @@ the teardown caught and logged (`TeardownSettlement`): the slot back to the
 cap and the peer out of the closing map. A peer is identified by its close
 coordinator (`RtcPeer::close`), the one handle unique to a peer: a pair's
 attachments share their host's transport and generation, so a lookup or
-removal by transport would take a view re-attached under the same id.
+removal by transport would take a view re-attached under the same id. The
+closing map is keyed by that coordinator too (`closing_key`), so two peers
+under one id and generation are two closing peers, each found and counted.
 
 The peer cap (`MAX_RTC_PEERS` in `rtc.rs`) charges one `AdmissionSlot` per
 session or host peer; a pair session inherits its host peer's slot and never
@@ -416,14 +418,18 @@ per-browser, and per-user caps until its TTL; a browser's shared connection
 never sends `rtc.close`, so nothing else would free it. `unavailable`, not `failed`: to a device `failed` on its
 active binding is a refusal of its offer and it drops its trust verdict,
 while `unavailable` is a connection that is gone, answered with a new one.
-A status deferred for want of channel room is retried from the control
-connection's heartbeat once registration's replay has run; at reconnect a
-deferred terminal status is replayed only for a binding the register frame
-carried (the server kept exactly those), and a deferred `connected` never
-is — the replay says `connected` for every peer that is. One race is
-accepted: a status for a binding the server retired on its own a moment
-earlier (a browser's close still in flight) earns a rate-limited warning on
-both sides and nothing else. In the deferred map a
+No status goes out before a connection's registration is acknowledged
+(`deferred_pruned`): the server refuses frames before `register`, and one
+refused would be one never deferred. A status deferred for that, or for
+want of channel room, is retried from the control connection's heartbeat
+once registration's replay has run; at reconnect a deferred terminal
+status is replayed only for a binding the register frame carried (the
+server kept exactly those), and a deferred `connected` never is — the
+replay says `connected` for every peer that is. A peer leaving service
+forgets the `connected` held for it. The three terminal statuses are
+named on both sides (`TERMINAL_RTC_STATUSES` here, `RTC_TERMINAL_STATUSES`
+in the server), and the server takes a goodbye for a binding it no longer
+holds as a no-op. In the deferred map a
 terminal status always wins: a replayed `connected` never overwrites the
 `unavailable` deferred after it. A retired host peer's association stops
 before its attachments settle, so their channel closes are not each held
