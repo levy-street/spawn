@@ -3,6 +3,7 @@ import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { confirm } from "@/components/ui/confirm";
 import { type Session, sessions } from "@/lib/api";
 import { sessionAtShell } from "@/lib/sessions";
+import { interruptScheduled } from "./shell-handoff-schedule";
 
 /**
  * Typing a command into a pane means the shell has to be the thing reading the
@@ -17,8 +18,6 @@ const INTERRUPT = "\u0003";
 const POLL_MS = 700;
 /** Gives the agent ~5s of interrupts and polling before we give up. */
 const ATTEMPTS = 8;
-/** Only the first few attempts send Ctrl-C; the rest just watch. */
-const INTERRUPTS = 4;
 
 export type ShellHandoffResult = "sent" | "cancelled" | "busy";
 
@@ -63,7 +62,7 @@ export async function runInShell({
   }
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (attempt < INTERRUPTS) handle.sendInput(INTERRUPT);
+    if (interruptScheduled(attempt)) handle.sendInput(INTERRUPT);
     await delay(POLL_MS);
     const latest = await sessions.get(session.id).catch(() => null);
     if (!latest) continue;

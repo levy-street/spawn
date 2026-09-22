@@ -44,7 +44,7 @@ import { basename } from "@/lib/paths";
 import { sessionAtShell, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
-import { restartSessionAgent } from "./agent-restart";
+import { type AgentRestartPhase, restartPhaseLabel, restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher, writeForegroundToCache } from "./agent-switcher";
 import { FolderPicker } from "./folder-picker";
 import { pendingLaunch } from "./pending-launch";
@@ -138,6 +138,7 @@ export function SessionPane({
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
   const { attach, connInfo, getHandle, agentNotice } = useLiveTerminal(session ? sessionId : null);
+  const [restartPhase, setRestartPhase] = useState<AgentRestartPhase | null>(null);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);
@@ -218,8 +219,10 @@ export function SessionPane({
           return saved;
         },
         onSession: (latest) => writeSessionToCache(queryClient, latest),
+        onPhase: setRestartPhase,
       });
     },
+    onSettled: () => setRestartPhase(null),
     onSuccess: (result) => {
       // Typed into the shell it had: claim the foreground for the relaunched
       // agent now, as a launch does, rather than letting the pane read as a
@@ -604,7 +607,10 @@ export function SessionPane({
                   >
                     <RotateCcw className="size-3.5" aria-hidden />
                     {restartM.isPending
-                      ? "Restarting…"
+                      ? restartPhaseLabel(
+                          restartPhase,
+                          agentDisplayName(session.foreground_command),
+                        )
                       : `Restart ${agentDisplayName(session.foreground_command)}`}
                   </button>
                 </div>
@@ -629,7 +635,7 @@ export function SessionPane({
                     className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground disabled:opacity-50"
                   >
                     <RotateCcw className="size-3.5" aria-hidden />
-                    {restartM.isPending ? "Restarting…" : "Restart"}
+                    {restartM.isPending ? restartPhaseLabel(restartPhase, "the agent") : "Restart"}
                   </button>
                   <button
                     type="button"

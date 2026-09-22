@@ -2,7 +2,9 @@ import { describe, expect, mock, test } from "bun:test";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import {
   AGENT_RESTART_ATTEMPTS,
+  type AgentRestartPhase,
   planAgentRestart,
+  restartPhaseLabel,
   restartSessionAgent,
   type ShellHandoff,
 } from "@/components/workspace/agent-restart";
@@ -169,5 +171,54 @@ describe("restartSessionAgent", () => {
     expect(result).toEqual({ kind: "restarted", plan: { kind: "shell" } });
     expect(handoff).not.toHaveBeenCalled();
     expect(pendingLaunch.has(session().id)).toBe(false);
+  });
+});
+
+describe("restart phases", () => {
+  test("an agent that quits: stopping, then resuming in the same shell", async () => {
+    const phases: AgentRestartPhase[] = [];
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      handle,
+      handoff: async () => "sent",
+      restart: async () => session(),
+      onPhase: (phase) => phases.push(phase),
+    });
+    expect(phases).toEqual(["stopping", "resuming"]);
+  });
+
+  test("an agent that will not quit: stopping, then a fresh shell", async () => {
+    const phases: AgentRestartPhase[] = [];
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      handle,
+      handoff: async () => "busy",
+      restart: async () => session({ status: "starting" }),
+      onPhase: (phase) => phases.push(phase),
+    });
+    expect(phases).toEqual(["stopping", "restarting"]);
+    pendingLaunch.clear(session().id);
+  });
+
+  test("a window already at its prompt skips straight to resuming", async () => {
+    const phases: AgentRestartPhase[] = [];
+    await restartSessionAgent({
+      session: session({ foreground_command: "bash" }),
+      agents: [claude],
+      handle,
+      handoff: async () => "sent",
+      restart: async () => session(),
+      onPhase: (phase) => phases.push(phase),
+    });
+    expect(phases).toEqual(["resuming"]);
+  });
+
+  test("the control names the phase", () => {
+    expect(restartPhaseLabel("stopping", "Claude Code")).toBe("Stopping Claude Code…");
+    expect(restartPhaseLabel("resuming", "Claude Code")).toBe("Starting Claude Code…");
+    expect(restartPhaseLabel("restarting", "Claude Code")).toBe("Restarting the shell…");
+    expect(restartPhaseLabel(null, "Claude Code")).toBe("Restarting…");
   });
 });

@@ -1,6 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { type AgentRestartResult, restartSessionAgent } from "@/components/launcher/agent-restart";
+import {
+  type AgentRestartPhase,
+  type AgentRestartResult,
+  restartSessionAgent,
+} from "@/components/launcher/agent-restart";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
 import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
 import { listAgents } from "@/data/api/endpoints/agents";
@@ -86,10 +90,17 @@ export function useRenameTerminalSession(sessionId: string) {
  * one otherwise (`agent-restart.ts`). Takes the terminal's keyboard so the
  * first road is open to it.
  */
+export interface RestartTerminalInput {
+  /** The open terminal's keyboard, when the restart is asked for from one. */
+  terminal: ShellCommandSink | null;
+  /** Each phase as it begins, for the control that started the restart. */
+  onPhase?: (phase: AgentRestartPhase) => void;
+}
+
 export function useRestartTerminalSession(sessionId: string) {
   const queryClient = useQueryClient();
-  return useMutation<AgentRestartResult, Error, ShellCommandSink | null>({
-    mutationFn: async (terminal) => {
+  return useMutation<AgentRestartResult, Error, RestartTerminalInput>({
+    mutationFn: async ({ terminal, onPhase }) => {
       const session = await getSession(sessionId);
       const agents = await queryClient
         .ensureQueryData({ queryKey: qk.agents(), queryFn: listAgents })
@@ -106,6 +117,7 @@ export function useRestartTerminalSession(sessionId: string) {
         pending: pendingLaunches,
         getSession,
         onSession: (latest) => queryClient.setQueryData(qk.session(latest.id), latest),
+        ...(onPhase ? { onPhase } : {}),
       });
     },
     onSuccess: (result) => {
