@@ -225,10 +225,10 @@ def _self_test() -> None:
     assert _websocket_url("http://127.0.0.1:3001/") == "ws://127.0.0.1:3001/ws/alerts"
     assert list(
         _udp_turn_endpoints(
-            "turn:98.83.222.112:3478?transport=udp,"
-            "turn:98.83.222.112:3478?transport=tcp,turns:turn.spawnd.dev:443"
+            "turn:100.26.16.161:3478?transport=udp,"
+            "turn:100.26.16.161:3478?transport=tcp,turns:turn.spawnd.dev:443"
         )
-    ) == [("98.83.222.112", 3478)]
+    ) == [("100.26.16.161", 3478)]
     transaction_id = b"0123456789ab"
     _validate_stun_response(
         struct.pack("!HHI12s", 0x0101, 0, _STUN_COOKIE, transaction_id),
