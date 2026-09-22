@@ -113,7 +113,10 @@ fixture, UDP fault-proxy and evidence-validator regressions run in
 `scripts/test-all.sh`; the real native builds run on standard GitHub-hosted platform runners.
 Native fixtures prepare build configuration before compilation and activate
 their daemon only after app installation. Unexpected fixture process exits
-permanently fail acceptance; they are not silently restarted.
+permanently fail acceptance; they are not silently restarted. The fixture
+daemon has 180 seconds to register: on the macOS runner it spends half a
+minute hashing the unoptimized pair into its release store before its first
+log line, and the lifecycle log records how long it took.
 After fixture readiness, native app boot has a separate 180-second budget;
 local startup diagnostics and scoped device captures preserve setup failures.
 Fixture shutdown defers cancellation until worker/API cleanup and its evidence
