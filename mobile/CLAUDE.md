@@ -92,6 +92,12 @@ scripts/, docs/   build helpers and app-specific notes
   The new account is seeded synchronously; the returned promise settles the
   active query reset. Acceptance automation awaits it before device registration
   so stale readiness cannot race native secure-storage operations.
+- Polling idles when nothing is pending. A `refetchInterval` under ten seconds
+  is for a state a person is waiting on right now — a live ceremony — and
+  gives way to the idle cadence the moment that state clears
+  (`data/trust/ceremony.ts`). The app runs these hooks for as long as it is
+  signed in; at an always-fast cadence they were most of the server's request
+  volume (2026-09-22).
 - Anything that touches the native layer — a dependency with native code, a
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.

@@ -94,6 +94,12 @@ vendor/          exact upstream crate sources for narrowly documented patches;
   `docs/RELEASE.md` first — a bump is a fleet-wide cutover with a forced
   release order.
 
+Nothing but `register` goes out on a control websocket before the server's
+`registered` arrives: the server answers every earlier frame with
+`invalid_frame` and a warning. The sessions' forwarder sinks — and the
+foreground re-announcement each makes on install — are installed from the
+`Registered` arm of `dispatch_loop`, never from connect.
+
 ## Platform boundaries and Windows paths
 
 OS syscalls and security policy that a feature module should not have to

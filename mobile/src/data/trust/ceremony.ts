@@ -38,8 +38,14 @@ import { encodeAccountEndorsementV1 } from "@/lib/crypto/transcripts";
  */
 
 export const CEREMONY_TRIES = 3;
+/** Relay poll cadence while a pairing names this device (a number is on screen). */
 export const PAIRING_POLL_MS = 1_500;
+/** Relay poll cadence with no pairing live; the approval prompt polls fast for both. */
+export const PAIRING_IDLE_POLL_MS = 15_000;
+/** Endorsement poll cadence while a ceremony is live, so the peer's edge is noticed. */
 export const ENDORSEMENT_POLL_MS = 4_000;
+/** Endorsement poll cadence with nothing live; edits elsewhere invalidate the key. */
+export const ENDORSEMENT_IDLE_POLL_MS = 60_000;
 
 export type CeremonyRole = "approver" | "new-device";
 export type CeremonyPhase = "connecting" | "show" | "enter" | "waiting" | "done" | "stopped";
@@ -244,16 +250,22 @@ export function useDeviceCeremony(input: {
   const active = input.enabled && accountId !== undefined && self !== undefined;
   const selfId = self?.id ?? "";
 
+  // This hook runs for as long as the app is signed in. It polls fast only
+  // while a pairing that names this device exists — when a person is watching
+  // a number — and idles otherwise; at the always-fast cadence these two
+  // queries were most of the server's request volume (2026-09-22).
   const pairings = useQuery({
     queryKey: qk.trustPairings(selfId),
     queryFn: () => listPairings(selfId),
-    refetchInterval: PAIRING_POLL_MS,
+    refetchInterval: (query) =>
+      (query.state.data?.length ?? 0) > 0 ? PAIRING_POLL_MS : PAIRING_IDLE_POLL_MS,
     enabled: active,
   });
+  const ceremonyLive = (pairings.data?.length ?? 0) > 0 || records.size > 0;
   const endorsements = useQuery({
     queryKey: qk.trustAccountEndorsements(),
     queryFn: listAccountEndorsements,
-    refetchInterval: ENDORSEMENT_POLL_MS,
+    refetchInterval: ceremonyLive ? ENDORSEMENT_POLL_MS : ENDORSEMENT_IDLE_POLL_MS,
     enabled: active,
   });
 

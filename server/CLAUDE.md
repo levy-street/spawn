@@ -55,6 +55,10 @@ tests/          pytest; test_<module>.py mirrors the module it covers
   starts, so old code must tolerate the new schema (`docs/RELEASE.md`).
 - Validate at the boundary: request bodies through pydantic, websocket frames
   field by field before use.
+- Production's database is SQLite. `db.py` sets every connection's pragmas —
+  WAL, a fifteen-second busy timeout, `synchronous=NORMAL`, foreign keys — so
+  readers never wait on a writer. A `database is locked` in the log is a
+  transaction held open too long, never a reason to add a retry.
 
 Agent installation through REST is refused after ownership checks; the server
 does not dispatch installers or run an agent auto-update scheduler. Historical

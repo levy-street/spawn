@@ -24,20 +24,41 @@ _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
-def enable_sqlite_foreign_keys(engine: AsyncEngine) -> None:
-    """Enforce foreign keys on every SQLite connection of this engine.
+# How long a SQLite connection waits for a lock before `database is locked`.
+# The driver's default is five seconds. Production runs on SQLite, and a burst
+# of daemon registrations on a starved host outlasted that: each failure cost
+# the daemon its websocket and the server another registration (2026-09-22).
+SQLITE_BUSY_TIMEOUT_MS = 15_000
 
-    SQLite ships with foreign keys OFF per connection, so the schema's
-    ondelete rules (CASCADE on ownership chains, the deliberate RESTRICT on
-    host_key_claims) silently did not exist under SQLite. Postgres —
-    production — always enforced them; the pragma makes SQLite-backed runs
-    (tests included) exercise the same referential behavior.
+
+def configure_sqlite_connections(engine: AsyncEngine) -> None:
+    """Set the pragmas every SQLite connection of this engine relies on.
+
+    `foreign_keys=ON`: SQLite ships with foreign keys OFF per connection, so
+    the schema's ondelete rules (CASCADE on ownership chains, the deliberate
+    RESTRICT on host_key_claims) would silently not exist. Postgres always
+    enforced them; the pragma gives SQLite-backed runs the same behavior.
+
+    `journal_mode=WAL`: the default rollback journal makes every writer block
+    every reader for the whole transaction, so one slow heartbeat UPDATE
+    stalled every daemon's registration lookup. In WAL readers never wait for
+    a writer. The mode persists in the file, so this is a no-op after the
+    first connection; an in-memory database answers `memory` and is left so.
+
+    `busy_timeout`: see `SQLITE_BUSY_TIMEOUT_MS`. Set before the journal-mode
+    switch so that switch itself waits for a busy database instead of failing.
+
+    `synchronous=NORMAL`: with WAL a commit survives a process crash without
+    an fsync per transaction; only power loss can lose the newest ones.
     """
 
     @event.listens_for(engine.sync_engine, "connect")
-    def _enable_sqlite_foreign_keys(dbapi_connection, _record):  # type: ignore[no-untyped-def]
+    def _configure_sqlite_connection(dbapi_connection, _record):  # type: ignore[no-untyped-def]
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
 
 
@@ -45,7 +66,7 @@ def _build_engine(url: str) -> AsyncEngine:
     # SQLite doesn't support pool_size / max_overflow.
     if url.startswith("sqlite"):
         engine = create_async_engine(url, future=True)
-        enable_sqlite_foreign_keys(engine)
+        configure_sqlite_connections(engine)
         return engine
     return create_async_engine(url, future=True, pool_pre_ping=True)
 

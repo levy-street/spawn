@@ -106,6 +106,14 @@ from the catalogue. Every claim about spawnd survives a diff against
   anything, so the product runs as "SPAWN D on Mac" — the device that
   possessed the computer — and never as a second device of its own.
 
+- Polling idles when nothing is pending. A `refetchInterval` under ten seconds
+  is for a state a person is waiting on right now — a live ceremony, a blocked
+  session — and gives way to the idle cadence the moment that state clears
+  (`lib/approve-ceremony.ts`, `components/access/session-approval-gate.tsx`).
+  Every signed-in tab runs these hooks for as long as it is open; at an
+  always-fast cadence they were most of the server's request volume
+  (2026-09-22). Prefer a `refetchInterval` function or a ref read at
+  schedule time over remounting the query.
 - Device transport: `DaemonConnectionsProvider` owns one signed host connection
   per registered device and host. Identity replacement retires its connections.
   `lib/daemon-connection.ts` shares it across tabs with

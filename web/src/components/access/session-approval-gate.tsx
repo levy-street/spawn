@@ -16,6 +16,11 @@ import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
 import { computeTrustRoster } from "@/lib/trust-roster";
 
+/** Roster poll cadence while the card is on screen. */
+export const GATE_POLL_UP_MS = 4_000;
+/** Roster poll cadence for an open session whose device is already trusted. */
+export const GATE_POLL_DOWN_MS = 30_000;
+
 /**
  * The approval card over a dead terminal (docs/TRUST_UX.md §3, §7).
  *
@@ -40,19 +45,24 @@ export function SessionApprovalGate() {
   const enabled = user !== null && sessionOpen;
 
   const registration = useBrowserDeviceRegistration(user?.id);
+  // While the card is up the flip to "approved" should feel immediate, matching
+  // the Access panel's open-state cadence. Every open agent session runs these
+  // two queries, nearly always for a device that is already trusted, so with
+  // the card down they idle — the interval is read when each refetch is
+  // scheduled, so the ref below is current by then.
+  const cardUp = useRef(false);
+  const gateInterval = () => (cardUp.current ? GATE_POLL_UP_MS : GATE_POLL_DOWN_MS);
   const devices = useQuery({
     queryKey: ["browser-devices"],
     queryFn: browserDevices.list,
     enabled,
-    // While a blocked session is on screen the flip to "approved" should feel
-    // immediate; this matches the Access panel's open-state cadence.
-    refetchInterval: 4000,
+    refetchInterval: gateInterval,
   });
   const edges = useQuery({
     queryKey: ["account-endorsements"],
     queryFn: trust.accountEndorsements,
     enabled,
-    refetchInterval: 4000,
+    refetchInterval: gateInterval,
   });
   const trustMap = useDeviceTrustMap(enabled);
   const passkey = usePasskeyTrust();
@@ -80,6 +90,7 @@ export function SessionApprovalGate() {
     trustMap.keyedHosts.length > 0 &&
     currentDevice !== undefined &&
     !currentTrusted;
+  cardUp.current = show;
 
   // Yield to the ceremony dialog the moment a pairing involving this device is
   // live — the number check renders above and replaces this card's guidance.
