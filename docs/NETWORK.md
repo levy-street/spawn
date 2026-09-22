@@ -12,7 +12,7 @@ As verified on 2026-08-25, nginx terminates the Let's Encrypt certificate for
 `spawnd.dev` and proxies to Next on `localhost:3001`, including WebSocket
 upgrade headers. Next proxies `/api/*` and `/ws/*` to the API on
 `127.0.0.1:8001`. coturn listens on UDP and TCP 3478 with `use-auth-secret`,
-realm `spawnd.dev`, and `external-ip=98.83.222.112/10.0.0.127`. There is no
+realm `spawnd.dev`, and `external-ip=100.26.16.161/10.0.0.127`. There is no
 TURN TLS listener today.
 
 Use a dedicated nginx `/ws/` location with 300-second read and send timeouts.
@@ -37,7 +37,7 @@ all preserved the upgrade; an HTTP-only health check cannot prove it.
 The server and coturn must share one secret:
 
 ```dotenv
-SPAWN_TURN_URLS=turn:98.83.222.112:3478?transport=udp,turn:98.83.222.112:3478?transport=tcp
+SPAWN_TURN_URLS=turn:100.26.16.161:3478?transport=udp,turn:100.26.16.161:3478?transport=tcp
 SPAWN_TURN_SECRET=<same random secret as coturn static-auth-secret>
 ```
 
