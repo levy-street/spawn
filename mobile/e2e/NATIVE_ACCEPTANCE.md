@@ -120,8 +120,12 @@ are not retried or accepted when setup fails.
 The controller records fixed startup phases and redacted local failures in
 `native.log`, even when fixture event reporting is unavailable. The bounded
 HTTP trace includes known control routes and token-presence flags without
-recording tokens or request content. Once fixture provisioning is ready, app
-boot has its own 180-second limit; failure starts no connection cases. Runner
+recording tokens or request content. Provisioning gives the fixture daemon
+180 seconds to register (`daemon_registered` in `fixture-lifecycle.jsonl`
+records how long it took; the macOS runner hashes the unoptimized pair into
+its release store before the daemon's first log line). Once provisioning is
+ready, app boot has its own 180-second limit; failure starts no connection
+cases. Runner
 failures capture a screenshot and a bounded, redacted Android accessibility
 dump on the validated emulator. Diagnostic failures preserve the original
 failure, and temporary accessibility files are removed from that emulator.

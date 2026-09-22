@@ -29,7 +29,15 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 MAX_EVENTS = 20000
 MAX_LIFECYCLE_EVENTS = 32
-PROVISION_TIMEOUT_SECONDS = 75
+# Provisioning is the isolated server, TURN, possession, the fixture daemon's
+# registration and two sessions coming up. The daemon is the slow part: on the
+# GitHub macOS runner it spends about 35 seconds hashing the unoptimized
+# spawnd/spawn-worker pair into its release store before it writes its first
+# log line (measured 2026-09-22: launched 13:05:04, first line 13:05:39,
+# registered 13:05:40). A 45-second registration deadline left five seconds
+# of margin and failed three of four runs that day with an empty daemon.log.
+DAEMON_REGISTRATION_SECONDS = 180
+PROVISION_TIMEOUT_SECONDS = 240
 CONTROL_TRACE_PATHS = frozenset(
     {
         "config",
@@ -676,7 +684,8 @@ class Fixture:
             env=daemon_env,
             cwd=self.scratch,
         )
-        deadline = time.monotonic() + 45
+        launched = time.monotonic()
+        deadline = launched + DAEMON_REGISTRATION_SECONDS
         while time.monotonic() < deadline:
             self.raise_if_failed()
             host = await self.request("GET", f"/api/hosts/{self.host_id}")
@@ -687,6 +696,11 @@ class Fixture:
             await asyncio.sleep(0.1)
         else:
             raise RuntimeError("fixture daemon never registered")
+        # How close the daemon came to the deadline is the number to read when
+        # this lane fails with an empty daemon.log again.
+        self.lifecycle(
+            "daemon_registered", seconds=round(time.monotonic() - launched, 1)
+        )
         for label in ("a", "b"):
             cwd = self.cwd / label
             cwd.mkdir()

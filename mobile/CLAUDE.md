@@ -180,7 +180,9 @@ Metro exports, Expo Go, and generated native projects do not satisfy that gate.
 Fixture preparation copies the daemon pair and exposes build configuration;
 the native runner activates live accounts, daemon and sessions only after app
 installation. Startup and liveness failures fail evidence without restarting
-fixture processes.
+fixture processes. The fixture daemon has 180 seconds to register (the macOS
+runner hashes the unoptimized pair into its release store first); the
+lifecycle log records how long it took.
 After fixture readiness, app boot has a separate 180-second deadline. Local
 startup diagnostics and validated-device failure captures remain available
 when the acceptance control channel cannot report an error.
