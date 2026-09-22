@@ -1,5 +1,6 @@
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type {
+  AgentNotice,
   ConnectionInfo,
   ScrollState,
   TransportState,
@@ -166,6 +167,7 @@ export type WorkerToNativeMessage =
     })
   | (WorkerMessage & { type: "title"; title: string })
   | (WorkerMessage & { type: "bell" })
+  | (WorkerMessage & { type: "agent-notice"; notice: AgentNotice | null })
   | (WorkerMessage & { type: "scroll-state"; scroll: ScrollState })
   | (WorkerMessage & { type: "selection"; text: string; requestId?: string })
   | (WorkerMessage & { type: "native-selection"; active: boolean })
@@ -310,6 +312,7 @@ const WORKER_MESSAGE_TYPES = new Set([
   "sign-request",
   "title",
   "bell",
+  "agent-notice",
   "scroll-state",
   "selection",
   "native-selection",

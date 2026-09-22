@@ -513,3 +513,93 @@ async def test_session_cross_user_scoping(client):
     ).status_code == 404
     assert (await client.delete(f"/api/sessions/{session_id}", headers=other)).status_code == 404
     assert (await client.get(f"/api/sessions/{session_id}", headers=owner)).status_code == 200
+
+
+async def test_session_remembers_the_conversation_its_agent_started(client):
+    """The conversation id the client typed after `--session-id` is kept with
+    the window, survives a restart (that is what a restart resumes), travels
+    with a retype, and is refused in any spelling a shell would need to quote."""
+    token = await _signup(client, "session-conversation@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host("session-conversation@example.com")
+    claude = await _builtin_agent_id(client, auth, "claude-code")
+    codex = await _builtin_agent_id(client, auth, "codex")
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+    try:
+        conversation = "3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10"
+        r = await client.post(
+            "/api/sessions",
+            json={
+                "host_id": host_id,
+                "cwd": "/repo",
+                "agent_id": claude,
+                "agent_session_id": conversation,
+            },
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+        session_id = r.json()["id"]
+        assert r.json()["agent_session_id"] == conversation
+
+        # A restart is what resumes the conversation, so it must not lose it.
+        r = await client.post(f"/api/sessions/{session_id}/restart", headers=auth)
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_session_id"] == conversation
+        r = await client.get(f"/api/sessions/{session_id}", headers=auth)
+        assert r.json()["agent_session_id"] == conversation
+
+        # Launching another agent into the window is a new conversation: a
+        # retype that names none clears the old one rather than pointing a
+        # resume at a thread this window has left...
+        r = await client.patch(
+            f"/api/sessions/{session_id}", json={"agent_id": codex}, headers=auth
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_id"] == codex
+        assert r.json()["agent_session_id"] is None
+
+        # ...and a retype that names one keeps it.
+        r = await client.patch(
+            f"/api/sessions/{session_id}",
+            json={"agent_id": claude, "agent_session_id": "conv-2"},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_session_id"] == "conv-2"
+
+        # Stopping back to a bare prompt ends the conversation with the agent.
+        r = await client.patch(
+            f"/api/sessions/{session_id}",
+            json={"agent_id": None, "agent_session_id": "conv-3"},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_id"] is None
+        assert r.json()["agent_session_id"] is None
+
+        # The id is typed into a shell verbatim, so nothing a shell would have
+        # to quote is accepted.
+        r = await client.patch(
+            f"/api/sessions/{session_id}",
+            json={"agent_id": claude, "agent_session_id": "rm -rf ~"},
+            headers=auth,
+        )
+        assert r.status_code == 422, r.text
+
+        # A plain shell window has no conversation to remember.
+        r = await client.post(
+            "/api/sessions",
+            json={"host_id": host_id, "cwd": "/repo", "agent_session_id": conversation},
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["agent_id"] is None
+        assert r.json()["agent_session_id"] is None
+    finally:
+        await broker.unregister_daemon(daemon)

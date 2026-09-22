@@ -20,6 +20,7 @@ function renderScreen() {
 }
 
 interface MockTerminalData {
+  agents: never[];
   error: Error | null;
   host: Record<string, unknown> | null;
   isLoading: boolean;
@@ -114,6 +115,7 @@ function dataFor(state: "loading" | "error" | "connected"): MockTerminalData {
       error: null,
       host: null,
       isLoading: true,
+      agents: [],
       refetch: jest.fn(async () => undefined),
       session: null,
     };
@@ -123,11 +125,13 @@ function dataFor(state: "loading" | "error" | "connected"): MockTerminalData {
       error: new Error("Unavailable"),
       host: null,
       isLoading: false,
+      agents: [],
       refetch: jest.fn(async () => undefined),
       session: null,
     };
   }
   return {
+    agents: [],
     error: null,
     host: { id: "host" },
     isLoading: false,

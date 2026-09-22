@@ -26,7 +26,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { AgentIcon } from "@/components/icons/AgentIcon";
+import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { confirm } from "@/components/ui/confirm";
@@ -37,13 +37,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { hostStatusTone, SessionStatusDot, StatusDot } from "@/components/ui/status";
-import { type Host, hosts, type Session, sessions } from "@/lib/api";
+import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@/lib/api";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
 import { basename } from "@/lib/paths";
 import { sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
+import { restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher } from "./agent-switcher";
 import { FolderPicker } from "./folder-picker";
 import { pendingLaunch } from "./pending-launch";
@@ -60,6 +61,10 @@ function MenuHint({ children }: { children: ReactNode }) {
 import { runInShell, stillRunningMessage } from "./shell-handoff";
 
 export type PaneSlotTarget = { el: HTMLElement; stacked: boolean };
+
+/** How long a queued launch waits for the pane's terminal handle: 100 ms
+ *  polls, so about five seconds — far longer than a handle ever lags. */
+const PENDING_LAUNCH_HANDLE_TRIES = 50;
 
 function writeSessionToCache(
   queryClient: ReturnType<typeof useQueryClient>,
@@ -132,8 +137,7 @@ export function SessionPane({
   const paneHost = hostList.find((host) => host.id === session?.host_id) ?? null;
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const { attach, connInfo, getHandle } = useLiveTerminal(session ? sessionId : null);
-  const launchedRef = useRef(false);
+  const { attach, connInfo, getHandle, agentNotice } = useLiveTerminal(session ? sessionId : null);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);
@@ -153,17 +157,36 @@ export function SessionPane({
     [sessionId],
   );
 
-  // An agent picked from the "+" menu starts by being typed into this shell,
-  // once its transport can actually carry the keystrokes.
+  // An agent picked from the "+" menu — or queued by a restart for the shell
+  // that replaces this one — starts by being typed into the shell, once its
+  // transport can actually carry the keystrokes. Every time the transport
+  // opens, not once per pane: a restart closes and reopens it, and the
+  // command it queued belongs to the shell on the far side of that reopen.
+  // The handle can lag the transport by a render or two, so the command is
+  // only claimed once something can type it; a claim that could not be typed
+  // is a launch silently lost.
+  const socketOpen = connInfo?.socketState === "open";
   useEffect(() => {
-    if (launchedRef.current || !session || connInfo?.socketState !== "open") return;
-    launchedRef.current = true;
-    const command = pendingLaunch.take(sessionId);
-    if (!command) return;
-    const handle = getHandle();
-    handle?.sendInput(`${command}\r`);
-    requestAnimationFrame(() => handle?.focus());
-  }, [connInfo?.socketState, getHandle, session, sessionId]);
+    if (!session || !socketOpen || !pendingLaunch.has(sessionId)) return;
+    let cancelled = false;
+    let tries = 0;
+    const attempt = () => {
+      if (cancelled) return;
+      const handle = getHandle();
+      if (!handle) {
+        if (tries++ < PENDING_LAUNCH_HANDLE_TRIES) window.setTimeout(attempt, 100);
+        return;
+      }
+      const command = pendingLaunch.take(sessionId);
+      if (!command) return;
+      handle.sendInput(`${command}\r`);
+      requestAnimationFrame(() => handle.focus());
+    };
+    attempt();
+    return () => {
+      cancelled = true;
+    };
+  }, [socketOpen, getHandle, session, sessionId]);
 
   const renameM = useMutation({
     mutationFn: (name: string | null) => sessions.update(sessionId, { name }),
@@ -175,10 +198,29 @@ export function SessionPane({
     },
     onError: (error) => onError(String(error)),
   });
+  // Restart brings the window back as what it was opened as: a shell, or its
+  // agent back in the same conversation — in the shell it already has where
+  // the agent will quit, in a fresh one otherwise (`agent-restart.ts`).
   const restartM = useMutation({
-    mutationFn: () => sessions.restart(sessionId),
-    onSuccess: (saved) => {
-      writeSessionToCache(queryClient, saved);
+    mutationFn: async () => {
+      if (!session) throw new Error("This session no longer exists.");
+      const definitions = await queryClient
+        .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
+        .catch(() => []);
+      return restartSessionAgent({
+        session,
+        agents: definitions,
+        handle: getHandle(),
+        handoff: runInShell,
+        restart: async () => {
+          const saved = await sessions.restart(sessionId);
+          writeSessionToCache(queryClient, saved);
+          return saved;
+        },
+        onSession: (latest) => writeSessionToCache(queryClient, latest),
+      });
+    },
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       onError(null);
       requestAnimationFrame(() => getHandle()?.focus());
@@ -528,6 +570,34 @@ export function SessionPane({
       {session ? (
         <div className="relative min-h-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
+          {agentNotice === "update_installed" && session.status === "running" && (
+            /* The agent's own status bar says it has updated itself and needs
+               relaunching. Offered here, over the pane, as the one click the
+               notice is asking for: quit, relaunch on the new version, resume
+               the conversation. Kept off the bottom rows, where the agent's
+               prompt and that status bar live. */
+            <div className="pointer-events-none absolute inset-x-0 top-2 z-20 flex justify-center px-2">
+              <div
+                role="status"
+                className="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border border-border bg-popover px-3 py-1.5 text-xs shadow-lg"
+              >
+                <span className="truncate text-muted-foreground">
+                  {agentDisplayName(session.foreground_command)} installed an update.
+                </span>
+                <button
+                  type="button"
+                  disabled={restartM.isPending}
+                  onClick={() => restartM.mutate()}
+                  className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-primary px-2.5 font-medium text-primary-foreground disabled:opacity-50"
+                >
+                  <RotateCcw className="size-3.5" aria-hidden />
+                  {restartM.isPending
+                    ? "Restarting…"
+                    : `Restart ${agentDisplayName(session.foreground_command)}`}
+                </button>
+              </div>
+            </div>
+          )}
           {(session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex max-w-xs flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 text-center shadow-lg">

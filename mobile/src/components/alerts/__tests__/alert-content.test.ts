@@ -32,6 +32,7 @@ const SESSION: Session = {
   activity_label: "Awaiting input",
   foreground_command: "helper",
   agent_id: null,
+  agent_session_id: null,
 };
 
 function alert(overrides: Partial<AlertEvent> = {}): AlertEvent {

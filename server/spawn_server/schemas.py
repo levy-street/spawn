@@ -236,7 +236,6 @@ class AdminInviteOut(BaseModel):
     url: str | None = None
 
 
-
 # ---------- waitlist ----------
 
 
@@ -273,6 +272,7 @@ class AdminWaitlistEntryOut(BaseModel):
     invite_state: Literal["pending", "used", "expired", "revoked"] | None = None
     # Whether an account now exists for the address, however it got in.
     has_account: bool = False
+
 
 class AdminMailStatus(BaseModel):
     backend: str
@@ -1257,6 +1257,12 @@ class SkillLaunchConfig(BaseModel):
 # ---------- sessions ----------
 
 
+# A conversation id is typed into a shell after the agent's command, so it is
+# held to the characters that never need quoting there. Agent CLIs use UUIDs;
+# the pattern leaves room for any other token an agent might spell.
+AGENT_SESSION_ID_PATTERN = r"^[A-Za-z0-9._:-]{1,64}$"
+
+
 class TilePlacement(BaseModel):
     """An explicit grid position for a newly created session's tile."""
 
@@ -1277,6 +1283,9 @@ class SessionCreate(BaseModel):
     # command into it — and this is what makes the window's type outlive the
     # process, so a duplicate can reproduce it.
     agent_id: str | None = None
+    # The conversation the client is starting that agent with (what it types
+    # after `--session-id`), so a restart can resume it. Opaque to the server.
+    agent_session_id: str | None = Field(default=None, pattern=AGENT_SESSION_ID_PATTERN)
     # Omitted -> all skills marked enabled_by_default.
     skill_ids: list[str] | None = None
     # Optional: transactionally append a tile for this session to a workspace.
@@ -1290,6 +1299,9 @@ class SessionPatch(BaseModel):
     # Sent when an agent is launched into a running window, and sent as null
     # when the window is stopped back to a bare prompt. Omitted leaves it be.
     agent_id: str | None = None
+    # Travels with `agent_id`: a fresh conversation id for a fresh launch, null
+    # when the window is stopped back to a prompt. Omitted leaves it be.
+    agent_session_id: str | None = Field(default=None, pattern=AGENT_SESSION_ID_PATTERN)
 
 
 class SessionOut(BaseModel):
@@ -1312,6 +1324,9 @@ class SessionOut(BaseModel):
     # What this window was opened as; `foreground_command` is what is running
     # in it now. See models.Session.agent_id.
     agent_id: str | None = None
+    # The conversation that agent was started with, for a restart to resume.
+    # See models.Session.agent_session_id.
+    agent_session_id: str | None = None
 
 
 # ---------- workspaces ----------
@@ -1458,6 +1473,7 @@ class WorkspaceFirstSession(BaseModel):
     host_id: str
     cwd: str
     agent_id: str | None = None
+    agent_session_id: str | None = Field(default=None, pattern=AGENT_SESSION_ID_PATTERN)
     skill_ids: list[str] | None = None
 
 

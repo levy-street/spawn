@@ -1,4 +1,4 @@
-import { agentRunCommand } from "@/components/launcher/agent-command";
+import { agentLaunchCommand, newAgentConversationId } from "@/components/launcher/agent-command";
 import { autoPlaceWorkspaceTiles } from "@/components/launcher/launcher-selection";
 import type { PendingLaunchStore } from "@/components/launcher/pending-launch";
 import type { AgentOut } from "@/data/api/schemas/agents";
@@ -33,11 +33,14 @@ export interface LaunchDependencies {
     cwd: string;
     name?: string;
     agent_id?: string;
+    agent_session_id?: string | null;
     workspace_id: string;
     tile: { x: number; y: number; w: number; h: number };
   }): Promise<SessionOut>;
   deleteSession(sessionId: string): Promise<void>;
-  /** Ids for widget tiles, which the server never mints one for. */
+  /** Ids for widget tiles, which the server never mints one for — and for
+   *  the conversation an agent is started under, which SPAWN D names so a
+   *  restart can resume it. */
   newId(): string;
   pending: PendingLaunchStore;
 }
@@ -112,20 +115,27 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
       await dependencies.patchWorkspace(workspace.id, { layout });
 
       const trimmedName = request.name?.trim();
+      // The conversation the agent starts under, chosen here so the window
+      // can record it and a restart can resume it; null for a CLI that names
+      // its own.
+      const conversation = request.agent
+        ? newAgentConversationId(request.agent.kind, dependencies.newId)
+        : null;
       const session = await dependencies.createSession({
         host_id: request.hostId,
         cwd: request.cwd,
         // The window is a shell an agent is about to be typed into; recording
         // which one is what makes it that kind of window, so a duplicate of it
-        // opens as one too.
-        ...(request.agent ? { agent_id: request.agent.id } : {}),
+        // opens as one too — and which conversation it is starting, so a
+        // restart can bring it back to it.
+        ...(request.agent ? { agent_id: request.agent.id, agent_session_id: conversation } : {}),
         workspace_id: request.workspaceId,
         tile: placement.tile,
         ...(trimmedName ? { name: trimmedName } : {}),
       });
       if (!request.agent) return { status: "launched", session, pendingCommand: false };
 
-      const command = agentRunCommand(request.agent);
+      const command = agentLaunchCommand(request.agent, conversation);
       try {
         await dependencies.pending.persist(session.id, command);
         return { status: "launched", session, pendingCommand: true };

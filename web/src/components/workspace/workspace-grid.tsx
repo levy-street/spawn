@@ -54,7 +54,7 @@ import {
   withTabTiles,
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentRunCommand } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
@@ -660,13 +660,15 @@ export function WorkspaceGrid({
         // before its agent has taken the foreground — and stays one if the
         // agent is later quit.
         const agent = sessionAgent(session, definitions);
+        // A copy is the same kind of window in a conversation of its own.
+        const conversation = agent ? newAgentConversationId(agent.kind) : null;
         const created = await sessionsApi.create({
           host_id: session.host_id,
           cwd: session.cwd,
-          ...(agent && { agent_id: agent.id }),
+          ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
           ...(skillIds.length > 0 && { skill_ids: skillIds }),
         });
-        if (agent) pendingLaunch.set(created.id, agentRunCommand(agent));
+        if (agent) pendingLaunch.set(created.id, agentLaunchCommand(agent, conversation));
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});
           throw new Error("This tab is full — close a window before duplicating another.");

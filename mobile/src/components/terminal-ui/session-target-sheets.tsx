@@ -1,7 +1,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { randomUUID } from "expo-crypto";
 import { useCallback, useState } from "react";
 
-import { shellQuote } from "@/components/launcher/agent-command";
+import {
+  agentInstallAndLaunchCommand,
+  agentLaunchCommand,
+  newAgentConversationId,
+  shellQuote,
+} from "@/components/launcher/agent-command";
 import { FolderPicker } from "@/components/launcher/folder-picker";
 import { pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
 import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
@@ -18,14 +24,7 @@ import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { qk } from "@/data/queryKeys";
-import {
-  agentInstallAndRunCommand,
-  agentRunCommand,
-  commandBasename,
-  identifyAgent,
-  isShellCommand,
-  sortAgents,
-} from "@/data/selectors/agent";
+import { commandBasename, identifyAgent, isShellCommand, sortAgents } from "@/data/selectors/agent";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import type { HostTransport, TransportState } from "@/terminal/transport/types";
 import { sizing } from "@/theme/sizing";
@@ -102,7 +101,7 @@ export function SessionTargetSheets({
     purpose: string,
     /** Omitted where the command changes what the window is doing but not what
      *  it is — a `cd` is not a change of type. */
-    retype?: { agentId: string | null },
+    retype?: { agentId: string | null; conversationId: string | null },
   ) => {
     const result = await handoff({ session, terminal, command, purpose });
     if (result === "busy") {
@@ -111,7 +110,10 @@ export function SessionTargetSheets({
     }
     if (result !== "sent" || retype === undefined) return;
     try {
-      const saved = await patchSession(session.id, { agent_id: retype.agentId });
+      const saved = await patchSession(session.id, {
+        agent_id: retype.agentId,
+        agent_session_id: retype.conversationId,
+      });
       queryClient.setQueryData(qk.session(session.id), saved);
       void queryClient.invalidateQueries({ queryKey: qk.sessions() });
     } catch {
@@ -128,10 +130,11 @@ export function SessionTargetSheets({
   const foreground = session.foreground_command;
   const atShell = isShellCommand(foreground) || !commandBasename(foreground);
 
-  const agentCommand = (agent: AgentOut): string =>
+  const agentCommand = (agent: AgentOut, conversation: string | null): string =>
     installed.has(agent.id)
-      ? agentRunCommand(agent)
-      : (agentInstallAndRunCommand(agent) ?? agentRunCommand(agent));
+      ? agentLaunchCommand(agent, conversation)
+      : (agentInstallAndLaunchCommand(agent, conversation) ??
+        agentLaunchCommand(agent, conversation));
 
   const actions: ActionSheetAction[] = [
     {
@@ -144,7 +147,8 @@ export function SessionTargetSheets({
       accessibilityRole: "radio",
       // Deliberately back at a prompt: a shell window again, and a
       // duplicate of it should be one.
-      onPress: () => void run("", "Returning to the shell", { agentId: null }),
+      onPress: () =>
+        void run("", "Returning to the shell", { agentId: null, conversationId: null }),
     },
     ...agents.map((agent): ActionSheetAction => {
       const current = commandBasename(agent.command) === commandBasename(foreground);
@@ -160,8 +164,15 @@ export function SessionTargetSheets({
         ),
         selected: current,
         accessibilityRole: "radio",
-        onPress: () =>
-          void run(agentCommand(agent), `Running ${agent.name}`, { agentId: agent.id }),
+        onPress: () => {
+          // A launch is a new conversation: named up front where the CLI lets
+          // us, so a restart later can resume this one rather than "the latest".
+          const conversation = newAgentConversationId(agent.kind, randomUUID);
+          void run(agentCommand(agent, conversation), `Running ${agent.name}`, {
+            agentId: agent.id,
+            conversationId: conversation,
+          });
+        },
       };
     }),
   ];

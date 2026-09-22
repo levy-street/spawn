@@ -13,6 +13,9 @@ export const SessionCreateSchema = z.object({
   name: z.string().max(128).nullable().optional(),
   /** The agent this window is being opened as: the type a duplicate copies. */
   agent_id: UUIDSchema.nullable().optional(),
+  /** The conversation that agent is being started with, for a restart to
+   *  resume. Only meaningful with `agent_id`. */
+  agent_session_id: z.string().max(64).nullable().optional(),
   skill_ids: z.array(UUIDSchema).nullable().optional(),
   workspace_id: UUIDSchema.nullable().optional(),
   tile: TilePlacementSchema.nullable().optional(),
@@ -22,6 +25,9 @@ export const SessionPatchSchema = z.object({
   /** Sent when an agent is launched into a running window, and sent as null
    *  when it is stopped back to a bare prompt. Omitted leaves the type be. */
   agent_id: UUIDSchema.nullable().optional(),
+  /** Travels with `agent_id`: a fresh conversation for a fresh launch, null
+   *  for a stop. */
+  agent_session_id: z.string().max(64).nullable().optional(),
 });
 export const SessionOutSchema = z.object({
   id: UUIDSchema,
@@ -45,6 +51,12 @@ export const SessionOutSchema = z.object({
    * so a bundle that reaches a phone before its server does still parses.
    */
   agent_id: UUIDSchema.nullable().default(null),
+  /**
+   * The conversation that agent was started with — what SPAWN D typed after
+   * `--session-id` — so a restart can `--resume` it. Null for a window whose
+   * agent was started by hand, or before this was recorded.
+   */
+  agent_session_id: z.string().nullable().default(null),
 });
 
 export type TilePlacement = z.infer<typeof TilePlacementSchema>;

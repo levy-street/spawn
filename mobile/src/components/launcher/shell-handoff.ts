@@ -40,12 +40,15 @@ export async function runInShell({
   getSession,
   onSession,
   wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  attempts = SHELL_HANDOFF_ATTEMPTS,
 }: {
   session: HandoffSession;
   terminal: ShellCommandSink | null;
   command: string;
   purpose: string;
-  confirmStop(input: {
+  /** Asks before the agent is interrupted. Omitted when the tap itself was
+   *  the consent — a "Restart Claude Code" button asks nothing further. */
+  confirmStop?(input: {
     title: string;
     description: string;
     confirmLabel: string;
@@ -53,6 +56,8 @@ export async function runInShell({
   getSession(sessionId: string): Promise<HandoffSession>;
   onSession?: (session: HandoffSession) => void;
   wait?: (milliseconds: number) => Promise<void>;
+  /** How many polls the agent gets to quit before it is reported still running. */
+  attempts?: number;
 }): Promise<ShellHandoffResult> {
   if (!terminal) return "cancelled";
   if (sessionAtShell(session)) {
@@ -61,14 +66,16 @@ export async function runInShell({
   }
 
   const foreground = foregroundName(session);
-  const proceed = await confirmStop({
-    title: `Stop ${foreground} first?`,
-    description: `${purpose} types a command at the shell prompt, and ${foreground} is holding this window's keyboard. Stopping it interrupts whatever it is doing.`,
-    confirmLabel: `Stop ${foreground}`,
-  });
-  if (!proceed) return "cancelled";
+  if (confirmStop) {
+    const proceed = await confirmStop({
+      title: `Stop ${foreground} first?`,
+      description: `${purpose} types a command at the shell prompt, and ${foreground} is holding this window's keyboard. Stopping it interrupts whatever it is doing.`,
+      confirmLabel: `Stop ${foreground}`,
+    });
+    if (!proceed) return "cancelled";
+  }
 
-  for (let attempt = 0; attempt < SHELL_HANDOFF_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (attempt < SHELL_HANDOFF_INTERRUPTS) terminal.sendInput(INTERRUPT);
     await wait(SHELL_HANDOFF_POLL_MS);
     const latest = await getSession(session.id).catch(() => null);

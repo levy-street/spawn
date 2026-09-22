@@ -438,7 +438,7 @@ export function WorkspaceDetail({
           }}
           onRestart={(session) => {
             void run(
-              () => actions.restartSession(session),
+              () => actions.restartSession(session, agents),
               () => setPaneTarget(null),
             );
           }}

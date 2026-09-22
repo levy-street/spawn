@@ -174,16 +174,21 @@ async def create_session_row(
     name: str | None,
     skill_ids: list[str] | None,
     agent_id: str | None = None,
+    agent_session_id: str | None = None,
 ) -> Session:
     """Add the Session row and its skill grants inside the open transaction."""
     explicit_name = name.strip() if name and name.strip() else None
+    resolved_agent_id = await resolve_agent_id(db, user=user, agent_id=agent_id)
     session_row = Session(
         owner_user_id=user.id,
         host_id=host.id,
         cwd=cwd,
         name=explicit_name or _default_session_name(host.name, cwd),
         status="starting",
-        agent_id=await resolve_agent_id(db, user=user, agent_id=agent_id),
+        agent_id=resolved_agent_id,
+        # A conversation belongs to an agent; without one there is nothing it
+        # could name.
+        agent_session_id=agent_session_id if resolved_agent_id is not None else None,
     )
     db.add(session_row)
     await db.flush()
@@ -275,6 +280,15 @@ async def patch_session(
     # prompt says it is a shell again; omitting the field leaves the type be.
     if "agent_id" in body.model_fields_set:
         session_row.agent_id = await resolve_agent_id(db, user=user, agent_id=body.agent_id)
+        # A new launch is a new conversation and a stop is the end of one, so
+        # a retype that says nothing about the conversation clears it rather
+        # than leaving a resume pointed at a thread this window is no longer in.
+        session_row.agent_session_id = None
+    if "agent_session_id" in body.model_fields_set:
+        # Only an agent window has a conversation to name.
+        session_row.agent_session_id = (
+            body.agent_session_id if session_row.agent_id is not None else None
+        )
 
     await db.commit()
     await db.refresh(session_row)
@@ -313,6 +327,7 @@ async def create_session(
         name=body.name,
         skill_ids=body.skill_ids,
         agent_id=body.agent_id,
+        agent_session_id=body.agent_session_id,
     )
 
     if workspace is not None:

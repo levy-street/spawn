@@ -14,6 +14,7 @@ import {
 } from "@/terminal/transport/host-transport-registry";
 import { SessionUploadCoordinator } from "@/terminal/transport/session-upload";
 import type {
+  AgentNotice,
   ConnectionInfo,
   DisplayControlState,
   ScrollState,
@@ -38,6 +39,7 @@ type StateListener = (state: TransportState) => void;
 type ErrorListener = (error: TransportError) => void;
 type TitleListener = (title: string) => void;
 type BellListener = () => void;
+type AgentNoticeListener = (notice: AgentNotice | null) => void;
 type ScrollListener = (scroll: ScrollState) => void;
 type DiagnosticListener = (diagnostic: WorkerDiagnostic) => void;
 type DisplayListener = (display: DisplayControlState) => void;
@@ -77,6 +79,7 @@ class WebViewSessionTransport implements SessionTransport {
   readonly #errorListeners = new Set<ErrorListener>();
   readonly #titleListeners = new Set<TitleListener>();
   readonly #bellListeners = new Set<BellListener>();
+  readonly #agentNoticeListeners = new Set<AgentNoticeListener>();
   readonly #scrollListeners = new Set<ScrollListener>();
   readonly #diagnosticListeners = new Set<DiagnosticListener>();
   readonly #displayListeners = new Set<DisplayListener>();
@@ -245,6 +248,7 @@ class WebViewSessionTransport implements SessionTransport {
   on(ev: "error", fn: ErrorListener): () => void;
   on(ev: "title", fn: TitleListener): () => void;
   on(ev: "bell", fn: BellListener): () => void;
+  on(ev: "agent-notice", fn: AgentNoticeListener): () => void;
   on(ev: "scroll", fn: ScrollListener): () => void;
   on(ev: "diagnostic", fn: DiagnosticListener): () => void;
   on(ev: "display", fn: DisplayListener): () => void;
@@ -255,6 +259,7 @@ class WebViewSessionTransport implements SessionTransport {
       | "error"
       | "title"
       | "bell"
+      | "agent-notice"
       | "scroll"
       | "diagnostic"
       | "display"
@@ -264,6 +269,7 @@ class WebViewSessionTransport implements SessionTransport {
       | ErrorListener
       | TitleListener
       | BellListener
+      | AgentNoticeListener
       | ScrollListener
       | DiagnosticListener
       | DisplayListener
@@ -280,6 +286,7 @@ class WebViewSessionTransport implements SessionTransport {
       | "error"
       | "title"
       | "bell"
+      | "agent-notice"
       | "scroll"
       | "diagnostic"
       | "display"
@@ -290,6 +297,7 @@ class WebViewSessionTransport implements SessionTransport {
       error: this.#errorListeners,
       title: this.#titleListeners,
       bell: this.#bellListeners,
+      "agent-notice": this.#agentNoticeListeners,
       scroll: this.#scrollListeners,
       diagnostic: this.#diagnosticListeners,
       display: this.#displayListeners,
@@ -442,6 +450,9 @@ class WebViewSessionTransport implements SessionTransport {
         break;
       case "bell":
         for (const listener of this.#bellListeners) listener();
+        break;
+      case "agent-notice":
+        for (const listener of this.#agentNoticeListeners) listener(message.notice);
         break;
       case "display": {
         this.#displayOwner = message.owner;

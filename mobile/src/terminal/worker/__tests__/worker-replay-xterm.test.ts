@@ -158,3 +158,50 @@ function bufferLines(term: XTerm): string[] {
     });
   });
 });
+
+(xtermPresent ? describe : describe.skip)("agent notices read off the screen", () => {
+  const settle = () => new Promise((done) => setTimeout(done, 600));
+  const noticePosts = (worker: Harness) =>
+    worker.post.mock.calls
+      .map(([message]: [{ type?: string; notice?: string | null }]) => message)
+      .filter((message) => message?.type === "agent-notice")
+      .map((message) => message.notice);
+
+  test("Claude Code's 'Update installed · Restart to update' status bar is reported once", async () => {
+    const term = realTerminal(8, 60);
+    await runWorker(harness(term), async (worker) => {
+      const requestId = openGates(worker);
+      await replay(
+        worker,
+        requestId,
+        seed(
+          ["❯ hello"],
+          "\x1b[7;1H⏵⏵ bypass permissions on · 1 monitor\r\n✓ Update installed · Restart to update",
+        ),
+      );
+      await settle();
+      expect(noticePosts(worker)).toEqual(["update_installed"]);
+      expect(worker.error).not.toHaveBeenCalled();
+    });
+  });
+
+  test("an ordinary screen says nothing, and a new generation withdraws a notice", async () => {
+    const term = realTerminal(8, 60);
+    await runWorker(harness(term), async (worker) => {
+      const requestId = openGates(worker);
+      await replay(worker, requestId, seed(["$ ls", "README.md"], "$ "));
+      await settle();
+      expect(noticePosts(worker)).toEqual([]);
+
+      await new Promise<void>((done) =>
+        term.write("\r\n✓ Update installed · Restart to apply", () => done()),
+      );
+      // Live output goes through the worker's own write queue; the seed above
+      // is enough to show a direct paint is not what schedules the scan, so
+      // drive it the way the session does.
+      worker.resetSessionGeneration?.();
+      await settle();
+      expect(noticePosts(worker)).toEqual([]);
+    });
+  });
+});

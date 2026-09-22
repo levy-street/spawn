@@ -120,8 +120,11 @@ Honest inventory, from the current wire protocol:
 **Metadata and values the server currently keeps seeing** — accounts and
 password hashes; host names/OS/arch/version/last-seen; workspace names,
 positions, and layouts; session names, host relationships, working directories,
-lifecycle state, exit codes, foreground executable basenames, and activity
-timestamps; agent-definition names, kinds, commands, environment prefixes, and
+lifecycle state, exit codes, foreground executable basenames, activity
+timestamps, the agent definition a window was opened as, and the opaque
+conversation id the client handed that agent at launch (`agent_session_id`,
+what a restart resumes — an identifier the client chose, never read by the
+server); agent-definition names, kinds, commands, environment prefixes, and
 install commands; skill names, descriptions, bodies, defaults, and session
 grants; public trust material; connection/signaling timing; and IP addresses.
 Host-agent availability flows expose the definition target, installed

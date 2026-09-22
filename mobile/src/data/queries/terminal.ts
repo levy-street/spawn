@@ -1,5 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { type AgentRestartResult, restartSessionAgent } from "@/components/launcher/agent-restart";
+import { pendingLaunches } from "@/components/launcher/pending-launch";
+import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
+import { listAgents } from "@/data/api/endpoints/agents";
 import { getHost } from "@/data/api/endpoints/hosts";
 import { getSession, patchSession, restartSession } from "@/data/api/endpoints/sessions";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -7,10 +11,17 @@ import type { SessionOut } from "@/data/api/schemas/sessions";
 import { cachedListItem } from "@/data/cached-list-item";
 import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
+import type { AgentDef } from "@/data/types/domain";
+
+/** Definitions change when someone edits them in Settings, not per keystroke. */
+const AGENTS_STALE_MS = 60_000;
 
 export interface TerminalData {
   session: SessionOut | undefined;
   host: HostOut | undefined;
+  /** Every agent definition, for naming what a restart of this window brings
+   *  back. Empty until loaded; the screen never waits on it. */
+  agents: readonly AgentDef[];
   isLoading: boolean;
   error: Error | null;
   refetch: () => Promise<void>;
@@ -32,9 +43,16 @@ export function useTerminalData(sessionId: string): TerminalData {
     ...cachedListItem<HostOut>(queryClient, qk.hosts(), hostId),
   });
 
+  const agentsQuery = useQuery({
+    queryKey: qk.agents(),
+    queryFn: listAgents,
+    staleTime: AGENTS_STALE_MS,
+  });
+
   return {
     session: sessionQuery.data,
     host: hostQuery.data,
+    agents: agentsQuery.data ?? [],
     isLoading: sessionQuery.isLoading || (hostId.length > 0 && hostQuery.isLoading),
     error:
       sessionQuery.error instanceof Error
@@ -60,12 +78,36 @@ export function useRenameTerminalSession(sessionId: string) {
   });
 }
 
+/**
+ * Restart from the open terminal: the window comes back as what it was
+ * opened as, its agent resumed in the same conversation where the CLI can —
+ * typed into the shell it already has when the agent will quit, into a fresh
+ * one otherwise (`agent-restart.ts`). Takes the terminal's keyboard so the
+ * first road is open to it.
+ */
 export function useRestartTerminalSession(sessionId: string) {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () => restartSession(sessionId),
-    onSuccess: (session) => {
-      queryClient.setQueryData(qk.session(sessionId), session);
+  return useMutation<AgentRestartResult, Error, ShellCommandSink | null>({
+    mutationFn: async (terminal) => {
+      const session = await getSession(sessionId);
+      const agents = await queryClient
+        .ensureQueryData({ queryKey: qk.agents(), queryFn: listAgents })
+        .catch(() => []);
+      return restartSessionAgent({
+        session,
+        agents,
+        terminal,
+        restart: async (id) => {
+          const saved = await restartSession(id);
+          queryClient.setQueryData(qk.session(id), saved);
+          return saved;
+        },
+        pending: pendingLaunches,
+        getSession,
+        onSession: (latest) => queryClient.setQueryData(qk.session(latest.id), latest),
+      });
+    },
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.sessions() });
     },
   });

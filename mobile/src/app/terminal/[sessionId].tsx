@@ -17,6 +17,7 @@ import {
   useRestartTerminalSession,
   useTerminalData,
 } from "@/data/queries/terminal";
+import { restartDetail } from "@/data/selectors/agent";
 import { useTheme } from "@/theme";
 import { bottomNavHeight } from "@/theme/sizing";
 
@@ -167,7 +168,8 @@ export default function TerminalScreen(): React.JSX.Element {
         onDismiss={() => router.back()}
         onKill={() => killSession(sessionName)}
         onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
-        onRestart={() => restart.mutateAsync().then(() => undefined)}
+        onRestart={(terminal) => restart.mutateAsync(terminal)}
+        restartDetail={restartDetail(data.session, data.agents)}
         session={data.session}
       />
     </>

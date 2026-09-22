@@ -321,6 +321,12 @@ export const SessionSchema = z.object({
    * back to a prompt.
    */
   agent_id: z.string().uuid().nullable().default(null),
+  /**
+   * The conversation that agent was started with — what SPAWN D typed after
+   * `--session-id` — so a restart can `--resume` it. Null for a window whose
+   * agent was started by hand, or before this was recorded.
+   */
+  agent_session_id: z.string().nullable().default(null),
 });
 export type Session = z.infer<typeof SessionSchema>;
 
@@ -1291,6 +1297,9 @@ export const sessions = {
     /** The agent this window is being opened as, when it is being opened as
      *  one: the type a duplicate of it reproduces. */
     agent_id?: string | null;
+    /** The conversation that agent is being started with, for a restart to
+     *  resume. Only meaningful with `agent_id`. */
+    agent_session_id?: string | null;
     skill_ids?: string[];
     workspace_id?: string;
     tile?: { x: number; y: number; w: number; h: number };
@@ -1300,7 +1309,10 @@ export const sessions = {
       body: JSON.stringify(body),
       schema: SessionSchema,
     }),
-  update: (id: string, body: { name?: string | null; agent_id?: string | null }) =>
+  update: (
+    id: string,
+    body: { name?: string | null; agent_id?: string | null; agent_session_id?: string | null },
+  ) =>
     api(`/api/sessions/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
@@ -1402,6 +1414,7 @@ export const workspaces = {
       host_id: string;
       cwd: string;
       agent_id?: string | null;
+      agent_session_id?: string | null;
       skill_ids?: string[];
     };
     host_id?: string;

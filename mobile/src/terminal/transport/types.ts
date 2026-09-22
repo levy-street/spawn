@@ -156,7 +156,17 @@ export interface SessionTransport {
   on(ev: "diagnostic", fn: (d: WorkerDiagnostic) => void): () => void;
   on(ev: "connection-info", fn: (info: ConnectionInfo) => void): () => void;
   on(ev: "display", fn: (d: DisplayControlState) => void): () => void;
+  on(ev: "agent-notice", fn: (notice: AgentNotice | null) => void): () => void;
 }
+
+/**
+ * A notice an agent CLI paints into its own status bar, read back off the
+ * rendered screen by the worker that is showing it — never off the wire, so
+ * the daemon and server stay content-blind. The one recognised so far: the
+ * agent installed a newer version of itself in the background and is still
+ * running the old one.
+ */
+export type AgentNotice = "update_installed";
 
 export interface HostControlError {
   code: string;

@@ -55,6 +55,7 @@ function session(overrides: Partial<SessionOut> = {}): SessionOut {
     activity_label: "Idle",
     foreground_command: "codex",
     agent_id: null,
+    agent_session_id: null,
     ...overrides,
   };
 }

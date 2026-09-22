@@ -1,5 +1,16 @@
 import type { AgentOut } from "@/data/api/schemas/agents";
 
+// The conversation grammar is one thing per client, spelled in the selectors
+// beside the rest of what an agent definition means; launcher code reads it
+// from here so nothing in this directory reaches past its own imports.
+export {
+  agentCanResume,
+  agentInstallAndLaunchCommand,
+  agentLaunchCommand,
+  agentResumeCommand,
+  newAgentConversationId,
+} from "@/data/selectors/agent";
+
 const SAFE_WORD = /^[A-Za-z0-9_@%+=:,./-]+$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 

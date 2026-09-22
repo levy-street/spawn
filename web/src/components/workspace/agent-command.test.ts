@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  agentCanResume,
   agentInstallAndRunCommand,
+  agentLaunchCommand,
+  agentResumeCommand,
   agentRunCommand,
   agentYoloAvailable,
   envPrefix,
+  newAgentConversationId,
   shellQuote,
 } from "@/components/workspace/agent-command";
 
@@ -124,5 +128,60 @@ describe("agentInstallAndRunCommand", () => {
   test("null when there is no install command", () => {
     expect(agentInstallAndRunCommand({ command: "codex", env: {}, install: null })).toBeNull();
     expect(agentInstallAndRunCommand({ command: "codex", env: {}, install: "  " })).toBeNull();
+  });
+});
+
+describe("conversation grammar", () => {
+  const claude = { kind: "claude-code", command: "claude", env: {} };
+  const codex = { kind: "codex", command: "codex", env: {} };
+  const hermes = { kind: "hermes", command: "hermes", env: {} };
+  const id = "3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10";
+
+  test("Claude Code is launched under an id SPAWN D chose and resumed by it", () => {
+    expect(agentLaunchCommand(claude, id)).toBe(`claude --session-id ${id}`);
+    expect(agentResumeCommand(claude, id)).toBe(`claude --resume ${id}`);
+  });
+
+  test("a Claude Code window with no recorded conversation continues the latest one", () => {
+    expect(agentLaunchCommand(claude, null)).toBe("claude");
+    expect(agentResumeCommand(claude, null)).toBe("claude --continue");
+  });
+
+  test("yolo flags and env travel with the launch and the resume alike", () => {
+    const yolo = { ...claude, yolo: true, yolo_args: "--dangerously-skip-permissions" };
+    expect(agentLaunchCommand(yolo, id)).toBe(
+      `claude --dangerously-skip-permissions --session-id ${id}`,
+    );
+    expect(agentResumeCommand({ ...yolo, env: { FOO: "1" } }, id)).toBe(
+      `FOO=1 claude --dangerously-skip-permissions --resume ${id}`,
+    );
+  });
+
+  test("Codex names its own sessions, so only the latest one can be reopened", () => {
+    expect(newAgentConversationId("codex")).toBeNull();
+    expect(agentLaunchCommand(codex, id)).toBe("codex");
+    expect(agentResumeCommand(codex, id)).toBe("codex resume --last");
+    expect(
+      agentResumeCommand(
+        { ...codex, yolo: true, yolo_args: "--dangerously-bypass-approvals-and-sandbox" },
+        null,
+      ),
+    ).toBe("codex --dangerously-bypass-approvals-and-sandbox resume --last");
+  });
+
+  test("an agent with no grammar launches plainly and cannot be resumed", () => {
+    expect(newAgentConversationId("hermes")).toBeNull();
+    expect(agentLaunchCommand(hermes, id)).toBe("hermes");
+    expect(agentResumeCommand(hermes, id)).toBeNull();
+    expect(agentCanResume("hermes")).toBe(false);
+    expect(agentCanResume("claude-code")).toBe(true);
+    expect(agentCanResume("Codex")).toBe(true);
+  });
+
+  test("a fresh conversation id is a UUID, only for a CLI that takes one", () => {
+    expect(newAgentConversationId("claude-code")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    expect(newAgentConversationId("claude-code")).not.toBe(newAgentConversationId("claude-code"));
   });
 });

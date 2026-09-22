@@ -3,6 +3,7 @@ import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
 import { canMovePaneToTab, canRemoveTab } from "@/data/layout/tabs";
 import { canAddTile, orderedTiles } from "@/data/layout/tiles";
+import { restartDetail } from "@/data/selectors/agent";
 import { sessionTitle } from "@/data/selectors/session";
 import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import { isFilesWidget, type Tile, type WorkspaceTab } from "@/data/types/layout";
@@ -121,7 +122,7 @@ export function PaneActionsSheet({
     actions.push({
       id: "restart",
       label: "Restart",
-      detail: "Restart the login shell",
+      detail: restartDetail(session, agents),
       icon: <Icon name="RotateCw" />,
       onPress: () => onRestart(session),
     });

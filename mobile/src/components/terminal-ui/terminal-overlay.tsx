@@ -5,6 +5,7 @@ import { StyleSheet, View } from "react-native";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import type { AgentRestartResult } from "@/components/launcher/agent-restart";
 import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
 import { TerminalAccessoryBar } from "@/components/terminal-ui/accessory-bar";
 import { AttachmentSheet } from "@/components/terminal-ui/attachment-sheet";
@@ -49,6 +50,7 @@ import {
   attachPendingLaunchDelivery,
   type PendingLaunchDeliveryResult,
 } from "@/data/queries/launcher";
+import { identifyAgent } from "@/data/selectors/agent";
 import { DEFAULT_SESSION_UI, useSessionUiStore } from "@/data/stores/session-ui";
 import { DEVICE_NOT_TRUSTED_CODE, invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { useHostApprovalWatch } from "@/data/trust/use-host-approval-watch";
@@ -56,6 +58,7 @@ import { haptics } from "@/lib/haptics";
 import { encodeKey } from "@/terminal/key-encoder";
 import { TerminalSurface, type TerminalSurfaceHandle } from "@/terminal/TerminalSurface";
 import type {
+  AgentNotice,
   ConnectionInfo,
   DisplayControlState,
   KeySpec,
@@ -75,7 +78,11 @@ export interface TerminalOverlayProps {
   focused: boolean;
   onDismiss: () => void;
   onRename: (name: string) => Promise<void>;
-  onRestart: () => Promise<void>;
+  /** Restart the window as what it was opened as, given the terminal's own
+   *  keyboard so an agent can be relaunched in the shell it already has. */
+  onRestart: (terminal: ShellCommandSink) => Promise<AgentRestartResult>;
+  /** What restarting brings back, for the menu row. */
+  restartDetail?: string;
   /** Reports its own outcome and must not reject: the window is already gone. */
   onKill: () => Promise<void>;
 }
@@ -112,6 +119,7 @@ export function TerminalOverlay({
   onDismiss,
   onRename,
   onRestart,
+  restartDetail,
   onKill,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
@@ -149,6 +157,7 @@ export function TerminalOverlay({
   // keyboard. Read from the foreground command rather than from the agent
   // registry: a terminal must know what it is talking to without a round trip.
   const agentKind = agentKindFor(session.foreground_command);
+  const updatedAgentName = identifyAgent(session.foreground_command, []).displayName;
   const { pinned, toggle: togglePinned } = usePinnedCommands(agentKind);
   const pinnedCommands = useMemo(
     () => resolvePinnedCommands(agentKind, pinned),
@@ -183,6 +192,11 @@ export function TerminalOverlay({
     onFocus: () => surfaceRef.current?.focus(),
   });
   const [display, setDisplay] = useState<DisplayControlState | null>(null);
+  // What the agent's own status bar is saying, read off the live screen by
+  // the worker. The one notice so far asks for a restart, which is offered
+  // right on it.
+  const [agentNotice, setAgentNotice] = useState<AgentNotice | null>(null);
+  const [restarting, setRestarting] = useState(false);
 
   // The bottom nav is portalled to window level and nothing holds its footprint
   // open, so the terminal reserves it — and drops that reservation the moment
@@ -375,6 +389,35 @@ export function TerminalOverlay({
     [updateFollow],
   );
 
+  /**
+   * The one restart, from the menu or the agent's own notice: an agent window
+   * comes back into its conversation, typed into the shell it already has
+   * when that works — nothing to reconnect — and a fresh shell otherwise,
+   * which the transport has to be reopened for.
+   */
+  const restartFromHere = (): void => {
+    if (restarting) return;
+    setRestarting(true);
+    void onRestart(terminalSink)
+      .then((result) => {
+        const agent = result.plan.kind === "agent" ? result.plan.agent.name : null;
+        if (result.kind === "resumed") {
+          transfers.setNotice(`${agent} restarted.`);
+          return;
+        }
+        transfers.setNotice(
+          agent
+            ? `Session restarted. ${agent} starts when the shell is back.`
+            : "Session restarted.",
+        );
+        retry();
+      })
+      .catch((error: unknown) => {
+        transfers.setNotice(error instanceof Error ? error.message : "Session restart failed.");
+      })
+      .finally(() => setRestarting(false));
+  };
+
   const takeDisplayControl = (): void => {
     surfaceRef.current?.takeControl();
     setDisplay((current) => (current === null ? current : { ...current, owner: true }));
@@ -448,18 +491,8 @@ export function TerminalOverlay({
             transfers.setNotice(error instanceof Error ? error.message : "Session rename failed.");
           }
         }}
-        onRestart={() => {
-          void onRestart()
-            .then(() => {
-              transfers.setNotice("Session restarted.");
-              retry();
-            })
-            .catch((error: unknown) => {
-              transfers.setNotice(
-                error instanceof Error ? error.message : "Session restart failed.",
-              );
-            });
-        }}
+        onRestart={restartFromHere}
+        {...(restartDetail ? { restartDetail } : {})}
         onSearch={() => setSearchVisible(true)}
         onSwitchAgent={() => setAgentVisible(true)}
         onUpload={() => setAttachVisible(true)}
@@ -494,6 +527,7 @@ export function TerminalOverlay({
                 if (safeTerminalLink(url)) void Linking.openURL(url);
                 else transfers.setNotice("The terminal link uses an unsupported URL scheme.");
               }}
+              onAgentNotice={setAgentNotice}
               onNativeSelection={onNativeSelection}
               onStateChange={handleConnectionState}
               onTitleChange={(next) => setLastKnownTitle(session.id, next)}
@@ -542,7 +576,18 @@ export function TerminalOverlay({
             visible={selectionVisible}
           />
         </View>
-        <TerminalNotice message={transfers.notice} />
+        {agentNotice === "update_installed" && session.status === "running" ? (
+          <TerminalNotice
+            action={{
+              label: restarting ? "Restarting…" : `Restart ${updatedAgentName}`,
+              disabled: restarting,
+              onPress: restartFromHere,
+            }}
+            message={`${updatedAgentName} installed an update.`}
+          />
+        ) : (
+          <TerminalNotice message={transfers.notice} />
+        )}
       </View>
       <TerminalAccessoryBar
         commands={pinnedCommands}
