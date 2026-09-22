@@ -1,4 +1,5 @@
 import type {
+  AgentNotice,
   ConnectionInfo,
   DisplayControlState,
   ScrollState,
@@ -16,6 +17,7 @@ type StateListener = (state: TransportState) => void;
 type ErrorListener = (error: TransportError) => void;
 type TitleListener = (title: string) => void;
 type BellListener = () => void;
+type AgentNoticeListener = (notice: AgentNotice | null) => void;
 type ScrollListener = (state: ScrollState) => void;
 type DiagnosticListener = (diagnostic: WorkerDiagnostic) => void;
 type DisplayListener = (display: DisplayControlState) => void;
@@ -110,6 +112,7 @@ export class FakeSessionTransport implements SessionTransport {
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly titleListeners = new Set<TitleListener>();
   private readonly bellListeners = new Set<BellListener>();
+  private readonly agentNoticeListeners = new Set<AgentNoticeListener>();
   private readonly scrollListeners = new Set<ScrollListener>();
   private readonly diagnosticListeners = new Set<DiagnosticListener>();
   private readonly displayListeners = new Set<DisplayListener>();
@@ -168,6 +171,7 @@ export class FakeSessionTransport implements SessionTransport {
   on(ev: "error", fn: ErrorListener): () => void;
   on(ev: "title", fn: TitleListener): () => void;
   on(ev: "bell", fn: BellListener): () => void;
+  on(ev: "agent-notice", fn: AgentNoticeListener): () => void;
   on(ev: "scroll", fn: ScrollListener): () => void;
   on(ev: "diagnostic", fn: DiagnosticListener): () => void;
   on(ev: "display", fn: DisplayListener): () => void;
@@ -178,6 +182,7 @@ export class FakeSessionTransport implements SessionTransport {
       | "error"
       | "title"
       | "bell"
+      | "agent-notice"
       | "scroll"
       | "diagnostic"
       | "display"
@@ -187,6 +192,7 @@ export class FakeSessionTransport implements SessionTransport {
       | ErrorListener
       | TitleListener
       | BellListener
+      | AgentNoticeListener
       | ScrollListener
       | DiagnosticListener
       | DisplayListener
@@ -201,6 +207,8 @@ export class FakeSessionTransport implements SessionTransport {
         return this.subscribe(this.titleListeners, fn as TitleListener);
       case "bell":
         return this.subscribe(this.bellListeners, fn as BellListener);
+      case "agent-notice":
+        return this.subscribe(this.agentNoticeListeners, fn as AgentNoticeListener);
       case "scroll":
         return this.subscribe(this.scrollListeners, fn as ScrollListener);
       case "diagnostic":
@@ -227,6 +235,10 @@ export class FakeSessionTransport implements SessionTransport {
 
   emitTitle(title: string): void {
     for (const listener of this.titleListeners) listener(title);
+  }
+
+  emitAgentNotice(notice: AgentNotice | null): void {
+    for (const listener of this.agentNoticeListeners) listener(notice);
   }
 
   emitBell(): void {

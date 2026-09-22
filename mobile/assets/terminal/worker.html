@@ -1215,6 +1215,11 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     session.uploads.clear();
     clearTimeout(session.writeTimer);
     session.writeTimer = null;
+    // A new generation is a new process behind the screen: whatever notice
+    // the old one painted is gone with it, and the new one repaints its own.
+    clearTimeout(agentNoticeTimer);
+    agentNoticeTimer = null;
+    reportAgentNotice(null);
   }
 
   api.resetSessionGeneration = resetGates;
@@ -1341,8 +1346,55 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       session.writeInFlight = false;
       if (state.follow && wasAtBottom) state.term.scrollToBottom();
       api.emitScroll();
+      scheduleAgentNoticeScan();
       flushWrites();
     });
+  }
+
+  // The screen is read for an agent's own status-bar notice a beat after
+  // output settles, never per byte: the notice is a stable line the agent
+  // keeps painting, so a trailing scan catches it and a change-only post
+  // keeps the app quiet. Only the live rows can hold a status bar — all of
+  // them, since an agent's UI sits wherever its output ended up — and only
+  // on the normal buffer: a full-screen app on the alternate buffer is not an
+  // agent's prompt. The same read the web app makes of its own screen; the
+  // daemon never sees the text either way.
+  const AGENT_NOTICE_SCAN_MS = 400;
+  const CLAUDE_CODE_UPDATE_INSTALLED = /Update installed\s*\S?\s*Restart to (?:update|apply)/;
+  let agentNotice = null;
+  let agentNoticeTimer = null;
+
+  function reportAgentNotice(notice) {
+    if (agentNotice === notice) return;
+    agentNotice = notice;
+    api.post({ type: "agent-notice", notice });
+  }
+
+  function scanAgentNotice() {
+    const term = state.term;
+    if (!term) return;
+    const buffer = term.buffer.active;
+    if (buffer === term.buffer.alternate) {
+      reportAgentNotice(null);
+      return;
+    }
+    const end = buffer.baseY + term.rows;
+    for (let y = buffer.baseY; y < end; y += 1) {
+      const row = buffer.getLine(y)?.translateToString(true) ?? "";
+      if (CLAUDE_CODE_UPDATE_INSTALLED.test(row)) {
+        reportAgentNotice("update_installed");
+        return;
+      }
+    }
+    reportAgentNotice(null);
+  }
+
+  function scheduleAgentNoticeScan() {
+    if (agentNoticeTimer !== null) return;
+    agentNoticeTimer = setTimeout(() => {
+      agentNoticeTimer = null;
+      scanAgentNotice();
+    }, AGENT_NOTICE_SCAN_MS);
   }
 
   api.receivePty = (value) => {
@@ -1441,6 +1493,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     if (history.operation === "snapshot") state.term.reset();
     const finish = () => {
       if (session.history !== history) return;
+      // The replayed screen can already carry the agent's notice.
+      scheduleAgentNoticeScan();
       let barrier = Number.isSafeInteger(anchor) ? anchor : null;
       for (const entry of session.preboot) {
         if (barrier !== null && entry.offsetAfter <= barrier) {

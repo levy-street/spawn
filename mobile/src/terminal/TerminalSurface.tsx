@@ -29,6 +29,7 @@ import {
 import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 import { createSessionTransport } from "@/terminal/transport/session-transport";
 import type {
+  AgentNotice,
   ConnectionInfo,
   DisplayControlState,
   SessionTransport,
@@ -68,6 +69,8 @@ export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bri
   onDisplayChange?(display: DisplayControlState): void;
   onConnectionInfo?(info: ConnectionInfo): void;
   onBell?(): void;
+  /** The agent's own status bar notice, read off the rendered screen. */
+  onAgentNotice?(notice: AgentNotice | null): void;
   onLink?(url: string): void;
   /** The system has, or no longer has, text selected in the terminal. */
   onNativeSelection?(active: boolean): void;
@@ -109,6 +112,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       onBell,
       onLink,
       onNativeSelection,
+      onAgentNotice,
       onContentProcessTerminated,
     },
     ref,
@@ -132,6 +136,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       onBell,
       onLink,
       onNativeSelection,
+      onAgentNotice,
       onContentProcessTerminated,
     });
     callbacks.current = {
@@ -145,6 +150,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       onBell,
       onLink,
       onNativeSelection,
+      onAgentNotice,
       onContentProcessTerminated,
     };
 
@@ -214,6 +220,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
         transport.on("display", (display) => callbacks.current.onDisplayChange?.(display)),
         transport.on("connection-info", (info) => callbacks.current.onConnectionInfo?.(info)),
         transport.on("bell", () => callbacks.current.onBell?.()),
+        transport.on("agent-notice", (notice) => callbacks.current.onAgentNotice?.(notice)),
       ];
       return () => {
         for (const unsubscribe of unsubscribers) unsubscribe();

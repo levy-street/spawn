@@ -17,7 +17,12 @@ import type {
   WorkspaceOut,
   WorkspaceTile,
 } from "@/data/api/schemas/workspaces";
-import { agentRunCommand, runningAgent, sessionAgent } from "@/data/selectors/agent";
+import {
+  agentLaunchCommand,
+  newAgentConversationId,
+  runningAgent,
+  sessionAgent,
+} from "@/data/selectors/agent";
 
 export interface WorkspaceOperationResult {
   workspace: WorkspaceOut;
@@ -161,15 +166,20 @@ export async function instantiateWorkspaceTemplate(
       if (tile.run.kind === "files") continue;
       const storedCommand = tile.run.kind === "agent" ? tile.run.command?.trim() : undefined;
       const templateAgent = runningAgent(storedCommand ?? null, input.agents);
+      const conversation = templateAgent
+        ? newAgentConversationId(templateAgent.kind, dependencies.randomId)
+        : null;
       const session = await dependencies.createSession({
         host_id: template.host_id,
         cwd: template.cwd,
-        ...(templateAgent ? { agent_id: templateAgent.id } : {}),
+        ...(templateAgent ? { agent_id: templateAgent.id, agent_session_id: conversation } : {}),
         workspace_id: workspaceId,
         tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
       });
       if (tile.run.kind === "agent") {
-        const command = templateAgent ? agentRunCommand(templateAgent) : storedCommand;
+        const command = templateAgent
+          ? agentLaunchCommand(templateAgent, conversation)
+          : storedCommand;
         if (command) {
           try {
             await dependencies.pending.persist(session.id, command);
@@ -243,18 +253,24 @@ export async function duplicateWorkspaceDeep(
         if (!session) continue;
         const access = await dependencies.getSessionAccess(session.id);
         const currentAgent = sessionAgent(session, input.agents);
+        const conversation = currentAgent
+          ? newAgentConversationId(currentAgent.kind, dependencies.randomId)
+          : null;
         const createdSession = await dependencies.createSession({
           host_id: session.host_id,
           cwd: session.cwd,
           name: session.name,
-          ...(currentAgent ? { agent_id: currentAgent.id } : {}),
+          ...(currentAgent ? { agent_id: currentAgent.id, agent_session_id: conversation } : {}),
           skill_ids: access.skills.map((skill) => skill.id),
           workspace_id: workspaceId,
           tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
         });
         if (currentAgent) {
           try {
-            await dependencies.pending.persist(createdSession.id, agentRunCommand(currentAgent));
+            await dependencies.pending.persist(
+              createdSession.id,
+              agentLaunchCommand(currentAgent, conversation),
+            );
             queuedSessionIds.push(createdSession.id);
           } catch {
             agentLaunchesSkipped += 1;

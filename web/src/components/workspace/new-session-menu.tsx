@@ -31,7 +31,7 @@ import { type Agent, ApiError, agents, type Host, hosts, sessions, workspaces } 
 import { autoPlace, type Rect } from "@/lib/grid";
 import { activeTab, tabHome, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentRunCommand } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { FolderPicker } from "./folder-picker";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { pendingLaunch } from "./pending-launch";
@@ -163,6 +163,11 @@ function useNewSessionChoices(
 
   const createM = useMutation({
     mutationFn: async ({ host, cwd, choice }: { host: Host; cwd: string; choice: Choice }) => {
+      // The conversation this agent starts under, chosen here so the window
+      // can record it and a restart can resume it; null for a CLI that names
+      // its own.
+      const conversation =
+        choice.kind === "agent" ? newAgentConversationId(choice.agent.kind) : null;
       // Whatever this makes room in is what `activeTab` reads below, so it has
       // to land on the server before anything else is fetched.
       undoRef.current = (await beforeCreate?.()) ?? null;
@@ -219,24 +224,32 @@ function useNewSessionChoices(
           cwd,
           // The window is a shell that an agent is about to be typed into;
           // recording which one is what makes it that kind of window, so a
-          // duplicate of it opens as one too.
-          ...(choice.kind === "agent" && { agent_id: choice.agent.id }),
+          // duplicate of it opens as one too — and which conversation it is
+          // starting, so a restart can bring it back to it.
+          ...(choice.kind === "agent" && {
+            agent_id: choice.agent.id,
+            agent_session_id: conversation,
+          }),
           workspace_id: workspaceId,
           tile,
         });
-        if (choice.kind === "agent") pendingLaunch.set(session.id, agentRunCommand(choice.agent));
+        if (choice.kind === "agent")
+          pendingLaunch.set(session.id, agentLaunchCommand(choice.agent, conversation));
         return { workspaceId, sessionId: session.id };
       }
       const result = await workspaces.create({
         first_session: {
           host_id: host.id,
           cwd,
-          ...(choice.kind === "agent" && { agent_id: choice.agent.id }),
+          ...(choice.kind === "agent" && {
+            agent_id: choice.agent.id,
+            agent_session_id: conversation,
+          }),
         },
       });
       if (!result.session) throw new Error("The workspace was created without its first session.");
       if (choice.kind === "agent")
-        pendingLaunch.set(result.session.id, agentRunCommand(choice.agent));
+        pendingLaunch.set(result.session.id, agentLaunchCommand(choice.agent, conversation));
       return { workspaceId: result.workspace.id, sessionId: result.session.id };
     },
     onSuccess: (result) => {

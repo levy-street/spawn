@@ -80,7 +80,7 @@ import {
 import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
 import { tabAttentionCount, workspaceLiveSessionCount } from "@/lib/workspaces";
-import { agentRunCommand } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { FolderPicker } from "./folder-picker";
 import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
@@ -976,15 +976,16 @@ export function WorkspaceTabs({
           const access = await sessionAccess.get(source.id).catch(() => null);
           const skillIds = access?.skills.map((skill) => skill.id) ?? [];
           const agent = sessionAgent(source, definitions);
+          const conversation = agent ? newAgentConversationId(agent.kind) : null;
           const copy = await sessions.create({
             host_id: source.host_id,
             cwd: source.cwd,
-            ...(agent && { agent_id: agent.id }),
+            ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
             ...(skillIds.length > 0 && { skill_ids: skillIds }),
           });
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
-          if (agent) pendingLaunch.set(copy.id, agentRunCommand(agent));
+          if (agent) pendingLaunch.set(copy.id, agentLaunchCommand(agent, conversation));
         }
         const next = duplicateTab(
           layout,

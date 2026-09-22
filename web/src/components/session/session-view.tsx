@@ -15,6 +15,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
+import { agentDisplayName, commandBasename } from "@/components/icons/AgentIcon";
 import { ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
@@ -28,11 +29,21 @@ import {
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
-import { AgentSwitcher } from "@/components/workspace/agent-switcher";
-import { ApiError, type Session, sessions, type Workspace, workspaces } from "@/lib/api";
+import { restartSessionAgent } from "@/components/workspace/agent-restart";
+import { AgentSwitcher, writeForegroundToCache } from "@/components/workspace/agent-switcher";
+import { pendingLaunch } from "@/components/workspace/pending-launch";
+import { runInShell } from "@/components/workspace/shell-handoff";
+import {
+  ApiError,
+  agents as agentsApi,
+  type Session,
+  sessions,
+  type Workspace,
+  workspaces,
+} from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { remove as removeTile } from "@/lib/grid";
-import { sessionTitle } from "@/lib/sessions";
+import { sessionAtShell, sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 
@@ -60,7 +71,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [draftName, setDraftName] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const { attach, getHandle, connInfo, displayState } = useLiveTerminal(sessionId);
+  const { attach, getHandle, connInfo, displayState, agentNotice } = useLiveTerminal(sessionId);
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -105,16 +116,64 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     },
     onError: (error) => setErrorMessage(String(error)),
   });
+  // The same restart the pane offers: the window comes back as what it was
+  // opened as, its agent resumed in the same conversation where it can be.
   const restartM = useMutation({
-    mutationFn: () => sessions.restart(sessionId),
-    onSuccess: (saved) => {
-      updateSessionCaches(queryClient, saved);
+    mutationFn: async () => {
+      if (!session) throw new Error("This session no longer exists.");
+      const definitions = await queryClient
+        .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
+        .catch(() => []);
+      return restartSessionAgent({
+        session,
+        agents: definitions,
+        handle: getHandle(),
+        handoff: runInShell,
+        restart: async () => {
+          const saved = await sessions.restart(sessionId);
+          updateSessionCaches(queryClient, saved);
+          return saved;
+        },
+        onSession: (latest) => updateSessionCaches(queryClient, latest),
+      });
+    },
+    onSuccess: (result) => {
+      if (result.kind === "resumed" && result.plan.kind === "agent") {
+        const basename = commandBasename(result.plan.command);
+        if (basename) writeForegroundToCache(queryClient, sessionId, basename);
+      }
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setErrorMessage(null);
       requestAnimationFrame(() => getHandle()?.focus());
     },
     onError: (error) => setErrorMessage(String(error)),
   });
+
+  // A command a restart queued for the fresh shell is typed the moment that
+  // shell's transport opens — the same drain the workspace pane runs, so a
+  // restart from this page lands the agent back too.
+  const socketOpen = connInfo?.socketState === "open";
+  useEffect(() => {
+    if (!session || !socketOpen || !pendingLaunch.has(sessionId)) return;
+    let cancelled = false;
+    let tries = 0;
+    const attempt = () => {
+      if (cancelled) return;
+      const handle = getHandle();
+      if (!handle) {
+        if (tries++ < 50) window.setTimeout(attempt, 100);
+        return;
+      }
+      const command = pendingLaunch.take(sessionId);
+      if (!command) return;
+      handle.sendInput(`${command}\r`);
+      requestAnimationFrame(() => handle.focus());
+    };
+    attempt();
+    return () => {
+      cancelled = true;
+    };
+  }, [socketOpen, getHandle, session, sessionId]);
   const removeFromWorkspaceM = useMutation({
     mutationFn: (workspace: Workspace) =>
       workspaces.update(workspace.id, {
@@ -325,6 +384,26 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       <div className="flex min-h-0 flex-1">
         <div className="relative min-h-0 min-w-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
+          {agentNotice === "update_installed" &&
+            session.status === "running" &&
+            !sessionAtShell(session) && (
+              <div className="pointer-events-none absolute inset-x-0 top-2 z-20 flex justify-center px-2">
+                <div
+                  role="status"
+                  className="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border border-border bg-popover px-3 py-1.5 text-xs shadow-lg"
+                >
+                  <span className="truncate text-muted-foreground">
+                    {agentDisplayName(session.foreground_command)} installed an update.
+                  </span>
+                  <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
+                    <RotateCcw className="size-3.5" aria-hidden />
+                    {restartM.isPending
+                      ? "Restarting…"
+                      : `Restart ${agentDisplayName(session.foreground_command)}`}
+                  </Button>
+                </div>
+              </div>
+            )}
           {(session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 shadow-lg">

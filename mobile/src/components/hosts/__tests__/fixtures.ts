@@ -78,6 +78,7 @@ export const runningSession: SessionOut = {
   activity_label: "Awaiting input",
   foreground_command: "codex",
   agent_id: null,
+  agent_session_id: null,
 };
 
 export const hostAgent: HostAgentStatus = {

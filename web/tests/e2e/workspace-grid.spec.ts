@@ -436,6 +436,9 @@ test("⌘ turns a drag into a duplicate: the source stays put and a copy is crea
     host_id: session().host_id,
     cwd: session().cwd,
     agent_id: AGENT_ID,
+    // A copy starts a conversation of its own; Codex names its own, so the
+    // copy records none rather than inheriting the source's.
+    agent_session_id: null,
   });
 
   // The source keeps its own tile; the copy takes the half it was dropped on.
@@ -513,5 +516,8 @@ test("a window duplicates as the type it was opened as, not as whatever holds it
     host_id: session().host_id,
     cwd: session().cwd,
     agent_id: AGENT_ID,
+    // A copy starts a conversation of its own; Codex names its own, so the
+    // copy records none rather than inheriting the source's.
+    agent_session_id: null,
   });
 });

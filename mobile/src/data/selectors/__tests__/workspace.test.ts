@@ -31,6 +31,7 @@ function session(id: string, overrides: Partial<Session> = {}): Session {
     activity_label: "Quiet",
     foreground_command: "codex",
     agent_id: null,
+    agent_session_id: null,
     ...overrides,
   };
 }

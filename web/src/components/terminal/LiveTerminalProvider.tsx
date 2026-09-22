@@ -13,6 +13,7 @@ import {
 import { createPortal } from "react-dom";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
+import type { AgentNotice } from "@/lib/agent-notice";
 import type { DisplayControlState } from "@/lib/ws";
 
 // Insert a prompt newline for mobile Return (same as the agent page/panes).
@@ -29,11 +30,14 @@ const WARM_LIMIT = 10;
 export type SessionLive = {
   connInfo: SessionConnectionInfo | null;
   displayState: DisplayControlState | null;
+  /** What the agent's own status bar is saying, read off the live screen. */
+  agentNotice: AgentNotice | null;
 };
 
 const EMPTY_SESSION_LIVE: SessionLive = {
   connInfo: null,
   displayState: null,
+  agentNotice: null,
 };
 
 /** Stable actions — this context value never changes, so a placeholder's
@@ -150,6 +154,12 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
       [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], displayState },
     }));
   }, []);
+  const onAgentNotice = useCallback((sessionId: string, agentNotice: AgentNotice | null) => {
+    setLive((m) => ({
+      ...m,
+      [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], agentNotice },
+    }));
+  }, []);
   const actions = useMemo<Actions>(
     () => ({ claim, release, getHandle }),
     [claim, release, getHandle],
@@ -190,6 +200,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
               handleRef={entry.handleRef}
               onInfo={onInfo}
               onDisplay={onDisplay}
+              onAgentNotice={onAgentNotice}
             />
           );
         })}
@@ -205,6 +216,7 @@ function PooledTerminal({
   handleRef,
   onInfo,
   onDisplay,
+  onAgentNotice,
 }: {
   sessionId: string;
   active: boolean;
@@ -212,6 +224,7 @@ function PooledTerminal({
   handleRef: { current: TerminalHandle | null };
   onInfo: (sessionId: string, info: SessionConnectionInfo) => void;
   onDisplay: (sessionId: string, state: DisplayControlState) => void;
+  onAgentNotice: (sessionId: string, notice: AgentNotice | null) => void;
 }) {
   return createPortal(
     <div className="size-full @container/term">
@@ -225,6 +238,7 @@ function PooledTerminal({
         active={active}
         onConnectionInfo={(info) => onInfo(sessionId, info)}
         onDisplayControl={(state) => onDisplay(sessionId, state)}
+        onAgentNotice={(notice) => onAgentNotice(sessionId, notice)}
       />
     </div>,
     host,
@@ -293,10 +307,11 @@ export function useLiveTerminal(sessionId: string | null) {
     ),
     connInfo: info.connInfo,
     displayState: info.displayState,
+    agentNotice: info.agentNotice,
   };
 }
 
-/** Reactive live info for one session (connInfo/displayState); {} if not warm. */
+/** Reactive live info for one session (connInfo/displayState/agentNotice); empty if not warm. */
 export function useSessionLive(sessionId: string | null): SessionLive {
   const { live } = useContext(StateCtx);
   return (sessionId ? live[sessionId] : null) ?? EMPTY_SESSION_LIVE;

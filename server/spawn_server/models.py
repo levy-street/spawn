@@ -986,6 +986,13 @@ class Session(Base):
     agent_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
     )
+    # The conversation SPAWN D started the agent with — the id it typed after
+    # `--session-id` — so a restart can type `--resume` and land back in the
+    # same thread on the updated binary. Chosen by the client, opaque here,
+    # never read by the server: a token, not content. NULL when the agent was
+    # started by hand or by a client that predates this column; a restart then
+    # falls back to the CLI's own "continue the latest conversation here".
+    agent_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="sessions")
     host: Mapped[Host] = relationship(back_populates="sessions")

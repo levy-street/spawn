@@ -66,6 +66,7 @@ export function makeSession(overrides: Partial<SessionOut> = {}): SessionOut {
     activity_label: "Active",
     foreground_command: null,
     agent_id: null,
+    agent_session_id: null,
     ...overrides,
   };
 }

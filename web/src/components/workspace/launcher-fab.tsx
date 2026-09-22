@@ -30,7 +30,7 @@ import {
 import { autoPlace, GRID_SIZE, type Rect, type Tile } from "@/lib/grid";
 import { activeTab, tabById, tabHome, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentRunCommand } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { queryAllInPane, queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
@@ -244,14 +244,22 @@ export function LauncherFab({
           ).layout;
         }
       }
+      // The conversation the agent starts under, recorded with the window so
+      // a restart can resume it; null for a CLI that names its own.
+      const conversation =
+        choice.kind === "agent" ? newAgentConversationId(choice.agent.kind) : null;
       const session = await sessions.create({
         host_id: home.host.id,
         cwd: home.cwd,
-        ...(choice.kind === "agent" && { agent_id: choice.agent.id }),
+        ...(choice.kind === "agent" && {
+          agent_id: choice.agent.id,
+          agent_session_id: conversation,
+        }),
         workspace_id: workspace.id,
         tile: placed,
       });
-      if (choice.kind === "agent") pendingLaunch.set(session.id, agentRunCommand(choice.agent));
+      if (choice.kind === "agent")
+        pendingLaunch.set(session.id, agentLaunchCommand(choice.agent, conversation));
       return { sessionId: session.id };
     },
     onSuccess: (result) => {

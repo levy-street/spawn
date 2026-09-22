@@ -9,7 +9,7 @@ import {
 } from "@/lib/api";
 import { basename } from "@/lib/paths";
 import { activeTab, type LayoutV3, withActiveTab } from "@/lib/tabs";
-import { agentRunCommand } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { pendingLaunch } from "./pending-launch";
 
 /** See the call in `instantiateTemplate`. */
@@ -85,15 +85,19 @@ export async function instantiateTemplate(
     }
     for (const tile of sessionTiles) {
       const agent = tile.run.kind === "agent" ? matchAgent(tile.run.command, definitions) : null;
+      const conversation = agent ? newAgentConversationId(agent.kind) : null;
       const session = await sessions.create({
         host_id: host.id,
         cwd,
-        ...(agent && { agent_id: agent.id }),
+        ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
         workspace_id: workspace.id,
         tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
       });
       if (tile.run.kind === "agent") {
-        pendingLaunch.set(session.id, agent ? agentRunCommand(agent) : tile.run.command);
+        pendingLaunch.set(
+          session.id,
+          agent ? agentLaunchCommand(agent, conversation) : tile.run.command,
+        );
       }
       focusSessionId ??= session.id;
     }

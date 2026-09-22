@@ -1,11 +1,13 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { randomUUID } from "expo-crypto";
 import { useCallback } from "react";
+import { restartSessionAgent } from "@/components/launcher/agent-restart";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
 
 import {
   createSession,
   deleteSession,
+  getSession,
   getSessionAccess,
   patchSession,
   restartSession,
@@ -28,7 +30,7 @@ import {
   useWorkspaceReorder,
 } from "@/data/queries/workspace-detail";
 import { qk } from "@/data/queryKeys";
-import { agentRunCommand, sessionAgent } from "@/data/selectors/agent";
+import { agentLaunchCommand, newAgentConversationId, sessionAgent } from "@/data/selectors/agent";
 import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import type { PaneId, TabId, Tile, WorkspaceLayoutV3 } from "@/data/types/layout";
 
@@ -121,11 +123,28 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       await invalidateSessions();
       return saved;
     },
-    restartSession: async (session: Session) => {
-      const saved = await restartSession(session.id);
-      client.setQueryData(qk.session(session.id), saved);
+    /**
+     * Bring the window back as what it was opened as: its agent resumed in
+     * the same conversation where the CLI can, a login shell otherwise. From
+     * the workspace there is no terminal open to type into, so the shell is
+     * restarted and the agent's resume command waits for the terminal to
+     * open (`agent-restart.ts`).
+     */
+    restartSession: async (session: Session, agents: readonly AgentDef[]) => {
+      const result = await restartSessionAgent({
+        session,
+        agents,
+        terminal: null,
+        restart: async (sessionId) => {
+          const saved = await restartSession(sessionId);
+          client.setQueryData(qk.session(sessionId), saved);
+          return saved;
+        },
+        pending: pendingLaunches,
+        getSession,
+      });
       await invalidateSessions();
-      return saved;
+      return result;
     },
     movePane: (workspace: Workspace, paneId: PaneId, targetTabId: TabId) => {
       const layout = movePaneToTab(workspace.layout, paneId, targetTabId);
@@ -151,13 +170,18 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       );
       if (!sourceTab) throw new Error("That pane is no longer in this workspace.");
       const movedAgent = sessionAgent(session ?? undefined, agents);
+      // Another host is another conversation: the agent's own state does not
+      // travel, so the window over there starts a fresh one under a new id.
+      const movedConversation = movedAgent
+        ? newAgentConversationId(movedAgent.kind, randomUUID)
+        : null;
       const created = await createSession({
         host_id: host.id,
         cwd: "~",
         ...(session?.name ? { name: session.name } : {}),
         // The window arrives on the new host as the same kind of window, so it
         // is one even before its agent has taken the foreground over there.
-        ...(movedAgent ? { agent_id: movedAgent.id } : {}),
+        ...(movedAgent ? { agent_id: movedAgent.id, agent_session_id: movedConversation } : {}),
       });
       const nextTab = {
         ...sourceTab,
@@ -182,7 +206,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       let launchError: Error | null = null;
       if (agent) {
         try {
-          await pendingLaunches.persist(created.id, agentRunCommand(agent));
+          await pendingLaunches.persist(created.id, agentLaunchCommand(agent, movedConversation));
         } catch {
           launchError = new Error(
             `The window moved to ${host.name} as a shell, but ${agent.name} could not be queued.`,
@@ -236,6 +260,8 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       if (!session) throw new Error("Session unavailable.");
       const access = await getSessionAccess(session.id);
       const agent = sessionAgent(session, agents);
+      // A copy is the same kind of window in a conversation of its own.
+      const conversation = agent ? newAgentConversationId(agent.kind, randomUUID) : null;
       const duplicate = await createSession({
         host_id: session.host_id,
         cwd: session.cwd,
@@ -243,7 +269,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
         // The copy is the same kind of window as its source — a Hermes window
         // duplicates as a Hermes window — whatever process happens to hold the
         // source's foreground right now.
-        ...(agent ? { agent_id: agent.id } : {}),
+        ...(agent ? { agent_id: agent.id, agent_session_id: conversation } : {}),
         skill_ids: access.skills.map((skill) => skill.id),
       });
       const layout = addTile(sourceTab.layout, { session_id: duplicate.id });
@@ -263,7 +289,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       }
       if (agent) {
         try {
-          await pendingLaunches.persist(duplicate.id, agentRunCommand(agent));
+          await pendingLaunches.persist(duplicate.id, agentLaunchCommand(agent, conversation));
         } catch {
           await invalidateSessions();
           throw new Error(

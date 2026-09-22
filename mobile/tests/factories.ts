@@ -72,6 +72,7 @@ export function makeSession(overrides: Partial<Session> = {}): Session {
     activity_label: "Active",
     foreground_command: "codex",
     agent_id: null,
+    agent_session_id: null,
     ...overrides,
   };
 }

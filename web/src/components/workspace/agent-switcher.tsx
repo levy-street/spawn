@@ -13,7 +13,11 @@ import {
 import { type Agent, agents, hosts, type Session, sessions } from "@/lib/api";
 import { sessionAtShell } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
-import { agentInstallAndRunCommand, agentRunCommand } from "./agent-command";
+import {
+  agentInstallAndRunCommand,
+  agentLaunchCommand,
+  newAgentConversationId,
+} from "./agent-command";
 import { runInShell } from "./shell-handoff";
 
 /**
@@ -84,9 +88,12 @@ export function AgentSwitcher({
     const handle = getHandle();
     if (!handle || !running) return;
     const installed = availability.get(agent.id)?.installed === true;
+    // A launch is a new conversation: named up front where the CLI lets us,
+    // so a restart later can resume this one rather than "the latest".
+    const conversation = newAgentConversationId(agent.kind);
     const command = installed
-      ? agentRunCommand(agent)
-      : (agentInstallAndRunCommand(agent) ?? agentRunCommand(agent));
+      ? agentLaunchCommand(agent, conversation)
+      : (agentInstallAndRunCommand(agent, conversation) ?? agentLaunchCommand(agent, conversation));
     void runInShell({ session, handle, command, purpose: `Running ${agent.name}` }).then(
       (result) => {
         if (result !== "sent") return;
@@ -107,7 +114,7 @@ export function AgentSwitcher({
         // interpreter's name for any CLI that ships as a script. A duplicate
         // reads this. Best-effort — a window whose type failed to save still
         // has the agent running in it.
-        void retype(queryClient, session.id, agent.id);
+        void retype(queryClient, session.id, agent.id, conversation);
       },
     );
   };
@@ -122,7 +129,7 @@ export function AgentSwitcher({
         writeForegroundToCache(queryClient, session.id, null);
         // Deliberately back at a prompt: this is a shell window again, and a
         // duplicate of it should be one.
-        void retype(queryClient, session.id, null);
+        void retype(queryClient, session.id, null, null);
       },
     );
   };
@@ -225,10 +232,14 @@ async function retype(
   queryClient: ReturnType<typeof useQueryClient>,
   sessionId: string,
   agentId: string | null,
+  conversationId: string | null,
 ): Promise<void> {
   try {
-    const saved = await sessions.update(sessionId, { agent_id: agentId });
-    writeSessionAgentToCache(queryClient, sessionId, saved.agent_id);
+    const saved = await sessions.update(sessionId, {
+      agent_id: agentId,
+      agent_session_id: conversationId,
+    });
+    writeSessionAgentToCache(queryClient, sessionId, saved.agent_id, saved.agent_session_id);
   } catch {
     // The type is a convenience the running agent does not depend on.
   }
@@ -238,17 +249,19 @@ function writeSessionAgentToCache(
   queryClient: ReturnType<typeof useQueryClient>,
   sessionId: string,
   agentId: string | null,
+  conversationId: string | null,
 ): void {
+  const typed = { agent_id: agentId, agent_session_id: conversationId };
   queryClient.setQueryData<Session>(["session", sessionId], (current) =>
-    current ? { ...current, agent_id: agentId } : current,
+    current ? { ...current, ...typed } : current,
   );
   queryClient.setQueryData<Session[]>(["sessions"], (current) =>
-    current?.map((item) => (item.id === sessionId ? { ...item, agent_id: agentId } : item)),
+    current?.map((item) => (item.id === sessionId ? { ...item, ...typed } : item)),
   );
 }
 
 /** Optimistic `foreground_command` write into both session caches. */
-function writeForegroundToCache(
+export function writeForegroundToCache(
   queryClient: ReturnType<typeof useQueryClient>,
   sessionId: string,
   foregroundCommand: string | null,

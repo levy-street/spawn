@@ -174,3 +174,112 @@ export function groupRunningAgents(
       left.identity.displayName.localeCompare(right.identity.displayName),
   );
 }
+
+/**
+ * How an agent CLI names a conversation, by agent kind. Every tool spells it
+ * differently, and most have no spelling at all: a launch that can be handed
+ * an id up front is what lets a later restart come back to the same thread.
+ * The same grammar the web app types, spelled once per client.
+ */
+export interface AgentConversationGrammar {
+  /** Flags that start a fresh conversation under an id SPAWN D chose. Null
+   *  when the CLI names its own conversations. */
+  launch: ((conversationId: string) => string) | null;
+  /** Flags that reopen a known conversation. Null when the CLI cannot. */
+  resume: ((conversationId: string) => string) | null;
+  /** Flags that reopen the most recent conversation in this folder, for a
+   *  window whose conversation id was never recorded. Null when it cannot. */
+  continueLatest: string | null;
+}
+
+const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> = {
+  "claude-code": {
+    launch: (id) => `--session-id ${id}`,
+    resume: (id) => `--resume ${id}`,
+    continueLatest: "--continue",
+  },
+  // Codex names its own sessions and takes `resume` as a subcommand after the
+  // global flags, so only "the latest one here" can be asked for.
+  codex: {
+    launch: null,
+    resume: null,
+    continueLatest: "resume --last",
+  },
+};
+
+/** The conversation grammar for an agent kind, or null for a CLI SPAWN D
+ *  knows no way to resume. */
+export function agentConversationGrammar(
+  kind: string | null | undefined,
+): AgentConversationGrammar | null {
+  return (kind && CONVERSATION_GRAMMARS[kind.trim().toLowerCase()]) || null;
+}
+
+/** Whether a window of this kind can be brought back to its conversation at all. */
+export function agentCanResume(kind: string | null | undefined): boolean {
+  const grammar = agentConversationGrammar(kind);
+  return Boolean(grammar && (grammar.resume || grammar.continueLatest));
+}
+
+/**
+ * A fresh conversation id for a launch, or null for a CLI that cannot be
+ * handed one. UUIDs: what every agent that takes an id expects, and safe to
+ * type at a prompt bare.
+ */
+export function newAgentConversationId(
+  kind: string | null | undefined,
+  randomUUID: () => string,
+): string | null {
+  return agentConversationGrammar(kind)?.launch ? randomUUID() : null;
+}
+
+/**
+ * What starting an agent types when the window is to remember its
+ * conversation: the run command with the id the CLI is told to use. Without
+ * a grammar for the kind, or without an id, exactly the run command.
+ */
+export function agentLaunchCommand(agent: AgentDef, conversationId: string | null): string {
+  const run = agentRunCommand(agent);
+  const launch = agentConversationGrammar(agent.kind)?.launch;
+  return launch && conversationId ? `${run} ${launch(conversationId)}` : run;
+}
+
+/** `install && launch`, or null when the agent has no install command. */
+export function agentInstallAndLaunchCommand(
+  agent: AgentDef,
+  conversationId: string | null,
+): string | null {
+  const install = agent.install?.trim();
+  return install ? `${install} && ${agentLaunchCommand(agent, conversationId)}` : null;
+}
+
+/**
+ * What a restart types to bring the agent back where it was: resume the
+ * recorded conversation, or the latest one in this folder when none was
+ * recorded. Null when this kind of agent cannot be resumed at all, so the
+ * caller falls back to a plain relaunch and says so.
+ */
+export function agentResumeCommand(agent: AgentDef, conversationId: string | null): string | null {
+  const grammar = agentConversationGrammar(agent.kind);
+  if (!grammar) return null;
+  const run = agentRunCommand(agent);
+  if (conversationId && grammar.resume) return `${run} ${grammar.resume(conversationId)}`;
+  if (grammar.continueLatest) return `${run} ${grammar.continueLatest}`;
+  return null;
+}
+
+/**
+ * What a restart of this window promises, for the row that offers it: the
+ * agent back in its conversation where the CLI can resume one, a plain
+ * relaunch where it cannot, the login shell for a shell window.
+ */
+export function restartDetail(
+  session: Pick<Session, "foreground_command" | "agent_id"> | undefined,
+  agents: readonly AgentDef[],
+): string {
+  const agent = sessionAgent(session, agents);
+  if (!agent) return "Restart the login shell";
+  return agentCanResume(agent.kind)
+    ? `Relaunch ${agent.name} and resume its conversation`
+    : `Relaunch ${agent.name}`;
+}

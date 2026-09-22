@@ -49,6 +49,7 @@ import {
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
+import { type AgentNotice, detectAgentNotice } from "@/lib/agent-notice";
 import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
@@ -90,6 +91,8 @@ const SCROLLBACK_DC_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
 // bracket redraws with DEC synchronized-output mode. Bracketed redraws are
 // held until CSI ? 2026 l, preventing xterm from painting partial frames.
 const LIVE_WRITE_IDLE_DELAY_MS = 8;
+/** How long after output settles the screen is read for an agent notice. */
+const AGENT_NOTICE_SCAN_MS = 400;
 const LIVE_WRITE_BATCH_BYTES = 32 * 1024;
 const LIVE_WRITE_SYNC_TIMEOUT_MS = 1_000;
 const LIVE_WRITE_SYNC_MAX_BYTES = 4 * 1024 * 1024;
@@ -240,6 +243,10 @@ export interface TerminalProps {
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
   onConnectionInfo?: (info: SessionConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
+  /** A notice the agent in this session paints into its own status bar —
+   *  read off the rendered screen here, never off the wire. Called with null
+   *  when the notice leaves the screen. */
+  onAgentNotice?: (notice: AgentNotice | null) => void;
 }
 
 /**
@@ -258,6 +265,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onConnectionInfo,
     active = true,
     onExit,
+    onAgentNotice,
   },
   ref,
 ) {
@@ -266,6 +274,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const termRef = useRef<XTerm | null>(null);
+  // Reached from the replay paths above its definition, like the flush refs.
+  const scheduleAgentNoticeScanRef = useRef<() => void>(() => {});
   const fitRef = useRef<FitAddon | null>(null);
   const fitTerminalRef = useRef<(preserveScroll: boolean) => void>(() => {});
   const displayOwnerRef = useRef<boolean | null>(null);
@@ -723,6 +733,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       writeSequenced(term, [...ops, ...replaySlices.map((slice) => ({ data: slice }))], () => {
         term.scrollToBottom();
         syncPredictionOverlayRef.current();
+        scheduleAgentNoticeScanRef.current();
       });
       return true;
     },
@@ -1032,7 +1043,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     writeSequenced(
       term,
       pending.chunks.map((data) => ({ data })),
-      () => flushPendingLiveSeedWritesRef.current(),
+      () => {
+        flushPendingLiveSeedWritesRef.current();
+        scheduleAgentNoticeScanRef.current();
+      },
     );
   };
 
@@ -1051,6 +1065,54 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     staleTime: 30_000,
     ...cachedListItem<Host>(queryClient, ["hosts"], signalingHostId ?? ""),
   });
+
+  /*
+   * The screen is scanned for an agent's own status-bar notice a beat after
+   * output settles, never per byte: the notice is a stable line the agent
+   * keeps painting, so a trailing scan catches it and a change-only callback
+   * keeps the pane quiet. Only the live rows can hold a status bar — all of
+   * them, since an agent's UI sits wherever its output ended up — and only
+   * on the normal buffer: a full-screen app on the alternate buffer is not an
+   * agent's prompt.
+   */
+  const onAgentNoticeRef = useRef(onAgentNotice);
+  onAgentNoticeRef.current = onAgentNotice;
+  const agentNoticeRef = useRef<AgentNotice | null>(null);
+  const agentNoticeTimerRef = useRef<number | null>(null);
+  const reportAgentNotice = useCallback((notice: AgentNotice | null) => {
+    if (agentNoticeRef.current === notice) return;
+    agentNoticeRef.current = notice;
+    onAgentNoticeRef.current?.(notice);
+  }, []);
+  const scanAgentNotice = useCallback(() => {
+    const term = termRef.current;
+    if (!term) return;
+    const buffer = term.buffer.active;
+    if (buffer.type === "alternate") {
+      reportAgentNotice(null);
+      return;
+    }
+    const end = buffer.baseY + term.rows;
+    const rows: string[] = [];
+    for (let y = buffer.baseY; y < end; y += 1) {
+      rows.push(buffer.getLine(y)?.translateToString(true) ?? "");
+    }
+    reportAgentNotice(detectAgentNotice(rows));
+  }, [reportAgentNotice]);
+  const scheduleAgentNoticeScan = useCallback(() => {
+    if (!onAgentNoticeRef.current || agentNoticeTimerRef.current !== null) return;
+    agentNoticeTimerRef.current = window.setTimeout(() => {
+      agentNoticeTimerRef.current = null;
+      scanAgentNotice();
+    }, AGENT_NOTICE_SCAN_MS);
+  }, [scanAgentNotice]);
+  scheduleAgentNoticeScanRef.current = scheduleAgentNoticeScan;
+  useEffect(
+    () => () => {
+      if (agentNoticeTimerRef.current !== null) window.clearTimeout(agentNoticeTimerRef.current);
+    },
+    [],
+  );
 
   flushLiveTerminalWritesRef.current = () => {
     if (liveTerminalWriteIdleTimerRef.current) {
@@ -1080,6 +1142,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     liveTerminalWriteInFlightRef.current = true;
     term.write(batch.bytes, () => {
       liveTerminalWriteInFlightRef.current = false;
+      scheduleAgentNoticeScan();
       try {
         for (const onWritten of batch.onWritten) onWritten();
       } finally {
@@ -1294,6 +1357,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackCacheDirtyRef.current = true;
       scheduleScrollbackCacheRefreshRef.current(SCROLLBACK_WARM_DELAY_MS);
       term.reset();
+      reportAgentNotice(null);
       unifiedDeepSeededRef.current = false;
       pushOp(
         "seed",
@@ -1302,6 +1366,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       writeSequenced(term, liveSeedWriteOps(decodeUtf8(bytes)), () => {
         term.scrollToBottom();
         flushPendingLiveSeedWritesRef.current();
+        scheduleAgentNoticeScanRef.current();
       });
     },
     onDisplayControl: applyDisplayControl,
@@ -1430,6 +1495,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       focusViewRef.current();
     }
   }, [socket.dcOpen, active]);
+  useEffect(() => {
+    // The channel dropping is how a restart reaches this pane: the process
+    // that painted the notice is gone with it, and the new one repaints its
+    // own if it has one.
+    if (!socket.dcOpen) reportAgentNotice(null);
+  }, [socket.dcOpen, reportAgentNotice]);
 
   // Stash the socket in a ref so the once-on-mount bootstrap useEffect can
   // reach it without re-running every render.

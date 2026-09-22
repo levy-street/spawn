@@ -52,6 +52,8 @@ export interface TerminalHeaderProps {
   onChangeFolder: () => void;
   onSwitchAgent: () => void;
   onRestart: () => void;
+  /** What restarting brings back — the agent resumed, or a login shell. */
+  restartDetail?: string;
   onKill: () => void;
   onUpload: () => void;
   onSearch: () => void;
@@ -73,6 +75,7 @@ export function TerminalHeader({
   onChangeFolder,
   onSwitchAgent,
   onRestart,
+  restartDetail,
   onKill,
   onUpload,
   onSearch,
@@ -134,7 +137,13 @@ export function TerminalHeader({
       icon: menuIcon("Folder"),
       onPress: onChangeFolder,
     },
-    { id: "restart", label: "Restart", icon: menuIcon("RotateCw"), onPress: onRestart },
+    {
+      id: "restart",
+      label: "Restart",
+      ...(restartDetail ? { detail: restartDetail } : {}),
+      icon: menuIcon("RotateCw"),
+      onPress: onRestart,
+    },
     { id: "upload", label: "Upload file", icon: menuIcon("Upload"), onPress: onUpload },
     { id: "search", label: "Search terminal", icon: menuIcon("Search"), onPress: onSearch },
     { id: "font-size", label: "Font size", icon: menuIcon("Type"), onPress: onFontSize },

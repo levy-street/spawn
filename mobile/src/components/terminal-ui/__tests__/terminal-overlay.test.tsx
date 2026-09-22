@@ -216,6 +216,7 @@ const session: SessionOut = {
   activity_label: "Active",
   foreground_command: "codex",
   agent_id: null,
+  agent_session_id: null,
 };
 
 const host: HostOut = {
@@ -265,7 +266,10 @@ async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
           onDismiss={options.onDismiss ?? jest.fn()}
           onKill={options.onKill ?? jest.fn(async () => undefined)}
           onRename={jest.fn(async () => undefined)}
-          onRestart={jest.fn(async () => undefined)}
+          onRestart={jest.fn(async () => ({
+            kind: "restarted" as const,
+            plan: { kind: "shell" as const },
+          }))}
           session={session}
         />
       </ThemeProvider>

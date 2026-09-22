@@ -82,9 +82,96 @@ export function agentRunCommand(agent: Pick<Agent, "command" | "env"> & AgentYol
  * command-not-found honestly).
  */
 export function agentInstallAndRunCommand(
-  agent: Pick<Agent, "command" | "env" | "install"> & AgentYolo,
+  agent: Pick<Agent, "command" | "env" | "install"> & Partial<Pick<Agent, "kind">> & AgentYolo,
+  conversationId: string | null = null,
 ): string | null {
   const install = agent.install?.trim();
   if (!install) return null;
-  return `${install} && ${agentRunCommand(agent)}`;
+  return `${install} && ${agentLaunchCommand(agent, conversationId)}`;
+}
+
+/**
+ * How an agent CLI names a conversation, by agent kind. Every tool spells it
+ * differently, and most have no spelling at all: a launch that can be handed
+ * an id up front is what lets a later restart come back to the same thread.
+ */
+export type AgentConversationGrammar = {
+  /** Flags that start a fresh conversation under an id SPAWN D chose. Null when
+   *  the CLI names its own conversations. */
+  launch: ((conversationId: string) => string) | null;
+  /** Flags that reopen a known conversation. Null when the CLI cannot. */
+  resume: ((conversationId: string) => string) | null;
+  /** Flags that reopen the most recent conversation in this folder, for a
+   *  window whose conversation id was never recorded. Null when the CLI cannot. */
+  continueLatest: string | null;
+};
+
+const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> = {
+  "claude-code": {
+    launch: (id) => `--session-id ${id}`,
+    resume: (id) => `--resume ${id}`,
+    continueLatest: "--continue",
+  },
+  // Codex names its own sessions and takes `resume` as a subcommand after the
+  // global flags, so only "the latest one here" can be asked for.
+  codex: {
+    launch: null,
+    resume: null,
+    continueLatest: "resume --last",
+  },
+};
+
+/** The conversation grammar for an agent kind, or null for a CLI SPAWN D
+ *  knows no way to resume. */
+export function agentConversationGrammar(
+  kind: string | null | undefined,
+): AgentConversationGrammar | null {
+  return (kind && CONVERSATION_GRAMMARS[kind.trim().toLowerCase()]) || null;
+}
+
+/** Whether a window of this kind can be brought back to its conversation at all. */
+export function agentCanResume(kind: string | null | undefined): boolean {
+  const grammar = agentConversationGrammar(kind);
+  return Boolean(grammar && (grammar.resume || grammar.continueLatest));
+}
+
+/**
+ * A fresh conversation id for a launch, or null for a CLI that cannot be
+ * handed one. UUIDs: what every agent that takes an id expects, and safe to
+ * type at a prompt bare.
+ */
+export function newAgentConversationId(kind: string | null | undefined): string | null {
+  return agentConversationGrammar(kind)?.launch ? crypto.randomUUID() : null;
+}
+
+/**
+ * What starting an agent types when the window is to remember its
+ * conversation: the run command with the id the CLI is told to use. Without a
+ * grammar for the kind, or without an id, exactly the run command.
+ */
+export function agentLaunchCommand(
+  agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
+  conversationId: string | null,
+): string {
+  const run = agentRunCommand(agent);
+  const launch = agentConversationGrammar(agent.kind)?.launch;
+  return launch && conversationId ? `${run} ${launch(conversationId)}` : run;
+}
+
+/**
+ * What a restart types to bring the agent back where it was: resume the
+ * recorded conversation, or the latest one in this folder when none was
+ * recorded. Null when this kind of agent cannot be resumed at all, so the
+ * caller falls back to a plain relaunch and says so.
+ */
+export function agentResumeCommand(
+  agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
+  conversationId: string | null,
+): string | null {
+  const grammar = agentConversationGrammar(agent.kind);
+  if (!grammar) return null;
+  const run = agentRunCommand(agent);
+  if (conversationId && grammar.resume) return `${run} ${grammar.resume(conversationId)}`;
+  if (grammar.continueLatest) return `${run} ${grammar.continueLatest}`;
+  return null;
 }
