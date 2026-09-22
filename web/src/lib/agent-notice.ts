@@ -12,9 +12,6 @@
  *  itself in the background and is still running the old one. */
 export type AgentNotice = "update_installed";
 
-/** How many rows up from the bottom of the live screen a status bar can sit. */
-export const AGENT_NOTICE_ROWS = 6;
-
 /**
  * Claude Code's status bar after a background self-update. Both spellings the
  * CLI ships are matched, and the separator is left loose: a narrow pane can
@@ -23,8 +20,10 @@ export const AGENT_NOTICE_ROWS = 6;
 const CLAUDE_CODE_UPDATE_INSTALLED = /Update installed\s*\S?\s*Restart to (?:update|apply)/;
 
 /**
- * What the bottom rows of a live screen say, if anything. `rows` is the text
- * of the last few screen rows, top to bottom, as the terminal renders them.
+ * What the live screen says, if anything. `rows` is the text of the screen's
+ * rows, top to bottom, as the terminal renders them — the whole live screen,
+ * not just its bottom: an agent's status bar sits wherever its UI ended up,
+ * which early in a session on a tall pane is nowhere near the last row.
  */
 export function detectAgentNotice(rows: readonly string[]): AgentNotice | null {
   for (const row of rows) {

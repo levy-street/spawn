@@ -11,6 +11,7 @@ import type { SessionOut } from "@/data/api/schemas/sessions";
 import { cachedListItem } from "@/data/cached-list-item";
 import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
+import { commandBasename } from "@/data/selectors/agent";
 import type { AgentDef } from "@/data/types/domain";
 
 /** Definitions change when someone edits them in Settings, not per keystroke. */
@@ -107,7 +108,18 @@ export function useRestartTerminalSession(sessionId: string) {
         onSession: (latest) => queryClient.setQueryData(qk.session(latest.id), latest),
       });
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      // Typed into the shell it had: claim the foreground for the relaunched
+      // agent now, as a launch does, rather than reading as a shell until the
+      // next poll — the handoff's own polling left the shell in the cache.
+      if (result.kind === "resumed" && result.plan.kind === "agent") {
+        const basename = commandBasename(result.plan.command);
+        if (basename) {
+          queryClient.setQueryData<SessionOut>(qk.session(sessionId), (current) =>
+            current ? { ...current, foreground_command: basename } : current,
+          );
+        }
+      }
       void queryClient.invalidateQueries({ queryKey: qk.sessions() });
     },
   });

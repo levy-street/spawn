@@ -261,7 +261,7 @@ function writeSessionAgentToCache(
 }
 
 /** Optimistic `foreground_command` write into both session caches. */
-function writeForegroundToCache(
+export function writeForegroundToCache(
   queryClient: ReturnType<typeof useQueryClient>,
   sessionId: string,
   foregroundCommand: string | null,

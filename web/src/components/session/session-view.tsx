@@ -15,7 +15,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
-import { agentDisplayName } from "@/components/icons/AgentIcon";
+import { agentDisplayName, commandBasename } from "@/components/icons/AgentIcon";
 import { ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
@@ -30,7 +30,7 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
 import { restartSessionAgent } from "@/components/workspace/agent-restart";
-import { AgentSwitcher } from "@/components/workspace/agent-switcher";
+import { AgentSwitcher, writeForegroundToCache } from "@/components/workspace/agent-switcher";
 import { pendingLaunch } from "@/components/workspace/pending-launch";
 import { runInShell } from "@/components/workspace/shell-handoff";
 import {
@@ -43,7 +43,7 @@ import {
 } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { remove as removeTile } from "@/lib/grid";
-import { sessionTitle } from "@/lib/sessions";
+import { sessionAtShell, sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 
@@ -137,7 +137,11 @@ export function SessionView({ sessionId }: { sessionId: string }) {
         onSession: (latest) => updateSessionCaches(queryClient, latest),
       });
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      if (result.kind === "resumed" && result.plan.kind === "agent") {
+        const basename = commandBasename(result.plan.command);
+        if (basename) writeForegroundToCache(queryClient, sessionId, basename);
+      }
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setErrorMessage(null);
       requestAnimationFrame(() => getHandle()?.focus());
@@ -380,24 +384,26 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       <div className="flex min-h-0 flex-1">
         <div className="relative min-h-0 min-w-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
-          {agentNotice === "update_installed" && session.status === "running" && (
-            <div className="pointer-events-none absolute inset-x-0 top-2 z-20 flex justify-center px-2">
-              <div
-                role="status"
-                className="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border border-border bg-popover px-3 py-1.5 text-xs shadow-lg"
-              >
-                <span className="truncate text-muted-foreground">
-                  {agentDisplayName(session.foreground_command)} installed an update.
-                </span>
-                <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
-                  <RotateCcw className="size-3.5" aria-hidden />
-                  {restartM.isPending
-                    ? "Restarting…"
-                    : `Restart ${agentDisplayName(session.foreground_command)}`}
-                </Button>
+          {agentNotice === "update_installed" &&
+            session.status === "running" &&
+            !sessionAtShell(session) && (
+              <div className="pointer-events-none absolute inset-x-0 top-2 z-20 flex justify-center px-2">
+                <div
+                  role="status"
+                  className="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border border-border bg-popover px-3 py-1.5 text-xs shadow-lg"
+                >
+                  <span className="truncate text-muted-foreground">
+                    {agentDisplayName(session.foreground_command)} installed an update.
+                  </span>
+                  <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
+                    <RotateCcw className="size-3.5" aria-hidden />
+                    {restartM.isPending
+                      ? "Restarting…"
+                      : `Restart ${agentDisplayName(session.foreground_command)}`}
+                  </Button>
+                </div>
               </div>
-            </div>
-          )}
+            )}
           {(session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 shadow-lg">

@@ -212,11 +212,11 @@
   // The screen is read for an agent's own status-bar notice a beat after
   // output settles, never per byte: the notice is a stable line the agent
   // keeps painting, so a trailing scan catches it and a change-only post
-  // keeps the app quiet. Only the live rows can hold a status bar, and only
-  // on the normal buffer — a full-screen app on the alternate buffer is not
-  // an agent's prompt. The same read the web app makes of its own screen;
-  // the daemon never sees the text either way.
-  const AGENT_NOTICE_ROWS = 6;
+  // keeps the app quiet. Only the live rows can hold a status bar — all of
+  // them, since an agent's UI sits wherever its output ended up — and only
+  // on the normal buffer: a full-screen app on the alternate buffer is not an
+  // agent's prompt. The same read the web app makes of its own screen; the
+  // daemon never sees the text either way.
   const AGENT_NOTICE_SCAN_MS = 400;
   const CLAUDE_CODE_UPDATE_INSTALLED = /Update installed\s*\S?\s*Restart to (?:update|apply)/;
   let agentNotice = null;
@@ -237,7 +237,7 @@
       return;
     }
     const end = buffer.baseY + term.rows;
-    for (let y = Math.max(0, end - AGENT_NOTICE_ROWS); y < end; y += 1) {
+    for (let y = buffer.baseY; y < end; y += 1) {
       const row = buffer.getLine(y)?.translateToString(true) ?? "";
       if (CLAUDE_CODE_UPDATE_INSTALLED.test(row)) {
         reportAgentNotice("update_installed");

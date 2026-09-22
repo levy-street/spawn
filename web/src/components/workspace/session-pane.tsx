@@ -26,7 +26,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
+import { AgentIcon, agentDisplayName, commandBasename } from "@/components/icons/AgentIcon";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { confirm } from "@/components/ui/confirm";
@@ -41,11 +41,11 @@ import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
 import { basename } from "@/lib/paths";
-import { sessionTitle, sessionTitleDetail } from "@/lib/sessions";
+import { sessionAtShell, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { restartSessionAgent } from "./agent-restart";
-import { AgentSwitcher } from "./agent-switcher";
+import { AgentSwitcher, writeForegroundToCache } from "./agent-switcher";
 import { FolderPicker } from "./folder-picker";
 import { pendingLaunch } from "./pending-launch";
 
@@ -220,7 +220,15 @@ export function SessionPane({
         onSession: (latest) => writeSessionToCache(queryClient, latest),
       });
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      // Typed into the shell it had: claim the foreground for the relaunched
+      // agent now, as a launch does, rather than letting the pane read as a
+      // shell until the next poll — the handoff's own polling left the shell
+      // in the cache, and a notice over "bash" names the wrong thing.
+      if (result.kind === "resumed" && result.plan.kind === "agent") {
+        const basename = commandBasename(result.plan.command);
+        if (basename) writeForegroundToCache(queryClient, sessionId, basename);
+      }
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       onError(null);
       requestAnimationFrame(() => getHandle()?.focus());
@@ -570,34 +578,38 @@ export function SessionPane({
       {session ? (
         <div className="relative min-h-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
-          {agentNotice === "update_installed" && session.status === "running" && (
-            /* The agent's own status bar says it has updated itself and needs
+          {agentNotice === "update_installed" &&
+            session.status === "running" &&
+            !sessionAtShell(session) && (
+              /* The agent's own status bar says it has updated itself and needs
                relaunching. Offered here, over the pane, as the one click the
                notice is asking for: quit, relaunch on the new version, resume
                the conversation. Kept off the bottom rows, where the agent's
-               prompt and that status bar live. */
-            <div className="pointer-events-none absolute inset-x-0 top-2 z-20 flex justify-center px-2">
-              <div
-                role="status"
-                className="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border border-border bg-popover px-3 py-1.5 text-xs shadow-lg"
-              >
-                <span className="truncate text-muted-foreground">
-                  {agentDisplayName(session.foreground_command)} installed an update.
-                </span>
-                <button
-                  type="button"
-                  disabled={restartM.isPending}
-                  onClick={() => restartM.mutate()}
-                  className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-primary px-2.5 font-medium text-primary-foreground disabled:opacity-50"
+               prompt and that status bar live. Only while an agent holds the
+               foreground: a notice left on screen by one that has quit names
+               nothing to restart. */
+              <div className="pointer-events-none absolute inset-x-0 top-2 z-20 flex justify-center px-2">
+                <div
+                  role="status"
+                  className="pointer-events-auto flex max-w-full items-center gap-2 rounded-lg border border-border bg-popover px-3 py-1.5 text-xs shadow-lg"
                 >
-                  <RotateCcw className="size-3.5" aria-hidden />
-                  {restartM.isPending
-                    ? "Restarting…"
-                    : `Restart ${agentDisplayName(session.foreground_command)}`}
-                </button>
+                  <span className="truncate text-muted-foreground">
+                    {agentDisplayName(session.foreground_command)} installed an update.
+                  </span>
+                  <button
+                    type="button"
+                    disabled={restartM.isPending}
+                    onClick={() => restartM.mutate()}
+                    className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-primary px-2.5 font-medium text-primary-foreground disabled:opacity-50"
+                  >
+                    <RotateCcw className="size-3.5" aria-hidden />
+                    {restartM.isPending
+                      ? "Restarting…"
+                      : `Restart ${agentDisplayName(session.foreground_command)}`}
+                  </button>
+                </div>
               </div>
-            </div>
-          )}
+            )}
           {(session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex max-w-xs flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 text-center shadow-lg">

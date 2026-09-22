@@ -50,7 +50,7 @@ import {
   attachPendingLaunchDelivery,
   type PendingLaunchDeliveryResult,
 } from "@/data/queries/launcher";
-import { identifyAgent } from "@/data/selectors/agent";
+import { identifyAgent, isShellCommand } from "@/data/selectors/agent";
 import { DEFAULT_SESSION_UI, useSessionUiStore } from "@/data/stores/session-ui";
 import { DEVICE_NOT_TRUSTED_CODE, invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { useHostApprovalWatch } from "@/data/trust/use-host-approval-watch";
@@ -576,7 +576,9 @@ export function TerminalOverlay({
             visible={selectionVisible}
           />
         </View>
-        {agentNotice === "update_installed" && session.status === "running" ? (
+        {agentNotice === "update_installed" &&
+        session.status === "running" &&
+        !isShellCommand(session.foreground_command) ? (
           <TerminalNotice
             action={{
               label: restarting ? "Restarting…" : `Restart ${updatedAgentName}`,
