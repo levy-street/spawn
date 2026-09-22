@@ -5,11 +5,7 @@ import { StyleSheet, View } from "react-native";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import {
-  type AgentRestartPhase,
-  type AgentRestartResult,
-  restartPhaseLabel,
-} from "@/components/launcher/agent-restart";
+import type { AgentRestartResult } from "@/components/launcher/agent-restart";
 import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
 import { TerminalAccessoryBar } from "@/components/terminal-ui/accessory-bar";
 import { AttachmentSheet } from "@/components/terminal-ui/attachment-sheet";
@@ -82,12 +78,9 @@ export interface TerminalOverlayProps {
   focused: boolean;
   onDismiss: () => void;
   onRename: (name: string) => Promise<void>;
-  /** Restart the window as what it was opened as, given the terminal's own
-   *  keyboard so an agent can be relaunched in the shell it already has. */
-  onRestart: (
-    terminal: ShellCommandSink,
-    onPhase: (phase: AgentRestartPhase) => void,
-  ) => Promise<AgentRestartResult>;
+  /** Restart the window as what it was opened as: a fresh shell, with the
+   *  agent's resume command queued for it. */
+  onRestart: () => Promise<AgentRestartResult>;
   /** What restarting brings back, for the menu row. */
   restartDetail?: string;
   /** Reports its own outcome and must not reject: the window is already gone. */
@@ -204,7 +197,6 @@ export function TerminalOverlay({
   // right on it.
   const [agentNotice, setAgentNotice] = useState<AgentNotice | null>(null);
   const [restarting, setRestarting] = useState(false);
-  const [restartPhase, setRestartPhase] = useState<AgentRestartPhase | null>(null);
 
   // The bottom nav is portalled to window level and nothing holds its footprint
   // open, so the terminal reserves it — and drops that reservation the moment
@@ -398,22 +390,16 @@ export function TerminalOverlay({
   );
 
   /**
-   * The one restart, from the menu or the agent's own notice: an agent window
-   * comes back into its conversation, typed into the shell it already has
-   * when that works — nothing to reconnect — and a fresh shell otherwise,
-   * which the transport has to be reopened for.
+   * The one restart, from the menu or the agent's own notice: the session is
+   * restarted and the agent's resume command waits for the fresh shell, which
+   * the transport has to be reopened for.
    */
   const restartFromHere = (): void => {
     if (restarting) return;
     setRestarting(true);
-    setRestartPhase(null);
-    void onRestart(terminalSink, setRestartPhase)
+    void onRestart()
       .then((result) => {
         const agent = result.plan.kind === "agent" ? result.plan.agent.name : null;
-        if (result.kind === "resumed") {
-          transfers.setNotice(`${agent} restarted.`);
-          return;
-        }
         transfers.setNotice(
           agent
             ? `Session restarted. ${agent} starts when the shell is back.`
@@ -424,10 +410,7 @@ export function TerminalOverlay({
       .catch((error: unknown) => {
         transfers.setNotice(error instanceof Error ? error.message : "Session restart failed.");
       })
-      .finally(() => {
-        setRestarting(false);
-        setRestartPhase(null);
-      });
+      .finally(() => setRestarting(false));
   };
 
   const takeDisplayControl = (): void => {
@@ -593,9 +576,7 @@ export function TerminalOverlay({
         !isShellCommand(session.foreground_command) ? (
           <TerminalNotice
             action={{
-              label: restarting
-                ? restartPhaseLabel(restartPhase, updatedAgentName)
-                : `Restart ${updatedAgentName}`,
+              label: restarting ? "Restarting…" : `Restart ${updatedAgentName}`,
               disabled: restarting,
               onPress: restartFromHere,
             }}

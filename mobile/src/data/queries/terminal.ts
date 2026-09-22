@@ -1,12 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import {
-  type AgentRestartPhase,
-  type AgentRestartResult,
-  restartSessionAgent,
-} from "@/components/launcher/agent-restart";
+import { type AgentRestartResult, restartSessionAgent } from "@/components/launcher/agent-restart";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
-import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
 import { listAgents } from "@/data/api/endpoints/agents";
 import { getHost } from "@/data/api/endpoints/hosts";
 import { getSession, patchSession, restartSession } from "@/data/api/endpoints/sessions";
@@ -15,7 +10,6 @@ import type { SessionOut } from "@/data/api/schemas/sessions";
 import { cachedListItem } from "@/data/cached-list-item";
 import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
-import { commandBasename } from "@/data/selectors/agent";
 import type { AgentDef } from "@/data/types/domain";
 
 /** Definitions change when someone edits them in Settings, not per keystroke. */
@@ -84,23 +78,14 @@ export function useRenameTerminalSession(sessionId: string) {
 }
 
 /**
- * Restart from the open terminal: the window comes back as what it was
- * opened as, its agent resumed in the same conversation where the CLI can —
- * typed into the shell it already has when the agent will quit, into a fresh
- * one otherwise (`agent-restart.ts`). Takes the terminal's keyboard so the
- * first road is open to it.
+ * Restart the window as what it was opened as: the session is restarted and,
+ * for an agent window, the agent's resume command is queued for the terminal
+ * to type the moment the fresh shell connects (`agent-restart.ts`).
  */
-export interface RestartTerminalInput {
-  /** The open terminal's keyboard, when the restart is asked for from one. */
-  terminal: ShellCommandSink | null;
-  /** Each phase as it begins, for the control that started the restart. */
-  onPhase?: (phase: AgentRestartPhase) => void;
-}
-
 export function useRestartTerminalSession(sessionId: string) {
   const queryClient = useQueryClient();
-  return useMutation<AgentRestartResult, Error, RestartTerminalInput>({
-    mutationFn: async ({ terminal, onPhase }) => {
+  return useMutation<AgentRestartResult, Error, void>({
+    mutationFn: async () => {
       const session = await getSession(sessionId);
       const agents = await queryClient
         .ensureQueryData({ queryKey: qk.agents(), queryFn: listAgents })
@@ -108,30 +93,15 @@ export function useRestartTerminalSession(sessionId: string) {
       return restartSessionAgent({
         session,
         agents,
-        terminal,
         restart: async (id) => {
           const saved = await restartSession(id);
           queryClient.setQueryData(qk.session(id), saved);
           return saved;
         },
         pending: pendingLaunches,
-        getSession,
-        onSession: (latest) => queryClient.setQueryData(qk.session(latest.id), latest),
-        ...(onPhase ? { onPhase } : {}),
       });
     },
-    onSuccess: (result) => {
-      // Typed into the shell it had: claim the foreground for the relaunched
-      // agent now, as a launch does, rather than reading as a shell until the
-      // next poll — the handoff's own polling left the shell in the cache.
-      if (result.kind === "resumed" && result.plan.kind === "agent") {
-        const basename = commandBasename(result.plan.command);
-        if (basename) {
-          queryClient.setQueryData<SessionOut>(qk.session(sessionId), (current) =>
-            current ? { ...current, foreground_command: basename } : current,
-          );
-        }
-      }
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.sessions() });
     },
   });

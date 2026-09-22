@@ -1,13 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import type { TerminalHandle } from "@/components/terminal/Terminal";
-import {
-  AGENT_RESTART_ATTEMPTS,
-  type AgentRestartPhase,
-  planAgentRestart,
-  restartPhaseLabel,
-  restartSessionAgent,
-  type ShellHandoff,
-} from "@/components/workspace/agent-restart";
+import { planAgentRestart, restartSessionAgent } from "@/components/workspace/agent-restart";
 import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { Agent, Session } from "@/lib/api";
 
@@ -54,8 +46,6 @@ function session(overrides: Partial<Session> = {}): Session {
   } as Session;
 }
 
-const handle = { sendInput: () => {}, focus: () => {} } as unknown as TerminalHandle;
-
 describe("planAgentRestart", () => {
   test("a Claude Code window comes back into its recorded conversation", () => {
     expect(planAgentRestart(session(), [claude])).toEqual({
@@ -88,137 +78,51 @@ describe("planAgentRestart", () => {
 });
 
 describe("restartSessionAgent", () => {
-  test("hands the agent's own shell the resume command when it can", async () => {
-    const handoff = mock<ShellHandoff>(async () => "sent");
-    const restart = mock(async () => session());
-    const result = await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      handle,
-      handoff,
-      restart,
-    });
-    expect(result.kind).toBe("resumed");
-    expect(restart).not.toHaveBeenCalled();
-    expect(handoff).toHaveBeenCalledTimes(1);
-    const input = handoff.mock.calls[0]?.[0];
-    expect(input?.command).toBe("claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10");
-    expect(input?.confirmed).toBe(true);
-    expect(input?.attempts).toBe(AGENT_RESTART_ATTEMPTS);
-    expect(pendingLaunch.has(session().id)).toBe(false);
-  });
-
-  test("starts a fresh shell with the command queued when the agent will not quit", async () => {
-    const handoff = mock(async () => "busy" as const);
+  test("restarts the session with the resume command queued for the fresh shell", async () => {
     const restart = mock(async () => session({ status: "starting" }));
-    const result = await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      handle,
-      handoff,
-      restart,
-    });
-    expect(result.kind).toBe("restarted");
+    const result = await restartSessionAgent({ session: session(), agents: [claude], restart });
+    expect(result.plan.kind).toBe("agent");
     expect(restart).toHaveBeenCalledTimes(1);
     expect(pendingLaunch.take(session().id)).toBe(
       "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
     );
   });
 
-  test("an exited window skips the handoff: there is no shell to type into", async () => {
-    const handoff = mock(async () => "sent" as const);
-    const restart = mock(async () => session({ status: "starting" }));
+  test("queues before restarting, so the new shell cannot open ahead of its command", async () => {
+    const seen = { queuedAtRestart: null as boolean | null };
     await restartSessionAgent({
-      session: session({ status: "exited", foreground_command: null }),
+      session: session(),
       agents: [claude],
-      handle,
-      handoff,
-      restart,
+      restart: async () => {
+        seen.queuedAtRestart = pendingLaunch.has(session().id);
+        return session({ status: "starting" });
+      },
     });
-    expect(handoff).not.toHaveBeenCalled();
-    expect(restart).toHaveBeenCalledTimes(1);
-    expect(pendingLaunch.take(session().id)).toBe(
-      "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
-    );
+    expect(seen.queuedAtRestart).toBe(true);
+    pendingLaunch.clear(session().id);
   });
 
   test("a restart the server refused leaves nothing queued", async () => {
-    const restart = mock(async () => {
-      throw new Error("host daemon is offline");
-    });
     await expect(
       restartSessionAgent({
         session: session({ status: "exited" }),
         agents: [claude],
-        handle: null,
-        handoff: async () => "busy" as const,
-        restart,
+        restart: async () => {
+          throw new Error("host daemon is offline");
+        },
       }),
     ).rejects.toThrow("host daemon is offline");
     expect(pendingLaunch.has(session().id)).toBe(false);
   });
 
   test("a shell window restarts without touching the queue", async () => {
-    const handoff = mock(async () => "sent" as const);
     const restart = mock(async () => session({ status: "starting" }));
     const result = await restartSessionAgent({
       session: session({ agent_id: null, foreground_command: "bash" }),
       agents: [claude],
-      handle,
-      handoff,
       restart,
     });
-    expect(result).toEqual({ kind: "restarted", plan: { kind: "shell" } });
-    expect(handoff).not.toHaveBeenCalled();
+    expect(result).toEqual({ plan: { kind: "shell" } });
     expect(pendingLaunch.has(session().id)).toBe(false);
-  });
-});
-
-describe("restart phases", () => {
-  test("an agent that quits: stopping, then resuming in the same shell", async () => {
-    const phases: AgentRestartPhase[] = [];
-    await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      handle,
-      handoff: async () => "sent",
-      restart: async () => session(),
-      onPhase: (phase) => phases.push(phase),
-    });
-    expect(phases).toEqual(["stopping", "resuming"]);
-  });
-
-  test("an agent that will not quit: stopping, then a fresh shell", async () => {
-    const phases: AgentRestartPhase[] = [];
-    await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      handle,
-      handoff: async () => "busy",
-      restart: async () => session({ status: "starting" }),
-      onPhase: (phase) => phases.push(phase),
-    });
-    expect(phases).toEqual(["stopping", "restarting"]);
-    pendingLaunch.clear(session().id);
-  });
-
-  test("a window already at its prompt skips straight to resuming", async () => {
-    const phases: AgentRestartPhase[] = [];
-    await restartSessionAgent({
-      session: session({ foreground_command: "bash" }),
-      agents: [claude],
-      handle,
-      handoff: async () => "sent",
-      restart: async () => session(),
-      onPhase: (phase) => phases.push(phase),
-    });
-    expect(phases).toEqual(["resuming"]);
-  });
-
-  test("the control names the phase", () => {
-    expect(restartPhaseLabel("stopping", "Claude Code")).toBe("Stopping Claude Code…");
-    expect(restartPhaseLabel("resuming", "Claude Code")).toBe("Starting Claude Code…");
-    expect(restartPhaseLabel("restarting", "Claude Code")).toBe("Restarting the shell…");
-    expect(restartPhaseLabel(null, "Claude Code")).toBe("Restarting…");
   });
 });

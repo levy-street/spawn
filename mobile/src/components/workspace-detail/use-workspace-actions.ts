@@ -7,7 +7,6 @@ import { pendingLaunches } from "@/components/launcher/pending-launch";
 import {
   createSession,
   deleteSession,
-  getSession,
   getSessionAccess,
   patchSession,
   restartSession,
@@ -125,23 +124,20 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
     },
     /**
      * Bring the window back as what it was opened as: its agent resumed in
-     * the same conversation where the CLI can, a login shell otherwise. From
-     * the workspace there is no terminal open to type into, so the shell is
-     * restarted and the agent's resume command waits for the terminal to
-     * open (`agent-restart.ts`).
+     * the same conversation where the CLI can, a login shell otherwise. The
+     * shell is restarted and the agent's resume command waits for the
+     * terminal to open (`agent-restart.ts`).
      */
     restartSession: async (session: Session, agents: readonly AgentDef[]) => {
       const result = await restartSessionAgent({
         session,
         agents,
-        terminal: null,
         restart: async (sessionId) => {
           const saved = await restartSession(sessionId);
           client.setQueryData(qk.session(sessionId), saved);
           return saved;
         },
         pending: pendingLaunches,
-        getSession,
       });
       await invalidateSessions();
       return result;

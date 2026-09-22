@@ -64,9 +64,7 @@ export async function runInShell({
   terminal: ShellCommandSink | null;
   command: string;
   purpose: string;
-  /** Asks before the agent is interrupted. Omitted when the tap itself was
-   *  the consent — a "Restart Claude Code" button asks nothing further. */
-  confirmStop?(input: {
+  confirmStop(input: {
     title: string;
     description: string;
     confirmLabel: string;
@@ -84,14 +82,12 @@ export async function runInShell({
   }
 
   const foreground = foregroundName(session);
-  if (confirmStop) {
-    const proceed = await confirmStop({
-      title: `Stop ${foreground} first?`,
-      description: `${purpose} types a command at the shell prompt, and ${foreground} is holding this window's keyboard. Stopping it interrupts whatever it is doing.`,
-      confirmLabel: `Stop ${foreground}`,
-    });
-    if (!proceed) return "cancelled";
-  }
+  const proceed = await confirmStop({
+    title: `Stop ${foreground} first?`,
+    description: `${purpose} types a command at the shell prompt, and ${foreground} is holding this window's keyboard. Stopping it interrupts whatever it is doing.`,
+    confirmLabel: `Stop ${foreground}`,
+  });
+  if (!proceed) return "cancelled";
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (interruptScheduled(attempt)) terminal.sendInput(INTERRUPT);
