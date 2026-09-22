@@ -408,6 +408,14 @@ export function vanishedCeremonyScreen(record: {
   return record.signedMine ? "waiting" : null;
 }
 
+/** Relay poll cadence while a pairing names this device (a number is on screen). */
+export const PAIRING_POLL_LIVE_MS = 1_500;
+/** Relay poll cadence with no pairing live: the blocked side polls fast for both. */
+export const PAIRING_POLL_IDLE_MS = 15_000;
+/** Endorsement poll cadence while a ceremony is live, so the peer's edge is noticed. */
+export const ENDORSEMENT_POLL_LIVE_MS = 4_000;
+/** Endorsement poll cadence with nothing live; edits elsewhere invalidate the key. */
+export const ENDORSEMENT_POLL_IDLE_MS = 60_000;
 export function useApproveDeviceCeremony({
   accountId,
   currentDevice,
@@ -436,18 +444,26 @@ export function useApproveDeviceCeremony({
   const deviceId = currentDevice?.id ?? null;
   const active = enabled && deviceId !== null;
 
+  // Every signed-in tab runs this hook for as long as it is open. It polls
+  // fast only while a pairing that names this device exists — that is when a
+  // person is watching a number — and idles otherwise. The blocked side's
+  // gate polls the same key fast while it waits, so a pairing started for
+  // this device still lands here at once; at the always-fast cadence these
+  // two queries alone were most of the server's request volume (2026-09-22).
   const pairings = useQuery({
     queryKey: ["device-pairings", deviceId],
     queryFn: () => trust.listPairings(deviceId ?? ""),
-    refetchInterval: 1500,
+    refetchInterval: (query) =>
+      (query.state.data?.length ?? 0) > 0 ? PAIRING_POLL_LIVE_MS : PAIRING_POLL_IDLE_MS,
     enabled: active,
   });
   // Polled while ceremonies can be live, so each side notices the PEER's
   // endorsement landing and can flip to its completed state.
+  const ceremonyLive = (pairings.data?.length ?? 0) > 0 || records.size > 0;
   const endorsements = useQuery({
     queryKey: ["account-endorsements"],
     queryFn: trust.accountEndorsements,
-    refetchInterval: 4000,
+    refetchInterval: ceremonyLive ? ENDORSEMENT_POLL_LIVE_MS : ENDORSEMENT_POLL_IDLE_MS,
     enabled: active,
   });
 

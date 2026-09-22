@@ -1025,10 +1025,11 @@ async fn serve_one_connection_with_loader(
         rediscover_existing_sessions(registry, rtc_sessions, &out_tx).await;
     }
 
-    // Install this connection's sink for every session's forwarder so PTY
-    // bytes route here. (Reattach-discovered sessions don't have a sink yet;
-    // sessions from prior WS connections had a stale sink to overwrite.)
-    install_session_sinks(registry, &out_tx).await;
+    // The sessions' forwarders get this connection as their sink only once
+    // the server has acknowledged `register` (the `Registered` arm of the
+    // dispatch loop): the server drops every earlier frame with an
+    // `invalid_frame` and a warning, and the foreground re-announcement for
+    // every session used to be exactly that, on every reconnect.
 
     // Send `register`.
     let host_name = hostname::get()
@@ -1902,6 +1903,13 @@ async fn dispatch_loop(
                     tracing::info!(%host_id, "registered with server");
                     *registered_at.lock().expect("registered timestamp lock") =
                         Some(Instant::now());
+                    // Install this connection's sink for every session's
+                    // forwarder so PTY bytes route here. (Reattach-discovered
+                    // sessions don't have a sink yet; sessions from prior WS
+                    // connections had a stale sink to overwrite.) Only now:
+                    // anything sent before this acknowledgement the server
+                    // refuses.
+                    install_session_sinks(registry, out_tx).await;
                     crate::update::registered(out_tx).await;
                     // Spawned, never awaited: this can sit for two minutes
                     // waiting on a person, and the dispatch loop is how every
