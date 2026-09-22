@@ -1,6 +1,6 @@
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import type { Agent, Session } from "@/lib/api";
-import { sessionAgent } from "@/lib/sessions";
+import { sessionAgent, sessionAtShell } from "@/lib/sessions";
 import { agentResumeCommand, agentRunCommand } from "./agent-command";
 import { pendingLaunch } from "./pending-launch";
 import type { ShellHandoffResult } from "./shell-handoff";
@@ -26,9 +26,39 @@ import type { ShellHandoffResult } from "./shell-handoff";
  *    connects.
  */
 
-/** How long the agent gets to quit before a fresh shell is started instead:
- *  polls at the handoff's cadence, so roughly ten seconds. */
-export const AGENT_RESTART_ATTEMPTS = 14;
+/**
+ * How long the agent gets to quit before a fresh shell is started instead:
+ * polls at the handoff's cadence, so roughly twenty-five seconds. Generous
+ * on purpose. Claude Code on a fast machine is gone within a second of the
+ * Ctrl-C pair, but an older build on a Raspberry Pi with a monitor running
+ * took longer than the ten seconds this used to allow, and the fallback —
+ * killing the shell, reconnecting, replaying — is the slower, heavier road
+ * that a few more seconds of patience avoids.
+ */
+export const AGENT_RESTART_ATTEMPTS = 30;
+
+/** Where a restart is, for the button that started it. */
+export type AgentRestartPhase =
+  /** Waiting for the agent to hand the prompt back. */
+  | "stopping"
+  /** The resume command has been typed into the shell the window had. */
+  | "resuming"
+  /** A fresh shell is being started; the command waits for it. */
+  | "restarting";
+
+/** What the restart control says while a phase is under way. */
+export function restartPhaseLabel(phase: AgentRestartPhase | null, agentName: string): string {
+  switch (phase) {
+    case "stopping":
+      return `Stopping ${agentName}…`;
+    case "resuming":
+      return `Starting ${agentName}…`;
+    case "restarting":
+      return "Restarting the shell…";
+    default:
+      return "Restarting…";
+  }
+}
 
 export type AgentRestartPlan =
   | { kind: "shell" }
@@ -78,6 +108,7 @@ export async function restartSessionAgent({
   restart,
   purpose = "Restarting",
   onSession,
+  onPhase,
 }: {
   session: Session;
   agents: readonly Agent[];
@@ -91,14 +122,21 @@ export async function restartSessionAgent({
   purpose?: string;
   /** Fresh session records seen while waiting, for the caller's cache. */
   onSession?: (session: Session) => void;
+  /** Each phase as it begins, for the control that started the restart. */
+  onPhase?: (phase: AgentRestartPhase) => void;
 }): Promise<AgentRestartResult> {
   const plan = planAgentRestart(session, agents);
   if (plan.kind === "shell") {
+    onPhase?.("restarting");
     await restart();
     return { kind: "restarted", plan };
   }
 
   if (session.status === "running" && handle) {
+    // A window already at its prompt has nothing to stop; the handoff types
+    // straight away, so the phase it is in is the one it ends in.
+    const opening: AgentRestartPhase = sessionAtShell(session) ? "resuming" : "stopping";
+    onPhase?.(opening);
     const result = await handoff({
       session,
       handle,
@@ -108,11 +146,15 @@ export async function restartSessionAgent({
       confirmed: true,
       attempts: AGENT_RESTART_ATTEMPTS,
     });
-    if (result === "sent") return { kind: "resumed", plan };
+    if (result === "sent") {
+      if (opening !== "resuming") onPhase?.("resuming");
+      return { kind: "resumed", plan };
+    }
   }
 
   // Queued before the restart so the new shell's first keystrokes are the
   // command; forgotten again if the restart never happened.
+  onPhase?.("restarting");
   pendingLaunch.set(session.id, plan.command);
   try {
     await restart();

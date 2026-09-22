@@ -2,7 +2,9 @@ import { makeAgent } from "@/components/launcher/__tests__/fixtures";
 import {
   AGENT_RESTART_ATTEMPTS,
   type AgentRestartHandoff,
+  type AgentRestartPhase,
   planAgentRestart,
+  restartPhaseLabel,
   restartSessionAgent,
 } from "@/components/launcher/agent-restart";
 import type { Session } from "@/data/types/domain";
@@ -191,5 +193,58 @@ describe("restartSessionAgent", () => {
     expect(result).toEqual({ kind: "restarted", plan: { kind: "shell" } });
     expect(handoff).not.toHaveBeenCalled();
     expect(pending.persist).not.toHaveBeenCalled();
+  });
+});
+
+describe("restart phases", () => {
+  test("an agent that quits: stopping, then resuming in the same shell", async () => {
+    const phases: AgentRestartPhase[] = [];
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      terminal,
+      restart: async () => session(),
+      pending: pendingStore(),
+      getSession: async () => session(),
+      handoff: async () => "sent",
+      onPhase: (phase) => phases.push(phase),
+    });
+    expect(phases).toEqual(["stopping", "resuming"]);
+  });
+
+  test("an agent that will not quit: stopping, then a fresh shell", async () => {
+    const phases: AgentRestartPhase[] = [];
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      terminal,
+      restart: async () => session({ status: "starting" }),
+      pending: pendingStore(),
+      getSession: async () => session(),
+      handoff: async () => "busy",
+      onPhase: (phase) => phases.push(phase),
+    });
+    expect(phases).toEqual(["stopping", "restarting"]);
+  });
+
+  test("a restart from a workspace with no terminal is a fresh shell from the start", async () => {
+    const phases: AgentRestartPhase[] = [];
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      terminal: null,
+      restart: async () => session({ status: "starting" }),
+      pending: pendingStore(),
+      getSession: async () => session(),
+      onPhase: (phase) => phases.push(phase),
+    });
+    expect(phases).toEqual(["restarting"]);
+  });
+
+  test("the control names the phase", () => {
+    expect(restartPhaseLabel("stopping", "Claude Code")).toBe("Stopping Claude Code…");
+    expect(restartPhaseLabel("resuming", "Claude Code")).toBe("Starting Claude Code…");
+    expect(restartPhaseLabel("restarting", "Claude Code")).toBe("Restarting the shell…");
+    expect(restartPhaseLabel(null, "Claude Code")).toBe("Restarting…");
   });
 });

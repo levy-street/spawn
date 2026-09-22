@@ -1,7 +1,25 @@
 const INTERRUPT = "\u0003";
 export const SHELL_HANDOFF_POLL_MS = 700;
 export const SHELL_HANDOFF_ATTEMPTS = 8;
+/** Polls that each carry a Ctrl-C at the start. */
 export const SHELL_HANDOFF_INTERRUPTS = 4;
+/** Every this-many polls after that, a pair of Ctrl-Cs. */
+export const SHELL_HANDOFF_INTERRUPT_PERIOD = 8;
+
+/**
+ * When, while waiting for an agent to hand the prompt back, the handoff sends
+ * it another Ctrl-C. Agents read the first as "cancel" and a second one soon
+ * after as "quit", so the first polls each carry one. An agent that ate that
+ * opening pair — a menu was open, a permission prompt had the keyboard, the
+ * machine was busy — gets a fresh pair every eighth poll after that, rather
+ * than the handoff falling silent and timing out into a restart of the whole
+ * shell. Once the agent has quit the extra presses land on a shell prompt,
+ * which ignores them, and the `clear` typed ahead of the command wipes them.
+ */
+export function interruptScheduled(attempt: number): boolean {
+  if (attempt < SHELL_HANDOFF_INTERRUPTS) return true;
+  return attempt % SHELL_HANDOFF_INTERRUPT_PERIOD < 2;
+}
 
 export interface HandoffSession {
   id: string;
@@ -76,7 +94,7 @@ export async function runInShell({
   }
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (attempt < SHELL_HANDOFF_INTERRUPTS) terminal.sendInput(INTERRUPT);
+    if (interruptScheduled(attempt)) terminal.sendInput(INTERRUPT);
     await wait(SHELL_HANDOFF_POLL_MS);
     const latest = await getSession(session.id).catch(() => null);
     if (!latest) continue;

@@ -1,4 +1,5 @@
 import {
+  interruptScheduled,
   runInShell,
   SHELL_HANDOFF_ATTEMPTS,
   SHELL_HANDOFF_INTERRUPTS,
@@ -90,5 +91,31 @@ describe("shell handoff", () => {
     ).resolves.toBe("busy");
     expect(getSession).toHaveBeenCalledTimes(SHELL_HANDOFF_ATTEMPTS);
     expect(sink.sendInput).toHaveBeenCalledTimes(SHELL_HANDOFF_INTERRUPTS);
+  });
+});
+
+describe("interrupt schedule", () => {
+  test("opens with a Ctrl-C on each of the first polls, then a pair every eighth poll", () => {
+    const sent = Array.from({ length: 40 }, (_, attempt) => attempt).filter(interruptScheduled);
+    expect(sent).toEqual([0, 1, 2, 3, 8, 9, 16, 17, 24, 25, 32, 33]);
+    expect(sent.slice(0, SHELL_HANDOFF_INTERRUPTS)).toEqual([0, 1, 2, 3]);
+  });
+
+  test("a long wait re-sends the pair instead of falling silent", async () => {
+    const sink = { sendInput: jest.fn(), focus: jest.fn() };
+    await expect(
+      runInShell({
+        session: makeSession({ foreground_command: "claude" }),
+        terminal: sink,
+        command: "claude --resume x",
+        purpose: "Restarting",
+        getSession: async () => makeSession({ foreground_command: "claude" }),
+        wait: async () => undefined,
+        attempts: 20,
+      }),
+    ).resolves.toBe("busy");
+    // 0-3, then 8-9 and 16-17: eight presses, all Ctrl-C, nothing typed.
+    expect(sink.sendInput).toHaveBeenCalledTimes(8);
+    expect(sink.sendInput.mock.calls.every(([data]: [string]) => data === "\u0003")).toBe(true);
   });
 });

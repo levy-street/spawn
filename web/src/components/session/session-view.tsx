@@ -29,7 +29,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
-import { restartSessionAgent } from "@/components/workspace/agent-restart";
+import {
+  type AgentRestartPhase,
+  restartPhaseLabel,
+  restartSessionAgent,
+} from "@/components/workspace/agent-restart";
 import { AgentSwitcher, writeForegroundToCache } from "@/components/workspace/agent-switcher";
 import { pendingLaunch } from "@/components/workspace/pending-launch";
 import { runInShell } from "@/components/workspace/shell-handoff";
@@ -72,6 +76,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const { attach, getHandle, connInfo, displayState, agentNotice } = useLiveTerminal(sessionId);
+  const [restartPhase, setRestartPhase] = useState<AgentRestartPhase | null>(null);
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -135,8 +140,10 @@ export function SessionView({ sessionId }: { sessionId: string }) {
           return saved;
         },
         onSession: (latest) => updateSessionCaches(queryClient, latest),
+        onPhase: setRestartPhase,
       });
     },
+    onSettled: () => setRestartPhase(null),
     onSuccess: (result) => {
       if (result.kind === "resumed" && result.plan.kind === "agent") {
         const basename = commandBasename(result.plan.command);
@@ -398,7 +405,10 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                   <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
                     <RotateCcw className="size-3.5" aria-hidden />
                     {restartM.isPending
-                      ? "Restarting…"
+                      ? restartPhaseLabel(
+                          restartPhase,
+                          agentDisplayName(session.foreground_command),
+                        )
                       : `Restart ${agentDisplayName(session.foreground_command)}`}
                   </Button>
                 </div>
@@ -411,7 +421,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                 <div className="flex gap-2">
                   <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
                     <RotateCcw className="size-3.5" aria-hidden />
-                    Restart
+                    {restartM.isPending ? restartPhaseLabel(restartPhase, "the agent") : "Restart"}
                   </Button>
                   <Button size="sm" variant="outline" onClick={closeSession}>
                     Close
