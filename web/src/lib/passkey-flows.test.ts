@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
+import { AccountHealError } from "./account-heal";
 import { exportAccountRootMaterial, generateAccountRoot } from "./account-root";
 import { ApiError } from "./api";
 import {
@@ -219,6 +220,60 @@ describe("setUpPasskey ordering (P-C5)", () => {
     );
     expect(opened.root).not.toBeNull();
     expect(harness.log.some((entry) => entry === "heal:mint:0")).toBe(true);
+  });
+
+  test("a KEYLESS prior root (no bundle) is revoked, then setup proceeds under a fresh root", async () => {
+    const harness = new Harness();
+    // A live is_root row with no bundle behind it — the host-gossip backfill's
+    // keyless root, or an earlier setup whose bundle is gone. setUpPasskey must
+    // ADOPT the account by revoking it so a fresh, bundle-sealed root can take
+    // the one live-root slot — never dead-end the operator who never set up a
+    // passkey.
+    harness.roster = [
+      { id: "keyless-root", public_key: "K".repeat(43), revoked_at: null, is_root: true },
+    ];
+    const outcome = await setUpPasskey(harness.io());
+    expect(harness.revokedRows.map((r) => r.id)).toContain("keyless-root");
+    // Setup still completed: a bundle is stored and the heal ran under the new root.
+    expect(harness.bundle).not.toBeNull();
+    expect(harness.log.some((entry) => entry === "heal:mint:0")).toBe(true);
+    expect(outcome.hostCount).toBe(0);
+    // ORDERING (the window fix): the revoke happens AFTER putBundle stored a
+    // bundle — the create-only CAS closes the passkey-free establishment gate,
+    // so no other device can mint a rival root in the interim. Revoking before
+    // putBundle (with no live root and no bundle) is exactly the window that
+    // would let a rival mint and make this heal conflict permanently.
+    const put = harness.log.findIndex((e) => e.startsWith("putBundle"));
+    const revoke = harness.log.indexOf("revokeDevice:keyless-root");
+    expect(put).toBeGreaterThanOrEqual(0);
+    expect(revoke).toBeGreaterThan(put);
+  });
+
+  test("a rival root minted in the setup window is revoked and the heal retried once", async () => {
+    const harness = new Harness();
+    // A rival keyless root that another device minted in the window before our
+    // putBundle committed and registered just after our first scan.
+    harness.roster = [
+      { id: "rival-root", public_key: "V".repeat(43), revoked_at: null, is_root: true },
+    ];
+    let healCalls = 0;
+    const outcome = await setUpPasskey(
+      harness.io({
+        heal: async (_root, hosts, source) => {
+          healCalls += 1;
+          harness.log.push(`heal:${source}:${hosts.length}`);
+          // The first heal's register sees the rival and conflicts; the second,
+          // after the rival is revoked, succeeds.
+          if (healCalls === 1)
+            throw new AccountHealError("root_conflict", "rival registered first");
+          return { report: null, failure: null };
+        },
+      }),
+    );
+    expect(healCalls).toBe(2); // conflicted once, then retried after revoking
+    expect(harness.revokedRows.map((r) => r.id)).toContain("rival-root");
+    expect(harness.bundle).not.toBeNull();
+    expect(outcome.hostCount).toBe(0);
   });
 
   test("a putBundle CAS loss enrolls NOTHING and points at Use passkey", async () => {
