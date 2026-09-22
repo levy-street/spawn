@@ -168,7 +168,7 @@ export default function TerminalScreen(): React.JSX.Element {
         onDismiss={() => router.back()}
         onKill={() => killSession(sessionName)}
         onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
-        onRestart={(terminal, onPhase) => restart.mutateAsync({ terminal, onPhase })}
+        onRestart={() => restart.mutateAsync()}
         restartDetail={restartDetail(data.session, data.agents)}
         session={data.session}
       />

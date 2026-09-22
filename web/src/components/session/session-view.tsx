@@ -15,7 +15,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
-import { agentDisplayName, commandBasename } from "@/components/icons/AgentIcon";
+import { agentDisplayName } from "@/components/icons/AgentIcon";
 import { ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
@@ -29,14 +29,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
-import {
-  type AgentRestartPhase,
-  restartPhaseLabel,
-  restartSessionAgent,
-} from "@/components/workspace/agent-restart";
-import { AgentSwitcher, writeForegroundToCache } from "@/components/workspace/agent-switcher";
+import { restartSessionAgent } from "@/components/workspace/agent-restart";
+import { AgentSwitcher } from "@/components/workspace/agent-switcher";
 import { pendingLaunch } from "@/components/workspace/pending-launch";
-import { runInShell } from "@/components/workspace/shell-handoff";
 import {
   ApiError,
   agents as agentsApi,
@@ -76,7 +71,6 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const { attach, getHandle, connInfo, displayState, agentNotice } = useLiveTerminal(sessionId);
-  const [restartPhase, setRestartPhase] = useState<AgentRestartPhase | null>(null);
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -132,23 +126,14 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       return restartSessionAgent({
         session,
         agents: definitions,
-        handle: getHandle(),
-        handoff: runInShell,
         restart: async () => {
           const saved = await sessions.restart(sessionId);
           updateSessionCaches(queryClient, saved);
           return saved;
         },
-        onSession: (latest) => updateSessionCaches(queryClient, latest),
-        onPhase: setRestartPhase,
       });
     },
-    onSettled: () => setRestartPhase(null),
-    onSuccess: (result) => {
-      if (result.kind === "resumed" && result.plan.kind === "agent") {
-        const basename = commandBasename(result.plan.command);
-        if (basename) writeForegroundToCache(queryClient, sessionId, basename);
-      }
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setErrorMessage(null);
       requestAnimationFrame(() => getHandle()?.focus());
@@ -405,10 +390,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                   <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
                     <RotateCcw className="size-3.5" aria-hidden />
                     {restartM.isPending
-                      ? restartPhaseLabel(
-                          restartPhase,
-                          agentDisplayName(session.foreground_command),
-                        )
+                      ? "Restarting…"
                       : `Restart ${agentDisplayName(session.foreground_command)}`}
                   </Button>
                 </div>
@@ -421,7 +403,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                 <div className="flex gap-2">
                   <Button size="sm" disabled={restartM.isPending} onClick={() => restartM.mutate()}>
                     <RotateCcw className="size-3.5" aria-hidden />
-                    {restartM.isPending ? restartPhaseLabel(restartPhase, "the agent") : "Restart"}
+                    {restartM.isPending ? "Restarting…" : "Restart"}
                   </Button>
                   <Button size="sm" variant="outline" onClick={closeSession}>
                     Close

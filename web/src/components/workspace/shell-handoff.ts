@@ -27,8 +27,6 @@ export async function runInShell({
   command,
   purpose,
   onSession,
-  confirmed = false,
-  attempts = ATTEMPTS,
 }: {
   session: Session;
   handle: TerminalHandle | null;
@@ -38,11 +36,6 @@ export async function runInShell({
   purpose: string;
   /** Fresh session records seen while waiting, for the caller's cache. */
   onSession?: (session: Session) => void;
-  /** True when the click itself was the consent to stop the agent — a
-   *  "Restart Claude Code" button asks nothing further. Default: ask. */
-  confirmed?: boolean;
-  /** How many polls to give the agent before reporting it still running. */
-  attempts?: number;
 }): Promise<ShellHandoffResult> {
   if (!handle) return "cancelled";
   if (sessionAtShell(session)) {
@@ -51,17 +44,15 @@ export async function runInShell({
   }
 
   const foreground = agentDisplayName(session.foreground_command);
-  if (!confirmed) {
-    const proceed = await confirm({
-      title: `Stop ${foreground} first?`,
-      body: `${purpose} types a command at the shell prompt, and ${foreground} is holding this window's keyboard. Stopping it interrupts whatever it is doing.`,
-      confirmLabel: `Stop ${foreground}`,
-      destructive: true,
-    });
-    if (!proceed) return "cancelled";
-  }
+  const proceed = await confirm({
+    title: `Stop ${foreground} first?`,
+    body: `${purpose} types a command at the shell prompt, and ${foreground} is holding this window's keyboard. Stopping it interrupts whatever it is doing.`,
+    confirmLabel: `Stop ${foreground}`,
+    destructive: true,
+  });
+  if (!proceed) return "cancelled";
 
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
     if (interruptScheduled(attempt)) handle.sendInput(INTERRUPT);
     await delay(POLL_MS);
     const latest = await sessions.get(session.id).catch(() => null);

@@ -26,7 +26,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { AgentIcon, agentDisplayName, commandBasename } from "@/components/icons/AgentIcon";
+import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { confirm } from "@/components/ui/confirm";
@@ -44,8 +44,8 @@ import { basename } from "@/lib/paths";
 import { sessionAtShell, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
-import { type AgentRestartPhase, restartPhaseLabel, restartSessionAgent } from "./agent-restart";
-import { AgentSwitcher, writeForegroundToCache } from "./agent-switcher";
+import { restartSessionAgent } from "./agent-restart";
+import { AgentSwitcher } from "./agent-switcher";
 import { FolderPicker } from "./folder-picker";
 import { pendingLaunch } from "./pending-launch";
 
@@ -138,7 +138,6 @@ export function SessionPane({
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
   const { attach, connInfo, getHandle, agentNotice } = useLiveTerminal(session ? sessionId : null);
-  const [restartPhase, setRestartPhase] = useState<AgentRestartPhase | null>(null);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);
@@ -200,8 +199,8 @@ export function SessionPane({
     onError: (error) => onError(String(error)),
   });
   // Restart brings the window back as what it was opened as: a shell, or its
-  // agent back in the same conversation — in the shell it already has where
-  // the agent will quit, in a fresh one otherwise (`agent-restart.ts`).
+  // agent back in the same conversation. The session is restarted and the
+  // agent's resume command queued for the fresh shell (`agent-restart.ts`).
   const restartM = useMutation({
     mutationFn: async () => {
       if (!session) throw new Error("This session no longer exists.");
@@ -211,27 +210,14 @@ export function SessionPane({
       return restartSessionAgent({
         session,
         agents: definitions,
-        handle: getHandle(),
-        handoff: runInShell,
         restart: async () => {
           const saved = await sessions.restart(sessionId);
           writeSessionToCache(queryClient, saved);
           return saved;
         },
-        onSession: (latest) => writeSessionToCache(queryClient, latest),
-        onPhase: setRestartPhase,
       });
     },
-    onSettled: () => setRestartPhase(null),
-    onSuccess: (result) => {
-      // Typed into the shell it had: claim the foreground for the relaunched
-      // agent now, as a launch does, rather than letting the pane read as a
-      // shell until the next poll — the handoff's own polling left the shell
-      // in the cache, and a notice over "bash" names the wrong thing.
-      if (result.kind === "resumed" && result.plan.kind === "agent") {
-        const basename = commandBasename(result.plan.command);
-        if (basename) writeForegroundToCache(queryClient, sessionId, basename);
-      }
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       onError(null);
       requestAnimationFrame(() => getHandle()?.focus());
@@ -607,10 +593,7 @@ export function SessionPane({
                   >
                     <RotateCcw className="size-3.5" aria-hidden />
                     {restartM.isPending
-                      ? restartPhaseLabel(
-                          restartPhase,
-                          agentDisplayName(session.foreground_command),
-                        )
+                      ? "Restarting…"
                       : `Restart ${agentDisplayName(session.foreground_command)}`}
                   </button>
                 </div>
@@ -635,7 +618,7 @@ export function SessionPane({
                     className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground disabled:opacity-50"
                   >
                     <RotateCcw className="size-3.5" aria-hidden />
-                    {restartM.isPending ? restartPhaseLabel(restartPhase, "the agent") : "Restart"}
+                    {restartM.isPending ? "Restarting…" : "Restart"}
                   </button>
                   <button
                     type="button"

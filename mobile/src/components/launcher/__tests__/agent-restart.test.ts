@@ -1,12 +1,5 @@
 import { makeAgent } from "@/components/launcher/__tests__/fixtures";
-import {
-  AGENT_RESTART_ATTEMPTS,
-  type AgentRestartHandoff,
-  type AgentRestartPhase,
-  planAgentRestart,
-  restartPhaseLabel,
-  restartSessionAgent,
-} from "@/components/launcher/agent-restart";
+import { planAgentRestart, restartSessionAgent } from "@/components/launcher/agent-restart";
 import type { Session } from "@/data/types/domain";
 
 const claude = makeAgent({
@@ -44,8 +37,6 @@ function session(overrides: Partial<Session> = {}): Session {
     ...overrides,
   };
 }
-
-const terminal = { sendInput: jest.fn(), focus: jest.fn() };
 
 function pendingStore() {
   const queued = new Map<string, string>();
@@ -93,69 +84,35 @@ describe("planAgentRestart", () => {
 });
 
 describe("restartSessionAgent", () => {
-  test("hands the agent's own shell the resume command when it can", async () => {
-    const handoff = jest.fn<ReturnType<AgentRestartHandoff>, Parameters<AgentRestartHandoff>>(
-      async () => "sent",
-    );
-    const restart = jest.fn(async () => session());
-    const pending = pendingStore();
-    const result = await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      terminal,
-      restart,
-      pending,
-      getSession: async () => session(),
-      handoff,
-    });
-    expect(result.kind).toBe("resumed");
-    expect(restart).not.toHaveBeenCalled();
-    expect(handoff).toHaveBeenCalledTimes(1);
-    expect(handoff.mock.calls[0]?.[0]).toMatchObject({
-      command: "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
-      attempts: AGENT_RESTART_ATTEMPTS,
-    });
-    expect(pending.persist).not.toHaveBeenCalled();
-  });
-
-  test("starts a fresh shell with the command queued when the agent will not quit", async () => {
-    const handoff = jest.fn(async () => "busy" as const);
+  test("restarts the session with the resume command queued for the fresh shell", async () => {
     const restart = jest.fn(async () => session({ status: "starting" }));
     const pending = pendingStore();
     const result = await restartSessionAgent({
       session: session(),
       agents: [claude],
-      terminal,
       restart,
       pending,
-      getSession: async () => session(),
-      handoff,
     });
-    expect(result.kind).toBe("restarted");
+    expect(result.plan.kind).toBe("agent");
     expect(restart).toHaveBeenCalledWith(session().id);
     expect(pending.queued.get(session().id)).toBe(
       "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
     );
   });
 
-  test("a restart asked for without a terminal goes straight to a fresh shell", async () => {
-    const handoff = jest.fn(async () => "sent" as const);
-    const restart = jest.fn(async () => session({ status: "starting" }));
+  test("queues before restarting, so the new shell cannot open ahead of its command", async () => {
     const pending = pendingStore();
+    const seen = { queuedAtRestart: null as boolean | null };
     await restartSessionAgent({
       session: session(),
       agents: [claude],
-      terminal: null,
-      restart,
+      restart: async () => {
+        seen.queuedAtRestart = pending.queued.has(session().id);
+        return session({ status: "starting" });
+      },
       pending,
-      getSession: async () => session(),
-      handoff,
     });
-    expect(handoff).not.toHaveBeenCalled();
-    expect(pending.queued.get(session().id)).toBe(
-      "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
-    );
-    expect(restart).toHaveBeenCalledTimes(1);
+    expect(seen.queuedAtRestart).toBe(true);
   });
 
   test("a restart the server refused leaves nothing queued", async () => {
@@ -164,13 +121,10 @@ describe("restartSessionAgent", () => {
       restartSessionAgent({
         session: session({ status: "exited" }),
         agents: [claude],
-        terminal,
         restart: async () => {
           throw new Error("host daemon is offline");
         },
         pending,
-        getSession: async () => session(),
-        handoff: async () => "busy" as const,
       }),
     ).rejects.toThrow("host daemon is offline");
     expect(pending.clear).toHaveBeenCalledWith(session().id);
@@ -178,73 +132,15 @@ describe("restartSessionAgent", () => {
   });
 
   test("a shell window restarts without touching the queue", async () => {
-    const handoff = jest.fn(async () => "sent" as const);
     const restart = jest.fn(async () => session({ status: "starting" }));
     const pending = pendingStore();
     const result = await restartSessionAgent({
       session: session({ agent_id: null, foreground_command: "bash" }),
       agents: [claude],
-      terminal,
       restart,
       pending,
-      getSession: async () => session(),
-      handoff,
     });
-    expect(result).toEqual({ kind: "restarted", plan: { kind: "shell" } });
-    expect(handoff).not.toHaveBeenCalled();
+    expect(result).toEqual({ plan: { kind: "shell" } });
     expect(pending.persist).not.toHaveBeenCalled();
-  });
-});
-
-describe("restart phases", () => {
-  test("an agent that quits: stopping, then resuming in the same shell", async () => {
-    const phases: AgentRestartPhase[] = [];
-    await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      terminal,
-      restart: async () => session(),
-      pending: pendingStore(),
-      getSession: async () => session(),
-      handoff: async () => "sent",
-      onPhase: (phase) => phases.push(phase),
-    });
-    expect(phases).toEqual(["stopping", "resuming"]);
-  });
-
-  test("an agent that will not quit: stopping, then a fresh shell", async () => {
-    const phases: AgentRestartPhase[] = [];
-    await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      terminal,
-      restart: async () => session({ status: "starting" }),
-      pending: pendingStore(),
-      getSession: async () => session(),
-      handoff: async () => "busy",
-      onPhase: (phase) => phases.push(phase),
-    });
-    expect(phases).toEqual(["stopping", "restarting"]);
-  });
-
-  test("a restart from a workspace with no terminal is a fresh shell from the start", async () => {
-    const phases: AgentRestartPhase[] = [];
-    await restartSessionAgent({
-      session: session(),
-      agents: [claude],
-      terminal: null,
-      restart: async () => session({ status: "starting" }),
-      pending: pendingStore(),
-      getSession: async () => session(),
-      onPhase: (phase) => phases.push(phase),
-    });
-    expect(phases).toEqual(["restarting"]);
-  });
-
-  test("the control names the phase", () => {
-    expect(restartPhaseLabel("stopping", "Claude Code")).toBe("Stopping Claude Code…");
-    expect(restartPhaseLabel("resuming", "Claude Code")).toBe("Starting Claude Code…");
-    expect(restartPhaseLabel("restarting", "Claude Code")).toBe("Restarting the shell…");
-    expect(restartPhaseLabel(null, "Claude Code")).toBe("Restarting…");
   });
 });
