@@ -11956,10 +11956,20 @@ mod tests {
         assert_eq!(located["result"]["supported"], true);
         assert_eq!(located["result"]["transcripts"][0]["name"], "abc-123.jsonl");
         assert_eq!(located["result"]["transcripts"][0]["role"], "conversation");
-        assert_eq!(
-            located["result"]["transcripts"][0]["path"].as_str(),
-            transcript_dir.join("abc-123.jsonl").to_str()
+        // The daemon names it from its canonical root, which on Windows is
+        // neither the temp dir's short form nor its `\\?\` form; the tail is
+        // what identifies the file.
+        let located_path = std::path::PathBuf::from(
+            located["result"]["transcripts"][0]["path"]
+                .as_str()
+                .unwrap(),
         );
+        assert!(located_path.ends_with(
+            std::path::Path::new(".claude")
+                .join("projects")
+                .join("-home-me-proj")
+                .join("abc-123.jsonl")
+        ));
         let unplaced = request_host_control(
             accepted_channel,
             &mut messages_rx,

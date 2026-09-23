@@ -221,7 +221,10 @@ if control.count(expected_control_imports) != 1:
 # only over the direct RTC data channel — none of them imports the server
 # WebSocket or any Outbound frame, so no agent or file content can reach the
 # server through them (docs/TRUST.md). host_desktop has its own dedicated guard
-# in scripts/check-host-desktop-launch.sh.
+# in scripts/check-host-desktop-launch.sh. host_transcripts (2026-09-23) only
+# *locates* an agent's own transcript files under the home root and answers on
+# the same data channel; the bytes are then read with fs.read. It is pinned
+# below to depend on host_files alone, so it cannot reach a server transport.
 if set(re.findall(r"crate::(\w+)", control)) != {
     "host_desktop",
     "host_direct",
@@ -230,8 +233,16 @@ if set(re.findall(r"crate::(\w+)", control)) != {
     "host_mime",
     "host_preview",
     "host_signal",
+    "host_transcripts",
 }:
     raise SystemExit("no-server-agent-upload: protected host-control gained an unreviewed crate dependency")
+transcripts_path = os.path.join(root, "daemon/src/host_transcripts.rs")
+with open(transcripts_path, encoding="utf-8") as source:
+    transcripts = source.read()
+if set(re.findall(r"crate::(\w+)", transcripts)) != {"host_files"}:
+    raise SystemExit("no-server-agent-upload: host transcript locator gained an unreviewed crate dependency")
+if re.search(r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|TcpStream|UdpSocket|mpsc)\b", transcripts):
+    raise SystemExit("no-server-agent-upload: host transcript locator gained a transport")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
@@ -662,6 +673,7 @@ self_test() {
   cp "$source_root/daemon/src/rtc.rs" "$fixture/daemon/src/rtc.rs"
   cp "$source_root/daemon/src/rtc_pair.rs" "$fixture/daemon/src/rtc_pair.rs"
   cp "$source_root/daemon/src/host_control.rs" "$fixture/daemon/src/host_control.rs"
+  cp "$source_root/daemon/src/host_transcripts.rs" "$fixture/daemon/src/host_transcripts.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
   printf '%s\n' \

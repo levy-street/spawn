@@ -628,10 +628,25 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
-    /// The canonical root, which is what every display path starts with (on
-    /// macOS the temp dir itself is behind a symlink).
-    fn home(temp: &tempfile::TempDir) -> PathBuf {
-        temp.path().canonicalize().unwrap()
+    /// The home every display path starts with: the root as the service
+    /// itself names it (canonical, and on Windows without the `\\?\`
+    /// prefix a canonicalized path carries).
+    async fn home(temp: &tempfile::TempDir) -> PathBuf {
+        PathBuf::from(
+            HostFileService::rooted_at(temp.path())
+                .await
+                .unwrap()
+                .home_dir(),
+        )
+    }
+
+    fn set_modified(path: &Path, when: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     #[test]
@@ -680,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn claude_conversation_is_found_by_id_with_its_subagents_launch_folder_first() {
         let temp = tempfile::tempdir().unwrap();
-        let home = home(&temp);
+        let home = home(&temp).await;
         let id = "45171e5a-5951-4d38-81e5-e1c0f9639d80";
         let cwd = home.join("proj");
         let folder = claude_project_folder(&cwd.to_string_lossy());
@@ -760,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn claude_without_an_id_lists_the_launch_folders_conversations_newest_first() {
         let temp = tempfile::tempdir().unwrap();
-        let home = home(&temp);
+        let home = home(&temp).await;
         let cwd = home.join("proj");
         let folder = claude_project_folder(&cwd.to_string_lossy());
         let project = home.join(".claude").join("projects").join(&folder);
@@ -768,14 +783,11 @@ mod tests {
         write(&project.join("agent-side.jsonl"), b"{}\n");
         write(&project.join("newer.jsonl"), b"{}\n");
         let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        std::fs::File::open(project.join("older.jsonl"))
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        std::fs::File::open(project.join("agent-side.jsonl"))
-            .unwrap()
-            .set_modified(old + std::time::Duration::from_secs(10))
-            .unwrap();
+        set_modified(&project.join("older.jsonl"), old);
+        set_modified(
+            &project.join("agent-side.jsonl"),
+            old + std::time::Duration::from_secs(10),
+        );
         std::fs::create_dir_all(project.join("a-directory.jsonl")).unwrap();
 
         let report = locate(
@@ -824,7 +836,7 @@ mod tests {
     #[tokio::test]
     async fn codex_rollout_is_found_by_id_across_dated_folders() {
         let temp = tempfile::tempdir().unwrap();
-        let home = home(&temp);
+        let home = home(&temp).await;
         let sessions = home.join(".codex").join("sessions");
         let id = "01a0aeda-b62e-7681-a475-3e513e9aafd9";
         write(
@@ -855,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn codex_rollouts_without_an_id_are_the_ones_opened_in_the_folder_newest_first() {
         let temp = tempfile::tempdir().unwrap();
-        let home = home(&temp);
+        let home = home(&temp).await;
         let sessions = home.join(".codex").join("sessions");
         let here = "/home/me/proj";
         let meta = |cwd: &str| {
@@ -912,7 +924,7 @@ mod tests {
     async fn codex_with_neither_id_nor_folder_has_nothing_to_go_on() {
         let temp = tempfile::tempdir().unwrap();
         write(
-            &home(&temp).join(".codex/sessions/2026/09/17/rollout-2026-09-17T10-12-44-01a0aeda-b62e-7681-a475-3e513e9aafd9.jsonl"),
+            &home(&temp).await.join(".codex/sessions/2026/09/17/rollout-2026-09-17T10-12-44-01a0aeda-b62e-7681-a475-3e513e9aafd9.jsonl"),
             b"{}\n",
         );
         let report = locate(temp.path(), query("codex", None, None)).await;
@@ -923,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn aider_history_lives_in_the_folder_it_ran_in() {
         let temp = tempfile::tempdir().unwrap();
-        let home = home(&temp);
+        let home = home(&temp).await;
         let cwd = home.join("proj");
         write(&cwd.join(".aider.chat.history.md"), b"# chat\n");
         write(&cwd.join(".aider.input.history"), b"+ hello\n");
@@ -947,14 +959,18 @@ mod tests {
         assert_eq!(report.searched, vec![cwd.to_string_lossy().into_owned()]);
 
         // A folder outside home is beyond the file capability, so there is
-        // nothing to find and nothing to fail on.
-        let outside = locate(
-            temp.path(),
-            query("aider", None, Some("/definitely/outside")),
-        )
-        .await;
-        assert!(outside.transcripts.is_empty());
-        assert_eq!(outside.searched, vec!["/definitely/outside".to_string()]);
+        // nothing to find and nothing to fail on. (`/definitely/outside` is
+        // only absolute on Unix; on Windows it would name a folder in home.)
+        #[cfg(unix)]
+        {
+            let outside = locate(
+                temp.path(),
+                query("aider", None, Some("/definitely/outside")),
+            )
+            .await;
+            assert!(outside.transcripts.is_empty());
+            assert_eq!(outside.searched, vec!["/definitely/outside".to_string()]);
+        }
     }
 
     #[tokio::test]
@@ -984,7 +1000,7 @@ mod tests {
     #[tokio::test]
     async fn a_linked_project_folder_or_transcript_is_never_followed() {
         let temp = tempfile::tempdir().unwrap();
-        let home = home(&temp);
+        let home = home(&temp).await;
         let id = "abc-123";
         let outside = temp.path().join("outside");
         write(&outside.join(format!("{id}.jsonl")), b"secret\n");
@@ -1004,7 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn the_answer_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
-        let home = home(&temp);
+        let home = home(&temp).await;
         let cwd = home.join("proj");
         let project = home
             .join(".claude")
