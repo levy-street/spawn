@@ -14,6 +14,7 @@ import {
   Folder,
   Pencil,
   RotateCcw,
+  ScrollText,
   X,
 } from "lucide-react";
 import {
@@ -27,6 +28,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
+import { SessionTranscriptsDialog } from "@/components/session/session-transcripts-dialog";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { confirm } from "@/components/ui/confirm";
@@ -129,6 +131,7 @@ export function SessionPane({
   const queryClient = useQueryClient();
   const highlighted = useHighlightedSession();
   const [editingName, setEditingName] = useState(false);
+  const [transcriptsOpen, setTranscriptsOpen] = useState(false);
   const [selfHovered, setSelfHovered] = useState(false);
   const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
   const cwdChipRef = useRef<HTMLButtonElement>(null);
@@ -506,6 +509,14 @@ export function SessionPane({
               Restart
             </DropdownMenuItem>
           )}
+          {/* The agent's own record of the conversation, read from the host.
+              A shell window has none, so the row waits for an agent. */}
+          {session && (session.agent_id || !sessionAtShell(session)) && (
+            <DropdownMenuItem onSelect={() => setTranscriptsOpen(true)}>
+              <ScrollText className="size-4" aria-hidden />
+              Transcript
+            </DropdownMenuItem>
+          )}
           {session && onDuplicate && (
             <DropdownMenuItem disabled={!canDuplicate} onSelect={() => onDuplicate(sessionId)}>
               <Copy className="size-4" aria-hidden />
@@ -648,6 +659,14 @@ export function SessionPane({
             </button>
           </div>
         </div>
+      )}
+
+      {session && (
+        <SessionTranscriptsDialog
+          open={transcriptsOpen}
+          session={session}
+          onClose={() => setTranscriptsOpen(false)}
+        />
       )}
 
       <FolderPicker

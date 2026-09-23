@@ -27,6 +27,8 @@ export interface PaneActionsSheetProps {
   onDuplicate: (tile: Tile, session: Session | null) => void;
   onReorder: (target: PaneActionTarget, offset: -1 | 1) => void;
   onRestart: (session: Session) => void;
+  /** The agent's own record of the conversation, read from the host. */
+  onTranscripts: (session: Session) => void;
   onRemove: (tile: Tile) => void;
 }
 
@@ -43,6 +45,7 @@ export function PaneActionsSheet({
   onDuplicate,
   onReorder,
   onRestart,
+  onTranscripts,
   onRemove,
 }: PaneActionsSheetProps) {
   const tab = workspace.layout.tabs.find((candidate) => candidate.id === target?.tabId) ?? null;
@@ -125,6 +128,13 @@ export function PaneActionsSheet({
       detail: restartDetail(session, agents),
       icon: <Icon name="RotateCw" />,
       onPress: () => onRestart(session),
+    });
+    actions.push({
+      id: "transcripts",
+      label: "Transcript",
+      detail: "As the agent wrote it, read from the host",
+      icon: <Icon name="FileText" />,
+      onPress: () => onTranscripts(session),
     });
   }
   if (tile) {

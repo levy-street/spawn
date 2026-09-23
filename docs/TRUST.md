@@ -124,7 +124,9 @@ lifecycle state, exit codes, foreground executable basenames, activity
 timestamps, the agent definition a window was opened as, and the opaque
 conversation id the client handed that agent at launch (`agent_session_id`,
 what a restart resumes — an identifier the client chose, never read by the
-server); agent-definition names, kinds, commands, environment prefixes, and
+server; the agent's own transcript files that id names are located and read
+only over the device's host channel, `agent.transcripts` then `fs.read`, and
+never reach the server); agent-definition names, kinds, commands, environment prefixes, and
 install commands; skill names, descriptions, bodies, defaults, and session
 grants; public trust material; connection/signaling timing; and IP addresses.
 Host-agent availability flows expose the definition target, installed

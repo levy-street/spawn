@@ -7,6 +7,8 @@ export const qk = {
   host: (hostId: string) => ["host", hostId] as const,
   hostPins: (hostId: string) => ["trust", "host-pins", hostId] as const,
   hostAgents: (hostId: string) => ["host-agents", hostId] as const,
+  agentTranscripts: (sessionId: string, conversationId: string | null, cwd: string | null) =>
+    ["agent-transcripts", sessionId, conversationId, cwd] as const,
 
   sessions: () => ["sessions"] as const,
   sessionsForHost: (hostId: string) => ["sessions", { host_id: hostId }] as const,

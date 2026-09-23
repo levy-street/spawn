@@ -53,6 +53,7 @@ describe("workspace action sheets", () => {
         onRename={jest.fn()}
         onReorder={jest.fn()}
         onRestart={jest.fn()}
+        onTranscripts={jest.fn()}
         sessionsById={new Map([[session.id, session]])}
         target={{ tabId: "main", tile }}
         visible

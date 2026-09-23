@@ -18,6 +18,7 @@ import {
 } from "@/terminal/transport/bridge";
 import { verifyDaemonHost } from "@/terminal/transport/daemon-trust";
 import {
+  AGENT_TRANSCRIPTS_OP,
   assertHostFileSize,
   collectHostStream,
   HOST_CONTROL_PROTOCOL,
@@ -29,6 +30,7 @@ import {
   type HostReadDeclarationWire,
   HostStreamRuntime,
   hashHostFileSource,
+  parseAgentTranscriptReport,
   parseHostHello,
   parseHostReadDeclaration,
   parseHostWriteStreamId,
@@ -40,6 +42,8 @@ import {
 } from "@/terminal/transport/signed-signalling";
 import { reconnectDelay } from "@/terminal/transport/state-machine";
 import type {
+  AgentTranscriptQuery,
+  AgentTranscriptReport,
   HostCapabilities,
   HostFileSource,
   HostPreviewFile,
@@ -468,6 +472,28 @@ class WebViewHostTransport implements StreamingHostTransport {
     } catch {
       // Cancellation remains best-effort if WebContent retired at the same instant.
     }
+  }
+
+  /**
+   * Where the agent in a window left its own record of the conversation.
+   * Locate only: the daemon names files, and each is read with `readFile`
+   * under the same home root and no-follow rule as any other host file.
+   */
+  async agentTranscripts(
+    query: AgentTranscriptQuery,
+    options?: HostRequestOptions,
+  ): Promise<AgentTranscriptReport> {
+    this.#requireCapability(AGENT_TRANSCRIPTS_OP);
+    const response = await this.request<unknown>(
+      AGENT_TRANSCRIPTS_OP,
+      {
+        agent_kind: query.agentKind,
+        ...(query.conversationId ? { conversation_id: query.conversationId } : {}),
+        ...(query.cwd ? { cwd: query.cwd } : {}),
+      },
+      options,
+    );
+    return parseAgentTranscriptReport(response);
   }
 
   async readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile> {

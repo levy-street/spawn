@@ -7,6 +7,7 @@ import { hostNeedsUpdatePrompt } from "@/components/hosts/host-update-status";
 import { LauncherSheet } from "@/components/launcher/launcher-sheet";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
+import { TranscriptsSheet } from "@/components/terminal-ui/transcripts-sheet";
 import { Confirm } from "@/components/ui/confirm";
 import { useToast } from "@/components/ui/toast";
 import {
@@ -37,6 +38,8 @@ import { useConnectionStore } from "@/data/stores/connection";
 import type { Session, Workspace } from "@/data/types/domain";
 import type { Tile, WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
+import { HostTransportSurface } from "@/terminal/HostTransportSurface";
+import type { HostTransport, TransportState } from "@/terminal/transport/types";
 import { tabSurfaces, useTheme } from "@/theme";
 
 export interface WorkspaceDetailProps {
@@ -122,6 +125,15 @@ export function WorkspaceDetail({
     [sessions],
   );
   const hostsById = useMemo(() => new Map(hosts.map((host) => [host.id, host])), [hosts]);
+  // The transcript sheet reads host files, which takes a host consumer channel
+  // of its own; it exists only while the sheet is up. The session is kept
+  // past dismissal so the sheet can animate out over it.
+  const [transcriptSession, setTranscriptSession] = useState<Session | null>(null);
+  const [transcriptsVisible, setTranscriptsVisible] = useState(false);
+  const [transcriptTransport, setTranscriptTransport] = useState<HostTransport | null>(null);
+  const [transcriptTransportState, setTranscriptTransportState] = useState<TransportState>("idle");
+  const transcriptHost = transcriptSession ? hostsById.get(transcriptSession.host_id) : undefined;
+  const transcriptHostKey = transcriptHost?.host_public_key ?? null;
   const fileUpdateHost = fileUpdatePrompt ? (hostsById.get(fileUpdatePrompt.hostId) ?? null) : null;
   const requestOpenFiles = useCallback(
     (hostId: string, path: string) => {
@@ -442,11 +454,41 @@ export function WorkspaceDetail({
               () => setPaneTarget(null),
             );
           }}
+          onTranscripts={(session) => {
+            setPaneTarget(null);
+            setTranscriptSession(session);
+            setTranscriptsVisible(true);
+          }}
           sessionsById={sessionsById}
           target={paneTarget}
           visible={paneTarget !== null}
           workspace={workspace}
         />
+        {transcriptsVisible && transcriptHost && transcriptHostKey ? (
+          <HostTransportSurface
+            hostId={transcriptHost.id}
+            hostIdentityPublicKey={transcriptHostKey}
+            onStateChange={setTranscriptTransportState}
+            onTransport={setTranscriptTransport}
+          />
+        ) : null}
+        {transcriptSession ? (
+          <TranscriptsSheet
+            agents={agents}
+            hostName={transcriptSession.host_name ?? transcriptHost?.name ?? "this host"}
+            onDismiss={() => {
+              setTranscriptsVisible(false);
+              setTranscriptTransport(null);
+              setTranscriptTransportState("idle");
+            }}
+            session={transcriptSession}
+            transport={transcriptsVisible ? transcriptTransport : null}
+            transportState={
+              !transcriptHostKey ? "failed" : transcriptsVisible ? transcriptTransportState : "idle"
+            }
+            visible={transcriptsVisible}
+          />
+        ) : null}
         <MovePaneHostSheet
           hosts={hosts}
           onDismiss={() => setHostTarget(null)}

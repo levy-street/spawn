@@ -7,6 +7,7 @@ import {
   FolderOpen,
   Pencil,
   RotateCcw,
+  ScrollText,
   Trash2,
   Unlink,
   X,
@@ -16,6 +17,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
 import { agentDisplayName } from "@/components/icons/AgentIcon";
+import { SessionTranscriptsDialog } from "@/components/session/session-transcripts-dialog";
 import { ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
@@ -67,6 +69,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const [editingName, setEditingName] = useState(false);
+  const [transcriptsOpen, setTranscriptsOpen] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -347,6 +350,14 @@ export function SessionView({ sessionId }: { sessionId: string }) {
             <RotateCcw className="size-4" aria-hidden />
             Restart
           </DropdownMenuItem>
+          {/* The agent's own record of the conversation, read from the host.
+              A shell window has none, so the row waits for an agent. */}
+          {(session.agent_id || !sessionAtShell(session)) && (
+            <DropdownMenuItem onSelect={() => setTranscriptsOpen(true)}>
+              <ScrollText className="size-4" aria-hidden />
+              Transcript
+            </DropdownMenuItem>
+          )}
           {memberWorkspace && (
             <DropdownMenuItem
               disabled={removeFromWorkspaceM.isPending}
@@ -362,6 +373,11 @@ export function SessionView({ sessionId }: { sessionId: string }) {
             Close session
           </DropdownMenuItem>
         </DropdownMenu>
+        <SessionTranscriptsDialog
+          open={transcriptsOpen}
+          session={session}
+          onClose={() => setTranscriptsOpen(false)}
+        />
       </header>
 
       {errorMessage && (

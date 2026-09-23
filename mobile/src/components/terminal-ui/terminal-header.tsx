@@ -54,6 +54,8 @@ export interface TerminalHeaderProps {
   onRestart: () => void;
   /** What restarting brings back — the agent resumed, or a login shell. */
   restartDetail?: string;
+  /** The agent's own record of the conversation, read from the host. */
+  onTranscripts: () => void;
   onKill: () => void;
   onUpload: () => void;
   onSearch: () => void;
@@ -75,6 +77,7 @@ export function TerminalHeader({
   onChangeFolder,
   onSwitchAgent,
   onRestart,
+  onTranscripts,
   restartDetail,
   onKill,
   onUpload,
@@ -143,6 +146,13 @@ export function TerminalHeader({
       ...(restartDetail ? { detail: restartDetail } : {}),
       icon: menuIcon("RotateCw"),
       onPress: onRestart,
+    },
+    {
+      id: "transcripts",
+      label: "Transcript",
+      detail: "As the agent wrote it, read from the host",
+      icon: menuIcon("FileText"),
+      onPress: onTranscripts,
     },
     { id: "upload", label: "Upload file", icon: menuIcon("Upload"), onPress: onUpload },
     { id: "search", label: "Search terminal", icon: menuIcon("Search"), onPress: onSearch },

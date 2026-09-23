@@ -24,6 +24,7 @@ mod host_metrics;
 mod host_mime;
 mod host_preview;
 mod host_signal;
+mod host_transcripts;
 mod install;
 mod lifecycle;
 mod login;

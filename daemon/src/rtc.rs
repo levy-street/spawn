@@ -11932,6 +11932,44 @@ mod tests {
         .await;
         assert_eq!(stat["result"]["kind"], "file");
         assert_eq!(stat["result"]["size"], upload.len());
+        // The agent's own record of a conversation is located by its id and
+        // then read like any other host file; a harness the daemon cannot
+        // place is said so, not guessed at.
+        let transcript_dir = file_root.path().join(".claude/projects/-home-me-proj");
+        tokio::fs::create_dir_all(&transcript_dir).await.unwrap();
+        tokio::fs::write(transcript_dir.join("abc-123.jsonl"), b"{}\n")
+            .await
+            .unwrap();
+        let located = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-transcripts",
+            "agent.transcripts",
+            json!({
+                "agent_kind": "claude-code",
+                "conversation_id": "abc-123",
+                "cwd": "/home/me/proj",
+            }),
+        )
+        .await;
+        assert_eq!(located["ok"], true);
+        assert_eq!(located["result"]["supported"], true);
+        assert_eq!(located["result"]["transcripts"][0]["name"], "abc-123.jsonl");
+        assert_eq!(located["result"]["transcripts"][0]["role"], "conversation");
+        assert_eq!(
+            located["result"]["transcripts"][0]["path"].as_str(),
+            transcript_dir.join("abc-123.jsonl").to_str()
+        );
+        let unplaced = request_host_control(
+            accepted_channel,
+            &mut messages_rx,
+            "e2e-transcripts-unplaced",
+            "agent.transcripts",
+            json!({"agent_kind": "opencode", "cwd": "/home/me/proj"}),
+        )
+        .await;
+        assert_eq!(unplaced["ok"], true);
+        assert_eq!(unplaced["result"]["supported"], false);
         for (request_id, path) in [
             ("e2e-remove-file", "renamed.txt"),
             ("e2e-remove-directory", "folder"),
