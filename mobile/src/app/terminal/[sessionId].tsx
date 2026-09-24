@@ -163,6 +163,7 @@ export default function TerminalScreen(): React.JSX.Element {
         gives that reservation back the moment the keyboard covers the bar. A
         fixed padding is what left a dead band under the key row. */}
       <TerminalOverlay
+        agents={data.agents}
         focused={focused}
         host={host}
         onDismiss={() => router.back()}

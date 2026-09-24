@@ -125,6 +125,38 @@ export interface HostFileStat {
   open_allowed?: boolean;
 }
 
+/** One file an agent harness wrote for a window's conversation. */
+export interface AgentTranscriptFile {
+  path: string;
+  name: string;
+  size: number;
+  modified_at?: number | null;
+  /** `conversation` is the record itself; `subagent` a helper it ran;
+   *  `input` a bare prompt history. */
+  role: "conversation" | "subagent" | "input";
+  conversation_id?: string | null;
+}
+
+/** Where the daemon looked for an agent's transcripts, and what it found. */
+export interface AgentTranscriptReport {
+  agent_kind: string;
+  /** False when the daemon knows nothing about where this harness writes. */
+  supported: boolean;
+  transcripts: AgentTranscriptFile[];
+  /** Display paths the daemon searched, for an empty answer to name. */
+  searched: string[];
+  truncated: boolean;
+}
+
+export interface AgentTranscriptQuery {
+  agentKind: string;
+  conversationId?: string | null;
+  cwd?: string | null;
+}
+
+/** The host-control operation that locates transcripts; gate on it. */
+export const AGENT_TRANSCRIPTS_OP = "agent.transcripts";
+
 export interface HostReadStream {
   streamId: string;
   path: string;
@@ -950,6 +982,48 @@ export class HostControlClient {
     ) {
       this.failRtc();
       throw new HostControlError("invalid_response", "Host returned an invalid file stat");
+    }
+    return result;
+  }
+
+  /**
+   * Where the agent running in a window left its own record of the
+   * conversation — Claude Code's `.jsonl` under `~/.claude/projects`, a
+   * Codex rollout, aider's chat history. Locate only: each file named is
+   * then read with `readFile`, so a transcript is a host file like any
+   * other and never crosses the server. Gated on `agent.transcripts`; an
+   * older daemon answers `unsupported_operation` as an ordinary error.
+   */
+  async agentTranscripts(
+    query: AgentTranscriptQuery,
+    options?: HostControlRequestOptions,
+  ): Promise<AgentTranscriptReport> {
+    const result = await this.request<AgentTranscriptReport>(
+      AGENT_TRANSCRIPTS_OP,
+      {
+        agent_kind: query.agentKind,
+        ...(query.conversationId ? { conversation_id: query.conversationId } : {}),
+        ...(query.cwd ? { cwd: query.cwd } : {}),
+      },
+      options,
+    );
+    if (
+      !result ||
+      typeof result.agent_kind !== "string" ||
+      typeof result.supported !== "boolean" ||
+      !Array.isArray(result.transcripts) ||
+      !Array.isArray(result.searched) ||
+      result.transcripts.some(
+        (file) =>
+          !file ||
+          typeof file.path !== "string" ||
+          typeof file.name !== "string" ||
+          !Number.isSafeInteger(file.size) ||
+          (file.role !== "conversation" && file.role !== "subagent" && file.role !== "input"),
+      )
+    ) {
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid transcript report");
     }
     return result;
   }

@@ -1106,7 +1106,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.read.range","fs.write.begin","fs.mkdir","fs.rename","fs.remove","fs.preview","host.metrics","desktop.reveal","desktop.open"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"range_bytes":16777216,"preview_bytes":2097152,"preview_pixels":[128,256,512,1024],"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.read.range","fs.write.begin","fs.mkdir","fs.rename","fs.remove","agent.transcripts","fs.preview","host.metrics","desktop.reveal","desktop.open"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"range_bytes":16777216,"preview_bytes":2097152,"preview_pixels":[128,256,512,1024],"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -1172,6 +1172,23 @@ which a range would fork inside a frozen v1 vocabulary. `fs.read` is unchanged
 and keeps its end-to-end whole-file guarantee for downloads and transfers. The
 response also carries `file_size`, `eof`, a sniffed `content_type` with its
 `content_type_source`, a `preview_kind`, and `open_allowed`.
+
+`agent.transcripts` accepts `{agent_kind, conversation_id?, cwd?}` and answers
+`{agent_kind, supported, transcripts, searched, truncated}`: where the agent
+harness running in a window left its own record of the conversation, so a
+device can view or download it. `transcripts` entries carry `path`, `name`,
+`size`, optional `modified_at`, a `role` (`conversation`, `subagent`, or
+`input`) and an optional `conversation_id`; `searched` names the directories
+looked in, for an empty answer to say so. Claude Code is found by its id under
+`~/.claude/projects/<folder>/<id>.jsonl` (the launch folder first, subagent
+records beside it), or by the launch folder's conversations when no id was
+recorded; Codex by the id at the end of a `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+name, or by the `cwd` its first line names; aider by `.aider.chat.history.md`
+in the folder. A harness the daemon cannot place answers `supported:false`.
+The operation only *locates*: every file it names is then read with the
+ordinary `fs.read`, under the same home root and no-follow rule, and the
+search itself is bounded (at most 24 answers, 512 directories, 2000 files).
+The server never sees the request or a byte of a transcript.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit

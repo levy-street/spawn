@@ -4,7 +4,11 @@ import { joinDirectory, type PathFlavor } from "@/components/files/paths";
 import type { HostDirList, HostHome } from "@/components/files/types";
 import { getHost, listHosts } from "@/data/api/endpoints/hosts";
 import { qk } from "@/data/queryKeys";
-import type { HostTransport } from "@/terminal/transport/types";
+import type {
+  AgentTranscriptQuery,
+  AgentTranscriptReport,
+  HostTransport,
+} from "@/terminal/transport/types";
 
 export function fetchHostHome(transport: HostTransport): Promise<HostHome> {
   return transport.request<HostHome>("fs.home");
@@ -89,5 +93,40 @@ export function useHostDirectory(
         ? undefined
         : lastPage.next_cursor,
     enabled: enabled && transport !== null && path.length > 0,
+  });
+}
+
+/**
+ * The agent's own record of a window's conversation, located by the daemon.
+ * A transport without the method is an older client build; an older daemon
+ * answers `unsupported_operation` itself.
+ */
+export function fetchAgentTranscripts(
+  transport: HostTransport,
+  query: AgentTranscriptQuery,
+): Promise<AgentTranscriptReport> {
+  if (!transport.agentTranscripts) {
+    throw new Error("This host connection cannot locate transcripts.");
+  }
+  return transport.agentTranscripts(query);
+}
+
+export function useAgentTranscripts(
+  sessionId: string,
+  transport: HostTransport | null,
+  query: AgentTranscriptQuery | null,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: qk.agentTranscripts(sessionId, query?.conversationId ?? null, query?.cwd ?? null),
+    queryFn: () => {
+      if (!transport || !query) throw new Error("Host transport is unavailable.");
+      return fetchAgentTranscripts(transport, query);
+    },
+    enabled: enabled && transport !== null && query !== null,
+    // Every opening is a fresh look: the agent writes as it goes.
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
   });
 }

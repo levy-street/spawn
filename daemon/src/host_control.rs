@@ -667,6 +667,59 @@ impl Context {
                     .await
             }
             "fs.write.begin" => self.begin_write(request_id, payload).await,
+            // Where an agent left its own record of this window's
+            // conversation (`host_transcripts`). Locate only: the device
+            // reads what it names with `fs.read`, under the same root and
+            // the same no-follow rule as every other read.
+            "agent.transcripts" => {
+                let Some(agent_kind) = payload_string(payload, "agent_kind") else {
+                    return self
+                        .error(request_id, "invalid_request", "agent_kind is required")
+                        .await;
+                };
+                let query = crate::host_transcripts::TranscriptQuery {
+                    agent_kind: agent_kind.to_string(),
+                    conversation_id: payload_string(payload, "conversation_id").map(str::to_string),
+                    cwd: payload_string(payload, "cwd").map(str::to_string),
+                };
+                match crate::host_transcripts::locate_in_session(
+                    &self.files,
+                    query,
+                    Arc::clone(&self.file_operations),
+                )
+                .await
+                {
+                    Ok(mut report) => loop {
+                        let Ok(result) = serde_json::to_value(&report) else {
+                            return false;
+                        };
+                        let envelope = json!({
+                            "version": VERSION,
+                            "type": "response",
+                            "request_id": request_id,
+                            "ok": true,
+                            "result": result,
+                        });
+                        if envelope.to_string().len() <= MAX_FRAME_BYTES {
+                            break self.send(envelope).await;
+                        }
+                        // Long paths can outgrow the frame; the newest
+                        // answers are kept, like a directory page.
+                        if report.transcripts.len() <= 1 {
+                            break self
+                                .error(
+                                    request_id,
+                                    "entry_too_large",
+                                    "transcript path exceeds the control frame limit",
+                                )
+                                .await;
+                        }
+                        report.transcripts.pop();
+                        report.truncated = true;
+                    },
+                    Err(error) => self.error(request_id, error.code, &error.detail).await,
+                }
+            }
             _ => {
                 self.error(
                     request_id,
@@ -2149,6 +2202,7 @@ pub(crate) fn install(
                 "fs.mkdir",
                 "fs.rename",
                 "fs.remove",
+                "agent.transcripts",
             ];
             if publication_context.preview.is_some() {
                 capabilities.push("fs.preview");

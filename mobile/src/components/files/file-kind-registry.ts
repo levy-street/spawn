@@ -158,6 +158,10 @@ export const BY_EXTENSION: Readonly<Record<string, FileKindEntry>> = {
   mdx: { kind: "markdown", label: "MDX", mime: "text/markdown", icon: "markdown" },
   txt: { kind: "text", label: "Plain text", mime: "text/plain", icon: "text" },
   log: { kind: "text", label: "Log file", mime: "text/plain", icon: "text" },
+  // One JSON object per line — agent transcripts, event logs. Read as text
+  // rather than highlighted: a single line can run to hundreds of kilobytes.
+  jsonl: { kind: "text", label: "JSON Lines", mime: "text/plain", icon: "text" },
+  ndjson: { kind: "text", label: "JSON Lines", mime: "text/plain", icon: "text" },
   csv: { kind: "text", label: "CSV data", mime: "text/csv", icon: "sheet" },
   tsv: { kind: "text", label: "TSV data", mime: "text/tab-separated-values", icon: "sheet" },
   html: code("HTML source", "xml"),

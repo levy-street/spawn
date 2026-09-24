@@ -294,7 +294,7 @@ impl HostFileOperations {
         *self.effect_hooks.lock().expect("effect hooks lock") = Some(hooks);
     }
 
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
@@ -797,7 +797,7 @@ impl HostFileService {
         Arc::clone(&self.write_lifecycle_hooks)
     }
 
-    async fn run_blocking<T, F>(
+    pub(crate) async fn run_blocking<T, F>(
         &self,
         operations: Arc<HostFileOperations>,
         kind: HostOperationKind,
@@ -841,7 +841,7 @@ impl HostFileService {
         self.root_display.to_string_lossy().into_owned()
     }
 
-    fn relative_components(&self, input: &str) -> FsResult<Vec<OsString>> {
+    pub(crate) fn relative_components(&self, input: &str) -> FsResult<Vec<OsString>> {
         if input.as_bytes().contains(&0) {
             return Err(FsError::new("invalid_path", "path contains a NUL byte"));
         }
@@ -877,7 +877,7 @@ impl HostFileService {
         Ok(components)
     }
 
-    fn display_path(&self, components: &[OsString]) -> PathBuf {
+    pub(crate) fn display_path(&self, components: &[OsString]) -> PathBuf {
         let mut path = self.root_display.as_ref().clone();
         for component in components {
             path.push(component);
@@ -885,7 +885,7 @@ impl HostFileService {
         path
     }
 
-    fn open_dir_components(&self, components: &[OsString]) -> FsResult<Dir> {
+    pub(crate) fn open_dir_components(&self, components: &[OsString]) -> FsResult<Dir> {
         let mut current = self.root.try_clone()?;
         for component in components {
             let metadata = current.symlink_metadata(component)?;
@@ -2263,7 +2263,7 @@ fn atomic_rename_replace(parent: &Dir, source: &OsStr, destination: &OsStr) -> F
     }
 }
 
-fn nofollow_error(error: std::io::Error) -> FsError {
+pub(crate) fn nofollow_error(error: std::io::Error) -> FsError {
     if matches!(error.raw_os_error(), Some(40)) {
         symlink_error()
     } else {
@@ -2284,7 +2284,7 @@ fn join_error(error: tokio::task::JoinError) -> FsError {
     FsError::new("io_error", format!("filesystem task failed: {error}"))
 }
 
-fn cancelled_error() -> FsError {
+pub(crate) fn cancelled_error() -> FsError {
     FsError::new("cancelled", "filesystem operation was cancelled")
 }
 
@@ -2399,7 +2399,7 @@ fn file_version(file: &std::fs::File) -> FsResult<String> {
     Ok(digest[..16].to_string())
 }
 
-fn modified_seconds(metadata: &fs::Metadata) -> Option<i64> {
+pub(crate) fn modified_seconds(metadata: &fs::Metadata) -> Option<i64> {
     metadata
         .modified()
         .ok()

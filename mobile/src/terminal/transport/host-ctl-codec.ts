@@ -2,6 +2,8 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { encodeHex } from "@/lib/crypto/bytes";
 import { decodeBridgeBytes, encodeBridgeBytes } from "@/terminal/transport/bridge";
 import type {
+  AgentTranscriptFile,
+  AgentTranscriptReport,
   HostCapabilities,
   HostControlLimits,
   HostFileSource,
@@ -24,6 +26,10 @@ export const HOST_FILE_MAX_BYTES = 512 * 1024 * 1024;
 export const HOST_RANGE_MAX_BYTES = 16 * 1024 * 1024;
 export const HOST_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 export const HOST_PREVIEW_PIXELS = [128, 256, 512, 1024] as const;
+/** The host-control operation that locates an agent's transcripts; gate on it. */
+export const AGENT_TRANSCRIPTS_OP = "agent.transcripts";
+/** Roles a transcript file can have, as the daemon names them. */
+const TRANSCRIPT_ROLES = new Set(["conversation", "subagent", "input"]);
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -193,6 +199,61 @@ export function parseHostReadDeclaration(
     sha256: declaration.sha256,
     raw: declaration,
   };
+}
+
+export function parseAgentTranscriptReport(value: unknown): AgentTranscriptReport {
+  const report = record(value);
+  const invalid = () =>
+    new HostControlTransportError(
+      "invalid_response",
+      "Host returned an invalid transcript report.",
+    );
+  if (
+    !report ||
+    typeof report["agent_kind"] !== "string" ||
+    typeof report["supported"] !== "boolean" ||
+    !Array.isArray(report["transcripts"]) ||
+    !Array.isArray(report["searched"])
+  ) {
+    throw invalid();
+  }
+  const transcripts = report["transcripts"].map((entry: unknown): AgentTranscriptFile => {
+    const file = record(entry);
+    if (!file) throw invalid();
+    const path = file["path"];
+    const name = file["name"];
+    const size = file["size"];
+    const role = file["role"];
+    const modified = file["modified_at"];
+    const conversation = file["conversation_id"];
+    if (
+      typeof path !== "string" ||
+      typeof name !== "string" ||
+      !Number.isSafeInteger(size) ||
+      (size as number) < 0 ||
+      typeof role !== "string" ||
+      !TRANSCRIPT_ROLES.has(role)
+    ) {
+      throw invalid();
+    }
+    return Object.freeze({
+      path,
+      name,
+      size: size as number,
+      modified_at: Number.isSafeInteger(modified) ? (modified as number) : null,
+      role: role as AgentTranscriptFile["role"],
+      conversation_id: typeof conversation === "string" ? conversation : null,
+    });
+  });
+  return Object.freeze({
+    agent_kind: report["agent_kind"],
+    supported: report["supported"],
+    transcripts: Object.freeze(transcripts),
+    searched: Object.freeze(
+      report["searched"].filter((entry: unknown): entry is string => typeof entry === "string"),
+    ),
+    truncated: report["truncated"] === true,
+  });
 }
 
 export function parseHostWriteStreamId(value: unknown): string {

@@ -5,6 +5,7 @@ import {
   HOST_FILE_MAX_BYTES,
   HOST_STREAM_CHUNK_BYTES,
   hashHostFileSource,
+  parseAgentTranscriptReport,
   parseHostHello,
   parseHostReadDeclaration,
   parseHostStreamFrame,
@@ -99,5 +100,65 @@ describe("host control codec", () => {
     );
     expect(digest).toBe("aeb5000e5f0d5144ec958b073a61c0a829f85d1dc7f614f386920710fa48b447");
     expect(reads).toEqual([HOST_STREAM_CHUNK_BYTES, HOST_STREAM_CHUNK_BYTES + 3]);
+  });
+});
+
+describe("agent transcript reports", () => {
+  test("normalises a report and keeps only what the daemon vouched for", () => {
+    const report = parseAgentTranscriptReport({
+      agent_kind: "claude-code",
+      supported: true,
+      transcripts: [
+        {
+          path: "/home/me/.claude/projects/-home-me-proj/abc.jsonl",
+          name: "abc.jsonl",
+          size: 4096,
+          modified_at: 1_700_000_000,
+          role: "conversation",
+          conversation_id: "abc",
+        },
+        { path: "/home/me/x/agent-1.jsonl", name: "agent-1.jsonl", size: 12, role: "subagent" },
+      ],
+      searched: ["/home/me/.claude/projects", 7],
+      truncated: "yes",
+    });
+    expect(report.transcripts).toEqual([
+      {
+        path: "/home/me/.claude/projects/-home-me-proj/abc.jsonl",
+        name: "abc.jsonl",
+        size: 4096,
+        modified_at: 1_700_000_000,
+        role: "conversation",
+        conversation_id: "abc",
+      },
+      {
+        path: "/home/me/x/agent-1.jsonl",
+        name: "agent-1.jsonl",
+        size: 12,
+        modified_at: null,
+        role: "subagent",
+        conversation_id: null,
+      },
+    ]);
+    expect(report.searched).toEqual(["/home/me/.claude/projects"]);
+    expect(report.truncated).toBe(false);
+  });
+
+  test("refuses a file with a role it does not know", () => {
+    expect(() =>
+      parseAgentTranscriptReport({
+        agent_kind: "claude-code",
+        supported: true,
+        transcripts: [{ path: "/x", name: "x", size: 1, role: "whatever" }],
+        searched: [],
+        truncated: false,
+      }),
+    ).toThrow(/invalid transcript report/);
+  });
+
+  test("refuses a report missing its verdict", () => {
+    expect(() => parseAgentTranscriptReport({ agent_kind: "codex", transcripts: [] })).toThrow(
+      /invalid transcript report/,
+    );
   });
 });

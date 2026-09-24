@@ -39,6 +39,7 @@ import {
   useTerminalKeepAwake,
 } from "@/components/terminal-ui/terminal-lifecycle";
 import { TerminalNotice } from "@/components/terminal-ui/terminal-notice";
+import { TranscriptsSheet } from "@/components/terminal-ui/transcripts-sheet";
 import { UploadProgressBar } from "@/components/terminal-ui/upload-progress-bar";
 import { useTerminalTransfers } from "@/components/terminal-ui/use-terminal-transfers";
 import { DeviceApprovalOverlay } from "@/components/trust/device-approval-overlay";
@@ -54,13 +55,16 @@ import { identifyAgent, isShellCommand } from "@/data/selectors/agent";
 import { DEFAULT_SESSION_UI, useSessionUiStore } from "@/data/stores/session-ui";
 import { DEVICE_NOT_TRUSTED_CODE, invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { useHostApprovalWatch } from "@/data/trust/use-host-approval-watch";
+import type { AgentDef } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
+import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { encodeKey } from "@/terminal/key-encoder";
 import { TerminalSurface, type TerminalSurfaceHandle } from "@/terminal/TerminalSurface";
 import type {
   AgentNotice,
   ConnectionInfo,
   DisplayControlState,
+  HostTransport,
   KeySpec,
   SessionTransport,
   TransportError,
@@ -83,6 +87,8 @@ export interface TerminalOverlayProps {
   onRestart: () => Promise<AgentRestartResult>;
   /** What restarting brings back, for the menu row. */
   restartDetail?: string;
+  /** Agent definitions, for naming which agent's transcript this is. */
+  agents?: readonly AgentDef[];
   /** Reports its own outcome and must not reject: the window is already gone. */
   onKill: () => Promise<void>;
 }
@@ -120,6 +126,7 @@ export function TerminalOverlay({
   onRename,
   onRestart,
   restartDetail,
+  agents = [],
   onKill,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
@@ -152,6 +159,11 @@ export function TerminalOverlay({
   const [headerMenuVisible, setHeaderMenuVisible] = useState(false);
   const [folderVisible, setFolderVisible] = useState(false);
   const [agentVisible, setAgentVisible] = useState(false);
+  // The transcript sheet reads host files, which takes a host consumer channel
+  // of its own; it exists only while the sheet is up.
+  const [transcriptsVisible, setTranscriptsVisible] = useState(false);
+  const [transcriptTransport, setTranscriptTransport] = useState<HostTransport | null>(null);
+  const [transcriptTransportState, setTranscriptTransportState] = useState<TransportState>("idle");
 
   // Which key list this session gets, and which of those keys ride above the
   // keyboard. Read from the foreground command rather than from the agent
@@ -177,6 +189,7 @@ export function TerminalOverlay({
     diagnosticsVisible ||
     folderVisible ||
     agentVisible ||
+    transcriptsVisible ||
     killConfirmVisible;
   useTerminalKeyboardHold({
     held: drawerOpen,
@@ -490,6 +503,7 @@ export function TerminalOverlay({
         {...(restartDetail ? { restartDetail } : {})}
         onSearch={() => setSearchVisible(true)}
         onSwitchAgent={() => setAgentVisible(true)}
+        onTranscripts={() => setTranscriptsVisible(true)}
         onUpload={() => setAttachVisible(true)}
         title={title}
       />
@@ -622,6 +636,29 @@ export function TerminalOverlay({
         onDismiss={() => setDiagnosticsVisible(false)}
         state={connectionState}
         visible={diagnosticsVisible}
+      />
+      {transcriptsVisible && hostKey ? (
+        <HostTransportSurface
+          hostId={host.id}
+          hostIdentityPublicKey={hostKey}
+          onStateChange={setTranscriptTransportState}
+          onTransport={setTranscriptTransport}
+        />
+      ) : null}
+      <TranscriptsSheet
+        agents={agents}
+        hostName={session.host_name ?? host.name}
+        onDismiss={() => {
+          setTranscriptsVisible(false);
+          setTranscriptTransport(null);
+          setTranscriptTransportState("idle");
+        }}
+        session={session}
+        transport={transcriptsVisible ? transcriptTransport : null}
+        transportState={
+          !hostKey ? "failed" : transcriptsVisible ? transcriptTransportState : "idle"
+        }
+        visible={transcriptsVisible}
       />
       <DeviceApprovalOverlay
         hostId={host.id}

@@ -40,7 +40,9 @@ src/
                  rtc_pair.rs (shared device connections and session-channel admission),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
-                 release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs,
+                 release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs
+                 (host_transcripts.rs locates an agent's own transcript files
+                 for `agent.transcripts`; reading stays with host_files.rs),
                  upload.rs, sessions.rs, service.rs + service/ (launchd/systemd
                  dispatch, Windows Task Scheduler/Run watchdog and control
                  pipe), …

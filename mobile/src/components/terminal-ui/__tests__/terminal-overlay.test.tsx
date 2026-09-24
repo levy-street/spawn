@@ -92,6 +92,7 @@ jest.mock("@/components/terminal-ui/session-target-sheets", () => ({
 }));
 jest.mock("@/components/terminal-ui/font-size-sheet", () => ({ FontSizeSheet: () => null }));
 jest.mock("@/components/terminal-ui/diagnostics-sheet", () => ({ DiagnosticsSheet: () => null }));
+jest.mock("@/components/terminal-ui/transcripts-sheet", () => ({ TranscriptsSheet: () => null }));
 jest.mock("@/components/terminal-ui/selection-toolbar", () => ({ SelectionToolbar: () => null }));
 jest.mock("@/components/terminal-ui/upload-progress-bar", () => ({
   UploadProgressBar: () => null,

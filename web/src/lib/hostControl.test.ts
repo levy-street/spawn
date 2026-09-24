@@ -1892,6 +1892,90 @@ describe("HostControlClient desktop actions", () => {
   });
 });
 
+describe("HostControlClient agent transcripts", () => {
+  const WITH_TRANSCRIPTS = ["ping", "fs.read", "agent.transcripts"];
+
+  test("asks by harness, conversation id and folder, and returns the report", async () => {
+    const { client, pc } = await readyClient({}, hostId, WITH_TRANSCRIPTS);
+    const pending = client.agentTranscripts({
+      agentKind: "claude-code",
+      conversationId: "45171e5a-5951-4d38-81e5-e1c0f9639d80",
+      cwd: "/home/me/proj",
+    });
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.operation).toBe("agent.transcripts");
+    expect(request.payload).toEqual({
+      agent_kind: "claude-code",
+      conversation_id: "45171e5a-5951-4d38-81e5-e1c0f9639d80",
+      cwd: "/home/me/proj",
+    });
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          agent_kind: "claude-code",
+          supported: true,
+          transcripts: [
+            {
+              path: "/home/me/.claude/projects/-home-me-proj/45171e5a-5951-4d38-81e5-e1c0f9639d80.jsonl",
+              name: "45171e5a-5951-4d38-81e5-e1c0f9639d80.jsonl",
+              size: 4096,
+              modified_at: 1_700_000_000,
+              role: "conversation",
+              conversation_id: "45171e5a-5951-4d38-81e5-e1c0f9639d80",
+            },
+          ],
+          searched: ["/home/me/.claude/projects"],
+          truncated: false,
+        },
+      }),
+    );
+    const report = await pending;
+    expect(report.transcripts).toHaveLength(1);
+    expect(report.transcripts[0].role).toBe("conversation");
+    client.close();
+  });
+
+  test("a window without a recorded id asks by folder only", async () => {
+    const { client, pc } = await readyClient({}, hostId, WITH_TRANSCRIPTS);
+    void client
+      .agentTranscripts({ agentKind: "codex", conversationId: null, cwd: "/w" })
+      .catch(() => undefined);
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.payload).toEqual({ agent_kind: "codex", cwd: "/w" });
+    client.close();
+  });
+
+  test("a malformed report is refused rather than rendered", async () => {
+    const { client, pc } = await readyClient({}, hostId, WITH_TRANSCRIPTS);
+    const pending = client.agentTranscripts({ agentKind: "claude-code" });
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          agent_kind: "claude-code",
+          supported: true,
+          transcripts: [{ path: "/x", name: "x", size: 1, role: "whatever" }],
+          searched: [],
+          truncated: false,
+        },
+      }),
+    );
+    await expect(pending).rejects.toThrow(/invalid transcript report/i);
+    client.close();
+  });
+});
+
 describe("HostControlClient ranged reads", () => {
   const FULL = ["ping", "fs.read", "fs.read.range", "fs.preview"];
 

@@ -196,6 +196,35 @@ export interface HostRequestOptions {
   timeoutMs?: number;
 }
 
+/** One file an agent harness wrote for a window's conversation. */
+export interface AgentTranscriptFile {
+  readonly path: string;
+  readonly name: string;
+  readonly size: number;
+  readonly modified_at: number | null;
+  /** `conversation` is the record itself; `subagent` a helper it ran;
+   *  `input` a bare prompt history. */
+  readonly role: "conversation" | "subagent" | "input";
+  readonly conversation_id: string | null;
+}
+
+/** Where the daemon looked for an agent's transcripts, and what it found. */
+export interface AgentTranscriptReport {
+  readonly agent_kind: string;
+  /** False when the daemon knows nothing about where this harness writes. */
+  readonly supported: boolean;
+  readonly transcripts: readonly AgentTranscriptFile[];
+  /** Display paths the daemon searched, for an empty answer to name. */
+  readonly searched: readonly string[];
+  readonly truncated: boolean;
+}
+
+export interface AgentTranscriptQuery {
+  readonly agentKind: string;
+  readonly conversationId?: string | null;
+  readonly cwd?: string | null;
+}
+
 export interface HostReadableFile {
   readonly streamId: string;
   readonly path: string;
@@ -305,6 +334,12 @@ export interface HostTransport {
   cancel(requestId: string): void;
   hasCapability?(operation: string): boolean;
   readFile?(path: string, options?: HostRequestOptions): Promise<HostReadableFile>;
+  /** Where the agent in a window left its own record of the conversation
+   *  (`agent.transcripts`); each file named is then read with `readFile`. */
+  agentTranscripts?(
+    query: AgentTranscriptQuery,
+    options?: HostRequestOptions,
+  ): Promise<AgentTranscriptReport>;
   readRange?(
     path: string,
     offset: number,
