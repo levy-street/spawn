@@ -212,8 +212,20 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
 
     useEffect(() => {
       callbacks.current.onTransport?.(transport);
+      // Opening a session takes its display, silently: the screen someone is
+      // looking at is the one that controls it, and the view it came from
+      // offers "Take control" instead. One claim per opening, on the first
+      // ready; a reconnect is not an opening, so two open devices never trade
+      // the lease back and forth on their own.
+      let displayClaimOwed = true;
       const unsubscribers = [
-        transport.on("state", (state) => callbacks.current.onStateChange?.(state)),
+        transport.on("state", (state) => {
+          if (state === "ready" && displayClaimOwed) {
+            displayClaimOwed = false;
+            transport.takeControl();
+          }
+          callbacks.current.onStateChange?.(state);
+        }),
         transport.on("error", (error) => callbacks.current.onError?.(error)),
         transport.on("diagnostic", (diagnostic) => callbacks.current.onDiagnostic?.(diagnostic)),
         transport.on("title", (title) => callbacks.current.onTitleChange?.(title)),

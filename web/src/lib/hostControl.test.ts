@@ -828,6 +828,43 @@ describe("HostControlClient", () => {
     client.close();
   });
 
+  test("an unreadable device key is a visible error that keeps retrying, not a silent stop", async () => {
+    const signed = await signedRtcTrust();
+    let resolutions = 0;
+    const client = new HostControlClient(hostId, {
+      deviceConnection: true,
+      reconnectBaseDelayMs: 1,
+      reconnectRandom: () => 0,
+      resolveSignedRtcTrust: async () =>
+        ++resolutions === 1 ? { mode: "unpinned" } : { mode: "signed", capability: signed.trust },
+    });
+    client.connect();
+    const config = {
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [{ urls: ["turn:relay.example"] }],
+      ice_transport_policy: "relay",
+      ...metadata,
+      protocol_version: 2,
+    };
+    const first = FakeWebSocket.instances.at(-1);
+    first.onopen?.();
+    first.receive(config);
+    await waitFor(() => client.getState() === "error");
+    expect(client.getConnectionError()).toContain("device key");
+    expect(client.getTerminalReason()).toBeNull();
+
+    // It retries on a fresh socket instead of stopping for good.
+    await waitFor(() => FakeWebSocket.instances.at(-1) !== first);
+    const current = FakeWebSocket.instances.at(-1);
+    current.onopen?.();
+    current.receive(config);
+    const offer = await waitForSentFrame(current, "rtc.offer");
+    expect(offer).toHaveProperty("signed_envelope");
+    expect(client.getConnectionError()).toBeNull();
+    client.close();
+  });
+
   test("a 1008 close is terminal and surfaces the signed-out state", async () => {
     const client = new HostControlClient(hostId, { reconnectBaseDelayMs: 1 });
     client.connect();

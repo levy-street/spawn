@@ -288,6 +288,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const activePrevRef = useRef(active);
   const takeControlNowRef = useRef<() => boolean>(() => false);
   const focusViewRef = useRef<() => boolean>(() => false);
+  // Opening a session takes its display, silently: the view someone is
+  // looking at is the one that controls it, and the view it came from shows
+  // "Take control" instead. One claim per opening — mounting in the
+  // foreground or being brought back to it — paid once the control channel
+  // can carry it and the tab is visible. A reconnect is not an opening, so
+  // two open devices never trade the lease back and forth on their own.
+  const displayClaimOwedRef = useRef(active);
+  const payDisplayClaimRef = useRef<() => void>(() => {});
   // GPU renderer for the FOREGROUND terminal only. The DOM renderer rebuilds
   // row elements and forces style/layout/paint after every echo — measurable
   // extra frames of felt keystroke latency. Parked terminals release their
@@ -342,11 +350,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     activePrevRef.current = active;
     activeRef.current = active;
     syncWebglRenderer(active);
+    if (!active) displayClaimOwedRef.current = false;
     if (active && !was) {
-      // Brought to the foreground from a parked state: reclaim control and fit
-      // to the now-visible container. Two rAFs let the host's appendChild move
-      // and the container's layout settle before we measure + resize.
-      requestAnimationFrame(() => requestAnimationFrame(() => focusViewRef.current()));
+      // Brought to the foreground from a parked state: that is an opening, so
+      // take control and fit to the now-visible container. Two rAFs let the
+      // host's appendChild move and the container's layout settle before we
+      // measure + resize.
+      displayClaimOwedRef.current = true;
+      requestAnimationFrame(() => requestAnimationFrame(() => payDisplayClaimRef.current()));
       // Catch up on the refreshes the parked quiescence skipped.
       if (scrollbackCacheDirtyRef.current) {
         scheduleScrollbackCacheRefreshRef.current(250);
@@ -911,6 +922,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   );
   takeControlNowRef.current = takeControlNow;
   focusViewRef.current = () => requestDisplayControl("focus_view");
+  payDisplayClaimRef.current = () => {
+    if (!displayClaimOwedRef.current || !activeRef.current) return;
+    if (document.visibilityState !== "visible") return;
+    if (requestDisplayControl("take_control")) displayClaimOwedRef.current = false;
+  };
 
   const applyDisplayControl = useCallback(
     (state: DisplayControlState) => {
@@ -1486,15 +1502,22 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
   });
   useEffect(() => {
-    if (
-      socket.dcOpen &&
-      active &&
-      document.hasFocus() &&
-      containerRef.current?.contains(document.activeElement)
-    ) {
+    if (!socket.dcOpen || !active) return;
+    if (displayClaimOwedRef.current) {
+      // Measure after layout settles, as the foreground path does.
+      requestAnimationFrame(() => requestAnimationFrame(() => payDisplayClaimRef.current()));
+      return;
+    }
+    if (document.hasFocus() && containerRef.current?.contains(document.activeElement)) {
       focusViewRef.current();
     }
   }, [socket.dcOpen, active]);
+  useEffect(() => {
+    // A session opened in a background tab takes control when it is first seen.
+    const onVisibility = () => payDisplayClaimRef.current();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
   useEffect(() => {
     // The channel dropping is how a restart reaches this pane: the process
     // that painted the notice is gone with it, and the new one repaints its

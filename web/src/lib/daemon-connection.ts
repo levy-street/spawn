@@ -34,6 +34,10 @@ const INITIAL: DaemonSnapshot = {
   trust: null,
 };
 const HEARTBEAT_MS = 2_000;
+// A live owner announces every heartbeat. A visible tab that hears nothing for
+// this long while it waits for the lock takes it: the owner is hung, or frozen
+// without the freeze event releasing it, and waiting on it was indefinite.
+const OWNER_SILENCE_MS = 10_000;
 const VIEW_LEASE_MS = 12_000;
 const MAX_CHANNELS = 256;
 const RECEIVE_WINDOW_BYTES = 2 * 1024 * 1024;
@@ -80,6 +84,8 @@ export class SharedDaemonConnection implements DaemonConnection {
   private term = 0;
   private epoch = 0;
   private ownerSeen = 0;
+  private waitingSince = 0;
+  private lastBeat = Date.now();
   private lockAbort: AbortController | null = null;
   private releaseLock: (() => void) | null = null;
   private stopRoot: (() => void) | null = null;
@@ -93,6 +99,8 @@ export class SharedDaemonConnection implements DaemonConnection {
     private readonly key: string,
     private readonly createRoot: () => HostControlClient,
     private readonly isActive: () => boolean = () => true,
+    private readonly onRetired: () => void = () => {},
+    private readonly timing = { heartbeatMs: HEARTBEAT_MS, ownerSilenceMs: OWNER_SILENCE_MS },
   ) {
     try {
       this.bus = new BroadcastChannel(`spawn.daemon.v2:${key}`);
@@ -103,20 +111,34 @@ export class SharedDaemonConnection implements DaemonConnection {
     this.heartbeat = setInterval(() => {
       if (!this.isActive()) {
         this.close();
+        this.onRetired();
         return;
       }
       if (!this.root && this.ownerSeen && Date.now() - this.ownerSeen > 6_000) {
         this.publish({ ...this.snapshot, state: "connecting", generation: null });
       }
+      const now = Date.now();
+      const suspended = now - this.lastBeat > 3 * this.timing.heartbeatMs;
+      this.lastBeat = now;
+      if (!this.root && suspended) {
+        // This tab was frozen or throttled, not the owner: ask it to announce
+        // and measure its silence from now.
+        this.waitingSince = now;
+        this.post({ type: "hello" });
+      } else if (!this.root) {
+        const heard = Math.max(this.ownerSeen, this.waitingSince);
+        if (!this.lockAbort) this.elect();
+        else if (document.visibilityState === "visible" && now - heard > this.timing.ownerSilenceMs)
+          this.elect(true);
+      }
       this.post({ type: "heartbeat" });
       if (this.root) {
         this.announce();
-        const now = Date.now();
         for (const [id, entry] of this.owned) {
           if (now - (this.leases.get(entry.tab) ?? 0) > VIEW_LEASE_MS) this.closeOwned(id);
         }
       }
-    }, HEARTBEAT_MS);
+    }, this.timing.heartbeatMs);
     window.addEventListener("pagehide", this.onHide);
     window.addEventListener("pageshow", this.onShow);
     document.addEventListener("freeze", this.onHide);
@@ -126,6 +148,7 @@ export class SharedDaemonConnection implements DaemonConnection {
   }
 
   getSnapshot = (): DaemonSnapshot => this.snapshot;
+  isClosed = (): boolean => this.closed;
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -194,8 +217,13 @@ export class SharedDaemonConnection implements DaemonConnection {
     this.listeners.clear();
   }
 
-  private elect(): void {
-    if (this.closed || this.lockAbort) return;
+  /**
+   * Queue for the owner lock, or with `steal` take it from a silent owner. A
+   * stolen owner's request rejects; it stands down and queues again (so does
+   * one that hears a newer owner's term first).
+   */
+  private elect(steal = false): void {
+    if (this.closed || (this.lockAbort && !steal)) return;
     if (!navigator.locks || !this.bus) {
       this.publish({
         ...INITIAL,
@@ -204,12 +232,18 @@ export class SharedDaemonConnection implements DaemonConnection {
       });
       return;
     }
+    this.lockAbort?.abort();
     const abort = new AbortController();
     this.lockAbort = abort;
+    this.waitingSince = Date.now();
+    let held = false;
+    // The API refuses `signal` together with `steal`; a steal is granted at once.
+    const options: LockOptions = steal ? { steal: true } : { signal: abort.signal };
     void navigator.locks
-      .request(`spawn.daemon.v2:${this.key}`, { signal: abort.signal }, async () => {
+      .request(`spawn.daemon.v2:${this.key}`, options, async () => {
         if (this.closed || abort.signal.aborted) return;
         if (!this.isActive()) return;
+        held = true;
         const termKey = `spawn.daemon.term:${this.key}`;
         const saved = Number(localStorage.getItem(termKey)) || 0;
         this.term = Math.max(Date.now(), saved + 1, this.term + 1);
@@ -226,12 +260,18 @@ export class SharedDaemonConnection implements DaemonConnection {
         });
       })
       .catch(() => {
-        if (!abort.signal.aborted && !this.closed)
-          this.publish({
-            ...INITIAL,
-            state: "error",
-            error: "SPAWN D could not coordinate this browser's daemon connection.",
-          });
+        if (abort.signal.aborted || this.closed) return;
+        if (held) {
+          // Another tab took the lock while this one looked hung.
+          this.relinquish();
+          this.elect();
+          return;
+        }
+        this.publish({
+          ...INITIAL,
+          state: "error",
+          error: "SPAWN D could not coordinate this browser's daemon connection.",
+        });
       })
       .finally(() => {
         if (this.lockAbort === abort) this.lockAbort = null;
@@ -321,6 +361,11 @@ export class SharedDaemonConnection implements DaemonConnection {
     if (message.type === "snapshot" && message.owner && message.snapshot) {
       if (!Number.isSafeInteger(message.term) || (message.term ?? 0) < this.term) return;
       if (!Number.isSafeInteger(message.epoch) || (message.epoch ?? -1) < 0) return;
+      if (this.leader && message.owner !== this.leader && message.term! > this.term) {
+        // A newer owner took the lock from this tab: stand down before following it.
+        this.relinquish();
+        queueMicrotask(() => this.elect());
+      }
       if (message.term === this.term && this.owner && this.owner !== message.owner) return;
       if (message.term === this.term && message.epoch! < this.epoch) return;
       this.term = message.term!;

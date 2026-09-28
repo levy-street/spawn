@@ -40,7 +40,13 @@ elect one owner across same-origin tabs, and BroadcastChannel carries bounded
 channel traffic to it. Monotonic owner terms fence handovers, and child epochs
 reject delayed opens after readiness loss on the same peer. Closing or
 freezing the owner releases its lock; another tab connects and its views fetch
-a fresh history seed, merging live output at its PTY offset. Unsupported
+a fresh history seed, merging live output at its PTY offset. An owner that
+stops announcing without releasing its lock (a hung tab, or one frozen without
+its freeze event) loses it: a visible tab that hears nothing for ten seconds
+steals the lock, and the silent owner stands down and follows when it resumes.
+A tab whose own timers were suspended does not count that gap as the owner's
+silence. A connection that retires itself is rebuilt by the provider rather
+than left closed until a reload. Unsupported
 coordination APIs produce an explicit error. Each account, registered device key,
 and host has its own lock and connection. Registration finishes before
 connection admission; replacing a
@@ -92,8 +98,12 @@ host-wide failures include the host name in both clients.
 
 A session remembers its controlling device in supervisor memory even when that
 device has no attached views; the lease does not survive a supervisor restart.
-Viewing and reconnecting from another device do not resize the terminal
-or acquire input control. **Take control** explicitly transfers that lease.
+Opening a session takes that lease silently — mounting a view in the
+foreground or bringing one back to it, once the view is visible — so the view
+a person is looking at is the one that controls the terminal. The view that
+held it keeps its output and offers **Take control** to take it back.
+Reconnecting is not opening: a recovered view never takes the lease on its
+own, so two open devices do not trade it back and forth.
 Focusing another view within the owning device transfers its active view and
 geometry. The UI waits for daemon confirmation before enabling input.
 
@@ -151,7 +161,7 @@ from simulator, emulator and Jest results.
 | Background and resume | Background briefly, then for more than three seconds; resume with both sessions open. | The short interruption and transport retirement both recover. Views reattach once, stale worker events cannot enable input or retire a new attachment, and session processes survive. |
 | Network change | Switch Wi-Fi to mobile data and back while output is streaming; repeat with direct connectivity unavailable and UDP TURN available. | Recovery restores both sessions and tools. Each host has one reconnect notice; input stays paused until fresh attachment/control confirmation. |
 | Queued input and files | Interrupt a backpressured paste and an upload while typing in the other session. | Unsent input is discarded. Already-dispatched input remains explicitly uncertain; interrupted writes follow the existing reconciliation flow without a blind duplicate write. |
-| Process restart | Terminate and reopen the app while sessions are running. | A fresh connection restores history and live output; the daemon's session workers survive, and another device's control lease is not taken implicitly. |
+| Process restart | Terminate and reopen the app while sessions are running. | A fresh connection restores history and live output; the daemon's session workers survive. Reopening a session is an opening and takes its control lease; transport recovery alone does not. |
 | Identity retirement | In the isolated fixture, sign out, switch accounts, replace the device key, and revoke host trust. | Each action retires the affected connection and pending work. Delayed bridge events cannot revive it or reach the next identity. |
 
 Retain device logs and the observed peer/attachment lifecycle with the review
