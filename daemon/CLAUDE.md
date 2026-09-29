@@ -339,6 +339,7 @@ updater knew about variants.
   channels. Fence every effect by parent trust/binding and worker generation.
   `session_ctl.rs` retains the controlling device's lease until explicit take
   or session removal; `focus_view` only moves control within that device.
+  Both clients send the take when a session is opened, never on reconnect.
   See `docs/DEVICE_CONNECTIONS.md` for the lifecycle and compatibility contract.
 
 `host_control::install` returns a `Lifetime` handle with only `is_retired` and

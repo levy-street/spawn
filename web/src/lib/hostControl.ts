@@ -1670,7 +1670,12 @@ export class HostControlClient {
         if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
       }
       if (this.options.deviceConnection && decision.mode === "unpinned") {
-        this.terminalReason = "client_bug";
+        // The provider only connects a registered device, so this is a failed
+        // read of its identity (IndexedDB) or of the host's key, not a verdict.
+        // Stopping here for good left a tab silently dead behind a "keeps
+        // retrying" overlay for hours (2026-09-28): say so and retry instead.
+        this.connectionError = "SPAWN D could not load this browser's device key. Retrying…";
+        this.setState("error");
         this.failRtc(sessionId);
         return;
       }
@@ -1683,6 +1688,7 @@ export class HostControlClient {
         return;
       }
       this.signedRtcRefusal = null;
+      this.connectionError = null;
       // Commit to signed mode for this generation BEFORE gathering starts, so
       // the legacy raw-answer branch is gated off for the entire lifetime of a
       // signed generation, not only once signedRtcSession is assigned below.

@@ -528,8 +528,9 @@ What moves where, and the regressions we accept:
 - **Multi-viewer / multi-device** → one authenticated peer per device and
   daemon, with separate terminal/control attachments for each view. Same-origin
   browser tabs share their device's peer. Different devices retain separate
-  connections and require explicit takeover of another device's terminal
-  control. Cost: upstream output fanout; realistic N is small.
+  connections and take another device's terminal control only by an
+  explicit take — sent when a person opens the session, or chooses
+  **Take control** — never on reconnect. Cost: upstream output fanout; realistic N is small.
 - **File upload** → a bounded/chunked/cancellable `spawn.ctl` stream, bound to
   a fresh channel capability and exact session-worker generation. Stable upload
   UUIDs make bounded retries resumable/idempotent; exact length and SHA-256 are

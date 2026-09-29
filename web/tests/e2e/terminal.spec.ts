@@ -388,19 +388,14 @@ test("terminal attempts direct WebRTC transport when advertised", async ({ page 
   // instead, where it is actually checkable.
 });
 
-test("opening another device's terminal preserves its control until explicit take", async ({
-  page,
-}) => {
+test("opening another device's terminal takes control without asking", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page, {
     control: { owner: false, cols: 156, rows: 38, viewers: 2 },
     history: "viewer\n",
   });
-  await expect(page.getByRole("button", { name: "Take control" })).toBeVisible();
-  await page.getByLabel("Session terminal").click();
-  await page.keyboard.type("ignored");
-  expect(binaryText(messages)).toBe("");
-  expect(jsonMessages(messages).some((message) => message?.type === "take_control")).toBe(false);
-  await page.getByRole("button", { name: "Take control" }).click();
+  await expect
+    .poll(() => jsonMessages(messages).find((message) => message?.type === "take_control"))
+    .toMatchObject({ type: "take_control", cols: expect.any(Number), rows: expect.any(Number) });
   await expect(page.getByRole("button", { name: "Take control" })).toHaveCount(0);
   await page.getByLabel("Session terminal").click();
   await page.keyboard.type("allowed");
@@ -410,21 +405,24 @@ test("opening another device's terminal preserves its control until explicit tak
 test("losing control leaves readable output and an explicit take-control button", async ({
   page,
 }) => {
-  // Opens as owner (default mock state) — the auto-claim never fires.
   const { messages } = await openTerminalWithMockSocket(page, { history: "owner\n" });
   await expect(liveTerminalRows(page)).toContainText("owner");
-  expect(jsonMessages(messages).some((m) => m?.type === "take_control")).toBe(false);
+  const takes = () => jsonMessages(messages).filter((m) => m?.type === "take_control").length;
+  // Opening claims the display once, even when this device already had it.
+  await expect.poll(takes).toBe(1);
 
-  // Another device takes control; the pane keeps its selectable output.
+  // Another device opens the session and takes control; this pane keeps its
+  // selectable output and does not take control back on its own.
   await setDisplayControl(page, { owner: false, cols: 156, rows: 38, viewers: 2 });
   const button = page.getByRole("button", { name: "Take control" });
   await expect(button).toBeVisible();
   await expect(page.getByText("Another view has control · 156x38 · 2 viewers")).toBeVisible();
+  const before = takes();
+  await page.waitForTimeout(300);
+  expect(takes()).toBe(before);
 
   await button.click();
-  await expect
-    .poll(() => jsonMessages(messages).find((message) => message?.type === "take_control"))
-    .toMatchObject({ type: "take_control", cols: expect.any(Number), rows: expect.any(Number) });
+  await expect.poll(takes).toBe(before + 1);
   await expect(button).toHaveCount(0);
 });
 

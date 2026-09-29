@@ -7,6 +7,8 @@ class Bus {
   static instances = new Set<Bus>();
   static messages: unknown[] = [];
   static delayOpens = false;
+  // A hung tab: it neither delivers nor receives messages.
+  static hung = new Set<Bus>();
   onmessage: ((event: { data: unknown }) => void) | null = null;
   constructor(readonly name: string) {
     Bus.instances.add(this);
@@ -14,10 +16,12 @@ class Bus {
   postMessage(data: unknown) {
     Bus.messages.push(structuredClone(data));
     if (Bus.delayOpens && (data as { type: string }).type === "channel-open") return;
+    if (Bus.hung.has(this)) return;
     for (const bus of Bus.instances)
       if (bus !== this && bus.name === this.name)
         queueMicrotask(() => {
-          if (Bus.instances.has(bus)) bus.onmessage?.({ data: structuredClone(data) });
+          if (Bus.instances.has(bus) && !Bus.hung.has(bus))
+            bus.onmessage?.({ data: structuredClone(data) });
         });
   }
   close() {
@@ -25,29 +29,51 @@ class Bus {
   }
 }
 class Locks {
-  queues = new Map<string, Array<() => void>>();
-  request(name: string, options: { signal: AbortSignal }, callback: () => Promise<void>) {
+  queues = new Map<string, Array<{ begin: () => void; stolen?: () => void }>>();
+  request(
+    name: string,
+    options: { signal?: AbortSignal; steal?: boolean },
+    callback: () => Promise<void>,
+  ) {
     return new Promise<void>((resolve, reject) => {
       const queue = this.queues.get(name) ?? [];
       this.queues.set(name, queue);
       let started = false;
-      const begin = () => {
-        started = true;
-        void callback()
-          .then(resolve, reject)
-          .finally(() => {
-            queue.shift();
-            queue[0]?.();
-          });
+      let stolen = false;
+      const entry = {
+        begin: () => {
+          started = true;
+          void callback()
+            .then(
+              () => !stolen && resolve(),
+              (error) => !stolen && reject(error),
+            )
+            .finally(() => {
+              if (stolen) return;
+              queue.shift();
+              queue[0]?.begin();
+            });
+        },
+        // The spec: a steal releases the holder at once and rejects its request.
+        stolen: () => {
+          stolen = true;
+          reject(new DOMException("Lock stolen", "AbortError"));
+        },
       };
-      options.signal.addEventListener("abort", () => {
+      options.signal?.addEventListener("abort", () => {
         if (started) return;
-        const index = queue.indexOf(begin);
+        const index = queue.indexOf(entry);
         if (index >= 0) queue.splice(index, 1);
         reject(new DOMException("Aborted", "AbortError"));
       });
-      queue.push(begin);
-      if (queue.length === 1) queueMicrotask(begin);
+      if (options.steal) {
+        if (queue.length > 0) queue.shift()?.stolen?.();
+        queue.unshift(entry);
+        queueMicrotask(entry.begin);
+        return;
+      }
+      queue.push(entry);
+      if (queue.length === 1) queueMicrotask(entry.begin);
     });
   }
 }
@@ -136,7 +162,12 @@ const roots: Root[] = [];
 const session = "11111111-2222-4333-8444-555555555555";
 const label = (kind = "pty") =>
   `spawn.${kind}/${session}/${crypto.randomUUID()}/${crypto.randomUUID()}`;
-function connect(key = "account:host", active = () => true) {
+function connect(
+  key = "account:host",
+  active = () => true,
+  onRetired = () => {},
+  timing?: { heartbeatMs: number; ownerSilenceMs: number },
+) {
   const connection = new SharedDaemonConnection(
     key,
     () => {
@@ -145,6 +176,8 @@ function connect(key = "account:host", active = () => true) {
       return root as unknown as HostControlClient;
     },
     active,
+    onRetired,
+    timing,
   );
   connections.push(connection);
   return connection;
@@ -160,7 +193,7 @@ beforeEach(() => {
     BroadcastChannel: Bus,
     navigator: { locks: new Locks() },
     window: new EventTarget(),
-    document: new EventTarget(),
+    document: Object.assign(new EventTarget(), { visibilityState: "visible" }),
     localStorage: {
       getItem: (key: string) => values.get(key) ?? null,
       setItem: (key: string, value: string) => values.set(key, value),
@@ -173,6 +206,7 @@ beforeEach(() => {
   roots.length = 0;
   Bus.messages.length = 0;
   Bus.delayOpens = false;
+  Bus.hung.clear();
 });
 afterEach(async () => {
   for (const connection of connections.splice(0)) connection.close();
@@ -408,4 +442,94 @@ test("unavailable cross-tab coordination produces an explicit error without open
   expect(connection.getSnapshot().state).toBe("error");
   expect(connection.getSnapshot().error).toContain("Update your browser");
   expect(roots).toHaveLength(0);
+});
+
+const FAST = { heartbeatMs: 20, ownerSilenceMs: 150 };
+
+test("a visible follower takes the lock from a silent owner, which stands down and follows", async () => {
+  const owner = connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+  );
+  const ownerBus = [...Bus.instances].at(-1)!;
+  const follower = connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+  );
+  await until(() => follower.getSnapshot().state === "ready");
+  expect(roots).toHaveLength(1);
+
+  Bus.hung.add(ownerBus);
+  await until(
+    () => roots.length === 2 && follower.getSnapshot().generation === roots[1].generation,
+  );
+  // The stolen owner's request rejected: its peer is gone, not left competing.
+  await until(() => roots[0].closed);
+
+  Bus.hung.delete(ownerBus);
+  await until(() => owner.getSnapshot().generation === roots[1].generation);
+  const channel = owner.createChannel(label());
+  await until(() => channel.readyState === "open");
+  expect(roots).toHaveLength(2);
+});
+
+test("a follower that hears its owner never takes the lock", async () => {
+  connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+  );
+  const follower = connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+  );
+  await until(() => follower.getSnapshot().state === "ready");
+  await Bun.sleep(FAST.ownerSilenceMs * 3);
+  expect(roots).toHaveLength(1);
+  expect(roots[0].closed).toBe(false);
+});
+
+test("a hidden follower waits for a silent owner rather than taking its lock", async () => {
+  const owner = connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+  );
+  void owner;
+  const ownerBus = [...Bus.instances].at(-1)!;
+  connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+  );
+  await until(() => roots[0]?.state === "ready");
+  Object.assign(globalThis.document, { visibilityState: "hidden" });
+  Bus.hung.add(ownerBus);
+  await Bun.sleep(FAST.ownerSilenceMs * 3);
+  expect(roots).toHaveLength(1);
+});
+
+test("a connection that retires itself says so, so its provider can rebuild it", async () => {
+  let active = true;
+  let retired = 0;
+  const connection = connect(
+    "account:host",
+    () => active,
+    () => retired++,
+    FAST,
+  );
+  await until(() => connection.getSnapshot().state === "ready");
+  active = false;
+  await until(() => connection.isClosed());
+  expect(retired).toBe(1);
+  expect(connection.getSnapshot().state).toBe("closed");
 });

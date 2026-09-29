@@ -24,6 +24,7 @@ const mockTransport = {
   resize: jest.fn(),
   requestReplay: jest.fn(),
   upload: jest.fn(),
+  takeControl: jest.fn(),
   on: jest.fn(() => () => undefined),
 } as unknown as SessionTransport;
 
@@ -97,6 +98,26 @@ describe("TerminalSurface", () => {
       expect.arrayContaining(["focus", "scroll", "set-follow", "set-font-size", "search"]),
     );
     expect(mockWrite).toHaveBeenCalledWith(new Uint8Array([3]));
+  });
+
+  test("opening a session takes its display once, and a reconnect does not take it again", async () => {
+    const onStateChange = jest.fn();
+    await render(<TerminalSurface {...props()} onStateChange={onStateChange} />);
+    const on = mockTransport.on as unknown as jest.Mock;
+    const stateListener = on.mock.calls.find(([event]) => event === "state")?.[1] as (
+      state: string,
+    ) => void;
+    await act(() => {
+      stateListener("connecting");
+    });
+    expect(mockTransport.takeControl).not.toHaveBeenCalled();
+    await act(() => {
+      stateListener("ready");
+      stateListener("reconnecting");
+      stateListener("ready");
+    });
+    expect(mockTransport.takeControl).toHaveBeenCalledTimes(1);
+    expect(onStateChange).toHaveBeenLastCalledWith("ready");
   });
 
   test("correlates asynchronous selection copies", async () => {

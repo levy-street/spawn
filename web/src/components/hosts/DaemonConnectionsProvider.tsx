@@ -44,6 +44,9 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
   activeDevice.current = deviceKey;
   const owned = useRef(new Map<string, SharedDaemonConnection>());
   const [connections, setConnections] = useState<ReadonlyMap<string, DaemonConnection>>(new Map());
+  // Bumped when a connection retires itself, so it is rebuilt without waiting
+  // for the host list to change.
+  const [retired, setRetired] = useState(0);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: an account or device-key change retires every connection.
   useEffect(() => {
@@ -54,6 +57,7 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
     };
   }, [accountId, deviceKey]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `retired` only re-runs the rebuild.
   useEffect(() => {
     if (!accountId || !deviceKey) {
       setConnections(new Map());
@@ -75,6 +79,9 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
       }
     }
     for (const host of hostQuery.data ?? []) {
+      // A retired connection stays closed for good; replace it rather than
+      // leaving every view of this host waiting on it until a reload.
+      if (current.get(host.id)?.isClosed() && isActive()) current.delete(host.id);
       if (current.has(host.id) || host.status !== "online") continue;
       const id = host.id;
       current.set(
@@ -103,11 +110,12 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
               },
             }),
           isActive,
+          () => setRetired((count) => count + 1),
         ),
       );
     }
     setConnections(new Map(current));
-  }, [accountId, deviceKey, hostQuery.data, queryClient]);
+  }, [accountId, deviceKey, hostQuery.data, queryClient, retired]);
 
   useEffect(
     () =>
