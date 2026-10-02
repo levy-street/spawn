@@ -9,6 +9,15 @@ interface ConnectionStoreState {
   hostSignals: Record<string, SocketState>;
   sessionTransports: Record<string, TransportState>;
   hostTransports: Record<string, TransportState>;
+  /** Why a host's connection needs attention, when it does. */
+  hostProblems: Record<string, string>;
+  /** Hosts this device has been connected to since it opened: only these can
+   *  be "reconnecting" rather than still connecting for the first time. */
+  hostsSeenReady: Record<string, true>;
+  /** Retry a host's connection now, from wherever its state is shown. */
+  hostRetries: Record<string, () => void>;
+  setHostProblem: (hostId: string, problem: string | null) => void;
+  setHostRetry: (hostId: string, retry: (() => void) | null) => void;
   setAlertSocket: (state: SocketState) => void;
   setSessionSignal: (sessionId: string, state: SocketState) => void;
   setHostSignal: (hostId: string, state: SocketState) => void;
@@ -25,6 +34,9 @@ const EMPTY_CONNECTIONS = {
   hostSignals: {},
   sessionTransports: {},
   hostTransports: {},
+  hostProblems: {},
+  hostsSeenReady: {},
+  hostRetries: {},
 };
 
 export const useConnectionStore = create<ConnectionStoreState>((set) => ({
@@ -42,7 +54,24 @@ export const useConnectionStore = create<ConnectionStoreState>((set) => ({
     }));
   },
   setHostTransport: (hostId, state) => {
-    set((current) => ({ hostTransports: { ...current.hostTransports, [hostId]: state } }));
+    set((current) => ({
+      hostTransports: { ...current.hostTransports, [hostId]: state },
+      ...(state === "ready" && !current.hostsSeenReady[hostId]
+        ? { hostsSeenReady: { ...current.hostsSeenReady, [hostId]: true as const } }
+        : {}),
+    }));
+  },
+  setHostProblem: (hostId, problem) => {
+    set((current) => {
+      const { [hostId]: _previous, ...rest } = current.hostProblems;
+      return { hostProblems: problem ? { ...rest, [hostId]: problem } : rest };
+    });
+  },
+  setHostRetry: (hostId, retry) => {
+    set((current) => {
+      const { [hostId]: _previous, ...rest } = current.hostRetries;
+      return { hostRetries: retry ? { ...rest, [hostId]: retry } : rest };
+    });
   },
   removeSession: (sessionId) => {
     set((current) => {
@@ -55,7 +84,10 @@ export const useConnectionStore = create<ConnectionStoreState>((set) => ({
     set((current) => {
       const { [hostId]: _signal, ...hostSignals } = current.hostSignals;
       const { [hostId]: _transport, ...hostTransports } = current.hostTransports;
-      return { hostSignals, hostTransports };
+      const { [hostId]: _problem, ...hostProblems } = current.hostProblems;
+      const { [hostId]: _retry, ...hostRetries } = current.hostRetries;
+      const { [hostId]: _seen, ...hostsSeenReady } = current.hostsSeenReady;
+      return { hostSignals, hostTransports, hostProblems, hostRetries, hostsSeenReady };
     });
   },
   reset: () => set(EMPTY_CONNECTIONS),

@@ -7,7 +7,6 @@ import {
   removeTab,
   renameTab,
   reorderTab,
-  setTabHome,
 } from "@/data/layout/tabs";
 import type { WorkspaceLayoutV3 } from "@/data/types/layout";
 
@@ -81,12 +80,6 @@ describe("tab algebra", () => {
     expect(removed?.active_tab).toBe("one");
     expect(removeTab(removed as WorkspaceLayoutV3, "one")).toBeNull();
     expect(getActiveTab({ ...layout(), active_tab: "missing" }).id).toBe("one");
-  });
-
-  it("sets and clears paired tab homes", () => {
-    const homed = setTabHome(layout(), "two", { host_id: "host-2", cwd: "/code" });
-    expect(homed.tabs[1]).toMatchObject({ host_id: "host-2", cwd: "/code" });
-    expect(setTabHome(homed, "two", null).tabs[1]).toMatchObject({ host_id: null, cwd: null });
   });
 
   it("moves a pane while preserving payload and replacing only its geometry", () => {

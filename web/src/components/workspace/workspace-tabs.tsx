@@ -3,16 +3,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
-  Check,
   Copy,
   Ellipsis,
-  FolderOpen,
   ImagePlus,
   LayoutTemplate,
   Merge,
   Pencil,
   Plus,
-  Server,
   Trash2,
   X,
 } from "lucide-react";
@@ -26,7 +23,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Badge } from "@/components/ui/badge";
+import { AttentionBadge } from "@/components/ui/attention-badge";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import {
@@ -43,14 +40,11 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import {
   ApiError,
   agents,
-  type Host,
-  hosts,
   sessionAccess,
   sessions,
   type Workspace,
@@ -59,7 +53,6 @@ import {
 } from "@/lib/api";
 import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE } from "@/lib/grid";
-import { basename } from "@/lib/paths";
 import { sessionAgent } from "@/lib/sessions";
 import {
   addTab,
@@ -79,14 +72,17 @@ import {
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
-import { tabAttentionCount, workspaceLiveSessionCount } from "@/lib/workspaces";
+import {
+  tabAttentionCount,
+  tabAttentionLevel,
+  workspaceFolder,
+  workspaceLiveSessionCount,
+} from "@/lib/workspaces";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
-import { FolderPicker } from "./folder-picker";
 import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
 import { type SplitChrome, SplitWorkspaceMenu, UnsplitButton } from "./split-chrome";
-import { useTabHome } from "./tab-home";
 import { type MergeDrop, type MergeRefusal, planMerge, WHOLE_CANVAS } from "./tab-merge";
 import { dockZoneAt, freeRects, wantsDuplicate } from "./workspace-grid-helpers";
 
@@ -250,22 +246,13 @@ export function WorkspaceTabs({
   const [draft, setDraft] = useState("");
   const [renameWorkspaceOpen, setRenameWorkspaceOpen] = useState(false);
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
-  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
-  const [hostPickerOpen, setHostPickerOpen] = useState(false);
-  /** A home-host change in flight: picked in the host dialog, committed only
-   *  once its folder is chosen — cancelling the folder picker drops it. */
-  const [pendingHomeHost, setPendingHomeHost] = useState<Host | null>(null);
   const [iconOpen, setIconOpen] = useState(false);
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [templateNameDraft, setTemplateNameDraft] = useState("");
   // One context menu serves the whole strip: right-click records which tab it
   // was aimed at and opens the menu at the cursor.
   const tabMenuRef = useRef<DropdownMenuHandle>(null);
-  // The tab under the cursor when its menu opened, so "Change tab folder"
-  // re-points that tab rather than whichever one is selected.
-  const [homeTabId, setHomeTabId] = useState<string | null>(null);
-  const tabHomeM = useTabHome(workspace, homeTabId ?? activeTabId, onError, settingsButtonRef);
   const tabGhostRef = useRef<HTMLDivElement>(null);
   const tabGhostLabelRef = useRef<HTMLSpanElement>(null);
   // The merge drag's two pieces of chrome: the tab carried under the pointer
@@ -287,11 +274,10 @@ export function WorkspaceTabs({
   const onPreviewTilesRef = useRef(onPreviewTiles);
   onPreviewTilesRef.current = onPreviewTiles;
   const [contextTabId, setContextTabId] = useState<string | null>(null);
-  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const sessionsQ = useQuery({ queryKey: ["sessions"], queryFn: () => sessions.list() });
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
-  const hostList = hostsQ.data ?? [];
-  const homeHost = hostList.find((host) => host.id === workspace.host_id) ?? null;
+  // Where to look for the workspace's mark: the folder its first window runs in.
+  const iconSource = workspaceFolder(workspace, sessionsQ.data ?? []);
 
   const writeCaches = (next: Workspace) => {
     queryClient.setQueryData(["workspace", next.id], next);
@@ -1076,11 +1062,6 @@ export function WorkspaceTabs({
     mutationFn: (name: string) =>
       workspaceTemplates.create({
         name,
-        // The workspace home rides along: creating from the template goes
-        // straight to this folder, no picker.
-        ...(workspace.host_id && workspace.cwd
-          ? { host_id: workspace.host_id, cwd: workspace.cwd }
-          : {}),
         // So does the mark: every workspace made from this template opens
         // wearing it, rather than scanning its way back to the same image.
         ...(workspace.icon ? { icon: workspace.icon, icon_source: workspace.icon_source } : {}),
@@ -1217,7 +1198,17 @@ export function WorkspaceTabs({
       // strips; see ownStripGroundAt in WorkspaceGrid).
       data-workspace-tab-strip
       data-workspace-tab-strip-owner={workspace.id}
-      className="flex h-11 shrink-0 items-end gap-1.5 overflow-x-auto bg-shell pr-1.5 pb-1.5"
+      // Scrolls sideways without a scrollbar: the wheel scrolls it, and the
+      // ends fade out where tabs continue past the edge.
+      onWheel={(event) => {
+        if (event.deltaX !== 0 || event.shiftKey) return;
+        event.currentTarget.scrollLeft += event.deltaY;
+      }}
+      className={cn(
+        "flex h-11 shrink-0 items-end gap-1 overflow-x-auto bg-shell pr-1.5 pb-1.5",
+        "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+        "[mask-image:linear-gradient(to_right,transparent,black_12px,black_calc(100%-12px),transparent)]",
+      )}
     >
       {splitChrome && (
         <SplitWorkspaceMenu
@@ -1234,11 +1225,12 @@ export function WorkspaceTabs({
       {orderedTabs.map((tab) => {
         const active = tab.id === activeTabId;
         const attention = tabAttentionCount(tab, sessionsById);
+        const attentionLevel = tabAttentionLevel(tab, sessionsById);
         // The tab's shape, shared by the tab and by its rename: renaming
         // swaps the label for a field and changes nothing else, so the tab
         // keeps its place in the strip and its footing on the panel.
         const shape = cn(
-          "flex h-8 min-w-40 items-center gap-1.5 rounded-md pl-3 text-xs font-medium transition-colors",
+          "flex h-8 min-w-24 max-w-56 items-center gap-1.5 rounded-md pl-3 text-xs font-medium transition-colors",
           // The label stays level with the resting tabs: the extra
           // height is all bottom padding, swallowed by flex centering.
           // A connected tab continues the surface directly beneath it:
@@ -1254,8 +1246,7 @@ export function WorkspaceTabs({
               : "[--tab-surface:var(--background)]"),
           // `tab-connected` flares the foot into the panel: see globals.
           active && look.connected && "tab-connected -mb-1.5 h-[38px] rounded-b-none pb-1.5",
-          !active &&
-            "bg-background/40 text-muted-foreground hover:bg-background/60 hover:text-foreground",
+          !active && "text-muted-foreground hover:bg-background/50 hover:text-foreground",
         );
         if (renamingId === tab.id) {
           return (
@@ -1304,7 +1295,7 @@ export function WorkspaceTabs({
               if (element) tabElementsRef.current.set(tab.id, element);
               else tabElementsRef.current.delete(tab.id);
             }}
-            className="relative shrink-0 data-[dragging]:z-10 data-[merging]:opacity-35"
+            className="group/tab relative shrink-0 data-[dragging]:z-10 data-[merging]:opacity-35"
           >
             <button
               type="button"
@@ -1350,12 +1341,8 @@ export function WorkspaceTabs({
             >
               {/* What is waiting behind this tab, the same rollup the sidebar
                   puts on a workspace row — read before the name. */}
-              {attention > 0 && (
-                <Badge variant="warning" className="shrink-0 px-1.5 py-0 text-[10px] leading-4">
-                  {attention}
-                </Badge>
-              )}
-              <span className="max-w-48 truncate">{tab.name}</span>
+              <AttentionBadge count={attention} level={attentionLevel} />
+              <span className="min-w-0 truncate">{tab.name}</span>
             </button>
             {canClose && (
               <button
@@ -1363,8 +1350,12 @@ export function WorkspaceTabs({
                 aria-label={`Close ${tab.name}`}
                 onClick={() => void close(tab.id)}
                 className={cn(
-                  "absolute right-1.5 top-4 grid size-4.5 -translate-y-1/2 place-items-center rounded-sm transition-colors",
+                  "absolute right-1.5 top-4 grid size-4.5 -translate-y-1/2 place-items-center rounded-sm transition-[color,background-color,opacity]",
                   "text-muted-foreground hover:bg-accent hover:text-foreground",
+                  // Quiet until it is wanted: on the tab you are on, or under
+                  // the pointer. Keyboard focus and touch always show it.
+                  !active &&
+                    "opacity-0 group-hover/tab:opacity-100 focus-visible:opacity-100 [@media(pointer:coarse)]:opacity-100",
                 )}
               >
                 <X className="size-3" aria-hidden />
@@ -1383,7 +1374,7 @@ export function WorkspaceTabs({
         hidden
         aria-hidden
         data-workspace-tab-ghost
-        className="flex h-8 min-w-40 shrink-0 items-center gap-1.5 rounded-md border-2 border-dashed border-ring bg-ring/10 px-3 text-xs font-medium text-foreground transition-transform duration-150 ease-out"
+        className="flex h-8 min-w-24 shrink-0 items-center gap-1.5 rounded-md border-2 border-dashed border-ring bg-ring/10 px-3 text-xs font-medium text-foreground transition-transform duration-150 ease-out"
       >
         <Copy className="size-3.5 shrink-0" aria-hidden />
         <span ref={tabGhostLabelRef} className="max-w-48 truncate" />
@@ -1418,7 +1409,6 @@ export function WorkspaceTabs({
         hideHeading
         // A new tab opens at the workspace's folder and "Change tab folder"
         // re-points it, so the "somewhere else" row says nothing new here.
-        hideElsewhere
         beforeCreate={addTabForWindow}
         className="mb-0.5 shrink-0"
         // Roomier than the default: agent rows carry a command underneath the
@@ -1470,21 +1460,6 @@ export function WorkspaceTabs({
           <Pencil className="size-4" aria-hidden />
           Rename tab
         </DropdownMenuItem>
-        <DropdownMenuItem
-          // Always the tab under the cursor, so a tab with windows on it can
-          // still be re-pointed — the empty state's chip is only there while
-          // the canvas is bare.
-          disabled={contextTabId === null}
-          onSelect={() => {
-            if (!contextTabId) return;
-            setHomeTabId(contextTabId);
-            if (contextTabId !== activeTabId) onSwitch(contextTabId);
-            tabHomeM.open();
-          }}
-        >
-          <FolderOpen className="size-4" aria-hidden />
-          Change tab folder
-        </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
           destructive
@@ -1497,8 +1472,6 @@ export function WorkspaceTabs({
           Close tab
         </DropdownMenuItem>
       </DropdownMenu>
-
-      {tabHomeM.dialogs}
 
       {/* Core workspace settings live at the strip's far right; adding panes
           is the floating launcher's job (bottom-right of the viewport). */}
@@ -1513,10 +1486,6 @@ export function WorkspaceTabs({
           // positions coincide and nothing shifts as the tabs scroll past.
           splitChrome && "sticky right-8.5 z-20 bg-shell",
         )}
-        // Wider than the base min-width: two of these rows carry a host or
-        // folder name that truncates, and the default leaves them almost no
-        // room to say which one.
-        menuClassName="w-64"
         renderTrigger={(props) => (
           <Button
             {...props}
@@ -1524,10 +1493,7 @@ export function WorkspaceTabs({
             type="button"
             variant="ghost"
             size="icon"
-            onClick={() => {
-              setFolderPickerOpen(false);
-              props.onClick();
-            }}
+            onClick={props.onClick}
             aria-label={`${workspace.name} settings`}
             className="size-7 text-muted-foreground hover:text-foreground"
           >
@@ -1547,23 +1513,6 @@ export function WorkspaceTabs({
         <DropdownMenuItem onSelect={() => setIconOpen(true)}>
           <ImagePlus className="size-4" aria-hidden />
           Change workspace icon…
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          disabled={hostList.length === 0 || (hostList.length === 1 && Boolean(homeHost))}
-          onSelect={() => setHostPickerOpen(true)}
-        >
-          <Server className="size-4" aria-hidden />
-          <span className="min-w-0 flex-1 truncate">
-            {homeHost ? `Default host: ${homeHost.name}` : "Set default host…"}
-          </span>
-        </DropdownMenuItem>
-        <DropdownMenuItem disabled={!homeHost} onSelect={() => setFolderPickerOpen(true)}>
-          <FolderOpen className="size-4" aria-hidden />
-          <span className="min-w-0 flex-1 truncate">
-            {workspace.cwd
-              ? `Default folder: ${basename(workspace.cwd) || workspace.cwd}`
-              : "Set default folder…"}
-          </span>
         </DropdownMenuItem>
         <DropdownMenuItem
           onSelect={() => {
@@ -1598,8 +1547,8 @@ export function WorkspaceTabs({
         onOpenChange={setIconOpen}
         name={workspace.name}
         icon={workspace.icon}
-        hostId={workspace.host_id}
-        cwd={workspace.cwd}
+        hostId={iconSource?.host_id ?? null}
+        cwd={iconSource?.cwd ?? null}
         busy={settingsM.isPending}
         onSelect={(icon) => settingsM.mutate({ icon, icon_source: "custom" })}
       />
@@ -1663,72 +1612,6 @@ export function WorkspaceTabs({
           </form>
         </DialogContent>
       </Dialog>
-
-      <Dialog open={hostPickerOpen} onOpenChange={setHostPickerOpen}>
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Choose this workspace's host</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-1 px-6 py-2">
-            <p className="pb-1 text-xs text-muted-foreground">
-              New windows open on this host. Existing windows stay where they are.
-            </p>
-            {hostList.map((host) => {
-              const current = host.id === workspace.host_id;
-              return (
-                <button
-                  key={host.id}
-                  type="button"
-                  disabled={host.status !== "online"}
-                  onClick={() => {
-                    setHostPickerOpen(false);
-                    if (current) return;
-                    // The change lands with its folder: the picker that
-                    // follows browses the new host, and committing both at
-                    // once means cancelling it changes nothing.
-                    setPendingHomeHost(host);
-                    setFolderPickerOpen(true);
-                  }}
-                  className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
-                >
-                  <StatusDot tone={hostStatusTone(host.status)} label={host.status} />
-                  <span className="min-w-0 flex-1 truncate">{host.name}</span>
-                  {host.status !== "online" && (
-                    <span className="shrink-0 text-xs text-muted-foreground">offline</span>
-                  )}
-                  {current && (
-                    <Check className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                  )}
-                </button>
-              );
-            })}
-          </div>
-          <DialogFooter>
-            <Button type="button" variant="secondary" onClick={() => setHostPickerOpen(false)}>
-              Cancel
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <FolderPicker
-        key={`${(pendingHomeHost ?? homeHost)?.id ?? "none"}:${folderPickerOpen ? "open" : "closed"}`}
-        open={folderPickerOpen}
-        host={pendingHomeHost ?? homeHost}
-        // Only when the host is unchanged: a folder from the old host means
-        // nothing on the new one, so switching hosts starts at its home.
-        initialPath={pendingHomeHost ? null : workspace.cwd}
-        anchorRef={settingsButtonRef}
-        onOpenChange={(open) => {
-          setFolderPickerOpen(open);
-          if (!open) setPendingHomeHost(null);
-        }}
-        onSelect={(path) =>
-          settingsM.mutate(
-            pendingHomeHost ? { host_id: pendingHomeHost.id, cwd: path } : { cwd: path },
-          )
-        }
-      />
 
       {/* What a tab dragged onto the canvas is promising: one outline per
           arriving window, laid out exactly where the drop would put them, and

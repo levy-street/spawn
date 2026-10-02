@@ -3,7 +3,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type Href, useRouter } from "expo-router";
 import { useCallback, useMemo, useState } from "react";
 import { View } from "react-native";
-
 import { Screen } from "@/components/layout/screen";
 import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { confirm } from "@/components/ui/confirm";
@@ -39,6 +38,7 @@ import {
 import { WorkspaceRow } from "@/components/workspaces/workspace-row";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import { useDeviceHostApprovals } from "@/data/queries/device-trust";
+import { useHostsQuery } from "@/data/queries/hosts";
 import {
   useArchiveWorkspaceMutation,
   useChangeWorkspaceIconMutation,
@@ -53,6 +53,7 @@ import {
   writeWorkspaceCaches,
 } from "@/data/queries/workspaces";
 import { qk } from "@/data/queryKeys";
+import { suggestPlaces } from "@/data/selectors/places";
 import {
   filterWorkspaces,
   selectOrderedWorkspaces,
@@ -112,6 +113,9 @@ export function WorkspaceListScreen() {
         template,
         agents: input.agents,
         name: input.draft.name,
+        place: input.draft.folder
+          ? { hostId: input.draft.folder.hostId, cwd: input.draft.folder.path }
+          : null,
         ...(input.draft.iconChoice
           ? {
               icon: input.draft.iconChoice.icon,
@@ -148,6 +152,14 @@ export function WorkspaceListScreen() {
 
   const workspaces = workspacesQuery.data ?? [];
   const sessions = sessionsQuery.data ?? [];
+  const hostsQuery = useHostsQuery();
+  // Where a template's windows most likely run: wherever windows ran last.
+  const suggestedFolder = useMemo(() => {
+    const hostList = hostsQuery.data ?? [];
+    const [top] = suggestPlaces({ sessions, hosts: hostList });
+    const host = top?.online ? hostList.find((item) => item.id === top.hostId) : undefined;
+    return top && host ? { hostId: host.id, hostName: host.name, path: top.cwd } : null;
+  }, [hostsQuery.data, sessions]);
   const agents = agentsQuery.data ?? [];
   const snapshot = useMemo<DomainSnapshot>(() => {
     const workspacesById = new Map<string, Workspace>(
@@ -328,6 +340,7 @@ export function WorkspaceListScreen() {
         />
         <CreateWorkspaceDialog
           busy={busy}
+          suggestedFolder={suggestedFolder}
           onCreate={(draft) => {
             if (draft.templateId) {
               operationMutation.mutate({
@@ -341,9 +354,6 @@ export function WorkspaceListScreen() {
             createMutation.mutate(
               {
                 name: draft.name,
-                // A folder is where the workspace opens: its terminals start
-                // there, exactly as a workspace made on the desktop does.
-                ...(draft.folder ? { host_id: draft.folder.hostId, cwd: draft.folder.path } : {}),
                 ...(draft.iconChoice
                   ? {
                       icon: draft.iconChoice.icon,

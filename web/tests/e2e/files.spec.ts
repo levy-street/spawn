@@ -358,13 +358,11 @@ test("session page toggles an inline files panel rooted at the cwd", async ({ pa
 
 test("a file explorer is added to the workspace as its own pane", async ({ page }) => {
   const requested: Array<string | null> = [];
-  const { HOST_ID, SESSION_B_ID, WORKSPACE_ID, workspace } = await import("./app-mocks");
+  const { SESSION_B_ID, WORKSPACE_ID, workspace } = await import("./app-mocks");
   await mockApp(page, {
     sessions: [session(), session({ id: SESSION_B_ID, name: "beta", cwd: "/Users/tester/beta" })],
     workspaces: [
       workspace({
-        host_id: HOST_ID,
-        cwd: "/Users/tester/projects/spawn",
         layout: {
           version: 3,
           tiles: [
@@ -382,9 +380,12 @@ test("a file explorer is added to the workspace as its own pane", async ({ page 
 
   await page.goto(`/w/${WORKSPACE_ID}`);
   // A file explorer is a pane like any other, added from the floating
-  // launcher; the workspace's home answers where it points.
+  // launcher — and like any other, it asks where, the focused pane's folder first.
   await page.getByRole("button", { name: "Add a window" }).hover();
   await page.getByRole("button", { name: "New file explorer window" }).click();
+  const first = page.getByRole("menu", { name: "Where?" }).getByRole("menuitem").first();
+  await expect(first).toContainText("~/projects/spawn");
+  await first.click();
 
   const pane = page.getByRole("region", { name: /^Files — / });
   await expect(pane).toBeVisible();
@@ -410,8 +411,9 @@ async function openWideExplorer(page: Page) {
   const { WORKSPACE_ID, workspace } = await import("./app-mocks");
   await page.setViewportSize({ width: 1160, height: 900 });
   await mockApp(page, {
-    sessions: [],
-    workspaces: [workspace({ host_id: HOST_ID, cwd: "/Users/tester/spawn" })],
+    // A window that ran in the folder: the likeliest place for the explorer.
+    sessions: [session({ cwd: "/Users/tester/spawn" })],
+    workspaces: [workspace()],
     files: (_hostId, path) =>
       fileListing({
         path: path ?? "/Users/tester/spawn",
@@ -425,6 +427,7 @@ async function openWideExplorer(page: Page) {
   await page.goto(`/w/${WORKSPACE_ID}`);
   await page.getByRole("button", { name: "Add a window" }).hover();
   await page.getByRole("button", { name: "New file explorer window" }).click();
+  await page.getByRole("menu", { name: "Where?" }).getByRole("menuitem").first().click();
   const pane = page.getByRole("region", { name: /^Files — / });
   await expect(pane.getByRole("tree", { name: "Files" })).toBeVisible();
   await pane.getByRole("treeitem").filter({ hasText: "README.md" }).hover();

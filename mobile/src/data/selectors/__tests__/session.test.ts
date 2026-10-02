@@ -6,6 +6,7 @@ import {
   durableUnreadCount,
   relativeTime,
   sessionAttention,
+  sessionOwnName,
   sessionTitle,
   terminalHasNewOutput,
 } from "@/data/selectors/session";
@@ -179,5 +180,13 @@ describe("session display helpers", () => {
     expect(terminalHasNewOutput(true, false, true)).toBe(true);
     expect(terminalHasNewOutput(true, true, true)).toBe(false);
     expect(durableUnreadCount()).toBe(0);
+  });
+});
+
+describe("sessionOwnName", () => {
+  it("treats an old server-made '<host> - <folder>' name as no name", () => {
+    expect(sessionOwnName({ name: "beta - notes", host_name: "beta" })).toBeNull();
+    expect(sessionOwnName({ name: "api server", host_name: "beta" })).toBe("api server");
+    expect(sessionOwnName({ name: "dream - spawn", host_name: "beta" })).toBe("dream - spawn");
   });
 });

@@ -1,14 +1,13 @@
 import { useMemo, useRef, useState } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
-
 import { type SwipeAction, SwipeableRow } from "@/components/gestures/swipeable-row";
 import { Icon } from "@/components/ui/icon";
 import { ListRow } from "@/components/ui/list-row";
 import { Menu, type MenuEntry } from "@/components/ui/menu";
-import { StatusDot } from "@/components/ui/status-dot";
-import { Text } from "@/components/ui/text";
+import { TabAttentionBadge } from "@/components/workspace-detail/tab-attention-badge";
 import { WorkspaceIcon } from "@/components/workspaces/workspace-icon";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
+import { attentionSummaryFromCounts } from "@/data/queries/alerts";
 import type { WorkspaceStats } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
 import { opacity } from "@/theme";
@@ -191,18 +190,12 @@ export function WorkspaceRow({
             title={workspace.name}
             trailing={
               <View style={styles.trailing}>
-                {stats.attention > 0 ? (
-                  <View style={styles.attention}>
-                    <StatusDot
-                      accessibilityLabel={`${stats.attention} need attention`}
-                      pulse={false}
-                      tone="waiting"
-                    />
-                    <Text color="mutedForeground" variant="micro">
-                      {stats.attention}
-                    </Text>
-                  </View>
-                ) : null}
+                {/* The same badge a tab wears, toned by its most urgent window:
+                    red once one has stopped, amber while one waits on you. */}
+                <TabAttentionBadge
+                  summary={attentionSummaryFromCounts(stats.waiting, stats.dead)}
+                  testID={`workspace-${workspace.id}-attention`}
+                />
                 <Pressable
                   accessibilityLabel={`${workspace.name} actions`}
                   accessibilityRole="button"

@@ -41,6 +41,8 @@ import {
   validate,
 } from "@/lib/grid";
 import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
+import { recordPaneFocus } from "@/lib/pane-focus";
+import { displayPath } from "@/lib/places";
 import { sessionAgent, sessionTitle } from "@/lib/sessions";
 import {
   addTab,
@@ -59,7 +61,6 @@ import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
 import { type PaneSlotTarget, SessionPane } from "./session-pane";
-import { TabHomeButton } from "./tab-home";
 import { WidgetPane, widgetTitle } from "./widget-pane";
 import {
   addPaneTiles,
@@ -535,6 +536,8 @@ export function WorkspaceGrid({
     query.addEventListener("change", update);
     return () => query.removeEventListener("change", update);
   }, []);
+
+  useEffect(() => recordPaneFocus(workspace.id, focusedId), [workspace.id, focusedId]);
 
   const setFocus = useCallback(
     (sessionId: string | null, focusTerminal = false) => {
@@ -1629,25 +1632,40 @@ export function WorkspaceGrid({
     [commitLayout, queryClient, sessionsById],
   );
 
-  /** Swap a session pane for a fresh shell on another host: the tile keeps
-   *  its rect, the old session is closed (confirmed first) and the new shell
-   *  starts in the picked host's home folder. */
+  /** Move a session pane to `cwd` on another host: the tile keeps its rect,
+   *  the old session is closed (confirmed first), and the same kind of window
+   *  — agent and skills — starts over there in a conversation of its own. */
   const moveToHost = useCallback(
-    async (sessionId: string, host: Host) => {
+    async (sessionId: string, host: Host, cwd: string) => {
       const session = sessionsById.get(sessionId);
       if (!session || session.host_id === host.id) return;
       const accepted = await confirm({
         title: `Move ${sessionTitle(session)} to ${host.name}?`,
-        body: `This shell will be closed and its running process killed; a new shell starts in your home folder on ${host.name}.`,
+        body: `This window's process is stopped here, and the same kind of window starts in ${displayPath(cwd)} on ${host.name}.`,
         confirmLabel: "Move window",
         destructive: true,
       });
       if (!accepted) return;
       let created: Session;
       try {
+        // The same kind of window, with the same skills, in a conversation of
+        // its own: an agent's history lives on the machine it ran on.
+        const definitions = await queryClient
+          .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
+          .catch(() => []);
+        const agent = sessionAgent(session, definitions);
+        const conversation = agent ? newAgentConversationId(agent.kind) : null;
+        const access = await sessionAccess.get(sessionId).catch(() => null);
+        const skillIds = access?.skills.map((skill) => skill.id) ?? [];
         // Created before anything is torn down, so a failure (host dropped
         // offline, say) leaves the pane exactly as it was.
-        created = await sessionsApi.create({ host_id: host.id, cwd: "~" });
+        created = await sessionsApi.create({
+          host_id: host.id,
+          cwd,
+          ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
+          ...(skillIds.length > 0 && { skill_ids: skillIds }),
+        });
+        if (agent) pendingLaunch.set(created.id, agentLaunchCommand(agent, conversation));
       } catch (error) {
         onErrorRef.current?.(error instanceof Error ? error.message : String(error));
         return;
@@ -1960,14 +1978,6 @@ export function WorkspaceGrid({
               className="relative size-full"
               action={
                 <div className="flex flex-col items-center gap-4">
-                  {/* Where a window lands, above the rule; what lands there,
-                      below it. */}
-                  <TabHomeButton
-                    workspace={workspace}
-                    tabId={tabId}
-                    onError={(message) => onError?.(message ?? "")}
-                  />
-                  <hr className="h-px w-full max-w-xl border-0 bg-border" />
                   {/* Every choice the ⋯ cascade offers, one click deep: an
                       empty tab is the one place with room to spell them out. */}
                   <NewSessionLozenges
@@ -2039,7 +2049,8 @@ export function WorkspaceGrid({
           onMoveDown={(id) => moveMobile(id, 1)}
           onRemoveFromWorkspace={removeFromWorkspace}
           onConvertToFiles={(id) => void convertToFiles(id)}
-          onMoveToHost={(id, host) => void moveToHost(id, host)}
+          onMoveToHost={(id, host, cwd) => void moveToHost(id, host, cwd)}
+          workspaceId={workspace.id}
           registerHandle={registerHandle}
           onError={onError ?? (() => {})}
         />

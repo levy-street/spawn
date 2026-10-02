@@ -4,6 +4,8 @@ import { ChevronUp, Server } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
+import { useHostLiveStatus } from "@/components/hosts/use-host-live-status";
 import { LegionHostDetail } from "@/components/legion/LegionHostDetail";
 import { CapacityBar, LegionDot, RunningIcons } from "@/components/legion/legion-parts";
 import { SidebarIconSlot, SidebarRowLabel, sidebarRowClass } from "@/components/nav/sidebar-parts";
@@ -327,9 +329,14 @@ function HostRow({
   onHoverEnd?: () => void;
 }) {
   const charted = row.host.status === "online" && row.cpuBucket !== null;
+  // This device's connection, not only the server's word: a host that is
+  // reconnecting says so on its own row instead of in a banner over the app.
+  const live = useHostLiveStatus(row.host);
+  const connection = useDaemonConnection(row.host.id);
+  const reconnecting = live?.reconnecting ?? false;
 
   return (
-    <li data-legion-host={row.host.id}>
+    <li data-legion-host={row.host.id} className="group/host relative">
       <Link
         href={`/hosts/${row.host.id}`}
         onClick={onNavigate}
@@ -337,16 +344,16 @@ function HostRow({
         onFocus={onHover}
         onBlur={onHoverEnd}
         className={cn(
-          // A resting ground, not just a hover one: with a chart in it a host
-          // row is a card, and a card that only appears under the pointer
-          // leaves the list looking like loose text between two rules. Hover
-          // then steps up a shade from there rather than arriving from nothing.
-          "flex flex-col justify-center gap-2.5 rounded-lg bg-accent/50 px-2 text-sm transition-colors hover:bg-accent",
-          charted ? "py-2" : "h-(--row-h)",
+          "flex flex-col justify-center gap-2 rounded-lg px-2 text-sm transition-colors hover:bg-accent",
+          charted || reconnecting ? "py-2" : "h-(--row-h)",
         )}
       >
         <span className="flex items-center gap-2">
-          <LegionDot tone={row.tone} label={hostToneLabel(row)} pulse={row.tone === "active"} />
+          <LegionDot
+            tone={reconnecting ? "warning" : row.tone}
+            label={reconnecting && live ? live.label : hostToneLabel(row)}
+            pulse={reconnecting || row.tone === "active"}
+          />
           <span
             className={cn(
               "min-w-0 flex-1 truncate text-[13px] leading-tight",
@@ -360,16 +367,41 @@ function HostRow({
            * thing worth knowing, and a bare 5 was never it. */}
           <RunningIcons running={row.running} fallbackCount={row.live} />
         </span>
+        {reconnecting && live && (
+          <span className="truncate pl-4 pr-12 text-[11px] leading-tight text-warning">
+            {live.problem ?? "Reconnecting…"}
+          </span>
+        )}
         {/* Side by side, half the row each: the sidebar's scarce resource is
-         * vertical, and two bars on one line compare directly instead of
-         * making the eye travel between them. */}
+         * vertical, and two bars on one line compare directly. */}
         {charted && (
-          <span className="flex items-center gap-1">
-            <CapacityBar fill={bucketFill(row.cpuBucket)} label="CPU" className="min-w-0 flex-1" />
-            <CapacityBar fill={bucketFill(row.memBucket)} label="MEM" className="min-w-0 flex-1" />
+          <span className="flex items-center gap-3 pl-4">
+            <CapacityBar
+              variant="slim"
+              fill={bucketFill(row.cpuBucket)}
+              label="CPU"
+              className="min-w-0 flex-1"
+            />
+            <CapacityBar
+              variant="slim"
+              fill={bucketFill(row.memBucket)}
+              label="MEM"
+              className="min-w-0 flex-1"
+            />
           </span>
         )}
       </Link>
+      {reconnecting && connection && (
+        // Beside the link, not in it: a control cannot sit inside a link.
+        <button
+          type="button"
+          onClick={() => connection.retry()}
+          aria-label={`Retry connection to ${row.host.name}`}
+          className="absolute right-1.5 top-[1.85rem] rounded px-1.5 text-[11px] font-medium text-foreground/80 hover:bg-background/60 hover:text-foreground"
+        >
+          Retry
+        </button>
+      )}
     </li>
   );
 }

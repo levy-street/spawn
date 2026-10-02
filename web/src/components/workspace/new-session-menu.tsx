@@ -2,7 +2,7 @@
 
 import { Slot } from "@radix-ui/react-slot";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, FolderOpen, FolderTree, Plus, Server, SquareTerminal } from "lucide-react";
+import { ChevronRight, FolderTree, Plus, SquareTerminal } from "lucide-react";
 import {
   isValidElement,
   type JSX,
@@ -15,26 +15,21 @@ import {
   useState,
 } from "react";
 import { AgentIcon } from "@/components/icons/AgentIcon";
-import {
-  HostUpdateBadge,
-  HostUpdateDialog,
-  useHostUpdate,
-} from "@/components/release/HostUpdateDialog";
+import { HostUpdateDialog, useHostUpdate } from "@/components/release/HostUpdateDialog";
 import {
   type CascadeItem,
   CascadeMenu,
   type CascadeMenuHandle,
   type CascadePanel,
 } from "@/components/ui/cascade-menu";
-import { hostStatusTone, StatusDot } from "@/components/ui/status";
-import { type Agent, ApiError, agents, type Host, hosts, sessions, workspaces } from "@/lib/api";
+import { type Agent, ApiError, agents, type Host, sessions, workspaces } from "@/lib/api";
 import { autoPlace, type Rect } from "@/lib/grid";
-import { activeTab, tabHome, withTabTiles } from "@/lib/tabs";
+import { activeTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
-import { FolderPicker } from "./folder-picker";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { pendingLaunch } from "./pending-launch";
+import { useWherePanel } from "./where-picker";
 import { addPaneTiles, PENDING_TILE_ID } from "./workspace-grid-helpers";
 
 /** What the menu is about to add: a shell, an agent in a shell, or a widget. */
@@ -49,10 +44,10 @@ export type NewSessionProps = {
   mode: "session" | "workspace";
   workspaceId?: string;
   /**
-   * The tab the window lands in — its home answers "where". Defaults to the
-   * workspace's active tab. Explicitly null for a tab that does not exist
-   * yet (the strip's "+", which makes the tab as part of the create): a fresh
-   * tab inherits the workspace's home, so that is what the menu offers.
+   * The tab the window lands in, which ranks the places offered for it.
+   * Defaults to the workspace's active tab. Explicitly null for a tab that
+   * does not exist yet (the strip's "+", which makes the tab as part of the
+   * create).
    */
   tabId?: string | null;
   /** Drop the new window at this exact rect instead of auto-placing it. */
@@ -64,11 +59,6 @@ export type NewSessionProps = {
    *  says what the menu is. The mobile sheet keeps its title: it opens over
    *  the whole screen with no trigger left beside it to read. */
   hideHeading?: boolean;
-  /** Drops the "somewhere other than home" escape hatch. For a surface where
-   *  home is not a guess — a new tab opens at the workspace's folder, and
-   *  "Change tab folder" re-points it afterwards — the extra row is a second
-   *  way to say the same thing and only lengthens the list. */
-  hideElsewhere?: boolean;
   /**
    * Run just before the window is created, for a caller that has to make room
    * for it first — the strip's "+" adds the tab (and makes it active, which is
@@ -83,10 +73,10 @@ export type NewSessionProps = {
 
 /**
  * The choice tree behind every "add a window" surface: what to run, then
- * where — unless the workspace's home answers that and one click is the whole
- * flow. Returns the panel to render, the disabled/tooltip state a trigger
- * wears, and the overlays every presentation has to mount (the folder picker
- * a "Select folder…" opens, and the error a refused create reports).
+ * where — always asked, with the likeliest place first (useWherePanel).
+ * Returns the panel to render, the disabled/tooltip state a trigger wears,
+ * and the overlays every presentation has to mount (the folder browser
+ * "Choose a folder…" opens, and the error a refused create reports).
  */
 function useNewSessionChoices(
   {
@@ -96,7 +86,6 @@ function useNewSessionChoices(
     placement,
     heading,
     hideHeading,
-    hideElsewhere,
     beforeCreate,
     onCreated,
   }: NewSessionProps,
@@ -111,13 +100,9 @@ function useNewSessionChoices(
   overlays: JSX.Element;
 } {
   const queryClient = useQueryClient();
-  const [pickerHost, setPickerHost] = useState<Host | null>(null);
-  const [pickerChoice, setPickerChoice] = useState<Choice>({ kind: "shell" });
-  const [pickerOpen, setPickerOpen] = useState(false);
   const [workspaceFull, setWorkspaceFull] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const hostUpdate = useHostUpdate(null);
-  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 15_000 });
   const workspaceQ = useQuery({
     queryKey: ["workspace", workspaceId],
     queryFn: () => workspaces.get(workspaceId as string),
@@ -125,7 +110,6 @@ function useNewSessionChoices(
     staleTime: 10_000,
   });
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
-  const hostList = hostsQ.data ?? [];
   const agentList = agentsQ.data ?? [];
   /** Undoes what `beforeCreate` did, held for as long as the create it was
    *  made for is still in flight. */
@@ -136,26 +120,6 @@ function useNewSessionChoices(
     tabId === null || !workspaceQ.data
       ? true
       : autoPlace(activeTab(workspaceQ.data.layout).layout.tiles).tile !== null;
-
-  /*
-   * Where a window added here opens: the tab's own home when it has one, else
-   * the workspace's (chosen when it was created). With either, adding a window
-   * never asks where — picking what (shell/agent/files) creates it at home
-   * immediately. The folder browser remains only for a workspace without a
-   * home (pre-migration rows whose sessions are gone, or a home host that has
-   * been removed) and for the explicit "somewhere else" choice.
-   */
-  const home = (() => {
-    if (mode !== "session" || !workspaceQ.data) return null;
-    const layout = workspaceQ.data.layout;
-    // `tabId: null` names a tab that is about to be made; no id in the
-    // envelope matches "", which is exactly how `tabHome` answers "inherit the
-    // workspace's home" — what the new tab will do.
-    const target = tabId === null ? "" : (tabId ?? activeTab(layout).id);
-    const resolved = tabHome(layout, target, workspaceQ.data);
-    const host = resolved ? hostList.find((item) => item.id === resolved.host_id) : undefined;
-    return host && resolved ? { host, cwd: resolved.cwd } : null;
-  })();
 
   useEffect(() => {
     if (workspaceHasRoom) setWorkspaceFull(false);
@@ -279,59 +243,17 @@ function useNewSessionChoices(
     hostUpdate.promptHostUpdate(host, () => createM.mutate({ host, cwd, choice }));
   };
 
-  /** Browse `host` for a folder; picking one creates the choice there. */
-  const browseFolders = (host: Host, choice: Choice) => {
-    setPickerChoice(choice);
-    setPickerHost(host);
-    setPickerOpen(true);
-  };
+  const where = useWherePanel({
+    workspaceId: mode === "session" ? workspaceId : null,
+    tabId: tabId ?? undefined,
+    anchorRef,
+    onBack,
+  });
 
-  /**
-   * "Somewhere other than home": the folder browser answers where, so there is
-   * no menu of locations to step through — one host opens it straight away,
-   * several ask which machine first.
-   */
-  const elsewhere = (
-    choice: Choice,
-  ): Pick<CascadeItem, "disabled" | "onSelect" | "panel" | "trailing"> => {
-    const only = hostList.length === 1 ? hostList[0] : null;
-    if (only) {
-      return {
-        disabled: only.status !== "online",
-        onSelect: () => browseFolders(only, choice),
-        trailing: <HostUpdateBadge host={only} />,
-      };
-    }
-    return {
-      panel: {
-        id: `hosts-${choiceKey(choice)}`,
-        title: "Choose a host",
-        loading: hostsQ.isLoading,
-        emptyLabel: "Connect a host before creating a session.",
-        items: hostList.map((host) => ({
-          key: host.id,
-          icon: <StatusDot tone={hostStatusTone(host.status)} label={host.status} />,
-          label: host.name,
-          detail: host.status === "offline" ? "offline" : undefined,
-          trailing: <HostUpdateBadge host={host} />,
-          disabled: host.status === "offline",
-          onSelect: () => browseFolders(host, choice),
-        })),
-      },
-    };
-  };
-
-  // What goes in the window; then where it points, unless home answers that.
-  const target = (
-    choice: Choice,
-  ): Pick<CascadeItem, "disabled" | "onSelect" | "panel" | "trailing"> =>
-    home
-      ? {
-          disabled: home.host.status !== "online",
-          onSelect: () => createAt(home.host, home.cwd, choice),
-          trailing: <HostUpdateBadge host={home.host} />,
-        }
-      : elsewhere(choice);
+  // What goes in the window, then where it runs — the second step always.
+  const target = (choice: Choice): Pick<CascadeItem, "panel"> => ({
+    panel: where.panel(`where-${choiceKey(choice)}`, (host, cwd) => createAt(host, cwd, choice)),
+  });
 
   const defaultHeading = mode === "workspace" ? "New workspace" : "Add a window";
   const root: CascadePanel = {
@@ -342,23 +264,9 @@ function useNewSessionChoices(
         key: "shell",
         icon: <SquareTerminal />,
         label: "Shell",
-        detail: home && home.host.status !== "online" ? "host offline" : "A plain login shell",
+        detail: "A plain login shell",
         ...target({ kind: "shell" }),
       },
-      // Home answers "where" for everything above, so a workspace with one
-      // needs this escape hatch to open a shell on another host (or just
-      // another folder) without giving up the one-click default.
-      ...(home && !hideElsewhere
-        ? [
-            {
-              key: "shell-elsewhere",
-              icon: hostList.length > 1 ? <Server /> : <FolderOpen />,
-              label: hostList.length > 1 ? "Shell on another host" : "Shell in another folder",
-              detail: hostList.length > 1 ? "Pick a host and folder" : "Pick a folder",
-              ...elsewhere({ kind: "shell" }),
-            },
-          ]
-        : []),
       ...agentList.map((agent) => ({
         key: agent.id,
         icon: <AgentIcon kind={agent.kind} size={18} className="rounded" />,
@@ -397,24 +305,7 @@ function useNewSessionChoices(
           {errorMessage}
         </span>
       )}
-      <FolderPicker
-        key={`${pickerHost?.id ?? "none"}:${pickerOpen ? "open" : "closed"}`}
-        open={pickerOpen}
-        host={pickerHost}
-        initialPath={pickerHost && home?.host.id === pickerHost.id ? home.cwd : null}
-        anchorRef={anchorRef}
-        onBack={
-          onBack &&
-          (() => {
-            setPickerOpen(false);
-            onBack();
-          })
-        }
-        onOpenChange={setPickerOpen}
-        onSelect={(path) => {
-          if (pickerHost) createAt(pickerHost, path, pickerChoice);
-        }}
-      />
+      {where.overlays}
       <HostUpdateDialog {...hostUpdate.dialogProps} />
     </>
   );
@@ -557,10 +448,7 @@ function Lozenge({
 export function NewSessionLozenges(props: NewSessionProps & { className?: string }): JSX.Element {
   const anchorRef = useRef<HTMLDivElement>(null);
   const { root, disabled, tooltip, overlays } = useNewSessionChoices(props, anchorRef);
-  // "Somewhere else" is the cascade's escape hatch for a surface with nothing
-  // else to say where a window lands. The row has the tab's own folder sitting
-  // right above it, which is the better answer, so it drops the item.
-  const picks = root.items.filter((item) => item.key !== "shell-elsewhere");
+  const picks = root.items;
   return (
     <div
       ref={anchorRef}

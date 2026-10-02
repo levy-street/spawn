@@ -56,6 +56,7 @@ import { cn } from "@/lib/utils";
 import {
   filterWorkspacesByName,
   workspaceAttentionCount,
+  workspaceAttentionLevel,
   workspaceLiveSessionCount,
 } from "@/lib/workspaces";
 
@@ -748,6 +749,7 @@ export function Sidebar({
                 }
                 collapsed={collapsed}
                 attentionCount={workspaceAttentionCount(workspace, sessionsById)}
+                attentionLevel={workspaceAttentionLevel(workspace, sessionsById)}
                 busy={workspaceBusy}
                 onNavigate={onNavigate}
                 onRename={(name) => renameWorkspaceM.mutate({ id: workspace.id, name })}

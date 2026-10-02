@@ -36,10 +36,17 @@ export function CapacityBar({
   label,
   caption,
   size = "sm",
+  variant = "inset",
   className,
 }: {
   /** 0..1. Anything outside is clamped; NaN draws an empty track. */
   fill: number;
+  /**
+   * "inset" rides the legend inside a tall track (the host page). "slim" is a
+   * hairline track with the legend beside it, for the sidebar, where type
+   * squeezed inside a bar that small was the hardest thing on it to read.
+   */
+  variant?: "inset" | "slim";
   /** Short legend — "CPU", "MEM". Also the accessible name. */
   label: string;
   /** Right-hand reading: "41%", "Busy". Omitted where the bar speaks alone. */
@@ -48,6 +55,34 @@ export function CapacityBar({
   className?: string;
 }) {
   const clamped = Number.isFinite(fill) ? Math.max(0, Math.min(1, fill)) : 0;
+  if (variant === "slim") {
+    return (
+      <span
+        className={cn("flex min-w-0 items-center gap-1.5", className)}
+        role="img"
+        aria-label={`${label}: ${caption ?? `${Math.round(clamped * 100)}%`}`}
+      >
+        <span
+          aria-hidden
+          className="shrink-0 font-mono text-[9px] font-medium uppercase tracking-[0.1em] text-muted-foreground"
+        >
+          {label}
+        </span>
+        <span
+          aria-hidden
+          className="relative h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted-foreground/15"
+        >
+          <span
+            className={cn(
+              "absolute inset-y-0 left-0 rounded-full transition-[width] duration-500 ease-swift",
+              FILL_TONE[fillTone(clamped)],
+            )}
+            style={{ width: `${clamped * 100}%` }}
+          />
+        </span>
+      </span>
+    );
+  }
   return (
     <span
       className={cn(
@@ -94,6 +129,8 @@ export function CapacityBar({
 /** Presence and activity only — see `hostTone` for why there is no fourth. */
 const TONE_DOT: Record<string, string> = {
   active: "bg-tone-active",
+  // This device has lost a host the server still sees: reconnecting.
+  warning: "bg-warning",
   idle: "bg-tone-idle",
   offline: "bg-tone-offline",
 };

@@ -4,7 +4,6 @@ import {
   AGENT_ID,
   type AppMockOptions,
   envelope,
-  HOST_ID,
   mockApp,
   pinKeyboard,
   SESSION_B_ID,
@@ -232,7 +231,11 @@ test("double-clicking a header expands only that window into empty space", async
     { session_id: THIRD_SESSION_ID, x: 16, y: 0, w: 8, h: 24 },
   ];
   const { store } = await setupGrid(page, initial);
-  await page.getByRole("toolbar", { name: "palette window controls" }).dblclick();
+  // On the bar's own ground (the title), not on the controls riding it.
+  await page
+    .getByRole("toolbar", { name: "palette window controls" })
+    .getByText("palette", { exact: true })
+    .dblclick();
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
     layout: envelope({
@@ -340,16 +343,14 @@ test("empty workspaces offer session creation", async ({ page }) => {
 test("the empty state's first window takes the left half, not the whole canvas", async ({
   page,
 }) => {
-  // A workspace with a home of its own: picking a lozenge is the whole flow.
-  const store = await mockApp(page, {
-    workspaces: [workspace({ host_id: HOST_ID, cwd: "/Users/tester" })],
-    sessions: [],
-  });
+  const store = await mockApp(page, { workspaces: [workspace()], sessions: [] });
   await page.goto(`/w/${WORKSPACE_ID}`);
   await page
     .getByRole("toolbar", { name: "Add a window" })
     .getByRole("button", { name: "Shell", exact: true })
     .click();
+  // Then where it runs: the likeliest place is first.
+  await page.getByRole("menu", { name: "Where?" }).getByRole("menuitem").first().click();
   await expect.poll(() => store.requests.sessions.length).toBe(1);
   expect(store.requests.sessions[0]).toMatchObject({ tile: { x: 0, y: 0, w: 12, h: 24 } });
   // The half it did not take invites the next window without a hover.

@@ -1,5 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
-import { fileEntry, fileListing, HOST_ID, mockApp, WORKSPACE_ID, workspace } from "./app-mocks";
+import { fileEntry, fileListing, mockApp, session, WORKSPACE_ID, workspace } from "./app-mocks";
 
 /**
  * Where the folder picker's column strip parks itself.
@@ -59,13 +59,22 @@ async function settledStrip(page: Page) {
   return previous;
 }
 
-test("drilling in reveals what is inside the folder", async ({ page }) => {
-  await mockApp(page, { workspaces: [workspace()], sessions: [], files });
-  await page.goto(`/w/${WORKSPACE_ID}`);
+/** A new window from the empty state, then "Choose a folder…" in its "where". */
+async function openPicker(page: Page) {
   await page
     .getByRole("toolbar", { name: "Add a window" })
     .getByRole("button", { name: "Shell", exact: true })
     .click();
+  await page
+    .getByRole("menu", { name: "Where?" })
+    .getByRole("menuitem", { name: /Choose a folder/ })
+    .click();
+}
+
+test("drilling in reveals what is inside the folder", async ({ page }) => {
+  await mockApp(page, { workspaces: [workspace()], sessions: [], files });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await openPicker(page);
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
   await expect(dialog.getByRole("listbox", { name: "Folders in /Users/tester" })).toBeVisible();
 
@@ -89,10 +98,7 @@ test("drilling in reveals what is inside the folder", async ({ page }) => {
 test("arrow keys walk the folders without a click first", async ({ page }) => {
   await mockApp(page, { workspaces: [workspace()], sessions: [], files });
   await page.goto(`/w/${WORKSPACE_ID}`);
-  await page
-    .getByRole("toolbar", { name: "Add a window" })
-    .getByRole("button", { name: "Shell", exact: true })
-    .click();
+  await openPicker(page);
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
 
   // The trailing column takes focus on open, so the keyboard works straight
@@ -107,16 +113,13 @@ test("arrow keys walk the folders without a click first", async ({ page }) => {
 
 test("opened at a folder shows it in context, and pressing it reveals", async ({ page }) => {
   await mockApp(page, {
-    // A workspace already pointed somewhere three columns deep.
-    workspaces: [workspace({ host_id: HOST_ID, cwd: "/Users/tester/Desktop/spawn-keys-backup" })],
-    sessions: [],
+    workspaces: [workspace()],
+    // A window that ran three columns deep: browsing that host starts there.
+    sessions: [session({ cwd: "/Users/tester/Desktop/spawn-keys-backup" })],
     files,
   });
   await page.goto(`/w/${WORKSPACE_ID}`);
-  await page
-    .getByRole("button", { name: /spawn-keys-backup/ })
-    .first()
-    .click();
+  await openPicker(page);
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
   await expect(
     dialog.getByRole("listbox", { name: "Folders in /Users/tester/Desktop/spawn-keys-backup" }),

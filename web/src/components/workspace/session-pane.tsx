@@ -6,12 +6,9 @@ import {
   ArrowUp,
   Bell,
   BellOff,
-  Check,
-  ChevronDown,
   Copy,
   Ellipsis,
   ExternalLink,
-  Folder,
   Pencil,
   RotateCcw,
   ScrollText,
@@ -38,18 +35,17 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { hostStatusTone, SessionStatusDot, StatusDot } from "@/components/ui/status";
+import { SessionStatusDot } from "@/components/ui/status";
 import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@/lib/api";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
-import { basename } from "@/lib/paths";
-import { sessionAtShell, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
+import { sessionAtShell, sessionOwnName, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher } from "./agent-switcher";
-import { FolderPicker } from "./folder-picker";
 import { pendingLaunch } from "./pending-launch";
+import { WhereChip } from "./where-chip";
 
 /** Trailing shortcut hint in a menu row — the gesture that does the same thing. */
 function MenuHint({ children }: { children: ReactNode }) {
@@ -97,6 +93,7 @@ export function SessionPane({
   onRemoveFromWorkspace,
   onConvertToFiles,
   onMoveToHost,
+  workspaceId,
   registerHandle,
   onError,
 }: {
@@ -122,9 +119,11 @@ export function SessionPane({
   onRemoveFromWorkspace: (sessionId: string) => void;
   /** Replace this pane with a file explorer widget (workspace grid only). */
   onConvertToFiles?: (sessionId: string) => void;
-  /** Swap this pane's shell for a fresh one on another host (workspace grid
-   *  only — the grid owns the tile swap). */
-  onMoveToHost?: (sessionId: string, host: Host) => void;
+  /** Swap this pane's window for the same kind of window on another host, in
+   *  `cwd` (workspace grid only — the grid owns the tile swap). */
+  onMoveToHost?: (sessionId: string, host: Host, cwd: string) => void;
+  /** Ranks the places the pane can be moved to: beside its tab-mates first. */
+  workspaceId?: string;
   registerHandle: (sessionId: string, getHandle: () => TerminalHandle | null) => void;
   onError: (message: string | null) => void;
 }) {
@@ -133,8 +132,6 @@ export function SessionPane({
   const [editingName, setEditingName] = useState(false);
   const [transcriptsOpen, setTranscriptsOpen] = useState(false);
   const [selfHovered, setSelfHovered] = useState(false);
-  const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
-  const cwdChipRef = useRef<HTMLButtonElement>(null);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const hostList = hostsQ.data ?? [];
   const paneHost = hostList.find((host) => host.id === session?.host_id) ?? null;
@@ -306,7 +303,11 @@ export function SessionPane({
   }
   if (!hostRef.current) return null;
 
-  const title = session ? sessionTitle(session) : "Missing session";
+  // The where chip beside it carries the host and folder, so the title is the
+  // window's own name, or what runs in it — never the folder a second time.
+  const title = session
+    ? sessionOwnName(session) || agentDisplayName(session.foreground_command)
+    : "Missing session";
   const stacked = slot?.stacked ?? false;
 
   return createPortal(
@@ -347,7 +348,9 @@ export function SessionPane({
 
       <header
         role="toolbar"
-        aria-label={`${title} window controls`}
+        // The full name for assistive tech: the visible title is short because
+        // the where chip carries the folder, but two "Shell" panes need telling apart.
+        aria-label={`${session ? sessionTitle(session) : title} window controls`}
         title={canDrag ? "Drag to move · Double-click to fill empty space" : undefined}
         className={cn(
           // Tighter on the right than the left: the bar ends in icon buttons, whose
@@ -417,61 +420,30 @@ export function SessionPane({
             <span className="min-w-0 truncate">{title}</span>
           </span>
         )}
-        {session && paneHost && hostList.length > 1 && onMoveToHost && (
-          /* The pane's host, as a control: with more than one host connected
-             this is a dropdown — picking another machine swaps this pane's
-             shell for a fresh one over there (the grid confirms first). */
-          <DropdownMenu
-            align="end"
-            renderTrigger={(props) => (
-              <button
-                {...props}
-                type="button"
-                aria-label="Change host"
-                title={`Running on ${paneHost.name}`}
-                className="flex h-7 max-w-36 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              >
-                <StatusDot tone={hostStatusTone(paneHost.status)} label={paneHost.status} />
-                <span className="truncate">{paneHost.name}</span>
-                <ChevronDown className="size-3 shrink-0" aria-hidden />
-              </button>
-            )}
-          >
-            {hostList.map((host) => (
-              <DropdownMenuItem
-                key={host.id}
-                disabled={host.status !== "online" && host.id !== session.host_id}
-                onSelect={() => {
-                  if (host.id !== session.host_id) onMoveToHost(sessionId, host);
-                }}
-              >
-                <StatusDot tone={hostStatusTone(host.status)} label={host.status} />
-                <span className="min-w-0 flex-1 truncate">{host.name}</span>
-                {host.id === session.host_id && <Check className="size-3.5 shrink-0" aria-hidden />}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenu>
-        )}
         {session && (
-          /* The pane's folder, as a control: pick a directory and the shell
-             is sent a `cd` — the terminal changes where it points without
-             leaving the keyboard-first flow. Squeezed narrow it keeps only its
-             icon: in a pane that thin the session's own name is worth more of
-             the bar than the folder's, and the title still carries the path. */
-          <button
-            ref={cwdChipRef}
-            type="button"
-            aria-label="Change directory"
-            title={session.cwd}
-            onClick={() => setCwdPickerOpen((value) => !value)}
-            className="flex h-7 max-w-40 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            <Folder className="size-3.5 shrink-0" aria-hidden />
-            <span className="truncate @max-[260px]/pane-header:hidden">
-              {basename(session.cwd) || session.cwd}
-            </span>
-            <ChevronDown className="size-3 shrink-0 @max-[260px]/pane-header:hidden" aria-hidden />
-          </button>
+          <WhereChip
+            session={session}
+            host={paneHost}
+            workspaceId={workspaceId}
+            onPick={(host, cwd) => {
+              if (host.id === session.host_id) {
+                // Same machine: the running shell changes directory, keeping
+                // its scrollback, rather than being replaced.
+                const purpose = "Changing this window's folder";
+                void runInShell({
+                  session,
+                  handle: getHandle(),
+                  command: `cd ${shellQuote(cwd)}`,
+                  purpose,
+                  onSession: (fresh) => writeSessionToCache(queryClient, fresh),
+                }).then((result) => {
+                  if (result === "busy") onError(stillRunningMessage(session, purpose));
+                });
+                return;
+              }
+              onMoveToHost?.(sessionId, host, cwd);
+            }}
+          />
         )}
         <DropdownMenu
           align="end"
@@ -668,28 +640,6 @@ export function SessionPane({
           onClose={() => setTranscriptsOpen(false)}
         />
       )}
-
-      <FolderPicker
-        key={`${paneHost?.id ?? "none"}:${cwdPickerOpen ? "open" : "closed"}`}
-        open={cwdPickerOpen}
-        host={paneHost}
-        initialPath={session?.cwd}
-        anchorRef={cwdChipRef}
-        onOpenChange={setCwdPickerOpen}
-        onSelect={(path) => {
-          if (!session) return;
-          const purpose = "Changing this window's folder";
-          void runInShell({
-            session,
-            handle: getHandle(),
-            command: `cd ${shellQuote(path)}`,
-            purpose,
-            onSession: (fresh) => writeSessionToCache(queryClient, fresh),
-          }).then((result) => {
-            if (result === "busy") onError(stillRunningMessage(session, purpose));
-          });
-        }}
-      />
     </section>,
     hostRef.current,
   );

@@ -90,7 +90,9 @@ async def test_session_patch_name_and_delete(client):
     assert r.status_code == 404
 
 
-async def test_session_create_defaults_name_from_host_and_cwd(client):
+async def test_session_create_leaves_an_unnamed_window_unnamed(client):
+    """Host and folder are shown beside a window already; a default name that
+    repeated them read as a duplicate in every header."""
     token = await _signup(client, "default-name@example.com")
     auth = {"Authorization": f"Bearer {token}"}
     host_id = await _create_host("default-name@example.com", name="dream", status="offline")
@@ -102,7 +104,7 @@ async def test_session_create_defaults_name_from_host_and_cwd(client):
     )
     assert r.status_code == 201, r.text
     body = r.json()
-    assert body["name"] == "dream - spawn"
+    assert body["name"] is None
     assert body["host_name"] == "dream"
     assert body["foreground_command"] is None
     # The launch surface is gone from the API shape entirely.
@@ -348,43 +350,40 @@ async def test_session_create_appends_workspace_tile(client):
     }
 
 
-async def test_session_create_adopts_home_for_a_homeless_workspace(client):
-    """A workspace with no home takes the first session's host and folder.
+async def test_a_workspace_holds_windows_from_several_hosts_and_gains_no_home(client):
+    """A workspace is a layout of windows, each of which says where it runs.
 
-    Pre-0047 workspaces whose original sessions were gone missed the home
-    backfill, and nothing after creation wrote one — so every "add a window"
-    asked where, forever. The first session created in such a workspace now
-    settles it; the second one must not move it again.
+    Creating a window in it never writes the window's host or folder back onto
+    the workspace: that "home" is what made every other window open there.
     """
-    token = await _signup(client, "adopt-home@example.com")
+    token = await _signup(client, "many-hosts@example.com")
     auth = {"Authorization": f"Bearer {token}"}
-    host_id = await _create_host("adopt-home@example.com")
+    first_host = await _create_host("many-hosts@example.com")
+    second_host = await _create_host("many-hosts@example.com")
+    assert first_host != second_host
 
-    ws = await client.post("/api/workspaces", json={"name": "old-timer"}, headers=auth)
+    ws = await client.post("/api/workspaces", json={"name": "mixed"}, headers=auth)
     assert ws.status_code == 201, ws.text
     workspace_id = ws.json()["workspace"]["id"]
-    assert ws.json()["workspace"]["host_id"] is None
-    assert ws.json()["workspace"]["cwd"] is None
 
-    r = await client.post(
-        "/api/sessions",
-        json={"host_id": host_id, "cwd": "/repo/adopted", "workspace_id": workspace_id},
-        headers=auth,
-    )
-    assert r.status_code == 201, r.text
-    workspace = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()
-    assert workspace["host_id"] == host_id
-    assert workspace["cwd"] == "/repo/adopted"
+    created = []
+    for host_id, cwd in ((first_host, "/repo/api"), (second_host, "/Users/me/site")):
+        r = await client.post(
+            "/api/sessions",
+            json={"host_id": host_id, "cwd": cwd, "workspace_id": workspace_id},
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+        created.append((r.json()["id"], host_id, cwd))
 
-    # The home is settled: a later session somewhere else does not move it.
-    r = await client.post(
-        "/api/sessions",
-        json={"host_id": host_id, "cwd": "/elsewhere", "workspace_id": workspace_id},
-        headers=auth,
-    )
-    assert r.status_code == 201, r.text
     workspace = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()
-    assert workspace["cwd"] == "/repo/adopted"
+    assert workspace["host_id"] is None
+    assert workspace["cwd"] is None
+    tiles = [tile["session_id"] for tab in workspace["layout"]["tabs"] for tile in tab["layout"]["tiles"]]
+    assert sorted(tiles) == sorted(session_id for session_id, _, _ in created)
+    for session_id, host_id, cwd in created:
+        session = (await client.get(f"/api/sessions/{session_id}", headers=auth)).json()
+        assert (session["host_id"], session["cwd"]) == (host_id, cwd)
 
 
 async def test_session_create_explicit_tile_validation(client):

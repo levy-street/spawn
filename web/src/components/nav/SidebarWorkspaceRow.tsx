@@ -1,5 +1,6 @@
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
 import { Archive, ImagePlus, MoreHorizontal, Pencil, Trash2, Unlink } from "lucide-react";
 import Link from "next/link";
 import {
@@ -15,7 +16,7 @@ import {
   sidebarRowClass,
   WorkspaceAvatar,
 } from "@/components/nav/sidebar-parts";
-import { Badge } from "@/components/ui/badge";
+import { AttentionBadge } from "@/components/ui/attention-badge";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -25,9 +26,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
-import type { Workspace } from "@/lib/api";
+import { sessions, type Workspace } from "@/lib/api";
 import type { SplitSide } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
+import { type AttentionLevel, workspaceFolder } from "@/lib/workspaces";
 
 export function SidebarWorkspaceRow({
   workspace,
@@ -35,6 +37,7 @@ export function SidebarWorkspaceRow({
   beside = false,
   collapsed,
   attentionCount,
+  attentionLevel = attentionCount > 0 ? "waiting" : null,
   busy,
   onNavigate,
   onRename,
@@ -53,6 +56,8 @@ export function SidebarWorkspaceRow({
   beside?: boolean;
   collapsed: boolean;
   attentionCount: number;
+  /** The most urgent of them: a stopped window outranks a waiting one. */
+  attentionLevel?: AttentionLevel | null;
   busy: boolean;
   onNavigate?: () => void;
   onRename: (name: string) => void;
@@ -66,6 +71,13 @@ export function SidebarWorkspaceRow({
   const menuRef = useRef<DropdownMenuHandle>(null);
   const [editing, setEditing] = useState(false);
   const [iconOpen, setIconOpen] = useState(false);
+  const sessionsQ = useQuery({
+    queryKey: ["sessions"],
+    queryFn: () => sessions.list(),
+    enabled: iconOpen,
+  });
+  // The icon dialog looks in the folder the workspace's first window runs in.
+  const iconSource = iconOpen ? workspaceFolder(workspace, sessionsQ.data ?? []) : null;
   const [draft, setDraft] = useState(workspace.name);
 
   useEffect(() => {
@@ -113,7 +125,12 @@ export function SidebarWorkspaceRow({
               // Astride the tile's top-right corner, ringed in the rail's own
               // ground (bg-shell, not card) so the gap reads as the sidebar
               // showing through — an inset dot, not a haloed one.
-              <span className="absolute -right-1 -top-1 size-3 rounded-full border-2 border-shell bg-warning" />
+              <span
+                className={cn(
+                  "absolute -right-1 -top-1 size-3 rounded-full border-2 border-shell",
+                  attentionLevel === "dead" ? "bg-destructive" : "bg-warning",
+                )}
+              />
             )}
           </Link>
         </RailTooltip>
@@ -195,18 +212,15 @@ export function SidebarWorkspaceRow({
                 slot: the badge holds it at rest, hovering the row swaps in the
                 kebab. Coarse pointers cannot hover, so there the badge steps
                 one slot left and the kebab stays put. */}
-            {attentionCount > 0 && (
-              <Badge
-                variant="warning"
-                className={cn(
-                  "pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 px-2 py-0 text-[11px] transition-opacity",
-                  "group-hover/workspace:opacity-0 group-focus-within/workspace:opacity-0",
-                  "[@media(pointer:coarse)]:right-10 [@media(pointer:coarse)]:opacity-100",
-                )}
-              >
-                {attentionCount}
-              </Badge>
-            )}
+            <AttentionBadge
+              count={attentionCount}
+              level={attentionLevel}
+              className={cn(
+                "pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 transition-opacity",
+                "group-hover/workspace:opacity-0 group-focus-within/workspace:opacity-0",
+                "[@media(pointer:coarse)]:right-10 [@media(pointer:coarse)]:opacity-100",
+              )}
+            />
             <DropdownMenu
               ref={menuRef}
               className="absolute right-1.5 top-1/2 -translate-y-1/2"
@@ -259,8 +273,8 @@ export function SidebarWorkspaceRow({
           onOpenChange={setIconOpen}
           name={workspace.name}
           icon={workspace.icon}
-          hostId={workspace.host_id}
-          cwd={workspace.cwd}
+          hostId={iconSource?.host_id ?? null}
+          cwd={iconSource?.cwd ?? null}
           busy={busy}
           onSelect={onIcon}
         />

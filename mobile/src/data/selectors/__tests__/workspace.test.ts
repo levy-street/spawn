@@ -4,7 +4,6 @@ import {
   selectActiveSession,
   selectActiveTabId,
   selectOrderedWorkspaces,
-  selectTabHome,
   selectTabItems,
   tabStats,
   workspaceRecency,
@@ -219,13 +218,6 @@ describe("workspace selection and ordering", () => {
     expect(selectActivePaneId(tab, "missing")).toBe("active");
     expect(selectActiveSession(tab, snapshot().sessionsById, "dead")?.id).toBe("dead");
     expect(selectActiveSession(tab, snapshot().sessionsById, "files")?.id).toBe("active");
-  });
-
-  it("resolves complete tab homes, then complete workspace homes", () => {
-    const current = workspace();
-    expect(selectTabHome(current, "two")).toEqual({ host_id: "host", cwd: "/tab-home" });
-    expect(selectTabHome(current, "one")).toEqual({ host_id: "host", cwd: "/workspace-home" });
-    expect(selectTabHome({ ...current, host_id: null }, "one")).toBeNull();
   });
 
   it("sorts active and archived workspaces without mutating source and filters normalized names", () => {

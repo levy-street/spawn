@@ -30,12 +30,14 @@ import {
   WorkspaceUnavailableState,
 } from "@/components/workspace-detail/workspace-detail-states";
 import { WorkspaceHeader } from "@/components/workspace-detail/workspace-header";
+import { WorkspaceFolderSheet } from "@/components/workspaces/workspace-folder-sheet";
 import { canAddTab } from "@/data/layout/tabs";
 import { canAddTile } from "@/data/layout/tiles";
 import { useWorkspaceDetail } from "@/data/queries/workspace-detail";
+import { displayPath } from "@/data/selectors/places";
 import { selectActiveTabId } from "@/data/selectors/workspace";
 import { useConnectionStore } from "@/data/stores/connection";
-import type { Session, Workspace } from "@/data/types/domain";
+import type { Host, Session, Workspace } from "@/data/types/domain";
 import type { Tile, WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
@@ -92,6 +94,8 @@ export function WorkspaceDetail({
   const [paneTarget, setPaneTarget] = useState<PaneActionTarget | null>(null);
   const [moveTile, setMoveTile] = useState<Tile | null>(null);
   const [hostTarget, setHostTarget] = useState<{ tile: Tile; session: Session } | null>(null);
+  /** A move waiting on a folder picked from any host's browser. */
+  const [browseTarget, setBrowseTarget] = useState<{ tile: Tile; session: Session } | null>(null);
   const [tabTarget, setTabTarget] = useState<WorkspaceTab | null>(null);
   const [workspaceActionsVisible, setWorkspaceActionsVisible] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
@@ -196,6 +200,23 @@ export function WorkspaceDetail({
     },
     [toast],
   );
+
+  /** Confirm, then move a pane to `cwd` on `host` as the same kind of window. */
+  const confirmMove = (target: { tile: Tile; session: Session }, host: Host, cwd: string) => {
+    setConfirmation({
+      title: `Move to ${host.name}?`,
+      description: `This window's process is stopped here, and the same kind of window starts in ${displayPath(cwd)} there.`,
+      confirmLabel: "Move window",
+      onConfirm: () => {
+        setConfirmation(null);
+        if (!workspace) return;
+        void run(
+          () => actions.movePaneToHost(workspace, target.tile, host, cwd, target.session, agents),
+          () => setPaneTarget(null),
+        );
+      },
+    });
+  };
 
   /*
    * Carrying a pane to another tab. The gesture reports window coordinates, so
@@ -491,29 +512,41 @@ export function WorkspaceDetail({
         ) : null}
         <MovePaneHostSheet
           hosts={hosts}
-          onDismiss={() => setHostTarget(null)}
-          onSelect={(host) => {
-            const target = hostTarget;
-            if (!target) return;
+          onBrowse={() => {
+            setBrowseTarget(hostTarget);
             setHostTarget(null);
-            setConfirmation({
-              title: `Move to ${host.name}?`,
-              description:
-                "This window's shell is closed and its running process killed; a new one starts in your home folder there.",
-              confirmLabel: "Move window",
-              onConfirm: () => {
-                setConfirmation(null);
-                void run(
-                  () =>
-                    actions.movePaneToHost(workspace, target.tile, host, target.session, agents),
-                  () => setPaneTarget(null),
-                );
-              },
-            });
+          }}
+          onDismiss={() => setHostTarget(null)}
+          onSelect={(host, cwd) => {
+            const target = hostTarget;
+            setHostTarget(null);
+            if (target) confirmMove(target, host, cwd);
           }}
           session={hostTarget?.session ?? null}
+          sessions={sessions}
+          tabSessionIds={
+            workspace.layout.tabs
+              .find((tab) =>
+                tab.layout.tiles.some((tile) => tile.session_id === hostTarget?.tile.session_id),
+              )
+              ?.layout.tiles.map((tile) => tile.session_id) ?? []
+          }
           visible={hostTarget !== null}
         />
+        {/* Mounted only while browsing: it lists hosts and folders as it opens. */}
+        {browseTarget !== null ? (
+          <WorkspaceFolderSheet
+            initial={null}
+            onDismiss={() => setBrowseTarget(null)}
+            onPick={(folder) => {
+              const target = browseTarget;
+              setBrowseTarget(null);
+              const host = hosts.find((candidate) => candidate.id === folder.hostId);
+              if (target && host) confirmMove(target, host, folder.path);
+            }}
+            visible
+          />
+        ) : null}
         <MovePaneSheet
           onDismiss={() => setMoveTile(null)}
           onMove={(tabId) => {

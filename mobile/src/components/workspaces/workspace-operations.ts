@@ -33,6 +33,9 @@ export interface InstantiateTemplateInput {
   template: WorkspaceTemplateOut;
   agents: readonly AgentOut[];
   name: string;
+  /** Where the template's windows run. A workspace has no host or folder of
+   *  its own, so this is chosen when the template is replayed. */
+  place: { hostId: string; cwd: string } | null;
   icon?: string | null;
   iconSource?: WorkspaceIconSource | null;
 }
@@ -134,24 +137,22 @@ export async function instantiateWorkspaceTemplate(
   input: InstantiateTemplateInput,
   dependencies: WorkspaceOperationDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<WorkspaceOperationResult> {
-  const { template } = input;
+  const { template, place } = input;
   const hasTiles = template.spec.tabs.some((tab) => (tab.tiles?.length ?? 0) > 0);
-  if (hasTiles && (!template.host_id || !template.cwd)) {
-    throw new Error("This template needs a host and folder before it can be created.");
+  if (hasTiles && !place) {
+    throw new Error("Choose where this template's windows run.");
   }
 
   const result = await dependencies.createWorkspace({
     name: input.name.trim(),
-    host_id: template.host_id,
-    cwd: template.cwd,
     icon: input.icon === undefined ? template.icon : input.icon,
     icon_source: input.iconSource === undefined ? template.icon_source : input.iconSource,
   });
   const workspaceId = result.workspace.id;
   const layout = initialTemplateLayout(
     template,
-    template.host_id,
-    template.cwd,
+    place?.hostId ?? null,
+    place?.cwd ?? null,
     dependencies.randomId,
   );
   let workspace = await dependencies.patchWorkspace(workspaceId, { layout });
@@ -160,7 +161,7 @@ export async function instantiateWorkspaceTemplate(
   for (let tabIndex = 0; tabIndex < template.spec.tabs.length; tabIndex += 1) {
     const templateTab = template.spec.tabs[tabIndex];
     const targetTab = layout.tabs[tabIndex];
-    if (!templateTab || !targetTab || !template.host_id || !template.cwd) continue;
+    if (!templateTab || !targetTab || !place) continue;
     workspace = await activateTab(workspaceId, targetTab.id, dependencies);
     for (const tile of templateTab.tiles ?? []) {
       if (tile.run.kind === "files") continue;
@@ -170,8 +171,8 @@ export async function instantiateWorkspaceTemplate(
         ? newAgentConversationId(templateAgent.kind, dependencies.randomId)
         : null;
       const session = await dependencies.createSession({
-        host_id: template.host_id,
-        cwd: template.cwd,
+        host_id: place.hostId,
+        cwd: place.cwd,
         ...(templateAgent ? { agent_id: templateAgent.id, agent_session_id: conversation } : {}),
         workspace_id: workspaceId,
         tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },

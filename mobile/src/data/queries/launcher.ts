@@ -16,7 +16,12 @@ import {
 import { ApiError } from "@/data/api/client";
 import { listAgents } from "@/data/api/endpoints/agents";
 import { listHosts, listRecentDirectories } from "@/data/api/endpoints/hosts";
-import { createSession, deleteSession, getSession } from "@/data/api/endpoints/sessions";
+import {
+  createSession,
+  deleteSession,
+  getSession,
+  listSessions,
+} from "@/data/api/endpoints/sessions";
 import { getWorkspace, patchWorkspace } from "@/data/api/endpoints/workspaces";
 import type { RecentDirOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
@@ -34,7 +39,7 @@ export const launcherOrchestrator = createLaunchOrchestrator({
 });
 
 export function useLauncherData(workspaceId: string, enabled = true) {
-  const [hosts, agents, workspace] = useQueries({
+  const [hosts, agents, workspace, sessions] = useQueries({
     queries: [
       { queryKey: qk.hosts(), queryFn: listHosts, enabled },
       { queryKey: qk.agents(), queryFn: listAgents, enabled },
@@ -43,6 +48,8 @@ export function useLauncherData(workspaceId: string, enabled = true) {
         queryFn: () => getWorkspace(workspaceId),
         enabled: enabled && workspaceId.length > 0,
       },
+      // Where windows already run ranks the places a new one is offered.
+      { queryKey: qk.sessions(), queryFn: () => listSessions(), enabled },
     ],
   });
 
@@ -50,6 +57,7 @@ export function useLauncherData(workspaceId: string, enabled = true) {
     hosts: hosts.data ?? [],
     agents: agents.data ?? [],
     workspace: workspace.data,
+    sessions: sessions.data ?? [],
     error: hosts.error ?? agents.error ?? workspace.error,
     isLoading: hosts.isLoading || agents.isLoading || workspace.isLoading,
     refetch: async () => {

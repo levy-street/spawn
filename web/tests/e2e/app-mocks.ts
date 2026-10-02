@@ -189,6 +189,11 @@ export function workspace(overrides: Record<string, unknown> = {}) {
     cwd: null,
     layout: wrapped ?? envelope({ version: 3, tiles: [] }),
     position: 0,
+    // Already looked for, and none found: the icon auto-fill otherwise scans
+    // the first window's folder and PATCHes the result, a write every test
+    // counting layout PATCHes would have to step around.
+    icon: null,
+    icon_source: "none",
     archived_at: null,
     created_at: CREATED_AT,
     updated_at: CREATED_AT,

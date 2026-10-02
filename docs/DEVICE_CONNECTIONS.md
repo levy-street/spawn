@@ -64,7 +64,11 @@ terminates a session. Signing out, changing accounts, or revoking host trust
 retires the affected connections and pending work. Replacing the phone's signing
 key also recreates its host and terminal workers, even within the same account.
 
-Each host has one reconnect notice and retry action. Panes preserve their last
+Each host has one reconnect state and retry action, shown where that host
+already appears rather than in an app-wide banner: its dot turns `warning` in
+the where chip of every pane running on it and in its Legion row (browser) or
+card (phone), and the row or card carries the reason and Retry. A host that is
+only asleep therefore never covers the work on other hosts. Panes preserve their last
 output for copying and indicate that input is paused. Input accepted before a
 loss may have executed; unsent input is discarded at every application queue.
 Leaving host readiness retires child channels even when ICE repair retains the
@@ -159,7 +163,7 @@ from simulator, emulator and Jest results.
 | --- | --- | --- |
 | Reuse and detach | Open two sessions and a file browser on one host; close and reopen each surface. | One device-to-host peer serves them; closing a surface leaves its siblings and the session workers running. |
 | Background and resume | Background briefly, then for more than three seconds; resume with both sessions open. | The short interruption and transport retirement both recover. Views reattach once, stale worker events cannot enable input or retire a new attachment, and session processes survive. |
-| Network change | Switch Wi-Fi to mobile data and back while output is streaming; repeat with direct connectivity unavailable and UDP TURN available. | Recovery restores both sessions and tools. Each host has one reconnect notice; input stays paused until fresh attachment/control confirmation. |
+| Network change | Switch Wi-Fi to mobile data and back while output is streaming; repeat with direct connectivity unavailable and UDP TURN available. | Recovery restores both sessions and tools. Each host shows one reconnect state where it appears (pane chips, Legion); input stays paused until fresh attachment/control confirmation. |
 | Queued input and files | Interrupt a backpressured paste and an upload while typing in the other session. | Unsent input is discarded. Already-dispatched input remains explicitly uncertain; interrupted writes follow the existing reconciliation flow without a blind duplicate write. |
 | Process restart | Terminate and reopen the app while sessions are running. | A fresh connection restores history and live output; the daemon's session workers survive. Reopening a session is an opening and takes its control lease; transport recovery alone does not. |
 | Identity retirement | In the isolated fixture, sign out, switch accounts, replace the device key, and revoke host trust. | Each action retires the affected connection and pending work. Delayed bridge events cannot revive it or reach the next identity. |
