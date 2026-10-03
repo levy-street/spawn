@@ -971,7 +971,8 @@ export function WorkspaceTabs({
           });
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
-          if (agent) pendingLaunch.set(copy.id, agentLaunchCommand(agent, conversation));
+          if (agent)
+            pendingLaunch.set(copy.id, copy.host_id, agentLaunchCommand(agent, conversation));
         }
         const next = duplicateTab(
           layout,

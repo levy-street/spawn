@@ -248,7 +248,7 @@ input.
 | POST   | `/api/sessions`      | `{host_id, cwd, name?, skill_ids?, workspace_id?, tile?}`                          |
 | PATCH  | `/api/sessions/{id}` | rename: `{name?}`                                                                 |
 | POST   | `/api/sessions/{id}/restart` | respawn the login shell in the session's saved `cwd`                       |
-| POST   | `/api/sessions/{id}/move` | `{host_id, cwd, expected_host_id, agent_session_id?}`: run the same window on another host (below) |
+| POST   | `/api/sessions/{id}/move` | `{host_id, cwd, expected_host_id, agent_id?, agent_session_id?}`: run the same window on another host (below) |
 | GET    | `/api/sessions/{id}/access` | list skill grants for a session                                             |
 | PATCH  | `/api/sessions/{id}/access` | replace grants with `{skill_ids?}`                                         |
 | DELETE | `/api/sessions/{id}` | sends `session.kill` if needed, then hard-deletes the session row                  |
@@ -257,7 +257,11 @@ input.
 key by the id — and replaces only its incarnation, the worker on one host. It
 rebinds first: `host_id` and `cwd`, status `starting`, `started_at` now, exit
 fields and `foreground_command` cleared, `agent_session_id` set to the body's
-(a new conversation; nothing of the old one travels) or cleared. Then the
+(a new conversation; nothing of the old one travels) or cleared. `agent_id`,
+when given, is the agent the client starts over there and becomes the
+window's type, as on create — a shell someone started `claude` in by hand
+names none, and would otherwise keep no conversation (an unknown or foreign
+agent is `404`); omitted, the type stays as it is. Then the
 recent folder is recorded, `session.kill` goes best effort to the old host —
 whose late frames now fail the `host_id` fence and change nothing, so no
 `session.died` — and `session.restart` with the usual fields to the new one,

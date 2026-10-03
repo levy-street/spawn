@@ -39,6 +39,10 @@ export const SessionMoveSchema = z.object({
   host_id: UUIDSchema,
   cwd: z.string().min(1).max(1024),
   expected_host_id: UUIDSchema,
+  /** The agent this device starts in it over there, which types a window
+   *  nothing recorded as one — a shell someone typed `claude` into. Omitted
+   *  leaves the type be. */
+  agent_id: UUIDSchema.nullable().optional(),
   /** The new conversation the agent starts with over there, or none. */
   agent_session_id: z.string().max(64).nullable().optional(),
 });

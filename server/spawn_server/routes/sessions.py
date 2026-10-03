@@ -409,10 +409,12 @@ async def move_session(
     """Run the same window on another host.
 
     The row is the window, so it stays: its id, name, agent, skill grants, and
-    everything clients key by its id — the tile, mutes, notification settings,
-    a queued launch. Only the incarnation changes, one worker and PTY on one
-    host for another. Nothing of the old incarnation travels; an agent window
-    starts a new conversation over there, named by `agent_session_id`.
+    everything clients key by its id — the tile, mutes, notification settings.
+    Only the incarnation changes, one worker and PTY on one host for another.
+    Nothing of the old incarnation travels; an agent window starts a new
+    conversation over there, named by `agent_session_id`. A shell whose agent
+    was started by hand is typed by the move (`agent_id`), as a create would
+    type it, so that conversation is remembered too.
 
     The order is the point. The row is rebound first, so the old host's late
     frames — the exit the kill below provokes above all — fail the
@@ -434,6 +436,15 @@ async def move_session(
     target = await db.get(Host, body.host_id)
     if target is None or target.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
+    # The agent the mover starts over there types the window, as on create —
+    # a shell someone started an agent in by hand becomes that agent's window,
+    # so its conversation is kept and a restart can resume it.
+    retyped = (
+        {"agent_id": await resolve_agent_id(db, user=user, agent_id=body.agent_id)}
+        if body.agent_id is not None
+        else {}
+    )
+    agent_id = retyped.get("agent_id", session_row.agent_id)
     # Compare first: a client that saw the window somewhere it no longer runs
     # is acting on a stale picture, even when it happens to name the host the
     # window has since moved to.
@@ -447,7 +458,7 @@ async def move_session(
 
     source_host_id = session_row.host_id
     # Only an agent window has a conversation to name.
-    conversation = body.agent_session_id if session_row.agent_id is not None else None
+    conversation = body.agent_session_id if agent_id is not None else None
     result = await db.execute(
         update(Session)
         .where(
@@ -466,6 +477,7 @@ async def move_session(
             last_input_at=None,
             foreground_command=None,
             agent_session_id=conversation,
+            **retyped,
         )
         .execution_options(synchronize_session=False)
     )

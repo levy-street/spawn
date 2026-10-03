@@ -135,6 +135,8 @@ export interface SessionTransportOptions {
 
 export interface SessionTransport {
   readonly sessionId: string;
+  /** The host this view attaches to the window on, fixed for its life. */
+  readonly hostId: string;
   readonly state: TransportState;
   readonly daemonState?: TransportState;
   /** Whether this view holds the session's display, as the daemon last said;

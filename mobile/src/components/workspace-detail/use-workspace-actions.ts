@@ -155,7 +155,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
      * where they are. What ran in it stops here and starts fresh there: a
      * shell, or the same agent in a new conversation (its history lives on the
      * machine it ran on), queued for this device to type when it opens the
-     * window over there. Nothing changes if the server refuses: a host gone
+     * window over there — into that host's shell only. Nothing changes if the server refuses: a host gone
      * offline, or a move from another device that landed first.
      */
     movePaneToHost: async (
@@ -178,6 +178,9 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
           host_id: host.id,
           cwd,
           expected_host_id: session.host_id,
+          // The agent it starts over there is what the window is, even when
+          // nothing recorded it: someone typed `claude` into a shell.
+          ...(agent ? { agent_id: agent.id } : {}),
           agent_session_id: conversation,
         });
       } catch (error) {
@@ -189,7 +192,11 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       let launchError: Error | null = null;
       if (agent) {
         try {
-          await pendingLaunches.persist(moved.id, agentLaunchCommand(agent, conversation));
+          await pendingLaunches.persist(
+            moved.id,
+            moved.host_id,
+            agentLaunchCommand(agent, conversation),
+          );
         } catch {
           launchError = new Error(
             `The window moved to ${host.name} as a shell, but ${agent.name} could not be queued.`,
@@ -275,7 +282,11 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       }
       if (agent) {
         try {
-          await pendingLaunches.persist(duplicate.id, agentLaunchCommand(agent, conversation));
+          await pendingLaunches.persist(
+            duplicate.id,
+            duplicate.host_id,
+            agentLaunchCommand(agent, conversation),
+          );
         } catch {
           await invalidateSessions();
           throw new Error(

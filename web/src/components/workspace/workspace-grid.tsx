@@ -15,7 +15,6 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import { Trident } from "@/components/icons/BrandMark";
-import { incarnationKey, openIntent } from "@/components/terminal/incarnation";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { confirm } from "@/components/ui/confirm";
@@ -57,7 +56,7 @@ import {
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
-import { moveWindowConfirmation, moveWindowError } from "./move-window";
+import { moveWindow, moveWindowConfirmation, moveWindowError } from "./move-window";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
@@ -672,7 +671,8 @@ export function WorkspaceGrid({
           ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
           ...(skillIds.length > 0 && { skill_ids: skillIds }),
         });
-        if (agent) pendingLaunch.set(created.id, agentLaunchCommand(agent, conversation));
+        if (agent)
+          pendingLaunch.set(created.id, created.host_id, agentLaunchCommand(agent, conversation));
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});
           throw new Error("This tab is full — close a window before duplicating another.");
@@ -1660,39 +1660,14 @@ export function WorkspaceGrid({
         destructive: true,
       });
       if (!accepted) return;
-      // A conversation of its own over there: an agent's history lives on the
-      // machine it ran on, and nothing of it travels.
-      const conversation = agent ? newAgentConversationId(agent.kind) : null;
-      // A read already in flight left the server before the move. Landing
-      // after it, it would put the window back on the host it left.
-      await Promise.all([
-        queryClient.cancelQueries({ queryKey: ["sessions"] }),
-        queryClient.cancelQueries({ queryKey: ["session", sessionId], exact: true }),
-      ]);
-      let moved: Session;
       try {
-        moved = await sessionsApi.move(sessionId, {
-          host_id: host.id,
-          cwd,
-          expected_host_id: session.host_id,
-          agent_session_id: conversation,
-        });
+        await moveWindow({ queryClient, session, host, cwd, agent });
       } catch (error) {
         onErrorRef.current?.(moveWindowError(error, host.name));
         // Refused or not, this tab's picture of the window may be stale.
         queryClient.invalidateQueries({ queryKey: ["sessions"] });
         return;
       }
-      // Queued and marked before the caches hear of the move, because the
-      // pane's terminal for the new host mounts from them and must find both:
-      // the launch to type, and the intent that makes this device's terminal
-      // take the display there rather than follow like everyone else's.
-      if (agent) pendingLaunch.set(sessionId, agentLaunchCommand(agent, conversation));
-      openIntent.mark(incarnationKey(sessionId, moved.host_id));
-      queryClient.setQueryData(["session", sessionId], moved);
-      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
-        current?.map((item) => (item.id === sessionId ? moved : item)),
-      );
       setFocus(sessionId, true);
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
     },

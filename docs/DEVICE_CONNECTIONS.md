@@ -119,10 +119,15 @@ surface for it are replaced rather than re-pointed, and the new one attaches
 over the new host's connection with no replay offsets, lease or screen of the
 old worker inside it. Following a moved window is a reconnect on every device
 and never takes the lease. The exception is the device that moved it: the
-browser marks the new incarnation as one it opened, and the phone opens the
-window's terminal, so that view takes the lease and types the agent's launch. A
-queued launch is typed only into a view open to the window's current host that
-holds its lease; typed any earlier it would be dropped. A device that missed the
+browser marks the new incarnation as one it opened before its move request
+leaves (it can hear of the move before its own response), and the phone opens
+the window's terminal, so that view takes the lease and types the agent's
+launch. A queued launch is typed only into a view open to the window's current
+host that holds its lease; typed any earlier it would be dropped. It belongs to
+the incarnation it was queued for: once a terminal is attached to the window on
+another host, or the browser's warm terminal follows it there, the launch is
+dropped rather than typed into what runs there, and one not typed within
+fifteen minutes lapses. A device that missed the
 move's data frame converges when its polled session list names the new host,
 which refetches the window's row; the list alone never moves a terminal, since a
 list response that left the server before the move can arrive after it.

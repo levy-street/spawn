@@ -42,9 +42,9 @@ function pendingStore() {
   const queued = new Map<string, string>();
   return {
     queued,
-    persist: jest.fn(async (sessionId: string, command: string) => {
+    persist: jest.fn(async (sessionId: string, hostId: string, command: string) => {
       queued.set(sessionId, command);
-      return { sessionId, command, createdAt: 0, expiresAt: 0 };
+      return { sessionId, hostId, command, createdAt: 0, expiresAt: 0 };
     }),
     clear: jest.fn(async (sessionId: string) => {
       queued.delete(sessionId);
@@ -96,6 +96,12 @@ describe("restartSessionAgent", () => {
     expect(result.plan.kind).toBe("agent");
     expect(restart).toHaveBeenCalledWith(session().id);
     expect(pending.queued.get(session().id)).toBe(
+      "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
+    );
+    // For the window as it runs where it was restarted, and nowhere else.
+    expect(pending.persist).toHaveBeenCalledWith(
+      session().id,
+      session().host_id,
       "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
     );
   });

@@ -83,7 +83,7 @@ describe("restartSessionAgent", () => {
     const result = await restartSessionAgent({ session: session(), agents: [claude], restart });
     expect(result.plan.kind).toBe("agent");
     expect(restart).toHaveBeenCalledTimes(1);
-    expect(pendingLaunch.take(session().id)).toBe(
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(
       "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
     );
   });
@@ -94,7 +94,7 @@ describe("restartSessionAgent", () => {
       session: session(),
       agents: [claude],
       restart: async () => {
-        seen.queuedAtRestart = pendingLaunch.has(session().id);
+        seen.queuedAtRestart = pendingLaunch.has(session().id, session().host_id);
         return session({ status: "starting" });
       },
     });
@@ -112,7 +112,7 @@ describe("restartSessionAgent", () => {
         },
       }),
     ).rejects.toThrow("host daemon is offline");
-    expect(pendingLaunch.has(session().id)).toBe(false);
+    expect(pendingLaunch.has(session().id, session().host_id)).toBe(false);
   });
 
   test("a shell window restarts without touching the queue", async () => {
@@ -123,6 +123,6 @@ describe("restartSessionAgent", () => {
       restart,
     });
     expect(result).toEqual({ plan: { kind: "shell" } });
-    expect(pendingLaunch.has(session().id)).toBe(false);
+    expect(pendingLaunch.has(session().id, session().host_id)).toBe(false);
   });
 });

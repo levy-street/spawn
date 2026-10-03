@@ -4,15 +4,29 @@ const STORAGE_PREFIX = "spawn.pendingLaunch";
 const CHUNK_BYTES = 1_536;
 export const PENDING_LAUNCH_TTL_MS = 15 * 60 * 1_000;
 
+/**
+ * A command waiting to be typed into a window's fresh shell.
+ *
+ * It belongs to one incarnation of the window, `${sessionId}@${hostId}` — the
+ * shell on the host it was queued for. Typed into that incarnation or into
+ * nothing: once a terminal is attached to the window on another host the
+ * command is dropped, never typed there, and one nobody typed within
+ * {@link PENDING_LAUNCH_TTL_MS} lapses. The browser keeps the same rules
+ * (`web/src/components/workspace/pending-launch.ts`).
+ */
 export interface PendingLaunchRecord {
   sessionId: string;
+  /** The host whose shell the command was queued for; null for a record an
+   *  earlier version of the app saved, which named none. */
+  hostId: string | null;
   command: string;
   createdAt: number;
   expiresAt: number;
 }
 
-interface PendingManifest extends Omit<PendingLaunchRecord, "command"> {
+interface PendingManifest extends Omit<PendingLaunchRecord, "command" | "hostId"> {
   version: 1;
+  hostId?: string;
   generation: string;
   chunks: number;
   delivered: boolean;
@@ -29,12 +43,21 @@ export type PendingLaunchRead =
   | { status: "already_delivered" }
   | { status: "missing" }
   | { status: "stale" }
+  /** Queued for the window as it ran on another host: dropped, not typed. */
+  | { status: "elsewhere" }
   | { status: "lost"; reason: "invalid_manifest" | "missing_chunk" };
 
 export interface PendingLaunchStore {
-  persist(sessionId: string, command: string): Promise<PendingLaunchRecord>;
-  /** Durably claims delivery before exposing command bytes. */
-  take(sessionId: string): Promise<PendingLaunchRead>;
+  /** Queue `command` for the window as it runs on `hostId` — the host the
+   *  caller just created, restarted or moved it on. */
+  persist(sessionId: string, hostId: string, command: string): Promise<PendingLaunchRecord>;
+  /** Durably claims delivery, into the window as it runs on `hostId`, before
+   *  exposing command bytes. */
+  take(sessionId: string, hostId: string): Promise<PendingLaunchRead>;
+  /** A terminal is attached to the window on `hostId`: a command queued for
+   *  it as it ran anywhere else belongs to an incarnation that has gone, and
+   *  is dropped. */
+  observe?(sessionId: string, hostId: string): Promise<void>;
   complete?(sessionId: string): Promise<void>;
   abandon?(sessionId: string): Promise<void>;
   clear(sessionId: string): Promise<void>;
@@ -86,6 +109,7 @@ function isManifest(value: unknown): value is PendingManifest {
     typeof candidate["sessionId"] === "string" &&
     typeof candidate["createdAt"] === "number" &&
     typeof candidate["expiresAt"] === "number" &&
+    (candidate["hostId"] === undefined || typeof candidate["hostId"] === "string") &&
     typeof candidate["generation"] === "string" &&
     Number.isInteger(candidate["chunks"]) &&
     Number(candidate["chunks"]) > 0 &&
@@ -130,7 +154,13 @@ export function createPendingLaunchStore(
   const ttlMs = options.ttlMs ?? PENDING_LAUNCH_TTL_MS;
   const claimQueues = new Map<string, Promise<unknown>>();
 
-  async function takePending(sessionId: string): Promise<PendingLaunchRead> {
+  /** Whether a manifest was queued for the window as it ran on another host.
+   *  One an earlier version saved names no host and is taken at its word. */
+  function elsewhere(manifest: PendingManifest, hostId: string): boolean {
+    return manifest.hostId !== undefined && manifest.hostId !== hostId;
+  }
+
+  async function takePending(sessionId: string, hostId: string): Promise<PendingLaunchRead> {
     const manifest = await parseManifest(storage, sessionId);
     if (manifest === null) return { status: "missing" };
     if (manifest === "invalid") {
@@ -145,6 +175,10 @@ export function createPendingLaunchStore(
         ),
       ]);
       return { status: "already_delivered" };
+    }
+    if (elsewhere(manifest, hostId)) {
+      await deleteManifestChunks(storage, sessionId, manifest);
+      return { status: "elsewhere" };
     }
     if (manifest.expiresAt <= now()) {
       await deleteManifestChunks(storage, sessionId, manifest);
@@ -166,6 +200,7 @@ export function createPendingLaunchStore(
       status: "ready",
       record: {
         sessionId,
+        hostId: manifest.hostId ?? null,
         command: chunks.join(""),
         createdAt: manifest.createdAt,
         expiresAt: manifest.expiresAt,
@@ -173,9 +208,16 @@ export function createPendingLaunchStore(
     };
   }
 
-  async function queueTake(sessionId: string): Promise<PendingLaunchRead> {
+  async function observePending(sessionId: string, hostId: string): Promise<void> {
+    const manifest = await parseManifest(storage, sessionId);
+    if (manifest === null || manifest === "invalid" || manifest.delivered) return;
+    if (elsewhere(manifest, hostId)) await deleteManifestChunks(storage, sessionId, manifest);
+  }
+
+  /** Claims and drops for one session run one at a time, in order. */
+  async function serialized<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
     const previous = claimQueues.get(sessionId) ?? Promise.resolve();
-    const queued = previous.catch(() => undefined).then(() => takePending(sessionId));
+    const queued = previous.catch(() => undefined).then(work);
     claimQueues.set(sessionId, queued);
     try {
       return await queued;
@@ -185,7 +227,7 @@ export function createPendingLaunchStore(
   }
 
   return {
-    async persist(sessionId, command) {
+    async persist(sessionId, hostId, command) {
       const previous = await parseManifest(storage, sessionId);
       const createdAt = now();
       const generation = `${createdAt.toString(36)}-${command.length.toString(36)}`;
@@ -195,6 +237,7 @@ export function createPendingLaunchStore(
         sessionId,
         createdAt,
         expiresAt: createdAt + ttlMs,
+        hostId,
         generation,
         chunks: chunks.length,
         delivered: false,
@@ -219,10 +262,12 @@ export function createPendingLaunchStore(
           ),
         );
       }
-      return { sessionId, command, createdAt, expiresAt: manifest.expiresAt };
+      return { sessionId, hostId, command, createdAt, expiresAt: manifest.expiresAt };
     },
 
-    take: queueTake,
+    take: (sessionId, hostId) => serialized(sessionId, () => takePending(sessionId, hostId)),
+
+    observe: (sessionId, hostId) => serialized(sessionId, () => observePending(sessionId, hostId)),
 
     async complete(sessionId) {
       const manifest = await parseManifest(storage, sessionId);

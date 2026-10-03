@@ -16,11 +16,16 @@ export type PendingLaunchDeliveryResult =
   | { status: "sent" }
   | { status: "missing" }
   | { status: "stale" }
+  /** Queued for the window as it ran on another host, and dropped. */
+  | { status: "elsewhere" }
   | { status: "lost"; reason: "invalid_record" | "storage_error" }
   | { status: "abandoned"; reason: "session_dead" | "delivery_unconfirmed" };
 
 export interface PendingLaunchTransport {
   readonly sessionId: string;
+  /** The host this view is attached to the window on: the incarnation a
+   *  command must have been queued for to be typed here. */
+  readonly hostId: string;
   readonly state: TransportState;
   /**
    * Whether this view holds the session's display — the only view whose input
@@ -48,6 +53,7 @@ function resultForRead(
 ): PendingLaunchDeliveryResult {
   if (read.status === "missing") return { status: "missing" };
   if (read.status === "stale") return { status: "stale" };
+  if (read.status === "elsewhere") return { status: "elsewhere" };
   if (read.status === "already_delivered") {
     return { status: "abandoned", reason: "delivery_unconfirmed" };
   }
@@ -106,7 +112,7 @@ export function observePendingLaunchDelivery({
     operation = (async () => {
       let read: PendingLaunchRead;
       try {
-        read = await pending.take(transport.sessionId);
+        read = await pending.take(transport.sessionId, transport.hostId);
       } catch {
         finish({ status: "lost", reason: "storage_error" });
         return;
@@ -137,9 +143,21 @@ export function observePendingLaunchDelivery({
     })();
   };
 
+  // Attached: the window runs on this view's host, so a command queued for it
+  // as it ran elsewhere is dropped even while this view waits for the display
+  // — or never gets it, and a later move back to that host finds nothing of
+  // the old shell's to type into the new one. Queued in the store ahead of
+  // any claim, so the claim sees the drop.
+  const noteAttached = (): void => {
+    if (settled) return;
+    void pending.observe?.(transport.sessionId, transport.hostId).catch(() => undefined);
+  };
+
   const handleState = (state: TransportState): void => {
-    if (state === "ready") deliver();
-    else if (state === "closed" || state === "failed") checkSessionLife();
+    if (state === "ready") {
+      noteAttached();
+      deliver();
+    } else if (state === "closed" || state === "failed") checkSessionLife();
   };
 
   const unsubscribe = transport.on("state", handleState);

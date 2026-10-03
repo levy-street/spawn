@@ -33,7 +33,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
 import { restartSessionAgent } from "@/components/workspace/agent-restart";
 import { AgentSwitcher } from "@/components/workspace/agent-switcher";
-import { canTypePendingLaunch, pendingLaunch } from "@/components/workspace/pending-launch";
+import { usePendingLaunchDrain } from "@/hooks/usePendingLaunchDrain";
 import {
   ApiError,
   agents as agentsApi,
@@ -147,28 +147,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   // A command a restart queued for the fresh shell is typed the moment that
   // shell's transport opens — the same drain, behind the same gate, the
   // workspace pane runs, so a restart from this page lands the agent back too.
-  const launchTypeable = canTypePendingLaunch(session, { connInfo, displayState });
-  useEffect(() => {
-    if (!session || !launchTypeable || !pendingLaunch.has(sessionId)) return;
-    let cancelled = false;
-    let tries = 0;
-    const attempt = () => {
-      if (cancelled) return;
-      const handle = getHandle();
-      if (!handle) {
-        if (tries++ < 50) window.setTimeout(attempt, 100);
-        return;
-      }
-      const command = pendingLaunch.take(sessionId);
-      if (!command) return;
-      handle.sendInput(`${command}\r`);
-      requestAnimationFrame(() => handle.focus());
-    };
-    attempt();
-    return () => {
-      cancelled = true;
-    };
-  }, [launchTypeable, getHandle, session, sessionId]);
+  usePendingLaunchDrain({ sessionId, session, connInfo, displayState, getHandle });
   const removeFromWorkspaceM = useMutation({
     mutationFn: (workspace: Workspace) =>
       workspaces.update(workspace.id, {

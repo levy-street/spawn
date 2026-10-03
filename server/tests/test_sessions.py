@@ -773,6 +773,9 @@ async def test_session_move_refusals_leave_the_window_where_it_was(client):
         assert r.status_code == 404 and r.json()["detail"] == "host not found"
         r = await move(body(host_id="no-such-host"))
         assert r.status_code == 404 and r.json()["detail"] == "host not found"
+        # A type nothing can launch is refused rather than stored.
+        r = await move(body(agent_id="no-such-agent"))
+        assert r.status_code == 404 and r.json()["detail"] == "agent not found"
         # Same machine is a cd in the running shell, never a move.
         r = await move(body(host_id=dream))
         assert r.status_code == 400 and r.json()["detail"] == "same_host"
@@ -939,6 +942,63 @@ async def test_session_move_starts_a_new_conversation_or_none(client):
         )
         assert r.status_code == 200, r.text
         assert (r.json()["id"], r.json()["host_id"]) == (agent_window, dream)
+        assert r.json()["agent_session_id"] == "conv-home"
+    finally:
+        for daemon in daemons:
+            await broker.unregister_daemon(daemon)
+
+
+async def test_session_move_types_a_shell_whose_agent_was_started_by_hand(client):
+    """A shell window someone typed `claude` into names no agent; the mover
+    knows it from the foreground and starts that agent over there. The move
+    records it as the window's type, as a create would, so the conversation it
+    starts there is remembered and a restart can resume it."""
+    auth, dream, mac, _skill_id, claude, _agent_window = await _move_fixture(
+        client, "session-move-hand-typed@example.com"
+    )
+    r = await client.post("/api/sessions", json={"host_id": dream, "cwd": "/repo"}, headers=auth)
+    assert r.status_code == 201, r.text
+    shell_window = r.json()["id"]
+    assert r.json()["agent_id"] is None
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    daemons = [
+        DaemonConn(host_id=host, user_id="user", websocket=_FakeWS())  # type: ignore[arg-type]
+        for host in (dream, mac)
+    ]
+    for daemon in daemons:
+        await broker.register_daemon(daemon)
+    try:
+        r = await client.post(
+            f"/api/sessions/{shell_window}/move",
+            json={
+                "host_id": mac,
+                "cwd": "/work",
+                "expected_host_id": dream,
+                "agent_id": claude,
+                "agent_session_id": "conv-by-hand",
+            },
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_id"] == claude
+        assert r.json()["agent_session_id"] == "conv-by-hand"
+
+        # Saying nothing about the type leaves it as it is now.
+        r = await client.post(
+            f"/api/sessions/{shell_window}/move",
+            json={
+                "host_id": dream,
+                "cwd": "/repo",
+                "expected_host_id": mac,
+                "agent_session_id": "conv-home",
+            },
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_id"] == claude
         assert r.json()["agent_session_id"] == "conv-home"
     finally:
         for daemon in daemons:

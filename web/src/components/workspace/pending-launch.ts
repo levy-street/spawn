@@ -5,52 +5,85 @@
  * takes no argv (proto/README.md). The menu that creates the session is not
  * the component that owns its terminal, so the command waits here until the
  * pane connects and claims it.
+ *
+ * A command belongs to one incarnation of its window — one worker on one
+ * host, `${id}@${host}` — the shell it was queued for. It is typed into that
+ * incarnation or into nothing: once the window is seen running on another
+ * host the command is dropped, never typed into whatever runs there, and one
+ * nobody could type for {@link PENDING_LAUNCH_TTL_MS} lapses. A launch waits
+ * for its view to hold the display, which can take as long as someone takes
+ * to press Take control; typed that late, a resume would land in the middle
+ * of whatever had been started by hand in the meantime.
  */
-const queued = new Map<string, string>();
+
+/** How long a queued command waits to be typed: the phone's wait too
+ *  (mobile `PENDING_LAUNCH_TTL_MS`). */
+export const PENDING_LAUNCH_TTL_MS = 15 * 60 * 1_000;
+
+type QueuedLaunch = { hostId: string; command: string; expiresAt: number };
+
+const queued = new Map<string, QueuedLaunch>();
+
+/** The command waiting for the window as it runs on `hostId`, if one has not
+ *  lapsed. One that lapsed is forgotten on the way. */
+function waiting(sessionId: string, hostId: string, now: number): QueuedLaunch | null {
+  const launch = queued.get(sessionId);
+  if (!launch) return null;
+  if (launch.expiresAt <= now) {
+    queued.delete(sessionId);
+    return null;
+  }
+  return launch.hostId === hostId ? launch : null;
+}
 
 export const pendingLaunch = {
-  set(sessionId: string, command: string): void {
-    queued.set(sessionId, command);
+  /** Queue `command` for the window as it runs on `hostId` — the host the
+   *  caller just created, restarted or moved it on. */
+  set(sessionId: string, hostId: string, command: string, now: number = Date.now()): void {
+    queued.set(sessionId, { hostId, command, expiresAt: now + PENDING_LAUNCH_TTL_MS });
   },
-  /** Whether a command is waiting, without claiming it. A pane that has no
-   *  terminal handle yet asks this before taking, so a command is never
-   *  claimed by something that cannot type it. */
-  has(sessionId: string): boolean {
-    return queued.has(sessionId);
+  /** Whether a command is waiting for the window as it runs on `hostId`,
+   *  without claiming it. A pane that has no terminal handle yet asks this
+   *  before taking, so a command is never claimed by something that cannot
+   *  type it. */
+  has(sessionId: string, hostId: string, now: number = Date.now()): boolean {
+    return waiting(sessionId, hostId, now) !== null;
   },
   /** Forget a queued command — the launch it was queued for never happened. */
   clear(sessionId: string): void {
     queued.delete(sessionId);
   },
-  /** Returns the command once, then forgets it. */
-  take(sessionId: string): string | null {
-    const command = queued.get(sessionId) ?? null;
+  /** Returns the command queued for the window as it runs on `hostId` once,
+   *  then forgets it. */
+  take(sessionId: string, hostId: string, now: number = Date.now()): string | null {
+    const launch = waiting(sessionId, hostId, now);
+    if (!launch) return null;
     queued.delete(sessionId);
-    return command;
+    return launch.command;
+  },
+  /**
+   * The window has been seen running on `hostId`: a command queued for it as
+   * it ran anywhere else belongs to an incarnation that is gone, and is
+   * dropped. Called only on evidence the caller trusts — a terminal attached
+   * there, or a terminal that followed the window there — never on a list
+   * response, which can have left the server before the move it predates.
+   */
+  observe(sessionId: string, hostId: string): void {
+    const launch = queued.get(sessionId);
+    if (launch && launch.hostId !== hostId) queued.delete(sessionId);
   },
 };
 
 /**
- * Whether a view can type a queued command into the window as it runs now.
- *
- * Three things, all reported by the live terminal: its transport is open; it
- * is open to the host the window runs on now — a window that has just moved
- * still has its old host's transport winding down, and a command typed there
- * lands in a shell that is being killed; and this view holds the display,
- * the only view whose input the host accepts. Typed any earlier, the command
- * is taken and silently dropped; waiting costs nothing.
+ * The host a view's live terminal is attached to, when that is where the
+ * window runs now: its transport is open, to the host the window's row names.
+ * Anything else — a transport still opening, or one that still belongs to the
+ * host a window has just left, whose shell is being killed — is null.
  */
-export function canTypePendingLaunch(
+export function attachedLaunchHost(
   session: { host_id: string } | undefined,
-  live: {
-    connInfo: { socketState: string; hostId?: string | null } | null;
-    displayState: { owner: boolean } | null;
-  },
-): boolean {
-  return (
-    session !== undefined &&
-    live.connInfo?.socketState === "open" &&
-    live.connInfo.hostId === session.host_id &&
-    live.displayState?.owner === true
-  );
+  connInfo: { socketState: string; hostId?: string | null } | null,
+): string | null {
+  if (session === undefined || connInfo?.socketState !== "open") return null;
+  return connInfo.hostId === session.host_id ? session.host_id : null;
 }

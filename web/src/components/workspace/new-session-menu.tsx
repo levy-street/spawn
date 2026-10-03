@@ -198,7 +198,11 @@ function useNewSessionChoices(
           tile,
         });
         if (choice.kind === "agent")
-          pendingLaunch.set(session.id, agentLaunchCommand(choice.agent, conversation));
+          pendingLaunch.set(
+            session.id,
+            session.host_id,
+            agentLaunchCommand(choice.agent, conversation),
+          );
         return { workspaceId, sessionId: session.id };
       }
       const result = await workspaces.create({
@@ -213,7 +217,11 @@ function useNewSessionChoices(
       });
       if (!result.session) throw new Error("The workspace was created without its first session.");
       if (choice.kind === "agent")
-        pendingLaunch.set(result.session.id, agentLaunchCommand(choice.agent, conversation));
+        pendingLaunch.set(
+          result.session.id,
+          result.session.host_id,
+          agentLaunchCommand(choice.agent, conversation),
+        );
       return { workspaceId: result.workspace.id, sessionId: result.session.id };
     },
     onSuccess: (result) => {

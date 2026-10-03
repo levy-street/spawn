@@ -36,6 +36,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { SessionStatusDot } from "@/components/ui/status";
+import { usePendingLaunchDrain } from "@/hooks/usePendingLaunchDrain";
 import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@/lib/api";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
@@ -44,7 +45,6 @@ import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher } from "./agent-switcher";
-import { canTypePendingLaunch, pendingLaunch } from "./pending-launch";
 import { WhereChip } from "./where-chip";
 
 /** Trailing shortcut hint in a menu row — the gesture that does the same thing. */
@@ -59,10 +59,6 @@ function MenuHint({ children }: { children: ReactNode }) {
 import { runInShell, stillRunningMessage } from "./shell-handoff";
 
 export type PaneSlotTarget = { el: HTMLElement; stacked: boolean };
-
-/** How long a queued launch waits for the pane's terminal handle: 100 ms
- *  polls, so about five seconds — far longer than a handle ever lags. */
-const PENDING_LAUNCH_HANDLE_TRIES = 50;
 
 function writeSessionToCache(
   queryClient: ReturnType<typeof useQueryClient>,
@@ -159,38 +155,10 @@ export function SessionPane({
     [sessionId],
   );
 
-  // An agent picked from the "+" menu — or queued by a restart or a move for
-  // the shell that replaces this one — starts by being typed into the shell,
-  // once its transport can actually carry the keystrokes. Every time the
-  // transport opens, not once per pane: a restart closes and reopens it, a
-  // move opens it on another host, and the command belongs to the shell on
-  // the far side of that reopen — so it also waits for the transport to be
-  // the window's current host's and for this view to hold the display
-  // (`canTypePendingLaunch`). The handle can lag the transport by a render or
-  // two, so the command is only claimed once something can type it; a claim
-  // that could not be typed is a launch silently lost.
-  const launchTypeable = canTypePendingLaunch(session, { connInfo, displayState });
-  useEffect(() => {
-    if (!session || !launchTypeable || !pendingLaunch.has(sessionId)) return;
-    let cancelled = false;
-    let tries = 0;
-    const attempt = () => {
-      if (cancelled) return;
-      const handle = getHandle();
-      if (!handle) {
-        if (tries++ < PENDING_LAUNCH_HANDLE_TRIES) window.setTimeout(attempt, 100);
-        return;
-      }
-      const command = pendingLaunch.take(sessionId);
-      if (!command) return;
-      handle.sendInput(`${command}\r`);
-      requestAnimationFrame(() => handle.focus());
-    };
-    attempt();
-    return () => {
-      cancelled = true;
-    };
-  }, [launchTypeable, getHandle, session, sessionId]);
+  // An agent picked from the "+" menu, or queued by a restart or a move for
+  // the shell that replaces this one, is typed into the shell once this pane
+  // holds the window as it runs now (`usePendingLaunchDrain`).
+  usePendingLaunchDrain({ sessionId, session, connInfo, displayState, getHandle });
 
   const renameM = useMutation({
     mutationFn: (name: string | null) => sessions.update(sessionId, { name }),

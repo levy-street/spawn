@@ -1331,7 +1331,9 @@ export const sessions = {
    * agent, skills — stays, and a fresh login shell replaces the old one.
    * `expected_host_id` is where this client saw the window; a window moved
    * meanwhile from somewhere else is refused (`move_conflict`) rather than
-   * moved twice. `agent_session_id` names the new conversation, or none.
+   * moved twice. `agent_id` is the agent this client starts there, which
+   * types a window nothing recorded as one; `agent_session_id` names the new
+   * conversation, or none.
    */
   move: (
     id: string,
@@ -1339,6 +1341,7 @@ export const sessions = {
       host_id: string;
       cwd: string;
       expected_host_id: string;
+      agent_id?: string | null;
       agent_session_id?: string | null;
     },
   ) =>

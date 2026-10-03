@@ -15,6 +15,7 @@ import { createPortal } from "react-dom";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { incarnationKey, openIntent } from "@/components/terminal/incarnation";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
+import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { AgentNotice } from "@/lib/agent-notice";
 import { type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
@@ -292,14 +293,20 @@ function PooledTerminal({
       generation: incarnation.hostId === null ? incarnation.generation : incarnation.generation + 1,
     });
   }
-  // Only an incarnation the window moved to has a key that changes anything;
-  // the first one's changes only as its host is learned.
-  const movedTo = incarnation.generation > 0 ? incarnationKey(sessionId, incarnation.hostId) : null;
+  // Only an incarnation the window moved to changes anything; the first one's
+  // host changes only as it is learned.
+  const movedTo = incarnation.generation > 0 ? incarnation.hostId : null;
   // The first incarnation is however this terminal was opened. A later one is
   // a reconnect on every device but the one that moved the window there.
-  const claimDisplayOnOpen = movedTo === null || openIntent.has(movedTo);
+  const claimDisplayOnOpen = movedTo === null || openIntent.has(incarnationKey(sessionId, movedTo));
   useEffect(() => {
-    if (movedTo !== null) openIntent.clear(movedTo);
+    if (movedTo !== null) {
+      openIntent.clear(incarnationKey(sessionId, movedTo));
+      // A launch queued for the window as it ran on another host belongs to
+      // an incarnation that has gone. Dropped here, where the warm terminal
+      // follows the window even with no pane on screen to type it.
+      pendingLaunch.observe(sessionId, movedTo);
+    }
     // Cleanups run before the next incarnation's terminal reports, so this
     // clears the old one's facts without touching the new one's.
     return () => onIncarnationEnd(sessionId);

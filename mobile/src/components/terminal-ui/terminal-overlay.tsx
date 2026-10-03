@@ -105,7 +105,11 @@ function safeTerminalLink(url: string): boolean {
 }
 
 function pendingLaunchNotice(result: PendingLaunchDeliveryResult): string | null {
-  if (result.status === "sent" || result.status === "missing") return null;
+  // Dropped because the window has moved on since: whoever moved it started
+  // what runs there now, and there is nothing to tell.
+  if (result.status === "sent" || result.status === "missing" || result.status === "elsewhere") {
+    return null;
+  }
   if (result.status === "stale") {
     return "The saved agent launch expired. This session was left as a shell.";
   }
