@@ -44,7 +44,7 @@ import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
 import { sessionAtShell, sessionOwnName, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
-import { ConversationElsewhereError, restartSessionAgent } from "./agent-restart";
+import { restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher } from "./agent-switcher";
 import { pendingLaunch } from "./pending-launch";
 import { WhereChip } from "./where-chip";
@@ -231,8 +231,7 @@ export function SessionPane({
       onError(null);
       requestAnimationFrame(() => getHandle()?.focus());
     },
-    onError: (error) =>
-      onError(error instanceof ConversationElsewhereError ? error.message : String(error)),
+    onError: (error) => onError(String(error)),
   });
   const closeM = useMutation({
     mutationFn: () => sessions.remove(sessionId),

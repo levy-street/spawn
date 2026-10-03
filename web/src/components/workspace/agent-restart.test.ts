@@ -1,7 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
-  ConversationElsewhereError,
-  conversationElsewhereMessage,
   planAgentRestart,
   restartConversation,
   restartSessionAgent,
@@ -21,6 +19,14 @@ const claude: Agent = {
   yolo_args: "--dangerously-skip-permissions",
   yolo_env: {},
   yolo: false,
+};
+const codex: Agent = {
+  ...claude,
+  id: "55555555-5555-4555-8555-555555555555",
+  name: "Codex",
+  kind: "codex",
+  command: "codex",
+  yolo_args: null,
 };
 const hermes: Agent = {
   ...claude,
@@ -149,6 +155,19 @@ function live(overrides: Partial<ConversationInspection> = {}): ConversationInsp
   };
 }
 
+/** A Codex window. Codex names its own conversations; this one's record holds
+ *  an id the host once named, since left for another (`/new`). */
+const staleCodex = "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09";
+const liveCodex = "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a0a";
+function codexSession(overrides: Partial<Session> = {}): Session {
+  return session({
+    agent_id: codex.id,
+    foreground_command: "codex",
+    agent_session_id: staleCodex,
+    ...overrides,
+  });
+}
+
 describe("restartConversation", () => {
   test("the host's answer wins over the recorded id", () => {
     expect(restartConversation(claude, session(), live())).toBe(moved);
@@ -158,19 +177,76 @@ describe("restartConversation", () => {
     expect(restartConversation(claude, session(), null)).toBe(recorded);
     expect(restartConversation(claude, session(), live({ agent: "codex" }))).toBe(recorded);
     expect(restartConversation(claude, session(), live({ agent: null }))).toBe(recorded);
-    expect(restartConversation(claude, session(), live({ conversation_id: null }))).toBe(recorded);
   });
 
-  test("a conversation held outside the window is refused, naming its host", () => {
-    expect(() =>
-      restartConversation(claude, session(), live({ live_elsewhere: true, conversation_id: null })),
-    ).toThrow("This conversation is running in the background on box. Stop it there first.");
-    expect(() =>
-      restartConversation(claude, session({ host_name: null }), live({ live_elsewhere: true })),
-    ).toThrow(ConversationElsewhereError);
-    expect(conversationElsewhereMessage("dream")).toBe(
-      "This conversation is running in the background on dream. Stop it there first.",
+  test("a host that answers for the agent and names no conversation is not second-guessed", () => {
+    // A parked window whose background job has gone, an attach client: the
+    // recorded id is the thread the window left.
+    for (const source of ["parked", "attach", "process"]) {
+      expect(restartConversation(claude, session(), live({ conversation_id: null, source }))).toBe(
+        null,
+      );
+    }
+  });
+
+  test("a conversation also held outside the window is still resumed", () => {
+    expect(
+      restartConversation(claude, session(), live({ live_elsewhere: true, source: "parked" })),
+    ).toBe(moved);
+  });
+
+  test("a Codex window never resumes a recorded id, only one the host names", () => {
+    expect(restartConversation(codex, codexSession(), null)).toBeNull();
+    expect(restartConversation(codex, codexSession(), live({ agent: "claude-code" }))).toBeNull();
+    expect(
+      restartConversation(
+        codex,
+        codexSession(),
+        live({ agent: "codex", conversation_id: null, source: "process" }),
+      ),
+    ).toBeNull();
+    expect(
+      restartConversation(
+        codex,
+        codexSession(),
+        live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+      ),
+    ).toBe(liveCodex);
+  });
+});
+
+describe("planAgentRestart with the host's answer", () => {
+  test("Codex reopens the latest conversation here unless the host names one", () => {
+    const command = (plan: ReturnType<typeof planAgentRestart>) =>
+      plan.kind === "agent" ? plan.command : null;
+    expect(command(planAgentRestart(codexSession(), [codex]))).toBe("codex resume --last");
+    expect(
+      command(
+        planAgentRestart(
+          codexSession(),
+          [codex],
+          live({ agent: "codex", conversation_id: null, source: "process" }),
+        ),
+      ),
+    ).toBe("codex resume --last");
+    expect(
+      command(
+        planAgentRestart(
+          codexSession(),
+          [codex],
+          live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+        ),
+      ),
+    ).toBe(`codex resume ${liveCodex}`);
+  });
+
+  test("Claude Code continues the latest conversation when the host names none", () => {
+    const plan = planAgentRestart(
+      session(),
+      [claude],
+      live({ conversation_id: null, live_elsewhere: true, source: "attach" }),
     );
+    expect(plan.kind === "agent" ? plan.command : null).toBe("claude --continue");
   });
 });
 
@@ -234,18 +310,68 @@ describe("restartSessionAgent with the host's answer", () => {
     expect(pendingLaunch.take(session().id)).toBe(`claude --resume ${moved}`);
   });
 
-  test("refuses before restarting anything while the conversation is held elsewhere", async () => {
+  test("restarts into a conversation held outside the window, and writes it back", async () => {
+    // A window parked in agent view: its background job holds the fork, and
+    // resuming that id attaches to it.
     const restart = mock(async () => session({ status: "starting" }));
-    await expect(
-      restartSessionAgent({
-        session: session(),
-        agents: [claude],
-        restart,
-        inspect: async () => live({ live_elsewhere: true, source: "parked" }),
-      }),
-    ).rejects.toBeInstanceOf(ConversationElsewhereError);
-    expect(restart).not.toHaveBeenCalled();
-    expect(pendingLaunch.has(session().id)).toBe(false);
+    const recordConversation = mock(async () => undefined);
+    const result = await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart,
+      inspect: async () => live({ live_elsewhere: true, source: "parked" }),
+      recordConversation,
+    });
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(recordConversation).toHaveBeenCalledWith(moved);
+    expect(result.plan.kind === "agent" ? result.plan.command : null).toBe(
+      `claude --resume ${moved}`,
+    );
+    expect(pendingLaunch.take(session().id)).toBe(`claude --resume ${moved}`);
+  });
+
+  test("a host that names no conversation writes nothing back", async () => {
+    const recordConversation = mock(async () => undefined);
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      inspect: async () => live({ conversation_id: null, source: "parked" }),
+      recordConversation,
+    });
+    expect(recordConversation).not.toHaveBeenCalled();
+    expect(pendingLaunch.take(session().id)).toBe("claude --continue");
+  });
+
+  test("a Codex window resumes the id the host names and leaves its record alone", async () => {
+    const recordConversation = mock(async () => undefined);
+    await restartSessionAgent({
+      session: codexSession({ agent_session_id: null }),
+      agents: [codex],
+      restart: async () => codexSession({ status: "starting" }),
+      inspect: async () =>
+        live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+      recordConversation,
+    });
+    expect(recordConversation).not.toHaveBeenCalled();
+    expect(pendingLaunch.take(session().id)).toBe(`codex resume ${liveCodex}`);
+
+    // After `/new` the host sees two conversations open and names neither;
+    // a recorded id is not the way back in.
+    for (const inspect of [
+      async () => live({ agent: "codex", conversation_id: null, source: "process" }),
+      async () => null,
+    ]) {
+      await restartSessionAgent({
+        session: codexSession(),
+        agents: [codex],
+        restart: async () => codexSession({ status: "starting" }),
+        inspect,
+        recordConversation,
+      });
+      expect(pendingLaunch.take(session().id)).toBe("codex resume --last");
+    }
+    expect(recordConversation).not.toHaveBeenCalled();
   });
 
   test("a shell window never asks the host", async () => {

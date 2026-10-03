@@ -15,8 +15,9 @@ export interface RestartConversationHooks {
 /**
  * What a restart asks the window's host and how it writes the answer back:
  * the two hooks `restartSessionAgent` takes. The question goes over this
- * device's own connection to the host (`conv.inspect`); only a changed id is
- * written to the server, as the window's `agent_session_id`.
+ * device's own connection to the host (`conv.inspect`); only a changed Claude
+ * Code id the host named is written to the server, as the window's
+ * `agent_session_id` (`restartSessionAgent` decides).
  */
 export function restartConversationHooks(
   client: QueryClient,

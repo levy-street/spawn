@@ -8,8 +8,10 @@ import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
  * another conversation, `/resume` adopts one, agent view forks the window's
  * conversation into a background job. The daemon answers `conv.inspect` from
  * the window's own processes and the agent's live-session registry, over the
- * device's host channel; nothing about it crosses the server. The same wire
- * shape the web app reads.
+ * device's host channel; the server never sees the question or the answer.
+ * The one thing that reaches it is a Claude Code conversation id the host
+ * named, which a restart writes back to the window's `agent_session_id`. The
+ * same wire shape the web app reads.
  */
 
 /** The `conv.*` family, one versioned capability for every operation in it. */
@@ -26,7 +28,8 @@ export interface ConversationInspection {
   readonly state: ConversationState;
   readonly cli_version: string | null;
   /** Another process outside this window holds the conversation: a
-   *  background session, an attach target, another window. */
+   *  background session, an attach target, another window. Restart resumes
+   *  it all the same: resuming a running background session attaches to it. */
   readonly live_elsewhere: boolean;
   /** What the daemon read: `registry`, `parked`, `attach`, `open_file`,
    *  `process`, `none`. A hint for diagnostics, never for gating. */

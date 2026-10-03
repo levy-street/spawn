@@ -32,10 +32,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
-import {
-  ConversationElsewhereError,
-  restartSessionAgent,
-} from "@/components/workspace/agent-restart";
+import { restartSessionAgent } from "@/components/workspace/agent-restart";
 import { AgentSwitcher } from "@/components/workspace/agent-switcher";
 import { pendingLaunch } from "@/components/workspace/pending-launch";
 import {
@@ -153,8 +150,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       setErrorMessage(null);
       requestAnimationFrame(() => getHandle()?.focus());
     },
-    onError: (error) =>
-      setErrorMessage(error instanceof ConversationElsewhereError ? error.message : String(error)),
+    onError: (error) => setErrorMessage(String(error)),
   });
 
   // A command a restart queued for the fresh shell is typed the moment that
