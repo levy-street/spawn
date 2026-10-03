@@ -593,6 +593,7 @@ class WebViewHostTransport implements StreamingHostTransport {
    * before its hello, while the host connection is fine, was refused for the
    * tool limit; twice in a row, the tool fails with that reason rather than
    * retrying until its reconnect budget runs out and blaming the connection.
+   * Any other loss breaks the row.
    */
   #consumerChannelLost(): void {
     if (this.#state === "closed" || this.#state === "failed") return;
@@ -600,7 +601,8 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#consumerRefused = false;
     this.#rotating = false;
     this.#clearRotationTimer();
-    if (refused) {
+    if (!refused) this.#consumerRefusals = 0;
+    else {
       this.#consumerRefusals += 1;
       if (this.#consumerRefusals >= HOST_CONSUMER_REFUSALS_BEFORE_FAILURE) {
         this.#fail(HOST_CONSUMER_LIMIT_CODE, HOST_CONSUMER_LIMIT_MESSAGE);
@@ -1466,6 +1468,8 @@ class WebViewHostTransport implements StreamingHostTransport {
       () => {
         this.#connectTimer = null;
         if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
+        // An attempt that timed out was not refused; it breaks a row of refusals.
+        this.#consumerRefusals = 0;
         if (this.#hasEverReady && this.#remainingConnectTime() > 0) {
           this.#scheduleReconnect();
           return;

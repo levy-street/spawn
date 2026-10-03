@@ -743,6 +743,55 @@ test("a tool channel that dies before it opens is an ordinary reconnect, never t
   }
 });
 
+test("refusals count only in a row: a channel lost for another reason breaks the row", async () => {
+  jest.useFakeTimers();
+  const h = harness();
+  const consumer = h.create();
+  try {
+    void consumer.open().catch(() => undefined);
+    h.channel(0).refuse();
+    await jest.advanceTimersByTimeAsync(1_000);
+    // Lost before it opened: not the tool limit, and not part of the row.
+    h.channel(1).close();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.channels).toHaveLength(3);
+    h.channel(2).refuse();
+    expect(consumer.state).toBe("reconnecting");
+    expect(consumer.lastError?.code).not.toBe(HOST_CONSUMER_LIMIT_CODE);
+    await jest.advanceTimersByTimeAsync(5_000);
+    h.channels.at(-1)?.open();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(consumer.state).toBe("ready");
+  } finally {
+    consumer.close();
+  }
+});
+
+test("a tool channel that times out unopened breaks a row of refusals too", async () => {
+  jest.useFakeTimers();
+  const h = harness();
+  const consumer = h.create();
+  try {
+    const opening = consumer.open();
+    h.channel(0).open();
+    await opening;
+    h.channel(0).close();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.channels).toHaveLength(2);
+    h.channel(1).refuse();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.channels).toHaveLength(3);
+    // Never opened: the tool's own deadline ends the attempt, not a refusal.
+    await jest.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 5_000);
+    expect(h.channels).toHaveLength(4);
+    h.channel(3).refuse();
+    expect(consumer.state).toBe("reconnecting");
+    expect(consumer.lastError?.code).not.toBe(HOST_CONSUMER_LIMIT_CODE);
+  } finally {
+    consumer.close();
+  }
+});
+
 test("the worker's own tool limit gives the same reason", async () => {
   const h = harness();
   const consumers = Array.from({ length: 33 }, () => h.create());

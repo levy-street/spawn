@@ -554,6 +554,8 @@ export class HostControlClient {
       // A refused consumer keeps saying why while it tries again.
       if (this.consumerRefusals < CONSUMER_REFUSALS_BEFORE_ERROR) this.setState("connecting");
     } catch {
+      // Not a refusal: whatever is wrong, it is no longer the view limit.
+      this.clearConsumerRefusal();
       this.setState("error");
       this.scheduleReconnect();
     }
@@ -592,7 +594,9 @@ export class HostControlClient {
    * This consumer's channel ended. One the daemon opened and closed before its
    * hello, while the connection itself is fine, was refused; refused twice in
    * a row, the consumer says why and retries on a slow backoff instead of
-   * reopening every half second for as long as the view is open.
+   * reopening every half second for as long as the view is open. Any other
+   * ending breaks the row: the consumer stops blaming the limit and tries
+   * again as it would after any lost channel.
    */
   private consumerChannelLost(id: string, opened: boolean): void {
     if (this.sessionId !== id) return;
@@ -603,6 +607,8 @@ export class HostControlClient {
       !this.helloReceived &&
       this.options.sharedConnection?.getSnapshot().state === "ready";
     if (!refused) {
+      if (this.consumerRefusals >= CONSUMER_REFUSALS_BEFORE_ERROR) this.setState("connecting");
+      this.clearConsumerRefusal();
       this.failRtc(id);
       return;
     }

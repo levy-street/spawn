@@ -2561,6 +2561,65 @@ describe("HostControlClient refused consumer channel", () => {
     client.close();
   });
 
+  /** A consumer refused twice in a row, saying so, with its slow retry due. */
+  async function refusedConsumer(options = {}) {
+    const connection = new FakeSharedConnection();
+    const client = new HostControlClient(hostId, {
+      sharedConnection: connection,
+      reconnectBaseDelayMs: 5,
+      reconnectRandom: () => 0,
+      ...options,
+    });
+    client.connect();
+    connection.latest().refuse();
+    await waitFor(() => connection.channels.length === 2);
+    connection.latest().refuse();
+    expect(client.getConnectionError()).toBe(CONSUMER_REFUSED_MESSAGE);
+    return { client, connection };
+  }
+
+  test("an attempt that fails for another reason stops blaming the view limit", async () => {
+    const { client, connection } = await refusedConsumer({ connectTimeoutMs: 30 });
+    // The slow retry opens a channel that the owner tab never opens: its hello
+    // deadline ends it, which is not a refusal.
+    await waitFor(() => connection.channels.length === 3);
+    const unopened = connection.latest();
+    await waitFor(() => unopened.closed, 1_000);
+    expect(unopened.closed).toBe(true);
+    expect(client.getConnectionError()).toBeNull();
+    expect(client.getState()).toBe("connecting");
+
+    // Refusals count only in a row: the next one is retried quietly again.
+    await waitFor(() => connection.channels.length === 4);
+    connection.latest().refuse();
+    expect(client.getConnectionError()).toBeNull();
+    expect(client.getState()).toBe("connecting");
+    await waitFor(() => connection.channels.length === 5);
+    connection.latest().open();
+    connection.latest().hello();
+    expect(client.getState()).toBe("ready");
+    client.close();
+  });
+
+  test("a channel that cannot be created is not reported as the view limit", async () => {
+    const { client, connection } = await refusedConsumer();
+    const createChannel = connection.createChannel.bind(connection);
+    let failures = 1;
+    connection.createChannel = (label: string) => {
+      if (failures > 0) {
+        failures -= 1;
+        throw new Error("Too many data channels");
+      }
+      return createChannel(label);
+    };
+    await waitFor(() => failures === 0);
+    expect(failures).toBe(0);
+    expect(client.getConnectionError()).toBeNull();
+    await waitFor(() => connection.channels.length === 3);
+    expect(client.getState()).toBe("connecting");
+    client.close();
+  });
+
   test("losing the shared connection clears a refusal: a new peer is a new budget", async () => {
     const connection = new FakeSharedConnection();
     const client = new HostControlClient(hostId, {
