@@ -107,7 +107,10 @@ foreground or bringing one back to it, once the view is visible — so the view
 a person is looking at is the one that controls the terminal. The view that
 held it keeps its output and offers **Take control** to take it back.
 Reconnecting is not opening: a recovered view never takes the lease on its
-own, so two open devices do not trade it back and forth.
+own, so two open devices do not trade it back and forth. An opening's claim
+that never got through — the view failed before it was ready — stays owed
+across reconnects. The phone's Retry is a reconnect: it carries such a claim
+and makes no new one.
 Focusing another view within the owning device transfers its active view and
 geometry. The UI waits for daemon confirmation before enabling input.
 

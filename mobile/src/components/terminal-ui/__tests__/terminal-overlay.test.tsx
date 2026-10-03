@@ -40,6 +40,7 @@ jest.mock("expo-linking", () => ({
 
 interface MockHeaderProps {
   onKill?: () => void;
+  onRestart?: () => void;
 }
 
 let mockHeaderProps: MockHeaderProps = {};
@@ -97,8 +98,12 @@ jest.mock("@/components/terminal-ui/selection-toolbar", () => ({ SelectionToolba
 jest.mock("@/components/terminal-ui/upload-progress-bar", () => ({
   UploadProgressBar: () => null,
 }));
+let mockConnectionProps: { onRetry?: () => void } = {};
 jest.mock("@/components/terminal-ui/connection-status", () => ({
-  ConnectionStateOverlay: () => null,
+  ConnectionStateOverlay: (props: { onRetry: () => void }) => {
+    mockConnectionProps = props;
+    return null;
+  },
 }));
 let mockApprovalOverlayProps: { hostId?: string; visible?: boolean; onDismiss?: () => void } = {};
 jest.mock("@/components/trust/device-approval-overlay", () => {
@@ -163,6 +168,7 @@ interface MockSurfaceProps {
   onLink?: (url: string) => void;
   onDisplayChange?: (display: DisplayControlState) => void;
   onTransport?: (transport: unknown) => void;
+  onStateChange?: (state: "connecting" | "ready" | "failed") => void;
   onError?: (error: { code: string; message: string; retryable: boolean }) => void;
 }
 
@@ -333,6 +339,98 @@ describe("a window that moves to another host while its terminal is open", () =>
     expect(mockSurfaceMounts).toBe(2);
     expect(mockTerminalSurfaceProps.hostId).toBe(elsewhere.id);
     expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
+  });
+});
+
+describe("Retry and the display", () => {
+  // One rule on both clients: an opening owes one claim, paid on the first
+  // ready; a reconnect — Retry among them — carries a claim still owed and
+  // never makes a new one. The browser's terminal keeps its owed claim across
+  // reconnects the same way.
+  const elsewhere: HostOut = {
+    ...host,
+    id: "00000000-0000-4000-8000-000000000009",
+    name: "dream",
+    host_public_key: "dream-public-key",
+  };
+  const overlay = (current: HostOut) => (
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 390, height: 844 },
+        insets: { top: 47, left: 0, right: 0, bottom: 34 },
+      }}
+    >
+      <ThemeProvider>
+        <TerminalOverlay
+          focused
+          host={current}
+          onDismiss={jest.fn()}
+          onKill={jest.fn(async () => undefined)}
+          onRename={jest.fn(async () => undefined)}
+          onRestart={jest.fn(async () => ({
+            kind: "restarted" as const,
+            plan: { kind: "shell" as const },
+          }))}
+          session={{ ...session, host_id: current.id, host_name: current.name }}
+        />
+      </ThemeProvider>
+    </SafeAreaProvider>
+  );
+  const surfaceSays = (state: "connecting" | "ready" | "failed") =>
+    act(() => mockTerminalSurfaceProps.onStateChange?.(state));
+  const pressRetry = () => act(() => mockConnectionProps.onRetry?.());
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockTerminalSurfaceProps = {};
+    mockConnectionProps = {};
+    mockSurfaceMounts = 0;
+  });
+
+  test("a Retry after this screen had the display reconnects without taking it back", async () => {
+    await render(overlay(host));
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(true);
+    await surfaceSays("ready");
+    await surfaceSays("failed");
+
+    await pressRetry();
+    expect(mockSurfaceMounts).toBe(2);
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
+  });
+
+  test("a Retry of an opening that never connected still takes the display", async () => {
+    await render(overlay(host));
+    await surfaceSays("failed");
+
+    await pressRetry();
+    expect(mockSurfaceMounts).toBe(2);
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(true);
+  });
+
+  test("a Retry after following a move never takes it, connected or not", async () => {
+    const view = await render(overlay(host));
+    await surfaceSays("ready");
+    await view.rerender(overlay(elsewhere));
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
+    await surfaceSays("failed");
+    await pressRetry();
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
+    await surfaceSays("ready");
+    await surfaceSays("failed");
+    await pressRetry();
+    expect(mockSurfaceMounts).toBe(4);
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
+  });
+
+  test("a restart from here is an opening again, wherever the window runs", async () => {
+    const view = await render(overlay(host));
+    await surfaceSays("ready");
+    await view.rerender(overlay(elsewhere));
+    await surfaceSays("ready");
+
+    await act(async () => mockHeaderProps.onRestart?.());
+    expect(mockTerminalSurfaceProps.hostId).toBe(elsewhere.id);
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(true);
   });
 });
 

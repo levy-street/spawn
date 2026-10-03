@@ -216,13 +216,22 @@ export function TerminalOverlay({
   const [restarting, setRestarting] = useState(false);
   // The window's current run — one worker on one host. A window moved to
   // another host keeps its id, and this screen follows it there with a fresh
-  // surface on that host's connection rather than re-pointing the old one. The
-  // first incarnation is however this screen was opened; one the window moved
-  // to while it was open is a reconnect, and does not take the display. What
-  // the old worker said about its display and its agent goes with it.
-  const [incarnation, setIncarnation] = useState({ hostId: host.id, opening: true });
+  // surface on that host's connection rather than re-pointing the old one.
+  // What the old worker said about its display and its agent goes with it.
+  //
+  // `claimOwed` is whether this screen still owes the run the claim an
+  // opening makes. The first run is however this screen was opened, and owes
+  // it until a surface reaches ready, where the surface takes the display. A
+  // Retry carries an unpaid claim to its fresh surface and never makes a new
+  // one: reconnecting is not opening, so a Retry after this screen had the
+  // display does not take it back from a device that took it since (the
+  // phone's lease, if no one did, still makes its new view the owner). A run
+  // the window moved to while this screen was open is a reconnect and owes
+  // nothing; a restart from here is an opening again (`reopen`). The browser
+  // keeps the same rule: its terminal's owed claim outlives reconnects.
+  const [incarnation, setIncarnation] = useState({ hostId: host.id, claimOwed: true });
   if (incarnation.hostId !== host.id) {
-    setIncarnation({ hostId: host.id, opening: false });
+    setIncarnation({ hostId: host.id, claimOwed: false });
     setDisplay(null);
     setAgentNotice(null);
   }
@@ -312,6 +321,8 @@ export function TerminalOverlay({
     previousConnectionState.current = next;
     setConnectionState(next);
     if (next === "ready") {
+      // The surface took the display on this ready if the claim was owed.
+      setIncarnation((current) => (current.claimOwed ? { ...current, claimOwed: false } : current));
       setHasEverBeenReady(true);
       setConnectionError(null);
       if (previous !== "ready") haptics.success();
@@ -341,7 +352,7 @@ export function TerminalOverlay({
   /** A retry this screen asked for itself — a restart — is an opening: its
    *  fresh surface takes the display, whichever host the window is on. */
   const reopen = useCallback((): void => {
-    setIncarnation((current) => (current.opening ? current : { ...current, opening: true }));
+    setIncarnation((current) => (current.claimOwed ? current : { ...current, claimOwed: true }));
     retry();
   }, [retry]);
 
@@ -543,7 +554,7 @@ export function TerminalOverlay({
           // handles and Copy/Look Up menu; a recogniser out here swallowed it.
           <View style={styles.surface}>
             <TerminalSurface
-              claimDisplay={incarnation.opening}
+              claimDisplay={incarnation.claimOwed}
               fontSize={fontSize}
               hostId={incarnation.hostId}
               hostIdentityPublicKey={hostKey}
