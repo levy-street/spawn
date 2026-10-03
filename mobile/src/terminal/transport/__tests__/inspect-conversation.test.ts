@@ -57,18 +57,27 @@ beforeEach(() => {
 
 describe("askWindowHost", () => {
   test("asks on a consumer channel of the retained connection, never taking its seat", async () => {
-    const asked = askWindowHost(host, sessionId);
-    await expect(asked.inspect()).resolves.toEqual(answer);
-    expect(mockRetain).toHaveBeenCalledWith(host, false);
-    expect(mockCreateConsumer).toHaveBeenCalledWith(
-      { ...host, bridge: mockLease.shared.bridge },
-      mockLease.shared.transport,
-    );
-    expect(mockConsumer.inspectConversation).toHaveBeenCalledWith(sessionId, { timeoutMs: 4_000 });
-    expect(mockConsumer.close).not.toHaveBeenCalled();
-    asked.doneAsking();
-    expect(mockConsumer.close).toHaveBeenCalledTimes(1);
-    expect(mockLease.release).toHaveBeenCalledTimes(1);
+    // A frozen clock: the budget is measured from Date.now(), and a loaded
+    // machine let 2 ms slip between opening the budget and asking.
+    jest.useFakeTimers();
+    try {
+      const asked = askWindowHost(host, sessionId);
+      await expect(asked.inspect()).resolves.toEqual(answer);
+      expect(mockRetain).toHaveBeenCalledWith(host, false);
+      expect(mockCreateConsumer).toHaveBeenCalledWith(
+        { ...host, bridge: mockLease.shared.bridge },
+        mockLease.shared.transport,
+      );
+      expect(mockConsumer.inspectConversation).toHaveBeenCalledWith(sessionId, {
+        timeoutMs: 4_000,
+      });
+      expect(mockConsumer.close).not.toHaveBeenCalled();
+      asked.doneAsking();
+      expect(mockConsumer.close).toHaveBeenCalledTimes(1);
+      expect(mockLease.release).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test("both questions share one channel and one budget", async () => {
