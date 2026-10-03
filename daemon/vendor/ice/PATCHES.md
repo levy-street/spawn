@@ -32,3 +32,8 @@ Remove the override after an upstream release provides equivalent handling.
 
 `src/udp_mux/mod.rs` also removes two redundant references in upstream log
 arguments so the vendored crate passes the workspace's current Clippy gate.
+
+`src/lib.rs` allows `clippy::double_must_use` at the crate root. Rust 1.99
+Clippy flags the `#[must_use]` that `async_trait` adds to every boxed future
+it generates, which would fail the workspace Clippy gate; the allowance
+changes no code.
