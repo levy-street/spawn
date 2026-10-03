@@ -15,12 +15,11 @@ export interface RunningAgentsProps {
 }
 
 /**
- * What is running on a machine, as the marks people recognise — the Claude
+ * What is running on a host, as the marks people recognise — the Claude
  * plate, the Codex plate, a terminal glyph — each with how many of it.
  *
  * "2 Claude Code, 1 shell" is the thing a person wants to know about a host,
- * and a bare session count never said it. Shared by the legion list row and the
- * legion card so a machine looks the same on both.
+ * and a bare session count never said it.
  */
 export function RunningAgents({
   groups,

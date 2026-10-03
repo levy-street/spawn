@@ -2,13 +2,14 @@
 
 import type { ReactNode } from "react";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
-import { fillTone } from "@/lib/legion";
+import { fillTone } from "@/lib/fleet";
 import { cn } from "@/lib/utils";
 
 /**
- * The legion's shared instrument set: a capacity bar, a presence dot, the marks
- * for what is running. Every legion surface draws the same ones, so a host that
- * looks pinned in the sidebar looks pinned on the page it opens.
+ * The shared instrument set of every hosts surface: a capacity bar, a presence
+ * dot, the marks for what is running. The sidebar strip, the Hosts page and the
+ * profile draw the same ones, so a host that looks pinned in the sidebar looks
+ * pinned on the page it opens.
  */
 
 /** Distinct agent marks a row shows before the rest become a count. */
@@ -135,7 +136,7 @@ const TONE_DOT: Record<string, string> = {
   offline: "bg-tone-offline",
 };
 
-export function LegionDot({
+export function HostDot({
   tone,
   label,
   pulse = false,

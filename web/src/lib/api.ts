@@ -167,17 +167,20 @@ export const HostSchema = z.object({
 });
 export type Host = z.infer<typeof HostSchema>;
 
-/** One UTC day of fleet activity. Sparse — quiet days are simply absent. */
-export const LegionDaySchema = z.object({
+/**
+ * One UTC day of fleet activity — a row of the server's `legion_days` rollup.
+ * Sparse: quiet days are simply absent.
+ */
+export const ProfileDaySchema = z.object({
   day: z.string(),
   sessions_started: z.number().int().default(0),
   session_seconds: z.number().int().default(0),
   peak_sessions: z.number().int().default(0),
   peak_hosts_online: z.number().int().default(0),
 });
-export type LegionDay = z.infer<typeof LegionDaySchema>;
+export type ProfileDay = z.infer<typeof ProfileDaySchema>;
 
-export const LegionTotalsSchema = z.object({
+export const ProfileTotalsSchema = z.object({
   hosts: z.number().int().default(0),
   hosts_online: z.number().int().default(0),
   cores: z.number().int().default(0),
@@ -192,16 +195,16 @@ export const LegionTotalsSchema = z.object({
   peak_sessions: z.number().int().default(0),
   first_day: z.string().nullable().default(null),
 });
-export type LegionTotals = z.infer<typeof LegionTotalsSchema>;
+export type ProfileTotals = z.infer<typeof ProfileTotalsSchema>;
 
 /** A foreground executable basename and how often it has been seen. */
-export const LegionAgentSchema = z.object({
+export const ProfileAgentSchema = z.object({
   command: z.string(),
   count: z.number().int(),
 });
-export type LegionAgent = z.infer<typeof LegionAgentSchema>;
+export type ProfileAgent = z.infer<typeof ProfileAgentSchema>;
 
-export const LegionHostSchema = z.object({
+export const ProfileHostSchema = z.object({
   id: z.string(),
   name: z.string(),
   os: z.string().nullable().default(null),
@@ -213,7 +216,7 @@ export const LegionHostSchema = z.object({
   created_at: z.string().nullable().default(null),
   last_seen_at: z.string().nullable().default(null),
 });
-export type LegionHost = z.infer<typeof LegionHostSchema>;
+export type ProfileHost = z.infer<typeof ProfileHostSchema>;
 
 /** Everything the profile dialog draws (`GET /api/profile`). */
 export const ProfileSchema = z.object({
@@ -222,10 +225,10 @@ export const ProfileSchema = z.object({
   created_at: z.string(),
   email_verified_at: z.string().nullable().default(null),
   is_admin: z.boolean().default(false),
-  totals: LegionTotalsSchema,
-  agents: z.array(LegionAgentSchema).default([]),
-  days: z.array(LegionDaySchema).default([]),
-  hosts: z.array(LegionHostSchema).default([]),
+  totals: ProfileTotalsSchema,
+  agents: z.array(ProfileAgentSchema).default([]),
+  days: z.array(ProfileDaySchema).default([]),
+  hosts: z.array(ProfileHostSchema).default([]),
   history_days: z.number().int(),
   /* The server's UTC day. The calendar is densified against this rather than
    * the browser's clock, so a viewer in UTC+13 colours the squares the streak

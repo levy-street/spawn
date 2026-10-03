@@ -97,6 +97,18 @@ the URL scheme, the storage keys, package names and paths stay `spawn`.
 
 Bare lower-case "spawn" as the product name is a bug, in either frontend.
 
+The fleet is **Hosts**: the page, the tab, the sidebar strip, and the
+frontends' own names for them. Attaching one is "Possess a host"; the
+possession flourishes ("cores possessed", "sessions summoned") belong to the
+profile and its share card only. "Legion" was the old name. In `web/src` and
+`mobile/src` it survives only as the `/legion` alias (the web redirect, the
+phone's deep link and its one-cycle stub screen), the server's `legion_days`
+table, and the `spawn.sidebar.legionOpen` storage key;
+`scripts/check-product-vocabulary.sh` enforces this there. The server's profile
+accounting keeps its names (`legion.py`, `LegionDay`, `legion_days`, the
+`Legion*Out` schemas): renaming a table mid-deploy breaks old code reading the
+new schema.
+
 ## Releasing
 
 Before deploying or releasing anything — server, web, a mobile update or

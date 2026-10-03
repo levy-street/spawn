@@ -10,7 +10,7 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | Session | one login-shell PTY on a host | `sessions` / `/api/sessions` / `/sessions/[id]` or a workspace tile |
 | Agent | launchable CLI definition used as a shortcut inside a session; not a process | `agents` / `/api/agents` / Settings → Agents |
 | Workspace | named packed grid of session tiles | `workspaces` / `/api/workspaces` / `/w/[id]` |
-| Host | paired machine running `spawnd` | `hosts` / `/api/hosts` / Settings → Hosts, `/hosts/[id]`, and `/legion` |
+| Host | paired machine running `spawnd` | `hosts` / `/api/hosts` / `/hosts` and `/hosts/[id]` |
 | Skill | managed content materialized for an allowed session | `skills` / `/api/skills` / Settings → Skills |
 
 ## HTTP and direct-channel capabilities
@@ -19,9 +19,9 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | --- | --- | --- | --- | --- |
 | Onboarding configuration | `/onboarding`, auth pages | `GET /api/auth/config` → `{providers, email_verification_required, invite_only}` | `auth.config` | none |
 | Account lifecycle | auth pages, Settings → Account | `/api/auth/signup`, `/api/auth/login`, `/api/auth/logout`, `/api/me`, `/api/account/delete`, recovery and verification routes under `/api/auth` | `auth.*`, `account.remove` | none |
-| Pair a host | onboarding, `/device`, Settings → Hosts | `/api/auth/device/{start,possession,poll,pending,approve}` | `auth.pendingDevice`, `auth.approveDevice` | device-code login and possession proof |
-| List/get/rename/delete hosts | Settings → Hosts, `/hosts/[id]` | `GET /api/hosts`, `GET/PATCH/DELETE /api/hosts/{id}` | `hosts.list/get/rename/remove` | registration and presence over daemon WS |
-| Check/install configured agents on a host | Settings → Hosts/Agents, session shortcut bar | `GET /api/hosts/{id}/agents`; `POST /api/hosts/{id}/agents/{agent_id}/install`; `PATCH /api/hosts/{id}/agents/{agent_id}/policy` | `hosts.agents/installAgent/updateAgentPolicy` | `host.agents.check` / `check_result`; `host.agents.install` / `install_result` |
+| Pair a host | onboarding, `/device`, `/hosts` → Possess a host | `/api/auth/device/{start,possession,poll,pending,approve}` | `auth.pendingDevice`, `auth.approveDevice` | device-code login and possession proof |
+| List/get/rename/delete hosts | sidebar Hosts strip, `/hosts`, `/hosts/[id]` | `GET /api/hosts`, `GET/PATCH/DELETE /api/hosts/{id}` | `hosts.list/get/rename/remove` | registration and presence over daemon WS |
+| Check/install configured agents on a host | `/hosts/[id]`, Settings → Agents, session shortcut bar | `GET /api/hosts/{id}/agents`; `POST /api/hosts/{id}/agents/{agent_id}/install`; `PATCH /api/hosts/{id}/agents/{agent_id}/policy` | `hosts.agents/installAgent/updateAgentPolicy` | `host.agents.check` / `check_result`; `host.agents.install` / `install_result` |
 | Recent session directories | none — the folder browser answers "where" now; the route and its client helper remain | `GET /api/hosts/{id}/recent-dirs` → `{dirs:[{path,last_used_at}]}` (newest first, max 8) | `hosts.recentDirs` | none |
 | Host files | folder picker, file explorer | none; only signaling is server-mediated | `HostControlClient` | capability-rooted `spawn.host.ctl` `fs.*` requests and bounded streams |
 | Host file previews | file explorer hover card and viewer dialog | none; never server-visible | `HostControlClient.readRange/previewImage` | `fs.read.range` bounded slice; `fs.preview` host-rendered PNG (macOS only, advertised per host) |
@@ -35,9 +35,9 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | Manage agent definitions | Settings → Agents, shortcut bar | `GET/POST /api/agents`, `PATCH/DELETE /api/agents/{id}` | `agents.*` | definitions are typed into the shell; built-ins are immutable through write routes |
 | Yolo mode (skip an agent's permission prompts) | Settings → Agents, one switch per agent | `PATCH /api/agents/{id}/preferences` → `{yolo}`; the spelling rides on `AgentOut` as `yolo_args`/`yolo_env` | `agents.setPreferences`, `agentRunCommand` | per user, not per definition (`agent_preferences`), so the switch is live on read-only built-ins; folded into the command the browser types, never a hidden launch flag |
 | Manage skills | Settings → Skills | `GET/POST /api/skills`, `PATCH/DELETE /api/skills/{id}` | `skills.*` | materialized into the session environment/config root |
-| Browser devices and trust | Settings → Browser devices / Device trust | `/api/browser-devices/*`, `/api/trust/{bundle,passkeys,endorsements,hosts/.../pins}` | `browserDevices.*`, `trust.*` | signed signaling and daemon-local browser pins |
-| Host capacity | sidebar Legion strip, `/legion`, profile dialog | on `GET /api/hosts`: static spec (`cpu_cores`, `cpu_physical_cores`, `cpu_model`, `memory_bytes`, `gpu`) plus `cpu_bucket`/`mem_bucket` in `0..=5` and `capacity_at`; buckets are withheld for an offline host | `summarizeLegion`, `useHostCapacity` | spec on `register`; buckets on `host.heartbeat`; **exact** figures only over `spawn.host.ctl` `host.metrics`, never server-visible. `SPAWND_NO_TELEMETRY=1` disables all three |
-| Profile and legion history | account menu → Profile | `GET /api/profile` → identity, `totals`, `agents`, sparse `days`, `hosts`, `history_days`, `today` | `profile.get`, `calendar` | none — read from `legion_days`, an append-only per-owner-per-day counter table written beside the existing lifecycle writes |
+| Browser devices and trust | Settings → Access | `/api/browser-devices/*`, `/api/trust/{bundle,passkeys,endorsements,hosts/.../pins}` | `browserDevices.*`, `trust.*` | signed signaling and daemon-local browser pins |
+| Host capacity | sidebar Hosts strip, `/hosts`, profile dialog | on `GET /api/hosts`: static spec (`cpu_cores`, `cpu_physical_cores`, `cpu_model`, `memory_bytes`, `gpu`) plus `cpu_bucket`/`mem_bucket` in `0..=5` and `capacity_at`; buckets are withheld for an offline host | `summarizeFleet`, `useHostCapacity` (every 3 s, only for a host card on screen in a tab in front) | spec on `register`; buckets on `host.heartbeat`; **exact** figures only over `spawn.host.ctl` `host.metrics`, never server-visible. `SPAWND_NO_TELEMETRY=1` disables all three |
+| Profile and activity history | account menu → Profile | `GET /api/profile` → identity, `totals`, `agents`, sparse `days`, `hosts`, `history_days`, `today` | `profile.get`, `calendar` | none — read from `legion_days`, an append-only per-owner-per-day counter table written beside the existing lifecycle writes |
 | Terminal input/output | workspace/session terminal | none | `useSessionSocket`, `LiveTerminalProvider` | ordered reliable `spawn.pty` DataChannel direct to the endpoint |
 | Alerts on agent completion | Settings → Notifications, pane menu → Mute alerts | none; delivered over `/ws/alerts` (owner-scoped, subprotocol `spawn.alerts.v1`) | `subscribeToAlerts`, `useSessionAlerts`, `notify-prefs` | transitions are detected beside the lifecycle writes in `ws/daemon.py`; the daemon gains no new frame |
 | Replay, resize, display ownership, upload | workspace/session terminal | none | `spawn.ctl` client | ordered reliable locked `spawn.ctl` v1 DataChannel direct to the endpoint |
@@ -126,16 +126,18 @@ order is `(y, x)` and drives the mobile stack and keyboard focus order.
 | `/sessions/[id]` | full-page single session |
 | `/login`, `/signup`, `/forgot-password`, `/reset-password`, `/verify-email` | account flows |
 | `/device` | daemon device-code approval |
+| `/hosts` | every host, its capacity, and what is running on it; exact figures over the host control channel for the cards on screen |
 | `/hosts/[id]`, `/hosts/[id]/files` | host detail and full host file explorer |
-| `/legion` | every host, its capacity, and what is running on it; optional live per-second figures over the host control channel |
+| `/legion` | redirect to `/hosts` (the page's name before the rename) |
 | `/download`, `/security` | public product/support pages |
 | `/admin` | administrator-only accounts, invites, and email operations |
 
-Account, appearance, hosts, agents, skills, browser devices, and device trust
-are tabs in the settings dialog opened from the app shell; they are not
-standalone app routes. The profile is likewise a dialog rather than a route,
-opened from the account menu in the sidebar footer, so it overlays a workspace
-of live panes without detaching any of them.
+Account, appearance, notifications, agents, skills, workspace templates, and
+access (browser devices and device trust) are tabs in the settings dialog
+opened from the app shell; they are not standalone app routes. Hosts are not a
+setting: they have the `/hosts` page. The profile is likewise a dialog rather
+than a route, opened from the account menu in the sidebar footer, so it
+overlays a workspace of live panes without detaching any of them.
 
 Capacity resolution is deliberate and is documented in docs/TRUST.md: the
 server holds a five-level bucket refreshed per heartbeat, the browser gets

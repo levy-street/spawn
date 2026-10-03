@@ -1,5 +1,5 @@
-import { HostListScreen } from "@/components/hosts/host-list-screen";
+import { HostsScreen } from "@/components/hosts/hosts-screen";
 
 export default function HostsRoute() {
-  return <HostListScreen />;
+  return <HostsScreen />;
 }

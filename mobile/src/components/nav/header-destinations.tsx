@@ -8,13 +8,12 @@ import type { IconName } from "@/components/ui/icon";
  * are roots of the tab bar, and a header link to a root is what made them open
  * as cards stacked over the screen you were already on.
  */
-export type HeaderDestination = "legion" | "admin";
+export type HeaderDestination = "admin";
 
 const DESTINATIONS: Record<
   HeaderDestination,
   { accessibilityLabel: string; href: Href; icon: IconName }
 > = {
-  legion: { accessibilityLabel: "Open Legion", href: "/legion", icon: "RadioTower" },
   admin: { accessibilityLabel: "Open admin", href: "/admin", icon: "ShieldCheck" },
 };
 

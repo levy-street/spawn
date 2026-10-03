@@ -51,6 +51,8 @@ jest.mock("@/data/api/endpoints/account", () => ({
   getMe: jest.fn(),
 }));
 
+import DevicePairingScreen from "@/app/onboarding/device";
+import PossessHostScreen from "@/app/onboarding/host";
 import { PairingScreen } from "@/components/onboarding/pairing-screen";
 import { FixedThemeProvider, lightTheme } from "@/theme";
 
@@ -92,6 +94,25 @@ describe("PairingScreen", () => {
     expect(screen.getByTestId("pairing-screen")).toHaveStyle({
       backgroundColor: lightTheme.colors.background,
     });
+  });
+
+  it("opens from every Possess a host control under the same name, in the browser's words", async () => {
+    const screen = await render(<PossessHostScreen />, { wrapper });
+
+    expect(screen.getAllByRole("header")).toHaveLength(1);
+    expect(screen.getByRole("header", { name: "Possess a host" })).toBeOnTheScreen();
+    expect(
+      screen.getByText(
+        "Install SPAWN D on the computer, run spawnd possess there, and keep this window open until it comes online.",
+      ),
+    ).toBeOnTheScreen();
+  });
+
+  it("lands a host's own approval link on the pairing steps without that lead", async () => {
+    const screen = await render(<DevicePairingScreen />, { wrapper });
+
+    expect(screen.getByRole("header", { name: "Connect a computer" })).toBeOnTheScreen();
+    expect(screen.queryByTestId("pairing-lead")).toBeNull();
   });
 
   it("pops a pushed pairing screen from the header", async () => {

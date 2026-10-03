@@ -21,6 +21,8 @@ describe("query key registry", () => {
       qk.hosts(),
       qk.host("host"),
       qk.hostAgents("host"),
+      qk.hostIdentity("host", "key", "account"),
+      qk.hostIdentityForHost("host"),
       qk.sessions(),
       qk.sessionsForHost("host"),
       qk.session("session"),

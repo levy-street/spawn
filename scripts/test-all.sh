@@ -80,6 +80,10 @@ printf '%s\n' "== CLAUDE.md structure guard =="
 scripts/check-claude-md.sh --self-test
 scripts/check-claude-md.sh
 
+printf '%s\n' "== product vocabulary guard =="
+scripts/check-product-vocabulary.sh --self-test
+scripts/check-product-vocabulary.sh
+
 printf '%s\n' "== daemon tests =="
 # The emulator's real-terminal proof drives the web workspace's xterm.js.
 # Naming it makes the proof required here, where the workspace is installed,

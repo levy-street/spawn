@@ -3,7 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Copy, Flame, Settings2 } from "lucide-react";
 import { useMemo, useState } from "react";
-import { LegionDot, Stat } from "@/components/legion/legion-parts";
+import { HostDot, Stat } from "@/components/hosts/fleet-parts";
 import { closeProfile, useProfileDialog } from "@/components/profile/profile-dialog-store";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
@@ -11,11 +11,11 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/toast";
 import { type Profile, profile as profileApi } from "@/lib/api";
-import { calendar, formatBytes, formatDuration, specLine } from "@/lib/legion";
+import { calendar, formatBytes, formatDuration, specLine } from "@/lib/fleet";
 import { cn } from "@/lib/utils";
 
 /**
- * Your profile: who you are, the legion as it stands, and what it has done
+ * Your profile: who you are, your hosts as they stand, and what they have done
  * over time.
  *
  * This is the loud surface — the one opened on purpose, where the sidebar
@@ -23,9 +23,10 @@ import { cn } from "@/lib/utils";
  * so it is deliberately *not* live: it fetches once on open and again only if
  * you come back to it, rather than joining the app's polling.
  *
- * The history behind it is the `legion_days` rollup, which exists because
- * session rows are deleted with their workspaces — a profile computed from the
- * sessions table would show a person's history shrinking as they tidy up.
+ * The history behind it is the server's `legion_days` rollup, which exists
+ * because session rows are deleted with their workspaces — a profile computed
+ * from the sessions table would show a person's history shrinking as they
+ * tidy up.
  */
 
 /** Squares per row in the calendar. A week, so the columns mean something. */
@@ -47,7 +48,7 @@ export function ProfileDialog() {
       <DialogContent size="full-mobile" data-testid="profile-dialog">
         <DialogTitle className="sr-only">Profile</DialogTitle>
         <DialogDescription className="sr-only">
-          Your account, the machines you have possessed, and what your legion has done over time.
+          Your account, the hosts you have possessed, and what they have done over time.
         </DialogDescription>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -97,7 +98,7 @@ function ProfileBody({ profile }: { profile: Profile }) {
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-base font-semibold">{profile.email}</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Possessing machines since {formatDate(profile.created_at)}
+            Possessing hosts since {formatDate(profile.created_at)}
             {totals.current_streak > 0 && (
               <>
                 {" · "}
@@ -123,33 +124,35 @@ function ProfileBody({ profile }: { profile: Profile }) {
         </Button>
       </header>
 
-      {/* The flex, stated plainly. Static spec first — "214 cores" is the line
-       * that gets read aloud, where live utilisation is a wiggling number. */}
-      <section aria-label="Your legion" className="rounded-xl border border-border bg-card p-4">
-        <div className="flex flex-wrap items-baseline justify-between gap-3">
-          <h3 className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            The legion
-          </h3>
-          <ShareLegion profile={profile} />
+      {/* The flex, stated plainly, then the hosts it adds up from. Static spec
+       * first — "214 cores" is the line that gets read aloud, where live
+       * utilisation is a wiggling number. The profile is the one surface that
+       * keeps the possession voice ("cores possessed", "sessions summoned");
+       * operational surfaces say plain "cores". */}
+      <section aria-labelledby="profile-hosts-title" className="space-y-3">
+        <div className="rounded-xl border border-border bg-card p-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-3">
+            <h3
+              id="profile-hosts-title"
+              className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground"
+            >
+              Your hosts
+            </h3>
+            <ShareStats profile={profile} />
+          </div>
+          <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+            <Stat
+              value={`${totals.hosts_online}/${totals.hosts}`}
+              label={totals.hosts === 1 ? "host online" : "hosts online"}
+            />
+            {/* Zero cores means every daemon is silent about its spec, which is
+             * a different thing from a host with no CPU — say nothing. */}
+            {totals.cores > 0 && <Stat value={totals.cores} label="cores possessed" />}
+            {memory && <Stat value={memory} label="memory" />}
+            <Stat value={totals.sessions_live} label="live now" accent={totals.sessions_live > 0} />
+            <Stat value={totals.sessions_started} label="sessions summoned" />
+          </div>
         </div>
-        <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
-          <Stat
-            value={`${totals.hosts_online}/${totals.hosts}`}
-            label={totals.hosts === 1 ? "host online" : "hosts online"}
-          />
-          {/* Zero cores means every daemon is silent about its spec, which is
-           * a different thing from a machine with no CPU — say nothing. */}
-          {totals.cores > 0 && <Stat value={totals.cores} label="cores possessed" />}
-          {memory && <Stat value={memory} label="memory" />}
-          <Stat value={totals.sessions_live} label="live now" accent={totals.sessions_live > 0} />
-          <Stat value={totals.sessions_started} label="sessions summoned" />
-        </div>
-      </section>
-
-      <section aria-label="Machines" className="space-y-2">
-        <h3 className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-          Machines
-        </h3>
         {profile.hosts.length === 0 ? (
           <p className="rounded-lg border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
             No hosts possessed yet.
@@ -163,7 +166,7 @@ function ProfileBody({ profile }: { profile: Profile }) {
                   key={host.id}
                   className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-border bg-card px-3 py-2.5"
                 >
-                  <LegionDot
+                  <HostDot
                     tone={host.status === "online" ? "active" : "offline"}
                     label={host.status}
                   />
@@ -278,7 +281,7 @@ function Heatmap({ grid }: { grid: ReturnType<typeof calendar> }) {
  * names: the people most likely to post this are the people most careful about
  * what a screenshot leaks, so the safe version is the only version.
  */
-function ShareLegion({ profile }: { profile: Profile }) {
+function ShareStats({ profile }: { profile: Profile }) {
   const [copied, setCopied] = useState(false);
   const { totals } = profile;
   const line = [

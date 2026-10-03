@@ -1,6 +1,6 @@
-import { fireEvent, render, screen } from "@testing-library/react-native";
+import { act, fireEvent, render, renderHook, screen, within } from "@testing-library/react-native";
 import * as Clipboard from "expo-clipboard";
-import { AccessibilityInfo } from "react-native";
+import { AccessibilityInfo, type ViewabilityConfigCallbackPairs } from "react-native";
 import {
   codexAgent,
   offlineHost,
@@ -13,11 +13,34 @@ import {
   hostDoctorPresentation,
   hostPinCapacityWarning,
 } from "@/components/hosts/host-detail-view";
-import { HostListView } from "@/components/hosts/host-list-screen";
-import { HostOutSchema } from "@/data/api/schemas/hosts";
+import { HostsView, hostsSummaryLine, useOnScreenHosts } from "@/components/hosts/hosts-screen";
+import { type HostOut, HostOutSchema } from "@/data/api/schemas/hosts";
 import { ThemeProvider } from "@/theme";
 
 jest.mock("expo-clipboard", () => ({ setStringAsync: jest.fn(async () => undefined) }));
+jest.mock("@/components/hosts/live-capacity-probe", () => ({
+  LiveCapacityProbe: jest.fn(() => null),
+}));
+
+/** Tell the rendered host list which cards are on screen, as FlatList does on a device. */
+async function reportOnScreen(hosts: readonly HostOut[]): Promise<void> {
+  const pairs = screen.getByTestId("hosts-list").props[
+    "viewabilityConfigCallbackPairs"
+  ] as ViewabilityConfigCallbackPairs;
+  await act(async () => {
+    for (const pair of pairs) {
+      pair.onViewableItemsChanged?.({
+        changed: [],
+        viewableItems: hosts.map((host, index) => ({
+          index,
+          isViewable: true,
+          item: host,
+          key: host.id,
+        })),
+      });
+    }
+  });
+}
 
 describe("host list and detail rendering", () => {
   beforeEach(() => {
@@ -31,7 +54,7 @@ describe("host list and detail rendering", () => {
     const onOpenActions = jest.fn();
     await render(
       <ThemeProvider>
-        <HostListView
+        <HostsView
           hosts={[onlineHost, offlineHost]}
           onConnect={jest.fn()}
           onOpen={onOpen}
@@ -66,16 +89,155 @@ describe("host list and detail rendering", () => {
     await fireEvent(officeMacRow, "longPress");
     expect(onOpenActions).toHaveBeenCalledTimes(2);
 
-    // The list is the machines and nothing else: no bank of fleet totals above
+    // The list is the hosts and nothing else: no bank of fleet totals above
     // the first host, and no row that opens a page of its own to show them.
-    expect(screen.queryByTestId("legion-summary")).toBeNull();
     expect(screen.queryByText("Fleet overview")).toBeNull();
+    // Said once, under the last host: where the exact figures come from.
+    expect(
+      screen.getByText(
+        "Exact figures travel straight from each host to this device. The spawnd server only ever sees a five-level reading every thirty seconds.",
+      ),
+    ).toBeOnTheScreen();
   });
 
-  test("a legion row reads out capacity, spec and what is running", async () => {
+  test("an empty fleet says what a host is and how to possess one", async () => {
+    const onConnect = jest.fn();
     await render(
       <ThemeProvider>
-        <HostListView
+        <HostsView
+          hosts={[]}
+          onConnect={onConnect}
+          onOpen={jest.fn()}
+          onOpenActions={jest.fn()}
+          onRefresh={jest.fn()}
+          refreshing={false}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("No hosts yet.")).toBeOnTheScreen();
+    expect(
+      screen.getByText(
+        "A host is a computer your agents run on. Install SPAWN D on it, then run spawnd possess there.",
+      ),
+    ).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("button", { name: "Possess a host" }));
+    expect(onConnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Exact figures travel/)).toBeNull();
+  });
+
+  test("totals the fleet in one line: hosts online, cores, and who needs you", () => {
+    const rollup = {
+      hosts: 3,
+      onlineHosts: 2,
+      offlineHosts: 1,
+      sessionRows: 9,
+      liveSessions: 4,
+      runningAgents: 2,
+      attention: 1,
+    };
+    expect(hostsSummaryLine([onlineHost, offlineHost, windowsHost], rollup)).toBe(
+      "2 of 3 online · 36 cores · 1 need you",
+    );
+    expect(
+      hostsSummaryLine([{ ...onlineHost, cpu_cores: null }], {
+        ...rollup,
+        hosts: 1,
+        onlineHosts: 1,
+        attention: 0,
+      }),
+    ).toBe("1 of 1 online");
+  });
+
+  test("asks only the cards on screen for exact figures, and none while not live", async () => {
+    const probe = jest.requireMock("@/components/hosts/live-capacity-probe") as {
+      LiveCapacityProbe: jest.Mock;
+    };
+    // What each card's probe was last told, which is what it is doing now.
+    const askingHosts = () => {
+      const latest = new Map<string, boolean>();
+      for (const [props] of probe.LiveCapacityProbe.mock.calls as [
+        { enabled: boolean; hostId: string },
+      ][]) {
+        latest.set(props.hostId, props.enabled);
+      }
+      return [...latest]
+        .filter(([, enabled]) => enabled)
+        .map(([hostId]) => hostId)
+        .sort();
+    };
+    const view = (live: boolean) => (
+      <ThemeProvider>
+        <HostsView
+          hosts={[onlineHost, windowsHost]}
+          live={live}
+          onConnect={jest.fn()}
+          onOpen={jest.fn()}
+          onOpenActions={jest.fn()}
+          onRefresh={jest.fn()}
+          refreshing={false}
+        />
+      </ThemeProvider>
+    );
+
+    probe.LiveCapacityProbe.mockClear();
+    const list = await render(view(true));
+    // Nothing has been laid out on screen yet, so nothing is asked.
+    expect(askingHosts()).toEqual([]);
+
+    // The list reports one card on screen: that card asks, the other does not.
+    await reportOnScreen([onlineHost]);
+    expect(askingHosts()).toEqual([onlineHost.id]);
+
+    // Scrolled: the card that left stops asking, the one that came in starts.
+    await reportOnScreen([windowsHost]);
+    expect(askingHosts()).toEqual([windowsHost.id]);
+
+    // Not live (another tab, or the app in the background): no card asks,
+    // even the one still on screen.
+    await list.rerender(view(false));
+    expect(askingHosts()).toEqual([]);
+    await list.rerender(view(true));
+    expect(askingHosts()).toEqual([windowsHost.id]);
+  });
+
+  test("tracks which hosts' cards are on screen, as the list reports them", async () => {
+    const { result } = await renderHook(useOnScreenHosts);
+    const report = (hosts: readonly HostOut[]) =>
+      act(async () => {
+        for (const pair of result.current.viewabilityConfigCallbackPairs) {
+          pair.onViewableItemsChanged?.({
+            changed: [],
+            viewableItems: hosts.map((host, index) => ({
+              index,
+              isViewable: true,
+              item: host,
+              key: host.id,
+            })),
+          });
+        }
+      });
+
+    expect([...result.current.onScreen]).toEqual([]);
+    await report([onlineHost]);
+    expect([...result.current.onScreen]).toEqual([onlineHost.id]);
+    const unchanged = result.current.onScreen;
+    await report([onlineHost]);
+    // The same cards are the same set, so no card re-renders for nothing.
+    expect(result.current.onScreen).toBe(unchanged);
+    await report([windowsHost, offlineHost]);
+    expect([...result.current.onScreen].sort()).toEqual([offlineHost.id, windowsHost.id].sort());
+    // The list's callbacks are fixed for its lifetime: FlatList refuses new ones.
+    const pairs = result.current.viewabilityConfigCallbackPairs;
+    await report([]);
+    expect(result.current.viewabilityConfigCallbackPairs).toBe(pairs);
+    expect([...result.current.onScreen]).toEqual([]);
+  });
+
+  test("a host card reads out capacity, spec and what is running", async () => {
+    await render(
+      <ThemeProvider>
+        <HostsView
           agents={[codexAgent]}
           hosts={[onlineHost, offlineHost]}
           onConnect={jest.fn()}
@@ -168,7 +330,7 @@ describe("host list and detail rendering", () => {
     };
     const list = await render(
       <ThemeProvider>
-        <HostListView
+        <HostsView
           hosts={[outdated]}
           onConnect={jest.fn()}
           onOpen={jest.fn()}
@@ -194,6 +356,104 @@ describe("host list and detail rendering", () => {
       </ThemeProvider>,
     );
     expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
+
+  test("a changed host identity blocks the page and offers removal as the only exit", async () => {
+    const onRemove = jest.fn();
+    const onOpenFiles = jest.fn();
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={onlineHost}
+          identityConflict
+          onOpenAgents={jest.fn()}
+          onOpenFiles={onOpenFiles}
+          onOpenSession={jest.fn()}
+          onRemove={onRemove}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    const panel = screen.getByTestId("host-identity-conflict");
+    expect(panel).toHaveProp("accessibilityRole", "alert");
+    expect(
+      screen.getByText("This host's identity changed — connections are blocked"),
+    ).toBeOnTheScreen();
+    // The browser's words, so a reinstall reads the same on every device.
+    expect(
+      screen.getByText(
+        "This host answered with a different identity than the one this device approved. Either the host's software was reinstalled — a reinstall gives it a new identity — or something between you and the host is impersonating it. This device won't connect either way.",
+      ),
+    ).toBeOnTheScreen();
+    expect(
+      screen.getByText(
+        "If you reinstalled this host yourself, remove it here, then run `spawnd possess` in its terminal — possessing it again is the re-verification.",
+      ),
+    ).toBeOnTheScreen();
+    // One exit, and never a way to accept the new identity in place.
+    expect(within(panel).getAllByRole("button")).toHaveLength(1);
+    expect(within(panel).queryByText(/trust|accept/i)).toBeNull();
+    await fireEvent.press(screen.getByTestId("conflict-remove-host"));
+    expect(onRemove).toHaveBeenCalledTimes(1);
+
+    expect(
+      screen.getByText(
+        "Connections to this host are blocked until it is removed and possessed again.",
+      ),
+    ).toBeOnTheScreen();
+    await fireEvent.press(screen.getByText("Files"));
+    expect(onOpenFiles).not.toHaveBeenCalled();
+  });
+
+  test("a host whose identity checks out shows no conflict and opens its files", async () => {
+    const onOpenFiles = jest.fn();
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={onlineHost}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={onOpenFiles}
+          onOpenSession={jest.fn()}
+          onRemove={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.queryByTestId("host-identity-conflict")).toBeNull();
+    await fireEvent.press(screen.getByRole("button", { name: /^Files, Browse this host/ }));
+    expect(onOpenFiles).toHaveBeenCalledTimes(1);
+  });
+
+  test("opens the update dialog from the update chip, as the browser's badge does", async () => {
+    const onOpenUpdate = jest.fn();
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={{
+            ...onlineHost,
+            update: {
+              state: "available",
+              latest_version: "2.0.0",
+              error: null,
+              requested_at: null,
+            },
+          }}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          onOpenUpdate={onOpenUpdate}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    await fireEvent.press(screen.getByRole("button", { name: "update available" }));
+    expect(onOpenUpdate).toHaveBeenCalledTimes(1);
   });
 
   test("selects every offline mini-doctor case and collapses it online", () => {

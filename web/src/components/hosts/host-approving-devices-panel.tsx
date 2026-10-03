@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Laptop } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, browserDevices, trust } from "@/lib/api";
 import { hostPinCapacityWarning } from "@/lib/host-pin-hygiene";
@@ -42,7 +43,7 @@ export function HostApprovingDevicesPanel({ hostId }: { hostId: string }) {
       </div>
       {warning !== null && (
         <div
-          className="flex items-start gap-2 border-b border-border bg-amber-500/5 px-4 py-3 text-sm text-amber-800 dark:text-amber-200"
+          className="flex items-start gap-2 border-b border-border bg-warning-soft px-4 py-3 text-sm text-warning"
           role="status"
           data-testid="host-pin-capacity-warning"
         >
@@ -88,9 +89,9 @@ export function HostApprovingDevicesPanel({ hostId }: { hostId: string }) {
               {deviceName(pin.browser_device_id)}
             </span>
             {!pin.delivered && (
-              <span className="shrink-0 rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300">
+              <Badge variant="warning" className="shrink-0">
                 Not delivered
-              </span>
+              </Badge>
             )}
           </li>
         ))}

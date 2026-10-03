@@ -1,5 +1,14 @@
 import { expect, test } from "@playwright/test";
-import { agent, host, mockApp, openSettings, USER_ID, user, windowsHost } from "./app-mocks";
+import {
+  agent,
+  host,
+  mockApp,
+  openSettings,
+  USER_ID,
+  user,
+  WORKSPACE_ID,
+  windowsHost,
+} from "./app-mocks";
 
 test("all seven settings tabs open", async ({ page }) => {
   await mockApp(page);
@@ -38,13 +47,13 @@ test("switching tabs changes the panel without navigating", async ({ page }) => 
   expect(page.url()).toBe(url);
 });
 
-test("Settings has no Hosts tab: machines live on the legion", async ({ page }) => {
+test("Settings has no Hosts tab: hosts have a page of their own", async ({ page }) => {
   await mockApp(page, { hosts: [host] });
   await openSettings(page);
   await expect(page.getByRole("button", { name: "Hosts", exact: true })).toHaveCount(0);
 });
 
-test("the connect flow lives on its own page, reached from the legion", async ({ page }) => {
+test("the connect flow lives on its own page, reached from Hosts", async ({ page }) => {
   await mockApp(page, { hosts: [host] });
   await page.goto("/device");
   await expect(page.getByRole("heading", { name: "Connect a host" })).toBeVisible();
@@ -54,23 +63,26 @@ test("the connect flow lives on its own page, reached from the legion", async ({
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
 });
 
-test("the legion add-machine flow waits after copying the plain command", async ({ page }) => {
+test("the Hosts page's possess flow waits after copying the plain command", async ({ page }) => {
   await page.addInitScript(() => {
     Object.defineProperty(window.navigator, "platform", { get: () => "Linux x86_64" });
   });
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await mockApp(page, { hosts: [host] });
-  await page.goto("/legion");
-  await page.getByRole("button", { name: "Add a machine", exact: true }).first().click();
+  await page.goto("/hosts");
+  await page.getByRole("button", { name: "Possess a host", exact: true }).first().click();
 
-  const dialog = page.getByRole("dialog", { name: "Add a machine" });
+  const dialog = page.getByRole("dialog", { name: "Possess a host" });
+  await expect(dialog).toContainText(
+    "Install SPAWN D on the computer, run spawnd possess there, and keep this window open until it comes online.",
+  );
   await expect(dialog.getByText(/curl -fsSL .*install\.sh \| sh$/)).toBeVisible();
   await expect(dialog.getByText("After installation, run")).toContainText("spawnd possess");
   await dialog.getByRole("button", { name: "Copy install command" }).click();
   await expect(dialog.getByText("Waiting for your machine…")).toBeVisible();
 });
 
-test("Windows defaults the shared device and legion gates to the WSL wrapper", async ({ page }) => {
+test("Windows defaults the shared device and Hosts gates to the WSL wrapper", async ({ page }) => {
   await page.addInitScript(() => {
     Object.defineProperty(window.navigator, "platform", { get: () => "Win32" });
   });
@@ -86,9 +98,9 @@ test("Windows defaults the shared device and legion gates to the WSL wrapper", a
     expected,
   );
 
-  await page.goto("/legion");
-  await page.getByRole("button", { name: "Add a machine", exact: true }).first().click();
-  const dialog = page.getByRole("dialog", { name: "Add a machine" });
+  await page.goto("/hosts");
+  await page.getByRole("button", { name: "Possess a host", exact: true }).first().click();
+  const dialog = page.getByRole("dialog", { name: "Possess a host" });
   await expect(dialog.getByRole("tab", { name: "Windows (WSL)" })).toHaveAttribute(
     "aria-selected",
     "true",
@@ -126,13 +138,74 @@ test("Windows defaults the shared gate to native after release proof is complete
   await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toHaveCount(0);
 });
 
-test("the legion formats a Windows x64 host without changing its generic fleet row", async ({
+test("the Hosts page formats a Windows x64 host without changing its generic fleet row", async ({
   page,
 }) => {
   await mockApp(page, { hosts: [windowsHost] });
-  await page.goto("/legion");
+  await page.goto("/hosts");
   await expect(page.getByText("Windows · x64", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "Windows PC", exact: true })).toBeVisible();
+});
+
+test("/legion is the Hosts page's old address and lands on it", async ({ page }) => {
+  await mockApp(page, { hosts: [{ ...host, cpu_cores: 8 }] });
+  await page.goto("/legion");
+  await expect(page).toHaveURL(/\/hosts$/u);
+  await expect(page.getByRole("heading", { name: "Hosts", exact: true })).toBeVisible();
+  // Operational surfaces say plain "cores"; "possessed" belongs to the profile.
+  // The host has cores, so the totals draw the figure and its label.
+  const totals = page.getByRole("region", { name: "Totals across your hosts" });
+  await expect(totals.getByText("cores", { exact: true })).toBeVisible();
+  await expect(page.getByText("cores possessed")).toHaveCount(0);
+  // Exact figures follow the cards on screen; there is no switch to find.
+  await expect(page.getByRole("button", { name: /^(?:Go live|Live)$/u })).toHaveCount(0);
+});
+
+test("a host list that fails to load is not an empty account, and Retry fetches it again", async ({
+  page,
+}) => {
+  await mockApp(page, { hosts: [{ ...host, cpu_cores: 8 }] });
+  let failing = true;
+  await page.route("**/api/hosts", async (route) => {
+    if (failing && route.request().method() === "GET") {
+      await route.fulfill({ status: 503, json: { detail: "hosts are down" } });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.goto("/hosts");
+
+  // The phone's Hosts tab says the same: what failed, and a way to try again.
+  await expect(page.getByRole("heading", { name: "Hosts unavailable", exact: true })).toBeVisible();
+  await expect(page.getByText(/^Failed to load hosts: /u)).toBeVisible();
+  await expect(page.getByText("No hosts yet.", { exact: true })).toHaveCount(0);
+  const totals = page.getByRole("region", { name: "Totals across your hosts" });
+  await expect(totals).toHaveCount(0);
+
+  failing = false;
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(totals.getByText("cores", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Hosts unavailable", exact: true })).toHaveCount(
+    0,
+  );
+});
+
+test("the sidebar's Hosts label opens the Hosts page while its count toggles the list", async ({
+  page,
+}) => {
+  await mockApp(page, { hosts: [host] });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  // The toggle's name carries the count it draws: one host here.
+  const toggle = page.getByRole("button", { name: /^(?:Show|Hide) the host list \(1\)$/u }).first();
+  await expect(toggle).toBeVisible();
+  const expanded = await toggle.getAttribute("aria-expanded");
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", expanded === "true" ? "false" : "true");
+  expect(page.url()).toContain(`/w/${WORKSPACE_ID}`);
+
+  await page.getByRole("link", { name: "Hosts", exact: true }).first().click();
+  await expect(page).toHaveURL(/\/hosts$/u);
+  await expect(page.getByRole("heading", { name: "Hosts", exact: true })).toBeVisible();
 });
 
 test("Agents keeps built-ins read-only and round-trips a custom definition", async ({ page }) => {

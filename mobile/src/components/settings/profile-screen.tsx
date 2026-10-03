@@ -18,7 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
-import type { LegionDayOut } from "@/data/api/schemas/legion";
+import type { ProfileDayOut } from "@/data/api/schemas/profile";
 import { useProfileSettingsQuery } from "@/data/queries/settings";
 import { haptics } from "@/lib/haptics";
 import {
@@ -48,14 +48,14 @@ function isoDay(time: number): string {
  * on a new account — and, sized to fill the width, two enormous squares.
  */
 export function heatmapWindow(
-  days: readonly LegionDayOut[],
+  days: readonly ProfileDayOut[],
   today: string,
   historyDays: number,
-): LegionDayOut[] {
+): ProfileDayOut[] {
   const byDay = new Map(days.map((day) => [day.day, day]));
   const end = Date.parse(`${today}T00:00:00Z`);
   if (Number.isNaN(end) || historyDays <= 0) return [...days];
-  const window: LegionDayOut[] = [];
+  const window: ProfileDayOut[] = [];
   for (let offset = historyDays - 1; offset >= 0; offset -= 1) {
     const day = isoDay(end - offset * DAY_MS);
     window.push(
@@ -80,11 +80,11 @@ export function weekdayIndex(day: string): number {
  * The days laid out as the calendar has them — one column per week, Monday at
  * the top — with empty cells before the first day so it lands on its weekday.
  */
-export function heatmapColumns(days: readonly LegionDayOut[]): (LegionDayOut | null)[][] {
+export function heatmapColumns(days: readonly ProfileDayOut[]): (ProfileDayOut | null)[][] {
   const first = days[0];
   if (!first) return [];
   const offset = weekdayIndex(first.day);
-  const columns: (LegionDayOut | null)[][] = [];
+  const columns: (ProfileDayOut | null)[][] = [];
   for (let index = 0; index < offset + days.length; index += 1) {
     const column = Math.floor(index / WEEK);
     columns[column] ??= [];
@@ -127,7 +127,7 @@ function Tile({
   );
 }
 
-function Heatmap({ days }: { days: readonly LegionDayOut[] }): React.JSX.Element | null {
+function Heatmap({ days }: { days: readonly ProfileDayOut[] }): React.JSX.Element | null {
   const theme = useTheme();
   const [width, setWidth] = useState(0);
   const columns = heatmapColumns(days);
@@ -142,7 +142,7 @@ function Heatmap({ days }: { days: readonly LegionDayOut[] }): React.JSX.Element
         )
       : spacing[3];
 
-  const shade = (day: LegionDayOut) => {
+  const shade = (day: ProfileDayOut) => {
     const ratio = day.sessions_started / max;
     if (day.sessions_started === 0) return { backgroundColor: theme.colors.muted };
     if (ratio <= 1 / 3) return { backgroundColor: theme.colors.brandAccentSoft };
@@ -238,7 +238,7 @@ export function ProfileScreen(): React.JSX.Element {
             {data.email}
           </Text>
           <Text color="mutedForeground" variant="caption">
-            Possessing machines since {since}
+            Possessing hosts since {since}
           </Text>
           {totals.current_streak > 0 ? (
             <Badge testID="profile-streak" variant="warning">
@@ -341,7 +341,7 @@ export function ProfileScreen(): React.JSX.Element {
         </View>
       </SettingsSection>
 
-      <SettingsSection title="Machines">
+      <SettingsSection title="Your hosts">
         {data.hosts.length === 0 ? (
           <EmptyState icon="Server" title="No hosts possessed yet." />
         ) : (

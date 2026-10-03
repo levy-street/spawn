@@ -12,7 +12,7 @@ import type { HostTransport } from "@/terminal/transport/types";
 /**
  * One host's connection, owned for the whole signed-in app. It shows nothing
  * itself: its state is published to the connection store, and read where the
- * host already appears — its Legion card, the terminals running on it — so a
+ * host already appears — its Hosts card, the terminals running on it — so a
  * host that is only asleep never puts a banner over everything else.
  */
 function DaemonSurface({ hostId, publicKey }: { hostId: string; publicKey: string }) {

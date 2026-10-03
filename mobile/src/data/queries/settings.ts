@@ -20,7 +20,7 @@ import {
   revokeBrowserDevice,
 } from "@/data/api/endpoints/devices";
 import { listHosts } from "@/data/api/endpoints/hosts";
-import { getProfile } from "@/data/api/endpoints/legion";
+import { getProfile } from "@/data/api/endpoints/profile";
 import { createSkill, deleteSkill, listSkills, patchSkill } from "@/data/api/endpoints/skills";
 import {
   deleteWorkspaceTemplate,
@@ -32,7 +32,7 @@ import type { AgentCreate, AgentOut, AgentPatch } from "@/data/api/schemas/agent
 import type { AccountDeleteRequest, MeResponse } from "@/data/api/schemas/auth";
 import type { BrowserDeviceOut } from "@/data/api/schemas/devices";
 import type { HostOut } from "@/data/api/schemas/hosts";
-import type { ProfileOut } from "@/data/api/schemas/legion";
+import type { ProfileOut } from "@/data/api/schemas/profile";
 import type { SkillCreate, SkillOut, SkillPatch } from "@/data/api/schemas/skills";
 import type { WorkspaceTemplateOut } from "@/data/api/schemas/templates";
 import type {

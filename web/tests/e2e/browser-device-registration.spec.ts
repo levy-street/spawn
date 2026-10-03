@@ -98,7 +98,7 @@ test("removing this device is seamless: the key dies, a fresh one takes its plac
   await page.reload();
   // A replacement key is an unapproved device. Use the neutral host list so
   // the workspace approval dialog does not cover the Settings button.
-  await openSettings(page, "access", undefined, "/legion");
+  await openSettings(page, "access", undefined, "/hosts");
   await expect(fingerprint).toHaveText(/^SHA256:/);
   await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toHaveCount(0);

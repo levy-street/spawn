@@ -38,7 +38,14 @@ function hostFingerprint(publicKeyWire: string | null): string {
   }
 }
 
-export function HostFacts({ host }: { host: HostOut }) {
+export function HostFacts({
+  host,
+  onOpenUpdate,
+}: {
+  host: HostOut;
+  /** Opens the update dialog from the update chip, as the browser's badge does. */
+  onOpenUpdate?(): void;
+}) {
   return (
     <View style={styles.section} testID="host-facts">
       <SectionHeader style={styles.sectionHeader} title="Details" />
@@ -46,7 +53,12 @@ export function HostFacts({ host }: { host: HostOut }) {
         <Fact label="System" value={formatHostPlatform(host)} />
         <Fact label="Daemon" value={host.version ?? "unknown"} />
         {hostUpdateLabelForFacts(host) ? (
-          <Fact label="Daemon update" value={<HostUpdateChip host={host} />} />
+          <Fact
+            label="Daemon update"
+            value={
+              <HostUpdateChip host={host} {...(onOpenUpdate ? { onPress: onOpenUpdate } : {})} />
+            }
+          />
         ) : null}
         <Fact label="Sessions" value={pluralize(host.session_count, "session")} />
         <Fact label="Connection" value={hostConnectionLabel(host)} />

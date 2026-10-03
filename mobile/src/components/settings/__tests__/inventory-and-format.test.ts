@@ -5,13 +5,13 @@ import {
 } from "@/components/settings/profile-format";
 import { SETTINGS_PANEL_COUNT, SETTINGS_PANELS } from "@/components/settings/settings-inventory";
 import { formatTemplateSummary } from "@/components/settings/templates-panel";
-import type { ProfileOut } from "@/data/api/schemas/legion";
+import type { ProfileOut } from "@/data/api/schemas/profile";
 import type { WorkspaceTemplateOut } from "@/data/api/schemas/templates";
 
 describe("settings inventory", () => {
   test("ships exactly the eight reference panels with a documented control inventory", () => {
     expect(SETTINGS_PANELS).toHaveLength(SETTINGS_PANEL_COUNT);
-    // No Hosts panel: machines are the Legion tab's, not a setting.
+    // No Hosts panel: hosts are the Hosts tab's, not a setting.
     expect(SETTINGS_PANELS.map((panel) => panel.label)).toEqual([
       "Account",
       "Appearance",

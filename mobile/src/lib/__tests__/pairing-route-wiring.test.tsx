@@ -26,7 +26,7 @@ jest.mock("@/data/queries/hosts", () => ({
   }),
   useRemoveHostMutation: () => mockMutation,
   useRenameHostMutation: () => mockMutation,
-  // The Legion tab counts sessions and agents for its rollup.
+  // The Hosts tab counts sessions and agents for its totals.
   useAllSessionsQuery: () => ({ data: [], isError: false, isPending: false }),
   useAgentsQuery: () => ({ data: [], isError: false, isPending: false }),
 }));
@@ -43,6 +43,10 @@ jest.mock("@/components/ui/toast", () => ({
   useToast: () => ({ error: jest.fn(), success: jest.fn() }),
 }));
 
+jest.mock("@react-navigation/native", () => ({
+  useIsFocused: () => true,
+}));
+
 jest.mock("@/components/hosts/host-actions-sheet", () => ({
   HostActionsSheet: () => null,
 }));
@@ -53,7 +57,7 @@ jest.mock("@/components/hosts/rename-host-dialog", () => ({
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import HostPairingScreen from "@/app/onboarding/host";
-import { HostListScreen } from "@/components/hosts/host-list-screen";
+import { HostsScreen } from "@/components/hosts/hosts-screen";
 import { ThemeProvider } from "@/theme";
 
 /** The shell renders a device-approval watcher that queries; give it a client. */
@@ -90,8 +94,8 @@ describe("standalone host pairing route", () => {
   });
 
   it("is reachable from both connect controls on Hosts", async () => {
-    const screen = await render(<HostListScreen />, { wrapper: Providers });
-    const connectButtons = screen.getAllByRole("button", { name: "Add a machine" });
+    const screen = await render(<HostsScreen />, { wrapper: Providers });
+    const connectButtons = screen.getAllByRole("button", { name: "Possess a host" });
     expect(connectButtons).toHaveLength(2);
 
     for (const button of connectButtons) await fireEvent.press(button);

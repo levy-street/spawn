@@ -14,8 +14,8 @@ import {
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
+import { HostsStrip } from "@/components/hosts/hosts-strip";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
-import { LegionStrip } from "@/components/legion/LegionStrip";
 import { DownloadMenu } from "@/components/nav/download-menu";
 import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
 import { SidebarWorkspacePair, SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
@@ -775,12 +775,12 @@ export function Sidebar({
         onDelete={(workspace) => void requestArchivedDelete(workspace)}
       />
 
-      {/* Below Archived and above Settings: the machines you own are footer
-       * furniture like the drawer over them, not a live ticker competing with
+      {/* Below Archived and above Settings: your hosts are footer furniture
+       * like the drawer over them, not a live ticker competing with
        * the workspace tree. Fed from the queries above rather than its own —
        * the section must not cost a request, and its counts must never
        * disagree with the rows it sits under. */}
-      <LegionStrip
+      <HostsStrip
         hosts={hostsQ.data ?? []}
         sessions={sessionsQ.data ?? []}
         collapsed={collapsed}

@@ -35,8 +35,21 @@ export function HostUpdateBadge({ host }: { host: HostOut }): React.JSX.Element 
   return <Badge variant={host.update?.state === "available" ? "warning" : "info"}>{label}</Badge>;
 }
 
-export function HostUpdateChip({ host }: { host: HostOut }): React.JSX.Element | null {
+export function HostUpdateChip({
+  host,
+  onPress,
+}: {
+  host: HostOut;
+  onPress?: () => void;
+}): React.JSX.Element | null {
   const label = hostUpdateLabel(host);
   if (!label) return null;
-  return <Chip variant={host.update?.state === "available" ? "warning" : "info"}>{label}</Chip>;
+  return (
+    <Chip
+      variant={host.update?.state === "available" ? "warning" : "info"}
+      {...(onPress ? { onPress } : {})}
+    >
+      {label}
+    </Chip>
+  );
 }

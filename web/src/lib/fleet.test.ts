@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import type { Host, LegionDay, Session } from "@/lib/api";
-import type { LegionHostRow } from "./legion";
+import type { Host, ProfileDay, Session } from "@/lib/api";
+import type { FleetHostRow } from "./fleet";
 import {
   bucketFill,
   bucketOf,
@@ -18,9 +18,9 @@ import {
   reportsCapacity,
   runningAgents,
   specLine,
-  summarizeLegion,
+  summarizeFleet,
   summaryLine,
-} from "./legion";
+} from "./fleet";
 
 const HOST_A = "11111111-2222-4333-8444-555555555551";
 const HOST_B = "11111111-2222-4333-8444-555555555552";
@@ -134,8 +134,8 @@ describe("hostTone", () => {
 });
 
 describe("hostToneLabel", () => {
-  const rowFor = (sessions: Session[], overrides: Partial<Host> = {}): LegionHostRow => {
-    const row = summarizeLegion([makeHost(HOST_A, "dream", overrides)], sessions).rows[0];
+  const rowFor = (sessions: Session[], overrides: Partial<Host> = {}): FleetHostRow => {
+    const row = summarizeFleet([makeHost(HOST_A, "dream", overrides)], sessions).rows[0];
     if (!row) throw new Error("expected one host row");
     return row;
   };
@@ -168,9 +168,9 @@ describe("hostToneLabel", () => {
   });
 });
 
-describe("summarizeLegion", () => {
+describe("summarizeFleet", () => {
   test("rolls hosts and sessions into one reading", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [makeHost(HOST_A, "nightmare"), makeHost(HOST_B, "dream")],
       [
         makeSession("s1", HOST_A, { activity_state: "active", foreground_command: "claude" }),
@@ -188,7 +188,7 @@ describe("summarizeLegion", () => {
   });
 
   test("orders online first then by name, never by load", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [
         makeHost(HOST_A, "zeta"),
         makeHost(HOST_B, "alpha", { status: "offline" }),
@@ -200,7 +200,7 @@ describe("summarizeLegion", () => {
   });
 
   test("an offline host reports no meter, whatever it last said", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [makeHost(HOST_A, "dream", { status: "offline", cpu_bucket: 5, mem_bucket: 5 })],
       [],
     );
@@ -209,7 +209,7 @@ describe("summarizeLegion", () => {
   });
 
   test("a fleet of silent daemons sums no cores rather than guessing", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [makeHost(HOST_A, "dream", { cpu_cores: null, memory_bytes: null, cpu_bucket: null })],
       [],
     );
@@ -218,7 +218,7 @@ describe("summarizeLegion", () => {
   });
 
   test("each row carries its own live sessions for the hover card", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [makeHost(HOST_A, "dream")],
       [
         makeSession("live", HOST_A, { activity_state: "waiting" }),
@@ -230,7 +230,7 @@ describe("summarizeLegion", () => {
   });
 
   test("sessions on a host that is gone are still counted against it", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [makeHost(HOST_A, "dream", { status: "offline" })],
       [makeSession("s1", HOST_A)],
     );
@@ -254,10 +254,10 @@ describe("reportsCapacity", () => {
 });
 
 describe("summaryLine", () => {
-  const base = summarizeLegion([makeHost(HOST_A, "dream")], []);
+  const base = summarizeFleet([makeHost(HOST_A, "dream")], []);
 
   test("attention wins over everything else", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [makeHost(HOST_A, "dream")],
       [
         makeSession("s1", HOST_A, { activity_state: "waiting" }),
@@ -272,17 +272,17 @@ describe("summaryLine", () => {
   });
 
   test("no hosts is a different statement from a quiet one", () => {
-    expect(summaryLine(summarizeLegion([], []))).toBe("No hosts yet");
+    expect(summaryLine(summarizeFleet([], []))).toBe("No hosts yet");
   });
 
   test("every host down is worth saying out loud", () => {
-    expect(summaryLine(summarizeLegion([makeHost(HOST_A, "d", { status: "offline" })], []))).toBe(
+    expect(summaryLine(summarizeFleet([makeHost(HOST_A, "d", { status: "offline" })], []))).toBe(
       "All hosts offline",
     );
   });
 
   test("counts label reads online hosts and live sessions", () => {
-    const summary = summarizeLegion(
+    const summary = summarizeFleet(
       [makeHost(HOST_A, "dream"), makeHost(HOST_B, "night", { status: "offline" })],
       [makeSession("s1", HOST_A)],
     );
@@ -337,7 +337,7 @@ describe("specLine", () => {
 });
 
 describe("calendar", () => {
-  const days: LegionDay[] = [
+  const days: ProfileDay[] = [
     {
       day: "2026-08-19",
       sessions_started: 4,

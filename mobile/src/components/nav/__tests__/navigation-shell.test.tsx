@@ -152,7 +152,7 @@ describe("app navigation shell", () => {
     expect(screen.getByTestId("mock-stack")).toBeTruthy();
     const names = mockStackScreens.map((entry) => entry.name);
     expect(names).toContain("(tabs)");
-    for (const pushed of ["workspace/[id]", "host/[id]/index", "legion", "admin/index"]) {
+    for (const pushed of ["workspace/[id]", "host/[id]/index", "admin/index"]) {
       expect(names).toContain(pushed);
     }
   });

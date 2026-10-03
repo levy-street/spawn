@@ -166,7 +166,7 @@ export default function AppEntryPage() {
           icon={<Server />}
           title="Your host is offline"
           body="Bring a daemon online before creating the first workspace."
-          action={<Button onClick={() => router.push("/legion")}>View hosts</Button>}
+          action={<Button onClick={() => router.push("/hosts")}>View hosts</Button>}
         />
       </AppShell>
     );

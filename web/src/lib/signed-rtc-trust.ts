@@ -67,6 +67,14 @@ export const SIGNED_RTC_REFUSAL_NEXT_STEP: Partial<Record<SignedRtcRefusalReason
 };
 
 /**
+ * Why the host page's ways in stay shut while its identity-conflict panel is
+ * up: the reason its disabled Files control gives. Mobile's host page says the
+ * same words (mobile/src/components/hosts/host-trust-copy.ts).
+ */
+export const HOST_IDENTITY_BLOCKED_REASON =
+  "Connections to this host are blocked until it is removed and possessed again.";
+
+/**
  * The trust decision for one live RTC connection generation.
  * - `signed`   — offers are signed with this browser's identity. Either a
  *   local pin matched (host fully verified), or the host is unpinned and the

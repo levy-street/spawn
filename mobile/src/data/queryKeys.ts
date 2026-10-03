@@ -6,6 +6,9 @@ export const qk = {
   hosts: () => ["hosts"] as const,
   host: (hostId: string) => ["host", hostId] as const,
   hostPins: (hostId: string) => ["trust", "host-pins", hostId] as const,
+  hostIdentity: (hostId: string, publicKey: string | null, accountId: string | null) =>
+    ["trust", "host-identity", hostId, publicKey, accountId] as const,
+  hostIdentityForHost: (hostId: string) => ["trust", "host-identity", hostId] as const,
   hostAgents: (hostId: string) => ["host-agents", hostId] as const,
   agentTranscripts: (sessionId: string, conversationId: string | null, cwd: string | null) =>
     ["agent-transcripts", sessionId, conversationId, cwd] as const,

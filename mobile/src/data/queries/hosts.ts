@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import { getBaseUrl } from "@/data/api/config";
 import { getMe } from "@/data/api/endpoints/account";
 import { listAgents } from "@/data/api/endpoints/agents";
@@ -24,7 +24,8 @@ import type {
   HostUpdateOut,
 } from "@/data/api/schemas/hosts";
 import { qk } from "@/data/queryKeys";
-import { openHostPinStore } from "@/data/trust/host-pins";
+import { type HostPin, openHostPinStore, subscribeHostPinChanges } from "@/data/trust/host-pins";
+import { activeDeviceIdentityAccount, subscribeDeviceIdentityAccount } from "@/lib/crypto/identity";
 
 const HOSTS_REFRESH_MS = 10_000;
 const HOST_REFRESH_MS = 30_000;
@@ -56,11 +57,10 @@ export interface RemoveHostDependencies {
     serverOrigin: string;
     hostPublicKey: string;
   }): Promise<void>;
-  hasLocalPin(input: {
+  localPins(input: {
     accountId: string;
     serverOrigin: string;
-    hostPublicKey: string;
-  }): Promise<boolean>;
+  }): Promise<readonly Pick<HostPin, "hostIds" | "hostPublicKey" | "state">[]>;
   removeRemote(hostId: string): Promise<void>;
 }
 
@@ -71,10 +71,9 @@ const removalDependencies: RemoveHostDependencies = {
   async serverOrigin() {
     return new URL(await getBaseUrl()).origin;
   },
-  async hasLocalPin(input) {
+  async localPins(input) {
     const store = await openHostPinStore();
-    const pins = await store.list(input.accountId, input.serverOrigin);
-    return pins.some((pin) => pin.hostPublicKey === input.hostPublicKey);
+    return store.list(input.accountId, input.serverOrigin);
   },
   async revokeLocalPin(input) {
     const store = await openHostPinStore();
@@ -83,22 +82,130 @@ const removalDependencies: RemoveHostDependencies = {
   removeRemote: deleteHost,
 };
 
-/** Tombstone the exact local key before server deletion so revoked trust cannot be silently reused. */
+/**
+ * The approval this device holds for a host, looked up the way every connection
+ * to it is decided (`HostPinStore.resolve`, through `verifyDaemonHost`): the
+ * pin bound to its ID, whatever key that pin holds; failing that, the pin for
+ * the key the server presents, whatever host IDs that pin carries.
+ *
+ * The second half is not a guess. This phone never binds a host ID when a
+ * connection matches by key, and the server keeps one host row per key, so a
+ * pin for the presented key that names other host IDs names this machine's
+ * former rows — removed elsewhere and possessed again with the same key. It is
+ * exactly the pin that lets this device reach the host today.
+ *
+ * And nothing else: when a pin is bound to this host under a different key (an
+ * identity conflict), the presented key does not reach this host at all, so a
+ * pin for it — another host's approval — is not this host's to withdraw.
+ */
+function approvalForHost(
+  pins: readonly Pick<HostPin, "hostIds" | "hostPublicKey" | "state">[],
+  host: Pick<HostOut, "id" | "host_public_key">,
+) {
+  const bound = pins.find((pin) => pin.hostIds.includes(host.id));
+  if (bound !== undefined || host.host_public_key === null) return bound;
+  return pins.find((pin) => pin.hostPublicKey === host.host_public_key);
+}
+
+/**
+ * Tombstone this device's trust for the host before server deletion, so revoked
+ * trust cannot be silently reused: whatever presents that key afterwards — this
+ * host if the deletion fails, or the same machine possessed again as a new
+ * host — is refused until a fresh ceremony approves it.
+ *
+ * What dies is the approval every connection to this host resolves to
+ * (`approvalForHost`) — even when the server now presents a different key, or
+ * withholds it. A different key is the identity-conflict case, and removal is
+ * its only exit: the server cannot veto a local withdrawal, and a re-keyed host
+ * would otherwise keep its old approval here forever. The browser revokes the
+ * same record (web/src/lib/browser-host-pins.ts revokeBrowserHostPin): it binds
+ * a host ID on every connection, so its pin bound to this host is the one
+ * found here. (A withheld key still skips the browser's tombstone; that gap is
+ * the browser's to close, not this device's to copy.)
+ */
 export async function removeHostWithTrust(
   host: HostOut,
   dependencies: RemoveHostDependencies = removalDependencies,
 ): Promise<void> {
-  if (host.host_public_key !== null) {
-    const [accountId, serverOrigin] = await Promise.all([
-      dependencies.accountId(),
-      dependencies.serverOrigin(),
-    ]);
-    const pinInput = { accountId, serverOrigin, hostPublicKey: host.host_public_key };
-    if (await dependencies.hasLocalPin(pinInput)) {
-      await dependencies.revokeLocalPin(pinInput);
-    }
+  const [accountId, serverOrigin] = await Promise.all([
+    dependencies.accountId(),
+    dependencies.serverOrigin(),
+  ]);
+  const pins = await dependencies.localPins({ accountId, serverOrigin });
+  const approved = approvalForHost(pins, host);
+  if (approved?.state === "active") {
+    await dependencies.revokeLocalPin({
+      accountId,
+      serverOrigin,
+      hostPublicKey: approved.hostPublicKey,
+    });
   }
   await dependencies.removeRemote(host.id);
+}
+
+export interface HostIdentityDependencies {
+  openHostPinStore(): Promise<Pick<Awaited<ReturnType<typeof openHostPinStore>>, "resolve">>;
+  serverOrigin(): Promise<string>;
+}
+
+const identityDependencies: HostIdentityDependencies = {
+  openHostPinStore,
+  serverOrigin: removalDependencies.serverOrigin,
+};
+
+/**
+ * Whether this device approved a different key for this host than the one the
+ * server now presents for it — a reinstall, or something impersonating it. Only
+ * this device's own approvals can say so: the server's word is what is in doubt.
+ */
+export async function hostIdentityConflicts(
+  input: { accountId: string; hostId: string; hostPublicKey: string },
+  dependencies: HostIdentityDependencies = identityDependencies,
+): Promise<boolean> {
+  const [store, serverOrigin] = await Promise.all([
+    dependencies.openHostPinStore(),
+    dependencies.serverOrigin(),
+  ]);
+  const resolution = await store.resolve({
+    accountId: input.accountId,
+    serverOrigin,
+    hostId: input.hostId,
+    presentedHostPublicKey: input.hostPublicKey,
+    phoneIdentityAvailable: true,
+  });
+  return resolution.status === "mismatch";
+}
+
+export function useHostIdentityConflictQuery(
+  host: Pick<HostOut, "id" | "host_public_key"> | undefined,
+) {
+  const queryClient = useQueryClient();
+  const accountId = useSyncExternalStore(
+    subscribeDeviceIdentityAccount,
+    activeDeviceIdentityAccount,
+    activeDeviceIdentityAccount,
+  );
+  const hostId = host?.id ?? "";
+  const hostPublicKey = host?.host_public_key ?? null;
+
+  // An approval made or revoked anywhere in the app changes the answer.
+  useEffect(
+    () =>
+      subscribeHostPinChanges(() => {
+        void queryClient.invalidateQueries({ queryKey: qk.hostIdentityForHost(hostId) });
+      }),
+    [hostId, queryClient],
+  );
+
+  return useQuery({
+    queryKey: qk.hostIdentity(hostId, hostPublicKey, accountId),
+    queryFn: () =>
+      accountId === null || hostPublicKey === null
+        ? false
+        : hostIdentityConflicts({ accountId, hostId, hostPublicKey }),
+    enabled: hostId.length > 0 && hostPublicKey !== null && accountId !== null,
+    retry: false,
+  });
 }
 
 export function useHostsQuery() {

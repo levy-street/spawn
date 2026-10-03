@@ -13,18 +13,22 @@ ceremony, a download page) says so in the commit message.
 src/
   app/            one directory per route (App Router)
                   [slug]/ admin/ app/ claude-plan-calculator/ desktop-build/
-                  device/ docs/ download/ forgot-password/ hosts/ legion/
-                  llms.txt/ login/ onboarding/ reset-password/ security/
-                  sessions/ signup/ tmux-cheatsheet/ verify-email/ w/
+                  device/ docs/ download/ forgot-password/ hosts/ llms.txt/
+                  login/ onboarding/ reset-password/ security/ sessions/
+                  signup/ tmux-cheatsheet/ verify-email/ w/
                   ([slug]/ renders the SEO page catalogue — see "SEO pages";
                   claude-plan-calculator/ and tmux-cheatsheet/ are its two
                   hand-built tool pages; docs/ renders design documents from
-                  ../docs on-site; llms.txt/ serves the AI-crawler summary)
+                  ../docs on-site; llms.txt/ serves the AI-crawler summary;
+                  hosts/ is the Hosts page, each host's page and its files —
+                  `/legion` is a redirect to it in next.config.ts)
   components/     UI grouped by product area
-                  access/ auth/ brand/ files/ grimoire/ hosts/ icons/ legion/
-                  nav/ release/ onboarding/ profile/ session/ settings/
-                  terminal/ trust/ ui/ workspace/
-                  (grimoire/ is the frame and templates of the SEO pages)
+                  access/ auth/ brand/ files/ grimoire/ hosts/ icons/ nav/
+                  release/ onboarding/ profile/ session/ settings/ terminal/
+                  trust/ ui/ workspace/
+                  (grimoire/ is the frame and templates of the SEO pages;
+                  hosts/ holds the sidebar's Hosts strip, the Hosts page's
+                  cards and the shared host connection provider)
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files
@@ -106,6 +110,12 @@ from the catalogue. Every claim about spawnd survives a diff against
   anything, so the product runs as "SPAWN D on Mac" — the device that
   possessed the computer — and never as a second device of its own.
 
+- The fleet is "Hosts" — the page, the sidebar strip, the code that draws
+  them (`components/hosts/`, `lib/fleet.ts`). "Legion" was its old name and
+  survives only where something outside the frontend still uses it: the
+  `/legion` redirect, the server's `legion_days` table, and the
+  `spawn.sidebar.legionOpen` storage key. `scripts/check-product-vocabulary.sh`
+  enforces this across `src/` here and in `mobile/`.
 - Polling idles when nothing is pending. A `refetchInterval` under ten seconds
   is for a state a person is waiting on right now — a live ceremony, a blocked
   session — and gives way to the idle cadence the moment that state clears

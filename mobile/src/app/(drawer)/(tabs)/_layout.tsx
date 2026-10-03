@@ -7,7 +7,7 @@ import { useTheme } from "@/theme";
 /**
  * The app's three roots. Nothing else lives here.
  *
- * Detail screens — a workspace, a host, the legion, admin — are pushed by the
+ * Detail screens — a workspace, a host, admin — are pushed by the
  * stack *above* this navigator rather than being tabs of their own. When they
  * were siblings here, opening a workspace was a tab switch: it slid the whole
  * app in over itself, skipped the push animation, and left "back" with no real

@@ -4,8 +4,9 @@ import { resolve } from "node:path";
 const POST_INSTALL_SURFACES = [
   "src/components/onboarding/install-instructions.tsx",
   "src/components/onboarding/pairing-success.tsx",
+  "src/components/onboarding/possess-copy.ts",
   "src/components/onboarding/trust-failure-state.tsx",
-  "src/components/hosts/host-list-screen.tsx",
+  "src/components/hosts/hosts-screen.tsx",
   "src/components/longtail/about-screen.tsx",
   "src/components/trust/device-approval-ceremony.tsx",
   "src/components/trust/device-approval-screen.tsx",

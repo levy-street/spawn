@@ -295,6 +295,11 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
   await page.goto(`/hosts/${HOST_ID}`);
   await expectExactHostBinding(page);
   const before = JSON.stringify(await readHostPins(page));
+  // The approved identity: Files is the way into the explorer.
+  await expect(page.getByRole("link", { name: "Files", exact: true })).toHaveAttribute(
+    "href",
+    `/hosts/${HOST_ID}/files`,
+  );
 
   state.hostResponse = { ...host, host_public_key: OTHER_HOST_PUBLIC_KEY };
   await page.reload();
@@ -308,6 +313,14 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
   await expect(panel).toContainText("identity changed");
   await expect(panel).toContainText("spawnd possess");
   await expect(panel.getByRole("button")).toHaveText(/Remove this host/u);
+  // The explorer would only meet the same refusal, so Files shuts and says
+  // why, in the words the phone uses (mobile host-trust-copy.ts).
+  await expect(page.getByRole("link", { name: "Files", exact: true })).toHaveCount(0);
+  const files = page.getByRole("button", { name: "Files", exact: true });
+  await expect(files).toBeDisabled();
+  await expect(files).toHaveAccessibleDescription(
+    "Connections to this host are blocked until it is removed and possessed again.",
+  );
   // Nothing was rebound or reactivated by the substituted key.
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 
@@ -320,8 +333,8 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
     .getByRole("dialog")
     .getByRole("button", { name: /^(?:Remove host|Retry deletion)$/u })
     .click();
-  // The overhaul retired the /hosts index; a removed host lands on the Legion (8ef696d).
-  await page.waitForURL("**/legion");
+  // A removed host lands on the Hosts page it was listed on.
+  await page.waitForURL("**/hosts");
   expect(state.deleteCalls).toBe(1);
   const pins = await readHostPins(page);
   expect(pins).toHaveLength(1);
@@ -351,8 +364,8 @@ test("deletion never revokes among multiple active unbound host pins", async ({ 
 
   await requestHostDeletion(page);
 
-  // The overhaul retired the /hosts index; a removed host lands on the Legion (8ef696d).
-  await page.waitForURL("**/legion");
+  // A removed host lands on the Hosts page it was listed on.
+  await page.waitForURL("**/hosts");
   expect(state.deleteCalls).toBe(1);
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
@@ -395,7 +408,7 @@ test("host-detail resolution binds before a legitimate tombstone-first DELETE", 
 
   await requestHostDeletion(page);
 
-  await expect(page).toHaveURL(/\/legion$/u);
+  await expect(page).toHaveURL(/\/hosts$/u);
   expect(state.deleteCalls).toBe(1);
   expect(pinStateAtDelete).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "revoked" },

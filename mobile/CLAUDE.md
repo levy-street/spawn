@@ -36,7 +36,8 @@ src/
     __tests__/    data-layer tests
   lib/            platform glue: crypto/, oauth, apple-auth, push,
                   notifications, release-watcher, updates, secure-storage,
-                  haptics, linking, motion/, providers, share, validation
+                  haptics, linking, motion/, providers, share, validation,
+                  app-active
   terminal/       terminal surface components
   theme/          design tokens — every colour, spacing, and type value
 assets/           icons and splash
@@ -98,6 +99,14 @@ scripts/, docs/   build helpers and app-specific notes
   (`data/trust/ceremony.ts`). The app runs these hooks for as long as it is
   signed in; at an always-fast cadence they were most of the server's request
   volume (2026-09-22).
+- Exact host figures (`host.metrics`) travel only over the host's own E2E
+  channel, and only for host cards on screen in the focused Hosts tab of a
+  foregrounded app, every three seconds (`components/hosts/hosts-screen.tsx`).
+  A card scrolled away, a card pushed over the tab, or a backgrounded app asks
+  nothing and holds no channel open; there is no opt-in switch.
+- The fleet is "Hosts" in copy and identifiers. The retired `/legion` address
+  survives only as the `(drawer)/legion.tsx` redirect stub (one OTA cycle) and
+  the `lib/linking.ts` alias; the profile client is `data/api/*/profile.ts`.
 - Anything that touches the native layer — a dependency with native code, a
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.
