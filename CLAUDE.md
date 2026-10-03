@@ -68,7 +68,11 @@ So any user-facing change ships in both, in the same commit:
 Both have their own idiom and neither should be a transliteration of the other.
 Match the surrounding code — `web/` uses Tailwind and server components,
 `mobile/` uses the `@/theme` tokens and the shared `ui/` primitives. Shared
-*meaning* stays identical; shared *markup* is not a goal.
+*meaning* stays identical; shared *markup* is not a goal. One file is the
+deliberate exception: the agent relaunch module, which composes what a device
+types into a host's shell, is the same file byte for byte in both
+(`web/src/lib/agent-relaunch.ts`, `mobile/src/data/selectors/agent-relaunch.ts`).
+Change both copies together; web's unit test fails when they differ.
 
 When something genuinely belongs to one platform — Face ID unlock, a
 `WebAuthn` ceremony that needs a browser — say so in the commit message. An

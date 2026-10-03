@@ -1,13 +1,13 @@
-import type { Agent, Session } from "@/lib/api";
-import type { ConversationInspection } from "@/lib/conversation";
-import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/lib/hostControl";
-import { sessionAgent } from "@/lib/sessions";
 import {
   agentConversationGrammar,
   agentLaunchCommand,
   agentResumeCommand,
   agentRunCommand,
-} from "./agent-command";
+} from "@/lib/agent-relaunch";
+import type { Agent, Session } from "@/lib/api";
+import type { ConversationInspection } from "@/lib/conversation";
+import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/lib/hostControl";
+import { sessionAgent } from "@/lib/sessions";
 import { pendingLaunch } from "./pending-launch";
 
 /**
@@ -40,6 +40,11 @@ import { pendingLaunch } from "./pending-launch";
  * conversation found". Where the host can look (`agent.transcripts`) and
  * finds no record of the id, the agent starts afresh under that same id
  * instead (`--session-id`); where it cannot say, the restart resumes.
+ *
+ * The line itself comes from the relaunch module (`@/lib/agent-relaunch`)
+ * that moves and account switches compose theirs with. A restart asks it for
+ * no permission mode and no note: the agent comes back in the mode its own
+ * conversation recorded, on the same host, exactly as it always has.
  */
 
 export type AgentRestartPlan =

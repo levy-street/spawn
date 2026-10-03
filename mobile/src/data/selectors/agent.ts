@@ -1,4 +1,24 @@
+import {
+  agentCanResume,
+  agentConversationGrammar,
+  agentLaunchCommand,
+  agentRunCommand,
+} from "@/data/selectors/agent-relaunch";
 import type { AgentDef, AgentIdentity, AgentLogoKey, Session } from "@/data/types/domain";
+
+// The quoting, the run command and each CLI's conversation grammar live in
+// the relaunch module, which the browser carries byte for byte and Restart
+// and moves compose their lines with; they are re-exported here so a launch
+// and a relaunch can never spell an agent two ways.
+export {
+  type AgentConversationGrammar,
+  agentCanResume,
+  agentConversationGrammar,
+  agentLaunchCommand,
+  agentResumeCommand,
+  agentRunCommand,
+  agentYoloAvailable,
+} from "@/data/selectors/agent-relaunch";
 
 const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash", "powershell", "pwsh", "cmd"]);
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -9,8 +29,6 @@ const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
  * comparison so the same program reads the same on every platform.
  */
 const WINDOWS_EXECUTABLE_SUFFIX = /\.(exe|com|bat|cmd|ps1)$/i;
-const SAFE_SHELL_VALUE = /^[A-Za-z0-9_@%+=:,./-]+$/;
-const SAFE_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 interface Brand {
   kind: string;
@@ -114,28 +132,6 @@ export function sortAgents(agents: readonly AgentDef[]): AgentDef[] {
   });
 }
 
-export function agentYoloAvailable(agent: AgentDef): boolean {
-  return Boolean(agent.yolo_args?.trim()) || Object.keys(agent.yolo_env).length > 0;
-}
-
-function quoteShell(value: string): string {
-  return SAFE_SHELL_VALUE.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-function envPrefix(env: Readonly<Record<string, string>>): string {
-  const assignments = Object.entries(env)
-    .filter(([key]) => SAFE_ENV_KEY.test(key))
-    .map(([key, value]) => `${key}=${quoteShell(value)}`);
-  return assignments.length > 0 ? `${assignments.join(" ")} ` : "";
-}
-
-export function agentRunCommand(agent: AgentDef): string {
-  const useYolo = agent.yolo && agentYoloAvailable(agent);
-  const env = useYolo ? { ...agent.env, ...agent.yolo_env } : agent.env;
-  const args = useYolo ? agent.yolo_args?.trim() : "";
-  return `${envPrefix(env)}${agent.command}${args ? ` ${args}` : ""}`;
-}
-
 export function agentInstallAndRunCommand(agent: AgentDef): string | null {
   const install = agent.install?.trim();
   return install ? `${install} && ${agentRunCommand(agent)}` : null;
@@ -176,56 +172,6 @@ export function groupRunningAgents(
 }
 
 /**
- * How an agent CLI names a conversation, by agent kind. Every tool spells it
- * differently, and most have no spelling at all: a launch that can be handed
- * an id up front is what lets a later restart come back to the same thread.
- * The same grammar the web app types, spelled once per client.
- */
-export interface AgentConversationGrammar {
-  /** Flags that start a fresh conversation under an id SPAWN D chose: at
-   *  launch, and on a restart whose conversation the host has no record of
-   *  yet. Null when the CLI names its own conversations. */
-  launch: ((conversationId: string) => string) | null;
-  /** Flags that reopen a known conversation. Null when the CLI cannot. */
-  resume: ((conversationId: string) => string) | null;
-  /** Flags that reopen the most recent conversation in this folder, for a
-   *  window whose conversation cannot be named. Null when it cannot. */
-  continueLatest: string | null;
-}
-
-const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> = {
-  "claude-code": {
-    launch: (id) => `--session-id ${id}`,
-    resume: (id) => `--resume ${id}`,
-    continueLatest: "--continue",
-  },
-  // Codex names its own sessions, so it cannot be launched under an id, and a
-  // restart never trusts a recorded one; it takes `resume` as a subcommand
-  // after the global flags. A conversation the host names for the window
-  // (`conv.inspect`) is resumed by that id, and "the latest one here" stands
-  // in wherever the host names none.
-  codex: {
-    launch: null,
-    resume: (id) => `resume ${id}`,
-    continueLatest: "resume --last",
-  },
-};
-
-/** The conversation grammar for an agent kind, or null for a CLI SPAWN D
- *  knows no way to resume. */
-export function agentConversationGrammar(
-  kind: string | null | undefined,
-): AgentConversationGrammar | null {
-  return (kind && CONVERSATION_GRAMMARS[kind.trim().toLowerCase()]) || null;
-}
-
-/** Whether a window of this kind can be brought back to its conversation at all. */
-export function agentCanResume(kind: string | null | undefined): boolean {
-  const grammar = agentConversationGrammar(kind);
-  return Boolean(grammar && (grammar.resume || grammar.continueLatest));
-}
-
-/**
  * A fresh conversation id for a launch, or null for a CLI that cannot be
  * handed one. UUIDs: what every agent that takes an id expects, and safe to
  * type at a prompt bare.
@@ -237,17 +183,6 @@ export function newAgentConversationId(
   return agentConversationGrammar(kind)?.launch ? randomUUID() : null;
 }
 
-/**
- * What starting an agent types when the window is to remember its
- * conversation: the run command with the id the CLI is told to use. Without
- * a grammar for the kind, or without an id, exactly the run command.
- */
-export function agentLaunchCommand(agent: AgentDef, conversationId: string | null): string {
-  const run = agentRunCommand(agent);
-  const launch = agentConversationGrammar(agent.kind)?.launch;
-  return launch && conversationId ? `${run} ${launch(conversationId)}` : run;
-}
-
 /** `install && launch`, or null when the agent has no install command. */
 export function agentInstallAndLaunchCommand(
   agent: AgentDef,
@@ -255,22 +190,6 @@ export function agentInstallAndLaunchCommand(
 ): string | null {
   const install = agent.install?.trim();
   return install ? `${install} && ${agentLaunchCommand(agent, conversationId)}` : null;
-}
-
-/**
- * What a restart types to bring the agent back where it was: resume the
- * conversation it names (`restartConversation` decides which), or the latest
- * one in this folder when there is none to name. Null when this kind of agent
- * cannot be resumed at all, so the caller falls back to a plain relaunch and
- * says so.
- */
-export function agentResumeCommand(agent: AgentDef, conversationId: string | null): string | null {
-  const grammar = agentConversationGrammar(agent.kind);
-  if (!grammar) return null;
-  const run = agentRunCommand(agent);
-  if (conversationId && grammar.resume) return `${run} ${grammar.resume(conversationId)}`;
-  if (grammar.continueLatest) return `${run} ${grammar.continueLatest}`;
-  return null;
 }
 
 /**

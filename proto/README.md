@@ -1731,6 +1731,125 @@ browser reports/compensates without a plaintext server fallback. Missing key,
 unknown envelope/schema, missing referenced manifest/skill revision,
 corruption, or offline host fails closed as defined by the ADR.
 
+## Relaunch lines and move notes
+
+When a device brings an agent back in a fresh shell — Restart today; a move,
+an account switch or a place change next — it types one line at the shell
+prompt, and after a move it tells the agent where it now is. Both are
+composed on the device by one module that the browser and the phone carry
+byte for byte (`web/src/lib/agent-relaunch.ts`,
+`mobile/src/data/selectors/agent-relaunch.ts`) and that
+[`agent-note-vectors.json`](agent-note-vectors.json) pins. Neither is a wire
+message and the server never sees either, but every client has to type
+exactly the same thing.
+
+**The line** is `<environment><command>[ <yolo arguments>][ <conversation>][
+<mode>][ <note>]`:
+
+- the agent definition's environment; its command, as written, since it is
+  the definition's own shell text; in yolo mode, its yolo arguments, with its
+  yolo environment merged over its environment;
+- the conversation, in the CLI's grammar: Claude Code `--resume <id>`,
+  `--continue` when there is no id to name, `--session-id <id>` to start a
+  fresh one under an id; Codex `resume <id>` and `resume --last`, and no start
+  under an id. An agent with no grammar is relaunched plainly, never resumed;
+- with an explicit permission mode, `--permission-mode <mode>` — Claude Code
+  only, with `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`
+  or `plan`; `manual`, which newer releases' help shows, is written `default`,
+  which every release accepts. Claude Code ranks
+  `--dangerously-skip-permissions` above any mode it is given, so a line with
+  an explicit mode carries neither the yolo arguments nor the yolo
+  environment, and a yolo window keeps its mode by asking for
+  `bypassPermissions`;
+- the note, as the last argument, where it is delivered positionally.
+
+A line that cannot be said as asked — a mode the CLI has no flag, or no such
+mode, for; a note the CLI or the shell cannot take on the command line — is
+not composed at all, never composed with that part left off. Restart asks for
+no mode and no note: the agent comes back on the same host in the mode its
+own conversation recorded, as it always has. Every resume SPAWN D types after
+a move or an account switch carries an explicit mode, so a carried record can
+never bring back a mode the Operator did not choose on the receiving host.
+
+**Shells and quoting.** The target daemon reports its login shell over the
+device's channel; a path, a login shell's leading `-` and a Windows `.exe` are
+stripped from it. `sh`, `bash`, `zsh`, `dash`, `ksh`, `mksh` and `ash` are
+POSIX: a word passes bare when it is only `[A-Za-z0-9_@%+=:,./-]`, and is
+otherwise single-quoted with `'\''` for a quote. `fish` single-quotes with
+`\'` and `\\` (bare: `[A-Za-z0-9_+=:,./-]`). `pwsh` and `powershell`
+single-quote with every quote doubled — PowerShell also ends a single-quoted
+string at `‘ ’ ‚ ‛`, so those are doubled too — and pass bare only a word that
+starts with a letter or `_` and goes on in `[A-Za-z0-9_./:-]`, since a bare
+word that starts with a digit can be read as a number; an environment there is
+`$env:KEY='value'; ` statements, PowerShell having no `KEY=value command`.
+`cmd`, `nu`, csh, tcsh and any shell the target does not name get the POSIX
+spelling, which every line had before a target could say, and never a note on
+the line. A quoted value is always one line: a line break or a tab typed at an
+interactive prompt acts whatever the quoting. The vectors' quoting cases and
+positional notes read back exactly in bash, dash, zsh, ksh, mksh, fish and
+PowerShell 7.6 (the notes under PowerShell's legacy argument passing too) —
+except one known gap: zsh expands a bare word or an assignment value that
+begins with `=` to a command's path, and the POSIX rule, older than this
+module and kept so that Restart types what it always has, passes such a word
+bare.
+
+**The note's facts.** A note is written only from what the device holds: the
+two hosts' names and OS from the server's host rows; the folder the agent
+continues in and the target's memory folder (taken from the repository root,
+not the folder) from the target daemon's replies; and the agent's state on the
+source when the person confirmed — `conv.inspect`'s `state`, where `running`
+and `blocked` are mid-turn and anything else is idle. Nothing read from the
+source host, no transcript text and no path it names, enters a note. A host
+name is the server's word and the note speaks with SPAWN D's voice, so a name
+keeps only letters and digits of any script, spaces and `. _ ( ) -`: spacing
+becomes one space; everything invisible goes (controls, bidirectional and
+zero-width formatting, lone surrogates, variation selectors, tag characters,
+private use, noncharacters — spelled as code-point ranges so every JavaScript
+engine draws the same line); it is cut to 40 code points with `…`; and a name
+with nothing left is "another host" (the source) or "this host" (the target).
+An OS is `Linux`, `macOS` or `Windows`, or is left out. A folder is shown
+exactly as the daemon reported it or not at all: one with anything invisible,
+a `"` (which PowerShell's legacy argument passing drops), or more than 160
+code points is left out together with the clause that names it.
+
+**The note.** Mid-turn, sent as the agent's next turn:
+
+> [SPAWN D] This conversation just moved from dream (Linux) to mac (macOS)
+> and continues in ~/code/spawn. Files were not copied, so anything not pushed
+> from dream is missing here. Background tasks and dream-only MCP tools did
+> not come along. The memory folder named in your instructions is on dream;
+> save memories under ~/.claude/projects/-Users-me-code-spawn/memory instead.
+> You were in the middle of a task: check whether your last action took
+> effect, then carry on.
+
+An agent blocked on a prompt gets "You were waiting for an answer to a prompt
+when it moved, and it was not answered: ask again if you still need it." as
+the last sentence instead. An idle agent gets a prefix for the person's next
+message, typed and never sent, ending in a space for their words:
+
+> [SPAWN D: moved from dream (Linux) to mac (macOS), now in ~/code/spawn. Not
+> carried: unpushed files, background tasks, dream-only MCP tools. Save
+> memories under ~/.claude/projects/-Users-me-code-spawn/memory.]
+
+Without a memory folder from the target the memory sentence is left out, and
+without a folder the clause naming it. The memory sentence is there because a
+resumed conversation keeps its recorded system prompt, which names the
+source's folder. The longest note the limits allow is 929 code points, and a
+note never starts with `/` or `!`.
+
+**Delivery.** `positional`: mid-turn, where the CLI takes a first prompt on its
+command line (Claude Code; not Codex) and the shell is POSIX, fish or
+PowerShell, the note is the line's last argument. `typed`: mid-turn anywhere
+else, typed into the agent once the device sees its ready prompt, then Enter.
+`typed_no_enter`: idle, typed once the agent is ready and never sent. No
+dialog the agent shows is answered for the person; Enter follows only the
+ready prompt, and never an idle note.
+
+**Never** a hidden `--prefill` (undocumented: a release without it would fail
+the resume itself), `--append-system-prompt` (a resumed conversation keeps
+its recorded system prompt until it is compacted), or a rewritten or stripped
+transcript (its thinking blocks are bound to it).
+
 ## Versioning
 
 - The WS subprotocol literal is the version handle. The browser WS
