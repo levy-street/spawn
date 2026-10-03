@@ -70,6 +70,51 @@ describe("workspace action sheets", () => {
     });
   });
 
+  it("lets a pane from a newer SPAWN D move or go, but never copies it blind", async () => {
+    const tile: Tile = {
+      session_id: "desktop-1",
+      x: 0,
+      y: 0,
+      w: 12,
+      h: 24,
+      widget: { kind: "desktop", host_id: "host-1", desktop_id: "d1" },
+    };
+    const workspace = makeWorkspace([makeTab("main", [tile]), makeTab("tests")]);
+    await render(
+      <PaneActionsSheet
+        agents={[]}
+        onDismiss={jest.fn()}
+        onDuplicate={jest.fn()}
+        onMove={jest.fn()}
+        onMoveToHost={jest.fn()}
+        onRemove={jest.fn()}
+        onRename={jest.fn()}
+        onReorder={jest.fn()}
+        onRestart={jest.fn()}
+        onTranscripts={jest.fn()}
+        sessionsById={new Map()}
+        target={{ tabId: "main", tile }}
+        visible
+        workspace={workspace}
+      />,
+    );
+
+    const actions = latestActions();
+    expectEveryActionHandled(actions);
+    expect(actions.map((action) => action.id)).toEqual([
+      "move",
+      "duplicate",
+      "move-up",
+      "move-down",
+      "remove",
+    ]);
+    expect(actions.find((action) => action.id === "duplicate")).toMatchObject({
+      disabled: true,
+      detail: "Needs a newer SPAWN D",
+    });
+    expect(actions.find((action) => action.id === "remove")?.disabled).toBeFalsy();
+  });
+
   it("explains disabled move destinations and wires every destination", async () => {
     const tile: Tile = { session_id: "session-1", x: 0, y: 0, w: 24, h: 24 };
     const workspace = makeWorkspace([makeTab("main", [tile]), makeTab("tests")]);

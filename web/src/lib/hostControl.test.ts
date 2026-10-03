@@ -301,12 +301,16 @@ afterEach(() => {
 
 describe("HostControlClient", () => {
   test.each([
-    { version: 1, supportsSessions: true },
-    { version: 2, supportsSessions: true },
-    { version: 2, supportsSessions: false },
+    { version: 1, supportsSessions: true, families: 0 },
+    { version: 2, supportsSessions: true, families: 0 },
+    { version: 2, supportsSessions: false, families: 0 },
+    // Past 64 names the old parser emptied the set, `session.transport.v1`
+    // went with it, and a working host was told to update its daemon.
+    { version: 2, supportsSessions: true, families: 70 },
   ])("signed host handshake %o applies authenticated SDP and required capabilities", async ({
     version,
     supportsSessions,
+    families,
   }) => {
     const signed = await signedRtcTrust();
     const client = new HostControlClient(hostId, {
@@ -371,7 +375,10 @@ describe("HostControlClient", () => {
           version: 1,
           type: "hello",
           protocol: HOST_CONTROL_PROTOCOL,
-          capabilities: supportsSessions ? ["session.transport.v1"] : ["ping"],
+          capabilities: [
+            ...Array.from({ length: families }, (_, index) => `family${index}.v1`),
+            supportsSessions ? "session.transport.v1" : "ping",
+          ],
         }),
       );
       if (!supportsSessions) {
@@ -1846,12 +1853,12 @@ describe("HostControlClient capabilities", () => {
     client.close();
   });
 
-  test("a malformed capability list degrades to empty without dropping the channel", async () => {
-    // An odd hello from a future daemon means "we cannot read its menu", not
-    // "this connection is broken".
+  test("a malformed capability entry is skipped without dropping the channel", async () => {
+    // An odd entry from a future daemon means "we cannot read that item", not
+    // "this connection is broken" and not "this host offers nothing".
     const { client, pc } = await readyClient({}, hostId, ["fs.list", 42]);
     expect(client.state).toBe("ready");
-    expect(client.getCapabilities().size).toBe(0);
+    expect([...client.getCapabilities()]).toEqual(["fs.list"]);
     expect(pc.channel.closed).toBe(false);
     client.close();
   });

@@ -293,6 +293,38 @@ export const RecentDirsSchema = z.object({
 });
 export type RecentDirs = z.infer<typeof RecentDirsSchema>;
 
+export const SESSION_STATUSES = ["starting", "running", "exited", "killed"] as const;
+export type SessionStatus = (typeof SESSION_STATUSES)[number];
+export const SESSION_ACTIVITY_STATES = [
+  "starting",
+  "active",
+  "quiet",
+  "waiting",
+  "input_sent",
+  "exited",
+  "killed",
+  "unknown",
+] as const;
+export type SessionActivityState = (typeof SESSION_ACTIVITY_STATES)[number];
+
+/**
+ * The server's status is free text, and a newer server adds values (a window
+ * being moved between hosts reads `moving`). One unknown value must not fail
+ * the parse of every session list it appears in, so it reads as `starting`:
+ * the window exists, and is not running here yet.
+ */
+export function knownSessionStatus(value: string): SessionStatus {
+  return (SESSION_STATUSES as readonly string[]).includes(value)
+    ? (value as SessionStatus)
+    : "starting";
+}
+
+function knownActivityState(value: string): SessionActivityState {
+  return (SESSION_ACTIVITY_STATES as readonly string[]).includes(value)
+    ? (value as SessionActivityState)
+    : "unknown";
+}
+
 /** A PTY on a host. Always the user's login shell in a chosen directory. */
 export const SessionSchema = z.object({
   id: z.string().uuid(),
@@ -300,16 +332,14 @@ export const SessionSchema = z.object({
   host_id: z.string().uuid(),
   host_name: z.string().nullable().default(null),
   cwd: z.string(),
-  status: z.enum(["starting", "running", "exited", "killed"]),
+  status: z.string().transform(knownSessionStatus),
   started_at: z.string(),
   exited_at: z.string().nullable(),
   exit_code: z.number().int().nullable(),
   last_output_at: z.string().nullable().default(null),
   last_input_at: z.string().nullable().default(null),
   last_activity_at: z.string().nullable().default(null),
-  activity_state: z
-    .enum(["starting", "active", "quiet", "waiting", "input_sent", "exited", "killed", "unknown"])
-    .default("unknown"),
+  activity_state: z.string().default("unknown").transform(knownActivityState),
   activity_label: z.string().default("Unknown"),
   /** Basename of the foreground process, reported by the daemon; null until
    * the worker reports one (old workers never do). */
@@ -390,12 +420,22 @@ export const SessionAccessSchema = z.object({
 });
 export type SessionAccess = z.infer<typeof SessionAccessSchema>;
 
+/**
+ * A pane's non-session content. One kind this client does not know must not
+ * fail the whole workspace: it parses as an inert widget, kept verbatim so a
+ * layout saved from here carries it back unchanged. Both kinds keep fields
+ * they do not name, for the same reason.
+ */
+export const TileWidgetSchema: z.ZodType<TileWidget> = z.union([
+  z.looseObject({
+    kind: z.literal("files"),
+    host_id: z.string().uuid(),
+    path: z.string(),
+  }),
+  z.looseObject({ kind: z.string().refine((kind) => kind !== "files") }),
+]);
+
 /** Grid layout v2: a 12×12 canvas of non-overlapping session tiles. */
-export const TileWidgetSchema: z.ZodType<TileWidget> = z.object({
-  kind: z.literal("files"),
-  host_id: z.string().uuid(),
-  path: z.string(),
-});
 
 export const TileSchema: z.ZodType<Tile> = z.object({
   session_id: z.string().uuid(),

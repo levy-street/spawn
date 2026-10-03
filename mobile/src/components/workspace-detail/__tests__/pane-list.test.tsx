@@ -131,6 +131,42 @@ describe("workspace tab pane lists", () => {
     expect(onOpenFiles).toHaveBeenCalledWith("host-1", "/Users/spawn/dev");
   });
 
+  it("draws a pane from a newer SPAWN D as an inert row that still opens its actions", async () => {
+    const onPaneActions = jest.fn();
+    const onOpenFiles = jest.fn();
+    const tile: Tile = {
+      session_id: "desktop-1",
+      x: 0,
+      y: 0,
+      w: 24,
+      h: 24,
+      widget: { kind: "desktop", host_id: "host-1", desktop_id: "d1" },
+    };
+    const screen = await render(
+      <PaneList
+        agents={[]}
+        canAddPane
+        hostsById={new Map([["host-1", makeHost()]])}
+        onAddPane={jest.fn()}
+        onOpenFiles={onOpenFiles}
+        onOpenTerminal={jest.fn()}
+        onPaneActions={onPaneActions}
+        onRefresh={jest.fn()}
+        refreshing={false}
+        sessionsById={new Map()}
+        tab={makeTab("main", [tile])}
+        transports={{}}
+      />,
+      { wrapper: ThemeProvider },
+    );
+
+    expect(screen.getByText("This pane needs a newer SPAWN D")).toBeTruthy();
+    expect(screen.queryByText("Session unavailable")).toBeNull();
+    fireEvent.press(screen.getByText("This pane needs a newer SPAWN D"));
+    expect(onPaneActions).toHaveBeenCalledWith(tile);
+    expect(onOpenFiles).not.toHaveBeenCalled();
+  });
+
   it("refreshes the tab on a pull, over the whole page rather than the rows alone", async () => {
     const onRefresh = jest.fn();
     const tab = makeTab("main", [

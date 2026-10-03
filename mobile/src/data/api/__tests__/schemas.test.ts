@@ -225,6 +225,68 @@ it("round-trips workspace layout response JSON", () => {
   expect(WorkspaceOutSchema.parse(fixture)).toEqual(fixture);
 });
 
+it("keeps a pane kind from a newer SPAWN D, verbatim, through read and save", () => {
+  const desktop = { kind: "desktop", host_id: UUID_B, desktop_id: "d1", fallback: { w: 1280 } };
+  const files = { kind: "files", host_id: UUID_B, path: "/srv", show_hidden: true };
+  const layout = {
+    version: 3,
+    active_tab: "main",
+    tabs: [
+      {
+        id: "main",
+        name: "Main",
+        layout: {
+          version: 3,
+          tiles: [
+            { session_id: UUID_A, x: 0, y: 0, w: 12, h: 24, widget: desktop },
+            { session_id: UUID_C, x: 12, y: 0, w: 12, h: 24, widget: files },
+          ],
+        },
+        host_id: null,
+        cwd: null,
+      },
+    ],
+  };
+  const parsed = WorkspaceOutSchema.parse({
+    id: UUID_A,
+    name: "Project",
+    host_id: null,
+    cwd: null,
+    layout,
+    position: 0,
+    icon: null,
+    icon_source: null,
+    archived_at: null,
+    created_at: NOW,
+    updated_at: NOW,
+  });
+  expect(parsed.layout).toEqual(layout);
+  // A layout saved from this phone carries both back exactly as they came.
+  expect(WorkspacePatchSchema.parse({ layout }).layout).toEqual(layout);
+});
+
+it("still refuses a files pane that is not well formed", () => {
+  const withWidget = (widget: unknown) => ({
+    version: 3,
+    active_tab: "main",
+    tabs: [
+      {
+        id: "main",
+        name: "Main",
+        layout: { version: 3, tiles: [{ session_id: UUID_A, x: 0, y: 0, w: 12, h: 24, widget }] },
+        host_id: null,
+        cwd: null,
+      },
+    ],
+  });
+  expect(() => WorkspacePatchSchema.parse({ layout: withWidget({ kind: "files" }) })).toThrow();
+  expect(() => WorkspacePatchSchema.parse({ layout: withWidget({ path: "/" }) })).toThrow();
+});
+
+it("parses a session status this app has never seen", () => {
+  expect(SessionOutSchema.parse({ ...session, status: "moving" }).status).toBe("moving");
+});
+
 it("preserves optional versus explicit-null workspace patch fields", () => {
   expect(WorkspacePatchSchema.parse({})).toEqual({});
   expect(WorkspacePatchSchema.parse({ icon: null, host_id: null, cwd: null })).toEqual({

@@ -190,3 +190,21 @@ describe("sessionOwnName", () => {
     expect(sessionOwnName({ name: "dream - spawn", host_name: "beta" })).toBe("dream - spawn");
   });
 });
+
+describe("a session status this app has never seen", () => {
+  // A newer server can report a status this build does not know (a window
+  // being moved between hosts reads `moving`). It must still list, read
+  // sensibly and never count as dead.
+  const moving = session({ status: "moving", activity_state: "moving", activity_label: "" });
+
+  test("reads as its own name, never as dead or running", () => {
+    expect(deriveActivity(moving, NOW)).toMatchObject({ state: "moving", label: "Moving" });
+    expect(sessionAttention(moving)).toBeNull();
+    expect(activityTone(moving)).toBe("offline");
+    expect(displayStatus(moving, null, "idle")).toMatchObject({
+      process: "moving",
+      label: "MOVING",
+      attention: null,
+    });
+  });
+});

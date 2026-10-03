@@ -1,4 +1,5 @@
 import type { Session, Workspace } from "@/lib/api";
+import { isFilesWidget } from "@/lib/grid";
 import { sessionNeedsAttention } from "@/lib/sessions";
 import { allSessionIds, allTiles, type WorkspaceTab } from "@/lib/tabs";
 
@@ -36,7 +37,7 @@ export function workspaceFolder(
     if (session) return { host_id: session.host_id, cwd: session.cwd };
   }
   for (const tile of allTiles(workspace.layout)) {
-    if (tile.widget) return { host_id: tile.widget.host_id, cwd: tile.widget.path };
+    if (isFilesWidget(tile.widget)) return { host_id: tile.widget.host_id, cwd: tile.widget.path };
   }
   return workspace.host_id && workspace.cwd
     ? { host_id: workspace.host_id, cwd: workspace.cwd }

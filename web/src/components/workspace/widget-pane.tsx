@@ -9,6 +9,7 @@ import {
   Folder,
   FolderPlus,
   RefreshCw,
+  Shapes,
   Trash2,
   Upload,
   X,
@@ -21,34 +22,20 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { hosts } from "@/lib/api";
-import type { Tile, TileWidget } from "@/lib/grid";
+import { type FilesTileWidget, isFilesWidget, type Tile, type TileWidget } from "@/lib/grid";
 import { basename } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 import { FolderPicker } from "./folder-picker";
 
+/** Header name of a pane whose kind came from a newer SPAWN D. */
+const UNSUPPORTED_PANE_TITLE = "Unsupported pane";
+
 export function widgetTitle(widget: TileWidget): string {
+  if (!isFilesWidget(widget)) return UNSUPPORTED_PANE_TITLE;
   return `Files — ${basename(widget.path) || widget.path}`;
 }
 
-/**
- * A non-session pane: same chrome as a shell pane (drag the title bar, the
- * grid's edge resize handles, remove from the menu) wrapped around widget
- * content.
- */
-export function WidgetPane({
-  tile,
-  widget,
-  focused,
-  paneCount,
-  canDrag,
-  canDuplicate = false,
-  onFocus,
-  onMoveStart,
-  onExpand,
-  onDuplicate,
-  onChangePath,
-  onRemove,
-}: {
+interface WidgetPaneProps {
   tile: Tile;
   widget: TileWidget;
   focused: boolean;
@@ -65,7 +52,37 @@ export function WidgetPane({
   /** Re-root this explorer at another folder on the same host. */
   onChangePath?: (tileId: string, path: string) => void;
   onRemove: (tileId: string) => void;
-}) {
+}
+
+/**
+ * A non-session pane: same chrome as a shell pane (drag the title bar, the
+ * grid's edge resize handles, remove from the menu) wrapped around widget
+ * content. A kind this client cannot draw gets the same chrome around an
+ * inert body, so it can still be moved, resized and closed.
+ */
+export function WidgetPane(props: WidgetPaneProps) {
+  const { widget } = props;
+  return isFilesWidget(widget) ? (
+    <FilesWidgetPane {...props} widget={widget} />
+  ) : (
+    <UnsupportedWidgetPane {...props} />
+  );
+}
+
+function FilesWidgetPane({
+  tile,
+  widget,
+  focused,
+  paneCount,
+  canDrag,
+  canDuplicate = false,
+  onFocus,
+  onMoveStart,
+  onExpand,
+  onDuplicate,
+  onChangePath,
+  onRemove,
+}: WidgetPaneProps & { widget: FilesTileWidget }) {
   const id = tile.session_id;
   const title = widgetTitle(widget);
   const explorerRef = useRef<FileExplorerHandle>(null);
@@ -209,6 +226,77 @@ export function WidgetPane({
         hideHeader
         className="min-h-0 flex-1"
       />
+    </section>
+  );
+}
+
+/**
+ * A pane a newer SPAWN D added: nothing here can draw it, and nothing here may
+ * change it. The layout keeps it untouched; this only says so, and still lets
+ * it be moved, resized or closed like any other pane.
+ */
+function UnsupportedWidgetPane({
+  tile,
+  focused,
+  paneCount,
+  canDrag,
+  onFocus,
+  onMoveStart,
+  onExpand,
+  onRemove,
+}: WidgetPaneProps) {
+  const id = tile.session_id;
+  return (
+    <section
+      aria-label={UNSUPPORTED_PANE_TITLE}
+      onPointerDownCapture={() => onFocus(id)}
+      className="relative isolate flex size-full min-h-0 min-w-0 flex-col overflow-hidden bg-background"
+      data-testid="unsupported-pane"
+    >
+      {!focused && paneCount > 1 && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-10 bg-shell/50 mix-blend-darken dark:mix-blend-lighten"
+        />
+      )}
+      <header
+        role="toolbar"
+        aria-label={`${UNSUPPORTED_PANE_TITLE} window controls`}
+        title={canDrag ? "Drag to move · Double-click to fill empty space" : undefined}
+        className={cn(
+          "flex h-9 shrink-0 items-center gap-2 border-b border-pane-divider bg-card/75 px-2 select-none",
+          canDrag && "cursor-grab active:cursor-grabbing",
+        )}
+        onPointerDown={(event) => {
+          if ((event.target as Element).closest?.("button, input, a")) return;
+          onMoveStart(id, event);
+        }}
+        onDoubleClick={(event) => {
+          if ((event.target as Element).closest?.("button, input, a")) return;
+          onExpand?.(id);
+        }}
+      >
+        <span className="mr-auto flex h-7 min-w-0 items-center gap-1.5 px-1.5 text-xs text-muted-foreground">
+          <Shapes className="size-3.5 shrink-0" aria-hidden />
+          <span className="truncate font-medium">{UNSUPPORTED_PANE_TITLE}</span>
+        </span>
+        <button
+          type="button"
+          aria-label={`Close ${UNSUPPORTED_PANE_TITLE}`}
+          onClick={() => onRemove(id)}
+          className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+        >
+          <X className="size-3.5" aria-hidden />
+        </button>
+      </header>
+      <div className="grid min-h-0 flex-1 place-items-center p-4 text-center">
+        <div className="max-w-xs space-y-1">
+          <p className="text-sm font-medium text-foreground">This pane needs a newer SPAWN D</p>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            A newer version added it. You can still move it, resize it or close it here.
+          </p>
+        </div>
+      </div>
     </section>
   );
 }

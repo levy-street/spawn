@@ -9,6 +9,7 @@ import {
   tabAttentionCount,
   tabAttentionLevel,
   workspaceAttentionCount,
+  workspaceFolder,
   workspaceLiveSessionCount,
   workspaceRecency,
   workspaceSessionIds,
@@ -243,5 +244,31 @@ describe("attention level", () => {
     expect(tabAttentionLevel(tab(["a", "c"]), sessions)).toBe("waiting");
     expect(tabAttentionLevel(tab(["a", "b"]), sessions)).toBe("dead");
     expect(tabAttentionLevel(tab(["c"]), sessions)).toBeNull();
+  });
+});
+
+describe("workspaceFolder", () => {
+  test("a pane from a newer SPAWN D is never read as a place to open a window", () => {
+    const desktop: Tile = {
+      session_id: S1,
+      x: 0,
+      y: 0,
+      w: 12,
+      h: 24,
+      widget: { kind: "desktop", host_id: "elsewhere", desktop_id: "d1" },
+    };
+    const files: Tile = {
+      session_id: S2,
+      x: 12,
+      y: 0,
+      w: 12,
+      h: 24,
+      widget: { kind: "files", host_id: "11111111-2222-4333-8444-555555555555", path: "/srv" },
+    };
+    expect(workspaceFolder(makeWorkspace([desktop, files]), [])).toEqual({
+      host_id: "11111111-2222-4333-8444-555555555555",
+      cwd: "/srv",
+    });
+    expect(workspaceFolder(makeWorkspace([desktop]), [])).toBeNull();
   });
 });

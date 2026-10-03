@@ -80,3 +80,38 @@ describe("templateSpecFromWorkspace", () => {
     expect(spec.tabs[0]?.tiles[1]?.run).toEqual({ kind: "shell" });
   });
 });
+
+describe("templateSpecFromWorkspace and panes from a newer SPAWN D", () => {
+  test("leaves out a pane it cannot describe instead of recording it as files", () => {
+    const withUnsupported: LayoutV3 = {
+      version: 3,
+      active_tab: "t1",
+      tabs: [
+        {
+          id: "t1",
+          name: "Mixed",
+          layout: {
+            version: 3,
+            tiles: [
+              { session_id: "s1", x: 0, y: 0, w: 12, h: 24 },
+              {
+                session_id: "w1",
+                x: 12,
+                y: 0,
+                w: 12,
+                h: 24,
+                widget: { kind: "desktop", host_id: "h1", desktop_id: "d1" },
+              },
+            ],
+          },
+        },
+      ],
+    };
+    const spec = templateSpecFromWorkspace(
+      withUnsupported,
+      new Map([["s1", session("s1", "zsh")]]),
+      [],
+    );
+    expect(spec.tabs[0]?.tiles).toEqual([{ x: 0, y: 0, w: 12, h: 24, run: { kind: "shell" } }]);
+  });
+});

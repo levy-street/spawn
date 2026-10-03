@@ -1,4 +1,5 @@
 import type { Agent, Session, WorkspaceTemplateSpec } from "@/lib/api";
+import { isFilesWidget } from "@/lib/grid";
 import { sessionAgent } from "@/lib/sessions";
 import type { LayoutV3 } from "@/lib/tabs";
 
@@ -20,15 +21,19 @@ export function templateSpecFromWorkspace(
     version: 2,
     tabs: layout.tabs.map((tab) => ({
       name: tab.name,
-      tiles: tab.layout.tiles.map((tile) => ({
-        x: tile.x,
-        y: tile.y,
-        w: tile.w,
-        h: tile.h,
-        run: tile.widget
-          ? { kind: "files" as const }
-          : (agentRun(sessionsById.get(tile.session_id), agents) ?? { kind: "shell" as const }),
-      })),
+      tiles: tab.layout.tiles
+        // A pane from a newer SPAWN D has no recipe this client can write
+        // down; leaving it out beats recording it as something it is not.
+        .filter((tile) => !tile.widget || isFilesWidget(tile.widget))
+        .map((tile) => ({
+          x: tile.x,
+          y: tile.y,
+          w: tile.w,
+          h: tile.h,
+          run: tile.widget
+            ? { kind: "files" as const }
+            : (agentRun(sessionsById.get(tile.session_id), agents) ?? { kind: "shell" as const }),
+        })),
     })),
   };
 }
