@@ -105,7 +105,11 @@ function safeTerminalLink(url: string): boolean {
 }
 
 function pendingLaunchNotice(result: PendingLaunchDeliveryResult): string | null {
-  if (result.status === "sent" || result.status === "missing") return null;
+  // Dropped because the window has moved on since: whoever moved it started
+  // what runs there now, and there is nothing to tell.
+  if (result.status === "sent" || result.status === "missing" || result.status === "elsewhere") {
+    return null;
+  }
   if (result.status === "stale") {
     return "The saved agent launch expired. This session was left as a shell.";
   }
@@ -210,6 +214,27 @@ export function TerminalOverlay({
   // right on it.
   const [agentNotice, setAgentNotice] = useState<AgentNotice | null>(null);
   const [restarting, setRestarting] = useState(false);
+  // The window's current run — one worker on one host. A window moved to
+  // another host keeps its id, and this screen follows it there with a fresh
+  // surface on that host's connection rather than re-pointing the old one.
+  // What the old worker said about its display and its agent goes with it.
+  //
+  // `claimOwed` is whether this screen still owes the run the claim an
+  // opening makes. The first run is however this screen was opened, and owes
+  // it until a surface reaches ready, where the surface takes the display. A
+  // Retry carries an unpaid claim to its fresh surface and never makes a new
+  // one: reconnecting is not opening, so a Retry after this screen had the
+  // display does not take it back from a device that took it since (the
+  // phone's lease, if no one did, still makes its new view the owner). A run
+  // the window moved to while this screen was open is a reconnect and owes
+  // nothing; a restart from here is an opening again (`reopen`). The browser
+  // keeps the same rule: its terminal's owed claim outlives reconnects.
+  const [incarnation, setIncarnation] = useState({ hostId: host.id, claimOwed: true });
+  if (incarnation.hostId !== host.id) {
+    setIncarnation({ hostId: host.id, claimOwed: false });
+    setDisplay(null);
+    setAgentNotice(null);
+  }
 
   // The bottom nav is portalled to window level and nothing holds its footprint
   // open, so the terminal reserves it — and drops that reservation the moment
@@ -296,6 +321,8 @@ export function TerminalOverlay({
     previousConnectionState.current = next;
     setConnectionState(next);
     if (next === "ready") {
+      // The surface took the display on this ready if the claim was owed.
+      setIncarnation((current) => (current.claimOwed ? { ...current, claimOwed: false } : current));
       setHasEverBeenReady(true);
       setConnectionError(null);
       if (previous !== "ready") haptics.success();
@@ -321,6 +348,13 @@ export function TerminalOverlay({
     setConnectionError(null);
     setSurfaceGeneration((generation) => generation + 1);
   }, [host.id]);
+
+  /** A retry this screen asked for itself — a restart — is an opening: its
+   *  fresh surface takes the display, whichever host the window is on. */
+  const reopen = useCallback((): void => {
+    setIncarnation((current) => (current.claimOwed ? current : { ...current, claimOwed: true }));
+    retry();
+  }, [retry]);
 
   // Approval is granted somewhere else entirely, so the phone watches for it
   // and reconnects itself. Making the operator walk back here and press Retry
@@ -418,7 +452,7 @@ export function TerminalOverlay({
             ? `Session restarted. ${agent} starts when the shell is back.`
             : "Session restarted.",
         );
-        retry();
+        reopen();
       })
       .catch((error: unknown) => {
         transfers.setNotice(error instanceof Error ? error.message : "Session restart failed.");
@@ -520,11 +554,12 @@ export function TerminalOverlay({
           // handles and Copy/Look Up menu; a recogniser out here swallowed it.
           <View style={styles.surface}>
             <TerminalSurface
+              claimDisplay={incarnation.claimOwed}
               fontSize={fontSize}
-              hostId={host.id}
+              hostId={incarnation.hostId}
               hostIdentityPublicKey={hostKey}
               initialSize={INITIAL_TERMINAL_GRID}
-              key={`${session.id}-${surfaceGeneration}`}
+              key={`${session.id}@${incarnation.hostId}-${surfaceGeneration}`}
               onDiagnostic={setDiagnostic}
               onConnectionInfo={setConnectionInfo}
               onDisplayChange={setDisplay}

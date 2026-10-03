@@ -9,8 +9,9 @@ import { fullTab, makeAgent, makeHost, makeSession, makeWorkspace } from "./fixt
 
 function makePending(overrides: Partial<PendingLaunchStore> = {}): PendingLaunchStore {
   return {
-    persist: async (sessionId, command) => ({
+    persist: async (sessionId, hostId, command) => ({
       sessionId,
+      hostId,
       command,
       createdAt: 1,
       expiresAt: 2,
@@ -42,10 +43,10 @@ describe("two-stage launch orchestration", () => {
     let savedCommand: string | null = null;
     const session = makeSession();
     const pending = makePending({
-      persist: async (sessionId, command) => {
-        events.push(`persist:${sessionId}`);
+      persist: async (sessionId, hostId, command) => {
+        events.push(`persist:${sessionId}@${hostId}`);
         savedCommand = command;
-        return { sessionId, command, createdAt: 1, expiresAt: 2 };
+        return { sessionId, hostId, command, createdAt: 1, expiresAt: 2 };
       },
     });
     const patchWorkspace = jest.fn<
@@ -81,7 +82,7 @@ describe("two-stage launch orchestration", () => {
     expect(events).toEqual([
       "patch",
       `create:${makeHost().id}:/Users/ada/spawn`,
-      `persist:${session.id}`,
+      `persist:${session.id}@${session.host_id}`,
     ]);
     expect(patchWorkspace).toHaveBeenCalledWith(
       makeWorkspace().id,

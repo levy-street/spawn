@@ -253,7 +253,11 @@ export function LauncherFab({
         tile: placed,
       });
       if (choice.kind === "agent")
-        pendingLaunch.set(session.id, agentLaunchCommand(choice.agent, conversation));
+        pendingLaunch.set(
+          session.id,
+          session.host_id,
+          agentLaunchCommand(choice.agent, conversation),
+        );
       return { sessionId: session.id };
     },
     onSuccess: (result) => {

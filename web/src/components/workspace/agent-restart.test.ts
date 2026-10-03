@@ -96,7 +96,7 @@ describe("restartSessionAgent", () => {
     const result = await restartSessionAgent({ session: session(), agents: [claude], restart });
     expect(result.plan.kind).toBe("agent");
     expect(restart).toHaveBeenCalledTimes(1);
-    expect(pendingLaunch.take(session().id)).toBe(
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(
       "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
     );
   });
@@ -107,7 +107,7 @@ describe("restartSessionAgent", () => {
       session: session(),
       agents: [claude],
       restart: async () => {
-        seen.queuedAtRestart = pendingLaunch.has(session().id);
+        seen.queuedAtRestart = pendingLaunch.has(session().id, session().host_id);
         return session({ status: "starting" });
       },
     });
@@ -125,7 +125,7 @@ describe("restartSessionAgent", () => {
         },
       }),
     ).rejects.toThrow("host daemon is offline");
-    expect(pendingLaunch.has(session().id)).toBe(false);
+    expect(pendingLaunch.has(session().id, session().host_id)).toBe(false);
   });
 
   test("a shell window restarts without touching the queue", async () => {
@@ -136,7 +136,7 @@ describe("restartSessionAgent", () => {
       restart,
     });
     expect(result).toEqual({ plan: { kind: "shell" } });
-    expect(pendingLaunch.has(session().id)).toBe(false);
+    expect(pendingLaunch.has(session().id, session().host_id)).toBe(false);
   });
 });
 
@@ -274,7 +274,10 @@ describe("restartSessionAgent with the host's answer", () => {
       resumes: true,
     });
     expect(order).toEqual([`record ${moved}`, "restart"]);
-    expect(pendingLaunch.take(session().id)).toBe(`claude --resume ${moved}`);
+    // Queued for the window as it runs on its host now: a move that lands
+    // before the shell opens drops it rather than typing it over there.
+    expect(pendingLaunch.has(session().id, "99999999-9999-4999-8999-999999999999")).toBe(false);
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`claude --resume ${moved}`);
   });
 
   test("an unchanged conversation is not written back", async () => {
@@ -298,7 +301,9 @@ describe("restartSessionAgent with the host's answer", () => {
         restart: async () => session({ status: "starting" }),
         inspect,
       });
-      expect(pendingLaunch.take(session().id)).toBe(`claude --resume ${recorded}`);
+      expect(pendingLaunch.take(session().id, session().host_id)).toBe(
+        `claude --resume ${recorded}`,
+      );
     }
     await restartSessionAgent({
       session: session(),
@@ -307,7 +312,7 @@ describe("restartSessionAgent with the host's answer", () => {
       inspect: async () => live(),
       recordConversation: async () => Promise.reject(new Error("server down")),
     });
-    expect(pendingLaunch.take(session().id)).toBe(`claude --resume ${moved}`);
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`claude --resume ${moved}`);
   });
 
   test("restarts into a conversation held outside the window, and writes it back", async () => {
@@ -327,7 +332,7 @@ describe("restartSessionAgent with the host's answer", () => {
     expect(result.plan.kind === "agent" ? result.plan.command : null).toBe(
       `claude --resume ${moved}`,
     );
-    expect(pendingLaunch.take(session().id)).toBe(`claude --resume ${moved}`);
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`claude --resume ${moved}`);
   });
 
   test("a host that names no conversation writes nothing back", async () => {
@@ -340,7 +345,7 @@ describe("restartSessionAgent with the host's answer", () => {
       recordConversation,
     });
     expect(recordConversation).not.toHaveBeenCalled();
-    expect(pendingLaunch.take(session().id)).toBe("claude --continue");
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe("claude --continue");
   });
 
   test("a Codex window resumes the id the host names and leaves its record alone", async () => {
@@ -354,7 +359,7 @@ describe("restartSessionAgent with the host's answer", () => {
       recordConversation,
     });
     expect(recordConversation).not.toHaveBeenCalled();
-    expect(pendingLaunch.take(session().id)).toBe(`codex resume ${liveCodex}`);
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`codex resume ${liveCodex}`);
 
     // After `/new` the host sees two conversations open and names neither;
     // a recorded id is not the way back in.
@@ -369,7 +374,7 @@ describe("restartSessionAgent with the host's answer", () => {
         inspect,
         recordConversation,
       });
-      expect(pendingLaunch.take(session().id)).toBe("codex resume --last");
+      expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex resume --last");
     }
     expect(recordConversation).not.toHaveBeenCalled();
   });

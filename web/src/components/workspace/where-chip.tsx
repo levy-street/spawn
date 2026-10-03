@@ -48,7 +48,7 @@ export function WhereChip({
       <CascadeMenu
         root={where.panel(`where-${session.id}`, onPick)}
         align="end"
-        sheetTitle="Move this window"
+        sheetTitle="Where this runs"
         renderTrigger={(props) => (
           <button
             {...props}

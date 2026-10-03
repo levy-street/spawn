@@ -95,6 +95,7 @@ export async function instantiateTemplate(
       if (tile.run.kind === "agent") {
         pendingLaunch.set(
           session.id,
+          session.host_id,
           agent ? agentLaunchCommand(agent, conversation) : tile.run.command,
         );
       }

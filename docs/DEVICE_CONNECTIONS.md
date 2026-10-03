@@ -108,9 +108,33 @@ foreground or bringing one back to it, once the view is visible — so the view
 a person is looking at is the one that controls the terminal. The view that
 held it keeps its output and offers **Take control** to take it back.
 Reconnecting is not opening: a recovered view never takes the lease on its
-own, so two open devices do not trade it back and forth.
+own, so two open devices do not trade it back and forth. An opening's claim
+that never got through — the view failed before it was ready — stays owed
+across reconnects. The phone's Retry is a reconnect: it carries such a claim
+and makes no new one.
 Focusing another view within the owning device transfers its active view and
 geometry. The UI waits for daemon confirmation before enabling input.
+
+A window can move to another host and keep its id (`POST
+/api/sessions/{id}/move`). Each run of it — one worker and PTY on one host — is
+an incarnation, `<session id>@<host id>`, and terminals are keyed by it: when
+the window's host changes, the browser's warm terminal and the phone's terminal
+surface for it are replaced rather than re-pointed, and the new one attaches
+over the new host's connection with no replay offsets, lease or screen of the
+old worker inside it. Following a moved window is a reconnect on every device
+and never takes the lease. The exception is the device that moved it: the
+browser marks the new incarnation as one it opened before its move request
+leaves (it can hear of the move before its own response), and the phone opens
+the window's terminal, so that view takes the lease and types the agent's
+launch. A queued launch is typed only into a view open to the window's current
+host that holds its lease; typed any earlier it would be dropped. It belongs to
+the incarnation it was queued for: once a terminal is attached to the window on
+another host, or the browser's warm terminal follows it there, the launch is
+dropped rather than typed into what runs there, and one not typed within
+fifteen minutes lapses. A device that missed the
+move's data frame converges when its polled session list names the new host,
+which refetches the window's row; the list alone never moves a terminal, since a
+list response that left the server before the move can arrive after it.
 
 ## Bounds and verification
 

@@ -1,5 +1,6 @@
 "use client";
 
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createContext,
   type ReactNode,
@@ -12,8 +13,12 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { incarnationKey, openIntent } from "@/components/terminal/incarnation";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
+import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { AgentNotice } from "@/lib/agent-notice";
+import { type Session, sessions } from "@/lib/api";
+import { cachedListItem } from "@/lib/cached-list-item";
 import type { DisplayControlState } from "@/lib/ws";
 
 // Insert a prompt newline for mobile Return (same as the agent page/panes).
@@ -160,6 +165,15 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
       [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], agentNotice },
     }));
   }, []);
+  // What an incarnation reported dies with it: an "open" transport, a display
+  // lease, an agent's update notice — all facts about a worker that is gone.
+  const onIncarnationEnd = useCallback((sessionId: string) => {
+    setLive((m) => {
+      if (!(sessionId in m)) return m;
+      const { [sessionId]: _drop, ...rest } = m;
+      return rest;
+    });
+  }, []);
   const actions = useMemo<Actions>(
     () => ({ claim, release, getHandle }),
     [claim, release, getHandle],
@@ -201,12 +215,51 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
               onInfo={onInfo}
               onDisplay={onDisplay}
               onAgentNotice={onAgentNotice}
+              onIncarnationEnd={onIncarnationEnd}
             />
           );
         })}
       </StateCtx.Provider>
     </ActionsCtx.Provider>
   );
+}
+
+/**
+ * Where a warm terminal's window runs, as this tab knows it.
+ *
+ * Read from the window's own row (`["session", id]`), the one the terminal
+ * also reads its status from. Nothing polls that row, though, while the
+ * session list is polled wherever windows are shown — so when the list has
+ * heard of a move the row has not (its data frame lost to a dropped alert
+ * socket, say), the row is refetched rather than trusted for ever. Only
+ * refetched: a list response that left the server before the move can arrive
+ * after it, and must never send a terminal back to the host it left.
+ */
+function useIncarnationHost(sessionId: string): string | null {
+  const queryClient = useQueryClient();
+  const row = useQuery({
+    queryKey: ["session", sessionId],
+    queryFn: () => sessions.get(sessionId),
+    staleTime: 30_000,
+    ...cachedListItem<Session>(queryClient, ["sessions"], sessionId),
+  });
+  // Observes the list without fetching it: the screens that show windows own
+  // its polling.
+  const list = useQuery({
+    queryKey: ["sessions"],
+    queryFn: () => sessions.list(),
+    enabled: false,
+  });
+  const hostId = row.data?.host_id ?? null;
+  const listedHostId = list.data?.find((item) => item.id === sessionId)?.host_id ?? null;
+  const listIsNewer = list.dataUpdatedAt > row.dataUpdatedAt;
+  useEffect(() => {
+    if (!listIsNewer || listedHostId === null || hostId === null || listedHostId === hostId) {
+      return;
+    }
+    void queryClient.invalidateQueries({ queryKey: ["session", sessionId], exact: true });
+  }, [hostId, listIsNewer, listedHostId, queryClient, sessionId]);
+  return hostId;
 }
 
 function PooledTerminal({
@@ -217,6 +270,7 @@ function PooledTerminal({
   onInfo,
   onDisplay,
   onAgentNotice,
+  onIncarnationEnd,
 }: {
   sessionId: string;
   active: boolean;
@@ -225,12 +279,46 @@ function PooledTerminal({
   onInfo: (sessionId: string, info: SessionConnectionInfo) => void;
   onDisplay: (sessionId: string, state: DisplayControlState) => void;
   onAgentNotice: (sessionId: string, notice: AgentNotice | null) => void;
+  onIncarnationEnd: (sessionId: string) => void;
 }) {
+  const hostId = useIncarnationHost(sessionId);
+  // The incarnation this pool entry shows. Learning the first host is not a
+  // move — the terminal mounted before the row loaded keeps going — but each
+  // change from one known host to another is: a new generation, a new
+  // Terminal, a new attachment over that host's connection.
+  const [incarnation, setIncarnation] = useState({ hostId, generation: 0 });
+  if (hostId !== null && hostId !== incarnation.hostId) {
+    setIncarnation({
+      hostId,
+      generation: incarnation.hostId === null ? incarnation.generation : incarnation.generation + 1,
+    });
+  }
+  // Only an incarnation the window moved to changes anything; the first one's
+  // host changes only as it is learned.
+  const movedTo = incarnation.generation > 0 ? incarnation.hostId : null;
+  // The first incarnation is however this terminal was opened. A later one is
+  // a reconnect on every device but the one that moved the window there.
+  const claimDisplayOnOpen = movedTo === null || openIntent.has(incarnationKey(sessionId, movedTo));
+  useEffect(() => {
+    if (movedTo !== null) {
+      openIntent.clear(incarnationKey(sessionId, movedTo));
+      // A launch queued for the window as it ran on another host belongs to
+      // an incarnation that has gone. Dropped here, where the warm terminal
+      // follows the window even with no pane on screen to type it.
+      pendingLaunch.observe(sessionId, movedTo);
+    }
+    // Cleanups run before the next incarnation's terminal reports, so this
+    // clears the old one's facts without touching the new one's.
+    return () => onIncarnationEnd(sessionId);
+  }, [movedTo, onIncarnationEnd, sessionId]);
   return createPortal(
     <div className="size-full @container/term">
       <Terminal
+        key={incarnation.generation}
         ref={handleRef}
         sessionId={sessionId}
+        hostId={incarnation.hostId}
+        claimDisplayOnOpen={claimDisplayOnOpen}
         rawInput
         mobileReturnMode="newline"
         mobileReturnBytes={MOBILE_PROMPT_NEWLINE}

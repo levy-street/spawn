@@ -1294,6 +1294,33 @@ class SessionCreate(BaseModel):
     tile: TilePlacement | None = None
 
 
+class SessionMove(BaseModel):
+    """Where a window runs, changed: the same row on another host.
+
+    The window keeps its id, name, agent, skill grants and every client key
+    hung off them; only the incarnation — the worker and PTY on one host — is
+    replaced. `expected_host_id` is the host the client saw the window on, so a
+    move raced by another device's move refuses instead of landing twice."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host_id: str
+    cwd: str = Field(min_length=1, max_length=1024)
+    expected_host_id: str
+    # The agent the client is starting in the window over there, when it
+    # starts one. A window opened as an agent already names it and this only
+    # repeats it; a shell someone typed an agent into by hand names none, and
+    # without this the agent would start there with a conversation the window
+    # never recorded. As on create it is the window's type, checked against the
+    # caller's agents, never anything the server runs. Omitted or null leaves
+    # the type as it is.
+    agent_id: str | None = None
+    # The conversation the client is starting the agent with on the new host
+    # (a fresh one: nothing of the old conversation travels). Omitted or null
+    # clears it, so a restart there never resumes a thread the host lacks.
+    agent_session_id: str | None = Field(default=None, pattern=AGENT_SESSION_ID_PATTERN)
+
+
 class SessionPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
     # Sent when an agent is launched into a running window, and sent as null

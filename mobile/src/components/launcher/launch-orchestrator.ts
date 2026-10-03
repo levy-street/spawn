@@ -137,7 +137,7 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
 
       const command = agentLaunchCommand(request.agent, conversation);
       try {
-        await dependencies.pending.persist(session.id, command);
+        await dependencies.pending.persist(session.id, session.host_id, command);
         return { status: "launched", session, pendingCommand: true };
       } catch (error) {
         return {

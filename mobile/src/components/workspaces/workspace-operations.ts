@@ -184,7 +184,7 @@ export async function instantiateWorkspaceTemplate(
           : storedCommand;
         if (command) {
           try {
-            await dependencies.pending.persist(session.id, command);
+            await dependencies.pending.persist(session.id, session.host_id, command);
           } catch {
             agentLaunchesSkipped += 1;
           }
@@ -275,6 +275,7 @@ export async function duplicateWorkspaceDeep(
           try {
             await dependencies.pending.persist(
               createdSession.id,
+              createdSession.host_id,
               agentLaunchCommand(currentAgent, conversation),
             );
             queuedSessionIds.push(createdSession.id);

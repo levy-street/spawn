@@ -128,6 +128,7 @@ export class FakeSessionTransport implements SessionTransport {
   constructor(
     readonly sessionId = "30000000-0000-4000-8000-000000000001",
     private readonly autoReady = true,
+    readonly hostId = "20000000-0000-4000-8000-000000000001",
   ) {}
 
   get state(): TransportState {
