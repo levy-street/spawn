@@ -476,6 +476,17 @@ async def test_archived_window_exits_without_a_died_alert(client, monkeypatch):
         ws.queue_text({**REGISTER, "existing_sessions": [pty_id]})
         await _wait_until(lambda: bool(_sent_frames(ws, "registered")))
         ws.queue_text({"type": "session.foreground", "session_id": pty_id, "command": "claude"})
+        # An agent is running in a window on a settled host. The socket reads
+        # frames in order, so once the foreground is stored, registration has
+        # finished too, including its own check for workers to stop.
+        for _ in range(200):
+            async with get_sessionmaker()() as session:
+                row = await session.get(Session, pty_id)
+                if row is not None and row.foreground_command == "claude":
+                    break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the foreground frame was never stored")
 
         archived = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=owner)
         assert archived.status_code == 200, archived.text

@@ -2012,6 +2012,11 @@ async def _stop_workers_left_running(
     one. Each worker's exit comes back as an ordinary `session.exit`, which
     raises no alert: the row is "killed" already, no longer this host's, or
     gone.
+
+    A window stopped after the host became routable and before this read is
+    sent two kills, its route's and this one. The second TERM reaches the
+    same worker, or none (the daemon answers `kill_failed`, which is only
+    logged), and changes nothing.
     """
     if not reported:
         return
