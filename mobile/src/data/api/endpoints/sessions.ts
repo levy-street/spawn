@@ -4,6 +4,8 @@ import { jsonBody, pathPart, queryString } from "@/data/api/endpoints/helpers";
 import {
   type SessionCreate,
   SessionCreateSchema,
+  type SessionMove,
+  SessionMoveSchema,
   type SessionOut,
   SessionOutSchema,
   type SessionPatch,
@@ -45,6 +47,14 @@ export function patchSession(sessionId: string, body: SessionPatch): Promise<Ses
 export function restartSession(sessionId: string): Promise<SessionOut> {
   return api(`/api/sessions/${pathPart(sessionId)}/restart`, {
     method: "POST",
+    schema: SessionOutSchema,
+  });
+}
+
+export function moveSession(sessionId: string, body: SessionMove): Promise<SessionOut> {
+  return api(`/api/sessions/${pathPart(sessionId)}/move`, {
+    method: "POST",
+    body: jsonBody(SessionMoveSchema.parse(body)),
     schema: SessionOutSchema,
   });
 }

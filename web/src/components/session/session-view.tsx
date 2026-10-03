@@ -33,7 +33,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
 import { restartSessionAgent } from "@/components/workspace/agent-restart";
 import { AgentSwitcher } from "@/components/workspace/agent-switcher";
-import { pendingLaunch } from "@/components/workspace/pending-launch";
+import { canTypePendingLaunch, pendingLaunch } from "@/components/workspace/pending-launch";
 import {
   ApiError,
   agents as agentsApi,
@@ -145,11 +145,11 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   });
 
   // A command a restart queued for the fresh shell is typed the moment that
-  // shell's transport opens — the same drain the workspace pane runs, so a
-  // restart from this page lands the agent back too.
-  const socketOpen = connInfo?.socketState === "open";
+  // shell's transport opens — the same drain, behind the same gate, the
+  // workspace pane runs, so a restart from this page lands the agent back too.
+  const launchTypeable = canTypePendingLaunch(session, { connInfo, displayState });
   useEffect(() => {
-    if (!session || !socketOpen || !pendingLaunch.has(sessionId)) return;
+    if (!session || !launchTypeable || !pendingLaunch.has(sessionId)) return;
     let cancelled = false;
     let tries = 0;
     const attempt = () => {
@@ -168,7 +168,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [socketOpen, getHandle, session, sessionId]);
+  }, [launchTypeable, getHandle, session, sessionId]);
   const removeFromWorkspaceM = useMutation({
     mutationFn: (workspace: Workspace) =>
       workspaces.update(workspace.id, {

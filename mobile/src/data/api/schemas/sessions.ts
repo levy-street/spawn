@@ -29,6 +29,19 @@ export const SessionPatchSchema = z.object({
    *  for a stop. */
   agent_session_id: z.string().max(64).nullable().optional(),
 });
+/**
+ * Run the same window on another host: the row — id, name, agent, skills —
+ * stays, and a fresh login shell replaces the old one in `cwd` there.
+ * `expected_host_id` is where this client saw the window; one moved meanwhile
+ * from another device is refused (`move_conflict`) rather than moved twice.
+ */
+export const SessionMoveSchema = z.object({
+  host_id: UUIDSchema,
+  cwd: z.string().min(1).max(1024),
+  expected_host_id: UUIDSchema,
+  /** The new conversation the agent starts with over there, or none. */
+  agent_session_id: z.string().max(64).nullable().optional(),
+});
 export const SessionOutSchema = z.object({
   id: UUIDSchema,
   name: z.string().nullable(),
@@ -62,4 +75,5 @@ export const SessionOutSchema = z.object({
 export type TilePlacement = z.infer<typeof TilePlacementSchema>;
 export type SessionCreate = z.infer<typeof SessionCreateSchema>;
 export type SessionPatch = z.infer<typeof SessionPatchSchema>;
+export type SessionMove = z.infer<typeof SessionMoveSchema>;
 export type SessionOut = z.infer<typeof SessionOutSchema>;

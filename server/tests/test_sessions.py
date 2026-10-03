@@ -602,3 +602,421 @@ async def test_session_remembers_the_conversation_its_agent_started(client):
         assert r.json()["agent_session_id"] is None
     finally:
         await broker.unregister_daemon(daemon)
+
+
+@dataclass
+class _HostLogWS(_FakeWS):
+    """A daemon socket that notes, beside every frame it is sent, where the
+    window's row said it ran at that instant — the order of effects is the
+    contract `/move` keeps."""
+
+    host: str = ""
+    log: list[tuple[str, str, str | None]] = field(default_factory=list)
+    watched: str | None = None
+
+    async def send_text(self, value: str) -> None:
+        await super().send_text(value)
+        row_host: str | None = None
+        if self.watched is not None:
+            from spawn_server.db import get_sessionmaker
+            from spawn_server.models import Session
+
+            async with get_sessionmaker()() as session:
+                row = await session.get(Session, self.watched)
+                row_host = row.host_id if row is not None else None
+        self.log.append((self.host, json.loads(value)["type"], row_host))
+
+
+async def _move_fixture(client, email: str):
+    """An account with two hosts, dream and mac, and an agent window on dream
+    that has a name, a skill and a conversation."""
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    dream = await _create_host(email, name="dream")
+    mac = await _create_host(email, name="mac")
+    skill = await client.post(
+        "/api/skills",
+        json={"name": "move-skill", "description": "d", "content": "# Move\nkept"},
+        headers=auth,
+    )
+    assert skill.status_code == 201, skill.text
+    claude = await _builtin_agent_id(client, auth, "claude-code")
+    r = await client.post(
+        "/api/sessions",
+        json={
+            "host_id": dream,
+            "cwd": "/repo",
+            "name": "builder",
+            "agent_id": claude,
+            "agent_session_id": "conv-dream",
+            "skill_ids": [skill.json()["id"]],
+        },
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    return auth, dream, mac, skill.json()["id"], claude, r.json()["id"]
+
+
+async def test_session_move_rebinds_the_window_then_kills_there_and_restarts_here(client):
+    auth, dream, mac, skill_id, claude, session_id = await _move_fixture(
+        client, "session-move@example.com"
+    )
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    log: list[tuple[str, str, str | None]] = []
+    dream_ws = _HostLogWS(host="dream", log=log, watched=session_id)
+    mac_ws = _HostLogWS(host="mac", log=log, watched=session_id)
+    dream_daemon = DaemonConn(host_id=dream, user_id="user", websocket=dream_ws)  # type: ignore[arg-type]
+    mac_daemon = DaemonConn(host_id=mac, user_id="user", websocket=mac_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(dream_daemon)
+    await broker.register_daemon(mac_daemon)
+    await broker.attach_session_to_daemon(session_id, dream_daemon)
+    try:
+        r = await client.post(
+            f"/api/sessions/{session_id}/move",
+            json={
+                "host_id": mac,
+                "cwd": "/work/spawn",
+                "expected_host_id": dream,
+                "agent_session_id": "conv-mac",
+            },
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        moved = r.json()
+
+        # The same window: id, name, agent kept; the place and the
+        # conversation are new, and the incarnation starts from nothing.
+        assert moved["id"] == session_id
+        assert moved["name"] == "builder"
+        assert moved["agent_id"] == claude
+        assert moved["host_id"] == mac
+        assert moved["host_name"] == "mac"
+        assert moved["cwd"] == "/work/spawn"
+        assert moved["status"] == "starting"
+        assert moved["agent_session_id"] == "conv-mac"
+        for cleared in (
+            "exited_at",
+            "exit_code",
+            "last_output_at",
+            "last_input_at",
+            "foreground_command",
+        ):
+            assert moved[cleared] is None, cleared
+
+        # Rebind first, then the kill to the old host, then the restart on the
+        # new one: by the time dream hears of it the row already names mac, so
+        # dream's exit is fenced out as a stranger's.
+        assert log == [("dream", "session.kill", mac), ("mac", "session.restart", mac)]
+        kill = json.loads(dream_ws.sent_text[-1])
+        assert kill == {"type": "session.kill", "session_id": session_id, "signal": "TERM"}
+        restart = json.loads(mac_ws.sent_text[-1])
+        assert restart["session_id"] == session_id
+        assert restart["cwd"] == "/work/spawn"
+        assert restart["create_cwd"] is True
+        # The skills the window was granted ride along, as on any restart.
+        assert [skill["name"] for skill in restart["skills"]] == ["move-skill"]
+        assert "argv" not in restart and "env" not in restart
+
+        # Routing follows the window to its new host.
+        assert broker.get_daemon_for_session(session_id) is mac_daemon
+        assert session_id not in dream_daemon.session_ids
+
+        # Grants live on the row, so they were never copied and cannot drift.
+        access = await client.get(f"/api/sessions/{session_id}/access", headers=auth)
+        assert [skill["id"] for skill in access.json()["skills"]] == [skill_id]
+        # The new folder is remembered for the new host, as a create would.
+        dirs = await client.get(f"/api/hosts/{mac}/recent-dirs", headers=auth)
+        assert dirs.json()["dirs"][0]["path"] == "/work/spawn"
+        listed = await client.get(f"/api/sessions?host_id={mac}", headers=auth)
+        assert [row["id"] for row in listed.json()] == [session_id]
+        assert (await client.get(f"/api/sessions?host_id={dream}", headers=auth)).json() == []
+    finally:
+        await broker.unregister_daemon(dream_daemon)
+        await broker.unregister_daemon(mac_daemon)
+
+
+async def test_session_move_refusals_leave_the_window_where_it_was(client):
+    auth, dream, mac, _skill_id, _claude, session_id = await _move_fixture(
+        client, "session-move-refusals@example.com"
+    )
+    other_token = await _signup(client, "session-move-stranger@example.com")
+    other = {"Authorization": f"Bearer {other_token}"}
+    strangers_host = await _create_host("session-move-stranger@example.com", name="theirs")
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    dream_ws, mac_ws, theirs_ws = _FakeWS(), _FakeWS(), _FakeWS()
+    daemons = [
+        DaemonConn(host_id=dream, user_id="user", websocket=dream_ws),  # type: ignore[arg-type]
+        DaemonConn(host_id=strangers_host, user_id="u2", websocket=theirs_ws),  # type: ignore[arg-type]
+    ]
+    for daemon in daemons:
+        await broker.register_daemon(daemon)
+
+    def body(**overrides):
+        return {"host_id": mac, "cwd": "/work", "expected_host_id": dream, **overrides}
+
+    async def move(json_body, headers=auth, sid=session_id):
+        return await client.post(f"/api/sessions/{sid}/move", json=json_body, headers=headers)
+
+    try:
+        # Not yours, either end.
+        r = await move(body(), headers=other)
+        assert r.status_code == 404 and r.json()["detail"] == "session not found"
+        r = await move(body(), sid="00000000-0000-4000-8000-000000000000")
+        assert r.status_code == 404 and r.json()["detail"] == "session not found"
+        r = await move(body(host_id=strangers_host))
+        assert r.status_code == 404 and r.json()["detail"] == "host not found"
+        r = await move(body(host_id="no-such-host"))
+        assert r.status_code == 404 and r.json()["detail"] == "host not found"
+        # Same machine is a cd in the running shell, never a move.
+        r = await move(body(host_id=dream))
+        assert r.status_code == 400 and r.json()["detail"] == "same_host"
+        # A picture of the window that is out of date is a conflict, even when
+        # it names the host the window has since gone to.
+        r = await move(body(expected_host_id=mac))
+        assert r.status_code == 409 and r.json()["detail"] == "move_conflict"
+        r = await move(body(host_id=dream, expected_host_id=mac))
+        assert r.status_code == 409 and r.json()["detail"] == "move_conflict"
+        # Nothing to start it on.
+        r = await move(body())
+        assert r.status_code == 409 and r.json()["detail"] == "target_offline"
+        # Shape: a folder, a known host, and a conversation id a shell can take.
+        assert (await move(body(cwd=""))).status_code == 422
+        assert (await move({"host_id": mac, "cwd": "/work"})).status_code == 422
+        assert (await move(body(agent_session_id="rm -rf ~"))).status_code == 422
+        assert (await move(body(tile={"x": 0}))).status_code == 422
+
+        row = (await client.get(f"/api/sessions/{session_id}", headers=auth)).json()
+        assert row["host_id"] == dream and row["cwd"] == "/repo"
+        assert row["agent_session_id"] == "conv-dream"
+        # Every refusal is decided before anything reaches a host.
+        assert dream_ws.sent_text == [] and mac_ws.sent_text == [] and theirs_ws.sent_text == []
+    finally:
+        for daemon in daemons:
+            await broker.unregister_daemon(daemon)
+
+
+async def test_session_move_compare_and_set_loses_to_a_move_that_landed_first(client, monkeypatch):
+    """Two devices moving one window: the one whose write lands second finds
+    the row no longer where it saw it and is refused, not applied on top."""
+    auth, dream, mac, _skill_id, _claude, session_id = await _move_fixture(
+        client, "session-move-race@example.com"
+    )
+    alto = await _create_host("session-move-race@example.com", name="alto")
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.dml import Update
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Session
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    mac_ws = _FakeWS()
+    mac_daemon = DaemonConn(host_id=mac, user_id="user", websocket=mac_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(mac_daemon)
+    real_execute = AsyncSession.execute
+    raced = False
+
+    async def execute(self, statement, *args, **kwargs):
+        # The other device's move commits after this request has checked the
+        # row and before its compare-and-set runs.
+        nonlocal raced
+        if not raced and isinstance(statement, Update) and statement.table.name == "sessions":
+            raced = True
+            async with get_sessionmaker()() as other:
+                row = await other.get(Session, session_id)
+                assert row is not None
+                row.host_id = alto
+                await other.commit()
+        return await real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", execute)
+    try:
+        r = await client.post(
+            f"/api/sessions/{session_id}/move",
+            json={"host_id": mac, "cwd": "/work", "expected_host_id": dream},
+            headers=auth,
+        )
+    finally:
+        monkeypatch.setattr(AsyncSession, "execute", real_execute)
+        await broker.unregister_daemon(mac_daemon)
+    assert raced
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == "move_conflict"
+    # The move that landed first stands, and nothing was dispatched for ours.
+    row = (await client.get(f"/api/sessions/{session_id}", headers=auth)).json()
+    assert row["host_id"] == alto
+    assert mac_ws.sent_text == []
+
+
+async def test_session_move_from_an_offline_host_still_rebinds(client):
+    """The old host being away does not hold the window hostage: the row
+    moves and the new host starts it. The old worker is the orphan reaper's
+    to stop when that host returns."""
+    auth, dream, mac, _skill_id, _claude, session_id = await _move_fixture(
+        client, "session-move-offline-source@example.com"
+    )
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    mac_ws = _FakeWS()
+    mac_daemon = DaemonConn(host_id=mac, user_id="user", websocket=mac_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(mac_daemon)
+    try:
+        r = await client.post(
+            f"/api/sessions/{session_id}/move",
+            json={"host_id": mac, "cwd": "/work", "expected_host_id": dream},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["host_id"] == mac
+        assert [json.loads(frame)["type"] for frame in mac_ws.sent_text] == ["session.restart"]
+    finally:
+        await broker.unregister_daemon(mac_daemon)
+
+
+async def test_session_move_starts_a_new_conversation_or_none(client):
+    """M2 carries nothing: the conversation is the one the mover names for the
+    new host, or none — never the old host's, which a restart there could not
+    resume. A shell window has no conversation to name at all."""
+    auth, dream, mac, _skill_id, _claude, agent_window = await _move_fixture(
+        client, "session-move-conversation@example.com"
+    )
+    r = await client.post("/api/sessions", json={"host_id": dream, "cwd": "/repo"}, headers=auth)
+    assert r.status_code == 201, r.text
+    shell_window = r.json()["id"]
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    daemons = [
+        DaemonConn(host_id=host, user_id="user", websocket=_FakeWS())  # type: ignore[arg-type]
+        for host in (dream, mac)
+    ]
+    for daemon in daemons:
+        await broker.register_daemon(daemon)
+    try:
+        r = await client.post(
+            f"/api/sessions/{agent_window}/move",
+            json={"host_id": mac, "cwd": "/work", "expected_host_id": dream},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_session_id"] is None
+        assert r.json()["agent_id"] is not None
+
+        r = await client.post(
+            f"/api/sessions/{shell_window}/move",
+            json={
+                "host_id": mac,
+                "cwd": "/work",
+                "expected_host_id": dream,
+                "agent_session_id": "conv-x",
+            },
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["agent_id"] is None
+        assert r.json()["agent_session_id"] is None
+
+        # And back again: the same window, the same id, wherever it runs.
+        r = await client.post(
+            f"/api/sessions/{agent_window}/move",
+            json={
+                "host_id": dream,
+                "cwd": "/repo",
+                "expected_host_id": mac,
+                "agent_session_id": "conv-home",
+            },
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert (r.json()["id"], r.json()["host_id"]) == (agent_window, dream)
+        assert r.json()["agent_session_id"] == "conv-home"
+    finally:
+        for daemon in daemons:
+            await broker.unregister_daemon(daemon)
+
+
+async def test_session_move_fans_out_once_and_the_old_hosts_exit_is_a_strangers(client):
+    """Every other client hears of the move by the ordinary data frame, which
+    carries the mover's echo id; and when the old host reports the exit the
+    kill caused, nothing changes — no "Shell exited", no session.died — because
+    the row no longer names that host."""
+    email = "session-move-fence@example.com"
+    auth, dream, mac, _skill_id, _claude, session_id = await _move_fixture(client, email)
+
+    from sqlalchemy import select
+
+    from spawn_server import auth as auth_mod
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Session, User
+    from spawn_server.redis import user_alert_channel
+    from spawn_server.ws.broker import DaemonConn, get_broker
+    from spawn_server.ws.daemon import daemon_ws
+    from tests.test_data_events import _ChannelTap
+    from tests.test_ws_daemon import FakeDaemonWebSocket
+
+    async with get_sessionmaker()() as session:
+        user_id = (await session.execute(select(User).where(User.email == email))).scalar_one().id
+
+    broker = get_broker()
+    mac_daemon = DaemonConn(host_id=mac, user_id=user_id, websocket=_FakeWS())  # type: ignore[arg-type]
+    await broker.register_daemon(mac_daemon)
+    try:
+        async with _ChannelTap(user_alert_channel(user_id)) as tap:
+            r = await client.post(
+                f"/api/sessions/{session_id}/move",
+                json={"host_id": mac, "cwd": "/work", "expected_host_id": dream},
+                headers={**auth, "X-Spawn-Client": "mover-tab"},
+            )
+            assert r.status_code == 200, r.text
+            frames = await tap.settled()
+        data = [frame for frame in frames if frame.get("type") == "data"]
+        assert [(f["resource"], f["id"], f["origin"]) for f in data] == [
+            ("sessions", session_id, "mover-tab")
+        ]
+    finally:
+        await broker.unregister_daemon(mac_daemon)
+
+    # dream comes back and reports the exit of the worker the move killed.
+    old = FakeDaemonWebSocket()
+    old.queue_text(
+        {
+            "type": "register",
+            "host_name": "dream",
+            "os": "linux",
+            "arch": "x86_64",
+            "version": "0.1.0",
+        }
+    )
+    old.queue_text(
+        {"type": "session.exit", "session_id": session_id, "exit_code": 0, "signal": "TERM"}
+    )
+    old.queue_disconnect()
+    async with _ChannelTap(user_alert_channel(user_id)) as tap:
+        await daemon_ws(old, token=auth_mod.issue_daemon_token(dream, user_id))  # type: ignore[arg-type]
+        frames = await tap.settled()
+
+    # dream was accepted, so its exit frame was read and judged, not dropped.
+    assert "registered" in [json.loads(frame)["type"] for frame in old.sent_text]
+    assert not [frame for frame in frames if frame.get("type") == "alert"]
+    assert not [
+        frame
+        for frame in frames
+        if frame.get("type") == "data" and frame.get("resource") == "sessions"
+    ]
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, session_id)
+        assert row is not None
+        assert (row.host_id, row.status, row.exited_at) == (mac, "starting", None)
+    # A stranger's exit is not a consistency failure: the old daemon was not
+    # thrown off for reporting it.
+    assert old.closed is None or old.closed[0] == 1000

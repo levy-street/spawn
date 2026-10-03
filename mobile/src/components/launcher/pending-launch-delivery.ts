@@ -22,8 +22,17 @@ export type PendingLaunchDeliveryResult =
 export interface PendingLaunchTransport {
   readonly sessionId: string;
   readonly state: TransportState;
+  /**
+   * Whether this view holds the session's display — the only view whose input
+   * the host accepts. Another device's view can hold it: one that followed a
+   * moved window to its new host may attach there first. A command written
+   * before this view's claim lands is dropped, so delivery waits for it. A
+   * transport that does not report ownership is taken at its word.
+   */
+  readonly displayOwner?: boolean;
   write(bytes: Uint8Array): void;
   on(ev: "state", listener: (state: TransportState) => void): () => void;
+  on(ev: "display", listener: (display: { owner: boolean }) => void): () => void;
 }
 
 export interface PendingLaunchDeliveryOptions {
@@ -90,8 +99,10 @@ export function observePendingLaunchDelivery({
       });
   };
 
+  const canType = (): boolean => transport.state === "ready" && transport.displayOwner !== false;
+
   const deliver = (): void => {
-    if (settled || operation || transport.state !== "ready") return;
+    if (settled || operation || !canType()) return;
     operation = (async () => {
       let read: PendingLaunchRead;
       try {
@@ -105,7 +116,7 @@ export function observePendingLaunchDelivery({
         finish(resultForRead(read));
         return;
       }
-      if (disposed || transport.state !== "ready") {
+      if (disposed || !canType()) {
         await completePending(pending, transport.sessionId).catch(() => undefined);
         finish({ status: "abandoned", reason: "delivery_unconfirmed" });
         return;
@@ -132,11 +143,14 @@ export function observePendingLaunchDelivery({
   };
 
   const unsubscribe = transport.on("state", handleState);
+  // The claim this view makes on its first ready lands after it.
+  const unsubscribeDisplay = transport.on("display", () => deliver());
   if (initialSessionLife === "dead") abandonDeadSession();
   else handleState(transport.state);
 
   return () => {
     disposed = true;
     unsubscribe();
+    unsubscribeDisplay();
   };
 }

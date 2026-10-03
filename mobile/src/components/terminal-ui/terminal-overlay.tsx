@@ -210,6 +210,18 @@ export function TerminalOverlay({
   // right on it.
   const [agentNotice, setAgentNotice] = useState<AgentNotice | null>(null);
   const [restarting, setRestarting] = useState(false);
+  // The window's current run — one worker on one host. A window moved to
+  // another host keeps its id, and this screen follows it there with a fresh
+  // surface on that host's connection rather than re-pointing the old one. The
+  // first incarnation is however this screen was opened; one the window moved
+  // to while it was open is a reconnect, and does not take the display. What
+  // the old worker said about its display and its agent goes with it.
+  const [incarnation, setIncarnation] = useState({ hostId: host.id, opening: true });
+  if (incarnation.hostId !== host.id) {
+    setIncarnation({ hostId: host.id, opening: false });
+    setDisplay(null);
+    setAgentNotice(null);
+  }
 
   // The bottom nav is portalled to window level and nothing holds its footprint
   // open, so the terminal reserves it — and drops that reservation the moment
@@ -322,6 +334,13 @@ export function TerminalOverlay({
     setSurfaceGeneration((generation) => generation + 1);
   }, [host.id]);
 
+  /** A retry this screen asked for itself — a restart — is an opening: its
+   *  fresh surface takes the display, whichever host the window is on. */
+  const reopen = useCallback((): void => {
+    setIncarnation((current) => (current.opening ? current : { ...current, opening: true }));
+    retry();
+  }, [retry]);
+
   // Approval is granted somewhere else entirely, so the phone watches for it
   // and reconnects itself. Making the operator walk back here and press Retry
   // is the part of this that used to feel broken.
@@ -418,7 +437,7 @@ export function TerminalOverlay({
             ? `Session restarted. ${agent} starts when the shell is back.`
             : "Session restarted.",
         );
-        retry();
+        reopen();
       })
       .catch((error: unknown) => {
         transfers.setNotice(error instanceof Error ? error.message : "Session restart failed.");
@@ -520,11 +539,12 @@ export function TerminalOverlay({
           // handles and Copy/Look Up menu; a recogniser out here swallowed it.
           <View style={styles.surface}>
             <TerminalSurface
+              claimDisplay={incarnation.opening}
               fontSize={fontSize}
-              hostId={host.id}
+              hostId={incarnation.hostId}
               hostIdentityPublicKey={hostKey}
               initialSize={INITIAL_TERMINAL_GRID}
-              key={`${session.id}-${surfaceGeneration}`}
+              key={`${session.id}@${incarnation.hostId}-${surfaceGeneration}`}
               onDiagnostic={setDiagnostic}
               onConnectionInfo={setConnectionInfo}
               onDisplayChange={setDisplay}

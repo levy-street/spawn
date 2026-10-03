@@ -120,6 +120,24 @@ describe("TerminalSurface", () => {
     expect(onStateChange).toHaveBeenLastCalledWith("ready");
   });
 
+  test("a surface that only followed its window to another host never takes the display", async () => {
+    const onStateChange = jest.fn();
+    await render(
+      <TerminalSurface {...props()} claimDisplay={false} onStateChange={onStateChange} />,
+    );
+    const on = mockTransport.on as unknown as jest.Mock;
+    const stateListener = on.mock.calls.find(([event]) => event === "state")?.[1] as (
+      state: string,
+    ) => void;
+    await act(() => {
+      stateListener("ready");
+      stateListener("reconnecting");
+      stateListener("ready");
+    });
+    expect(mockTransport.takeControl).not.toHaveBeenCalled();
+    expect(onStateChange).toHaveBeenLastCalledWith("ready");
+  });
+
   test("correlates asynchronous selection copies", async () => {
     const ref = createRef<TerminalSurfaceHandle>();
     await render(<TerminalSurface ref={ref} {...props()} />);

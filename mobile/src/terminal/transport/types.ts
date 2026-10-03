@@ -137,6 +137,9 @@ export interface SessionTransport {
   readonly sessionId: string;
   readonly state: TransportState;
   readonly daemonState?: TransportState;
+  /** Whether this view holds the session's display, as the daemon last said;
+   *  only the holder's input reaches the shell. */
+  readonly displayOwner?: boolean;
   /** Retains the app-owned daemon connection before the terminal WebView loads. */
   prepare?(): void;
   networkChanged?(): void;

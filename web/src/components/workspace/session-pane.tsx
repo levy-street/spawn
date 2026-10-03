@@ -44,7 +44,7 @@ import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher } from "./agent-switcher";
-import { pendingLaunch } from "./pending-launch";
+import { canTypePendingLaunch, pendingLaunch } from "./pending-launch";
 import { WhereChip } from "./where-chip";
 
 /** Trailing shortcut hint in a menu row — the gesture that does the same thing. */
@@ -119,8 +119,8 @@ export function SessionPane({
   onRemoveFromWorkspace: (sessionId: string) => void;
   /** Replace this pane with a file explorer widget (workspace grid only). */
   onConvertToFiles?: (sessionId: string) => void;
-  /** Swap this pane's window for the same kind of window on another host, in
-   *  `cwd` (workspace grid only — the grid owns the tile swap). */
+  /** Move this pane's window to `cwd` on another host — the same window, run
+   *  over there (workspace grid only: the grid confirms and moves it). */
   onMoveToHost?: (sessionId: string, host: Host, cwd: string) => void;
   /** Ranks the places the pane can be moved to: beside its tab-mates first. */
   workspaceId?: string;
@@ -137,7 +137,9 @@ export function SessionPane({
   const paneHost = hostList.find((host) => host.id === session?.host_id) ?? null;
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const { attach, connInfo, getHandle, agentNotice } = useLiveTerminal(session ? sessionId : null);
+  const { attach, connInfo, displayState, getHandle, agentNotice } = useLiveTerminal(
+    session ? sessionId : null,
+  );
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);
@@ -157,17 +159,19 @@ export function SessionPane({
     [sessionId],
   );
 
-  // An agent picked from the "+" menu — or queued by a restart for the shell
-  // that replaces this one — starts by being typed into the shell, once its
-  // transport can actually carry the keystrokes. Every time the transport
-  // opens, not once per pane: a restart closes and reopens it, and the
-  // command it queued belongs to the shell on the far side of that reopen.
-  // The handle can lag the transport by a render or two, so the command is
-  // only claimed once something can type it; a claim that could not be typed
-  // is a launch silently lost.
-  const socketOpen = connInfo?.socketState === "open";
+  // An agent picked from the "+" menu — or queued by a restart or a move for
+  // the shell that replaces this one — starts by being typed into the shell,
+  // once its transport can actually carry the keystrokes. Every time the
+  // transport opens, not once per pane: a restart closes and reopens it, a
+  // move opens it on another host, and the command belongs to the shell on
+  // the far side of that reopen — so it also waits for the transport to be
+  // the window's current host's and for this view to hold the display
+  // (`canTypePendingLaunch`). The handle can lag the transport by a render or
+  // two, so the command is only claimed once something can type it; a claim
+  // that could not be typed is a launch silently lost.
+  const launchTypeable = canTypePendingLaunch(session, { connInfo, displayState });
   useEffect(() => {
-    if (!session || !socketOpen || !pendingLaunch.has(sessionId)) return;
+    if (!session || !launchTypeable || !pendingLaunch.has(sessionId)) return;
     let cancelled = false;
     let tries = 0;
     const attempt = () => {
@@ -186,7 +190,7 @@ export function SessionPane({
     return () => {
       cancelled = true;
     };
-  }, [socketOpen, getHandle, session, sessionId]);
+  }, [launchTypeable, getHandle, session, sessionId]);
 
   const renameM = useMutation({
     mutationFn: (name: string | null) => sessions.update(sessionId, { name }),

@@ -28,10 +28,14 @@ class MemoryStorage implements PendingLaunchStorage {
   }
 }
 
+type DisplayListener = (display: { owner: boolean }) => void;
+
 class FakeTransport implements PendingLaunchTransport {
   state: TransportState = "idle";
+  displayOwner?: boolean;
   readonly writes: Uint8Array[] = [];
   readonly listeners = new Set<(state: TransportState) => void>();
+  readonly displayListeners = new Set<DisplayListener>();
 
   constructor(readonly sessionId: string) {}
 
@@ -39,14 +43,30 @@ class FakeTransport implements PendingLaunchTransport {
     this.writes.push(bytes);
   }
 
-  on(_event: "state", listener: (state: TransportState) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+  on(event: "state", listener: (state: TransportState) => void): () => void;
+  on(event: "display", listener: DisplayListener): () => void;
+  on(
+    event: "state" | "display",
+    listener: ((state: TransportState) => void) | DisplayListener,
+  ): () => void {
+    if (event === "display") {
+      const onDisplay = listener as DisplayListener;
+      this.displayListeners.add(onDisplay);
+      return () => this.displayListeners.delete(onDisplay);
+    }
+    const onState = listener as (state: TransportState) => void;
+    this.listeners.add(onState);
+    return () => this.listeners.delete(onState);
   }
 
   emit(state: TransportState): void {
     this.state = state;
     for (const listener of this.listeners) listener(state);
+  }
+
+  emitDisplay(owner: boolean): void {
+    this.displayOwner = owner;
+    for (const listener of this.displayListeners) listener({ owner });
   }
 }
 
@@ -113,6 +133,51 @@ describe("pending launch delivery", () => {
     );
     expect(results).toEqual([{ status: "sent" }]);
     expect(storage.values.size).toBe(0);
+  });
+
+  test("waits for this view to hold the display before typing, then types once", async () => {
+    // A window moved to another host can be attached there first by a device
+    // that only followed it; until this view's claim lands its input would be
+    // dropped, and the command with it.
+    const storage = new MemoryStorage();
+    const pending = createPendingLaunchStore(storage);
+    await pending.persist("session-moved", "claude --session-id abc");
+    const transport = new FakeTransport("session-moved");
+    transport.displayOwner = false;
+    const results: PendingLaunchDeliveryResult[] = [];
+    observe(transport, pending, results);
+
+    transport.emit("ready");
+    await flushDelivery();
+    expect(transport.writes).toHaveLength(0);
+    expect(results).toEqual([]);
+
+    transport.emitDisplay(true);
+    await flushDelivery();
+    transport.emitDisplay(true);
+    await flushDelivery();
+    expect(transport.writes.map((bytes) => new TextDecoder().decode(bytes))).toEqual([
+      "claude --session-id abc\r",
+    ]);
+    expect(results).toEqual([{ status: "sent" }]);
+  });
+
+  test("does not type into a view that is not ready, whoever holds the display", async () => {
+    const storage = new MemoryStorage();
+    const pending = createPendingLaunchStore(storage);
+    await pending.persist("session-owner-early", "codex");
+    const transport = new FakeTransport("session-owner-early");
+    const results: PendingLaunchDeliveryResult[] = [];
+    observe(transport, pending, results);
+
+    transport.emit("connecting");
+    transport.emitDisplay(true);
+    await flushDelivery();
+    expect(transport.writes).toHaveLength(0);
+
+    transport.emit("ready");
+    await flushDelivery();
+    expect(transport.writes).toHaveLength(1);
   });
 
   test("does not resend when ready is emitted after a reconnect", async () => {

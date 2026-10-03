@@ -29,3 +29,28 @@ export const pendingLaunch = {
     return command;
   },
 };
+
+/**
+ * Whether a view can type a queued command into the window as it runs now.
+ *
+ * Three things, all reported by the live terminal: its transport is open; it
+ * is open to the host the window runs on now — a window that has just moved
+ * still has its old host's transport winding down, and a command typed there
+ * lands in a shell that is being killed; and this view holds the display,
+ * the only view whose input the host accepts. Typed any earlier, the command
+ * is taken and silently dropped; waiting costs nothing.
+ */
+export function canTypePendingLaunch(
+  session: { host_id: string } | undefined,
+  live: {
+    connInfo: { socketState: string; hostId?: string | null } | null;
+    displayState: { owner: boolean } | null;
+  },
+): boolean {
+  return (
+    session !== undefined &&
+    live.connInfo?.socketState === "open" &&
+    live.connInfo.hostId === session.host_id &&
+    live.displayState?.owner === true
+  );
+}

@@ -111,6 +111,22 @@ own, so two open devices do not trade it back and forth.
 Focusing another view within the owning device transfers its active view and
 geometry. The UI waits for daemon confirmation before enabling input.
 
+A window can move to another host and keep its id (`POST
+/api/sessions/{id}/move`). Each run of it — one worker and PTY on one host — is
+an incarnation, `<session id>@<host id>`, and terminals are keyed by it: when
+the window's host changes, the browser's warm terminal and the phone's terminal
+surface for it are replaced rather than re-pointed, and the new one attaches
+over the new host's connection with no replay offsets, lease or screen of the
+old worker inside it. Following a moved window is a reconnect on every device
+and never takes the lease. The exception is the device that moved it: the
+browser marks the new incarnation as one it opened, and the phone opens the
+window's terminal, so that view takes the lease and types the agent's launch. A
+queued launch is typed only into a view open to the window's current host that
+holds its lease; typed any earlier it would be dropped. A device that missed the
+move's data frame converges when its polled session list names the new host,
+which refetches the window's row; the list alone never moves a terminal, since a
+list response that left the server before the move can arrive after it.
+
 ## Bounds and verification
 
 Channel proxies bound individual frames to 64 KiB, queued sends to 256 KiB and

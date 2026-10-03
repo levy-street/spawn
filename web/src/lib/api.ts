@@ -1326,6 +1326,27 @@ export const sessions = {
       body: JSON.stringify({}),
       schema: SessionSchema,
     }),
+  /**
+   * Run the same window on another host, in `cwd` there: the row — id, name,
+   * agent, skills — stays, and a fresh login shell replaces the old one.
+   * `expected_host_id` is where this client saw the window; a window moved
+   * meanwhile from somewhere else is refused (`move_conflict`) rather than
+   * moved twice. `agent_session_id` names the new conversation, or none.
+   */
+  move: (
+    id: string,
+    body: {
+      host_id: string;
+      cwd: string;
+      expected_host_id: string;
+      agent_session_id?: string | null;
+    },
+  ) =>
+    api(`/api/sessions/${id}/move`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: SessionSchema,
+    }),
   /** Kill + hard delete. */
   remove: (id: string) => api<void>(`/api/sessions/${id}`, { method: "DELETE" }),
 };

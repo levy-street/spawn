@@ -12,10 +12,12 @@ import type { Tile } from "@/data/types/layout";
 import { makeHost, makeSession, makeTab, makeWorkspace } from "./fixtures";
 
 const mockActionSets: unknown[][] = [];
+const mockSheetTitles: unknown[] = [];
 
 jest.mock("@/components/ui/action-sheet", () => ({
   ActionSheet: (props: Record<string, unknown>) => {
     mockActionSets.push((props["actions"] as unknown[]) ?? []);
+    mockSheetTitles.push(props["title"]);
     return null;
   },
 }));
@@ -150,6 +152,8 @@ describe("moving a window to another host", () => {
       />,
     );
 
+    // The same sheet title as the browser's where chip.
+    expect(mockSheetTitles.at(-1)).toBe("Where this runs");
     const actions = latestActions();
     expect(actions.map((action) => action.id)).toEqual([
       "host-2:/Users/me/site",

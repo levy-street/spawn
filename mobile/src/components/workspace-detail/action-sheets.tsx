@@ -219,9 +219,10 @@ export interface MovePaneHostSheetProps {
 /**
  * Where on another machine a window should run: the likeliest places first
  * (beside this tab's windows, recent places, each host's home), then any
- * folder at all. Its shell cannot follow it across, so the choice is
- * destructive — the caller confirms before acting on it. A folder on the same
- * machine is the terminal's own Folder action, which keeps the shell.
+ * folder at all. The window moves and keeps its name and skills, but what ran
+ * in it cannot follow it across, so the choice is destructive — the caller
+ * confirms before acting on it. A folder on the same machine is the
+ * terminal's own Folder action, which keeps the shell.
  */
 export function MovePaneHostSheet({
   visible,
@@ -263,9 +264,9 @@ export function MovePaneHostSheet({
   return (
     <ActionSheet
       actions={actions}
-      message="The same kind of window starts there; this one's process is stopped."
+      message="The window keeps its name and skills; what runs in it here stops."
       onDismiss={onDismiss}
-      title="Move to another host"
+      title="Where this runs"
       visible={visible && session !== null}
     />
   );

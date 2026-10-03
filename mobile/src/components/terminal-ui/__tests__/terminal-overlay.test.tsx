@@ -158,6 +158,8 @@ jest.mock("@/components/terminal-ui/use-terminal-transfers", () => ({
 }));
 
 interface MockSurfaceProps {
+  hostId?: string;
+  claimDisplay?: boolean;
   onLink?: (url: string) => void;
   onDisplayChange?: (display: DisplayControlState) => void;
   onTransport?: (transport: unknown) => void;
@@ -165,6 +167,7 @@ interface MockSurfaceProps {
 }
 
 let mockTerminalSurfaceProps: MockSurfaceProps = {};
+let mockSurfaceMounts = 0;
 const mockTakeControl = jest.fn();
 const mockBlur = jest.fn();
 const mockFocus = jest.fn();
@@ -187,6 +190,9 @@ jest.mock("@/terminal/TerminalSurface", () => {
         }>,
       ) => {
         mockTerminalSurfaceProps = props;
+        React.useEffect(() => {
+          mockSurfaceMounts += 1;
+        }, []);
         React.useImperativeHandle(ref, () => ({
           blur: mockBlur,
           focus: mockFocus,
@@ -277,6 +283,58 @@ async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
     </SafeAreaProvider>,
   );
 }
+
+describe("a window that moves to another host while its terminal is open", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockTerminalSurfaceProps = {};
+    mockSurfaceMounts = 0;
+  });
+
+  test("follows it with a fresh surface on the new host that does not take the display", async () => {
+    const elsewhere: HostOut = {
+      ...host,
+      id: "00000000-0000-4000-8000-000000000009",
+      name: "dream",
+      host_public_key: "dream-public-key",
+    };
+    const overlay = (current: HostOut) => (
+      <SafeAreaProvider
+        initialMetrics={{
+          frame: { x: 0, y: 0, width: 390, height: 844 },
+          insets: { top: 47, left: 0, right: 0, bottom: 34 },
+        }}
+      >
+        <ThemeProvider>
+          <TerminalOverlay
+            focused
+            host={current}
+            onDismiss={jest.fn()}
+            onKill={jest.fn(async () => undefined)}
+            onRename={jest.fn(async () => undefined)}
+            onRestart={jest.fn(async () => ({
+              kind: "restarted" as const,
+              plan: { kind: "shell" as const },
+            }))}
+            session={{ ...session, host_id: current.id, host_name: current.name }}
+          />
+        </ThemeProvider>
+      </SafeAreaProvider>
+    );
+    const view = await render(overlay(host));
+    // Opened here: this screen's first surface is an opening.
+    expect(mockTerminalSurfaceProps.hostId).toBe(host.id);
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(true);
+    expect(mockSurfaceMounts).toBe(1);
+
+    await view.rerender(overlay(elsewhere));
+    // A new incarnation: a new surface, on the new host's connection, that
+    // reconnects rather than opens — another device moved it.
+    expect(mockSurfaceMounts).toBe(2);
+    expect(mockTerminalSurfaceProps.hostId).toBe(elsewhere.id);
+    expect(mockTerminalSurfaceProps.claimDisplay).toBe(false);
+  });
+});
 
 describe("terminal overlay dismissal", () => {
   beforeEach(() => {

@@ -95,6 +95,9 @@ class WebViewSessionTransport implements SessionTransport {
   get daemonState(): TransportState {
     return this.#lease?.shared.transport.state ?? "idle";
   }
+  get displayOwner(): boolean {
+    return this.#displayOwner;
+  }
   prepare(): void {
     if (this.#lease) return;
     if (!this.options.hostId) throw new Error("Terminal attachment requires its host ID.");

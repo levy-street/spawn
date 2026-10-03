@@ -248,9 +248,24 @@ input.
 | POST   | `/api/sessions`      | `{host_id, cwd, name?, skill_ids?, workspace_id?, tile?}`                          |
 | PATCH  | `/api/sessions/{id}` | rename: `{name?}`                                                                 |
 | POST   | `/api/sessions/{id}/restart` | respawn the login shell in the session's saved `cwd`                       |
+| POST   | `/api/sessions/{id}/move` | `{host_id, cwd, expected_host_id, agent_session_id?}`: run the same window on another host (below) |
 | GET    | `/api/sessions/{id}/access` | list skill grants for a session                                             |
 | PATCH  | `/api/sessions/{id}/access` | replace grants with `{skill_ids?}`                                         |
 | DELETE | `/api/sessions/{id}` | sends `session.kill` if needed, then hard-deletes the session row                  |
+
+`/move` keeps the row — id, name, agent, skill grants, and everything clients
+key by the id — and replaces only its incarnation, the worker on one host. It
+rebinds first: `host_id` and `cwd`, status `starting`, `started_at` now, exit
+fields and `foreground_command` cleared, `agent_session_id` set to the body's
+(a new conversation; nothing of the old one travels) or cleared. Then the
+recent folder is recorded, `session.kill` goes best effort to the old host —
+whose late frames now fail the `host_id` fence and change nothing, so no
+`session.died` — and `session.restart` with the usual fields to the new one,
+which ends any worker of that id already there. `expected_host_id` makes it a
+compare-and-set: a window that runs somewhere else than the client saw is
+`409 move_conflict`. Also `404` for a session or host that is not yours, `400
+same_host`, `409 target_offline`. No migration and no new execution parameter:
+the same lifecycle authority as restart.
 
 `skill_ids` omitted grants every `enabled_by_default` skill. `workspace_id`
 transactionally appends a tile to that workspace (`tile` omitted → the server
@@ -797,10 +812,10 @@ them a reply), and a `session.foreground` report does not arm it at all —
 workers re-report their foreground on every reconnect, and arming there raised
 alerts for sessions that had done nothing. Before publishing, the row is
 re-read: the last output must exist, be newer than the last input, and be at
-least the window old. Three writes null `foreground_command` — the
-`session.exit` handler, `POST /api/sessions/{id}/restart`, and workspace
-archive — and only the first of them is an alert; the other two are things
-the owner just asked for. `agent.finished` therefore requires the session to
+least the window old. Four writes null `foreground_command` — the
+`session.exit` handler, `POST /api/sessions/{id}/restart`, `POST
+/api/sessions/{id}/move`, and workspace archive — and only the first of them is
+an alert; the other three are things the owner just asked for. `agent.finished` therefore requires the session to
 still be `running`.
 
 ### Server → browser
