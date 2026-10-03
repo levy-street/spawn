@@ -1132,6 +1132,290 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
     assert get_broker().get_daemon_for_session(pty_id) is None
 
 
+async def _set_session_status(session_id: str, status: str) -> None:
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, session_id)
+        assert row is not None
+        row.status = status
+        await session.commit()
+
+
+async def test_register_stops_workers_whose_windows_were_stopped_or_moved_while_offline(
+    client, caplog
+):
+    """A kill sent while a host is offline reaches nobody, so its worker is
+    still running when the host comes back. Registration delivers it then —
+    for a window stopped here, and for one moved to another of the owner's
+    hosts — and for nothing else: an id with no row may be a window created
+    after the backup a database was restored from."""
+    user_id, _ = await _signup(client, "ws-daemon-reaper@example.com")
+    stranger_id, _ = await _signup(client, "ws-daemon-reaper-stranger@example.com")
+    host_id = await _create_host(user_id, name="returning")
+    other_host_id = await _create_host(user_id, name="elsewhere")
+    stranger_host_id = await _create_host(stranger_id, name="not-yours")
+    live = await _create_session_row(user_id, host_id, name="live")
+    stopped = await _create_session_row(user_id, host_id, name="stopped")
+    await _set_session_status(stopped, "killed")
+    moved = await _create_session_row(user_id, other_host_id, name="moved")
+    foreign = await _create_session_row(stranger_id, stranger_host_id, name="foreign")
+    unknown = "00000000-0000-4000-8000-0000000000ef"
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    with caplog.at_level("INFO", logger="spawn.ws.daemon"):
+        ws.queue_text(
+            {
+                "type": "register",
+                "version": "0.2.0",
+                "existing_sessions": [live, stopped, moved, foreign, unknown, moved, 7],
+            }
+        )
+        await _wait_until(
+            lambda: sum(item.get("type") == "session.kill" for item in _sent_json(ws)) >= 2
+        )
+        await asyncio.sleep(0.05)
+
+    sent = _sent_json(ws)
+    kills = [item for item in sent if item.get("type") == "session.kill"]
+    assert kills == [
+        {"type": "session.kill", "session_id": stopped, "signal": "TERM"},
+        {"type": "session.kill", "session_id": moved, "signal": "TERM"},
+    ]
+    # Delivered only once the daemon has been told it is registered.
+    registered_at = next(i for i, item in enumerate(sent) if item.get("type") == "registered")
+    assert all(sent.index(kill) > registered_at for kill in kills)
+
+    broker = get_broker()
+    daemon = broker.get_daemon_for_host(host_id)
+    assert daemon is not None
+    assert broker.get_daemon_for_session(live) is daemon
+    # The stopped window is still this host's: its exit must reach its row.
+    assert broker.get_daemon_for_session(stopped) is daemon
+    assert broker.get_daemon_for_session(moved) is None
+    assert broker.get_daemon_for_session(foreign) is None
+    assert broker.get_daemon_for_session(unknown) is None
+
+    unclaimed = [r for r in caplog.records if "no window in this account" in r.getMessage()]
+    assert len(unclaimed) == 1
+    assert "runs 2 session(s)" in unclaimed[0].getMessage()
+    assert unknown in unclaimed[0].getMessage()
+
+    # The kills come back as ordinary exits. The moved window's row is the
+    # other host's and is left alone; the stopped one records its exit.
+    ws.queue_text({"type": "session.exit", "session_id": moved, "signal": "TERM"})
+    ws.queue_text({"type": "session.exit", "session_id": stopped, "exit_code": 143})
+    await _wait_until(lambda: broker.get_daemon_for_session(stopped) is None)
+    assert ws.close_calls == []
+
+    async with get_sessionmaker()() as session:
+        moved_row = await session.get(Session, moved)
+        assert moved_row is not None
+        assert (moved_row.host_id, moved_row.status, moved_row.exit_code) == (
+            other_host_id,
+            "running",
+            None,
+        )
+        stopped_row = await session.get(Session, stopped)
+        assert stopped_row is not None
+        assert (stopped_row.status, stopped_row.exit_code) == ("killed", 143)
+        assert stopped_row.exited_at is not None
+        live_row = await session.get(Session, live)
+        assert live_row is not None and live_row.status == "running"
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+    assert get_broker().get_daemon_for_host(host_id) is None
+    assert get_broker().get_daemon_for_session(stopped) is None
+
+
+def _signal_when_registration_done(monkeypatch) -> asyncio.Event:
+    """Set once registration has run everything it does after `registered`,
+    the reaper's kills included: the update check is its last step."""
+    from spawn_server.ws import daemon as daemon_mod
+
+    done = asyncio.Event()
+    original = daemon_mod._auto_update_after_registration
+
+    async def last_step(*args, **kwargs):
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(daemon_mod, "_auto_update_after_registration", last_step)
+    return done
+
+
+def _frames_for(ws: FakeDaemonWebSocket, session_id: str) -> list[str]:
+    return [
+        str(item.get("type")) for item in _sent_json(ws) if item.get("session_id") == session_id
+    ]
+
+
+async def test_register_spares_a_window_restarted_while_its_host_registers(client, monkeypatch):
+    """The owner presses Restart on a window stopped while its host was away,
+    the moment the host shows online. The registration that read the row as
+    "killed" must not then stop the restarted worker."""
+    from spawn_server.ws import daemon as daemon_mod
+
+    user_id, access = await _signup(client, "ws-daemon-reaper-restart@example.com")
+    host_id = await _create_host(user_id, name="returning")
+    sid = await _create_session_row(user_id, host_id, name="stopped-while-away")
+    await _set_session_status(sid, "killed")
+    done = _signal_when_registration_done(monkeypatch)
+
+    original_device_ids = daemon_mod._live_browser_device_ids
+    restarted: list[int] = []
+
+    async def restart_once(hid: str) -> list[str]:
+        # Runs after the host is routable and before `registered` is sent.
+        if not restarted:
+            response = await client.post(
+                f"/api/sessions/{sid}/restart",
+                headers={"Authorization": f"Bearer {access}"},
+            )
+            restarted.append(response.status_code)
+        return await original_device_ids(hid)
+
+    monkeypatch.setattr(daemon_mod, "_live_browser_device_ids", restart_once)
+
+    token = auth.issue_daemon_token(host_id, user_id)
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text({"type": "register", "version": "0.2.0", "existing_sessions": [sid]})
+    await asyncio.wait_for(done.wait(), timeout=2)
+
+    assert restarted == [200]
+    assert _frames_for(ws, sid) == ["session.restart"]
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, sid)
+        assert row is not None and row.status == "starting"
+    assert ws.close_calls == []
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_register_stops_windows_stopped_or_deleted_while_its_host_registers(
+    client, monkeypatch
+):
+    """A window stopped or deleted after registration read its rows, but
+    before the host could be reached, had its own kill sent to nobody. The
+    registration delivers it instead of leaving the worker running."""
+    user_id, access = await _signup(client, "ws-daemon-reaper-late-stop@example.com")
+    host_id = await _create_host(user_id, name="returning")
+    stopped = await _create_session_row(user_id, host_id, name="stopped-meanwhile")
+    deleted = await _create_session_row(user_id, host_id, name="deleted-meanwhile")
+    live = await _create_session_row(user_id, host_id, name="live")
+    done = _signal_when_registration_done(monkeypatch)
+
+    broker = get_broker()
+    original_accept = broker.accept_daemon_owner
+    deleted_status: list[int] = []
+
+    async def stop_and_delete_then_accept(conn, generation):
+        # What archive commits, and a real delete, while no daemon is routable.
+        if not deleted_status:
+            await _set_session_status(stopped, "killed")
+            response = await client.delete(
+                f"/api/sessions/{deleted}", headers={"Authorization": f"Bearer {access}"}
+            )
+            deleted_status.append(response.status_code)
+        return await original_accept(conn, generation)
+
+    monkeypatch.setattr(broker, "accept_daemon_owner", stop_and_delete_then_accept)
+
+    token = auth.issue_daemon_token(host_id, user_id)
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text(
+        {"type": "register", "version": "0.2.0", "existing_sessions": [stopped, deleted, live]}
+    )
+    await asyncio.wait_for(done.wait(), timeout=2)
+
+    assert deleted_status == [204]
+    assert _frames_for(ws, stopped) == ["session.kill"]
+    assert _frames_for(ws, deleted) == ["session.kill"]
+    assert _frames_for(ws, live) == []
+
+    # Their exits are confirmations, not crashes, and close nothing.
+    ws.queue_text({"type": "session.exit", "session_id": stopped, "exit_code": 143})
+    ws.queue_text({"type": "session.exit", "session_id": deleted, "exit_code": 143})
+    await _wait_until(
+        lambda: (
+            broker.get_daemon_for_session(stopped) is None
+            and broker.get_daemon_for_session(deleted) is None
+        )
+    )
+    assert ws.close_calls == []
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, stopped)
+        assert row is not None and (row.status, row.exit_code) == ("killed", 143)
+        assert await session.get(Session, deleted) is None
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_a_launch_committed_after_the_reaper_reads_goes_out_after_its_kill(
+    client, monkeypatch
+):
+    """A restart can commit after registration has read the row as stopped
+    and before its kill is sent. The kill must still reach the daemon first:
+    the daemon handles both in order, so the kill then stops the old worker
+    and the restart's replacement survives. The other order would TERM the
+    replacement."""
+    from spawn_server.ws import daemon as daemon_mod
+
+    user_id, access = await _signup(client, "ws-daemon-reaper-order@example.com")
+    host_id = await _create_host(user_id, name="returning")
+    sid = await _create_session_row(user_id, host_id, name="stopped-while-away")
+    await _set_session_status(sid, "killed")
+    done = _signal_when_registration_done(monkeypatch)
+
+    original_read = daemon_mod._read_workers_to_stop
+    restart_task: list[asyncio.Task] = []
+
+    async def restart_after_the_read(*args, **kwargs):
+        decided = await original_read(*args, **kwargs)
+        restart_task.append(
+            asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{sid}/restart",
+                    headers={"Authorization": f"Bearer {access}"},
+                )
+            )
+        )
+        # Let the restart commit and get as far as it can.
+        for _ in range(100):
+            async with get_sessionmaker()() as session:
+                row = await session.get(Session, sid)
+                if row is not None and row.status == "starting":
+                    break
+            await asyncio.sleep(0.01)
+        try:
+            await _wait_until(lambda: "session.restart" in _frames_for(ws, sid), timeout=0.3)
+        except AssertionError:
+            pass
+        return decided
+
+    monkeypatch.setattr(daemon_mod, "_read_workers_to_stop", restart_after_the_read)
+
+    token = auth.issue_daemon_token(host_id, user_id)
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text({"type": "register", "version": "0.2.0", "existing_sessions": [sid]})
+    await asyncio.wait_for(done.wait(), timeout=3)
+    response = await asyncio.wait_for(restart_task[0], timeout=2)
+
+    assert response.status_code == 200
+    assert _frames_for(ws, sid) == ["session.kill", "session.restart"]
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
 async def test_pending_daemon_cannot_evict_or_reroute_accepted_owner(client):
     user_id, _ = await _signup(client, "ws-daemon-pending-owner@example.com")
     host_id = await _create_host(user_id)
