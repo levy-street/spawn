@@ -182,8 +182,9 @@ export function groupRunningAgents(
  * The same grammar the web app types, spelled once per client.
  */
 export interface AgentConversationGrammar {
-  /** Flags that start a fresh conversation under an id SPAWN D chose. Null
-   *  when the CLI names its own conversations. */
+  /** Flags that start a fresh conversation under an id SPAWN D chose: at
+   *  launch, and on a restart whose conversation the host has no record of
+   *  yet. Null when the CLI names its own conversations. */
   launch: ((conversationId: string) => string) | null;
   /** Flags that reopen a known conversation. Null when the CLI cannot. */
   resume: ((conversationId: string) => string) | null;

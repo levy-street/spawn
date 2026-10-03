@@ -39,7 +39,7 @@ import { Input } from "@/components/ui/input";
 import { SessionStatusDot } from "@/components/ui/status";
 import { usePendingLaunchDrain } from "@/hooks/usePendingLaunchDrain";
 import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@/lib/api";
-import { inspectWindowConversation } from "@/lib/conversation-inspect";
+import { askWindowHost } from "@/lib/conversation-inspect";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
 import { sessionAtShell, sessionOwnName, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
@@ -185,8 +185,9 @@ export function SessionPane({
       return restartSessionAgent({
         session,
         agents: definitions,
-        // The conversation the window is actually in, from its host.
-        inspect: () => inspectWindowConversation(session.host_id, daemonConnection, sessionId),
+        // The conversation the window is actually in, and whether it has a
+        // record yet, from its host.
+        ...askWindowHost(session.host_id, daemonConnection, sessionId),
         recordConversation: async (conversationId) => {
           const saved = await sessions.update(sessionId, { agent_session_id: conversationId });
           writeSessionToCache(queryClient, saved);

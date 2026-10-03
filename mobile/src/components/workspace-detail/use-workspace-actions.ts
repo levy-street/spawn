@@ -141,7 +141,8 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
           return saved;
         },
         pending: pendingLaunches,
-        // The conversation the window is actually in, from its host.
+        // The conversation the window is actually in, and whether it has a
+        // record yet, from its host.
         ...restartConversationHooks(client, session),
       });
       await invalidateSessions();

@@ -1,11 +1,13 @@
 import { makeAgent } from "@/components/launcher/__tests__/fixtures";
 import {
+  conversationOnRecord,
   planAgentRestart,
   restartConversation,
   restartSessionAgent,
 } from "@/components/launcher/agent-restart";
 import type { Session } from "@/data/types/domain";
 import type { ConversationInspection } from "@/terminal/transport/conversation-codec";
+import type { AgentTranscriptReport } from "@/terminal/transport/types";
 
 const claude = makeAgent({
   id: "11111111-1111-4111-8111-111111111111",
@@ -425,5 +427,215 @@ describe("restartSessionAgent with the host's answer", () => {
       inspect,
     });
     expect(inspect).not.toHaveBeenCalled();
+  });
+});
+
+/** The host's answer to `agent.transcripts` for one conversation id. */
+function records(
+  conversationIds: readonly string[],
+  overrides: Partial<AgentTranscriptReport> = {},
+): AgentTranscriptReport {
+  return {
+    agent_kind: "claude-code",
+    supported: true,
+    transcripts: conversationIds.map((id) => ({
+      path: `~/.claude/projects/-repo/${id}.jsonl`,
+      name: `${id}.jsonl`,
+      size: 4096,
+      modified_at: 1_790_000_000,
+      role: "conversation" as const,
+      conversation_id: id,
+    })),
+    searched: ["~/.claude/projects"],
+    truncated: false,
+    ...overrides,
+  };
+}
+
+describe("conversationOnRecord", () => {
+  test("a transcript of the conversation is a record of it", () => {
+    expect(conversationOnRecord(records([recorded]), recorded)).toBe(true);
+    expect(conversationOnRecord(records([recorded], { truncated: true }), recorded)).toBe(true);
+  });
+
+  test("a search that looked everywhere and found nothing is no record", () => {
+    expect(conversationOnRecord(records([]), recorded)).toBe(false);
+    expect(conversationOnRecord(records([moved]), recorded)).toBe(false);
+  });
+
+  test("an answer that cannot say is neither", () => {
+    expect(conversationOnRecord(null, recorded)).toBeNull();
+    expect(conversationOnRecord(records([], { supported: false }), recorded)).toBeNull();
+    expect(conversationOnRecord(records([], { truncated: true }), recorded)).toBeNull();
+  });
+});
+
+describe("planAgentRestart with the host's records", () => {
+  test("a conversation the host has no record of starts fresh under the same id", () => {
+    expect(planAgentRestart(session(), [claude], null, false)).toEqual({
+      kind: "agent",
+      agent: claude,
+      command: `claude --session-id ${recorded}`,
+      resumes: false,
+    });
+    expect(planAgentRestart(session(), [claude], null, true)).toEqual({
+      kind: "agent",
+      agent: claude,
+      command: `claude --resume ${recorded}`,
+      resumes: true,
+    });
+  });
+
+  test("with no conversation to name, a missing record changes nothing", () => {
+    const plan = planAgentRestart(session({ agent_session_id: null }), [claude], null, false);
+    expect(plan.kind === "agent" ? plan.command : null).toBe("claude --continue");
+    const codexPlan = planAgentRestart(
+      codexSession(),
+      [codex],
+      live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+      false,
+    );
+    expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe(`codex resume ${liveCodex}`);
+  });
+});
+
+describe("restartSessionAgent with the host's records", () => {
+  test("transcript present: the conversation is resumed", async () => {
+    const transcripts = jest.fn(async () => records([recorded]));
+    const pending = pendingStore();
+    const result = await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => null,
+      transcripts,
+    });
+    expect(transcripts).toHaveBeenCalledWith({
+      agentKind: "claude-code",
+      conversationId: recorded,
+      cwd: "/repo",
+    });
+    expect(result.plan.kind === "agent" ? result.plan.resumes : null).toBe(true);
+    expect(pending.queued.get(session().id)).toBe(`claude --resume ${recorded}`);
+  });
+
+  test("transcript absent: the agent starts fresh under the window's id", async () => {
+    const pending = pendingStore();
+    const result = await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => null,
+      transcripts: async () => records([]),
+    });
+    expect(result.plan).toEqual({
+      kind: "agent",
+      agent: claude,
+      command: `claude --session-id ${recorded}`,
+      resumes: false,
+    });
+    expect(pending.queued.get(session().id)).toBe(`claude --session-id ${recorded}`);
+  });
+
+  test("transcripts unavailable: the conversation is resumed as before", async () => {
+    for (const transcripts of [
+      undefined,
+      async () => null,
+      async () => Promise.reject(new Error("unsupported_operation")),
+      async () => records([], { supported: false }),
+      async () => records([], { truncated: true }),
+    ]) {
+      const pending = pendingStore();
+      await restartSessionAgent({
+        session: session(),
+        agents: [claude],
+        restart: async () => session({ status: "starting" }),
+        pending,
+        inspect: async () => null,
+        ...(transcripts ? { transcripts } : {}),
+      });
+      expect(pending.queued.get(session().id)).toBe(`claude --resume ${recorded}`);
+    }
+  });
+
+  test("the host is asked about the conversation the window is actually in", async () => {
+    const transcripts = jest.fn(async () => records([recorded]));
+    const recordConversation = jest.fn(async () => undefined);
+    const pending = pendingStore();
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => live(),
+      transcripts,
+      recordConversation,
+    });
+    expect(transcripts).toHaveBeenCalledWith({
+      agentKind: "claude-code",
+      conversationId: moved,
+      cwd: "/repo",
+    });
+    expect(recordConversation).toHaveBeenCalledWith(moved);
+    expect(pending.queued.get(session().id)).toBe(`claude --session-id ${moved}`);
+  });
+
+  test("only an agent launched under an id, with an id to resume, is looked up", async () => {
+    const transcripts = jest.fn(async () => records([]));
+    const pending = pendingStore();
+    await restartSessionAgent({
+      session: codexSession(),
+      agents: [codex],
+      restart: async () => codexSession({ status: "starting" }),
+      pending,
+      inspect: async () =>
+        live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+      transcripts,
+    });
+    expect(pending.queued.get(session().id)).toBe(`codex resume ${liveCodex}`);
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => live({ conversation_id: null, source: "parked" }),
+      transcripts,
+    });
+    expect(pending.queued.get(session().id)).toBe("claude --continue");
+    expect(transcripts).not.toHaveBeenCalled();
+  });
+
+  test("the host is let go once, before the restart", async () => {
+    const order: string[] = [];
+    for (const current of [session(), session({ agent_id: null, foreground_command: "bash" })]) {
+      await restartSessionAgent({
+        session: current,
+        agents: [claude],
+        restart: async () => {
+          order.push("restart");
+          return session({ status: "starting" });
+        },
+        pending: pendingStore(),
+        inspect: async () => {
+          order.push("inspect");
+          return null;
+        },
+        transcripts: async () => {
+          order.push("transcripts");
+          return records([recorded]);
+        },
+        doneAsking: () => order.push("done asking"),
+      });
+    }
+    expect(order).toEqual([
+      "inspect",
+      "transcripts",
+      "done asking",
+      "restart",
+      "done asking",
+      "restart",
+    ]);
   });
 });

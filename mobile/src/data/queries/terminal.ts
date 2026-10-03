@@ -128,7 +128,8 @@ export function useRestartTerminalSession(sessionId: string) {
           return saved;
         },
         pending: pendingLaunches,
-        // The conversation the window is actually in, from its host.
+        // The conversation the window is actually in, and whether it has a
+        // record yet, from its host.
         ...restartConversationHooks(queryClient, session),
       });
     },

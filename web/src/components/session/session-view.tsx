@@ -44,7 +44,7 @@ import {
   workspaces,
 } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
-import { inspectWindowConversation } from "@/lib/conversation-inspect";
+import { askWindowHost } from "@/lib/conversation-inspect";
 import { remove as removeTile } from "@/lib/grid";
 import { sessionAtShell, sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
@@ -132,8 +132,9 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       return restartSessionAgent({
         session,
         agents: definitions,
-        // The conversation the window is actually in, from its host.
-        inspect: () => inspectWindowConversation(session.host_id, daemonConnection, sessionId),
+        // The conversation the window is actually in, and whether it has a
+        // record yet, from its host.
+        ...askWindowHost(session.host_id, daemonConnection, sessionId),
         recordConversation: async (conversationId) => {
           const saved = await sessions.update(sessionId, { agent_session_id: conversationId });
           updateSessionCaches(queryClient, saved);
