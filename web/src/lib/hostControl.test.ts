@@ -8,7 +8,13 @@ async function waitFor(cond: () => boolean, deadlineMs = 500): Promise<void> {
   while (!cond() && Date.now() < deadline) await Bun.sleep(2);
 }
 
-import { HOST_CONTROL_PROTOCOL, HostControlClient } from "./hostControl";
+import {
+  CHANNEL_REQUEST_BUDGET,
+  CHANNEL_ROTATE_AFTER_REQUESTS,
+  CONSUMER_REFUSED_MESSAGE,
+  HOST_CONTROL_PROTOCOL,
+  HostControlClient,
+} from "./hostControl";
 import {
   decodeEd25519PublicKeyWire,
   exportEd25519PublicKeyWire,
@@ -2127,3 +2133,337 @@ describe("HostControlClient readHead", () => {
     client.close();
   });
 });
+
+/** A consumer channel as the shared connection hands it out: opens later. */
+class FakeConsumerChannel {
+  readyState = "connecting";
+  sent: string[] = [];
+  closed = false;
+  onopen = null;
+  onmessage = null;
+  onclose = null;
+  onerror = null;
+
+  constructor(readonly label: string) {}
+
+  send(value: string) {
+    if (this.readyState !== "open") throw new Error("Channel is not open");
+    this.sent.push(value);
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.readyState = "closed";
+    this.onclose?.();
+  }
+
+  open() {
+    this.readyState = "open";
+    this.onopen?.();
+  }
+
+  hello(capabilities = ["ping", "host.metrics", "fs.read"]) {
+    this.receive({ version: 1, type: "hello", protocol: HOST_CONTROL_PROTOCOL, capabilities });
+  }
+
+  /** What a daemon at its consumer limit does: accept the stream, then close it. */
+  refuse() {
+    this.open();
+    this.readyState = "closed";
+    this.closed = true;
+    this.onclose?.();
+  }
+
+  receive(frame) {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+
+  requests() {
+    return this.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === "request");
+  }
+
+  answerLast(result: unknown = { pong: true }) {
+    const request = this.requests().at(-1);
+    this.receive({
+      version: 1,
+      type: "response",
+      request_id: request.request_id,
+      ok: true,
+      result,
+    });
+  }
+}
+
+class FakeSharedConnection {
+  snapshot = {
+    state: "ready",
+    generation: "peer-1",
+    capabilities: [],
+    refusal: null,
+    trust: "verified",
+  };
+  channels: FakeConsumerChannel[] = [];
+  listeners = new Set<() => void>();
+
+  getSnapshot() {
+    return this.snapshot;
+  }
+
+  subscribe(listener: () => void) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  createChannel(label: string) {
+    const channel = new FakeConsumerChannel(label);
+    this.channels.push(channel);
+    return channel;
+  }
+
+  retry() {}
+
+  publish(snapshot) {
+    this.snapshot = { ...this.snapshot, ...snapshot };
+    for (const listener of this.listeners) listener();
+  }
+
+  latest() {
+    return this.channels.at(-1);
+  }
+}
+
+async function readyConsumer(options = {}) {
+  const connection = new FakeSharedConnection();
+  const client = new HostControlClient(hostId, {
+    sharedConnection: connection,
+    reconnectBaseDelayMs: 1,
+    reconnectRandom: () => 0,
+    ...options,
+  });
+  const states: string[] = [];
+  client.subscribe((state) => states.push(state));
+  client.connect();
+  connection.latest().open();
+  connection.latest().hello();
+  expect(client.getState()).toBe("ready");
+  return { client, connection, states };
+}
+
+/** Send and answer `count` pings, one at a time, as a live view does; a
+ *  replacement channel that is still opening is admitted first. */
+async function pingRepeatedly(client, connection, count: number) {
+  for (let index = 0; index < count; index += 1) {
+    const channel = connection.latest();
+    if (channel.readyState === "connecting") {
+      channel.open();
+      channel.hello();
+    }
+    const ping = client.ping();
+    channel.answerLast();
+    await ping;
+  }
+}
+
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+describe("HostControlClient consumer channel rotation", () => {
+  test("a long-lived consumer swaps channels before the daemon's 4,096-id limit, unnoticed", async () => {
+    const { client, connection, states } = await readyConsumer();
+    await pingRepeatedly(client, connection, CHANNEL_ROTATE_AFTER_REQUESTS);
+    // Idle past the mark: the swap happens now, not at the next caller's cost.
+    await Promise.resolve();
+    expect(connection.channels).toHaveLength(2);
+    const [spent, fresh] = connection.channels;
+    expect(spent.closed).toBe(true);
+    expect(spent.requests()).toHaveLength(CHANNEL_ROTATE_AFTER_REQUESTS);
+    expect(fresh.label).toMatch(/^spawn\.host\.ctl\/[0-9a-f-]{36}$/);
+    expect(fresh.label).not.toBe(spent.label);
+
+    // A request made while the replacement opens waits for it; nothing is
+    // sent on the spent channel, and nothing fails.
+    const waiting = client.request("host.metrics", {});
+    expect(fresh.sent).toHaveLength(0);
+    fresh.open();
+    expect(fresh.sent).toHaveLength(0);
+    fresh.hello();
+    expect(fresh.requests().map((frame) => frame.operation)).toEqual(["host.metrics"]);
+    fresh.answerLast({ sample: { cpu_percent: 1 } });
+    await expect(waiting).resolves.toEqual({ sample: { cpu_percent: 1 } });
+
+    // Well past what one channel may carry, and the view never left ready.
+    await pingRepeatedly(client, connection, 2 * CHANNEL_ROTATE_AFTER_REQUESTS);
+    expect(connection.channels).toHaveLength(4);
+    for (const channel of connection.channels)
+      expect(channel.requests().length).toBeLessThanOrEqual(CHANNEL_REQUEST_BUDGET);
+    expect(states).toEqual(["idle", "connecting", "ready"]);
+    expect(client.hasCapability("host.metrics")).toBe(true);
+    client.close();
+  });
+
+  test("the swap waits for in-flight work, and past the budget requests wait for the swap", async () => {
+    const { client, connection } = await readyConsumer();
+    await pingRepeatedly(client, connection, CHANNEL_ROTATE_AFTER_REQUESTS - 1);
+    const first = connection.latest();
+
+    // A read that stays open across the mark: its frames belong to this channel.
+    const reading = client.readFile("/private/slow.log");
+    first.answerLast({
+      stream_id: "slow-read",
+      path: "/private/slow.log",
+      name: "slow.log",
+      length: 0,
+      sha256: EMPTY_SHA256,
+    });
+    const read = await reading;
+    await Promise.resolve();
+    expect(connection.channels).toHaveLength(1);
+
+    // Still under the budget: requests keep using the busy channel.
+    await pingRepeatedly(
+      client,
+      connection,
+      CHANNEL_REQUEST_BUDGET - CHANNEL_ROTATE_AFTER_REQUESTS,
+    );
+    expect(first.requests()).toHaveLength(CHANNEL_REQUEST_BUDGET);
+    expect(connection.channels).toHaveLength(1);
+
+    // At the budget: the next request is held, not sent.
+    const held = client.request("host.metrics", {}, { timeoutMs: 5_000 });
+    expect(first.requests()).toHaveLength(CHANNEL_REQUEST_BUDGET);
+    expect(connection.channels).toHaveLength(1);
+
+    // The read finishes; only now is the channel idle and swapped.
+    first.receive({
+      version: 1,
+      type: "stream.end",
+      stream_id: "slow-read",
+      length: 0,
+      sha256: EMPTY_SHA256,
+    });
+    await expect(collectAll(read.stream)).resolves.toHaveLength(0);
+    await Promise.resolve();
+    expect(first.closed).toBe(true);
+    const second = connection.latest();
+    expect(second).not.toBe(first);
+    second.open();
+    second.hello();
+    expect(second.requests().map((frame) => frame.operation)).toEqual(["host.metrics"]);
+    second.answerLast({ ok: 1 });
+    await expect(held).resolves.toEqual({ ok: 1 });
+    expect(client.getState()).toBe("ready");
+    client.close();
+  });
+
+  test("a held request that times out was never sent, so nothing is cancelled", async () => {
+    const { client, connection } = await readyConsumer();
+    await pingRepeatedly(client, connection, CHANNEL_ROTATE_AFTER_REQUESTS);
+    await Promise.resolve();
+    const fresh = connection.latest();
+    const held = client.request("host.metrics", {}, { timeoutMs: 1 });
+    await expect(held).rejects.toThrow("timed out");
+    fresh.open();
+    fresh.hello();
+    expect(fresh.sent).toHaveLength(0);
+    for (const channel of connection.channels)
+      expect(channel.sent.map((frame) => JSON.parse(frame).type)).not.toContain("cancel");
+    client.close();
+  });
+
+  test("a replacement that never says hello is retired instead of holding requests for ever", async () => {
+    const { client, connection } = await readyConsumer({ connectTimeoutMs: 5 });
+    await pingRepeatedly(client, connection, CHANNEL_ROTATE_AFTER_REQUESTS);
+    await Promise.resolve();
+    const stuck = connection.latest();
+    const held = client.request("host.metrics", {}, { timeoutMs: 5_000 });
+    await expect(held).rejects.toThrow();
+    expect(stuck.closed).toBe(true);
+    await waitFor(() => connection.channels.length === 3);
+    connection.latest().open();
+    connection.latest().hello();
+    expect(client.getState()).toBe("ready");
+    client.close();
+  });
+});
+
+describe("HostControlClient refused consumer channel", () => {
+  test("a daemon at its consumer limit gets a clear error and a slow retry, not a loop", async () => {
+    const connection = new FakeSharedConnection();
+    const client = new HostControlClient(hostId, {
+      sharedConnection: connection,
+      reconnectBaseDelayMs: 5,
+      reconnectRandom: () => 0,
+    });
+    client.connect();
+    // One refusal can be a race with a channel that is still closing.
+    connection.latest().refuse();
+    expect(client.getState()).toBe("connecting");
+    expect(client.getConnectionError()).toBeNull();
+    await waitFor(() => connection.channels.length === 2);
+    connection.latest().refuse();
+    expect(client.getState()).toBe("error");
+    expect(client.getConnectionError()).toBe(CONSUMER_REFUSED_MESSAGE);
+    expect(client.getConnectionError()).toContain("SPAWN D");
+
+    // A snapshot change does not reopen behind the backoff (4 × 5 ms × 0.7).
+    connection.publish({ info: { kind: "direct", rttMs: 3, protocol: "udp" } });
+    expect(connection.channels).toHaveLength(2);
+    await waitFor(() => connection.channels.length === 3);
+    // Still refused: still saying why, and backing off further.
+    expect(client.getState()).toBe("error");
+    connection.latest().refuse();
+    expect(client.getState()).toBe("error");
+    await Bun.sleep(10);
+    expect(connection.channels).toHaveLength(3);
+    await waitFor(() => connection.channels.length === 4);
+
+    // A view closes elsewhere; the next attempt is admitted.
+    connection.latest().open();
+    connection.latest().hello();
+    expect(client.getState()).toBe("ready");
+    expect(client.getConnectionError()).toBeNull();
+    client.close();
+  });
+
+  test("a channel lost after its hello is an ordinary reconnect, never a refusal", async () => {
+    const { client, connection } = await readyConsumer();
+    for (let round = 0; round < 3; round += 1) {
+      connection.latest().close();
+      await waitFor(() => connection.channels.length === round + 2);
+      expect(client.getConnectionError()).toBeNull();
+      connection.latest().open();
+      connection.latest().hello();
+      expect(client.getState()).toBe("ready");
+    }
+    client.close();
+  });
+
+  test("losing the shared connection clears a refusal: a new peer is a new budget", async () => {
+    const connection = new FakeSharedConnection();
+    const client = new HostControlClient(hostId, {
+      sharedConnection: connection,
+      reconnectBaseDelayMs: 1_000,
+      reconnectRandom: () => 0,
+    });
+    client.connect();
+    connection.latest().refuse();
+    connection.publish({ state: "connecting", generation: null });
+    connection.publish({ state: "ready", generation: "peer-2" });
+    expect(connection.channels).toHaveLength(2);
+    // Without the reset this would be the second refusal in a row.
+    connection.latest().refuse();
+    expect(client.getState()).toBe("connecting");
+    expect(client.getConnectionError()).toBeNull();
+    client.close();
+  });
+});
+
+async function collectAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return chunks;
+    chunks.push(value);
+  }
+}

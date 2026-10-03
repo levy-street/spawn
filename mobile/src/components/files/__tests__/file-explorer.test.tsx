@@ -5,6 +5,10 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { FileExplorer } from "@/components/files/file-explorer";
 import type { HostDirEntry } from "@/components/files/types";
+import {
+  HOST_CONSUMER_LIMIT_CODE,
+  HOST_CONSUMER_LIMIT_MESSAGE,
+} from "@/terminal/transport/host-ctl-codec";
 import { ThemeProvider } from "@/theme";
 
 const mockTransport = {
@@ -23,20 +27,29 @@ const mockEntries: HostDirEntry[] = [
   { is_dir: false, kind: "file", name: "notes.md", path: "/Users/charlie/notes.md", size: 40 },
 ];
 
+let mockSurfaceFailure: { code: string; message: string } | null = null;
+
 jest.mock("@/terminal/HostTransportSurface", () => {
   const ReactModule = jest.requireActual<typeof import("react")>("react");
   return {
     HostTransportSurface: ({
+      onError,
       onStateChange,
       onTransport,
     }: {
+      onError?(error: { code: string; message: string; retryable: boolean }): void;
       onStateChange(state: string): void;
       onTransport(transport: unknown): void;
     }) => {
       ReactModule.useEffect(() => {
         onTransport(mockTransport);
-        onStateChange("ready");
-      }, [onStateChange, onTransport]);
+        if (mockSurfaceFailure) {
+          onError?.({ ...mockSurfaceFailure, retryable: false });
+          onStateChange("failed");
+        } else {
+          onStateChange("ready");
+        }
+      }, [onError, onStateChange, onTransport]);
       return null;
     },
   };
@@ -112,6 +125,10 @@ function renderExplorer(onBack = jest.fn()) {
   );
 }
 
+afterEach(() => {
+  mockSurfaceFailure = null;
+});
+
 describe("FileExplorer", () => {
   test("wears one header, naming the machine under the screen's name", async () => {
     const onBack = jest.fn();
@@ -141,5 +158,22 @@ describe("FileExplorer", () => {
     expect(screen.getByText("notes.md")).toBeOnTheScreen();
     await fireEvent.press(screen.getByRole("button", { name: "Folder actions" }));
     expect(screen.getByText("Show dotfiles")).toBeOnTheScreen();
+  });
+
+  test("a refused tool channel says too many views are open, and offers Retry", async () => {
+    mockSurfaceFailure = { code: HOST_CONSUMER_LIMIT_CODE, message: HOST_CONSUMER_LIMIT_MESSAGE };
+    await renderExplorer();
+    expect(screen.getByText("Files unavailable")).toBeOnTheScreen();
+    expect(screen.getByText(HOST_CONSUMER_LIMIT_MESSAGE)).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeOnTheScreen();
+  });
+
+  test("any other failure keeps the plain connection copy", async () => {
+    mockSurfaceFailure = { code: "connect_timeout", message: "Timed out." };
+    await renderExplorer();
+    expect(
+      screen.getByText("The direct host connection could not be established."),
+    ).toBeOnTheScreen();
+    expect(screen.queryByText("Timed out.")).toBeNull();
   });
 });

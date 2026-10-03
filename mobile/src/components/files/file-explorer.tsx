@@ -36,7 +36,8 @@ import {
 import { qk } from "@/data/queryKeys";
 import { haptics } from "@/lib/haptics";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
-import type { HostTransport, TransportState } from "@/terminal/transport/types";
+import { HOST_CONSUMER_LIMIT_CODE } from "@/terminal/transport/host-ctl-codec";
+import type { HostTransport, TransportError, TransportState } from "@/terminal/transport/types";
 import { spacing, useTheme } from "@/theme";
 
 type NameMode = { kind: "create" } | { kind: "rename"; entry: HostDirEntry } | null;
@@ -71,6 +72,7 @@ export function FileExplorer({
   const pathFlavor = pathFlavorForHostOS(hostOS);
   const [transport, setTransport] = useState<HostTransport | null>(null);
   const [transportState, setTransportState] = useState<TransportState>("idle");
+  const [transportError, setTransportError] = useState<TransportError | null>(null);
   const [path, setPath] = useState("");
   const [showDotfiles, setShowDotfiles] = useState(true);
   const [selected, setSelected] = useState<HostDirEntry | null>(null);
@@ -213,6 +215,7 @@ export function FileExplorer({
                 onPress={() => {
                   setTransport(null);
                   setTransportState("idle");
+                  setTransportError(null);
                   setTransportGeneration((generation) => generation + 1);
                 }}
                 variant="outline"
@@ -220,7 +223,12 @@ export function FileExplorer({
                 Retry
               </Button>
             }
-            description="The direct host connection could not be established."
+            description={
+              // Too many views is something the person can fix; say so.
+              transportError?.code === HOST_CONSUMER_LIMIT_CODE
+                ? transportError.message
+                : "The direct host connection could not be established."
+            }
             icon="Unplug"
             title="Files unavailable"
           />
@@ -236,6 +244,7 @@ export function FileExplorer({
           hostId={hostId}
           hostIdentityPublicKey={hostIdentityPublicKey}
           key={`${hostId}:${transportGeneration}`}
+          onError={setTransportError}
           onStateChange={setTransportState}
           onTransport={setTransport}
         />

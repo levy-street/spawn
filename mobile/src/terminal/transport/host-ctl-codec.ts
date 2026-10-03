@@ -26,6 +26,30 @@ export const HOST_FILE_MAX_BYTES = 512 * 1024 * 1024;
 export const HOST_RANGE_MAX_BYTES = 16 * 1024 * 1024;
 export const HOST_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 export const HOST_PREVIEW_PIXELS = [128, 256, 512, 1024] as const;
+/**
+ * A daemon admits 4,096 request ids on one host-control channel, remembers
+ * every one, and closes the channel at the next (daemon/src/host_control.rs,
+ * MAX_SEEN_REQUESTS). A tool that lives for hours — live capacity every three
+ * seconds, a file browser left open — dies there, and daemons already
+ * installed will never forget an id. So a consumer swaps its channel for a
+ * fresh one once it has sent the first number and nothing is in flight, and
+ * never sends more than the second on one channel: past it, requests wait for
+ * the swap. Keep this for as long as such daemons can be reached.
+ */
+export const HOST_CONTROL_ROTATE_AFTER_REQUESTS = 3_500;
+export const HOST_CONTROL_REQUEST_BUDGET = 4_000;
+/**
+ * A daemon accepts 32 tool channels per device and host (daemon/src/rtc_pair.rs,
+ * MAX_PAIR_CONTROLS) and closes any past that before its hello; the worker
+ * keeps the same limit itself. One such close can race a channel still
+ * closing, so the second in a row is the limit.
+ */
+export const HOST_CONSUMER_REFUSALS_BEFORE_FAILURE = 2;
+/** The worker's report that the daemon closed a tool channel before its hello. */
+export const HOST_CONSUMER_REFUSED_CODE = "host_consumer_refused";
+export const HOST_CONSUMER_LIMIT_CODE = "host_consumer_limit";
+export const HOST_CONSUMER_LIMIT_MESSAGE =
+  "Too many SPAWN D views are open on this host. Close one and try again.";
 /** The host-control operation that locates an agent's transcripts; gate on it. */
 export const AGENT_TRANSCRIPTS_OP = "agent.transcripts";
 /** Roles a transcript file can have, as the daemon names them. */
@@ -406,6 +430,8 @@ export interface HostStreamPort {
     payload: Readonly<Record<string, unknown>>,
   ): Promise<void>;
   fatal(error: HostControlTransportError): void;
+  /** A stream left the runtime, finished or not. */
+  settled?(): void;
   readonly timeoutMs: number;
 }
 
@@ -418,6 +444,11 @@ export class HostStreamRuntime {
   readonly #outgoing = new Map<string, OutgoingStreamState>();
 
   constructor(private readonly port: HostStreamPort) {}
+
+  /** Streams in progress. Each belongs to the channel it started on. */
+  get active(): number {
+    return this.#incoming.size + this.#outgoing.size;
+  }
 
   beginIncoming(
     declaration: HostReadDeclarationWire,
@@ -546,6 +577,7 @@ export class HostStreamRuntime {
         this.#outgoing.delete(streamId);
         if (outgoing.timer) clearTimeout(outgoing.timer);
         void this.port.send("cancel", { stream_id: streamId }).catch(() => undefined);
+        this.port.settled?.();
       }
       void reader.cancel(failure).catch(() => undefined);
       const finalFailure =
@@ -588,6 +620,7 @@ export class HostStreamRuntime {
     if (outgoing && (frame.type === "stream.committed" || frame.type === "stream.error")) {
       this.#outgoing.delete(frame.streamId);
       if (outgoing.timer) clearTimeout(outgoing.timer);
+      this.port.settled?.();
       if (frame.type === "stream.committed") {
         if (!outgoing.commitDispatched) {
           this.port.fatal(
@@ -766,6 +799,7 @@ export class HostStreamRuntime {
     this.#incoming.delete(streamId);
     if (incoming.timer) clearTimeout(incoming.timer);
     incoming.removeAbort?.();
+    this.port.settled?.();
   }
 
   #resetIncomingTimeout(streamId: string, incoming: IncomingStreamState): void {
@@ -784,6 +818,7 @@ export class HostStreamRuntime {
     outgoing.timer = setTimeout(() => {
       if (this.#outgoing.get(streamId) !== outgoing) return;
       this.#outgoing.delete(streamId);
+      this.port.settled?.();
       void this.port.send("cancel", { stream_id: streamId }).catch(() => undefined);
       outgoing.reject(
         outgoing.commitDispatched

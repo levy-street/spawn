@@ -190,6 +190,7 @@ export const FileExplorer = forwardRef<
     capabilities,
     os: hostOs,
     signedRtcRefusal,
+    connectionError,
   } = useHostControl(hostId);
   const pathFlavor = pathFlavorForHostOS(hostOs);
   const controlReady = hostControlState === "ready" && hostControl !== null;
@@ -1119,16 +1120,25 @@ export const FileExplorer = forwardRef<
             </Link>
           </div>
         )}
+        {connectionError && !signedRtcRefusal && (
+          <p className="px-3 py-2 text-xs text-destructive" role="alert">
+            {connectionError}
+          </p>
+        )}
         {rootQ.error && (
           <p className="px-3 py-2 text-xs text-destructive" role="alert">
             {errorMessage(rootQ.error)}
           </p>
         )}
-        {!rootBusy && entryRows.length === 0 && creatingIn === null && !rootQ.error && (
-          <p className="px-3 py-4 text-center text-xs text-muted-foreground">
-            Empty directory. Drop files here to upload.
-          </p>
-        )}
+        {!rootBusy &&
+          entryRows.length === 0 &&
+          creatingIn === null &&
+          !rootQ.error &&
+          !connectionError && (
+            <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+              Empty directory. Drop files here to upload.
+            </p>
+          )}
 
         {creatingIn === resolvedRoot && resolvedRoot && (
           <NewFolderRow
