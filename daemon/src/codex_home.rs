@@ -14,8 +14,11 @@
 //!   `model_instructions_file`;
 //! - their conversation stores, `sessions/`, `archived_sessions/`,
 //!   `history.jsonl` and `session_index.jsonl`, linked, so a rollout written
-//!   here lands in the store every other Codex reads: `codex resume` finds it
-//!   from any window and `agent.transcripts` finds it where it looks;
+//!   here lands in the user's store: `agent.transcripts` finds it where it
+//!   looks, and `codex resume <id>` finds it from any window. Codex's resume
+//!   picker lists from a state database of each home's own (`state_5.sqlite`,
+//!   never linked: two paths to one SQLite database corrupt it), so the
+//!   user's picker does not list a window's conversations;
 //! - their sign-in and Codex's small caches, mirrored: a link to the user's
 //!   file where they have one, nothing where they have none, and never a file
 //!   of the window's own. Codex refresh tokens are single-use, so a second

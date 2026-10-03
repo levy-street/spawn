@@ -501,8 +501,11 @@ the user's own Codex home (`codex_home.rs`):
   path it named in the user's home; Codex refuses to start over a
   `model_instructions_file` it cannot find.
 - their `sessions/`, `archived_sessions/`, `history.jsonl` and
-  `session_index.jsonl` linked, so rollouts land where `codex resume` and
-  `agent.transcripts` look. A real store there is the window's own record
+  `session_index.jsonl` linked, so rollouts land where `agent.transcripts`
+  looks and `codex resume <id>` finds them from any window. Codex's resume
+  picker lists from each home's own state database, which is never linked
+  (two paths to one SQLite database corrupt it), so the user's picker does
+  not list a window's conversations. A real store there is the window's own record
   from before the links and is kept; a hard-linked one (Windows' projection
   of an earlier source) is re-pointed, since its data has another name.
 - their `auth.json` and Codex's caches mirrored: a link to the user's file
