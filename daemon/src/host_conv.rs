@@ -290,8 +290,11 @@ fn from_record(
             conversation_id: Some(own.conversation_id.clone()),
             state: own.state,
             cli_version: own.version.clone(),
+            // A parked record's `sessionId` is the conversation that window
+            // left, not one it holds: its background job holds the fork.
             live_elsewhere: records.iter().any(|other| {
                 other.pid != own.pid
+                    && other.parked == Parked::No
                     && !in_window.contains(&other.pid)
                     && other.conversation_id == own.conversation_id
             }),
@@ -1117,6 +1120,41 @@ mod tests {
         // A dead holder holds nothing.
         table.dead.insert(2001);
         assert!(!run(&table, &store).live_elsewhere);
+    }
+
+    #[test]
+    fn a_parked_window_does_not_hold_the_conversation_it_left() {
+        // Another window parked in agent view: its record keeps the id it
+        // left beside `parkedJobId`, and its background job holds the fork
+        // under a new id. This window resumed the original thread, which
+        // nothing else holds.
+        let mut table = FakeTable::window();
+        table.spawn(1001, SHELL, Some(WINDOW_TTY), CLAUDE, "77");
+        table.spawn(2000, 1, Some(2000), "/bin/zsh", "5");
+        table.spawn(2001, 2000, Some(2000), CLAUDE, "88");
+        table.spawn(3000, 1, None, CLAUDE, "6");
+        table.spawn(3001, 3000, Some(3001), CLAUDE, "7");
+        let mut parked = record(2001, CONVERSATION, "idle", "88");
+        parked["parkedJobId"] = "a2efba65".into();
+        let mut job = record(3001, OTHER, "idle", "7");
+        job["kind"] = "bg".into();
+        job["jobId"] = "a2efba65".into();
+        let store = store_with(&[record(1001, CONVERSATION, "idle", "77"), parked, job]);
+        let inspection = run(&table, &store);
+        assert_eq!(inspection.source, Source::Registry);
+        assert_eq!(inspection.conversation_id.as_deref(), Some(CONVERSATION));
+        assert!(!inspection.live_elsewhere);
+
+        // The fork's own holder is still seen from a window that is in it.
+        let mut table = FakeTable::window();
+        table.spawn(1001, SHELL, Some(WINDOW_TTY), CLAUDE, "77");
+        table.spawn(3000, 1, None, CLAUDE, "6");
+        table.spawn(3001, 3000, Some(3001), CLAUDE, "7");
+        let mut job = record(3001, OTHER, "idle", "7");
+        job["kind"] = "bg".into();
+        job["jobId"] = "a2efba65".into();
+        let store = store_with(&[record(1001, OTHER, "idle", "77"), job]);
+        assert!(run(&table, &store).live_elsewhere);
     }
 
     #[test]

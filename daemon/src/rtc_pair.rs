@@ -2151,11 +2151,18 @@ mod tests {
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;
         let registry = SessionRegistry::new();
-        // A window whose shell is a real process with nothing under it.
+        // A window whose shell is a real process with nothing under it. A
+        // daemon that cannot walk a window (Windows) neither advertises nor
+        // answers `conv.*`, whatever the pid, so this test's own stands in.
+        #[cfg(unix)]
         let mut shell = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
+        #[cfg(unix)]
+        let shell_pid = shell.id();
+        #[cfg(not(unix))]
+        let shell_pid = std::process::id();
         let window = Uuid::new_v4();
         let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
@@ -2174,7 +2181,7 @@ mod tests {
                 outbox_tx,
                 control: crate::pty::ForwarderControl::new(),
             })
-            .with_shell_pid(shell.id()),
+            .with_shell_pid(shell_pid),
         );
         // A worker that never reported its shell.
         let unreported = Uuid::new_v4();
@@ -2278,8 +2285,11 @@ mod tests {
         sessions.close_all().await;
         let _ = pc.close().await;
         signal_sink.abort();
-        shell.kill().unwrap();
-        shell.wait().unwrap();
+        #[cfg(unix)]
+        {
+            shell.kill().unwrap();
+            shell.wait().unwrap();
+        }
     }
 
     #[tokio::test]
