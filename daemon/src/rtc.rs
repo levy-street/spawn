@@ -5095,7 +5095,9 @@ fn install_host_data_channel_handler(
                 let _ = dc.close().await;
                 return;
             }
-            install_host_control_channel(dc, signal_id, binding, signaling, files);
+            // Protocol 1: admitted on the server's binding, no device behind
+            // it, so no device-intent operations (`host_control::requires_pair`).
+            install_host_control_channel(dc, signal_id, binding, signaling, files, None);
         })
     }));
 }
@@ -5161,9 +5163,10 @@ fn install_host_control_channel(
     binding: HostRtcBinding,
     signaling: RtcWsSender,
     files_override: Option<Arc<HostFileService>>,
+    pair: Option<crate::host_conv::WindowShells>,
 ) -> Arc<crate::host_control::Lifetime> {
     let connected_signal = HostConnectedSignal::new(signaling, signal_id, binding);
-    crate::host_control::install(dc, connected_signal, files_override)
+    crate::host_control::install(dc, connected_signal, files_override, pair)
 }
 
 pub(crate) async fn send_host_status(
@@ -10200,6 +10203,60 @@ mod tests {
         assert!(sessions.host_peers.lock().await.is_empty());
     }
 
+    /// A protocol 1 host channel is admitted on the server's binding alone,
+    /// with no authenticated device behind it: device-intent families are
+    /// neither advertised nor answered there, whatever a client sends.
+    #[tokio::test]
+    async fn a_legacy_host_channel_refuses_device_intent_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "c".repeat(32),
+            binding_generation: 1,
+            protocol: HOST_CONTROL_LABEL.to_owned(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, _out_rx) =
+            start_paired_host_endpoint(files, binding, "legacy-device-intent").await;
+        let (_, hello) = receive_host_control(&mut messages).await;
+        assert_eq!(hello["type"], "hello");
+        let capabilities = hello["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|name| name == "fs.home"));
+        assert!(!capabilities
+            .iter()
+            .any(|name| name.as_str().is_some_and(|name| name.starts_with("conv."))));
+        for (index, operation) in [
+            "conv.inspect",
+            "conv.export",
+            "session.launch.set",
+            "agent.accounts.list",
+            "screen.view",
+            "box.list",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = request_host_control(
+                &channel,
+                &mut messages,
+                &format!("legacy-intent-{index}"),
+                operation,
+                json!({"session_id": Uuid::new_v4().to_string()}),
+            )
+            .await;
+            assert_eq!(response["ok"], false, "{operation}");
+            assert_eq!(response["error"]["code"], "pair_required", "{operation}");
+        }
+        // Everything it served before, it still serves.
+        let home =
+            request_host_control(&channel, &mut messages, "legacy-home", "fs.home", json!({}))
+                .await;
+        assert_eq!(home["ok"], true);
+        browser_pc.close().await.unwrap();
+        close_test_peer(&daemon_pc).await;
+    }
+
     #[tokio::test]
     async fn two_real_host_channels_keep_source_and_destination_capabilities_isolated() {
         let source_root = tempfile::tempdir().unwrap();
@@ -10423,6 +10480,7 @@ mod tests {
                 protocol_version: RTC_PROTOCOL_VERSION,
             },
             RtcWsSender::default(),
+            None,
             None,
         );
         let weak_lifetime = Arc::downgrade(&lifetime);

@@ -225,7 +225,13 @@ if control.count(expected_control_imports) != 1:
 # *locates* an agent's own transcript files under the home root and answers on
 # the same data channel; the bytes are then read with fs.read. It is pinned
 # below to depend on host_files alone, so it cannot reach a server transport.
+# host_conv (2026-10-03) answers conv.inspect: which conversation a window is
+# in, read from the window's process tree and the agent's own live-session
+# registry. It is handed only a pid resolver for the device's windows, never
+# the session registry, and is pinned below to depend on nothing crate-local
+# and to execute nothing.
 if set(re.findall(r"crate::(\w+)", control)) != {
+    "host_conv",
     "host_desktop",
     "host_direct",
     "host_files",
@@ -243,6 +249,19 @@ if set(re.findall(r"crate::(\w+)", transcripts)) != {"host_files"}:
     raise SystemExit("no-server-agent-upload: host transcript locator gained an unreviewed crate dependency")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|TcpStream|UdpSocket|mpsc)\b", transcripts):
     raise SystemExit("no-server-agent-upload: host transcript locator gained a transport")
+conv_path = os.path.join(root, "daemon/src/host_conv.rs")
+with open(conv_path, encoding="utf-8") as source:
+    conv = source.read()
+conv_runtime = conv.split("#[cfg(all(test, unix))]\nmod tests {")[0]
+if set(re.findall(r"crate::(\w+)", conv)):
+    raise SystemExit("no-server-agent-upload: conversation inspector gained a crate dependency")
+if re.search(r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|TcpStream|UdpSocket|mpsc)\b", conv):
+    raise SystemExit("no-server-agent-upload: conversation inspector gained a transport")
+if re.search(
+    r"process::Command|\bCommand::new\b|\b(?:posix_spawnp?|execv[pe]*|execl[pe]*|fexecve|v?fork|system)\s*\(",
+    conv_runtime,
+):
+    raise SystemExit("no-server-agent-upload: conversation inspector may not execute anything")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
@@ -261,6 +280,7 @@ expected_control_exports = [
     dc: Arc<RTCDataChannel>,
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
+    pair: Option<crate::host_conv::WindowShells>,
 ) -> Arc<Lifetime> {""",
 ]
 control_exports = list(
@@ -276,10 +296,12 @@ if len(control_exports) != len(expected_control_exports) or any(
 # Pin the private state and entire retirement implementation as well. Public
 # trait methods and derives need no `pub` keyword, so the export list alone
 # cannot detect them. The symbol inventory below rejects additional impls in
-# this or another module, just as it does for HostConnectedSignal.
+# this or another module, just as it does for HostConnectedSignal. Reviewed
+# 2026-10-03: Context gained `pair`, the pid resolver for a pair-admitted
+# channel's windows (host_conv::WindowShells); it publishes nothing.
 lifetime_block = control[control.index("struct Context {"):control.index("impl Context {")]
 if hashlib.sha256(lifetime_block.encode()).hexdigest() != (
-    "1439d68c0d88eaaaa21a58b9b7d2203fe42f2e049160cba7415f8b50f9168879"
+    "8d64655df14d5488df14884d0d56c91d1f51f0f6ccbd1e8c3d9ab70e5943a908"
 ):
     raise SystemExit("no-server-agent-upload: protected host retirement capability changed")
 if control.count("connected_signal: HostConnectedSignal") != 1:
@@ -674,6 +696,7 @@ self_test() {
   cp "$source_root/daemon/src/rtc_pair.rs" "$fixture/daemon/src/rtc_pair.rs"
   cp "$source_root/daemon/src/host_control.rs" "$fixture/daemon/src/host_control.rs"
   cp "$source_root/daemon/src/host_transcripts.rs" "$fixture/daemon/src/host_transcripts.rs"
+  cp "$source_root/daemon/src/host_conv.rs" "$fixture/daemon/src/host_conv.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
   printf '%s\n' \

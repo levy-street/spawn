@@ -17,6 +17,7 @@ mod cpu_scopes;
 mod creds;
 mod doctor;
 mod host_control;
+mod host_conv;
 mod host_desktop;
 mod host_direct;
 mod host_files;

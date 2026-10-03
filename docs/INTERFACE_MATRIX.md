@@ -27,6 +27,7 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | Host file previews | file explorer hover card and viewer dialog | none; never server-visible | `HostControlClient.readRange/previewImage` | `fs.read.range` bounded slice; `fs.preview` host-rendered PNG (macOS only, advertised per host) |
 | Reveal / open a host file on its desktop | file row menu, viewer toolbar | none | `HostControlClient.reveal/openDefault` | `desktop.reveal` / `desktop.open`; path-only payload, allowlisted and rate-limited on the host (macOS only, advertised per host) |
 | Agent transcript | pane/full-session **Transcript** action (mobile: terminal menu and pane sheet); list, view, download | none; never server-visible | `HostControlClient.agentTranscripts`, then `readFile`/`saveFileToBrowser` | `agent.transcripts` locates the harness's own files for the window's `agent_session_id`/`cwd` (Claude Code `.jsonl`, Codex rollout, aider history); each is read with `fs.read` (advertised per daemon; older daemons answer `unsupported_operation`) |
+| Live conversation | Restart (pane, full session, mobile terminal menu and pane sheet) | none; never server-visible, except that a changed id is written back with `PATCH /api/sessions/{id}` `agent_session_id` | `HostControlClient.inspectConversation` (web), `HostTransport.inspectConversation` (mobile) | `conv.inspect {session_id}` → `{agent, conversation_id, state, cli_version, live_elsewhere, source}`, read from the window's own process tree and Claude Code's `sessions/<pid>.json` registry; executes nothing. Advertised as the family capability `conv.v1`, on pair-admitted channels only (a legacy host channel answers `pair_required`); Linux and macOS daemons |
 | List/create/get/rename/delete sessions | sidebar, workspace grid, `/sessions/[id]` | `GET/POST /api/sessions`, `GET/PATCH/DELETE /api/sessions/{id}`; list accepts only optional `host_id` | `sessions.*` | `session.create`, `session.kill`; terminal over direct channels |
 | Restart a session | sidebar, pane/full-session actions, the agent's own "Update installed · Restart to update" notice | `POST /api/sessions/{id}/restart` | `sessions.restart`; for an agent window the client queues the agent's resume command (`claude --resume <agent_session_id>`, or `--continue` when none was recorded) and types it the moment the fresh shell's transport opens | `session.restart` ends the worker (the process tree goes with its PTY) and starts a login shell in the stored `cwd`; the resume command is client-typed input like any launch |
 | Session skill access | Settings → Skills and session access consumers | `GET/PATCH /api/sessions/{id}/access` | `sessionAccess.get/update` | skills are included in `session.create` / `session.restart` and materialized per session |
@@ -65,6 +66,14 @@ its tiles before deleting the workspace.
 | Session PTY | DataChannel `spawn.pty` | protocol version 2 | raw PTY bytes |
 | Session control | DataChannel `spawn.ctl` | locked protocol version 1 | replay, viewport/display ownership, and session uploads |
 | Host control | DataChannel `spawn.host.ctl` | protocol version 1 | host filesystem and host-scoped protected operations |
+
+`spawn.host.ctl` advertises what a daemon can do in its `hello`. A new
+operation family is one versioned capability for the whole family (`conv.v1`
+for every `conv.*` operation), never a name per operation. Families that
+carry a device's intent — `conv.*`, then `session.launch.*`,
+`agent.accounts.*`, `screen.*`, `box.*` — are answered only on channels
+admitted through an authenticated device pair; a legacy protocol-1 host
+channel neither advertises them nor answers them (`pair_required`).
 
 The daemon control frames implemented in `daemon/src/proto.rs` are:
 
