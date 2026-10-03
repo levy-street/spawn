@@ -491,19 +491,34 @@ A window given skills gets `<config_dir>/sessions/<session id>/`
 and never wipes it — the wipe this replaced deleted the Codex conversations
 of every skilled window on Restart. `skills/` is spawnd's and is rewritten
 (a link in its place is removed, not followed); `codex-home/` is drawn from
-the user's own Codex home (`codex_home.rs`): their `config.toml` merged with
-`toml_edit`, their trust and credential-store choices kept; their `sessions/`,
-`archived_sessions/`, `history.jsonl` and `session_index.jsonl` linked, so
-rollouts land where `codex resume` and `agent.transcripts` look; their
-`auth.json` linked — a hard link on Windows, never a copy, since a copy that
-refreshed would fork Codex's single-use refresh token — and not projected at
-all for a keyring or `auto` credential store. The source is the session
-environment's `CODEX_HOME` (else `~/.codex`), never one inside the window
-homes. Every link is re-pointed and verified on each apply; a real entry
-that could be the user's — a store a window kept before the links, a
-sign-in made in the window — is left alone, and a projected file is replaced
-only where nothing is lost (a link, symbolic or hard, or a byte-identical
-copy).
+the user's own Codex home (`codex_home.rs`):
+
+- their `config.toml`, merged with `toml_edit`, their trust and
+  credential-store choices kept. Codex resolves a relative path there against
+  the folder the file is in, so every key it reads that way
+  (`RELATIVE_PATH_KEYS`, from Codex's `AbsolutePathBuf` config fields —
+  `model_instructions_file` and its kin, per profile too) is rewritten to the
+  path it named in the user's home; Codex refuses to start over a
+  `model_instructions_file` it cannot find.
+- their `sessions/`, `archived_sessions/`, `history.jsonl` and
+  `session_index.jsonl` linked, so rollouts land where `codex resume` and
+  `agent.transcripts` look. A real store there is the window's own record
+  from before the links and is kept; a hard-linked one (Windows' projection
+  of an earlier source) is re-pointed, since its data has another name.
+- their `auth.json` and Codex's caches mirrored: a link to the user's file
+  where there is one, nothing where there is none. The window never keeps a
+  sign-in of its own — not a copy an older spawnd left, not one made in the
+  window, not a hard link the user's logout split off — because a second
+  copy forks Codex's single-use refresh token, and a window signs out when
+  the user does. Files are hard links on Windows (a file symlink needs a
+  privilege), symlinks elsewhere. A `keyring` or `ephemeral` credential store
+  never reads `auth.json`, so the window keeps none; `auto` falls back to it
+  and is mirrored like `file`.
+
+The source is the session environment's `CODEX_HOME` (else `~/.codex`,
+created when missing so a window opened before Codex ever ran links from its
+first start), never one inside the window homes. Every link is re-pointed and
+verified on each apply.
 
 ## Before calling a change done
 

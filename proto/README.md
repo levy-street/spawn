@@ -350,10 +350,13 @@ When a session is created, granted skills are included in the daemon
 `session.create` frame. The daemon writes per-session files and exports
 `SPAWN_AGENT_CONFIG_DIR`, `SPAWN_SKILLS_FILE`, and `SPAWN_SKILLS_DIR` into the
 shell's environment (the variables configure agent CLIs launched from the
-shell). It also always writes a per-session `CODEX_HOME` projection containing
-a `config.toml`, the managed skills, and links to existing Codex auth state
-when present — shell-first sessions cannot know in advance whether Codex will
-be launched, so every skilled session gets the projection.
+shell). It also always gives the session a `CODEX_HOME` of its own, reconciled
+at every start and restart and never wiped: the user's own `config.toml`
+merged with the managed skills (its relative paths rewritten to name the
+user's files), the user's Codex conversation stores linked, and their sign-in
+mirrored as a link, never a copy — "A skilled window's home" in
+`daemon/CLAUDE.md` has the rules. Shell-first sessions cannot know in advance
+whether Codex will be launched, so every skilled session gets one.
 
 ### Workspaces
 

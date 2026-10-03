@@ -3649,6 +3649,10 @@ fn materialize_window_home(
     // (or clicks) `codex`, it inherits this CODEX_HOME and sees the skills.
     let codex_home = root.join("codex-home");
     let source = codex_source_home(env, homes, default_codex_home);
+    if let Some(default) = default_codex_home.filter(|default| source.as_deref() == Some(*default))
+    {
+        ensure_default_codex_home(default);
+    }
     let trusted_project = (!create.cwd.trim().is_empty()).then(|| expand_host_path(&create.cwd));
     crate::codex_home::reconcile(&crate::codex_home::Plan {
         codex_home: &codex_home,
@@ -3676,6 +3680,23 @@ fn codex_source_home(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && !path.starts_with(homes));
     configured.or_else(|| default.map(Path::to_path_buf))
+}
+
+/// `~/.codex`, made where it is missing, as Codex makes it on its first run:
+/// a window opened before the user ever ran Codex then links its stores and
+/// sign-in into the user's from its first start, rather than keeping its own
+/// from then on. A configured `CODEX_HOME` that is missing is not made — Codex
+/// itself refuses one — and nothing here stops the window starting.
+fn ensure_default_codex_home(path: &Path) {
+    match fs::create_dir(path) {
+        Ok(()) => tracing::info!(path = %path.display(), "created the user's Codex home"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "could not create the user's Codex home; this window's Codex keeps its own"
+        ),
+    }
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -6297,6 +6318,34 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn a_window_opened_before_codex_ever_ran_links_into_the_default_codex_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let homes = temp.path().join("config").join("sessions");
+        let user_home = temp.path().join("home");
+        fs::create_dir_all(&user_home).expect("user home");
+        let default = user_home.join(".codex");
+        let create = skilled_create("/work/repo");
+        let mut env = BTreeMap::new();
+        materialize_window_home(&homes, &create, &mut env, Some(&default)).expect("materialize");
+        assert!(default.is_dir(), "the default Codex home was not made");
+        let codex_home = homes.join(create.session_id.to_string()).join("codex-home");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read_link(codex_home.join("sessions")).expect("sessions linked"),
+            default.join("sessions")
+        );
+        #[cfg(not(unix))]
+        let _ = codex_home;
+
+        // A configured CODEX_HOME that is missing is not made.
+        let missing = temp.path().join("nowhere").join("codex");
+        env.clear();
+        env.insert("CODEX_HOME".into(), missing.to_string_lossy().into_owned());
+        materialize_window_home(&homes, &create, &mut env, Some(&default)).expect("materialize");
+        assert!(!missing.exists());
     }
 
     #[test]
