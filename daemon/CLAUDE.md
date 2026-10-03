@@ -342,6 +342,17 @@ updater knew about variants.
   Both clients send the take when a session is opened, never on reconnect.
   See `docs/DEVICE_CONNECTIONS.md` for the lifecycle and compatibility contract.
 
+A `spawn.host.ctl` channel refuses a request id it is still serving or
+finished among its last 4,096 (`RequestWindow`): a duplicate there closes the
+channel, as reuse always has, but an older id is forgotten, never counted, so
+a host view open for days is not closed at its 4,097th request, as it was by
+every daemon before this one. An id stays in flight while anything it
+started — a read, a write stream, a preview — still runs (`RequestTicket`).
+A `cancel` that overtakes its request is kept, the same bounded way, until
+the request arrives or finishes. `fs.read` streams at most the size it
+declared and hashed, like `fs.read.range`: a file that grows mid-read is not
+followed.
+
 `host_control::install` returns a `Lifetime` handle with only `is_retired` and
 `retire`. Pair retirement fences those handles before removal from the host
 map becomes observable, then performs asynchronous channel cleanup. The

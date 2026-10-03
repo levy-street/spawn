@@ -1116,8 +1116,14 @@ Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
 limited to 128 bytes, and malformed, binary, wrong-version, or oversized
 messages close the channel. The browser limits concurrent requests, applies a
 timeout, sends cancellation on timeout/abort, and binds responses to the
-outstanding request ID. Request IDs may not be reused within a host session;
-the daemon closes rather than evicting its bounded replay set.
+outstanding request ID. A request ID may not be reused while its request is in
+flight (a read, write stream, or preview it started still running) or among
+the daemon's 4,096 most recently finished; a duplicate there closes the
+channel, and an older ID is forgotten rather than counted. Daemons before
+this window remembered every ID and closed the channel at its 4,097th, so a
+client that keeps one consumer open that long must reopen it for them. A
+`cancel` that arrives before its request is held, within the same bound,
+until the request arrives.
 
 `spawn.host.ctl` requires one ordered, fully reliable DataChannel. An unordered
 channel, or one configured with `maxPacketLifeTime`/`maxRetransmits`, is rejected
@@ -1172,6 +1178,10 @@ which a range would fork inside a frozen v1 vocabulary. `fs.read` is unchanged
 and keeps its end-to-end whole-file guarantee for downloads and transfers. The
 response also carries `file_size`, `eof`, a sniffed `content_type` with its
 `content_type_source`, a `preview_kind`, and `open_allowed`.
+
+`fs.read` streams exactly the `length` it declared, whose `sha256` was taken as
+the read began: a file that grows meanwhile (an agent's transcript) arrives as
+that consistent prefix, and one that shrinks or changes ends in `file_changed`.
 
 `agent.transcripts` accepts `{agent_kind, conversation_id?, cwd?}` and answers
 `{agent_kind, supported, transcripts, searched, truncated}`: where the agent
