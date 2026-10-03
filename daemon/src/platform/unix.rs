@@ -258,6 +258,12 @@ pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
     })
 }
 
+/// How many names the file has; more than one means removing a name loses
+/// none of its data.
+pub fn hard_link_count(file: &File) -> io::Result<u64> {
+    Ok(file.metadata()?.nlink())
+}
+
 pub fn file_stamp(file: &File) -> io::Result<FileStamp> {
     let metadata = file.metadata()?;
     let mut bytes = Vec::with_capacity(40);

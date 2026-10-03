@@ -42,10 +42,14 @@ src/
                  focused tests live in update_tests.rs), release_key.rs (pinned
                  release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs
                  (host_transcripts.rs locates an agent's own transcript files
-                 for `agent.transcripts`; reading stays with host_files.rs),
-                 upload.rs, sessions.rs, service.rs + service/ (launchd/systemd
-                 dispatch, Windows Task Scheduler/Run watchdog and control
-                 pipe), …
+                 for `agent.transcripts`, in the stores CLAUDE_CONFIG_DIR and
+                 CODEX_HOME name, by Claude Code's exact folder rule — pinned
+                 by proto/claude-project-folder.json; reading stays with
+                 host_files.rs), codex_home.rs (a skilled window's own
+                 CODEX_HOME, reconciled against the user's — see "A skilled
+                 window's home"), upload.rs, sessions.rs, service.rs + service/
+                 (launchd/systemd dispatch, Windows Task Scheduler/Run
+                 watchdog and control pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
   state.rs       atomic local daemon heartbeat contract (`state.json`)
@@ -342,6 +346,17 @@ updater knew about variants.
   Both clients send the take when a session is opened, never on reconnect.
   See `docs/DEVICE_CONNECTIONS.md` for the lifecycle and compatibility contract.
 
+A `spawn.host.ctl` channel refuses a request id it is still serving or
+finished among its last 4,096 (`RequestWindow`): a duplicate there closes the
+channel, as reuse always has, but an older id is forgotten, never counted, so
+a host view open for days is not closed at its 4,097th request, as it was by
+every daemon before this one. An id stays in flight while anything it
+started — a read, a write stream, a preview — still runs (`RequestTicket`).
+A `cancel` that overtakes its request is kept, the same bounded way, until
+the request arrives or finishes. `fs.read` streams at most the size it
+declared and hashed, like `fs.read.range`: a file that grows mid-read — even
+while it is being hashed — is not followed.
+
 `host_control::install` returns a `Lifetime` handle with only `is_retired` and
 `retire`. Pair retirement fences those handles before removal from the host
 map becomes observable, then performs asynchronous channel cleanup. The
@@ -467,6 +482,46 @@ connection's, since peers keep opening and closing through a server outage
 leak — of slots, or of peers that never finish closing — shows while it is
 one peer. Never write the state file from the RTC path: that write is an
 fsync, and the offer path waits on the locks it would run under.
+
+## A skilled window's home
+
+A window given skills gets `<config_dir>/sessions/<session id>/`
+(`config::window_homes_dir`): its `skills/` and `skills.json`, and the
+`codex-home/` its `CODEX_HOME` names. Each start and restart reconciles it
+and never wipes it — the wipe this replaced deleted the Codex conversations
+of every skilled window on Restart. `skills/` is spawnd's and is rewritten
+(a link in its place is removed, not followed); `codex-home/` is drawn from
+the user's own Codex home (`codex_home.rs`):
+
+- their `config.toml`, merged with `toml_edit`, their trust and
+  credential-store choices kept. Codex resolves a relative path there against
+  the folder the file is in, so every key it reads that way
+  (`RELATIVE_PATH_KEYS`, from Codex's `AbsolutePathBuf` config fields —
+  `model_instructions_file` and its kin, per profile too) is rewritten to the
+  path it named in the user's home; Codex refuses to start over a
+  `model_instructions_file` it cannot find.
+- their `sessions/`, `archived_sessions/`, `history.jsonl` and
+  `session_index.jsonl` linked, so rollouts land where `agent.transcripts`
+  looks and `codex resume <id>` finds them from any window. Codex's resume
+  picker lists from each home's own state database, which is never linked
+  (two paths to one SQLite database corrupt it), so the user's picker does
+  not list a window's conversations. A real store there is the window's own record
+  from before the links and is kept; a hard-linked one (Windows' projection
+  of an earlier source) is re-pointed, since its data has another name.
+- their `auth.json` and Codex's caches mirrored: a link to the user's file
+  where there is one, nothing where there is none. The window never keeps a
+  sign-in of its own — not a copy an older spawnd left, not one made in the
+  window, not a hard link the user's logout split off — because a second
+  copy forks Codex's single-use refresh token, and a window signs out when
+  the user does. Files are hard links on Windows (a file symlink needs a
+  privilege), symlinks elsewhere. A `keyring` or `ephemeral` credential store
+  never reads `auth.json`, so the window keeps none; `auto` falls back to it
+  and is mirrored like `file`.
+
+The source is the session environment's `CODEX_HOME` (else `~/.codex`,
+created when missing so a window opened before Codex ever ran links from its
+first start), never one inside the window homes. Every link is re-pointed and
+verified on each apply.
 
 ## Before calling a change done
 

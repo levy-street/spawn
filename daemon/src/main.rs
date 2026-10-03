@@ -12,6 +12,7 @@
 
 mod activity;
 mod cli;
+mod codex_home;
 mod config;
 mod cpu_scopes;
 mod creds;

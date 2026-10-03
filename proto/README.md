@@ -350,10 +350,13 @@ When a session is created, granted skills are included in the daemon
 `session.create` frame. The daemon writes per-session files and exports
 `SPAWN_AGENT_CONFIG_DIR`, `SPAWN_SKILLS_FILE`, and `SPAWN_SKILLS_DIR` into the
 shell's environment (the variables configure agent CLIs launched from the
-shell). It also always writes a per-session `CODEX_HOME` projection containing
-a `config.toml`, the managed skills, and links to existing Codex auth state
-when present — shell-first sessions cannot know in advance whether Codex will
-be launched, so every skilled session gets the projection.
+shell). It also always gives the session a `CODEX_HOME` of its own, reconciled
+at every start and restart and never wiped: the user's own `config.toml`
+merged with the managed skills (its relative paths rewritten to name the
+user's files), the user's Codex conversation stores linked, and their sign-in
+mirrored as a link, never a copy — "A skilled window's home" in
+`daemon/CLAUDE.md` has the rules. Shell-first sessions cannot know in advance
+whether Codex will be launched, so every skilled session gets one.
 
 ### Workspaces
 
@@ -1143,8 +1146,14 @@ Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
 limited to 128 bytes, and malformed, binary, wrong-version, or oversized
 messages close the channel. The browser limits concurrent requests, applies a
 timeout, sends cancellation on timeout/abort, and binds responses to the
-outstanding request ID. Request IDs may not be reused within a host session;
-the daemon closes rather than evicting its bounded replay set.
+outstanding request ID. A request ID may not be reused while its request is in
+flight (a read, write stream, or preview it started still running) or among
+the daemon's 4,096 most recently finished; a duplicate there closes the
+channel, and an older ID is forgotten rather than counted. Daemons before
+this window remembered every ID and closed the channel at its 4,097th, so a
+client that keeps one consumer open that long must reopen it for them. A
+`cancel` that arrives before its request is held, within the same bound,
+until the request arrives.
 
 `spawn.host.ctl` requires one ordered, fully reliable DataChannel. An unordered
 channel, or one configured with `maxPacketLifeTime`/`maxRetransmits`, is rejected
@@ -1200,18 +1209,43 @@ and keeps its end-to-end whole-file guarantee for downloads and transfers. The
 response also carries `file_size`, `eof`, a sniffed `content_type` with its
 `content_type_source`, a `preview_kind`, and `open_allowed`.
 
+`fs.read` streams exactly the `length` it declared, whose `sha256` was taken as
+the read began: a file that grows meanwhile (an agent's transcript) arrives as
+that consistent prefix, and one that shrinks or changes ends in `file_changed`.
+
 `agent.transcripts` accepts `{agent_kind, conversation_id?, cwd?}` and answers
 `{agent_kind, supported, transcripts, searched, truncated}`: where the agent
 harness running in a window left its own record of the conversation, so a
 device can view or download it. `transcripts` entries carry `path`, `name`,
 `size`, optional `modified_at`, a `role` (`conversation`, `subagent`, or
 `input`) and an optional `conversation_id`; `searched` names the directories
-looked in, for an empty answer to say so. Claude Code is found by its id under
-`~/.claude/projects/<folder>/<id>.jsonl` (the launch folder first, subagent
-records beside it), or by the launch folder's conversations when no id was
-recorded; Codex by the id at the end of a `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
-name, or by the `cwd` its first line names; aider by `.aider.chat.history.md`
-in the folder. A harness the daemon cannot place answers `supported:false`.
+looked in, for an empty answer to say so. Each store is where the daemon's
+environment puts it: `CLAUDE_CONFIG_DIR` (else `~/.claude`) and `CODEX_HOME`
+(else `~/.codex`, also when it names one of spawnd's per-window homes, which
+a daemon started from a skilled window inherits); a store outside home answers
+`supported:false` rather than widening the read root, and a `~` cwd is the
+host's home. Both agents name their working directory with its symbolic links
+resolved, so a cwd reached through a link is matched under that name first,
+then as given; a resolved Claude Code folder that does not exist is not listed
+in `searched`. Claude Code is found by its id under
+`<store>/projects/<folder>/<id>.jsonl`, the launch folder first, every record
+of the id before the sidecar beside each (`<id>/subagents/` records and their
+`.meta.json`, `subagents/workflows/<run>/`, `workflows/` and
+`workflows/scripts/` as `subagent`; spilled `tool-results/` as
+`conversation`), or by the launch folder's conversations when no id was
+recorded. The folder is Claude Code's own rule — every UTF-16 unit that is not
+an ASCII letter or digit becomes `-`, and a name over 200 units is cut there
+and suffixed with `-` and the base-36 absolute value of the cwd's Java-style
+`hashCode` — pinned by [`claude-project-folder.json`](claude-project-folder.json);
+a long name also matches another hash of the same cut whose records name the
+cwd, as Claude Code itself does. Codex is found by the id at the end of a
+`<store>/sessions/YYYY/MM/DD/rollout-*.jsonl` (or compressed `.jsonl.zst`)
+name, or by the `cwd` an uncompressed rollout's first line names, then in the
+`codex-home/sessions` a skilled window kept before its Codex home linked the
+store; aider by `.aider.chat.history.md` and `.aider.input.history` in the
+folder and at its git root. Roles stay those three because deployed clients
+refuse a report with any other. A harness the daemon cannot place answers
+`supported:false`.
 The operation only *locates*: every file it names is then read with the
 ordinary `fs.read`, under the same home root and no-follow rule, and the
 search itself is bounded (at most 24 answers, 512 directories, 2000 files).
