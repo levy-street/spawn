@@ -1,12 +1,23 @@
 import { makeAgent } from "@/components/launcher/__tests__/fixtures";
-import { planAgentRestart, restartSessionAgent } from "@/components/launcher/agent-restart";
+import {
+  planAgentRestart,
+  restartConversation,
+  restartSessionAgent,
+} from "@/components/launcher/agent-restart";
 import type { Session } from "@/data/types/domain";
+import type { ConversationInspection } from "@/terminal/transport/conversation-codec";
 
 const claude = makeAgent({
   id: "11111111-1111-4111-8111-111111111111",
   name: "Claude Code",
   kind: "claude-code",
   command: "claude",
+});
+const codex = makeAgent({
+  id: "55555555-5555-4555-8555-555555555555",
+  name: "Codex",
+  kind: "codex",
+  command: "codex",
 });
 const hermes = makeAgent({
   id: "22222222-2222-4222-8222-222222222222",
@@ -142,5 +153,264 @@ describe("restartSessionAgent", () => {
     });
     expect(result).toEqual({ plan: { kind: "shell" } });
     expect(pending.persist).not.toHaveBeenCalled();
+  });
+});
+
+const recorded = "3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10";
+const moved = "4e0b4642-0972-40ac-9a18-61d542276b76";
+
+function live(overrides: Partial<ConversationInspection> = {}): ConversationInspection {
+  return {
+    agent: "claude-code",
+    conversation_id: moved,
+    state: "idle",
+    cli_version: "2.1.288",
+    live_elsewhere: false,
+    source: "registry",
+    ...overrides,
+  };
+}
+
+/** A Codex window. Codex names its own conversations; this one's record holds
+ *  an id the host once named, since left for another (`/new`). */
+const staleCodex = "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09";
+const liveCodex = "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a0a";
+function codexSession(overrides: Partial<Session> = {}): Session {
+  return session({
+    agent_id: codex.id,
+    foreground_command: "codex",
+    agent_session_id: staleCodex,
+    ...overrides,
+  });
+}
+
+describe("restartConversation", () => {
+  test("the host's answer wins over the recorded id", () => {
+    expect(restartConversation(claude, session(), live())).toBe(moved);
+  });
+
+  test("without an answer, or with one about another program, the recorded id stands", () => {
+    expect(restartConversation(claude, session(), null)).toBe(recorded);
+    expect(restartConversation(claude, session(), live({ agent: "codex" }))).toBe(recorded);
+    expect(restartConversation(claude, session(), live({ agent: null }))).toBe(recorded);
+  });
+
+  test("a host that answers for the agent and names no conversation is not second-guessed", () => {
+    // A parked window whose background job has gone, an attach client: the
+    // recorded id is the thread the window left.
+    for (const source of ["parked", "attach", "process"]) {
+      expect(restartConversation(claude, session(), live({ conversation_id: null, source }))).toBe(
+        null,
+      );
+    }
+  });
+
+  test("a conversation also held outside the window is still resumed", () => {
+    expect(
+      restartConversation(claude, session(), live({ live_elsewhere: true, source: "parked" })),
+    ).toBe(moved);
+  });
+
+  test("a Codex window never resumes a recorded id, only one the host names", () => {
+    expect(restartConversation(codex, codexSession(), null)).toBeNull();
+    expect(restartConversation(codex, codexSession(), live({ agent: "claude-code" }))).toBeNull();
+    expect(
+      restartConversation(
+        codex,
+        codexSession(),
+        live({ agent: "codex", conversation_id: null, source: "process" }),
+      ),
+    ).toBeNull();
+    expect(
+      restartConversation(
+        codex,
+        codexSession(),
+        live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+      ),
+    ).toBe(liveCodex);
+  });
+});
+
+describe("planAgentRestart with the host's answer", () => {
+  test("Codex reopens the latest conversation here unless the host names one", () => {
+    const command = (plan: ReturnType<typeof planAgentRestart>) =>
+      plan.kind === "agent" ? plan.command : null;
+    expect(command(planAgentRestart(codexSession(), [codex]))).toBe("codex resume --last");
+    expect(
+      command(
+        planAgentRestart(
+          codexSession(),
+          [codex],
+          live({ agent: "codex", conversation_id: null, source: "process" }),
+        ),
+      ),
+    ).toBe("codex resume --last");
+    expect(
+      command(
+        planAgentRestart(
+          codexSession(),
+          [codex],
+          live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+        ),
+      ),
+    ).toBe(`codex resume ${liveCodex}`);
+  });
+
+  test("Claude Code continues the latest conversation when the host names none", () => {
+    const plan = planAgentRestart(
+      session(),
+      [claude],
+      live({ conversation_id: null, live_elsewhere: true, source: "attach" }),
+    );
+    expect(plan.kind === "agent" ? plan.command : null).toBe("claude --continue");
+  });
+});
+
+describe("restartSessionAgent with the host's answer", () => {
+  test("resumes the conversation the window is in, and writes it back first", async () => {
+    const order: string[] = [];
+    const pending = pendingStore();
+    const result = await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => {
+        order.push("restart");
+        return session({ status: "starting" });
+      },
+      pending,
+      inspect: async () => live(),
+      recordConversation: async (id) => {
+        order.push(`record ${id}`);
+      },
+    });
+    expect(result.plan).toEqual({
+      kind: "agent",
+      agent: claude,
+      command: `claude --resume ${moved}`,
+      resumes: true,
+    });
+    expect(order).toEqual([`record ${moved}`, "restart"]);
+    expect(pending.queued.get(session().id)).toBe(`claude --resume ${moved}`);
+  });
+
+  test("an unchanged conversation is not written back", async () => {
+    const recordConversation = jest.fn(async () => undefined);
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending: pendingStore(),
+      inspect: async () => live({ conversation_id: recorded }),
+      recordConversation,
+    });
+    expect(recordConversation).not.toHaveBeenCalled();
+  });
+
+  test("a host that cannot answer, or a write-back that fails, still restarts as before", async () => {
+    for (const inspect of [async () => null, async () => Promise.reject(new Error("offline"))]) {
+      const pending = pendingStore();
+      await restartSessionAgent({
+        session: session(),
+        agents: [claude],
+        restart: async () => session({ status: "starting" }),
+        pending,
+        inspect,
+      });
+      expect(pending.queued.get(session().id)).toBe(`claude --resume ${recorded}`);
+    }
+    const pending = pendingStore();
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => live(),
+      recordConversation: async () => Promise.reject(new Error("server down")),
+    });
+    expect(pending.queued.get(session().id)).toBe(`claude --resume ${moved}`);
+  });
+
+  test("restarts into a conversation held outside the window, and writes it back", async () => {
+    // A window parked in agent view: its background job holds the fork, and
+    // resuming that id attaches to it.
+    const restart = jest.fn(async () => session({ status: "starting" }));
+    const recordConversation = jest.fn(async () => undefined);
+    const pending = pendingStore();
+    const result = await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart,
+      pending,
+      inspect: async () => live({ live_elsewhere: true, source: "parked" }),
+      recordConversation,
+    });
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(recordConversation).toHaveBeenCalledWith(moved);
+    expect(result.plan.kind === "agent" ? result.plan.command : null).toBe(
+      `claude --resume ${moved}`,
+    );
+    expect(pending.queued.get(session().id)).toBe(`claude --resume ${moved}`);
+  });
+
+  test("a host that names no conversation writes nothing back", async () => {
+    const recordConversation = jest.fn(async () => undefined);
+    const pending = pendingStore();
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => live({ conversation_id: null, source: "parked" }),
+      recordConversation,
+    });
+    expect(recordConversation).not.toHaveBeenCalled();
+    expect(pending.queued.get(session().id)).toBe("claude --continue");
+  });
+
+  test("a Codex window resumes the id the host names and leaves its record alone", async () => {
+    const recordConversation = jest.fn(async () => undefined);
+    const pending = pendingStore();
+    await restartSessionAgent({
+      session: codexSession({ agent_session_id: null }),
+      agents: [codex],
+      restart: async () => codexSession({ status: "starting" }),
+      pending,
+      inspect: async () =>
+        live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+      recordConversation,
+    });
+    expect(recordConversation).not.toHaveBeenCalled();
+    expect(pending.queued.get(session().id)).toBe(`codex resume ${liveCodex}`);
+
+    // After `/new` the host sees two conversations open and names neither;
+    // a recorded id is not the way back in.
+    for (const inspect of [
+      async () => live({ agent: "codex", conversation_id: null, source: "process" }),
+      async () => null,
+    ]) {
+      const pending = pendingStore();
+      await restartSessionAgent({
+        session: codexSession(),
+        agents: [codex],
+        restart: async () => codexSession({ status: "starting" }),
+        pending,
+        inspect,
+        recordConversation,
+      });
+      expect(pending.queued.get(session().id)).toBe("codex resume --last");
+    }
+    expect(recordConversation).not.toHaveBeenCalled();
+  });
+
+  test("a shell window never asks the host", async () => {
+    const inspect = jest.fn(async () => live());
+    await restartSessionAgent({
+      session: session({ agent_id: null, foreground_command: "bash" }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending: pendingStore(),
+      inspect,
+    });
+    expect(inspect).not.toHaveBeenCalled();
   });
 });

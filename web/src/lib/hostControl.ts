@@ -1,3 +1,8 @@
+import {
+  CONVERSATION_INSPECT_OP,
+  type ConversationInspection,
+  parseConversationInspection,
+} from "@/lib/conversation";
 import { parseCapabilities } from "@/lib/preview/capabilities";
 import { hashStream, Sha256 } from "@/lib/sha256";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
@@ -1272,6 +1277,34 @@ export class HostControlClient {
       throw new HostControlError("invalid_response", "Host returned an invalid transcript report");
     }
     return result;
+  }
+
+  /**
+   * Which conversation a window is actually in, read by its daemon from the
+   * window's own processes and the agent's live-session registry — the id
+   * `/clear`, `/branch`, `/resume` or agent view moved it to, and whether a
+   * process outside the window holds it. Gated on `conv.v1`; a daemon without
+   * it answers `unsupported_operation`, and a legacy host channel
+   * `pair_required`.
+   */
+  async inspectConversation(
+    sessionId: string,
+    options?: HostControlRequestOptions,
+  ): Promise<ConversationInspection> {
+    const result = await this.request<unknown>(
+      CONVERSATION_INSPECT_OP,
+      { session_id: sessionId },
+      options,
+    );
+    const inspection = parseConversationInspection(result);
+    if (!inspection) {
+      this.failRtc();
+      throw new HostControlError(
+        "invalid_response",
+        "Host returned an invalid conversation report",
+      );
+    }
+    return inspection;
   }
 
   /**

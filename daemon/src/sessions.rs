@@ -216,6 +216,17 @@ impl SessionRegistry {
             .map(|entry| entry.handle.control.clone())
     }
 
+    /// The shell a window's processes hang from, for read-only inspection
+    /// (`host_conv`). `None` for an unknown session or a worker that never
+    /// reported its shell.
+    pub fn shell_pid(&self, id: Uuid) -> Option<u32> {
+        self.inner
+            .lock()
+            .expect("sessions lock")
+            .get(&id)
+            .and_then(|entry| entry.handle.shell_pid())
+    }
+
     pub fn cwd_for_binding(&self, binding: SessionBinding) -> Option<Arc<str>> {
         let guard = self.inner.lock().expect("sessions lock");
         guard

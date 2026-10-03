@@ -45,11 +45,13 @@ src/
                  for `agent.transcripts`, in the stores CLAUDE_CONFIG_DIR and
                  CODEX_HOME name, by Claude Code's exact folder rule — pinned
                  by proto/claude-project-folder.json; reading stays with
-                 host_files.rs), codex_home.rs (a skilled window's own
-                 CODEX_HOME, reconciled against the user's — see "A skilled
-                 window's home"), upload.rs, sessions.rs, service.rs + service/
-                 (launchd/systemd dispatch, Windows Task Scheduler/Run
-                 watchdog and control pipe), …
+                 host_files.rs; host_conv.rs answers `conv.inspect` from a
+                 window's process tree and Claude Code's live-session
+                 registry, and executes nothing), codex_home.rs (a skilled
+                 window's own CODEX_HOME, reconciled against the user's — see
+                 "A skilled window's home"), upload.rs, sessions.rs,
+                 service.rs + service/ (launchd/systemd dispatch, Windows Task
+                 Scheduler/Run watchdog and control pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
   state.rs       atomic local daemon heartbeat contract (`state.json`)
@@ -89,6 +91,15 @@ vendor/          exact upstream crate sources for narrowly documented patches;
 ## Where things go
 
 - A new host capability: its own `src/<name>.rs`, registered in `main.rs`.
+- A new `spawn.host.ctl` operation family is advertised in the channel's
+  `hello` as one versioned family capability (`conv.v1` covers every
+  `conv.*` operation), never a name per operation: clients cap the list they
+  accept. A family that carries a device's intent for the host (`conv.*`, and
+  `session.launch.*`, `agent.accounts.*`, `screen.*`, `box.*` as they arrive)
+  is listed in `host_control::DEVICE_INTENT_FAMILIES` before its first
+  operation: only a channel admitted through an authenticated device pair
+  (`rtc_pair.rs`) answers it, and a legacy protocol-1 host channel, which has
+  no device behind it, refuses it with `pair_required` and never advertises it.
 - Anything both binaries need: `sessiond/`; anything tests or the browser
   need too: the `lib.rs` surface.
 - Wire changes: daemon frames must stay compatible with

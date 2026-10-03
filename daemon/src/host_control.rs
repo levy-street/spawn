@@ -403,6 +403,11 @@ struct Context {
     publications: Arc<PublicationFence>,
     closed: Arc<AtomicBool>,
     shutdown: CancellationToken,
+    /// Present only on a channel admitted through an authenticated device
+    /// pair (`rtc_pair.rs`): which shell each window's processes hang from,
+    /// and nothing else of the session registry. Device-intent operations
+    /// are refused without it (`requires_pair`).
+    pair: Option<crate::host_conv::WindowShells>,
 }
 
 /// Effect permission is retired synchronously, before asynchronous channel
@@ -655,6 +660,15 @@ impl Context {
             return false;
         };
         let payload = object.get("payload").and_then(Value::as_object);
+        if requires_pair(operation) && self.pair.is_none() {
+            return self
+                .error(
+                    request_id,
+                    "pair_required",
+                    "this operation needs an authenticated device connection",
+                )
+                .await;
+        }
         match operation {
             "ping" => self.response(request_id, json!({"pong": true})).await,
             "fs.home" => {
@@ -878,6 +892,9 @@ impl Context {
                     Err(error) => self.error(request_id, error.code, &error.detail).await,
                 }
             }
+            crate::host_conv::INSPECT_OP if crate::host_conv::SUPPORTED => {
+                self.inspect_conversation(request_id, payload).await
+            }
             _ => {
                 self.error(
                     request_id,
@@ -886,6 +903,62 @@ impl Context {
                 )
                 .await
             }
+        }
+    }
+
+    /// Which conversation a window is in, read from its own processes and
+    /// the agent's live-session registry (`host_conv`). Read-only; the walk
+    /// runs off the control loop, under this channel's operation accounting.
+    async fn inspect_conversation(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+    ) -> bool {
+        let Some(windows) = self.pair.clone() else {
+            return self
+                .error(
+                    request_id,
+                    "pair_required",
+                    "this operation needs an authenticated device connection",
+                )
+                .await;
+        };
+        let Some(session_id) = payload_string(payload, "session_id").and_then(|id| {
+            Uuid::parse_str(id)
+                .ok()
+                .filter(|uuid| uuid.to_string() == id)
+        }) else {
+            return self
+                .error(
+                    request_id,
+                    "invalid_request",
+                    "session_id must be a session UUID",
+                )
+                .await;
+        };
+        let Some(shell_pid) = windows.shell_pid(session_id) else {
+            return self
+                .error(
+                    request_id,
+                    "session_not_found",
+                    "no window with this id is running on this host",
+                )
+                .await;
+        };
+        let inspected = self
+            .files
+            .run_blocking(
+                Arc::clone(&self.file_operations),
+                crate::host_files::HostOperationKind::List,
+                move |_| Ok(crate::host_conv::inspect_window(shell_pid)),
+            )
+            .await;
+        match inspected {
+            Ok(inspection) => match serde_json::to_value(&inspection) {
+                Ok(result) => self.response(request_id, result).await,
+                Err(_) => false,
+            },
+            Err(error) => self.error(request_id, error.code, &error.detail).await,
         }
     }
 
@@ -2149,10 +2222,31 @@ fn payload_bool(payload: Option<&Map<String, Value>>, key: &str) -> Option<bool>
     payload?.get(key)?.as_bool()
 }
 
+/// Operation families that carry a device's intent for this host: its
+/// conversations now; launch contexts, agent accounts, screens and boxes as
+/// they arrive. A legacy (protocol 1) host channel is admitted on the
+/// server's binding alone, with no authenticated device behind it
+/// (`rtc.rs`, `pair: None`), so every family here is refused on it whatever
+/// a client sends. A new family is added here before its first operation.
+const DEVICE_INTENT_FAMILIES: [&str; 5] = [
+    "conv.",
+    "session.launch.",
+    "agent.accounts.",
+    "screen.",
+    "box.",
+];
+
+fn requires_pair(operation: &str) -> bool {
+    DEVICE_INTENT_FAMILIES
+        .iter()
+        .any(|family| operation.starts_with(family))
+}
+
 pub(crate) fn install(
     dc: Arc<RTCDataChannel>,
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
+    pair: Option<crate::host_conv::WindowShells>,
 ) -> Arc<Lifetime> {
     // Stored handlers must not own their channel: close does not clear them.
     let message_dc = Arc::downgrade(&dc);
@@ -2234,6 +2328,7 @@ pub(crate) fn install(
     let open_closed = Arc::clone(&closed);
     let open_normal_rx = Arc::clone(&normal_rx);
     let open_fast_rx = Arc::clone(&fast_rx);
+    let open_pair = pair;
     dc.on_open(Box::new(move || {
         let dc = open_dc.upgrade();
         let context_slot = Arc::clone(&open_context);
@@ -2246,6 +2341,7 @@ pub(crate) fn install(
         let closed = Arc::clone(&open_closed);
         let normal_rx = Arc::clone(&open_normal_rx);
         let fast_rx = Arc::clone(&open_fast_rx);
+        let pair = open_pair.clone();
         Box::pin(async move {
             let Some(dc) = dc else { return };
             let files = match files {
@@ -2289,6 +2385,7 @@ pub(crate) fn install(
                 publications,
                 closed,
                 shutdown,
+                pair,
             };
             let mut context_slot = context_slot.lock().await;
             if context.closed.load(Ordering::Acquire) || context.shutdown.is_cancelled() {
@@ -2399,6 +2496,14 @@ pub(crate) fn install(
             if crate::host_desktop::DESKTOP_SUPPORTED {
                 capabilities.push("desktop.reveal");
                 capabilities.push("desktop.open");
+            }
+            // New operation families are advertised as one versioned family
+            // capability (`conv.v1`), not a name per operation: clients cap
+            // the list they accept, and a family stays far from that cap.
+            // Device-intent families appear only where they are answered —
+            // on a pair-admitted channel, on a platform that supports them.
+            if publication_context.pair.is_some() && crate::host_conv::SUPPORTED {
+                capabilities.push(crate::host_conv::CAPABILITY);
             }
             let hello = json!({
                 "version": VERSION,

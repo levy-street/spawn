@@ -102,7 +102,7 @@ export type AgentConversationGrammar = {
   /** Flags that reopen a known conversation. Null when the CLI cannot. */
   resume: ((conversationId: string) => string) | null;
   /** Flags that reopen the most recent conversation in this folder, for a
-   *  window whose conversation id was never recorded. Null when the CLI cannot. */
+   *  window whose conversation cannot be named. Null when the CLI cannot. */
   continueLatest: string | null;
 };
 
@@ -112,11 +112,14 @@ const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> 
     resume: (id) => `--resume ${id}`,
     continueLatest: "--continue",
   },
-  // Codex names its own sessions and takes `resume` as a subcommand after the
-  // global flags, so only "the latest one here" can be asked for.
+  // Codex names its own sessions, so it cannot be launched under an id, and a
+  // restart never trusts a recorded one; it takes `resume` as a subcommand
+  // after the global flags. A conversation the host names for the window
+  // (`conv.inspect`) is resumed by that id, and "the latest one here" stands
+  // in wherever the host names none.
   codex: {
     launch: null,
-    resume: null,
+    resume: (id) => `resume ${id}`,
     continueLatest: "resume --last",
   },
 };
@@ -160,9 +163,10 @@ export function agentLaunchCommand(
 
 /**
  * What a restart types to bring the agent back where it was: resume the
- * recorded conversation, or the latest one in this folder when none was
- * recorded. Null when this kind of agent cannot be resumed at all, so the
- * caller falls back to a plain relaunch and says so.
+ * conversation it names (`restartConversation` decides which), or the latest
+ * one in this folder when there is none to name. Null when this kind of agent
+ * cannot be resumed at all, so the caller falls back to a plain relaunch and
+ * says so.
  */
 export function agentResumeCommand(
   agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,

@@ -157,10 +157,11 @@ describe("conversation grammar", () => {
     );
   });
 
-  test("Codex names its own sessions, so only the latest one can be reopened", () => {
+  test("Codex names its own sessions: resumed by an id the host named, else the latest one", () => {
     expect(newAgentConversationId("codex")).toBeNull();
     expect(agentLaunchCommand(codex, id)).toBe("codex");
-    expect(agentResumeCommand(codex, id)).toBe("codex resume --last");
+    expect(agentResumeCommand(codex, id)).toBe(`codex resume ${id}`);
+    expect(agentResumeCommand(codex, null)).toBe("codex resume --last");
     expect(
       agentResumeCommand(
         { ...codex, yolo: true, yolo_args: "--dangerously-bypass-approvals-and-sandbox" },

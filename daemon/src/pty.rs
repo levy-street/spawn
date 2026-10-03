@@ -1140,6 +1140,9 @@ pub struct SessionHandle {
     /// Canonical cwd capability root reported by the worker that owns this
     /// exact backend generation.
     pub cwd: Arc<str>,
+    /// The session's shell, as its worker reported it; 0 when the worker did
+    /// not say. Read only to find the window's own processes (`host_conv`).
+    shell_pid: u32,
     /// Last size applied through this handle.
     size: Arc<Mutex<(u16, u16)>>,
     /// Held alive while the session is alive; when dropped, the per-session
@@ -1173,6 +1176,7 @@ impl SessionHandle {
         Self {
             session_id: parts.session_id,
             cwd: Arc::from(parts.cwd),
+            shell_pid: 0,
             size: Arc::new(Mutex::new((parts.cols, parts.rows))),
             outbox_tx: parts.outbox_tx,
             control: parts.control,
@@ -1182,6 +1186,17 @@ impl SessionHandle {
             #[cfg(test)]
             input_copies: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The shell pid the worker reported at start or adoption.
+    pub fn with_shell_pid(mut self, pid: u32) -> Self {
+        self.shell_pid = pid;
+        self
+    }
+
+    /// The window's shell, or `None` when its worker never said.
+    pub fn shell_pid(&self) -> Option<u32> {
+        (self.shell_pid != 0).then_some(self.shell_pid)
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<()> {

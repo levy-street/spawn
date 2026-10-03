@@ -8,6 +8,7 @@ import { getSession, patchSession, restartSession } from "@/data/api/endpoints/s
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { cachedListItem } from "@/data/cached-list-item";
+import { restartConversationHooks } from "@/data/queries/conversation";
 import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
 import type { AgentDef } from "@/data/types/domain";
@@ -99,6 +100,8 @@ export function useRestartTerminalSession(sessionId: string) {
           return saved;
         },
         pending: pendingLaunches,
+        // The conversation the window is actually in, from its host.
+        ...restartConversationHooks(queryClient, session),
       });
     },
     onSuccess: () => {
