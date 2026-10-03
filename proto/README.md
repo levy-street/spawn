@@ -1161,6 +1161,21 @@ nothing new and a future Linux daemon lights them up with no client change.
 Unadvertised operations answer `unsupported_operation` as an ordinary error
 response rather than closing the channel.
 
+From `conv.*` on, an operation family is advertised as one versioned
+capability, never a name per operation: `conv.v1` covers every `conv.*`
+operation, and an incompatible revision of a family is a new name
+(`conv.v2`). Clients cap the number of names they accept, and a family keeps a
+hello far from that cap. A family that carries a device's intent for the host
+— `conv.*` now, with `session.launch.*`, `agent.accounts.*`, `screen.*` and
+`box.*` reserved for it — is advertised and answered only on a
+`spawn.host.ctl` channel admitted through an authenticated device pair (the
+shared device connection of `docs/DEVICE_CONNECTIONS.md`). A legacy protocol-1
+host channel is admitted on the server's binding alone, with no device behind
+it: it never advertises those families, and answers any operation in them
+with the ordinary error `pair_required`, whatever the client sends. A daemon
+that cannot perform a family on its platform does not advertise it there
+either, and answers `unsupported_operation`.
+
 `fs.read.range` accepts `{path, offset?, length, if_version?}` and streams a
 bounded slice: `length` is capped at 16 MiB and clamped down to what remains,
 and the declared `sha256` covers **exactly the returned slice**, not the whole
@@ -1189,6 +1204,52 @@ The operation only *locates*: every file it names is then read with the
 ordinary `fs.read`, under the same home root and no-follow rule, and the
 search itself is bounded (at most 24 answers, 512 directories, 2000 files).
 The server never sees the request or a byte of a transcript.
+
+`conv.inspect` (family `conv.v1`, pair channels of Linux and macOS daemons
+only) accepts `{session_id}` — the id of a window this daemon runs, as a
+canonical lower-case UUID — and answers which agent conversation that window
+is actually in:
+
+```json
+{"version":1,"type":"request","request_id":"unguessable-id","operation":"conv.inspect","payload":{"session_id":"33333333-3333-4333-8333-333333333333"}}
+{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"agent":"claude-code","conversation_id":"064c9faa-9990-4b0c-9d35-f06ae2dd0d05","state":"idle","cli_version":"2.1.288","live_elsewhere":false,"source":"registry"}}
+```
+
+`agent` is the agent kind as agent definitions spell it (`claude-code`,
+`codex`), or null for a window running no agent. `conversation_id` is the
+conversation's id, or null when the host cannot name one with certainty: a
+window parked in Claude's agent view whose background job has gone, a
+`claude attach` client, a Codex holding several rollouts open. `state` is
+`running`, `blocked` (a permission prompt or question), `idle` or `unknown`,
+and a client reads a value it does not know as `unknown`. `cli_version` is the
+agent's own version, or null. `live_elsewhere` is true when a process the
+window's stop would not stop holds the conversation — a Claude background
+session (including the one a window in agent view shows), an attach target,
+another window. `source` says what the answer rests on (`registry`, `parked`,
+`attach`, `open_file`, `process`, `none`); it is a hint for diagnostics, and
+clients never gate on it. A `session_id` that is not a canonical UUID answers
+`invalid_request`; a window this daemon is not running, or whose worker never
+reported its shell, answers `session_not_found`.
+
+The daemon walks the window's own processes from the shell its worker
+reported — `/proc` on Linux, libproc on macOS; a process that left the shell's
+terminal session is not the window's — and matches Claude Code's live-session
+registry (`<config>/sessions/<pid>.json`), believing a record only while that
+exact process runs (pid, `pidDomain`, and `procStart` where it can be
+compared; where it cannot, the process must at least be Claude). A Codex
+window is named by the one rollout file its process holds open. Nothing is
+executed, no process's arguments or environment are read, every registry file
+is read bounded and without following links, and the answer carries no paths
+and fits one control frame.
+
+A restart asks first where `conv.v1` is advertised. When the answer is about
+the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
+`codex resume <id>`), and a null one resumes "the latest one here"
+(`--continue`, `resume --last`) rather than an id recorded earlier;
+`live_elsewhere` does not stop a restart, since resuming a running background
+session attaches to it. The server never sees the request or the answer; a
+device writes a Claude Code id the host named back to the window's
+`agent_session_id`, and nothing else.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit
