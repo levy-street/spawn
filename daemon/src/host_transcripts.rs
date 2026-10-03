@@ -14,10 +14,17 @@
 //!
 //! Each store is where the daemon's own environment puts it, the environment
 //! every window starts from: `CLAUDE_CONFIG_DIR` (else `~/.claude`) and
-//! `CODEX_HOME` (else `~/.codex`). One configured outside home, or as a
-//! relative path, is beyond the file capability, so it too answers
-//! `supported: false`: no `fs.read` could reach what a search found there,
-//! and the locator does not widen what the daemon will read.
+//! `CODEX_HOME` (else `~/.codex`, and also when it names one of spawnd's own
+//! window homes, which a daemon started from a skilled window inherits). One
+//! configured outside home, or as a relative path, is beyond the file
+//! capability, so it too answers `supported: false`: no `fs.read` could reach
+//! what a search found there, and the locator does not widen what the daemon
+//! will read.
+//!
+//! An agent names its working directory with every link resolved — Claude
+//! Code's project folder is computed from `realpathSync(process.cwd())`, and
+//! Codex records `getcwd` — so a window opened through a link is looked for
+//! under that name first, then under the folder as given.
 //!
 //! Roles are a closed set on the wire — `conversation`, `subagent`, `input` —
 //! that deployed clients validate, refusing a report with any other. So a
@@ -112,12 +119,22 @@ pub(crate) struct AgentStores {
 
 impl AgentStores {
     fn from_env() -> Self {
+        let window_homes = crate::config::window_homes_dir().ok();
         Self {
             claude_config_dir: configured_dir("CLAUDE_CONFIG_DIR"),
-            codex_home: configured_dir("CODEX_HOME"),
-            window_homes: crate::config::window_homes_dir().ok(),
+            codex_home: users_codex_home(configured_dir("CODEX_HOME"), window_homes.as_deref()),
+            window_homes,
         }
     }
+}
+
+/// `CODEX_HOME` as the user's store, unless it names one of spawnd's own
+/// window homes: a daemon started from a skilled window inherits that
+/// window's, whose `sessions` is a link into the user's store that the file
+/// capability refuses to follow. The store is then the default one, as it is
+/// for the window's own source (`run.rs`, `codex_source_home`).
+fn users_codex_home(configured: Option<PathBuf>, window_homes: Option<&Path>) -> Option<PathBuf> {
+    configured.filter(|path| !window_homes.is_some_and(|homes| path.starts_with(homes)))
 }
 
 fn configured_dir(name: &str) -> Option<PathBuf> {
@@ -249,6 +266,7 @@ fn locate_sync(
         files_examined: 0,
         truncated: false,
         searched: Vec::new(),
+        real_cwd: None,
     };
     let query = TranscriptQuery {
         agent_kind: query.agent_kind.clone(),
@@ -260,6 +278,11 @@ fn locate_sync(
             .filter(|cwd| !cwd.trim().is_empty())
             .map(|cwd| search.expand_home(cwd)),
     };
+    search.real_cwd = query
+        .cwd
+        .as_deref()
+        .and_then(real_folder)
+        .filter(|real| query.cwd.as_deref() != Some(real.as_str()));
     let (supported, mut transcripts) = match query.agent_kind.as_str() {
         "claude-code" => match search.store(stores.claude_config_dir.as_deref(), ".claude") {
             Some(store) => (true, search.claude(&store, &query)?),
@@ -295,9 +318,9 @@ struct Child {
 enum CodexMatch {
     /// Its name ends in the id.
     Id { plain: String, compressed: String },
-    /// Its first line names the folder (a compressed rollout cannot be read
-    /// for it, so only an id finds one of those).
-    Cwd(String),
+    /// Its first line names the folder, by any of its names (a compressed
+    /// rollout cannot be read for it, so only an id finds one of those).
+    Cwd(Vec<String>),
 }
 
 struct Search<'a> {
@@ -308,6 +331,9 @@ struct Search<'a> {
     files_examined: usize,
     truncated: bool,
     searched: Vec<String>,
+    /// The window's folder with every link resolved, where that is another
+    /// name for it (`real_folder`).
+    real_cwd: Option<String>,
 }
 
 impl Search<'_> {
@@ -345,6 +371,17 @@ impl Search<'_> {
             .display_path(components)
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// The window's folder as an agent names its own working directory —
+    /// every link resolved, as Claude Code's `realpathSync(process.cwd())`
+    /// and Codex's `getcwd` have it — and then as given, where that differs.
+    fn cwds(&self, query: &TranscriptQuery) -> Vec<String> {
+        self.real_cwd
+            .iter()
+            .chain(query.cwd.iter())
+            .cloned()
+            .collect()
     }
 
     /// `~` and `~/x` against the home the file capability is rooted at;
@@ -525,7 +562,8 @@ impl Search<'_> {
     ) -> FsResult<Vec<TranscriptFile>> {
         let mut base = store.to_vec();
         base.push(OsString::from("projects"));
-        let preferred = query.cwd.as_deref().map(claude_project_folder);
+        let cwds = self.cwds(query);
+        let preferred: Vec<String> = cwds.iter().map(|cwd| claude_project_folder(cwd)).collect();
         let mut found = Vec::new();
         if let Some(id) = &query.conversation_id {
             self.searched.push(self.display(&base));
@@ -542,8 +580,9 @@ impl Search<'_> {
             folders.sort();
             folders.sort_by_key(|name| {
                 preferred
-                    .as_deref()
-                    .is_none_or(|folder| name != OsStr::new(folder))
+                    .iter()
+                    .position(|folder| name == OsStr::new(folder))
+                    .unwrap_or(preferred.len())
             });
             // Every record first, then what lies beside each: a sidecar can
             // run to hundreds of files and must not crowd out the record of
@@ -579,17 +618,32 @@ impl Search<'_> {
                     break;
                 }
             }
-        } else if let Some(folder) = preferred {
-            let mut components = base.clone();
-            components.push(OsString::from(&folder));
-            self.searched.push(self.display(&components));
+        } else if !cwds.is_empty() {
+            // Claude Code files the window under its folder with links
+            // resolved; a window opened through a link is looked for there
+            // first, then as given. A resolved folder that holds nothing is
+            // not reported as searched: it would only name a link's target.
             let mut folders = Vec::new();
-            if let Some(project) = self.open_optional_dir(&components)? {
-                folders.push((project, components));
-            }
-            if folder.len() > CLAUDE_FOLDER_UNITS {
-                if let Some(cwd) = query.cwd.as_deref() {
-                    folders.extend(self.claude_rehashed_folders(&base, &folder, cwd)?);
+            let mut looked: Vec<&str> = Vec::new();
+            for (index, (cwd, folder)) in cwds.iter().zip(&preferred).enumerate() {
+                if looked.contains(&folder.as_str()) {
+                    continue;
+                }
+                looked.push(folder);
+                let mut components = base.clone();
+                components.push(OsString::from(folder));
+                let as_given = index + 1 == cwds.len();
+                if as_given {
+                    self.searched.push(self.display(&components));
+                }
+                if let Some(project) = self.open_optional_dir(&components)? {
+                    if !as_given {
+                        self.searched.push(self.display(&components));
+                    }
+                    folders.push((project, components));
+                }
+                if folder.len() > CLAUDE_FOLDER_UNITS {
+                    folders.extend(self.claude_rehashed_folders(&base, folder, cwd)?);
                 }
             }
             for (project, components) in folders {
@@ -661,7 +715,7 @@ impl Search<'_> {
                 if !self.tick_file()? {
                     break;
                 }
-                if head_contains(&project, &record, &needle) {
+                if head_contains(&project, &record, std::slice::from_ref(&needle)) {
                     opened_here = true;
                     break;
                 }
@@ -800,7 +854,12 @@ impl Search<'_> {
                 plain: format!("-{id}.jsonl"),
                 compressed: format!("-{id}.jsonl.zst"),
             },
-            (None, Some(cwd)) => CodexMatch::Cwd(cwd_needle(cwd)?),
+            (None, Some(_)) => CodexMatch::Cwd(
+                self.cwds(query)
+                    .iter()
+                    .map(|cwd| cwd_needle(cwd))
+                    .collect::<FsResult<_>>()?,
+            ),
             (None, None) => return Ok(Vec::new()),
         };
         let mut found = Vec::new();
@@ -923,9 +982,9 @@ impl Search<'_> {
                             CodexMatch::Id { plain, compressed } => {
                                 has_suffix(&name, plain) || has_suffix(&name, compressed)
                             }
-                            CodexMatch::Cwd(needle) => {
+                            CodexMatch::Cwd(needles) => {
                                 has_suffix(&name, ".jsonl")
-                                    && head_contains(&day_dir, &name, needle)
+                                    && head_contains(&day_dir, &name, needles)
                             }
                         };
                         if !matched {
@@ -1051,10 +1110,25 @@ fn cwd_needle(cwd: &str) -> FsResult<String> {
     ))
 }
 
-/// Whether the first `HEAD_BYTES` of a file contain `needle`. A file that
-/// cannot be opened simply does not match: one unreadable record must not
-/// end the search for the rest.
-fn head_contains(dir: &Dir, name: &OsStr, needle: &str) -> bool {
+/// The folder `cwd` with every link on the way resolved: the name Claude
+/// Code computes its project folder from (`realpathSync(process.cwd())`), and
+/// the `cwd` Codex records. Only a name: resolving it reads link targets,
+/// never contents, nothing is opened through it, and every search still goes
+/// through the file capability.
+fn real_folder(cwd: &str) -> Option<String> {
+    if !Path::new(cwd).is_absolute() {
+        return None;
+    }
+    let real = std::fs::canonicalize(cwd).ok()?;
+    #[cfg(windows)]
+    let real = crate::host_files::windows_wire_path(&real);
+    real.into_os_string().into_string().ok()
+}
+
+/// Whether the first `HEAD_BYTES` of a file contain any of `needles`. A file
+/// that cannot be opened simply does not match: one unreadable record must
+/// not end the search for the rest.
+fn head_contains(dir: &Dir, name: &OsStr, needles: &[String]) -> bool {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let Ok(file) = dir.open_with(name, &options) else {
@@ -1069,7 +1143,8 @@ fn head_contains(dir: &Dir, name: &OsStr, needle: &str) -> bool {
     {
         return false;
     }
-    String::from_utf8_lossy(&head).contains(needle)
+    let head = String::from_utf8_lossy(&head);
+    needles.iter().any(|needle| head.contains(needle.as_str()))
 }
 
 /// A helper's record or its metadata (`agent-<n>.jsonl`, `agent-<n>.meta.json`).
@@ -1962,5 +2037,131 @@ mod tests {
         assert_eq!(report.transcripts[0].size, 7);
         assert_eq!(report.transcripts[1].size, 7);
         assert!(report.transcripts[0].path.contains("src"));
+    }
+
+    #[test]
+    fn a_codex_home_inside_spawnds_window_homes_is_not_the_users_store() {
+        let homes = Path::new("/home/me/.config/spawn/sessions");
+        let window = homes.join("2b1c5b7e-0000-4000-8000-000000000001/codex-home");
+        assert_eq!(users_codex_home(Some(window), Some(homes)), None);
+        assert_eq!(
+            users_codex_home(Some(PathBuf::from("/srv/codex")), Some(homes)),
+            Some(PathBuf::from("/srv/codex"))
+        );
+        assert_eq!(users_codex_home(None, Some(homes)), None);
+    }
+
+    /// A daemon started from a skilled window's terminal inherits that
+    /// window's `CODEX_HOME`, whose `sessions` links into the user's store.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_started_in_a_skilled_window_still_finds_codex_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let homes = home.join(".config/spawn/sessions");
+        let window = homes.join("2b1c5b7e-0000-4000-8000-000000000001/codex-home");
+        let id = "01a0aeda-b62e-7681-a475-3e513e9aafd9";
+        write(
+            &home
+                .join(".codex/sessions/2026/10/03")
+                .join(format!("rollout-2026-10-03T10-00-00-{id}.jsonl")),
+            b"{}\n",
+        );
+        std::fs::create_dir_all(&window).unwrap();
+        std::os::unix::fs::symlink(home.join(".codex/sessions"), window.join("sessions")).unwrap();
+        let stores = AgentStores {
+            codex_home: users_codex_home(Some(window), Some(&homes)),
+            window_homes: Some(homes),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("codex", Some(id), None)).await;
+        assert!(report.supported);
+        assert_eq!(report.transcripts.len(), 1);
+        assert_eq!(report.transcripts[0].conversation_id.as_deref(), Some(id));
+    }
+
+    /// Claude Code and Codex name a window opened through a link by the
+    /// link's target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_window_opened_through_a_link_is_found_under_its_real_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let real = home.join("data").join("work");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = home.join("work");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let real_project = home
+            .join(".claude/projects")
+            .join(claude_project_folder(&real.to_string_lossy()));
+        write(&real_project.join("one.jsonl"), b"{}\n");
+        let as_given = home
+            .join(".claude/projects")
+            .join(claude_project_folder(&linked.to_string_lossy()));
+
+        let report = locate(
+            temp.path(),
+            query("claude-code", None, Some(&linked.to_string_lossy())),
+        )
+        .await;
+        assert_eq!(names(&report), vec![("conversation", "one.jsonl")]);
+        assert_eq!(
+            report.searched,
+            vec![
+                real_project.to_string_lossy().into_owned(),
+                as_given.to_string_lossy().into_owned(),
+            ]
+        );
+
+        // By id, the real folder is checked first.
+        write(&as_given.join("two.jsonl"), b"{}\n");
+        write(&real_project.join("two.jsonl"), b"{}\n");
+        let report = locate(
+            temp.path(),
+            query("claude-code", Some("two"), Some(&linked.to_string_lossy())),
+        )
+        .await;
+        assert_eq!(report.transcripts.len(), 2);
+        assert!(report.transcripts[0]
+            .path
+            .starts_with(&*real_project.to_string_lossy()));
+
+        // A real folder that holds nothing is not named as searched.
+        let empty_real = home.join("data").join("empty");
+        std::fs::create_dir_all(&empty_real).unwrap();
+        let empty_link = home.join("empty");
+        std::os::unix::fs::symlink(&empty_real, &empty_link).unwrap();
+        let report = locate(
+            temp.path(),
+            query("claude-code", None, Some(&empty_link.to_string_lossy())),
+        )
+        .await;
+        assert!(report.transcripts.is_empty());
+        assert_eq!(
+            report.searched,
+            vec![home
+                .join(".claude/projects")
+                .join(claude_project_folder(&empty_link.to_string_lossy()))
+                .to_string_lossy()
+                .into_owned()]
+        );
+
+        // Codex records the real folder as its cwd.
+        write(
+            &home
+                .join(".codex/sessions/2026/10/03")
+                .join("rollout-2026-10-03T10-00-00-01a0aeda-b62e-7681-a475-3e513e9aafd9.jsonl"),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&real.to_string_lossy()).unwrap()
+            )
+            .as_bytes(),
+        );
+        let report = locate(
+            temp.path(),
+            query("codex", None, Some(&linked.to_string_lossy())),
+        )
+        .await;
+        assert_eq!(report.transcripts.len(), 1);
     }
 }

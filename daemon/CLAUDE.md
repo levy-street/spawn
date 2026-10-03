@@ -354,8 +354,8 @@ every daemon before this one. An id stays in flight while anything it
 started — a read, a write stream, a preview — still runs (`RequestTicket`).
 A `cancel` that overtakes its request is kept, the same bounded way, until
 the request arrives or finishes. `fs.read` streams at most the size it
-declared and hashed, like `fs.read.range`: a file that grows mid-read is not
-followed.
+declared and hashed, like `fs.read.range`: a file that grows mid-read — even
+while it is being hashed — is not followed.
 
 `host_control::install` returns a `Lifetime` handle with only `is_retired` and
 `retire`. Pair retirement fences those handles before removal from the host

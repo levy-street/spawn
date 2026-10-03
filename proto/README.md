@@ -1194,12 +1194,17 @@ device can view or download it. `transcripts` entries carry `path`, `name`,
 `input`) and an optional `conversation_id`; `searched` names the directories
 looked in, for an empty answer to say so. Each store is where the daemon's
 environment puts it: `CLAUDE_CONFIG_DIR` (else `~/.claude`) and `CODEX_HOME`
-(else `~/.codex`); a store outside home answers `supported:false` rather than
-widening the read root, and a `~` cwd is the host's home. Claude Code is found
-by its id under `<store>/projects/<folder>/<id>.jsonl`, the launch folder
-first, every record of the id before the sidecar beside each (`<id>/subagents/`
-records and their `.meta.json`, `subagents/workflows/<run>/`, `workflows/`
-and `workflows/scripts/` as `subagent`; spilled `tool-results/` as
+(else `~/.codex`, also when it names one of spawnd's per-window homes, which
+a daemon started from a skilled window inherits); a store outside home answers
+`supported:false` rather than widening the read root, and a `~` cwd is the
+host's home. Both agents name their working directory with its symbolic links
+resolved, so a cwd reached through a link is matched under that name first,
+then as given; a resolved Claude Code folder that does not exist is not listed
+in `searched`. Claude Code is found by its id under
+`<store>/projects/<folder>/<id>.jsonl`, the launch folder first, every record
+of the id before the sidecar beside each (`<id>/subagents/` records and their
+`.meta.json`, `subagents/workflows/<run>/`, `workflows/` and
+`workflows/scripts/` as `subagent`; spilled `tool-results/` as
 `conversation`), or by the launch folder's conversations when no id was
 recorded. The folder is Claude Code's own rule — every UTF-16 unit that is not
 an ASCII letter or digit becomes `-`, and a name over 200 units is cut there
