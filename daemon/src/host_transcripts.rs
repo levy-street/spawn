@@ -2,15 +2,28 @@
 //! asks for it.
 //!
 //! `agent.transcripts` answers with the files an agent harness wrote for one
-//! window's conversation: Claude Code's `~/.claude/projects/<folder>/<id>.jsonl`
-//! and the subagent records beside it, Codex's dated `rollout-*.jsonl` files,
-//! aider's chat history in the working folder. The daemon only *locates*. The
-//! device then reads each file with the ordinary `fs.read`, through the same
-//! home-rooted, symlink-refusing capability every other read goes through, and
-//! nothing about the content reaches the server (`docs/TRUST.md`). An agent
-//! whose record lives somewhere the daemon cannot name — opencode keeps its
-//! conversations in a database — answers `supported: false` rather than a
-//! guess.
+//! window's conversation: Claude Code's `projects/<folder>/<id>.jsonl` and the
+//! sidecar beside it, Codex's dated `rollout-*.jsonl` files, aider's chat
+//! history in the working folder or at the root of its repository. The daemon
+//! only *locates*. The device then reads each file with the ordinary
+//! `fs.read`, through the same home-rooted, symlink-refusing capability every
+//! other read goes through, and nothing about the content reaches the server
+//! (`docs/TRUST.md`). An agent whose record lives somewhere the daemon cannot
+//! name — opencode keeps its conversations in a database — answers
+//! `supported: false` rather than a guess.
+//!
+//! Each store is where the daemon's own environment puts it, the environment
+//! every window starts from: `CLAUDE_CONFIG_DIR` (else `~/.claude`) and
+//! `CODEX_HOME` (else `~/.codex`). One configured outside home, or as a
+//! relative path, is beyond the file capability, so it too answers
+//! `supported: false`: no `fs.read` could reach what a search found there,
+//! and the locator does not widen what the daemon will read.
+//!
+//! Roles are a closed set on the wire — `conversation`, `subagent`, `input` —
+//! that deployed clients validate, refusing a report with any other. So a
+//! Claude Code sidecar reuses them: a helper's record, its metadata and the
+//! workflows that ran helpers are `subagent`; tool output spilled out of the
+//! record is `conversation`.
 //!
 //! Every search is bounded: so many directories opened, so many files looked
 //! at, so many answers. A home directory with ten thousand Codex days in it
@@ -18,6 +31,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -30,7 +44,9 @@ use crate::host_files::{
 };
 
 /// Most files one answer names. Past this the answer says `truncated` and
-/// keeps what it found first; the frame has 16 KiB to fit in.
+/// keeps what it found first; the frame has 16 KiB to fit in, which holds
+/// roughly this many home-rooted paths, so a larger cap would only move the
+/// cut into the frame-fitting loop.
 pub(crate) const MAX_TRANSCRIPTS: usize = 24;
 /// Directories one search opens before it stops looking.
 const MAX_SCAN_DIRS: usize = 512;
@@ -38,9 +54,13 @@ const MAX_SCAN_DIRS: usize = 512;
 const MAX_SCAN_FILES: usize = 2000;
 /// Entries one directory listing reads before it stops.
 const MAX_LISTED_ENTRIES: usize = 2048;
-/// How much of a Codex rollout is read to learn which folder it was opened
-/// in: the `session_meta` line comes first and names `cwd` near its start.
-const CODEX_HEAD_BYTES: usize = 64 * 1024;
+/// How much of a record is read to learn which folder it was opened in: a
+/// Codex rollout's `session_meta` line comes first and names `cwd` near its
+/// start, and every Claude Code message line carries one.
+const HEAD_BYTES: usize = 64 * 1024;
+/// Claude Code cuts a project folder name at this many UTF-16 units and
+/// suffixes a hash (`claude_project_folder`).
+const CLAUDE_FOLDER_UNITS: usize = 200;
 
 pub(crate) struct TranscriptQuery {
     /// The agent definition's `kind` (`claude-code`, `codex`, `aider`, …).
@@ -58,8 +78,9 @@ pub(crate) struct TranscriptFile {
     pub name: String,
     pub size: u64,
     pub modified_at: Option<i64>,
-    /// `conversation` for the main record, `subagent` for a helper the
-    /// conversation ran, `input` for a bare prompt history.
+    /// `conversation` for the main record (and output it spilled),
+    /// `subagent` for a helper the conversation ran, `input` for a bare
+    /// prompt history.
     pub role: &'static str,
     pub conversation_id: Option<String>,
 }
@@ -67,12 +88,42 @@ pub(crate) struct TranscriptFile {
 #[derive(Debug, Serialize)]
 pub(crate) struct TranscriptReport {
     pub agent_kind: String,
-    /// False when the daemon knows nothing about where this harness writes.
+    /// False when the daemon knows nothing about where this harness writes,
+    /// or where it writes is beyond the file capability.
     pub supported: bool,
     pub transcripts: Vec<TranscriptFile>,
     /// Where the daemon looked, as display paths, so an empty answer can say.
     pub searched: Vec<String>,
     pub truncated: bool,
+}
+
+/// Where this daemon's agents keep their records.
+#[derive(Default)]
+pub(crate) struct AgentStores {
+    /// `CLAUDE_CONFIG_DIR`; unset means `~/.claude`.
+    pub claude_config_dir: Option<PathBuf>,
+    /// `CODEX_HOME`; unset means `~/.codex`.
+    pub codex_home: Option<PathBuf>,
+    /// spawnd's own per-window homes (`config::window_homes_dir`). A skilled
+    /// window started before its Codex home linked rollouts into the store
+    /// above keeps its own `codex-home/sessions` there.
+    pub window_homes: Option<PathBuf>,
+}
+
+impl AgentStores {
+    fn from_env() -> Self {
+        Self {
+            claude_config_dir: configured_dir("CLAUDE_CONFIG_DIR"),
+            codex_home: configured_dir("CODEX_HOME"),
+            window_homes: crate::config::window_homes_dir().ok(),
+        }
+    }
+}
+
+fn configured_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
 }
 
 /// The server's own rule for the id (`AGENT_SESSION_ID_PATTERN`), plus one of
@@ -87,19 +138,56 @@ pub(crate) fn valid_conversation_id(id: &str) -> bool {
         && id.bytes().any(|byte| byte.is_ascii_alphanumeric())
 }
 
-/// The folder Claude Code files a working directory under: every byte that
-/// is not a letter or digit becomes a dash, so `/home/me/proj` is
-/// `-home-me-proj` and `C:\Users\me` is `C--Users-me`.
+/// The folder Claude Code files a working directory under, exactly as it
+/// computes it: every UTF-16 unit that is not an ASCII letter or digit
+/// becomes a dash, so `/home/me/proj` is `-home-me-proj`, `C:\Users\me` is
+/// `C--Users-me`, and an emoji is two dashes. A name longer than 200 units is
+/// cut there and given `-` plus the base-36 absolute value of the path's
+/// Java-style `hashCode`. `proto/claude-project-folder.json` pins it.
 pub(crate) fn claude_project_folder(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+    let folder: String = cwd
+        .encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        })
+        .collect();
+    if folder.len() <= CLAUDE_FOLDER_UNITS {
+        return folder;
+    }
+    let hash = cwd.encode_utf16().fold(0_i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+    });
+    // `Math.abs` on a double: `i32::MIN` has an absolute value too.
+    format!(
+        "{}-{}",
+        &folder[..CLAUDE_FOLDER_UNITS],
+        base36(i64::from(hash).unsigned_abs())
+    )
+}
+
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    String::from_utf8(digits).unwrap_or_default()
 }
 
 /// The id at the end of a Codex rollout name:
-/// `rollout-2026-09-17T10-12-44-<id>.jsonl`.
+/// `rollout-2026-09-17T10-12-44-<id>.jsonl`, or `.jsonl.zst` once Codex has
+/// compressed an old one.
 pub(crate) fn codex_conversation_id(name: &str) -> Option<String> {
-    let rest = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let rest = name.strip_prefix("rollout-")?;
+    let rest = rest
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| rest.strip_suffix(".jsonl"))?;
     // `YYYY-MM-DDThh-mm-ss` is 19 bytes, then the dash before the id.
     const TIMESTAMP_AND_DASH: usize = 20;
     if rest.len() <= TIMESTAMP_AND_DASH || !rest.is_char_boundary(TIMESTAMP_AND_DASH) {
@@ -112,6 +200,17 @@ pub(crate) fn codex_conversation_id(name: &str) -> Option<String> {
 pub(crate) async fn locate_in_session(
     files: &HostFileService,
     query: TranscriptQuery,
+    operations: Arc<HostFileOperations>,
+) -> FsResult<TranscriptReport> {
+    locate_with_stores(files, query, None, operations).await
+}
+
+/// `stores` is `None` for the daemon's own environment, resolved on the
+/// blocking pool because naming spawnd's config dir touches the disk.
+async fn locate_with_stores(
+    files: &HostFileService,
+    query: TranscriptQuery,
+    stores: Option<AgentStores>,
     operations: Arc<HostFileOperations>,
 ) -> FsResult<TranscriptReport> {
     if let Some(id) = &query.conversation_id {
@@ -130,7 +229,8 @@ pub(crate) async fn locate_in_session(
     let service = files.clone();
     files
         .run_blocking(operations, HostOperationKind::List, move |operations| {
-            locate_sync(&service, &query, operations)
+            let stores = stores.unwrap_or_else(AgentStores::from_env);
+            locate_sync(&service, &query, &stores, operations)
         })
         .await
 }
@@ -138,20 +238,38 @@ pub(crate) async fn locate_in_session(
 fn locate_sync(
     files: &HostFileService,
     query: &TranscriptQuery,
+    stores: &AgentStores,
     operations: &HostFileOperations,
 ) -> FsResult<TranscriptReport> {
     let mut search = Search {
         files,
+        stores,
         operations,
         dirs_opened: 0,
         files_examined: 0,
         truncated: false,
         searched: Vec::new(),
     };
+    let query = TranscriptQuery {
+        agent_kind: query.agent_kind.clone(),
+        conversation_id: query.conversation_id.clone(),
+        // `~` is the host's home, which is what the agent itself was given.
+        cwd: query
+            .cwd
+            .as_deref()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(|cwd| search.expand_home(cwd)),
+    };
     let (supported, mut transcripts) = match query.agent_kind.as_str() {
-        "claude-code" => (true, search.claude(query)?),
-        "codex" => (true, search.codex(query)?),
-        "aider" => (true, search.aider(query)?),
+        "claude-code" => match search.store(stores.claude_config_dir.as_deref(), ".claude") {
+            Some(store) => (true, search.claude(&store, &query)?),
+            None => (false, Vec::new()),
+        },
+        "codex" => match search.store(stores.codex_home.as_deref(), ".codex") {
+            Some(store) => (true, search.codex(&store, &query)?),
+            None => (false, Vec::new()),
+        },
+        "aider" => (true, search.aider(&query)?),
         _ => (false, Vec::new()),
     };
     if transcripts.len() > MAX_TRANSCRIPTS {
@@ -159,7 +277,7 @@ fn locate_sync(
         search.truncated = true;
     }
     Ok(TranscriptReport {
-        agent_kind: query.agent_kind.clone(),
+        agent_kind: query.agent_kind,
         supported,
         transcripts,
         searched: search.searched,
@@ -173,8 +291,18 @@ struct Child {
     is_file: bool,
 }
 
+/// What a Codex rollout is matched by.
+enum CodexMatch {
+    /// Its name ends in the id.
+    Id { plain: String, compressed: String },
+    /// Its first line names the folder (a compressed rollout cannot be read
+    /// for it, so only an id finds one of those).
+    Cwd(String),
+}
+
 struct Search<'a> {
     files: &'a HostFileService,
+    stores: &'a AgentStores,
     operations: &'a HostFileOperations,
     dirs_opened: usize,
     files_examined: usize,
@@ -219,6 +347,42 @@ impl Search<'_> {
             .into_owned()
     }
 
+    /// `~` and `~/x` against the home the file capability is rooted at;
+    /// anything else as given.
+    fn expand_home(&self, cwd: &str) -> String {
+        let home = self.files.home_dir();
+        if cwd == "~" {
+            return home;
+        }
+        match cwd.strip_prefix("~/").or_else(|| cwd.strip_prefix("~\\")) {
+            Some(rest) => {
+                #[cfg(windows)]
+                let rest = rest.replace('/', "\\");
+                Path::new(&home).join(rest).to_string_lossy().into_owned()
+            }
+            None => cwd.to_string(),
+        }
+    }
+
+    /// A harness's store as components under home: `default` there when
+    /// nothing is configured, else the configured directory when home holds
+    /// it. `None`, after saying where it is, for one the capability cannot
+    /// reach.
+    fn store(&mut self, configured: Option<&Path>, default: &str) -> Option<Vec<OsString>> {
+        let Some(configured) = configured else {
+            return Some(vec![OsString::from(default)]);
+        };
+        let components = configured
+            .to_str()
+            .filter(|_| configured.is_absolute())
+            .and_then(|path| self.files.relative_components(path).ok());
+        if components.is_none() {
+            self.searched
+                .push(configured.to_string_lossy().into_owned());
+        }
+        components
+    }
+
     /// A directory under home, or nothing where it does not exist. Any other
     /// refusal — a symlinked `~/.claude`, say — is the file capability's
     /// verdict and is reported as such, because `fs.read` would give the same.
@@ -231,6 +395,16 @@ impl Search<'_> {
             Err(error) if error.code == "not_found" => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// A directory under home reached without any link on the way, or
+    /// nothing, whatever the reason: for places that may or may not exist
+    /// and are not the store the answer is about.
+    fn open_extra_dir(&mut self, components: &[OsString]) -> FsResult<Option<Dir>> {
+        if !self.tick_dir()? {
+            return Ok(None);
+        }
+        Ok(self.files.open_dir_components(components).ok())
     }
 
     /// A child directory opened without following a link, or nothing.
@@ -300,14 +474,57 @@ impl Search<'_> {
         }))
     }
 
-    /// Claude Code: `~/.claude/projects/<folder>/<id>.jsonl`, with the helpers
-    /// that conversation ran under `<id>/subagents/`. With an id, every
-    /// project folder is checked — a conversation resumed from another folder
-    /// continues in that folder's file — the launch folder first. Without one
-    /// (an agent typed by hand), the launch folder's conversations, newest
-    /// first.
-    fn claude(&mut self, query: &TranscriptQuery) -> FsResult<Vec<TranscriptFile>> {
-        let base = [OsString::from(".claude"), OsString::from("projects")];
+    /// Every regular file in `dir` that `wanted` accepts, by name, into
+    /// `found`. True once the answer is full or the budget spent: stop.
+    fn files_into(
+        &mut self,
+        dir: &Dir,
+        components: &[OsString],
+        wanted: fn(&OsStr) -> bool,
+        role: &'static str,
+        conversation_id: &str,
+        found: &mut Vec<TranscriptFile>,
+    ) -> FsResult<bool> {
+        let mut names: Vec<OsString> = self
+            .children(dir)?
+            .into_iter()
+            .filter(|child| child.is_file && wanted(&child.name))
+            .map(|child| child.name)
+            .collect();
+        names.sort();
+        for name in names {
+            // One past the cap is enough to know the answer is truncated.
+            if found.len() > MAX_TRANSCRIPTS {
+                self.truncated = true;
+                return Ok(true);
+            }
+            match self.file_in(
+                dir,
+                components,
+                &name,
+                role,
+                Some(conversation_id.to_string()),
+            )? {
+                Some(file) => found.push(file),
+                None if self.truncated => return Ok(true),
+                None => {}
+            }
+        }
+        Ok(self.truncated)
+    }
+
+    /// Claude Code: `<store>/projects/<folder>/<id>.jsonl`, with the sidecar
+    /// that conversation wrote under `<id>/`. With an id, every project folder
+    /// is checked — a conversation resumed from another folder continues in
+    /// that folder's file — the launch folder first. Without one (an agent
+    /// typed by hand), the launch folder's conversations, newest first.
+    fn claude(
+        &mut self,
+        store: &[OsString],
+        query: &TranscriptQuery,
+    ) -> FsResult<Vec<TranscriptFile>> {
+        let mut base = store.to_vec();
+        base.push(OsString::from("projects"));
         let preferred = query.cwd.as_deref().map(claude_project_folder);
         let mut found = Vec::new();
         if let Some(id) = &query.conversation_id {
@@ -328,6 +545,10 @@ impl Search<'_> {
                     .as_deref()
                     .is_none_or(|folder| name != OsStr::new(folder))
             });
+            // Every record first, then what lies beside each: a sidecar can
+            // run to hundreds of files and must not crowd out the record of
+            // the same conversation resumed in another folder.
+            let mut holders = Vec::new();
             for folder in folders {
                 let Some(project) = self.open_child_dir(&projects, &folder)? else {
                     if self.truncated {
@@ -335,7 +556,8 @@ impl Search<'_> {
                     }
                     continue;
                 };
-                let components = [base[0].clone(), base[1].clone(), folder];
+                let mut components = base.clone();
+                components.push(folder);
                 let Some(file) = self.file_in(
                     &project,
                     &components,
@@ -350,53 +572,43 @@ impl Search<'_> {
                     continue;
                 };
                 found.push(file);
-                if let Some(side) = self.open_child_dir(&project, OsStr::new(id))? {
-                    if let Some(subagents) = self.open_child_dir(&side, OsStr::new("subagents"))? {
-                        let mut components = components.to_vec();
-                        components.push(OsString::from(id));
-                        components.push(OsString::from("subagents"));
-                        let mut names: Vec<OsString> = self
-                            .children(&subagents)?
-                            .into_iter()
-                            .filter(|child| child.is_file && has_suffix(&child.name, ".jsonl"))
-                            .map(|child| child.name)
-                            .collect();
-                        names.sort();
-                        for name in names {
-                            if let Some(file) = self.file_in(
-                                &subagents,
-                                &components,
-                                &name,
-                                "subagent",
-                                Some(id.clone()),
-                            )? {
-                                found.push(file);
-                            }
-                        }
-                    }
+                holders.push((project, components));
+            }
+            for (project, components) in holders {
+                if self.claude_sidecar(&project, &components, id, &mut found)? {
+                    break;
                 }
             }
         } else if let Some(folder) = preferred {
-            let components = [base[0].clone(), base[1].clone(), OsString::from(folder)];
+            let mut components = base.clone();
+            components.push(OsString::from(&folder));
             self.searched.push(self.display(&components));
-            let Some(project) = self.open_optional_dir(&components)? else {
-                return Ok(found);
-            };
-            for child in self.children(&project)? {
-                if !child.is_file || !has_suffix(&child.name, ".jsonl") {
-                    continue;
+            let mut folders = Vec::new();
+            if let Some(project) = self.open_optional_dir(&components)? {
+                folders.push((project, components));
+            }
+            if folder.len() > CLAUDE_FOLDER_UNITS {
+                if let Some(cwd) = query.cwd.as_deref() {
+                    folders.extend(self.claude_rehashed_folders(&base, &folder, cwd)?);
                 }
-                let stem = child.name.to_string_lossy();
-                let stem = stem.strip_suffix(".jsonl").unwrap_or(&stem);
-                let (role, conversation_id) = if stem.starts_with("agent-") {
-                    ("subagent", None)
-                } else {
-                    ("conversation", Some(stem.to_string()))
-                };
-                if let Some(file) =
-                    self.file_in(&project, &components, &child.name, role, conversation_id)?
-                {
-                    found.push(file);
+            }
+            for (project, components) in folders {
+                for child in self.children(&project)? {
+                    if !child.is_file || !has_suffix(&child.name, ".jsonl") {
+                        continue;
+                    }
+                    let stem = child.name.to_string_lossy();
+                    let stem = stem.strip_suffix(".jsonl").unwrap_or(&stem);
+                    let (role, conversation_id) = if stem.starts_with("agent-") {
+                        ("subagent", None)
+                    } else {
+                        ("conversation", Some(stem.to_string()))
+                    };
+                    if let Some(file) =
+                        self.file_in(&project, &components, &child.name, role, conversation_id)?
+                    {
+                        found.push(file);
+                    }
                 }
             }
             found.sort_by(|a, b| b.modified_at.cmp(&a.modified_at).then(a.name.cmp(&b.name)));
@@ -406,67 +618,296 @@ impl Search<'_> {
         Ok(found)
     }
 
-    /// Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`,
+    /// A long folder name ends in a hash, and a Claude Code that hashed
+    /// differently filed the same folder under another suffix. Claude Code
+    /// itself accepts a folder with the same 200-unit cut whose records were
+    /// opened in this cwd; so does this.
+    fn claude_rehashed_folders(
+        &mut self,
+        base: &[OsString],
+        folder: &str,
+        cwd: &str,
+    ) -> FsResult<Vec<(Dir, Vec<OsString>)>> {
+        let mut matched = Vec::new();
+        let Some(projects) = self.open_optional_dir(base)? else {
+            return Ok(matched);
+        };
+        let prefix = format!("{}-", &folder[..CLAUDE_FOLDER_UNITS]);
+        let needle = cwd_needle(cwd)?;
+        let mut names: Vec<OsString> = self
+            .children(&projects)?
+            .into_iter()
+            .filter(|child| {
+                child.is_dir && has_prefix(&child.name, &prefix) && child.name != OsStr::new(folder)
+            })
+            .map(|child| child.name)
+            .collect();
+        names.sort();
+        for name in names {
+            let Some(project) = self.open_child_dir(&projects, &name)? else {
+                if self.truncated {
+                    break;
+                }
+                continue;
+            };
+            let mut records = Vec::new();
+            for child in self.children(&project)? {
+                if child.is_file && has_suffix(&child.name, ".jsonl") {
+                    records.push(child.name);
+                }
+            }
+            let mut opened_here = false;
+            for record in records {
+                if !self.tick_file()? {
+                    break;
+                }
+                if head_contains(&project, &record, &needle) {
+                    opened_here = true;
+                    break;
+                }
+            }
+            if opened_here {
+                let mut components = base.to_vec();
+                components.push(name);
+                self.searched.push(self.display(&components));
+                matched.push((project, components));
+            }
+        }
+        Ok(matched)
+    }
+
+    /// What `<folder>/<id>/` holds for one conversation, in the order a
+    /// reader wants it: the helpers it ran (`subagents/`, their `.meta.json`
+    /// beside each record, and `subagents/workflows/<run>/`), the workflows
+    /// that ran them (`workflows/`, `workflows/scripts/`), then the tool
+    /// output too long to keep in the record (`tool-results/`, named from the
+    /// record by path). True once the answer is full.
+    fn claude_sidecar(
+        &mut self,
+        project: &Dir,
+        components: &[OsString],
+        id: &str,
+        found: &mut Vec<TranscriptFile>,
+    ) -> FsResult<bool> {
+        let Some(side) = self.open_child_dir(project, OsStr::new(id))? else {
+            return Ok(self.truncated);
+        };
+        let mut side_components = components.to_vec();
+        side_components.push(OsString::from(id));
+        let child = |components: &[OsString], name: &str| {
+            let mut components = components.to_vec();
+            components.push(OsString::from(name));
+            components
+        };
+
+        if let Some(subagents) = self.open_child_dir(&side, OsStr::new("subagents"))? {
+            let sub_components = child(&side_components, "subagents");
+            if self.files_into(
+                &subagents,
+                &sub_components,
+                is_helper_record,
+                "subagent",
+                id,
+                found,
+            )? {
+                return Ok(true);
+            }
+            if let Some(runs) = self.open_child_dir(&subagents, OsStr::new("workflows"))? {
+                let runs_components = child(&sub_components, "workflows");
+                let mut names: Vec<OsString> = self
+                    .children(&runs)?
+                    .into_iter()
+                    .filter(|child| child.is_dir)
+                    .map(|child| child.name)
+                    .collect();
+                names.sort();
+                for name in names {
+                    let Some(run) = self.open_child_dir(&runs, &name)? else {
+                        if self.truncated {
+                            return Ok(true);
+                        }
+                        continue;
+                    };
+                    let mut run_components = runs_components.clone();
+                    run_components.push(name);
+                    if self.files_into(
+                        &run,
+                        &run_components,
+                        is_helper_record,
+                        "subagent",
+                        id,
+                        found,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        if let Some(workflows) = self.open_child_dir(&side, OsStr::new("workflows"))? {
+            let workflow_components = child(&side_components, "workflows");
+            if self.files_into(
+                &workflows,
+                &workflow_components,
+                any_name,
+                "subagent",
+                id,
+                found,
+            )? {
+                return Ok(true);
+            }
+            if let Some(scripts) = self.open_child_dir(&workflows, OsStr::new("scripts"))? {
+                if self.files_into(
+                    &scripts,
+                    &child(&workflow_components, "scripts"),
+                    any_name,
+                    "subagent",
+                    id,
+                    found,
+                )? {
+                    return Ok(true);
+                }
+            }
+        }
+        if let Some(results) = self.open_child_dir(&side, OsStr::new("tool-results"))? {
+            if self.files_into(
+                &results,
+                &child(&side_components, "tool-results"),
+                any_name,
+                "conversation",
+                id,
+                found,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(self.truncated)
+    }
+
+    /// Codex: `<store>/sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`,
     /// newest day first. Codex picks its own id, so a window rarely has one
     /// recorded; the rollouts opened in the window's folder stand in — each
     /// file's first line is its `session_meta` and names the `cwd`.
-    fn codex(&mut self, query: &TranscriptQuery) -> FsResult<Vec<TranscriptFile>> {
-        let base = [OsString::from(".codex"), OsString::from("sessions")];
+    fn codex(
+        &mut self,
+        store: &[OsString],
+        query: &TranscriptQuery,
+    ) -> FsResult<Vec<TranscriptFile>> {
+        let mut base = store.to_vec();
+        base.push(OsString::from("sessions"));
         self.searched.push(self.display(&base));
-        let suffix = query
-            .conversation_id
-            .as_ref()
-            .map(|id| OsString::from(format!("-{id}.jsonl")));
-        let needle = match (&suffix, &query.cwd) {
-            (Some(_), _) => None,
-            (None, Some(cwd)) => Some(format!(
-                "\"cwd\":{}",
-                serde_json::to_string(cwd).map_err(|error| FsError::new(
-                    "invalid_path",
-                    format!("working directory is not encodable: {error}")
-                ))?
-            )),
+        let matcher = match (&query.conversation_id, &query.cwd) {
+            (Some(id), _) => CodexMatch::Id {
+                plain: format!("-{id}.jsonl"),
+                compressed: format!("-{id}.jsonl.zst"),
+            },
+            (None, Some(cwd)) => CodexMatch::Cwd(cwd_needle(cwd)?),
             (None, None) => return Ok(Vec::new()),
         };
         let mut found = Vec::new();
-        let Some(sessions) = self.open_optional_dir(&base)? else {
-            return Ok(found);
+        if let Some(sessions) = self.open_optional_dir(&base)? {
+            if self.codex_days(&sessions, &base, &matcher, &mut found)? {
+                return Ok(found);
+            }
+        }
+        self.codex_window_stores(&matcher, &mut found)?;
+        Ok(found)
+    }
+
+    /// Rollouts a skilled window kept in its own `codex-home/sessions`,
+    /// written before that directory became a link into the store: still
+    /// this host's conversations, and nowhere else. A linked one is the store
+    /// itself, already searched, and is not followed.
+    fn codex_window_stores(
+        &mut self,
+        matcher: &CodexMatch,
+        found: &mut Vec<TranscriptFile>,
+    ) -> FsResult<()> {
+        let Some(homes) = self
+            .stores
+            .window_homes
+            .as_deref()
+            .and_then(Path::to_str)
+            .and_then(|path| self.files.relative_components(path).ok())
+        else {
+            return Ok(());
         };
-        'days: for year in self.numbered_dirs(&sessions)? {
-            let Some(year_dir) = self.open_child_dir(&sessions, &year)? else {
+        let Some(windows) = self.open_extra_dir(&homes)? else {
+            return Ok(());
+        };
+        let mut names: Vec<OsString> = self
+            .children(&windows)?
+            .into_iter()
+            .filter(|child| child.is_dir)
+            .map(|child| child.name)
+            .collect();
+        names.sort();
+        let mut looked = false;
+        for name in names {
+            let mut components = homes.clone();
+            components.extend([
+                name,
+                OsString::from("codex-home"),
+                OsString::from("sessions"),
+            ]);
+            let Some(sessions) = self.open_extra_dir(&components)? else {
                 if self.truncated {
                     break;
+                }
+                continue;
+            };
+            if !looked {
+                // One line for all of them: a host with many windows must
+                // not spend the frame on where it looked.
+                self.searched.push(self.display(&homes));
+                looked = true;
+            }
+            if self.codex_days(&sessions, &components, matcher, found)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// One Codex `sessions` tree, newest day first. True once the search is
+    /// over: the id found, the answer full, or the budget spent.
+    fn codex_days(
+        &mut self,
+        sessions: &Dir,
+        base: &[OsString],
+        matcher: &CodexMatch,
+        found: &mut Vec<TranscriptFile>,
+    ) -> FsResult<bool> {
+        for year in self.numbered_dirs(sessions)? {
+            let Some(year_dir) = self.open_child_dir(sessions, &year)? else {
+                if self.truncated {
+                    return Ok(true);
                 }
                 continue;
             };
             for month in self.numbered_dirs(&year_dir)? {
                 let Some(month_dir) = self.open_child_dir(&year_dir, &month)? else {
                     if self.truncated {
-                        break 'days;
+                        return Ok(true);
                     }
                     continue;
                 };
                 for day in self.numbered_dirs(&month_dir)? {
                     let Some(day_dir) = self.open_child_dir(&month_dir, &day)? else {
                         if self.truncated {
-                            break 'days;
+                            return Ok(true);
                         }
                         continue;
                     };
-                    let components = [
-                        base[0].clone(),
-                        base[1].clone(),
-                        year.clone(),
-                        month.clone(),
-                        day.clone(),
-                    ];
+                    let mut components = base.to_vec();
+                    components.extend([year.clone(), month.clone(), day.clone()]);
                     let mut names: Vec<OsString> = self
                         .children(&day_dir)?
                         .into_iter()
                         .filter(|child| {
                             child.is_file
                                 && has_prefix(&child.name, "rollout-")
-                                && has_suffix(&child.name, ".jsonl")
+                                && (has_suffix(&child.name, ".jsonl")
+                                    || has_suffix(&child.name, ".jsonl.zst"))
                         })
                         .map(|child| child.name)
                         .collect();
@@ -476,12 +917,16 @@ impl Search<'_> {
                     names.reverse();
                     for name in names {
                         if !self.tick_file()? {
-                            break 'days;
+                            return Ok(true);
                         }
-                        let matched = match (&suffix, &needle) {
-                            (Some(suffix), _) => os_ends_with(&name, suffix),
-                            (None, Some(needle)) => self.head_contains(&day_dir, &name, needle),
-                            (None, None) => false,
+                        let matched = match matcher {
+                            CodexMatch::Id { plain, compressed } => {
+                                has_suffix(&name, plain) || has_suffix(&name, compressed)
+                            }
+                            CodexMatch::Cwd(needle) => {
+                                has_suffix(&name, ".jsonl")
+                                    && head_contains(&day_dir, &name, needle)
+                            }
                         };
                         if !matched {
                             continue;
@@ -497,18 +942,18 @@ impl Search<'_> {
                             found.push(file);
                         }
                         // An id names one file; a folder can name many.
-                        if suffix.is_some() {
-                            break 'days;
+                        if matches!(matcher, CodexMatch::Id { .. }) {
+                            return Ok(true);
                         }
                         if found.len() >= MAX_TRANSCRIPTS {
                             self.truncated = true;
-                            break 'days;
+                            return Ok(true);
                         }
                     }
                 }
             }
         }
-        Ok(found)
+        Ok(false)
     }
 
     /// The all-digit child directories of `dir`, newest (highest) first.
@@ -529,29 +974,10 @@ impl Search<'_> {
         Ok(names)
     }
 
-    /// Whether the first `CODEX_HEAD_BYTES` of a file contain `needle`. A file
-    /// that cannot be opened simply does not match: one unreadable rollout
-    /// must not end the search for the rest.
-    fn head_contains(&self, dir: &Dir, name: &OsStr, needle: &str) -> bool {
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let Ok(file) = dir.open_with(name, &options) else {
-            return false;
-        };
-        let mut head = Vec::with_capacity(CODEX_HEAD_BYTES);
-        if file
-            .into_std()
-            .take(CODEX_HEAD_BYTES as u64)
-            .read_to_end(&mut head)
-            .is_err()
-        {
-            return false;
-        }
-        String::from_utf8_lossy(&head).contains(needle)
-    }
-
     /// aider: `.aider.chat.history.md` and `.aider.input.history` in the
-    /// folder it ran in. There is no id; the folder is the conversation.
+    /// folder it ran in and, inside a git repository, at the repository's
+    /// root, where aider keeps them whichever subfolder it was started in.
+    /// There is no id; the folder is the conversation.
     fn aider(&mut self, query: &TranscriptQuery) -> FsResult<Vec<TranscriptFile>> {
         let mut found = Vec::new();
         let Some(cwd) = &query.cwd else {
@@ -570,16 +996,89 @@ impl Search<'_> {
         let Some(dir) = self.open_optional_dir(&components)? else {
             return Ok(found);
         };
-        for (name, role) in [
-            (".aider.chat.history.md", "conversation"),
-            (".aider.input.history", "input"),
-        ] {
-            if let Some(file) = self.file_in(&dir, &components, OsStr::new(name), role, None)? {
-                found.push(file);
+        self.aider_files(&dir, &components, &mut found)?;
+        if let Some((root, root_components)) = self.git_root(&components)? {
+            if root_components != components {
+                self.searched.push(self.display(&root_components));
+                self.aider_files(&root, &root_components, &mut found)?;
             }
         }
         Ok(found)
     }
+
+    fn aider_files(
+        &mut self,
+        dir: &Dir,
+        components: &[OsString],
+        found: &mut Vec<TranscriptFile>,
+    ) -> FsResult<()> {
+        for (name, role) in [
+            (".aider.chat.history.md", "conversation"),
+            (".aider.input.history", "input"),
+        ] {
+            if let Some(file) = self.file_in(dir, components, OsStr::new(name), role, None)? {
+                found.push(file);
+            }
+        }
+        Ok(())
+    }
+
+    /// The nearest folder at or above `components`, within home, that holds
+    /// a `.git` (a directory, or the file a worktree or submodule has).
+    fn git_root(&mut self, components: &[OsString]) -> FsResult<Option<(Dir, Vec<OsString>)>> {
+        for depth in (0..=components.len()).rev() {
+            let ancestor = &components[..depth];
+            let Some(dir) = self.open_optional_dir(ancestor)? else {
+                return Ok(None);
+            };
+            if dir.symlink_metadata(".git").is_ok() {
+                return Ok(Some((dir, ancestor.to_vec())));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// How a record names the folder it was opened in: Codex's `session_meta`
+/// and every Claude Code message line carry `"cwd":"<path>"`.
+fn cwd_needle(cwd: &str) -> FsResult<String> {
+    Ok(format!(
+        "\"cwd\":{}",
+        serde_json::to_string(cwd).map_err(|error| FsError::new(
+            "invalid_path",
+            format!("working directory is not encodable: {error}")
+        ))?
+    ))
+}
+
+/// Whether the first `HEAD_BYTES` of a file contain `needle`. A file that
+/// cannot be opened simply does not match: one unreadable record must not
+/// end the search for the rest.
+fn head_contains(dir: &Dir, name: &OsStr, needle: &str) -> bool {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let Ok(file) = dir.open_with(name, &options) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(HEAD_BYTES);
+    if file
+        .into_std()
+        .take(HEAD_BYTES as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    String::from_utf8_lossy(&head).contains(needle)
+}
+
+/// A helper's record or its metadata (`agent-<n>.jsonl`, `agent-<n>.meta.json`).
+fn is_helper_record(name: &OsStr) -> bool {
+    has_suffix(name, ".jsonl") || has_suffix(name, ".json")
+}
+
+fn any_name(_: &OsStr) -> bool {
+    true
 }
 
 fn has_suffix(name: &OsStr, suffix: &str) -> bool {
@@ -590,13 +1089,6 @@ fn has_prefix(name: &OsStr, prefix: &str) -> bool {
     name.to_str().is_some_and(|name| name.starts_with(prefix))
 }
 
-fn os_ends_with(name: &OsStr, suffix: &OsStr) -> bool {
-    match (name.to_str(), suffix.to_str()) {
-        (Some(name), Some(suffix)) => name.ends_with(suffix),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -604,15 +1096,34 @@ mod tests {
 
     use super::*;
 
+    /// The stores every agent defaults to, whatever the environment running
+    /// the tests says.
     async fn locate(root: &Path, query: TranscriptQuery) -> TranscriptReport {
+        locate_in(root, AgentStores::default(), query).await
+    }
+
+    async fn locate_in(
+        root: &Path,
+        stores: AgentStores,
+        query: TranscriptQuery,
+    ) -> TranscriptReport {
         let service = HostFileService::rooted_at(root).await.unwrap();
-        locate_in_session(
+        locate_with_stores(
             &service,
             query,
+            Some(stores),
             HostFileOperations::new(Arc::new(AtomicBool::new(false))),
         )
         .await
         .unwrap()
+    }
+
+    fn names(report: &TranscriptReport) -> Vec<(&str, &str)> {
+        report
+            .transcripts
+            .iter()
+            .map(|file| (file.role, file.name.as_str()))
+            .collect()
     }
 
     fn query(kind: &str, id: Option<&str>, cwd: Option<&str>) -> TranscriptQuery {
@@ -677,6 +1188,33 @@ mod tests {
     }
 
     #[test]
+    fn claude_folders_match_claude_codes_own_rule_byte_for_byte() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../proto/claude-project-folder.json")).unwrap();
+        assert_eq!(
+            vectors["max_units"].as_u64(),
+            Some(CLAUDE_FOLDER_UNITS as u64)
+        );
+        let cases = vectors["cases"].as_array().unwrap();
+        assert!(cases.len() >= 20);
+        for case in cases {
+            let cwd = case["cwd"].as_str().unwrap();
+            assert_eq!(
+                claude_project_folder(cwd),
+                case["folder"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+            if let Some(expected) = case["java_hash"].as_i64() {
+                let hash = cwd.encode_utf16().fold(0_i32, |hash, unit| {
+                    hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+                });
+                assert_eq!(i64::from(hash), expected, "{}", case["name"]);
+            }
+        }
+    }
+
+    #[test]
     fn codex_ids_come_after_the_timestamp() {
         assert_eq!(
             codex_conversation_id(
@@ -690,6 +1228,13 @@ mod tests {
             None
         );
         assert_eq!(codex_conversation_id("notes.jsonl"), None);
+        assert_eq!(
+            codex_conversation_id(
+                "rollout-2026-09-17T10-12-44-01a0aeda-b62e-7681-a475-3e513e9aafd9.jsonl.zst"
+            )
+            .as_deref(),
+            Some("01a0aeda-b62e-7681-a475-3e513e9aafd9")
+        );
     }
 
     #[tokio::test]
@@ -743,20 +1288,19 @@ mod tests {
         .await;
         assert!(report.supported);
         assert!(!report.truncated);
-        let described: Vec<(&str, &str)> = report
-            .transcripts
-            .iter()
-            .map(|file| (file.role, file.name.as_str()))
-            .collect();
+        // Both records before either sidecar; a helper's metadata beside its
+        // record.
         assert_eq!(
-            described,
+            names(&report),
             vec![
                 ("conversation", "45171e5a-5951-4d38-81e5-e1c0f9639d80.jsonl"),
-                ("subagent", "agent-a.jsonl"),
-                ("subagent", "agent-b.jsonl"),
                 ("conversation", "45171e5a-5951-4d38-81e5-e1c0f9639d80.jsonl"),
+                ("subagent", "agent-a.jsonl"),
+                ("subagent", "agent-a.meta.json"),
+                ("subagent", "agent-b.jsonl"),
             ]
         );
+        assert!(report.transcripts[1].path.contains("-elsewhere"));
         assert_eq!(
             report.transcripts[0].path,
             projects
@@ -1036,5 +1580,387 @@ mod tests {
         .await;
         assert_eq!(report.transcripts.len(), MAX_TRANSCRIPTS);
         assert!(report.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_claude_sidecar_lists_helpers_workflows_and_spilled_output_after_the_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let id = "acc62a59-dd15-4c71-a8e1-5469b722dbd6";
+        let cwd = home.join("proj");
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_folder(&cwd.to_string_lossy()));
+        let side = project.join(id);
+        write(&project.join(format!("{id}.jsonl")), b"{}\n");
+        write(&side.join("subagents/agent-a1.jsonl"), b"{}\n");
+        write(&side.join("subagents/agent-a1.meta.json"), b"{}");
+        write(&side.join("subagents/notes.txt"), b"not a helper");
+        write(
+            &side.join("subagents/workflows/wf_0aa1/agent-b2.jsonl"),
+            b"{}\n",
+        );
+        write(
+            &side.join("subagents/workflows/wf_0aa1/agent-b2.meta.json"),
+            b"{}",
+        );
+        write(&side.join("workflows/wf_0aa1.json"), b"{}");
+        write(&side.join("workflows/scripts/review-wf_0aa1.js"), b"//");
+        write(&side.join("tool-results/toolu_01.txt"), b"long output");
+        let report = locate(
+            temp.path(),
+            query("claude-code", Some(id), Some(&cwd.to_string_lossy())),
+        )
+        .await;
+        assert_eq!(
+            names(&report),
+            vec![
+                ("conversation", "acc62a59-dd15-4c71-a8e1-5469b722dbd6.jsonl"),
+                ("subagent", "agent-a1.jsonl"),
+                ("subagent", "agent-a1.meta.json"),
+                ("subagent", "agent-b2.jsonl"),
+                ("subagent", "agent-b2.meta.json"),
+                ("subagent", "wf_0aa1.json"),
+                ("subagent", "review-wf_0aa1.js"),
+                ("conversation", "toolu_01.txt"),
+            ]
+        );
+        assert!(report
+            .transcripts
+            .iter()
+            .all(|file| file.conversation_id.as_deref() == Some(id)));
+        assert_eq!(
+            report.transcripts[3].path,
+            side.join("subagents")
+                .join("workflows")
+                .join("wf_0aa1")
+                .join("agent-b2.jsonl")
+                .to_string_lossy()
+        );
+        assert!(!report.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_too_big_for_one_answer_keeps_the_record_and_says_truncated() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let id = "big-sidecar";
+        let cwd = home.join("proj");
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_folder(&cwd.to_string_lossy()));
+        write(&project.join(format!("{id}.jsonl")), b"{}\n");
+        for index in 0..(MAX_TRANSCRIPTS * 3) {
+            write(
+                &project
+                    .join(id)
+                    .join("tool-results")
+                    .join(format!("{index:03}.txt")),
+                b"x",
+            );
+        }
+        let report = locate(
+            temp.path(),
+            query("claude-code", Some(id), Some(&cwd.to_string_lossy())),
+        )
+        .await;
+        assert_eq!(report.transcripts.len(), MAX_TRANSCRIPTS);
+        assert!(report.truncated);
+        assert_eq!(report.transcripts[0].name, "big-sidecar.jsonl");
+    }
+
+    #[tokio::test]
+    async fn claude_records_are_found_in_the_store_claude_config_dir_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let id = "abc-123";
+        let store = home.join("work-claude");
+        write(
+            &store.join("projects/-anywhere").join(format!("{id}.jsonl")),
+            b"{}\n",
+        );
+        // The default store holds a different copy; it is not where this
+        // daemon's agents write.
+        write(
+            &home
+                .join(".claude/projects/-anywhere")
+                .join(format!("{id}.jsonl")),
+            b"{}\n{}\n",
+        );
+        let stores = AgentStores {
+            claude_config_dir: Some(store.clone()),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("claude-code", Some(id), None)).await;
+        assert!(report.supported);
+        assert_eq!(report.transcripts.len(), 1);
+        assert_eq!(report.transcripts[0].size, 3);
+        assert_eq!(
+            report.searched,
+            vec![store.join("projects").to_string_lossy().into_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_outside_home_is_unsupported_not_searched() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("projects/-x/abc.jsonl"), b"{}\n");
+        for kind in ["claude-code", "codex"] {
+            let stores = AgentStores {
+                claude_config_dir: Some(outside.path().to_path_buf()),
+                codex_home: Some(outside.path().to_path_buf()),
+                ..AgentStores::default()
+            };
+            let report = locate_in(temp.path(), stores, query(kind, Some("abc"), None)).await;
+            assert!(!report.supported, "{kind}");
+            assert!(report.transcripts.is_empty(), "{kind}");
+            assert_eq!(
+                report.searched,
+                vec![outside.path().to_string_lossy().into_owned()],
+                "{kind}"
+            );
+        }
+        // A relative store is no place at all.
+        let stores = AgentStores {
+            claude_config_dir: Some(PathBuf::from("relative/claude")),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("claude-code", Some("abc"), None)).await;
+        assert!(!report.supported);
+    }
+
+    #[tokio::test]
+    async fn a_tilde_cwd_is_the_hosts_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_folder(&home.join("proj").to_string_lossy()));
+        write(&project.join("one.jsonl"), b"{}\n");
+        let report = locate(temp.path(), query("claude-code", None, Some("~/proj"))).await;
+        assert_eq!(names(&report), vec![("conversation", "one.jsonl")]);
+
+        let sessions = home.join(".codex").join("sessions").join("2026/09/17");
+        write(
+            &sessions
+                .join("rollout-2026-09-17T10-12-44-01a0aeda-b62e-7681-a475-3e513e9aafd9.jsonl"),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(&home.to_string_lossy()).unwrap()
+            )
+            .as_bytes(),
+        );
+        let report = locate(temp.path(), query("codex", None, Some("~"))).await;
+        assert_eq!(report.transcripts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_long_folder_is_found_by_its_hashed_name_and_by_another_hash_of_the_same_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let cwd = home.join("x".repeat(120)).join("y".repeat(120));
+        let cwd = cwd.to_string_lossy().into_owned();
+        let folder = claude_project_folder(&cwd);
+        assert!(folder.len() > CLAUDE_FOLDER_UNITS);
+        let projects = home.join(".claude").join("projects");
+        write(&projects.join(&folder).join("current.jsonl"), b"{}\n");
+        let line = |cwd: &str| {
+            format!(
+                "{{\"type\":\"user\",\"cwd\":{},\"message\":{{}}}}\n",
+                serde_json::to_string(cwd).unwrap()
+            )
+        };
+        // Same 200-unit cut, another hash: filed by a Claude Code that hashed
+        // differently, for this cwd...
+        let cut = &folder[..CLAUDE_FOLDER_UNITS];
+        write(
+            &projects.join(format!("{cut}-oldhash")).join("older.jsonl"),
+            line(&cwd).as_bytes(),
+        );
+        // ...and one for a different cwd that happens to share the cut.
+        write(
+            &projects
+                .join(format!("{cut}-otherhash"))
+                .join("stranger.jsonl"),
+            line(&format!("{cwd}-sibling")).as_bytes(),
+        );
+        let report = locate(temp.path(), query("claude-code", None, Some(&cwd))).await;
+        let mut found: Vec<&str> = report
+            .transcripts
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["current.jsonl", "older.jsonl"]);
+        assert_eq!(report.searched.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_rollouts_are_found_in_the_store_codex_home_names_compressed_or_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let store = home.join("codex-alt");
+        let id = "01a0aeda-b62e-7681-a475-3e513e9aafd9";
+        let day = store.join("sessions/2026/09/01");
+        write(
+            &day.join(format!("rollout-2026-09-01T10-12-44-{id}.jsonl.zst")),
+            b"\x28\xb5\x2f\xfd",
+        );
+        let stores = AgentStores {
+            codex_home: Some(store.clone()),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("codex", Some(id), None)).await;
+        assert_eq!(report.transcripts.len(), 1);
+        assert_eq!(report.transcripts[0].conversation_id.as_deref(), Some(id));
+        assert!(report.transcripts[0].name.ends_with(".jsonl.zst"));
+        assert_eq!(
+            report.searched,
+            vec![store.join("sessions").to_string_lossy().into_owned()]
+        );
+
+        // A compressed rollout cannot be read for its folder, so a folder
+        // search passes over it rather than guessing.
+        let stores = AgentStores {
+            codex_home: Some(store),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("codex", None, Some("/home/me"))).await;
+        assert!(report.transcripts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_rollouts_a_window_kept_in_its_own_codex_home_are_found_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let homes = home.join(".config/spawn/sessions");
+        let id = "01a0aec5-82ea-79e1-a933-49b8049810ca";
+        let window = homes.join("2b1c5b7e-0000-4000-8000-000000000001");
+        write(
+            &window
+                .join("codex-home/sessions/2026/08/30")
+                .join(format!("rollout-2026-08-30T08-00-00-{id}.jsonl")),
+            b"{}\n",
+        );
+        // A window with no Codex conversation of its own is passed over.
+        std::fs::create_dir_all(homes.join("3c2d6c8f-0000-4000-8000-000000000002/skills")).unwrap();
+        let stores = AgentStores {
+            window_homes: Some(homes.clone()),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("codex", Some(id), None)).await;
+        assert_eq!(report.transcripts.len(), 1);
+        assert!(report.transcripts[0].path.contains("codex-home"));
+        assert_eq!(
+            report.searched,
+            vec![
+                home.join(".codex/sessions").to_string_lossy().into_owned(),
+                homes.to_string_lossy().into_owned(),
+            ]
+        );
+
+        // The store itself answers first, and ends an id search there.
+        write(
+            &home
+                .join(".codex/sessions/2026/09/02")
+                .join(format!("rollout-2026-09-02T08-00-00-{id}.jsonl")),
+            b"{}\n",
+        );
+        let stores = AgentStores {
+            window_homes: Some(homes),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("codex", Some(id), None)).await;
+        assert_eq!(report.transcripts.len(), 1);
+        assert!(!report.transcripts[0].path.contains("codex-home"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_window_codex_home_linked_into_the_store_is_not_searched_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let store = home.join(".codex/sessions");
+        let here = "/home/me/proj";
+        write(
+            &store
+                .join("2026/09/17")
+                .join("rollout-2026-09-17T10-12-44-01a0aeda-b62e-7681-a475-3e513e9aafd9.jsonl"),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{}}}}}\n",
+                serde_json::to_string(here).unwrap()
+            )
+            .as_bytes(),
+        );
+        let homes = home.join(".config/spawn/sessions");
+        let codex_home = homes.join("2b1c5b7e-0000-4000-8000-000000000001/codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::os::unix::fs::symlink(&store, codex_home.join("sessions")).unwrap();
+        let stores = AgentStores {
+            window_homes: Some(homes),
+            ..AgentStores::default()
+        };
+        let report = locate_in(temp.path(), stores, query("codex", None, Some(here))).await;
+        assert_eq!(report.transcripts.len(), 1);
+        assert_eq!(report.searched, vec![store.to_string_lossy().into_owned()]);
+    }
+
+    #[tokio::test]
+    async fn aider_history_at_the_repository_root_is_found_from_a_subfolder() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = home(&temp).await;
+        let repo = home.join("repo");
+        let cwd = repo.join("packages").join("web");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        write(&repo.join(".aider.chat.history.md"), b"# chat\n");
+        write(&repo.join(".aider.input.history"), b"+ hi\n");
+        let report = locate(
+            temp.path(),
+            query("aider", None, Some(&cwd.to_string_lossy())),
+        )
+        .await;
+        assert_eq!(
+            names(&report),
+            vec![
+                ("conversation", ".aider.chat.history.md"),
+                ("input", ".aider.input.history"),
+            ]
+        );
+        assert_eq!(
+            report.searched,
+            vec![
+                cwd.to_string_lossy().into_owned(),
+                repo.to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(report.transcripts[0].path.ends_with(&format!(
+            "repo{}.aider.chat.history.md",
+            std::path::MAIN_SEPARATOR
+        )));
+
+        // A worktree's `.git` is a file; it marks the root all the same, and
+        // history in the folder itself comes first.
+        let worktree = home.join("worktree");
+        let sub = worktree.join("src");
+        write(
+            &worktree.join(".git"),
+            b"gitdir: ../repo/.git/worktrees/w\n",
+        );
+        write(&sub.join(".aider.chat.history.md"), b"# here\n");
+        write(&worktree.join(".aider.chat.history.md"), b"# root\n");
+        let report = locate(
+            temp.path(),
+            query("aider", None, Some(&sub.to_string_lossy())),
+        )
+        .await;
+        assert_eq!(report.transcripts.len(), 2);
+        assert_eq!(report.transcripts[0].size, 7);
+        assert_eq!(report.transcripts[1].size, 7);
+        assert!(report.transcripts[0].path.contains("src"));
     }
 }

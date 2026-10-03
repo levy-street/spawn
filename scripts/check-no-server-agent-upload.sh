@@ -239,10 +239,22 @@ if set(re.findall(r"crate::(\w+)", control)) != {
 transcripts_path = os.path.join(root, "daemon/src/host_transcripts.rs")
 with open(transcripts_path, encoding="utf-8") as source:
     transcripts = source.read()
-if set(re.findall(r"crate::(\w+)", transcripts)) != {"host_files"}:
+# config (2026-10-03) only names spawnd's own per-window homes, where a skilled
+# window's Codex rollouts from before the linked CODEX_HOME still live; it is
+# paths, pinned below to reach nothing but the platform's directory helpers.
+if set(re.findall(r"crate::(\w+)", transcripts)) != {"config", "host_files"}:
     raise SystemExit("no-server-agent-upload: host transcript locator gained an unreviewed crate dependency")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|TcpStream|UdpSocket|mpsc)\b", transcripts):
     raise SystemExit("no-server-agent-upload: host transcript locator gained a transport")
+with open(os.path.join(root, "daemon/src/config.rs"), encoding="utf-8") as source:
+    config_source = source.read()
+if set(re.findall(r"crate::(\w+)", config_source)) - {"platform"}:
+    raise SystemExit("no-server-agent-upload: the locator's config dependency gained a crate dependency")
+if re.search(
+    r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|tungstenite|TcpStream|UdpSocket|mpsc)\b",
+    config_source,
+):
+    raise SystemExit("no-server-agent-upload: the locator's config dependency gained a transport")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
@@ -674,6 +686,7 @@ self_test() {
   cp "$source_root/daemon/src/rtc_pair.rs" "$fixture/daemon/src/rtc_pair.rs"
   cp "$source_root/daemon/src/host_control.rs" "$fixture/daemon/src/host_control.rs"
   cp "$source_root/daemon/src/host_transcripts.rs" "$fixture/daemon/src/host_transcripts.rs"
+  cp "$source_root/daemon/src/config.rs" "$fixture/daemon/src/config.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
   printf '%s\n' \
@@ -810,6 +823,20 @@ self_test() {
     return 1
   fi
   printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  local config_original
+  config_original="$(<"$fixture/daemon/src/config.rs")"
+  printf '%s\n' \
+    "$config_original" \
+    'pub fn send_transcript(out_tx: &str) { crate::ws::send(out_tx); }' \
+    >"$fixture/daemon/src/config.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "no-server-agent-upload self-test: a transport in the locator's config dependency passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$config_original" >"$fixture/daemon/src/config.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   local host_direct_original

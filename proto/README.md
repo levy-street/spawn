@@ -1189,12 +1189,28 @@ harness running in a window left its own record of the conversation, so a
 device can view or download it. `transcripts` entries carry `path`, `name`,
 `size`, optional `modified_at`, a `role` (`conversation`, `subagent`, or
 `input`) and an optional `conversation_id`; `searched` names the directories
-looked in, for an empty answer to say so. Claude Code is found by its id under
-`~/.claude/projects/<folder>/<id>.jsonl` (the launch folder first, subagent
-records beside it), or by the launch folder's conversations when no id was
-recorded; Codex by the id at the end of a `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
-name, or by the `cwd` its first line names; aider by `.aider.chat.history.md`
-in the folder. A harness the daemon cannot place answers `supported:false`.
+looked in, for an empty answer to say so. Each store is where the daemon's
+environment puts it: `CLAUDE_CONFIG_DIR` (else `~/.claude`) and `CODEX_HOME`
+(else `~/.codex`); a store outside home answers `supported:false` rather than
+widening the read root, and a `~` cwd is the host's home. Claude Code is found
+by its id under `<store>/projects/<folder>/<id>.jsonl`, the launch folder
+first, every record of the id before the sidecar beside each (`<id>/subagents/`
+records and their `.meta.json`, `subagents/workflows/<run>/`, `workflows/`
+and `workflows/scripts/` as `subagent`; spilled `tool-results/` as
+`conversation`), or by the launch folder's conversations when no id was
+recorded. The folder is Claude Code's own rule — every UTF-16 unit that is not
+an ASCII letter or digit becomes `-`, and a name over 200 units is cut there
+and suffixed with `-` and the base-36 absolute value of the cwd's Java-style
+`hashCode` — pinned by [`claude-project-folder.json`](claude-project-folder.json);
+a long name also matches another hash of the same cut whose records name the
+cwd, as Claude Code itself does. Codex is found by the id at the end of a
+`<store>/sessions/YYYY/MM/DD/rollout-*.jsonl` (or compressed `.jsonl.zst`)
+name, or by the `cwd` an uncompressed rollout's first line names, then in the
+`codex-home/sessions` a skilled window kept before its Codex home linked the
+store; aider by `.aider.chat.history.md` and `.aider.input.history` in the
+folder and at its git root. Roles stay those three because deployed clients
+refuse a report with any other. A harness the daemon cannot place answers
+`supported:false`.
 The operation only *locates*: every file it names is then read with the
 ordinary `fs.read`, under the same home root and no-follow rule, and the
 search itself is bounded (at most 24 answers, 512 directories, 2000 files).
