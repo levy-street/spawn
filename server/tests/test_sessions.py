@@ -497,6 +497,46 @@ async def test_session_restart_dispatches_shell_respawn(client):
     await broker.unregister_daemon(daemon)
 
 
+async def test_session_kill_addresses_only_the_host_it_names(client):
+    """A moved window is already routed to its new host once the launch
+    there has gone out. Stopping its worker on the host it left must reach
+    that host's daemon, and leave the new host's worker and routing alone."""
+    email = "session-kill-host@example.com"
+    await _signup(client, email)
+
+    from spawn_server.routes.sessions import send_session_kill
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    left_host = await _create_host(email, name="left")
+    new_host = await _create_host(email, name="new")
+    session_id = await _create_session_row(email, new_host)
+
+    broker = get_broker()
+    left_ws, new_ws = _FakeWS(), _FakeWS()
+    left = DaemonConn(host_id=left_host, user_id="user", websocket=left_ws)  # type: ignore[arg-type]
+    new = DaemonConn(host_id=new_host, user_id="user", websocket=new_ws)  # type: ignore[arg-type]
+    await broker.register_daemon(left)
+    await broker.register_daemon(new)
+    try:
+        await broker.attach_session_to_daemon(session_id, new)
+
+        await send_session_kill(session_id, left_host)
+
+        assert [json.loads(frame) for frame in left_ws.sent_text] == [
+            {"type": "session.kill", "session_id": session_id, "signal": "TERM"}
+        ]
+        assert new_ws.sent_text == []
+        assert broker.get_daemon_for_session(session_id) is new
+
+        # Its own host's kill still detaches it.
+        await send_session_kill(session_id, new_host)
+        assert [json.loads(frame)["type"] for frame in new_ws.sent_text] == ["session.kill"]
+        assert broker.get_daemon_for_session(session_id) is None
+    finally:
+        await broker.unregister_daemon(left)
+        await broker.unregister_daemon(new)
+
+
 async def test_session_cross_user_scoping(client):
     owner_token = await _signup(client, "session-scope-a@example.com")
     other_token = await _signup(client, "session-scope-b@example.com")

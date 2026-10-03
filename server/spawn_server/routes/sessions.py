@@ -126,19 +126,23 @@ async def dispatch_session_launch(
         log.warning("%s: no daemon connection for host=%s", frame_type, host.id)
         return
 
-    await broker.attach_session_to_daemon(session_row.id, daemon)
-    try:
-        await daemon.send_text(
-            {
-                "type": frame_type,
-                "session_id": session_row.id,
-                "cwd": session_row.cwd,
-                "skills": skills or [],
-                "create_cwd": create_cwd,
-            }
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("%s dispatch failed: %s", frame_type, e)
+    # Held while registration decides which of this daemon's workers to stop
+    # and sends those kills (`DaemonConn.lifecycle_lock`): a launch committed
+    # after that decision goes out after the kills, never before them.
+    async with daemon.lifecycle_lock:
+        await broker.attach_session_to_daemon(session_row.id, daemon)
+        try:
+            await daemon.send_text(
+                {
+                    "type": frame_type,
+                    "session_id": session_row.id,
+                    "cwd": session_row.cwd,
+                    "skills": skills or [],
+                    "create_cwd": create_cwd,
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s dispatch failed: %s", frame_type, e)
 
 
 async def resolve_agent_id(db: AsyncSession, *, user: User, agent_id: str | None) -> str | None:
@@ -400,19 +404,26 @@ async def restart_session(
 
 
 async def send_session_kill(session_id: str, host_id: str) -> None:
-    """Ask the daemon running a session to end it (best effort) and stop
-    routing to it.
+    """Ask `host_id`'s daemon to end the session's worker there (best effort)
+    and stop routing the session to that daemon.
 
     Sent only after the commit that stopped, deleted or moved the row. The
     daemon confirms with `session.exit`, and that handler reads the row: one
     still marked running reads as a crash and pages the owner with "was
     killed". An offline host is sent nothing; when it registers again it is
     told to stop any worker whose row says stopped or names another host
-    (`_sort_existing_sessions` in `ws/daemon.py`). A row deleted while its host
-    is offline leaves nothing to compare against, so that worker runs on.
+    (`_stop_workers_left_running` in `ws/daemon.py`). A row deleted while its
+    host is offline leaves nothing to compare against, so that worker runs on.
+
+    Only `host_id` is addressed. For a move, pass the host the window left:
+    the session may already be routed to its new host (a launch there
+    attaches it), and that worker and its routing are left alone whichever
+    order the two are sent in.
     """
     broker = get_broker()
-    daemon = broker.get_daemon_for_session(session_id) or broker.get_daemon_for_host(host_id)
+    daemon = broker.get_daemon_for_session(session_id)
+    if daemon is None or daemon.host_id != host_id:
+        daemon = broker.get_daemon_for_host(host_id)
     if daemon is not None:
         try:
             await daemon.send_text(
@@ -420,7 +431,7 @@ async def send_session_kill(session_id: str, host_id: str) -> None:
             )
         except Exception as e:  # noqa: BLE001
             log.warning("session.kill dispatch failed: %s", e)
-    await broker.detach_session(session_id)
+    await broker.detach_session_from_host(session_id, host_id)
 
 
 def mark_session_stopped(session_row: Session) -> None:

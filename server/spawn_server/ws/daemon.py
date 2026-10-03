@@ -1905,8 +1905,23 @@ def _validated_live_bindings(value: object) -> list[dict[str, object]]:
 _UNCLAIMED_SESSION_LOG_IDS = 8
 
 
+def _reported_session_ids(reported: object) -> list[str]:
+    """The distinct string ids of a register frame's `existing_sessions`, in
+    the order given. Anything else in it is ignored, and so is a value that is
+    not a list."""
+    if not isinstance(reported, list):
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for sid in reported:
+        if isinstance(sid, str) and sid not in seen:
+            seen.add(sid)
+            ids.append(sid)
+    return ids
+
+
 async def _sort_existing_sessions(
-    session: AsyncSession, host: Host, reported: object
+    session: AsyncSession, host: Host, reported: list[str]
 ) -> tuple[list[str], list[str], list[str]]:
     """Split a registering daemon's live workers into (adopt, stop, unclaimed).
 
@@ -1919,21 +1934,22 @@ async def _sort_existing_sessions(
     - adopt: rows bound to this host. Routing reattaches them.
     - stop: adopted rows the server already stopped ("killed"), and rows that
       now name another of the owner's hosts — that window runs there now.
-    - unclaimed: ids with no row in this account. They are left running and
-      only logged: after a database restore a missing row may be a window
-      created since the backup, and stopping live work on a guess is worse
-      than an idle shell. Another account's row is never acted on either.
+    - unclaimed: ids with no row in this account. They are left running, and
+      their count and first ids go to the server log only; no device is told.
+      After a database restore a missing row may be a window created since
+      the backup, and stopping live work on a guess is worse than an idle
+      shell. Another account's row is never acted on either.
+
+    The rows are trusted as they stand. That covers a restore only for rows
+    the backup lacks: a restored row that says "killed", or names another
+    host, is stopped here even when the window was restarted, restored or
+    moved back after the backup was taken, because nothing compares the
+    worker's age with the row's.
     """
     adopt: list[str] = []
     stop: list[str] = []
     unclaimed: list[str] = []
-    if not isinstance(reported, list):
-        return adopt, stop, unclaimed
-    seen: set[str] = set()
     for sid in reported:
-        if not isinstance(sid, str) or sid in seen:
-            continue
-        seen.add(sid)
         session_row = await session.get(Session, sid)
         if session_row is not None and session_row.host_id == host.id:
             adopt.append(sid)
@@ -1944,6 +1960,97 @@ async def _sort_existing_sessions(
         else:
             unclaimed.append(sid)
     return adopt, stop, unclaimed
+
+
+async def _read_workers_to_stop(
+    conn: DaemonConn, host: Host, reported: list[str], known: set[str]
+) -> tuple[list[str], list[str]] | None:
+    """(stop, unclaimed) for the reported workers, read from the rows as they
+    are now; None when this connection no longer owns its host or the read
+    failed."""
+    try:
+        async with _bounded_host_ownership_session() as session:
+            owner = await _lock_durable_host_owner(session, conn)
+            stop: list[str] = []
+            unclaimed: list[str] = []
+            if owner:
+                _, stop, unclaimed = await _sort_existing_sessions(session, host, reported)
+            await session.rollback()
+    except (TimeoutError, SQLAlchemyError) as exc:
+        log.warning(
+            "host=%s: could not read which reported sessions to stop; "
+            "left for its next registration: %s",
+            host.id,
+            exc,
+        )
+        return None
+    if not owner:
+        # A newer connection owns the host now; its registration decides.
+        return None
+    # A row this registration saw a moment ago and that is gone now was
+    # deleted while the host registered, when its kill had no daemon to reach.
+    stop.extend(sid for sid in unclaimed if sid in known)
+    return stop, [sid for sid in unclaimed if sid not in known]
+
+
+async def _stop_workers_left_running(
+    conn: DaemonConn, host: Host, reported: list[str], known: set[str]
+) -> None:
+    """Send the kills this host missed while it was away.
+
+    Runs after `registered`, when routes can already reach this daemon, so
+    the decision is not taken from the read that chose which sessions to
+    adopt: a window restarted, restored or moved back since then must not be
+    stopped, and one stopped or deleted since then, whose own kill found no
+    daemon, must be. `known` is every reported id that read found a row for
+    in this account.
+
+    The read and the kills happen under `conn.lifecycle_lock`, which every
+    launch also holds while it sends. A launch whose commit this read did not
+    see therefore reaches the daemon after these kills, and the daemon, which
+    handles lifecycle frames in order, stops the old worker and not the new
+    one. Each worker's exit comes back as an ordinary `session.exit`, which
+    raises no alert: the row is "killed" already, no longer this host's, or
+    gone.
+    """
+    if not reported:
+        return
+    try:
+        async with asyncio.timeout(HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS):
+            await conn.lifecycle_lock.acquire()
+    except TimeoutError:
+        log.warning(
+            "host=%s: launches held its lifecycle lock too long; "
+            "reported sessions left for its next registration",
+            host.id,
+        )
+        return
+    try:
+        decided = await _read_workers_to_stop(conn, host, reported, known)
+        if decided is None:
+            return
+        stop, unclaimed = decided
+        for sid in stop:
+            await _bounded_send_text(
+                conn, {"type": "session.kill", "session_id": sid, "signal": "TERM"}
+            )
+        if stop:
+            log.info(
+                "stopping %d session(s) stopped, moved or deleted while host=%s was away",
+                len(stop),
+                host.id,
+            )
+        if unclaimed:
+            # Server log only: no frame or field carries this count to a
+            # device yet.
+            log.warning(
+                "host=%s runs %d session(s) with no window in this account; left running ids=%s",
+                host.id,
+                len(unclaimed),
+                unclaimed[:_UNCLAIMED_SESSION_LOG_IDS],
+            )
+    finally:
+        conn.lifecycle_lock.release()
 
 
 def _rtc_binding_frame(
@@ -2188,9 +2295,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         else:
                             await _close_daemon_consistency_failure(conn)
                         break
+                    reported_existing = _reported_session_ids(obj.get("existing_sessions"))
                     valid_existing: list[str] = []
-                    stale_existing: list[str] = []
-                    unclaimed_existing: list[str] = []
+                    known_existing: set[str] = set()
                     durable_owner = False
                     async with _bounded_host_ownership_session() as session:
                         durable_owner = await _lock_durable_host_owner(session, conn)
@@ -2198,10 +2305,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             (
                                 valid_existing,
                                 stale_existing,
-                                unclaimed_existing,
-                            ) = await _sort_existing_sessions(
-                                session, host, obj.get("existing_sessions")
-                            )
+                                _,
+                            ) = await _sort_existing_sessions(session, host, reported_existing)
+                            known_existing = {*valid_existing, *stale_existing}
                         await session.rollback()
 
                     registration_accepted = False
@@ -2270,27 +2376,11 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             time.monotonic() + DURABLE_OWNERSHIP_CACHE_SECONDS
                         )
                         # The kills that could not be delivered while this
-                        # host was away. Each worker's exit comes back as an
-                        # ordinary `session.exit`, which raises no alert: the
-                        # row is "killed" already, or no longer this host's.
-                        for sid in stale_existing:
-                            await _bounded_send_text(
-                                conn, {"type": "session.kill", "session_id": sid, "signal": "TERM"}
-                            )
-                        if stale_existing:
-                            log.info(
-                                "stopping %d session(s) stopped or moved while host=%s was offline",
-                                len(stale_existing),
-                                host.id,
-                            )
-                        if unclaimed_existing:
-                            log.warning(
-                                "host=%s runs %d session(s) with no window in this account; "
-                                "left running ids=%s",
-                                host.id,
-                                len(unclaimed_existing),
-                                unclaimed_existing[:_UNCLAIMED_SESSION_LOG_IDS],
-                            )
+                        # host was away, decided afresh now that it is
+                        # routable (see the function).
+                        await _stop_workers_left_running(
+                            conn, host, reported_existing, known_existing
+                        )
                         if conn.keeps_peers_across_reconnect:
                             await _reconcile_live_bindings(conn, live_bindings)
                         await _auto_update_after_registration(conn)

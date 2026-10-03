@@ -500,9 +500,16 @@ including those a restarted daemon adopted (`docs/SESSIOND.md`). Routing is
 reattached for each id whose row names this host. A kill sent while a host is
 offline reaches nobody, so after `registered` the server sends
 `session.kill` (`TERM`) for each worker whose window was stopped (row
-`killed`) or moved to another of the owner's hosts in the meantime. An id
-with no row in the account is left running and only logged: after a database
-restore, a missing row may be a window created since the backup.
+`killed`) or moved to another of the owner's hosts in the meantime, or
+deleted while the host was registering. It decides which from the rows as
+they are after `registered`, and launches to that daemon wait while it reads
+them and sends the kills, so a window restarted in the meantime keeps its new
+worker. An id with no row in the account is left running. Its count and
+first ids are written to the server log only; no device is told. A missing
+row may be a window created since the backup a database was restored from.
+That is all a restore is protected against: a restored row that says
+`killed`, or names another host, is acted on as written, even if the window
+was restarted or moved back after the backup.
 
 Both activity frames are daemon-throttled metadata signals. They contain no
 terminal bytes: `session.activity` records meaningful PTY output timing, while
