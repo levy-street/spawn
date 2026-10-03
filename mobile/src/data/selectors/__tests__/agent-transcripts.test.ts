@@ -1,4 +1,5 @@
 import {
+  TRANSCRIPTS_TRUNCATED_NOTE,
   transcriptEmptyState,
   transcriptQueryFor,
   transcriptRoleLabel,
@@ -83,6 +84,24 @@ describe("transcript copy", () => {
     );
     expect(notice?.title).toBe("No transcript for opencode");
     expect(notice?.body).toContain("SPAWN D doesn't know where opencode keeps");
+  });
+
+  test("a store outside the home folder is named, not called unknown", () => {
+    const notice = transcriptEmptyState(
+      report({ agent_kind: "codex", supported: false, searched: ["/srv/codex"] }),
+      "codex",
+      "dream",
+    );
+    expect(notice?.title).toBe("No transcript for codex");
+    expect(notice?.body).toBe(
+      "codex keeps its conversations in /srv/codex on dream, outside the home folder SPAWN D can read.",
+    );
+  });
+
+  test("a cut-short list does not claim only older conversations were left out", () => {
+    expect(TRANSCRIPTS_TRUNCATED_NOTE).toBe(
+      "Not every file is listed. The rest, which can include this conversation's helper files, stay on the host.",
+    );
   });
 
   test("an empty search says where it looked", () => {

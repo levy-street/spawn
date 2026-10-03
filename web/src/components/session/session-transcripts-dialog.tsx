@@ -17,6 +17,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
 import { useHostControl } from "@/hooks/useHostControl";
 import {
+  TRANSCRIPTS_TRUNCATED_NOTE,
   type TranscriptNotice,
   transcriptEmptyState,
   transcriptQueryFor,
@@ -192,9 +193,7 @@ export function SessionTranscriptsDialog({
               </ul>
             )}
             {reportQuery.data?.truncated && !notice && !busy && (
-              <p className="pt-2 text-xs text-muted-foreground">
-                Only the newest are listed; older conversations stay on the host.
-              </p>
+              <p className="pt-2 text-xs text-muted-foreground">{TRANSCRIPTS_TRUNCATED_NOTE}</p>
             )}
             {status && (
               <p className="pt-2 text-xs text-muted-foreground" role="status">
