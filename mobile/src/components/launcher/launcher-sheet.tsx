@@ -4,9 +4,8 @@ import { StyleSheet, View } from "react-native";
 import { HostUpdateDialog } from "@/components/hosts/host-update-dialog";
 import { hostNeedsUpdatePrompt } from "@/components/hosts/host-update-status";
 import { FolderPicker } from "@/components/launcher/folder-picker";
-import { pathBasename, pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
+import { pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
 import { HostStep } from "@/components/launcher/host-step";
-import { type LaunchHome, resolveLaunchHome } from "@/components/launcher/launcher-selection";
 import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { Button } from "@/components/ui/button";
 import { DrawerRow, DrawerSeparator } from "@/components/ui/drawer-row";
@@ -14,6 +13,7 @@ import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { Sheet, SheetHeader, SheetScrollView } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
+import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import type { AgentOut } from "@/data/api/schemas/agents";
@@ -28,6 +28,7 @@ import {
   useRecentDirectories,
 } from "@/data/queries/launcher";
 import { identifyAgent, sortAgents } from "@/data/selectors/agent";
+import { displayPath, placeReasonLabel, suggestPlaces } from "@/data/selectors/places";
 import { haptics } from "@/lib/haptics";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import type { HostTransport, TransportState } from "@/terminal/transport/types";
@@ -38,11 +39,10 @@ import { sizing } from "@/theme/sizing";
 type Choice = { kind: "shell" } | { kind: "agent"; agent: AgentOut } | { kind: "files" };
 
 /**
- * "choose" is the whole flow whenever the tab has a home to open in. The two
- * picker steps exist for the workspace that has none, and for the explicit
- * "somewhere else" choice.
+ * What to run ("choose"), then where it runs ("where": the likeliest places,
+ * first one first). "host" and "folder" browse for anywhere else.
  */
-type LauncherStep = "choose" | "host" | "folder" | "recovery";
+type LauncherStep = "choose" | "where" | "host" | "folder" | "recovery";
 
 /** Past this many rows the menu scrolls, so the panel claims the tall shape. */
 const COMPACT_ROW_LIMIT = 7;
@@ -70,21 +70,14 @@ function choiceLabel(choice: Choice): string {
   return choice.kind === "files" ? "File explorer" : "Shell";
 }
 
-function homeDetail(home: LaunchHome | null): string | null {
-  if (!home) return null;
-  if (home.host.status !== "online") return `${home.host.name} is offline — pick somewhere else`;
-  return `Opens in ${pathBasename(home.cwd, pathFlavorForHostOS(home.host.os)) || home.cwd} on ${home.host.name}`;
-}
-
 /**
- * Adding a window: what to run, and nothing else.
+ * Adding a window: what to run, then where it runs.
  *
- * The tab's own home — or the workspace's, chosen when it was created — answers
- * where, so picking Claude Code *is* the whole flow: the shell is created on that
- * host, in that folder, in the tab the drawer was opened from, and the terminal
- * opens on it. The host and folder pickers below are the fallback for a workspace
- * with no home and for the deliberate "somewhere else", and both can be changed
- * again from the running window (`terminal-header`).
+ * A workspace has no host or folder of its own — each window says where it
+ * runs — so the second step is always asked, with the likeliest place first:
+ * beside the windows of this tab, then this workspace, then recent places,
+ * then each host's home. "Choose a folder…" browses any host for anything
+ * else. The window can be moved again from its header (`terminal-header`).
  */
 export function LauncherSheet({
   initialTabId,
@@ -103,10 +96,8 @@ export function LauncherSheet({
   const addWidget = useAddFilesWidget();
   const cancelRequested = useRef(false);
   const [step, setStep] = useState<LauncherStep>("choose");
-  /** The choice the pickers are completing; null when they are re-pointing the menu. */
+  /** The choice the "where" steps are completing. */
   const [pendingChoice, setPendingChoice] = useState<Choice | null>(null);
-  /** A location chosen through "somewhere else", standing in for the tab's home. */
-  const [elsewhere, setElsewhere] = useState<LaunchHome | null>(null);
   const [pickerHost, setPickerHost] = useState<HostOut | null>(null);
   const [hostTransport, setHostTransport] = useState<HostTransport | null>(null);
   const [hostTransportState, setHostTransportState] = useState<TransportState>("idle");
@@ -123,14 +114,25 @@ export function LauncherSheet({
 
   const tabId =
     (initialTabId ?? workspace?.layout.active_tab ?? workspace?.layout.tabs[0]?.id) || "";
-  const home = elsewhere ?? (workspace ? resolveLaunchHome(workspace, tabId, data.hosts) : null);
+  const tab = workspace?.layout.tabs.find((candidate) => candidate.id === tabId);
+  const places = useMemo(
+    () =>
+      suggestPlaces({
+        sessions: data.sessions,
+        hosts: data.hosts,
+        tabSessionIds: tab?.layout.tiles.map((tile) => tile.session_id) ?? [],
+        workspaceSessionIds:
+          workspace?.layout.tabs.flatMap((each) => each.layout.tiles.map((t) => t.session_id)) ??
+          [],
+      }),
+    [data.sessions, data.hosts, tab, workspace],
+  );
   const agents = useMemo(() => sortAgents(data.agents), [data.agents]);
 
   useEffect(() => {
     if (!visible) return;
     setStep("choose");
     setPendingChoice(null);
-    setElsewhere(null);
     setPickerHost(null);
     setHostTransport(null);
     setHostTransportState("idle");
@@ -222,18 +224,12 @@ export function LauncherSheet({
   };
 
   /**
-   * Ask where. The folder browser answers that on its own, so there is no menu
-   * of locations to step through — one host opens it straight away, several ask
-   * which machine first.
-   *
-   * `target` is the choice waiting on an answer, and null is the "somewhere
-   * else" row: that one re-points the menu rather than completing anything, so
-   * the folder comes back as the home every choice above it then opens in.
+   * Browse for a folder anywhere: one host opens the browser straight away,
+   * several ask which machine first.
    */
-  const browse = (target: Choice | null) => {
+  const browse = () => {
     haptics.selection();
     setError(null);
-    setPendingChoice(target);
     const only = data.hosts.length === 1 ? data.hosts[0] : null;
     if (only) {
       setPickerHost(only);
@@ -244,14 +240,12 @@ export function LauncherSheet({
     setStep("host");
   };
 
-  // What goes in the window; then where it points, unless home answers that.
+  // What goes in the window; then where it runs — always the second step.
   const pick = (target: Choice) => {
-    if (home && home.host.status === "online") {
-      haptics.selection();
-      create(home.host, home.cwd, target);
-      return;
-    }
-    browse(target);
+    haptics.selection();
+    setError(null);
+    setPendingChoice(target);
+    setStep("where");
   };
 
   const rows = [
@@ -284,33 +278,27 @@ export function LauncherSheet({
   ];
 
   const back: Partial<Record<LauncherStep, LauncherStep>> = {
-    host: "choose",
-    folder: data.hosts.length === 1 ? "choose" : "host",
+    where: "choose",
+    host: "where",
+    folder: data.hosts.length === 1 ? "where" : "host",
   };
   const scrolls = step !== "choose" || rows.length > COMPACT_ROW_LIMIT;
   // The host step carries its own heading, so the bar only names what is being
   // placed; the folder browser has none of its own, so the bar is its heading.
   const placing =
-    step === "host"
-      ? (pendingChoice && choiceLabel(pendingChoice)) || "Somewhere else"
-      : step === "folder"
-        ? pendingChoice
-          ? `Folder for ${choiceLabel(pendingChoice)}`
-          : "Choose a folder"
-        : null;
+    step === "where"
+      ? `Where should ${pendingChoice ? choiceLabel(pendingChoice) : "it"} run?`
+      : step === "host"
+        ? (pendingChoice && choiceLabel(pendingChoice)) || "Choose a host"
+        : step === "folder"
+          ? pendingChoice
+            ? `Folder for ${choiceLabel(pendingChoice)}`
+            : "Choose a folder"
+          : null;
 
   const menu = (
     <>
       <SheetHeader title="Add a window" />
-      {home ? (
-        <Text
-          color={home.host.status === "online" ? "mutedForeground" : "warning"}
-          style={styles.caption}
-          variant="caption"
-        >
-          {homeDetail(home)}
-        </Text>
-      ) : null}
       {rows.map((row) => (
         <DrawerRow
           detail={row.detail}
@@ -322,23 +310,40 @@ export function LauncherSheet({
           testID={`launcher-choice-${row.key}`}
         />
       ))}
-      {/* Home answers "where" for everything above, so a workspace with one
-          needs this escape hatch to open on another host — or just another
-          folder — without giving up the one-tap default. */}
-      {home ? (
-        <>
-          <DrawerSeparator />
-          <DrawerRow
-            detail={data.hosts.length > 1 ? "Pick a host and folder first" : "Pick a folder first"}
-            disabled={busy}
-            icon={<Icon name={data.hosts.length > 1 ? "Server" : "FolderOpen"} />}
-            label="Somewhere else"
-            onPress={() => browse(null)}
-            testID="launcher-choice-elsewhere"
-          />
-        </>
-      ) : null}
     </>
+  );
+
+  const hostName = (id: string) => data.hosts.find((host) => host.id === id)?.name ?? "host";
+  const whereList = (
+    <SheetScrollView contentContainerStyle={styles.menuContent}>
+      {places.map((place, index) => {
+        const host = data.hosts.find((candidate) => candidate.id === place.hostId);
+        return (
+          <DrawerRow
+            detail={`${hostName(place.hostId)} · ${place.online ? placeReasonLabel(place.reason) : "offline"}`}
+            disabled={busy || !place.online || !host}
+            icon={<StatusDot tone={place.online ? "active" : "offline"} />}
+            key={`${place.hostId}:${place.cwd}`}
+            label={displayPath(place.cwd)}
+            onPress={() => {
+              if (!host || !pendingChoice) return;
+              haptics.selection();
+              create(host, place.cwd, pendingChoice);
+            }}
+            testID={index === 0 ? "launcher-where-suggested" : `launcher-where-${index}`}
+          />
+        );
+      })}
+      <DrawerSeparator />
+      <DrawerRow
+        detail={data.hosts.length > 1 ? "Browse any host" : "Browse this host"}
+        disabled={busy}
+        icon={<Icon name="FolderOpen" />}
+        label="Choose a folder…"
+        onPress={browse}
+        testID="launcher-where-browse"
+      />
+    </SheetScrollView>
   );
 
   return (
@@ -394,6 +399,8 @@ export function LauncherSheet({
           ) : (
             <View>{menu}</View>
           )
+        ) : step === "where" ? (
+          whereList
         ) : step === "host" ? (
           <HostStep
             hosts={data.hosts}
@@ -410,18 +417,9 @@ export function LauncherSheet({
           />
         ) : step === "folder" ? (
           <FolderPicker
-            initialPath={pickerHost && home?.host.id === pickerHost.id ? home.cwd : null}
+            initialPath={places.find((place) => place.hostId === pickerHost?.id)?.cwd ?? null}
             onSelect={(path) => {
-              if (!pickerHost) return;
-              if (pendingChoice) {
-                create(pickerHost, path, pendingChoice);
-                return;
-              }
-              // "Somewhere else" only answered where; the menu asks what again,
-              // now opening here instead of at the tab's home.
-              haptics.selection();
-              setElsewhere({ host: pickerHost, cwd: path });
-              setStep("choose");
+              if (pickerHost && pendingChoice) create(pickerHost, path, pendingChoice);
             }}
             recentError={recents.error?.message ?? null}
             recentDirectories={recents.data}

@@ -99,7 +99,8 @@ describe("workspace list presentation", () => {
       { wrapper: Providers },
     );
     expect(screen.getByText("2 tabs · 3 running · 1 need attention")).toBeTruthy();
-    expect(screen.getByLabelText("1 need attention")).toBeTruthy();
+    // The tab badge's own wording, toned by the most urgent window.
+    expect(screen.getByLabelText("1 session awaiting input")).toBeTruthy();
     await fireEvent.press(screen.getByLabelText(/spawn mobile, 2 tabs/));
     expect(callbacks.onOpen).toHaveBeenCalledTimes(1);
     await screen.unmount();

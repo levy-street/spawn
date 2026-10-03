@@ -7,6 +7,7 @@ import {
   filterWorkspacesByName,
   isArchived,
   tabAttentionCount,
+  tabAttentionLevel,
   workspaceAttentionCount,
   workspaceLiveSessionCount,
   workspaceRecency,
@@ -218,5 +219,29 @@ describe("workspaceLiveSessionCount", () => {
     ]);
     expect(workspaceLiveSessionCount(workspace, sessionsById)).toBe(0);
     expect(workspaceLiveSessionCount(workspace, new Map())).toBe(0);
+  });
+});
+
+describe("attention level", () => {
+  test("a stopped window outranks a waiting one, and none means null", () => {
+    const at = (id: string, status: Session["status"], activity: Session["activity_state"]) =>
+      [id, { id, status, activity_state: activity } as Session] as const;
+    const sessions = new Map([
+      at("a", "running", "waiting"),
+      at("b", "exited", "exited"),
+      at("c", "running", "active"),
+    ]);
+    const tab = (ids: string[]) =>
+      ({
+        id: "t",
+        name: "t",
+        layout: {
+          version: 3,
+          tiles: ids.map((id) => ({ session_id: id, x: 0, y: 0, w: 1, h: 1 })),
+        },
+      }) as unknown as Parameters<typeof tabAttentionLevel>[0];
+    expect(tabAttentionLevel(tab(["a", "c"]), sessions)).toBe("waiting");
+    expect(tabAttentionLevel(tab(["a", "b"]), sessions)).toBe("dead");
+    expect(tabAttentionLevel(tab(["c"]), sessions)).toBeNull();
   });
 });

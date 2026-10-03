@@ -12,6 +12,7 @@ import { HostUpdateBadge } from "@/components/hosts/host-update-status";
 import { LiveCapacityProbe } from "@/components/hosts/live-capacity-probe";
 import { RunningAgents } from "@/components/hosts/running-agents";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
@@ -21,6 +22,7 @@ import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { groupRunningAgents } from "@/data/selectors/agent";
 import { sessionAttention } from "@/data/selectors/session";
+import { useHostLiveStatus } from "@/data/stores/host-live";
 import { haptics } from "@/lib/haptics";
 import type { TransportState } from "@/terminal/transport/types";
 import { spacing, useTheme } from "@/theme";
@@ -47,6 +49,9 @@ export function LegionHostCard({
   const [transportState, setTransportState] = useState<TransportState>("idle");
   const [liveError, setLiveError] = useState<string | null>(null);
   const online = host.status === "online";
+  // This device's connection, not only the server's word: a host that is
+  // reconnecting says so here rather than in a banner over every screen.
+  const live = useHostLiveStatus(host);
   const liveSessions = sessions.filter(
     (session) => session.status !== "exited" && session.status !== "killed",
   );
@@ -90,18 +95,39 @@ export function LegionHostCard({
         >
           <View style={styles.heading}>
             <StatusDot
-              accessibilityLabel={online ? "Online" : "Offline"}
-              pulse={false}
-              tone={online ? "active" : "offline"}
+              accessibilityLabel={live.status.label}
+              pulse={live.status.reconnecting}
+              tone={live.status.tone}
             />
             <View style={styles.headingCopy}>
               <Text numberOfLines={1} variant="label">
                 {host.name}
               </Text>
-              <Text color="mutedForeground" variant="caption">
-                {online ? formatHostPlatform(host) : "Offline"}
+              <Text
+                color={live.status.reconnecting ? "warning" : "mutedForeground"}
+                numberOfLines={2}
+                variant="caption"
+              >
+                {live.status.reconnecting
+                  ? live.status.label
+                  : online
+                    ? formatHostPlatform(host)
+                    : "Offline"}
               </Text>
             </View>
+            {live.status.reconnecting && live.retry ? (
+              <Button
+                accessibilityLabel={`Retry connection to ${host.name}`}
+                onPress={() => {
+                  haptics.selection();
+                  live.retry?.();
+                }}
+                size="sm"
+                variant="secondary"
+              >
+                Retry
+              </Button>
+            ) : null}
             {liveEnabled && metrics !== null ? <Badge variant="success">Live</Badge> : null}
             <HostUpdateBadge host={host} />
             <Icon color="mutedForeground" name="ChevronRight" />

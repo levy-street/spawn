@@ -26,6 +26,7 @@ let mockData: {
   hosts: ReturnType<typeof makeHost>[];
   agents: ReturnType<typeof makeAgent>[];
   workspace: ReturnType<typeof makeWorkspace> | undefined;
+  sessions: ReturnType<typeof makeSession>[];
 };
 
 jest.mock("@/terminal/HostTransportSurface", () => ({ HostTransportSurface: () => null }));
@@ -74,11 +75,21 @@ function Providers({ children }: PropsWithChildren): React.JSX.Element {
   );
 }
 
-function homedWorkspace() {
+/** A workspace whose second tab already has a window, in ~/spawn on Ada's Mac. */
+const neighbour = makeSession({ id: "30000000-0000-4000-8000-0000000000aa" });
+function workspaceWithWindow() {
   return makeWorkspace({
-    host_id: host.id,
-    cwd: "/Users/ada/spawn",
-    layout: { version: 3, active_tab: "tab-1", tabs: [makeTab(), makeTab({ id: "tab-2" })] },
+    layout: {
+      version: 3,
+      active_tab: "tab-1",
+      tabs: [
+        makeTab(),
+        makeTab({
+          id: "tab-2",
+          layout: { version: 3, tiles: [{ session_id: neighbour.id, x: 0, y: 0, w: 24, h: 24 }] },
+        }),
+      ],
+    },
   });
 }
 
@@ -91,7 +102,7 @@ async function renderSheet(overrides: Partial<Parameters<typeof LauncherSheet>[0
       onDismiss={onDismiss}
       onLaunched={onLaunched}
       visible
-      workspaceId={homedWorkspace().id}
+      workspaceId={workspaceWithWindow().id}
       {...overrides}
     />,
     { wrapper: Providers },
@@ -102,17 +113,46 @@ async function renderSheet(overrides: Partial<Parameters<typeof LauncherSheet>[0
 describe("adding a window", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockData = { hosts: [host], agents: [agent], workspace: homedWorkspace() };
+    mockData = {
+      hosts: [host],
+      agents: [agent],
+      workspace: workspaceWithWindow(),
+      sessions: [
+        neighbour,
+        makeSession({
+          id: "30000000-0000-4000-8000-0000000000bb",
+          cwd: "/Users/ada/notes",
+          last_activity_at: "2026-01-01T00:00:00Z",
+          started_at: "2026-01-01T00:00:00Z",
+        }),
+      ],
+    };
   });
 
-  test("picking an agent is the whole flow: it lands at home, in the tab it was opened from", async () => {
-    const { onDismiss, onLaunched } = await renderSheet();
+  test("asks where after what, with the window beside this tab's first", async () => {
+    await renderSheet();
 
     await act(() => fireEvent.press(screen.getByTestId(`launcher-choice-${agent.id}`)));
 
+    expect(mockLaunch).not.toHaveBeenCalled();
+    expect(screen.getByText(`Where should ${agent.name} run?`)).toBeTruthy();
+    const suggested = screen.getByTestId("launcher-where-suggested");
+    expect(screen.getByText("~/spawn")).toBeTruthy();
+    expect(screen.getByText(`${host.name} · this tab`)).toBeTruthy();
+    expect(screen.getByText("~/notes")).toBeTruthy();
+    expect(screen.getByTestId("launcher-where-browse")).toBeTruthy();
+    expect(suggested).toBeTruthy();
+  });
+
+  test("picking the suggested place launches there, in the tab it was opened from", async () => {
+    const { onDismiss, onLaunched } = await renderSheet();
+
+    await act(() => fireEvent.press(screen.getByTestId(`launcher-choice-${agent.id}`)));
+    await act(() => fireEvent.press(screen.getByTestId("launcher-where-suggested")));
+
     expect(mockLaunch).toHaveBeenCalledTimes(1);
     expect(mockLaunch.mock.calls[0]?.[0]).toEqual({
-      workspaceId: homedWorkspace().id,
+      workspaceId: workspaceWithWindow().id,
       // The tab the drawer was opened from, not the workspace's active one.
       tabId: "tab-2",
       hostId: host.id,
@@ -123,31 +163,15 @@ describe("adding a window", () => {
     expect(onDismiss).toHaveBeenCalled();
   });
 
-  test("prefers the tab's own home over the workspace's", async () => {
-    mockData.workspace = makeWorkspace({
-      host_id: host.id,
-      cwd: "/Users/ada/spawn",
-      layout: {
-        version: 3,
-        active_tab: "tab-1",
-        tabs: [makeTab(), makeTab({ id: "tab-2", host_id: host.id, cwd: "/Users/ada/notes" })],
-      },
-    });
-    await renderSheet();
-
-    await act(() => fireEvent.press(screen.getByTestId("launcher-choice-shell")));
-
-    expect(mockLaunch.mock.calls[0]?.[0]).toMatchObject({ cwd: "/Users/ada/notes" });
-  });
-
-  test("adds a file explorer as layout, with no session to open afterwards", async () => {
+  test("adds a file explorer as layout at the chosen place, with no session to open", async () => {
     const { onLaunched } = await renderSheet();
 
     await act(() => fireEvent.press(screen.getByTestId("launcher-choice-files")));
+    await act(() => fireEvent.press(screen.getByTestId("launcher-where-suggested")));
 
     expect(mockLaunch).not.toHaveBeenCalled();
     expect(mockAddWidget).toHaveBeenCalledWith({
-      workspaceId: homedWorkspace().id,
+      workspaceId: workspaceWithWindow().id,
       tabId: "tab-2",
       hostId: host.id,
       path: "/Users/ada/spawn",
@@ -157,22 +181,13 @@ describe("adding a window", () => {
 
   test("pauses an outdated host launch and lets Not now proceed", async () => {
     const outdated = makeHost({
-      update: {
-        state: "available",
-        latest_version: "2",
-        error: null,
-        requested_at: null,
-      },
+      update: { state: "available", latest_version: "2", error: null, requested_at: null },
     });
     mockData.hosts = [outdated];
-    mockData.workspace = makeWorkspace({
-      host_id: outdated.id,
-      cwd: "/Users/ada/spawn",
-      layout: { version: 3, active_tab: "tab-1", tabs: [makeTab(), makeTab({ id: "tab-2" })] },
-    });
     await renderSheet();
 
     await fireEvent.press(screen.getByTestId("launcher-choice-shell"));
+    await fireEvent.press(screen.getByTestId("launcher-where-suggested"));
     expect(mockLaunch).not.toHaveBeenCalled();
 
     await act(() => fireEvent.press(screen.getByTestId("launcher-host-update-not-now")));
@@ -181,43 +196,31 @@ describe("adding a window", () => {
     );
   });
 
-  test("says where the one tap will land, and offers the way out of it", async () => {
-    await renderSheet();
-
-    expect(screen.getByText(`Opens in spawn on ${host.name}`)).toBeTruthy();
-    expect(screen.getByTestId("launcher-choice-elsewhere")).toBeTruthy();
-  });
-
-  test("'somewhere else' re-points the menu rather than launching anything", async () => {
-    await renderSheet();
-
-    await act(() => fireEvent.press(screen.getByTestId("launcher-choice-elsewhere")));
-
-    // One host, so it goes straight to the folder browser, and asks for a
-    // folder rather than for one to put a particular thing in.
-    expect(screen.getByText("Choose a folder")).toBeTruthy();
-    expect(mockLaunch).not.toHaveBeenCalled();
-  });
-
-  test("asks for a folder instead of launching when the workspace has no home", async () => {
+  test("a workspace with no windows yet still offers each host's home", async () => {
     mockData.workspace = makeWorkspace();
+    mockData.sessions = [];
+    await renderSheet({ initialTabId: "tab-1" });
+
+    await act(() => fireEvent.press(screen.getByTestId("launcher-choice-shell")));
+
+    expect(screen.getByText("~")).toBeTruthy();
+    expect(screen.getByText(`${host.name} · home`)).toBeTruthy();
+  });
+
+  test("choosing a folder browses one host directly, and asks which with several", async () => {
     await renderSheet();
-
     await act(() => fireEvent.press(screen.getByTestId(`launcher-choice-${agent.id}`)));
-
-    expect(mockLaunch).not.toHaveBeenCalled();
-    // One host: the folder browser answers where, with no host menu in between.
+    await act(() => fireEvent.press(screen.getByTestId("launcher-where-browse")));
     expect(screen.getByText(`Folder for ${agent.name}`)).toBeTruthy();
     expect(screen.queryByText("Choose a host")).toBeNull();
-    expect(screen.queryByTestId("launcher-choice-elsewhere")).toBeNull();
   });
 
-  test("asks which machine first when there is more than one and no home to assume", async () => {
-    mockData.workspace = makeWorkspace();
+  test("with several hosts, choosing a folder asks which machine first", async () => {
     mockData.hosts = [host, makeHost({ id: "20000000-0000-4000-8000-000000000002", name: "hub" })];
     await renderSheet();
 
     await act(() => fireEvent.press(screen.getByTestId("launcher-choice-shell")));
+    await act(() => fireEvent.press(screen.getByTestId("launcher-where-browse")));
 
     expect(screen.getByText("Choose a host")).toBeTruthy();
   });

@@ -1,15 +1,7 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  createContext,
-  type ReactNode,
-  useContext,
-  useEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { type Host, hosts, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
@@ -23,7 +15,12 @@ import { resolveSignedRtcTrust } from "@/lib/signed-rtc-trust";
 
 const Connections = createContext<ReadonlyMap<string, DaemonConnection>>(new Map());
 
-/** Connection ownership survives route changes and the last terminal closing. */
+/**
+ * Connection ownership survives route changes and the last terminal closing.
+ * It draws nothing: a host's connection shows where that host already
+ * appears — its Legion row, the panes running on it (useHostLiveStatus) — so
+ * one that is only asleep never covers the screen you are working in.
+ */
 export function DaemonConnectionsProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth({ probe: "hinted" });
   const accountId = user?.id ?? null;
@@ -128,52 +125,7 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
   return (
     <Connections.Provider value={accountId ? connections : new Map()}>
       {children}
-      <div className="pointer-events-none fixed inset-x-2 top-2 z-50 flex flex-col gap-2">
-        {accountId &&
-          [...connections].map(([id, connection]) => (
-            <DaemonNotice
-              key={id}
-              connection={connection}
-              name={records.current.get(id)?.name ?? "host"}
-            />
-          ))}
-      </div>
     </Connections.Provider>
-  );
-}
-
-function DaemonNotice({ connection, name }: { connection: DaemonConnection; name: string }) {
-  const snapshot = useSyncExternalStore(
-    connection.subscribe,
-    connection.getSnapshot,
-    connection.getSnapshot,
-  );
-  const wasReady = useRef(false);
-  if (snapshot.state === "ready") wasReady.current = true;
-  if (
-    snapshot.state === "ready" ||
-    (!wasReady.current && !snapshot.error && snapshot.state !== "error")
-  )
-    return null;
-  return (
-    <div
-      role="status"
-      className="pointer-events-auto mx-auto flex max-w-xl items-center gap-3 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-xs shadow-lg"
-    >
-      <span>
-        {snapshot.error
-          ? `${name}: ${snapshot.error}`
-          : `Reconnecting to ${name}. Terminal input is paused.`}
-      </span>
-      <button
-        type="button"
-        aria-label={`Retry connection to ${name}`}
-        className="rounded border border-border px-2 py-1"
-        onClick={() => connection.retry()}
-      >
-        Retry
-      </button>
-    </div>
   );
 }
 

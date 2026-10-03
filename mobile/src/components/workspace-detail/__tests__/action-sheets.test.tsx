@@ -1,6 +1,7 @@
 import { render } from "@testing-library/react-native";
 
 import {
+  MovePaneHostSheet,
   MovePaneSheet,
   PaneActionsSheet,
   TabActionsSheet,
@@ -8,7 +9,7 @@ import {
 } from "@/components/workspace-detail/action-sheets";
 import type { Tile } from "@/data/types/layout";
 
-import { makeSession, makeTab, makeWorkspace } from "./fixtures";
+import { makeHost, makeSession, makeTab, makeWorkspace } from "./fixtures";
 
 const mockActionSets: unknown[][] = [];
 
@@ -122,5 +123,47 @@ describe("workspace action sheets", () => {
       disabled: true,
       detail: "A workspace can have up to 8 tabs",
     });
+  });
+});
+
+describe("moving a window to another host", () => {
+  beforeEach(() => mockActionSets.splice(0));
+
+  it("offers other hosts' likeliest places, then any folder, and never the host it is on", async () => {
+    const here = makeHost({ id: "host-1", name: "dream" });
+    const there = makeHost({ id: "host-2", name: "studio" });
+    const away = makeHost({ id: "host-3", name: "alto", status: "offline" });
+    const pane = makeSession({ id: "pane", host_id: here.id, cwd: "/home/oem/spawn" });
+    const neighbour = makeSession({ id: "neighbour", host_id: there.id, cwd: "/Users/me/site" });
+    const onSelect = jest.fn();
+    const onBrowse = jest.fn();
+    await render(
+      <MovePaneHostSheet
+        hosts={[here, there, away]}
+        onBrowse={onBrowse}
+        onDismiss={jest.fn()}
+        onSelect={onSelect}
+        session={pane}
+        sessions={[pane, neighbour]}
+        tabSessionIds={["pane", "neighbour"]}
+        visible
+      />,
+    );
+
+    const actions = latestActions();
+    expect(actions.map((action) => action.id)).toEqual([
+      "host-2:/Users/me/site",
+      "host-2:~",
+      "host-3:~",
+      "browse",
+    ]);
+    expect(actions[0]?.detail).toBe("studio · this tab");
+    // An offline host is shown, and cannot be chosen.
+    expect(actions[2]?.disabled).toBe(true);
+
+    actions[0]?.onPress();
+    expect(onSelect).toHaveBeenCalledWith(there, "/Users/me/site");
+    actions[3]?.onPress();
+    expect(onBrowse).toHaveBeenCalled();
   });
 });

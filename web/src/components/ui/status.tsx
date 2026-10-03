@@ -3,13 +3,15 @@ import { sessionActivityDetail, sessionActivityLabel, sessionActivityTone } from
 import { cn } from "@/lib/utils";
 
 /** Maps 1:1 to the `--tone-*` design tokens (see docs/DESIGN.md). */
-export type DotTone = "active" | "waiting" | "idle" | "offline";
+export type DotTone = "active" | "waiting" | "idle" | "offline" | "warning";
 
 const TONE_CLASS: Record<DotTone, string> = {
   active: "bg-tone-active",
   waiting: "bg-tone-waiting",
   idle: "bg-tone-idle",
   offline: "bg-tone-offline",
+  // Attention, not activity: a host this device is reconnecting to.
+  warning: "bg-warning",
 };
 
 export function hostStatusTone(status: string): DotTone {

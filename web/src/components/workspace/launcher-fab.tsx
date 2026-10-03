@@ -12,28 +12,26 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import { AgentIcon } from "@/components/icons/AgentIcon";
-import {
-  HostUpdateBadge,
-  HostUpdateDialog,
-  useHostUpdate,
-} from "@/components/release/HostUpdateDialog";
+import { HostUpdateDialog, useHostUpdate } from "@/components/release/HostUpdateDialog";
+import { CascadeMenu, type CascadeMenuHandle } from "@/components/ui/cascade-menu";
 import { toast } from "@/components/ui/toast";
 import {
   type Agent,
   ApiError,
   agents,
-  hosts,
+  type Host,
   sessions,
   type Workspace,
   workspaces,
 } from "@/lib/api";
 import { autoPlace, GRID_SIZE, type Rect, type Tile } from "@/lib/grid";
-import { activeTab, tabById, tabHome, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
+import { activeTab, tabById, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { queryAllInPane, queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
+import { useWherePanel } from "./where-picker";
 import {
   addPaneTiles,
   type DockZone,
@@ -51,6 +49,14 @@ type Drop =
   | { kind: "opening"; rect: Rect }
   | { kind: "dock"; targetId: string; zone: DockZone }
   | { kind: "auto" };
+
+/** A window placed by the launcher, waiting on where it runs. */
+type Launch = {
+  choice: Choice;
+  placement?: Rect;
+  /** Dropped on a pane: split it and take the half on `zone`'s side. */
+  dock?: { targetId: string; zone: DockZone };
+};
 
 /** Pointer travel that separates a tap on an item from a drag off it. */
 const DRAG_THRESHOLD_PX = 4;
@@ -70,10 +76,10 @@ function choiceLabel(choice: Choice): string {
 /**
  * The pane launcher: a + sunk into the bottom-right corner of the viewport.
  * Hovering (or focusing) it fans out one icon per thing a pane can run —
- * shell, each installed agent, the file explorer. Tapping an icon creates the
- * pane at the workspace's home folder, auto-placed in the open tab; dragging
- * an icon onto the canvas places it exactly where it lands (the grid's
- * openings light up as drop targets).
+ * shell, each installed agent, the file explorer. Tapping an icon auto-places
+ * the pane in the open tab; dragging one onto the canvas places it exactly
+ * where it lands (the grid's openings light up as drop targets). Either way
+ * it then asks where the window runs, likeliest place first.
  */
 export function LauncherFab({
   workspace,
@@ -137,29 +143,17 @@ export function LauncherFab({
   const bin = dragging !== null || paneDragging === true;
   const showItems = open && !bin;
 
-  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 15_000 });
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
-  // Where a window launched here opens: the tab's own home when it has one,
-  // else the workspace's — and only when that host is still around.
-  const target = tabHome(workspace.layout, tabId, workspace);
-  const homeHost = (hostsQ.data ?? []).find((host) => host.id === target?.host_id) ?? null;
-  const home = homeHost && target ? { host: homeHost, cwd: target.cwd } : null;
-  const hostUpdate = useHostUpdate(home?.host ?? null);
+  const hostUpdate = useHostUpdate(null);
 
   const createM = useMutation({
     mutationFn: async ({
       choice,
       placement,
       dock,
-    }: {
-      choice: Choice;
-      placement?: Rect;
-      /** Dropped on a pane: split it and take the half on `zone`'s side. */
-      dock?: { targetId: string; zone: DockZone };
-    }) => {
-      if (!home) {
-        throw new Error("Set this workspace's folder first (… menu in the tab strip).");
-      }
+      host,
+      cwd,
+    }: Launch & { host: Host; cwd: string }) => {
       // Fresh envelope: panes must land in the tab on screen, but the server
       // appends to its own active_tab, which only layout writes move. Stamp
       // it first when the view has drifted from it.
@@ -209,7 +203,7 @@ export function LauncherFab({
                 tile.session_id === id
                   ? {
                       ...tile,
-                      widget: { kind: "files" as const, host_id: home.host.id, path: home.cwd },
+                      widget: { kind: "files" as const, host_id: host.id, path: cwd },
                     }
                   : tile,
               ),
@@ -249,8 +243,8 @@ export function LauncherFab({
       const conversation =
         choice.kind === "agent" ? newAgentConversationId(choice.agent.kind) : null;
       const session = await sessions.create({
-        host_id: home.host.id,
-        cwd: home.cwd,
+        host_id: host.id,
+        cwd,
         ...(choice.kind === "agent" && {
           agent_id: choice.agent.id,
           agent_session_id: conversation,
@@ -278,20 +272,24 @@ export function LauncherFab({
     },
   });
 
-  const disabled = !home || home.host.status !== "online" || createM.isPending;
-  const disabledReason = !home
-    ? "Set this workspace's folder first (… menu in the tab strip)"
-    : home.host.status !== "online"
-      ? `${home.host.name} is offline`
-      : undefined;
+  const disabled = createM.isPending;
 
-  const launch = (input: {
-    choice: Choice;
-    placement?: Rect;
-    dock?: { targetId: string; zone: DockZone };
-  }) => {
-    if (!home) return;
-    hostUpdate.promptHostUpdate(home.host, () => createM.mutate(input));
+  // The window's what and where-on-canvas are settled by the tap or drop; the
+  // where-it-runs is asked next, from the launcher itself.
+  const whereMenuRef = useRef<CascadeMenuHandle>(null);
+  const pendingRef = useRef<Launch | null>(null);
+  const where = useWherePanel({ workspaceId: workspace.id, tabId, anchorRef: fabRef });
+  const whereRoot = where.panel("launcher-where", (host, cwd) => {
+    const pending = pendingRef.current;
+    pendingRef.current = null;
+    if (!pending) return;
+    hostUpdate.promptHostUpdate(host, () => createM.mutate({ ...pending, host, cwd }));
+  });
+  const launch = (input: Launch) => {
+    pendingRef.current = input;
+    const box = fabRef.current?.getBoundingClientRect();
+    if (box) whereMenuRef.current?.openAt(box.right, box.top);
+    else whereMenuRef.current?.open();
   };
 
   const layoutRef = useRef(workspace.layout);
@@ -458,7 +456,7 @@ export function LauncherFab({
       endDrag();
       if (!drag) return;
       if (!drag.started) {
-        // A tap: create at home, auto-placed in the open tab.
+        // A tap: auto-placed in the open tab, once it is known where it runs.
         launch({ choice: drag.choice });
         return;
       }
@@ -575,12 +573,6 @@ export function LauncherFab({
           "[@media(pointer:coarse)]:bottom-[calc(3.5rem+var(--safe-bottom))]",
         )}
       >
-        {home && (
-          <HostUpdateBadge
-            host={home.host}
-            className="absolute -top-7 right-0 shadow-sm shadow-black/10"
-          />
-        )}
         <div
           role="toolbar"
           aria-label="New window launcher"
@@ -599,9 +591,7 @@ export function LauncherFab({
               key={item.key}
               type="button"
               aria-label={item.label}
-              title={
-                disabledReason ?? `${item.label} — click to add, drag onto the canvas to place`
-              }
+              title={`${item.label} — click to add, drag onto the canvas to place`}
               disabled={disabled}
               tabIndex={showItems ? 0 : -1}
               // Fan out from the trigger: the icon nearest it leads, the rest
@@ -633,7 +623,7 @@ export function LauncherFab({
           type="button"
           aria-label={bin ? "Discard what you are dragging" : "Add a window"}
           aria-expanded={showItems}
-          title={bin ? "Drop here to discard" : (disabledReason ?? "Add a window")}
+          title={bin ? "Drop here to discard" : "Add a window"}
           onClick={() => setOpen((current) => !current)}
           className={cn(
             // The one primary action on the canvas: a filled square button,
@@ -693,6 +683,17 @@ export function LauncherFab({
           {choiceLabel(dragging.choice)}
         </div>
       )}
+      <CascadeMenu
+        ref={whereMenuRef}
+        root={whereRoot}
+        align="end"
+        sheetTitle="Where?"
+        onOpenChange={(isOpen) => {
+          if (!isOpen && !createM.isPending) setOpen(false);
+        }}
+        renderTrigger={() => <span hidden aria-hidden />}
+      />
+      {where.overlays}
       <HostUpdateDialog {...hostUpdate.dialogProps} />
     </>
   );

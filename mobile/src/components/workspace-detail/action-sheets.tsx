@@ -4,6 +4,7 @@ import { StatusDot } from "@/components/ui/status-dot";
 import { canMovePaneToTab, canRemoveTab } from "@/data/layout/tabs";
 import { canAddTile, orderedTiles } from "@/data/layout/tiles";
 import { restartDetail } from "@/data/selectors/agent";
+import { displayPath, placeReasonLabel, suggestPlaces } from "@/data/selectors/places";
 import { sessionTitle } from "@/data/selectors/session";
 import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import { isFilesWidget, type Tile, type WorkspaceTab } from "@/data/types/layout";
@@ -115,7 +116,7 @@ export function PaneActionsSheet({
   if (session && tile) {
     actions.push({
       id: "move-host",
-      label: "Run on another host",
+      label: "Move to another host…",
       detail: `Now on ${session.host_name ?? "this host"}`,
       icon: <Icon name="Server" />,
       onPress: () => onMoveToHost(tile, session),
@@ -205,47 +206,66 @@ export interface MovePaneHostSheetProps {
   visible: boolean;
   session: Session | null;
   hosts: readonly Host[];
+  /** Where windows already run, which ranks the places offered. */
+  sessions: readonly Session[];
+  /** The windows of the pane's tab: their places come first. */
+  tabSessionIds?: readonly string[];
   onDismiss: () => void;
-  onSelect: (host: Host) => void;
+  onSelect: (host: Host, cwd: string) => void;
+  /** Browse any host for a folder that is not in the list. */
+  onBrowse: () => void;
 }
 
 /**
- * Which machine a window runs on. Its shell cannot follow it across, so the
- * choice is destructive — the caller confirms before acting on it.
+ * Where on another machine a window should run: the likeliest places first
+ * (beside this tab's windows, recent places, each host's home), then any
+ * folder at all. Its shell cannot follow it across, so the choice is
+ * destructive — the caller confirms before acting on it. A folder on the same
+ * machine is the terminal's own Folder action, which keeps the shell.
  */
 export function MovePaneHostSheet({
   visible,
   session,
   hosts,
+  sessions,
+  tabSessionIds,
   onDismiss,
   onSelect,
+  onBrowse,
 }: MovePaneHostSheetProps) {
-  const ordered = [...hosts].sort(
-    (left, right) =>
-      Number(right.status === "online") - Number(left.status === "online") ||
-      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
-  );
-  const actions = ordered.map((host): ActionSheetAction => {
-    const current = host.id === session?.host_id;
-    const online = host.status === "online";
-    return {
-      id: host.id,
-      label: host.name,
-      icon: <StatusDot pulse={false} tone={online ? "active" : "offline"} />,
-      selected: current,
-      disabled: current || !online,
-      accessibilityRole: "radio",
-      ...(current ? { detail: "Already here" } : online ? {} : { detail: "Offline" }),
-      onPress: () => onSelect(host),
-    };
-  });
+  const others = hosts.filter((host) => host.id !== session?.host_id);
+  const places = suggestPlaces({ sessions, hosts: others, tabSessionIds, limit: 6 });
+  const actions: ActionSheetAction[] = [
+    ...places.flatMap((place): ActionSheetAction[] => {
+      const host = others.find((candidate) => candidate.id === place.hostId);
+      if (!host) return [];
+      return [
+        {
+          id: `${place.hostId}:${place.cwd}`,
+          label: displayPath(place.cwd),
+          detail: `${host.name} · ${place.online ? placeReasonLabel(place.reason) : "offline"}`,
+          icon: <StatusDot pulse={false} tone={place.online ? "active" : "offline"} />,
+          disabled: !place.online,
+          onPress: () => onSelect(host, place.cwd),
+        },
+      ];
+    }),
+    {
+      id: "browse",
+      label: "Choose a folder…",
+      detail: "Browse any host",
+      icon: <Icon name="FolderOpen" />,
+      disabled: others.length === 0,
+      onPress: onBrowse,
+    },
+  ];
 
   return (
     <ActionSheet
       actions={actions}
-      message="The window keeps its place; a fresh shell starts in your home folder there."
+      message="The same kind of window starts there; this one's process is stopped."
       onDismiss={onDismiss}
-      title="Run on another host"
+      title="Move to another host"
       visible={visible && session !== null}
     />
   );

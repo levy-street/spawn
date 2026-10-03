@@ -158,6 +158,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       workspace: Workspace,
       tile: Tile,
       host: Host,
+      cwd: string,
       session: Session | null,
       agents: readonly AgentDef[],
     ) => {
@@ -173,7 +174,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
         : null;
       const created = await createSession({
         host_id: host.id,
-        cwd: "~",
+        cwd,
         ...(session?.name ? { name: session.name } : {}),
         // The window arrives on the new host as the same kind of window, so it
         // is one even before its agent has taken the foreground over there.

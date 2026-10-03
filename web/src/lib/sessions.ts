@@ -21,8 +21,23 @@ export type SessionActivityTone = "active" | "waiting" | "idle" | "offline";
  * is what tells two panes apart at a glance. The host lives in the header's
  * tooltip instead; it rarely differs between panes.
  */
-export function sessionTitle(session: Session): string {
+/**
+ * The name someone gave this window, if any. Servers before 2026-10 named
+ * every window "<host> - <folder>" themselves; that is shown beside it already
+ * (the where chip), so a name of exactly that shape counts as no name.
+ */
+export function sessionOwnName(session: Pick<Session, "name" | "host_name">): string | null {
   const name = session.name?.trim();
+  if (!name) return null;
+  const host = session.host_name?.trim();
+  if (host && name.startsWith(`${host} - `) && !/[\\/]/.test(name.slice(host.length + 3))) {
+    return null;
+  }
+  return name;
+}
+
+export function sessionTitle(session: Session): string {
+  const name = sessionOwnName(session);
   if (name) return name;
   const folder = session.cwd.trim() ? lastCwdDir(session.cwd) : null;
   const running = agentDisplayName(session.foreground_command);

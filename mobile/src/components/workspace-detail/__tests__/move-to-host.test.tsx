@@ -65,11 +65,19 @@ describe("running a window on another host", () => {
       order.push("delete");
     });
 
-    const result = await (await actions()).movePaneToHost(workspace, tile, host, makeSession(), []);
+    const result = await (await actions()).movePaneToHost(
+      workspace,
+      tile,
+      host,
+      "/srv/app",
+      makeSession(),
+      [],
+    );
 
     expect(order).toEqual(["create", "delete"]);
     expect(createSession).toHaveBeenCalledWith(
-      expect.objectContaining({ host_id: host.id, cwd: "~" }),
+      // The folder chosen for it there, not wherever the shell happens to start.
+      expect.objectContaining({ host_id: host.id, cwd: "/srv/app" }),
     );
     expect(deleteSession).toHaveBeenCalledWith("session-1");
     // Same rect, new session behind it.
@@ -88,6 +96,7 @@ describe("running a window on another host", () => {
       workspace,
       tile,
       host,
+      "/srv/app",
       makeSession({ foreground_command: "codex" }),
       [agent],
     );
@@ -100,7 +109,9 @@ describe("running a window on another host", () => {
     mockCommit.mockRejectedValue(new Error("workspace_full"));
 
     const move = (await actions()).movePaneToHost;
-    await expect(move(workspace, tile, host, makeSession(), [])).rejects.toThrow("workspace_full");
+    await expect(move(workspace, tile, host, "~", makeSession(), [])).rejects.toThrow(
+      "workspace_full",
+    );
 
     expect(deleteSession).toHaveBeenCalledWith(moved.id);
     // The window the person is looking at is left exactly as it was.
@@ -111,7 +122,7 @@ describe("running a window on another host", () => {
     const workspace = makeWorkspace([makeTab("main")]);
 
     const move = (await actions()).movePaneToHost;
-    await expect(move(workspace, tile, host, makeSession(), [])).rejects.toThrow(
+    await expect(move(workspace, tile, host, "~", makeSession(), [])).rejects.toThrow(
       "no longer in this workspace",
     );
 

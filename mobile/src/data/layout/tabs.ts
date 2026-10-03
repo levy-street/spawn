@@ -1,12 +1,5 @@
 import { autoPlace, canAddTile, orderedTiles, removeTile } from "@/data/layout/tiles";
-import type {
-  HostId,
-  PaneId,
-  TabId,
-  Tile,
-  WorkspaceLayoutV3,
-  WorkspaceTab,
-} from "@/data/types/layout";
+import type { PaneId, TabId, Tile, WorkspaceLayoutV3, WorkspaceTab } from "@/data/types/layout";
 
 export const MAX_TABS = 8;
 
@@ -98,20 +91,6 @@ export function removeTab(layout: WorkspaceLayoutV3, tabId: TabId): WorkspaceLay
       ? (tabs[Math.max(0, index - 1)]?.id ?? tabs[0]?.id ?? null)
       : layout.active_tab;
   return { ...layout, active_tab, tabs };
-}
-
-export function setTabHome(
-  layout: WorkspaceLayoutV3,
-  tabId: TabId,
-  home: { host_id: HostId; cwd: string } | null,
-): WorkspaceLayoutV3 {
-  if (!layout.tabs.some((tab) => tab.id === tabId)) return layout;
-  return {
-    ...layout,
-    tabs: layout.tabs.map((tab) =>
-      tab.id === tabId ? { ...tab, host_id: home?.host_id ?? null, cwd: home?.cwd ?? null } : tab,
-    ),
-  };
 }
 
 export function allTiles(layout: WorkspaceLayoutV3): Tile[] {

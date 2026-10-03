@@ -44,7 +44,9 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 
 `POST /api/sessions` accepts `host_id`, `cwd`, optional `name`, optional
 `skill_ids`, and optional `workspace_id` plus `tile`. With a workspace and no
-explicit tile, the server auto-places it. The daemon receives no user-supplied
+explicit tile, the server auto-places it. A workspace's windows may run on
+any mix of hosts; creating one never writes a host or folder back onto the
+workspace, and an unnamed window stays unnamed (`name` null). The daemon receives no user-supplied
 argv, environment, or install command: it resolves and starts the host user's
 login shell.
 

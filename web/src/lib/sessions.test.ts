@@ -12,6 +12,7 @@ import {
   sessionAtShell,
   sessionHref,
   sessionNeedsAttention,
+  sessionOwnName,
   sessionTitle,
   sessionTitleDetail,
 } from "./sessions";
@@ -232,5 +233,17 @@ describe("sessionAgent", () => {
     const deleted = makeSession({ agent_id: "gone", foreground_command: "claude" });
     expect(sessionAgent(deleted, agents)?.id).toBe("a1");
     expect(sessionAgent(makeSession({ agent_id: "gone" }), agents)).toBeNull();
+  });
+});
+
+describe("sessionOwnName", () => {
+  test("an old server-made '<host> - <folder>' name counts as no name", () => {
+    expect(sessionOwnName({ name: "beta - notes", host_name: "beta" })).toBeNull();
+    expect(sessionOwnName({ name: "  ", host_name: "beta" })).toBeNull();
+  });
+  test("a name someone chose is kept, even one that starts with the host", () => {
+    expect(sessionOwnName({ name: "api server", host_name: "beta" })).toBe("api server");
+    expect(sessionOwnName({ name: "beta - a/b", host_name: "beta" })).toBe("beta - a/b");
+    expect(sessionOwnName({ name: "dream - spawn", host_name: "beta" })).toBe("dream - spawn");
   });
 });

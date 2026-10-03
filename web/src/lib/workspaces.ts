@@ -20,6 +20,29 @@ export function workspaceSessionIds(workspace: Workspace): string[] {
   return allSessionIds(workspace.layout);
 }
 
+/**
+ * The folder a workspace is "about", for what still wants one — its icon is
+ * looked for there. A workspace has no host or folder of its own; this is
+ * where its first window runs (tabs in order, reading order within), falling
+ * back to the home older workspaces were created with.
+ */
+export function workspaceFolder(
+  workspace: Workspace,
+  sessions: readonly Session[],
+): { host_id: string; cwd: string } | null {
+  const byId = new Map(sessions.map((session) => [session.id, session]));
+  for (const id of workspaceSessionIds(workspace)) {
+    const session = byId.get(id);
+    if (session) return { host_id: session.host_id, cwd: session.cwd };
+  }
+  for (const tile of allTiles(workspace.layout)) {
+    if (tile.widget) return { host_id: tile.widget.host_id, cwd: tile.widget.path };
+  }
+  return workspace.host_id && workspace.cwd
+    ? { host_id: workspace.host_id, cwd: workspace.cwd }
+    : null;
+}
+
 export function workspaceTileCount(workspace: Workspace): number {
   return allTiles(workspace.layout).length;
 }
@@ -75,6 +98,38 @@ export function tabAttentionCount(tab: WorkspaceTab, sessionsById: Map<string, S
     const session = sessionsById.get(tile.session_id);
     return session ? sessionNeedsAttention(session) !== null : false;
   }).length;
+}
+
+/** The most urgent thing among some sessions: a window that died outranks
+ *  one that is waiting on you. Null when none needs anything. */
+export type AttentionLevel = "dead" | "waiting";
+
+function worstAttention(sessions: Iterable<Session | undefined>): AttentionLevel | null {
+  let worst: AttentionLevel | null = null;
+  for (const session of sessions) {
+    const level = session ? sessionNeedsAttention(session) : null;
+    if (level === "dead") return "dead";
+    if (level === "waiting") worst = "waiting";
+  }
+  return worst;
+}
+
+export function workspaceAttentionLevel(
+  workspace: Workspace,
+  sessionsById: Map<string, Session>,
+): AttentionLevel | null {
+  return worstAttention(workspaceSessionIds(workspace).map((id) => sessionsById.get(id)));
+}
+
+export function tabAttentionLevel(
+  tab: WorkspaceTab,
+  sessionsById: Map<string, Session>,
+): AttentionLevel | null {
+  return worstAttention(
+    tab.layout.tiles
+      .filter((tile) => !tile.widget)
+      .map((tile) => sessionsById.get(tile.session_id)),
+  );
 }
 
 /** Recency for ordering heuristics: the newest *input* across the workspace's

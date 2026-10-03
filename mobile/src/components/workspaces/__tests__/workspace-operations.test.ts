@@ -193,21 +193,33 @@ describe("workspace lifecycle operations", () => {
     };
 
     const result = await instantiateWorkspaceTemplate(
-      { template, agents: [agent()], name: "Mobile review" },
+      {
+        template,
+        agents: [agent()],
+        name: "Mobile review",
+        // Where its windows run is chosen at replay, not read off the template.
+        place: { hostId: "host-2", cwd: "/chosen" },
+      },
       harness.dependencies,
     );
 
     expect(harness.createWorkspace).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "Mobile review", host_id: "host-1", cwd: "/work" }),
+      expect.not.objectContaining({ host_id: expect.anything() }),
+    );
+    expect(harness.createWorkspace).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "Mobile review" }),
     );
     const initialLayout = harness.patchWorkspace.mock.calls[0]?.[1].layout;
     expect(initialLayout?.tabs[0]?.layout.tiles).toEqual([
       expect.objectContaining({
         session_id: "widget-new",
-        widget: { kind: "files", host_id: "host-1", path: "/work" },
+        widget: { kind: "files", host_id: "host-2", path: "/chosen" },
       }),
     ]);
     expect(harness.createSession).toHaveBeenCalledTimes(2);
+    expect(harness.createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ host_id: "host-2", cwd: "/chosen" }),
+    );
     expect(harness.createSession).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({ workspace_id: "workspace-new", tile: { x: 8, y: 0, w: 8, h: 24 } }),

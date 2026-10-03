@@ -3,8 +3,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import { useHostControl } from "@/hooks/useHostControl";
-import { hosts, type Workspace, workspaces } from "@/lib/api";
+import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { findFolderIcon } from "@/lib/workspace-icon-scan";
+import { workspaceFolder } from "@/lib/workspaces";
 
 /**
  * Giving a workspace the mark its folder already has.
@@ -24,14 +25,21 @@ export function useWorkspaceIconAutoFill(workspace: Workspace | undefined): void
   const queryClient = useQueryClient();
   const attempted = useRef(new Set<string>());
 
+  const sessionsQ = useQuery({
+    queryKey: ["sessions"],
+    queryFn: () => sessions.list(),
+    staleTime: 30_000,
+    enabled: workspace !== undefined && workspace.icon_source === null,
+  });
+  // The folder its first window runs in: a workspace has none of its own.
+  const folder = workspace ? workspaceFolder(workspace, sessionsQ.data ?? []) : null;
   const wants =
     workspace !== undefined &&
     workspace.icon_source === null &&
     workspace.archived_at === null &&
-    workspace.host_id !== null &&
-    workspace.cwd !== null;
+    folder !== null;
 
-  const hostId = wants ? (workspace as Workspace).host_id : null;
+  const hostId = wants ? (folder?.host_id ?? null) : null;
   const hostQ = useQuery({
     queryKey: ["hosts"],
     queryFn: hosts.list,
@@ -46,7 +54,7 @@ export function useWorkspaceIconAutoFill(workspace: Workspace | undefined): void
   // Primitives, not the workspace object: a layout write while the walk is in
   // flight must not re-run the effect and abandon it.
   const id = wants ? (workspace as Workspace).id : null;
-  const cwd = wants ? (workspace as Workspace).cwd : null;
+  const cwd = wants ? (folder?.cwd ?? null) : null;
 
   useEffect(() => {
     if (!client || state !== "ready" || id === null || cwd === null) return;

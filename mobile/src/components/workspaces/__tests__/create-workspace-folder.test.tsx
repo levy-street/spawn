@@ -18,10 +18,24 @@ jest.mock("@/components/ui/dialog", () => ({
   })(),
 }));
 
+// Pressing the select picks its last option, which is enough to choose a template.
 jest.mock("@/components/ui/select", () => ({
   ...(() => {
-    const { View: MockView } = require("react-native") as typeof import("react-native");
-    return { Select: () => <MockView testID="workspace-template-select" /> };
+    const { Pressable: MockPressable } = require("react-native") as typeof import("react-native");
+    return {
+      Select: ({
+        options,
+        onChange,
+      }: {
+        options: { value: string }[];
+        onChange: (value: string) => void;
+      }) => (
+        <MockPressable
+          onPress={() => onChange(options[options.length - 1]?.value ?? "")}
+          testID="workspace-template-select"
+        />
+      ),
+    };
   })(),
 }));
 
@@ -71,30 +85,73 @@ function Providers({ children }: { children: ReactNode }) {
   );
 }
 
-describe("choosing where a new workspace opens", () => {
-  test("the chosen folder rides the draft out, named by its tail", async () => {
+const TEMPLATE = {
+  id: "template-1",
+  name: "Review",
+  host_id: null,
+  cwd: null,
+  icon: null,
+  icon_source: null,
+  created_at: "2026-08-20T00:00:00Z",
+  updated_at: "2026-08-20T00:00:00Z",
+  spec: {
+    version: 2 as const,
+    tabs: [
+      { name: "Tab 1", tiles: [{ x: 0, y: 0, w: 24, h: 24, run: { kind: "shell" as const } }] },
+    ],
+  },
+};
+const SUGGESTED = { hostId: HOST_ID, hostName: "dream", path: "/home/oem/notes" };
+
+describe("where a new workspace's windows run", () => {
+  test("a blank workspace asks for no folder: each window it gets says where it runs", async () => {
     const onCreate = jest.fn();
     await render(
       <CreateWorkspaceDialog
         busy={false}
         onCreate={onCreate}
         onDismiss={jest.fn()}
-        templates={[]}
+        suggestedFolder={SUGGESTED}
+        templates={[TEMPLATE]}
         visible
       />,
       { wrapper: Providers },
     );
 
-    expect(screen.getByTestId("create-workspace-folder")).toBeOnTheScreen();
-    expect(screen.getByText("Choose a folder")).toBeOnTheScreen();
+    expect(screen.queryByTestId("create-workspace-folder")).toBeNull();
+    await fireEvent.changeText(screen.getByPlaceholderText("Workspace name"), "Spawn");
+    await fireEvent.press(screen.getByTestId("create-workspace-submit"));
+    expect(onCreate).toHaveBeenCalledWith({
+      folder: null,
+      iconChoice: null,
+      name: "Spawn",
+      templateId: null,
+    });
+  });
+
+  test("a template offers the likeliest place, and a picked folder replaces it", async () => {
+    const onCreate = jest.fn();
+    await render(
+      <CreateWorkspaceDialog
+        busy={false}
+        onCreate={onCreate}
+        onDismiss={jest.fn()}
+        suggestedFolder={SUGGESTED}
+        templates={[TEMPLATE]}
+        visible
+      />,
+      { wrapper: Providers },
+    );
+
+    await fireEvent.press(screen.getByTestId("workspace-template-select"));
+    expect(screen.getByText("…/oem/notes")).toBeOnTheScreen();
+    expect(screen.getByText("On dream.")).toBeOnTheScreen();
 
     await fireEvent.press(screen.getByTestId("create-workspace-folder"));
     await fireEvent.press(screen.getByTestId("pick-folder"));
-
     // A full path does not fit on a phone, and its head is the part every
     // folder on a machine shares.
     expect(screen.getByText("…/dev/spawn")).toBeOnTheScreen();
-    expect(screen.getByText("Opens on dream.")).toBeOnTheScreen();
 
     await fireEvent.changeText(screen.getByPlaceholderText("Workspace name"), "Spawn");
     await fireEvent.press(screen.getByTestId("create-workspace-submit"));
@@ -102,7 +159,7 @@ describe("choosing where a new workspace opens", () => {
       folder: { hostId: HOST_ID, hostName: "dream", path: FOLDER },
       iconChoice: null,
       name: "Spawn",
-      templateId: null,
+      templateId: "template-1",
     });
   });
 });

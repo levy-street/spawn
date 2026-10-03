@@ -86,31 +86,6 @@ export function withTabTiles(layout: LayoutV3, tabId: string, tiles: Tile[]): La
   };
 }
 
-/**
- * Where a window added to `tabId` opens: the tab's own home when it has one,
- * else the workspace's, else nothing (and the caller has to ask).
- */
-export function tabHome(
-  layout: LayoutV3,
-  tabId: string,
-  workspace: { host_id: string | null; cwd: string | null },
-): Home | null {
-  const tab = tabById(layout, tabId);
-  if (tab?.host_id && tab.cwd) return { host_id: tab.host_id, cwd: tab.cwd };
-  if (workspace.host_id && workspace.cwd) return { host_id: workspace.host_id, cwd: workspace.cwd };
-  return null;
-}
-
-/** The envelope with one tab re-pointed; null clears it back to inheriting. */
-export function withTabHome(layout: LayoutV3, tabId: string, home: Home | null): LayoutV3 {
-  return {
-    ...layout,
-    tabs: layout.tabs.map((tab) =>
-      tab.id === tabId ? { ...tab, host_id: home?.host_id ?? null, cwd: home?.cwd ?? null } : tab,
-    ),
-  };
-}
-
 export function withActiveTab(layout: LayoutV3, tabId: string): LayoutV3 {
   return tabById(layout, tabId) ? { ...layout, active_tab: tabId } : layout;
 }

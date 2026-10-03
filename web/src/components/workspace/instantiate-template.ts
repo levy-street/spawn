@@ -51,7 +51,6 @@ export async function instantiateTemplate(
     // is left unlooked, and finds its own.
     ...iconForInstance(template, host, cwd),
   });
-  await workspaces.update(workspace.id, { host_id: host.id, cwd });
 
   const tabs = template.spec.tabs.map((tab) => ({
     id: crypto.randomUUID(),

@@ -14,11 +14,9 @@ import {
   removeTab,
   renameTab,
   reorderTab,
-  tabHome,
   tabOfSession,
   tabTiles,
   withActiveTab,
-  withTabHome,
   withTabTiles,
 } from "./tabs";
 
@@ -37,51 +35,6 @@ function envelope(tabs: Array<{ id: string; name?: string; tiles?: Tile[] }>): L
     })),
   };
 }
-
-describe("tab home", () => {
-  const workspace = { host_id: "ws-host", cwd: "/workspace" };
-
-  test("a tab with no home of its own inherits the workspace's", () => {
-    expect(tabHome(envelope([{ id: "a" }]), "a", workspace)).toEqual({
-      host_id: "ws-host",
-      cwd: "/workspace",
-    });
-  });
-
-  test("a tab's own pair wins, and only its own tab is re-pointed", () => {
-    const layout = withTabHome(envelope([{ id: "a" }, { id: "b" }]), "a", {
-      host_id: "tab-host",
-      cwd: "/tab",
-    });
-    expect(tabHome(layout, "a", workspace)).toEqual({ host_id: "tab-host", cwd: "/tab" });
-    expect(tabHome(layout, "b", workspace)).toEqual({ host_id: "ws-host", cwd: "/workspace" });
-  });
-
-  test("clearing a tab's home puts it back to inheriting", () => {
-    const owned = withTabHome(envelope([{ id: "a" }]), "a", {
-      host_id: "tab-host",
-      cwd: "/tab",
-    });
-    expect(tabHome(withTabHome(owned, "a", null), "a", workspace)).toEqual({
-      host_id: "ws-host",
-      cwd: "/workspace",
-    });
-  });
-
-  test("half a pair is no home — neither the tab's nor the workspace's", () => {
-    const layout = envelope([{ id: "a" }]);
-    layout.tabs[0] = { ...(layout.tabs[0] as (typeof layout.tabs)[number]), host_id: "tab-host" };
-    expect(tabHome(layout, "a", workspace)).toEqual({ host_id: "ws-host", cwd: "/workspace" });
-    expect(tabHome(layout, "a", { host_id: "ws-host", cwd: null })).toBeNull();
-  });
-
-  test("an unknown tab still answers with the workspace's home", () => {
-    expect(tabHome(envelope([{ id: "a" }]), "ghost", workspace)).toEqual({
-      host_id: "ws-host",
-      cwd: "/workspace",
-    });
-  });
-});
 
 describe("tab envelope", () => {
   test("activeTab falls back to the first when active_tab is stale", () => {

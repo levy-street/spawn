@@ -180,16 +180,6 @@ export function selectActiveSession(
   return null;
 }
 
-export function selectTabHome(
-  workspace: Workspace,
-  tabId: TabId,
-): { host_id: string; cwd: string } | null {
-  const tab = workspace.layout.tabs.find((candidate) => candidate.id === tabId);
-  if (tab?.host_id && tab.cwd) return { host_id: tab.host_id, cwd: tab.cwd };
-  if (workspace.host_id && workspace.cwd) return { host_id: workspace.host_id, cwd: workspace.cwd };
-  return null;
-}
-
 export function selectTabItems(
   state: DomainSnapshot,
   workspaceId: WorkspaceId,

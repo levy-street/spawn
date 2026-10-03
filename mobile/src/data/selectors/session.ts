@@ -115,8 +115,24 @@ function basename(path: string): string {
   return normalized.split(/[\\/]/).pop() ?? "";
 }
 
+/**
+ * The name someone gave this window, if any. Servers before 2026-10 named
+ * every window "<host> - <folder>" themselves; host and folder are shown
+ * beside it already, so a name of exactly that shape counts as no name. The
+ * browser applies the same rule (web/src/lib/sessions.ts).
+ */
+export function sessionOwnName(session: Pick<Session, "name" | "host_name">): string | null {
+  const name = session.name?.trim();
+  if (!name) return null;
+  const host = session.host_name?.trim();
+  if (host && name.startsWith(`${host} - `) && !/[\\/]/.test(name.slice(host.length + 3))) {
+    return null;
+  }
+  return name;
+}
+
 export function sessionTitle(session: Session, agents: readonly AgentDef[] = []): string {
-  const explicit = session.name?.trim();
+  const explicit = sessionOwnName(session);
   if (explicit) return explicit;
   const identity = identifyAgent(session.foreground_command, agents);
   const directory = basename(session.cwd);

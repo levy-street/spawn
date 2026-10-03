@@ -101,7 +101,10 @@ The `*-soft` tints are translucent so they sit correctly on any surface
 (card, popover, background). The standard chip recipe is the Badge's:
 `border-<status>/25 bg-<status>-soft text-<status>`.
 
-"Attention" states (a session waiting for input) use the `warning` family.
+"Attention" states (a session waiting for input) use the `warning` family,
+and so does a host this device is reconnecting to: its dot, wherever the host
+appears (a pane's where chip, its Legion row), turns `warning` and pulses.
+There is no app-wide connection banner; the host says so where it is shown.
 
 ### Code (theme-swapped)
 

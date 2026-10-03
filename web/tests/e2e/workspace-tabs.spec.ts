@@ -343,14 +343,12 @@ test("a plain tab drag still reorders — the modifier is what copies", async ({
   expect(store.requests.sessions).toEqual([]);
 });
 
-test("the + asks what goes in the tab, and makes the tab and the window together", async ({
+test("the + asks what goes in the tab and where, then makes the tab and the window together", async ({
   page,
 }) => {
   const store = await mockApp(page, {
     sessions: [],
-    // A workspace with a home: one click answers "what", and "where" is
-    // already known, which is the whole point of the picker being one step.
-    workspaces: [workspace({ layout: THREE_TABS, host_id: HOST_ID, cwd: "/Users/tester" })],
+    workspaces: [workspace({ layout: THREE_TABS })],
   });
   await page.goto(`/w/${WORKSPACE_ID}`);
   const strip = page.getByRole("tablist", { name: "Workspace tabs" });
@@ -358,18 +356,17 @@ test("the + asks what goes in the tab, and makes the tab and the window together
 
   // Opening the picker makes nothing: there is no empty tab to abandon.
   await page.getByRole("button", { name: "New tab" }).click();
-  // The trigger already says New tab, so the menu is the choices alone — and
-  // only the choices: a new tab opens at the workspace's folder, so the
-  // "somewhere else" row has nothing to add.
   const menu = page.getByRole("menu");
-  await expect(menu.getByRole("menuitem", { name: /A plain login shell/ })).toBeVisible();
-  await expect(menu.getByRole("menuitem", { name: /another folder|another host/ })).toHaveCount(0);
+  await menu.getByRole("menuitem", { name: /A plain login shell/ }).click();
+  // Then where it runs — still nothing written until that is answered too.
+  const where = page.getByRole("menu", { name: "Where?" });
+  await expect(where).toBeVisible();
   expect(layoutPatches(store.requests.workspacePatches)).toHaveLength(0);
   expect(store.requests.sessions).toHaveLength(0);
 
-  // Choosing what goes in it writes the tab, then opens the window there.
-  await menu.getByRole("menuitem", { name: /A plain login shell/ }).click();
+  await where.getByRole("menuitem").first().click();
   await expect.poll(() => store.requests.sessions.length).toBe(1);
+  expect(store.requests.sessions[0]).toMatchObject({ host_id: HOST_ID, cwd: "~" });
   const added = layoutPatches(store.requests.workspacePatches)[0] as LayoutV3;
   expect(added.tabs.map((tab) => tab.name)).toEqual(["Alpha", "Beta", "Gamma", "Tab 4"]);
   expect(added.active_tab).toBe(added.tabs[3]?.id);

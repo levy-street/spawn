@@ -445,6 +445,7 @@ export const CascadeMenu = forwardRef<
           <div
             id={menuId}
             role="menu"
+            aria-label={panel.title ?? sheetTitle}
             onKeyDown={onListKeyDown}
             className="overflow-x-hidden px-2 pb-2"
           >
@@ -459,6 +460,7 @@ export const CascadeMenu = forwardRef<
             id={menuId}
             ref={menuRef}
             role="menu"
+            aria-label={panel.title ?? sheetTitle}
             onKeyDown={onListKeyDown}
             style={coords ?? { position: "fixed", visibility: "hidden" }}
             className={cn(

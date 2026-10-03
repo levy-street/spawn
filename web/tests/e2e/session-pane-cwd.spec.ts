@@ -23,6 +23,15 @@ const listing = fileListing({
   entries: [fileEntry({ name: "projects", path: "/Users/tester/projects", is_dir: true })],
 });
 
+/** The pane's where chip, then "Choose a folder…": a folder on the same host. */
+async function chooseFolder(page: Page) {
+  await page.getByRole("button", { name: /Change where it runs/ }).click();
+  await page
+    .getByRole("menu", { name: "Where?" })
+    .getByRole("menuitem", { name: /Choose a folder/ })
+    .click();
+}
+
 async function openPaneFolderPicker(page: Page, foreground: string) {
   const messages: Array<string | Buffer> = [];
   await installSessionRtcMock(page, messages, { history: "ready\r\n$ ", autoSnapshot: true });
@@ -48,7 +57,7 @@ async function openPaneFolderPicker(page: Page, foreground: string) {
     ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
   await page.goto(`/w/${WORKSPACE_ID}`);
-  await page.getByRole("button", { name: "Change directory" }).click();
+  await chooseFolder(page);
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
   // Miller columns can show the same folder name in several columns; pick it
   // from the home column explicitly.
@@ -73,7 +82,7 @@ test("an agent in the foreground is stopped first, and only with permission", as
   await ask.getByRole("button", { name: "Cancel" }).click();
   expect(ptyText(messages)).toBe("");
 
-  await page.getByRole("button", { name: "Change directory" }).click();
+  await chooseFolder(page);
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
   // Miller columns can show the same folder name in several columns; pick it
   // from the home column explicitly.
@@ -93,7 +102,9 @@ test("an agent in the foreground is stopped first, and only with permission", as
   await expect.poll(() => ptyText(messages)).toContain("clear\ncd /Users/tester/projects\n");
 });
 
-test("a pane too narrow for the folder's name keeps just the icon", async ({ page }) => {
+test("the where chip says host and folder, and a narrow pane keeps just the folder", async ({
+  page,
+}) => {
   await mockApp(page, {
     sessions: [session()],
     workspaces: [
@@ -104,16 +115,18 @@ test("a pane too narrow for the folder's name keeps just the icon", async ({ pag
     files: () => listing,
   });
   await page.goto(`/w/${WORKSPACE_ID}`);
-  const chip = page.getByRole("button", { name: "Change directory" });
-  const folderName = chip.locator("span");
-  await expect(folderName).toBeVisible();
+  const chip = page.getByRole("button", { name: /Change where it runs/ });
+  await expect(chip).toHaveAccessibleName("Runs in ~/projects/spawn on Mac. Change where it runs");
+  await expect(chip.getByText("~/projects/spawn")).toBeVisible();
+  await expect(chip.getByText("Mac", { exact: true })).toBeVisible();
 
-  // Squeezed to a header this thin, the name goes and the icon stays — the
-  // control is still there to click, and the title still spells the path out.
+  // Squeezed to a thin header, the folder's own name is what stays: the
+  // control is still there to click, and its title still spells the path out.
   await page.setViewportSize({ width: 520, height: 800 });
-  await expect(folderName).toBeHidden();
+  await expect(chip.getByText("Mac", { exact: true })).toBeHidden();
+  await expect(chip.getByText("spawn", { exact: true })).toBeVisible();
   await expect(chip).toBeVisible();
 
   await page.setViewportSize({ width: 1280, height: 800 });
-  await expect(folderName).toBeVisible();
+  await expect(chip.getByText("~/projects/spawn")).toBeVisible();
 });

@@ -11,7 +11,7 @@ import Animated, {
 
 import { borderWidth, opacity, spacing, useTheme } from "@/theme";
 
-export type StatusTone = "active" | "waiting" | "idle" | "offline";
+export type StatusTone = "active" | "waiting" | "idle" | "offline" | "warning";
 
 export interface StatusDotProps {
   accessibilityLabel?: string;
@@ -27,6 +27,8 @@ const TONE_COLOR = {
   waiting: "toneWaiting",
   idle: "toneIdle",
   offline: "toneOffline",
+  // Attention, not activity: a host this device is reconnecting to.
+  warning: "warning",
 } as const;
 
 export function useReducedMotionPreference(): boolean {

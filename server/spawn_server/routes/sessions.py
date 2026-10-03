@@ -26,17 +26,6 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _last_cwd_dir(cwd: str) -> str:
-    normalized = cwd.strip().rstrip("/\\")
-    if not normalized:
-        return cwd.strip() or "/"
-    return normalized.replace("\\", "/").rsplit("/", 1)[-1] or normalized
-
-
-def _default_session_name(host_name: str, cwd: str) -> str:
-    return f"{host_name} - {_last_cwd_dir(cwd)}"[:128]
-
-
 def _aware(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
@@ -183,7 +172,9 @@ async def create_session_row(
         owner_user_id=user.id,
         host_id=host.id,
         cwd=cwd,
-        name=explicit_name or _default_session_name(host.name, cwd),
+        # No name until someone gives it one: the host and folder are shown
+        # beside it already, and a name that repeats them read as a duplicate.
+        name=explicit_name or None,
         status="starting",
         agent_id=resolved_agent_id,
         # A conversation belongs to an agent; without one there is nothing it
@@ -338,13 +329,6 @@ async def create_session(
             db, user, workspaces_routes.parse_workspace_layout(workspace.layout)
         )
         workspace.layout = _append_tile(layout, session_id=session_row.id, tile=body.tile)
-        # A workspace without a home — a pre-0047 row whose sessions were gone
-        # at backfill time, or one whose home host was deleted — adopts the
-        # first session created in it, so every window after this one opens
-        # there instead of asking again.
-        if workspace.host_id is None or workspace.cwd is None:
-            workspace.host_id = host.id
-            workspace.cwd = body.cwd
         workspace.updated_at = _utcnow()
 
     await db.commit()

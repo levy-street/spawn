@@ -23,7 +23,8 @@ export interface CreateWorkspaceDraft {
   name: string;
   templateId: string | null;
   iconChoice: WorkspaceIconChoice | null;
-  /** Where it opens. Null keeps the workspace unplaced, as it was before. */
+  /** Where a template's windows run; null for a blank workspace, which has
+   *  no host or folder of its own — each window it gets says where it runs. */
   folder: WorkspaceFolder | null;
 }
 
@@ -33,9 +34,11 @@ export interface CreateWorkspaceDialogProps {
   busy: boolean;
   onDismiss: () => void;
   onCreate: (draft: CreateWorkspaceDraft) => void;
+  /** The likeliest place for a template's windows, offered as the default. */
+  suggestedFolder?: WorkspaceFolder | null;
 }
 
-function templateNeedsSavedHome(template: WorkspaceTemplateOut): boolean {
+function templateHasWindows(template: WorkspaceTemplateOut): boolean {
   return template.spec.tabs.some((tab) => (tab.tiles?.length ?? 0) > 0);
 }
 
@@ -45,6 +48,7 @@ export function CreateWorkspaceDialog({
   busy,
   onDismiss,
   onCreate,
+  suggestedFolder = null,
 }: CreateWorkspaceDialogProps) {
   const [name, setName] = useState("");
   const [templateId, setTemplateId] = useState<string>(BLANK_TEMPLATE);
@@ -53,12 +57,14 @@ export function CreateWorkspaceDialog({
   const [folderVisible, setFolderVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Seeded once per opening: a suggestion arriving later must not replace a pick.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: see above.
   useEffect(() => {
     if (!visible) return;
     setName("");
     setTemplateId(BLANK_TEMPLATE);
     setIconChoice(null);
-    setFolder(null);
+    setFolder(suggestedFolder);
     setFolderVisible(false);
     setError(null);
   }, [visible]);
@@ -66,20 +72,19 @@ export function CreateWorkspaceDialog({
   const options = useMemo(
     () => [
       { value: BLANK_TEMPLATE, label: "Blank workspace" },
-      ...templates.map((template) => {
-        const needsHome = templateNeedsSavedHome(template);
-        const missingHome = needsHome && (!template.host_id || !template.cwd);
-        return {
-          value: template.id,
-          label: template.name,
-          ...(missingHome
-            ? { detail: "Choose a folder on desktop first", disabled: true }
-            : { detail: "Use saved tabs and windows" }),
-        };
-      }),
+      ...templates.map((template) => ({
+        value: template.id,
+        label: template.name,
+        detail: "Use saved tabs and windows",
+      })),
     ],
     [templates],
   );
+
+  const chosenTemplate = templates.find((template) => template.id === templateId) ?? null;
+  // Only a template with windows in it needs to know where they run; a blank
+  // workspace starts empty and every window it gets asks for itself.
+  const needsPlace = chosenTemplate !== null && templateHasWindows(chosenTemplate);
 
   const submit = () => {
     const trimmed = name.trim();
@@ -87,14 +92,16 @@ export function CreateWorkspaceDialog({
       setError("Enter a workspace name.");
       return;
     }
+    if (needsPlace && !folder) {
+      setError("Choose where this template's windows run.");
+      return;
+    }
     setError(null);
     onCreate({
       name: trimmed,
       templateId: templateId === BLANK_TEMPLATE ? null : templateId,
       iconChoice,
-      // A template carries its own saved home; the folder chosen here is for
-      // the blank workspace that has none.
-      folder: templateId === BLANK_TEMPLATE ? folder : null,
+      folder: needsPlace ? folder : null,
     });
   };
 
@@ -144,14 +151,11 @@ export function CreateWorkspaceDialog({
               value={templateId}
             />
           </Field>
-          {templateId === BLANK_TEMPLATE ? (
+          {needsPlace ? (
             <Field
-              hint={
-                folder
-                  ? `Opens on ${folder.hostName}.`
-                  : "Optional. Terminals in this workspace start here."
-              }
-              label="Folder"
+              hint={folder ? `On ${folder.hostName}.` : "Where this template's windows run."}
+              label="Where"
+              required
             >
               <Button
                 disabled={busy}
