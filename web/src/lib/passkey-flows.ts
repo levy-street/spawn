@@ -14,6 +14,7 @@
  */
 
 import {
+  AccountHealError,
   type AccountHealReport,
   assessSealedRootRevocation,
   selectSealedRootRowForRevocation,
@@ -148,6 +149,28 @@ async function putBundleGuarded(
   }
 }
 
+/**
+ * Revoke a device (a keyless account root, in practice) with a few retries.
+ * The caller invokes this only once the gate that could mint a rival is already
+ * shut, so retrying is safe and converges; a total failure is surfaced.
+ */
+async function revokeWithRetries(
+  io: PasskeyFlowsIo,
+  deviceId: string,
+  expectedPublicKey: string,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await io.browserDevices.revoke(deviceId, expectedPublicKey);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
 // ---------------------------------------------------------------------------
 // Set up (fix P-C5, first half: seal before enroll)
 // ---------------------------------------------------------------------------
@@ -191,19 +214,16 @@ export async function setUpPasskey(io: PasskeyFlowsIo): Promise<SetUpOutcome> {
     );
   }
 
-  // Preflight the account root BEFORE the passkey gesture: a live root from
-  // an earlier setup (whose seed this bundle would not hold) must stop us
-  // here, not after the operator has enrolled an authenticator.
-  const priorRoot = (await io.browserDevices.list()).find(
-    (d) => d.is_root && d.revoked_at === null,
-  );
-  if (priorRoot !== undefined) {
-    throw new Error(
-      "This account still has keys from a previous passkey setup. Remove them under " +
-        "Access → Advanced before setting up a new passkey.",
-    );
-  }
-
+  // A live account root here is necessarily KEYLESS (we returned above if any
+  // bundle existed, so no passkey owns it — the host-gossip backfill established
+  // it, or an earlier setup's bundle is gone). It is adopted by revoking it, but
+  // NOT here: revoking before a bundle is stored would leave a window with
+  // neither a live root nor a bundle, in which the passkey-free establishment
+  // gate on another open device would mint a RIVAL root and make this setup's
+  // heal conflict permanently. Keeping it live through the gesture holds that
+  // gate shut ("no-live-root" is false); it is revoked below, once `putBundle`
+  // has closed the gate for good (`bundleAbsent` is false the moment a bundle
+  // exists). See the revoke just before the heal.
   const passkey = await io.createTrustPasskey(id, io.userLabel);
   if (!passkey.prfEnabled) {
     throw new PasskeyPrfError(
@@ -239,11 +259,37 @@ export async function setUpPasskey(io: PasskeyFlowsIo): Promise<SetUpOutcome> {
   await recordBundleRevision(io.scope, revision);
   await io.trust.addPasskey(passkey.credentialId, "this device");
 
-  // Register + heal only after the sealed seed is durably stored: a root
-  // the bundle cannot recover must never become an endorser or anchor.
+  // Now that a bundle durably exists — the create-only `putBundle` closed the
+  // passkey-free establishment gate for every device (`bundleAbsent` is false) —
+  // adopt the account under `root`. Any live account root is necessarily KEYLESS
+  // (no passkey owns it; this is the account's only bundle and it seals `root`),
+  // so it is revoked to free the one live-root slot. A rival keyless root can
+  // still have been minted by another device in the tiny window BEFORE our
+  // `putBundle` committed and registered just after our scan; the register/heal
+  // then conflicts. Since no NEW rival can begin once the bundle exists, one
+  // extra revoke-and-retry round drains any straggler. Register + heal only run
+  // after the sealed seed is durably stored — a root the bundle cannot recover
+  // must never become an endorser or anchor.
   const pins = await activeLocalPins(io.scope);
-  const heal = await io.heal(root, pinHosts(pins), "mint");
-  return { hostCount, heal };
+  for (let round = 0; ; round++) {
+    const priorRoot = (await io.browserDevices.list()).find(
+      (d) => d.is_root && d.revoked_at === null && d.public_key !== root.publicKeyWire,
+    );
+    if (priorRoot !== undefined) {
+      await revokeWithRetries(io, priorRoot.id, priorRoot.public_key);
+    }
+    try {
+      const heal = await io.heal(root, pinHosts(pins), "mint");
+      return { hostCount, heal };
+    } catch (error) {
+      // A `root_conflict` means a rival root slipped in between the scan and the
+      // register; revoke it on the next round and retry. Anything else, or a
+      // second conflict (which would mean a NEW rival after the bundle exists —
+      // impossible), propagates.
+      const conflict = error instanceof AccountHealError && error.code === "root_conflict";
+      if (!conflict || round >= 1) throw error;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

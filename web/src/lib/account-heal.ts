@@ -41,7 +41,7 @@ import {
   createRootRegistrationProof,
 } from "./account-root";
 import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
-import { browserDevices, trust } from "./api";
+import { ApiError, type BrowserDevice, browserDevices, trust } from "./api";
 import {
   type BrowserDeviceIdentity,
   createBrowserEndorsementProof,
@@ -298,11 +298,16 @@ export async function planAccountHeal(
 
 /**
  * Register the root as this account's `is_root` browser device if it is not
- * registered yet. Idempotent by key: re-registering the same `pk_R` returns the
- * existing row. A DIFFERENT live root already present is a trust conflict —
- * surfaced, never papered over.
+ * registered yet, and return its roster row. Idempotent by key: re-registering
+ * the same `pk_R` returns the existing row. A DIFFERENT live root already
+ * present is a trust conflict — surfaced, never papered over. The returned row's
+ * id lets a caller that could not finish (e.g. a heal whose roster read failed)
+ * revoke the orphan it just registered.
  */
-export async function ensureRootRegistered(root: AccountRoot, accountId: string): Promise<void> {
+export async function ensureRootRegistered(
+  root: AccountRoot,
+  accountId: string,
+): Promise<BrowserDevice> {
   const devices = await browserDevices.list();
   const liveRoot = devices.find((d) => d.is_root && d.revoked_at === null);
   if (liveRoot !== undefined) {
@@ -312,15 +317,31 @@ export async function ensureRootRegistered(root: AccountRoot, accountId: string)
         "the server's account root does not match the root sealed in your trust bundle",
       );
     }
-    return;
+    return liveRoot;
   }
-  const registered = await browserDevices.register({
-    key_algorithm: "ed25519",
-    public_key: root.publicKeyWire,
-    signature: await createRootRegistrationProof(root, accountId),
-    label: "Account root",
-    is_root: true,
-  });
+  let registered: BrowserDevice;
+  try {
+    registered = await browserDevices.register({
+      key_algorithm: "ed25519",
+      public_key: root.publicKeyWire,
+      signature: await createRootRegistrationProof(root, accountId),
+      label: "Account root",
+      is_root: true,
+    });
+  } catch (error) {
+    // A 409 means another device registered a live root between our list() above
+    // and this register (the one-live-root index fired). That is a conflict, not
+    // a soft failure: surface it as `root_conflict` so a caller adopting a
+    // keyless root can revoke the rival and retry, instead of `healBestEffort`
+    // swallowing it into "completes next time" while the root stays unregistered.
+    if (error instanceof ApiError && error.status === 409) {
+      throw new AccountHealError(
+        "root_conflict",
+        "another device registered an account root first",
+      );
+    }
+    throw error;
+  }
   // Verify the row the server answered with is the row that was submitted
   // (hardening B3): a response naming another key or dropping the root mark
   // means the roster does NOT hold pk_R as the root, and healing on top of
@@ -335,6 +356,7 @@ export async function ensureRootRegistered(root: AccountRoot, accountId: string)
       "the server did not record the account root as submitted",
     );
   }
+  return registered;
 }
 
 /**
