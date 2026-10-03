@@ -16,6 +16,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
+import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
 import { agentDisplayName } from "@/components/icons/AgentIcon";
 import { SessionTranscriptsDialog } from "@/components/session/session-transcripts-dialog";
 import { ConnectionChip } from "@/components/terminal/ConnectionChip";
@@ -31,7 +32,10 @@ import {
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
-import { restartSessionAgent } from "@/components/workspace/agent-restart";
+import {
+  ConversationElsewhereError,
+  restartSessionAgent,
+} from "@/components/workspace/agent-restart";
 import { AgentSwitcher } from "@/components/workspace/agent-switcher";
 import { pendingLaunch } from "@/components/workspace/pending-launch";
 import {
@@ -43,6 +47,7 @@ import {
   workspaces,
 } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
+import { inspectWindowConversation } from "@/lib/conversation-inspect";
 import { remove as removeTile } from "@/lib/grid";
 import { sessionAtShell, sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
@@ -94,6 +99,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     [sessionId, workspacesQ.data],
   );
   const session = sessionQ.data;
+  const daemonConnection = useDaemonConnection(session?.host_id ?? null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -129,6 +135,12 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       return restartSessionAgent({
         session,
         agents: definitions,
+        // The conversation the window is actually in, from its host.
+        inspect: () => inspectWindowConversation(session.host_id, daemonConnection, sessionId),
+        recordConversation: async (conversationId) => {
+          const saved = await sessions.update(sessionId, { agent_session_id: conversationId });
+          updateSessionCaches(queryClient, saved);
+        },
         restart: async () => {
           const saved = await sessions.restart(sessionId);
           updateSessionCaches(queryClient, saved);
@@ -141,7 +153,8 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       setErrorMessage(null);
       requestAnimationFrame(() => getHandle()?.focus());
     },
-    onError: (error) => setErrorMessage(String(error)),
+    onError: (error) =>
+      setErrorMessage(error instanceof ConversationElsewhereError ? error.message : String(error)),
   });
 
   // A command a restart queued for the fresh shell is typed the moment that

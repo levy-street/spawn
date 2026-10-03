@@ -340,6 +340,12 @@ export interface HostTransport {
     query: AgentTranscriptQuery,
     options?: HostRequestOptions,
   ): Promise<AgentTranscriptReport>;
+  /** Which conversation a window is actually in (`conv.inspect`, gated on
+   *  `conv.v1`). */
+  inspectConversation?(
+    sessionId: string,
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").ConversationInspection>;
   readRange?(
     path: string,
     offset: number,
@@ -381,6 +387,10 @@ export interface HostTransport {
 export interface StreamingHostTransport extends HostTransport {
   readonly capabilities: HostCapabilities | null;
   hasCapability(operation: string): boolean;
+  inspectConversation(
+    sessionId: string,
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").ConversationInspection>;
   readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile>;
   readRange(
     path: string,

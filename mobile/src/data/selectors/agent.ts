@@ -198,11 +198,13 @@ const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> 
     resume: (id) => `--resume ${id}`,
     continueLatest: "--continue",
   },
-  // Codex names its own sessions and takes `resume` as a subcommand after the
-  // global flags, so only "the latest one here" can be asked for.
+  // Codex names its own sessions, so it cannot be launched under an id; it
+  // takes `resume` as a subcommand after the global flags. A conversation the
+  // host named for the window (`conv.inspect`) is resumed by that id, and
+  // "the latest one here" stands in only where none was named.
   codex: {
     launch: null,
-    resume: null,
+    resume: (id) => `resume ${id}`,
     continueLatest: "resume --last",
   },
 };

@@ -2120,3 +2120,55 @@ describe("HostControlClient readHead", () => {
     client.close();
   });
 });
+
+describe("HostControlClient conversation inspection", () => {
+  const WITH_CONV = ["ping", "conv.v1"];
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+
+  test("asks about one window and returns what its host says", async () => {
+    const { client, pc } = await readyClient({}, hostId, WITH_CONV);
+    expect(client.hasCapability("conv.v1")).toBe(true);
+    const pending = client.inspectConversation(sessionId);
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.operation).toBe("conv.inspect");
+    expect(request.payload).toEqual({ session_id: sessionId });
+    const result = {
+      agent: "claude-code",
+      conversation_id: "4e0b4642-0972-40ac-9a18-61d542276b76",
+      state: "idle",
+      cli_version: "2.1.288",
+      live_elsewhere: true,
+      source: "parked",
+    };
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result,
+      }),
+    );
+    expect(await pending).toEqual(result);
+    client.close();
+  });
+
+  test("a malformed answer is refused rather than believed", async () => {
+    const { client, pc } = await readyClient({}, hostId, WITH_CONV);
+    const pending = client.inspectConversation(sessionId);
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: { agent: "claude-code", conversation_id: "../../x", live_elsewhere: false },
+      }),
+    );
+    await expect(pending).rejects.toThrow(/invalid conversation report/i);
+    client.close();
+  });
+});
