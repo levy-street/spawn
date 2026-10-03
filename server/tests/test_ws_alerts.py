@@ -193,9 +193,18 @@ class _AlertCollector:
             await self._received.wait()
 
 
-async def _run_daemon(token: str, frames: list[dict[str, Any]]) -> FakeDaemonWebSocket:
+async def _run_daemon(
+    token: str,
+    frames: list[dict[str, Any]],
+    *,
+    existing_sessions: list[str] | None = None,
+) -> FakeDaemonWebSocket:
     ws = FakeDaemonWebSocket()
-    ws.queue_text(REGISTER)
+    ws.queue_text(
+        REGISTER
+        if existing_sessions is None
+        else {**REGISTER, "existing_sessions": existing_sessions}
+    )
     for frame in frames:
         ws.queue_text(frame)
     ws.queue_disconnect()
@@ -401,6 +410,151 @@ async def test_alerts_do_not_cross_owners(client):
 
     assert len(alerts.events) == 1
     assert eavesdropper.events == []
+
+
+# ---------- exits the server asked for ----------
+
+
+async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("timed out waiting for condition")
+        await asyncio.sleep(0.01)
+
+
+def _record_pushes(monkeypatch) -> list[dict[str, Any]]:
+    from spawn_server.ws import daemon as daemon_module
+
+    pushed: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        daemon_module,
+        "_schedule_alert_push",
+        lambda _owner_id, payload: pushed.append(payload),
+    )
+    return pushed
+
+
+def _sent_frames(ws: FakeDaemonWebSocket, kind: str) -> list[dict[str, Any]]:
+    frames = [json.loads(item) for item in ws.sent_text]
+    return [frame for frame in frames if frame.get("type") == kind]
+
+
+async def test_archived_window_exits_without_a_died_alert(client, monkeypatch):
+    """Archive stops every window in the workspace. The daemon's confirming
+    exit is the stop the owner asked for, not a death: no alert, no push, and
+    no fencing close of the daemon's link — while the exit is still recorded."""
+    pushed = _record_pushes(monkeypatch)
+    user_id, access_token = await _signup(client, "alert-archive@example.com")
+    owner = {"Authorization": f"Bearer {access_token}"}
+    host_id = await _create_host(user_id)
+    pty_id = await _create_session_row(user_id, host_id)
+    created = await client.post("/api/workspaces", json={"name": "put away"}, headers=owner)
+    workspace_id = created.json()["workspace"]["id"]
+    tile = {"session_id": pty_id, "x": 0, "y": 0, "w": 24, "h": 24}
+    layout = {
+        "version": 3,
+        "active_tab": "tab-1",
+        "tabs": [
+            {
+                "id": "tab-1",
+                "name": "Tab 1",
+                "host_id": None,
+                "cwd": None,
+                "layout": {"version": 3, "tiles": [tile]},
+            }
+        ],
+    }
+    patched = await client.patch(
+        f"/api/workspaces/{workspace_id}", json={"layout": layout}, headers=owner
+    )
+    assert patched.status_code == 200, patched.text
+
+    ws = FakeDaemonWebSocket()
+    task = asyncio.create_task(daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id)))  # type: ignore[arg-type]
+    async with _AlertCollector(user_id) as alerts:
+        ws.queue_text({**REGISTER, "existing_sessions": [pty_id]})
+        await _wait_until(lambda: bool(_sent_frames(ws, "registered")))
+        ws.queue_text({"type": "session.foreground", "session_id": pty_id, "command": "claude"})
+
+        archived = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=owner)
+        assert archived.status_code == 200, archived.text
+        assert [frame["session_id"] for frame in _sent_frames(ws, "session.kill")] == [pty_id]
+
+        ws.queue_text({"type": "session.exit", "session_id": pty_id, "signal": "TERM"})
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert alerts.events == []
+    assert pushed == []
+    assert ws.closed is None
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, pty_id)
+        assert row is not None
+        assert row.status == "killed"
+        assert row.exited_at is not None
+        assert row.foreground_command is None
+
+
+async def test_returning_host_exits_raise_no_died_alert(client, monkeypatch):
+    """The kills a returning host is handed come back as exits too: for a
+    window stopped while it was away (its row already says so) and for one
+    moved to another host (no longer this host's row to report on)."""
+    pushed = _record_pushes(monkeypatch)
+    user_id, _ = await _signup(client, "alert-returning@example.com")
+    host_id = await _create_host(user_id)
+    other_host_id = await _create_host(user_id, name="elsewhere")
+    stopped = await _create_session_row(user_id, host_id, status="killed")
+    moved = await _create_session_row(user_id, other_host_id)
+
+    async with _AlertCollector(user_id) as alerts:
+        ws = await _run_daemon(
+            auth.issue_daemon_token(host_id, user_id),
+            [
+                {"type": "session.exit", "session_id": stopped, "exit_code": 143},
+                {"type": "session.exit", "session_id": moved, "signal": "TERM"},
+            ],
+            existing_sessions=[stopped, moved],
+        )
+
+    assert sorted(frame["session_id"] for frame in _sent_frames(ws, "session.kill")) == sorted(
+        [stopped, moved]
+    )
+    assert alerts.events == []
+    assert pushed == []
+    assert ws.closed is None
+    async with get_sessionmaker()() as session:
+        stopped_row = await session.get(Session, stopped)
+        assert stopped_row is not None
+        assert (stopped_row.status, stopped_row.exit_code) == ("killed", 143)
+        moved_row = await session.get(Session, moved)
+        assert moved_row is not None
+        assert (moved_row.status, moved_row.exit_code) == ("running", None)
+
+
+async def test_a_crash_still_raises_died_and_its_push(client, monkeypatch):
+    """The other side of the two tests above: nobody asked for this exit."""
+    pushed = _record_pushes(monkeypatch)
+    user_id, _ = await _signup(client, "alert-still-crashes@example.com")
+    host_id = await _create_host(user_id)
+    pty_id = await _create_session_row(user_id, host_id)
+
+    async with _AlertCollector(user_id) as alerts:
+        await _run_daemon(
+            auth.issue_daemon_token(host_id, user_id),
+            [
+                {"type": "session.foreground", "session_id": pty_id, "command": "claude"},
+                {"type": "session.exit", "session_id": pty_id, "signal": "KILL"},
+            ],
+            existing_sessions=[pty_id],
+        )
+
+    assert [event["event"] for event in alerts.events] == ["session.died"]
+    assert alerts.events[0]["command"] == "claude"
+    assert [payload["event"] for payload in pushed] == ["session.died"]
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, pty_id)
+        assert row is not None and row.status == "killed"
 
 
 # ---------- delivery over /ws/alerts ----------

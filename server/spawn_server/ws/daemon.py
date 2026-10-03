@@ -1900,6 +1900,52 @@ def _validated_live_bindings(value: object) -> list[dict[str, object]]:
     return valid
 
 
+#: How many unclaimed session ids one registration names in its log line. The
+#: count beside them is always exact.
+_UNCLAIMED_SESSION_LOG_IDS = 8
+
+
+async def _sort_existing_sessions(
+    session: AsyncSession, host: Host, reported: object
+) -> tuple[list[str], list[str], list[str]]:
+    """Split a registering daemon's live workers into (adopt, stop, unclaimed).
+
+    `existing_sessions` is the daemon's word for what still runs on it; each
+    session row is the server's word for where its window runs. The two part
+    when a window is stopped, or moved to another host, while this host is
+    offline: the kill sent then reached nobody, so the worker lives on with no
+    window that will ever attach to it.
+
+    - adopt: rows bound to this host. Routing reattaches them.
+    - stop: adopted rows the server already stopped ("killed"), and rows that
+      now name another of the owner's hosts — that window runs there now.
+    - unclaimed: ids with no row in this account. They are left running and
+      only logged: after a database restore a missing row may be a window
+      created since the backup, and stopping live work on a guess is worse
+      than an idle shell. Another account's row is never acted on either.
+    """
+    adopt: list[str] = []
+    stop: list[str] = []
+    unclaimed: list[str] = []
+    if not isinstance(reported, list):
+        return adopt, stop, unclaimed
+    seen: set[str] = set()
+    for sid in reported:
+        if not isinstance(sid, str) or sid in seen:
+            continue
+        seen.add(sid)
+        session_row = await session.get(Session, sid)
+        if session_row is not None and session_row.host_id == host.id:
+            adopt.append(sid)
+            if session_row.status == "killed":
+                stop.append(sid)
+        elif session_row is not None and session_row.owner_user_id == host.owner_user_id:
+            stop.append(sid)
+        else:
+            unclaimed.append(sid)
+    return adopt, stop, unclaimed
+
+
 def _rtc_binding_frame(
     binding: RtcSessionBinding,
     frame_type: str,
@@ -2142,18 +2188,20 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         else:
                             await _close_daemon_consistency_failure(conn)
                         break
-                    existing = obj.get("existing_sessions") or []
                     valid_existing: list[str] = []
+                    stale_existing: list[str] = []
+                    unclaimed_existing: list[str] = []
                     durable_owner = False
                     async with _bounded_host_ownership_session() as session:
                         durable_owner = await _lock_durable_host_owner(session, conn)
                         if durable_owner:
-                            for sid in existing:
-                                if not isinstance(sid, str):
-                                    continue
-                                session_row = await session.get(Session, sid)
-                                if session_row is not None and session_row.host_id == host.id:
-                                    valid_existing.append(sid)
+                            (
+                                valid_existing,
+                                stale_existing,
+                                unclaimed_existing,
+                            ) = await _sort_existing_sessions(
+                                session, host, obj.get("existing_sessions")
+                            )
                         await session.rollback()
 
                     registration_accepted = False
@@ -2221,6 +2269,28 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         conn.durable_owner_valid_until = (
                             time.monotonic() + DURABLE_OWNERSHIP_CACHE_SECONDS
                         )
+                        # The kills that could not be delivered while this
+                        # host was away. Each worker's exit comes back as an
+                        # ordinary `session.exit`, which raises no alert: the
+                        # row is "killed" already, or no longer this host's.
+                        for sid in stale_existing:
+                            await _bounded_send_text(
+                                conn, {"type": "session.kill", "session_id": sid, "signal": "TERM"}
+                            )
+                        if stale_existing:
+                            log.info(
+                                "stopping %d session(s) stopped or moved while host=%s was offline",
+                                len(stale_existing),
+                                host.id,
+                            )
+                        if unclaimed_existing:
+                            log.warning(
+                                "host=%s runs %d session(s) with no window in this account; "
+                                "left running ids=%s",
+                                host.id,
+                                len(unclaimed_existing),
+                                unclaimed_existing[:_UNCLAIMED_SESSION_LOG_IDS],
+                            )
                         if conn.keeps_peers_across_reconnect:
                             await _reconcile_live_bindings(conn, live_bindings)
                         await _auto_update_after_registration(conn)
@@ -2559,6 +2629,15 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 # went down with the session.
                                 dying_command = session_row.foreground_command
                                 alert_owner_id = session_row.owner_user_id
+                                # The server writes "killed" itself when it
+                                # stops a window (archive), committed before
+                                # the kill goes out — or, for a host that was
+                                # offline, long before it returns and is sent
+                                # it. This exit is that confirmation: the owner
+                                # asked for it, so it is not news, and the row
+                                # stays "killed" however the shell went. A
+                                # crash reaches here from "running".
+                                stopped_by_server = session_row.status == "killed"
                                 # How long this circle stayed open. Read here
                                 # for the same reason: after the update the row
                                 # is still present, but this is the one place
@@ -2577,7 +2656,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                         _session_owner_exists(conn),
                                     )
                                     .values(
-                                        status="killed" if sig else "exited",
+                                        status="killed" if sig or stopped_by_server else "exited",
                                         exit_code=code,
                                         exited_at=_utcnow(),
                                         foreground_command=None,
@@ -2592,12 +2671,13 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     # the same update nulls foreground_command,
                                     # so `is_agent_finish` sees a status that
                                     # has left "running" and stays silent.
-                                    died_alert = session_died_payload(
-                                        sid,
-                                        dying_command,
-                                        exit_code=code if isinstance(code, int) else None,
-                                        signal=sig if isinstance(sig, str) else None,
-                                    )
+                                    if not stopped_by_server:
+                                        died_alert = session_died_payload(
+                                            sid,
+                                            dying_command,
+                                            exit_code=code if isinstance(code, int) else None,
+                                            signal=sig if isinstance(sig, str) else None,
+                                        )
                                 else:
                                     await session.rollback()
                             else:

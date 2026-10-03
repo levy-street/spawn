@@ -1132,6 +1132,103 @@ async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_conne
     assert get_broker().get_daemon_for_session(pty_id) is None
 
 
+async def _set_session_status(session_id: str, status: str) -> None:
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, session_id)
+        assert row is not None
+        row.status = status
+        await session.commit()
+
+
+async def test_register_stops_workers_whose_windows_were_stopped_or_moved_while_offline(
+    client, caplog
+):
+    """A kill sent while a host is offline reaches nobody, so its worker is
+    still running when the host comes back. Registration delivers it then —
+    for a window stopped here, and for one moved to another of the owner's
+    hosts — and for nothing else: an id with no row may be a window created
+    after the backup a database was restored from."""
+    user_id, _ = await _signup(client, "ws-daemon-reaper@example.com")
+    stranger_id, _ = await _signup(client, "ws-daemon-reaper-stranger@example.com")
+    host_id = await _create_host(user_id, name="returning")
+    other_host_id = await _create_host(user_id, name="elsewhere")
+    stranger_host_id = await _create_host(stranger_id, name="not-yours")
+    live = await _create_session_row(user_id, host_id, name="live")
+    stopped = await _create_session_row(user_id, host_id, name="stopped")
+    await _set_session_status(stopped, "killed")
+    moved = await _create_session_row(user_id, other_host_id, name="moved")
+    foreign = await _create_session_row(stranger_id, stranger_host_id, name="foreign")
+    unknown = "00000000-0000-4000-8000-0000000000ef"
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    with caplog.at_level("INFO", logger="spawn.ws.daemon"):
+        ws.queue_text(
+            {
+                "type": "register",
+                "version": "0.2.0",
+                "existing_sessions": [live, stopped, moved, foreign, unknown, moved, 7],
+            }
+        )
+        await _wait_until(
+            lambda: sum(item.get("type") == "session.kill" for item in _sent_json(ws)) >= 2
+        )
+        await asyncio.sleep(0.05)
+
+    sent = _sent_json(ws)
+    kills = [item for item in sent if item.get("type") == "session.kill"]
+    assert kills == [
+        {"type": "session.kill", "session_id": stopped, "signal": "TERM"},
+        {"type": "session.kill", "session_id": moved, "signal": "TERM"},
+    ]
+    # Delivered only once the daemon has been told it is registered.
+    registered_at = next(i for i, item in enumerate(sent) if item.get("type") == "registered")
+    assert all(sent.index(kill) > registered_at for kill in kills)
+
+    broker = get_broker()
+    daemon = broker.get_daemon_for_host(host_id)
+    assert daemon is not None
+    assert broker.get_daemon_for_session(live) is daemon
+    # The stopped window is still this host's: its exit must reach its row.
+    assert broker.get_daemon_for_session(stopped) is daemon
+    assert broker.get_daemon_for_session(moved) is None
+    assert broker.get_daemon_for_session(foreign) is None
+    assert broker.get_daemon_for_session(unknown) is None
+
+    unclaimed = [r for r in caplog.records if "no window in this account" in r.getMessage()]
+    assert len(unclaimed) == 1
+    assert "runs 2 session(s)" in unclaimed[0].getMessage()
+    assert unknown in unclaimed[0].getMessage()
+
+    # The kills come back as ordinary exits. The moved window's row is the
+    # other host's and is left alone; the stopped one records its exit.
+    ws.queue_text({"type": "session.exit", "session_id": moved, "signal": "TERM"})
+    ws.queue_text({"type": "session.exit", "session_id": stopped, "exit_code": 143})
+    await _wait_until(lambda: broker.get_daemon_for_session(stopped) is None)
+    assert ws.close_calls == []
+
+    async with get_sessionmaker()() as session:
+        moved_row = await session.get(Session, moved)
+        assert moved_row is not None
+        assert (moved_row.host_id, moved_row.status, moved_row.exit_code) == (
+            other_host_id,
+            "running",
+            None,
+        )
+        stopped_row = await session.get(Session, stopped)
+        assert stopped_row is not None
+        assert (stopped_row.status, stopped_row.exit_code) == ("killed", 143)
+        assert stopped_row.exited_at is not None
+        live_row = await session.get(Session, live)
+        assert live_row is not None and live_row.status == "running"
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+    assert get_broker().get_daemon_for_host(host_id) is None
+    assert get_broker().get_daemon_for_session(stopped) is None
+
+
 async def test_pending_daemon_cannot_evict_or_reroute_accepted_owner(client):
     user_id, _ = await _signup(client, "ws-daemon-pending-owner@example.com")
     host_id = await _create_host(user_id)

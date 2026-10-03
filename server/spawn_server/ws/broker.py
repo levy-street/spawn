@@ -501,14 +501,18 @@ class Broker:
     ) -> bool:
         async with self._lock:
             conn = self._daemon_by_session.get(session_id)
-            if expected_daemon is not None and (
-                conn is not expected_daemon
-                or expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
+            if expected_daemon is not None:
+                if expected_host_generation is None or not self._is_accepted_daemon_owner_locked(
                     expected_daemon, expected_host_generation
-                )
-            ):
-                return False
+                ):
+                    return False
+                if conn is None:
+                    # Already let go: stopping or deleting a session detaches
+                    # it before its daemon confirms the exit. There is nothing
+                    # to undo, and the reporter is still the accepted owner.
+                    return True
+                if conn is not expected_daemon:
+                    return False
             conn = self._daemon_by_session.pop(session_id, None)
             if conn is not None:
                 conn.session_ids.discard(session_id)

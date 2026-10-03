@@ -229,7 +229,7 @@ the window. `today` is the server's UTC day, returned so a client densifying
 rather than disagreeing with it across a timezone.
 
 Behind it is `legion_days`, an append-only per-owner-per-UTC-day counter table
-(migration 0042). It exists because sessions are hard-deleted with their
+(migration 0055). It exists because sessions are hard-deleted with their
 workspace: a profile computed from the `sessions` table would show a person's
 history shrinking as they tidy up. `agents` counts the same disclosed
 `session.foreground` basenames the pane labels use — never arguments or paths —
@@ -250,7 +250,7 @@ input.
 | POST   | `/api/sessions/{id}/restart` | respawn the login shell in the session's saved `cwd`                       |
 | GET    | `/api/sessions/{id}/access` | list skill grants for a session                                             |
 | PATCH  | `/api/sessions/{id}/access` | replace grants with `{skill_ids?}`                                         |
-| DELETE | `/api/sessions/{id}` | sends `session.kill` if needed, then hard-deletes the session row                  |
+| DELETE | `/api/sessions/{id}` | hard-deletes the session row, then sends `session.kill` if its host is connected   |
 
 `skill_ids` omitted grants every `enabled_by_default` skill. `workspace_id`
 transactionally appends a tile to that workspace (`tile` omitted → the server
@@ -361,14 +361,13 @@ A workspace is a named 24×24 canvas of tiles. Tiles hold a session terminal, or
 
 | Method | Path | Body |
 |--------|------|------|
-| GET | `/api/workspaces` | list, ordered by `position` |
+| GET | `/api/workspaces` | list, ordered by `position`; `?archived=true` lists the archived ones instead, newest first |
 | POST | `/api/workspaces` | `{name?, first_session?: {host_id, cwd, skill_ids?}, icon?, icon_source?}` → `{workspace, session\|null}` |
 | GET | `/api/workspaces/{id}` | one workspace |
 | PATCH | `/api/workspaces/{id}` | `{name?, layout?, position?, host_id?, cwd?, icon?, icon_source?}` — `icon` present-and-null clears the mark, absent leaves it |
-| DELETE | `/api/workspaces/{id}` | kills and deletes every session referenced by its tiles, then the workspace (204) |
-| POST | `/api/workspaces/{id}/archive` | put it away: kills its sessions, keeps its shape server-side, empties its layout, sets `archived_at` |
-| POST | `/api/workspaces/{id}/unarchive` | rebuild it and spawn a fresh shell per pane; `{host_id?}` re-homes it, and 409 `host_required` asks for one when a pane's own host is gone or offline |
-| GET | `/api/workspaces/{id}/archived-shape` | the snapshot an archived workspace is holding, for viewing it without restoring: `{version: 1, active_tab, tabs: [{id, name, host_id, cwd, tiles: [{x, y, w, h, pane}]}]}` where `pane` is `{kind: "session", host_id, cwd, name, skill_ids, command}` or `{kind: "widget", widget}`; 409 `workspace_not_archived` otherwise |
+| DELETE | `/api/workspaces/{id}` | deletes every session referenced by its tiles and the workspace, then sends each `session.kill` (204) |
+| POST | `/api/workspaces/{id}/archive` | put it away (suspend, `0053`): stops every session in it — status `killed`, committed before each `session.kill` is sent — and keeps the rows and the layout exactly as they are; sets `archived_at`; 409 `workspace_archived` if it already is |
+| POST | `/api/workspaces/{id}/unarchive` | bring it back: each session restarts under its own id, in its own folder, on its own host (`session.restart`); one whose host is offline stays stopped and is started from its own window later — a restore is never refused over one host; 409 `workspace_not_archived` otherwise |
 | GET | `/api/workspace-templates` | the caller's saved templates, ordered by name |
 | POST | `/api/workspace-templates` | `{name, host_id?, cwd?, spec, icon?, icon_source?}` — host/cwd: the folder the template remembers (instantiation skips the picker);  spec: `{version: 1, tabs: [{name, tiles: [{x, y, w, h, run}]}]}` where `run` is `{kind: "shell"\|"agent"\|"files", command?}` (command required for agents); geometry validated per tab with the grid invariants |
 | PATCH | `/api/workspace-templates/{id}` | `{name?, host_id?, cwd?, spec?, icon?, icon_source?}` |
@@ -411,28 +410,34 @@ Envelope invariants (server-validated on every write): 1–8 tabs, unique
 non-empty tab `id`s (≤64 chars), non-empty `name`s (≤64), and `active_tab`
 must name a tab when set (it records the last-open tab; new sessions land
 there when no explicit target is given). A session lives in exactly one tab
-— duplicates across tabs are pruned, first tab wins. Migration `0033` wraps
+— duplicates across tabs are pruned, first tab wins. Migration `0046` wraps
 every stored v2 layout into a single `{"id": "tab-1", "name": "Tab 1"}` tab,
 and `parse_workspace_layout` performs the same upgrade at read time for any
 straggler rows.
 
-Workspace home (`0034`): each workspace carries a nullable `host_id` + `cwd`
-— the host and folder chosen when it was created (`first_session`), backfilled
-from the first session tile for existing rows. New sessions and widgets
-default there, so adding a pane never asks where; PATCH validates that
-`host_id` names one of the caller's hosts and that `cwd` is non-empty.
+A workspace has no home host. It is a layout of windows, and each window
+runs wherever it was opened: a session tile on its own session row's host, a
+files widget on the `host_id` it names. One workspace can hold windows from
+several hosts, and every new window asks where it runs (both clients rank the
+choices with one pure function: web `lib/places.ts`, mobile
+`data/selectors/places.ts`).
 
-Tab home (`0039`): each tab carries the same nullable `host_id` + `cwd` pair
-inside the envelope — where a window added to *that* tab opens. It is always a
-pair, and null on both means "inherit the workspace's home", so a tab that has
-never been re-pointed follows the workspace as it moves. A tab naming a host
-that is not the caller's — or carrying half a pair — is written back as
-inheriting rather than rejected, the same treatment an unowned tile gets.
-Migration `0039` backfills each tab from its first session tile (and each
-archived tab from its first stored session pane); tabs with nothing to inherit
-from are left untouched, since an absent pair already reads as inheriting.
-`ArchivedTab` carries the pair too, so a restore comes back pointing where the
-tab pointed.
+The home pairs that used to decide this are retired but still stored, for
+older clients:
+
+- Workspace (`0047`, re-backfilled by `0067`): a nullable `host_id` + `cwd`.
+  Create records the `first_session`'s host and folder, or an explicit
+  `host_id`/`cwd`; PATCH still accepts the pair, validating that `host_id`
+  names one of the caller's hosts and that `cwd` is non-empty. Session create
+  no longer adopts a session's host onto a workspace without one.
+- Tab (`0052`): the same nullable pair inside each envelope tab, always a
+  pair. A tab naming a host that is not the caller's, or carrying half a
+  pair, is written back as null rather than rejected, the same treatment an
+  unowned tile gets. Duplicating a workspace or a tab carries it over.
+
+No client opens a window there any more. The web reads the workspace pair
+only as the last fallback for the folder a workspace's icon is looked for in,
+after its first session and its first files widget.
 
 Per-tab grid invariants (unchanged from v2): integer geometry on a 24×24
 canvas, `w ≥ 4`, `h ≥ 4`, no overlap, max 16 tiles; unowned `session_id`s on
@@ -489,6 +494,15 @@ not to need one.
 
 {"type": "session.foreground", "session_id": "uuid", "command": "claude"}
 ```
+
+`existing_sessions` lists the session workers still running on the host,
+including those a restarted daemon adopted (`docs/SESSIOND.md`). Routing is
+reattached for each id whose row names this host. A kill sent while a host is
+offline reaches nobody, so after `registered` the server sends
+`session.kill` (`TERM`) for each worker whose window was stopped (row
+`killed`) or moved to another of the owner's hosts in the meantime. An id
+with no row in the account is left running and only logged: after a database
+restore, a missing row may be a window created since the backup.
 
 Both activity frames are daemon-throttled metadata signals. They contain no
 terminal bytes: `session.activity` records meaningful PTY output timing, while
@@ -801,7 +815,12 @@ least the window old. Three writes null `foreground_command` — the
 `session.exit` handler, `POST /api/sessions/{id}/restart`, and workspace
 archive — and only the first of them is an alert; the other two are things
 the owner just asked for. `agent.finished` therefore requires the session to
-still be `running`.
+still be `running`. The first is an alert only when nobody asked for it
+either: archive writes `killed` and commits before it sends the kill, so the
+exit that confirms it finds the row stopped already and is recorded
+(`exit_code`, `exited_at`) without one. The same holds for a kill delivered
+to a returning host, and an exit from a host the window has moved away from
+does not touch the row at all.
 
 ### Server → browser
 
@@ -821,9 +840,10 @@ still be `running`.
   it finished a turn, or it is asking something. For an agent CLI this is the
   common case, because those idle at their own prompt instead of exiting.
   Emitted at most once per quiet period — only fresh activity rearms it.
-- `session.died` — the session exited or was killed. `command` names whatever
-  was in the foreground when it went, or is null for an idle shell. Exactly
-  one event is published for this transition, never a finish as well.
+- `session.died` — the session exited or was killed, and the server had not
+  stopped it (see above). `command` names whatever was in the foreground when
+  it went, or is null for an idle shell. Exactly one event is published for
+  this transition, never a finish as well.
 - `alerts.ping` — idle keepalive, roughly every 25 s. Carries no meaning
   beyond "the link is alive"; a client that stops seeing them should redial.
 

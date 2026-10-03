@@ -389,6 +389,50 @@ async def test_host_ping_rejects_stale_daemon_and_generation(app):
 
 
 @pytest.mark.asyncio
+async def test_fenced_detach_accepts_a_session_already_let_go(app):
+    """Stopping or deleting a session detaches it before its daemon confirms
+    the exit. That confirmation finding nothing left to detach is not a
+    fencing failure; a session routed to another daemon, or a reporter that is
+    no longer the accepted owner, still is."""
+    broker = Broker()
+    daemon = DaemonConn("detach-host", "owner", FakeWS())  # type: ignore[arg-type]
+    await _accept_owner(broker, daemon, generation=1)
+    elsewhere = DaemonConn("detach-other-host", "owner", FakeWS())  # type: ignore[arg-type]
+    await _accept_owner(broker, elsewhere, generation=1)
+
+    await broker.attach_session_to_daemon("routed-here", daemon)
+    assert await broker.detach_session(
+        "routed-here", expected_daemon=daemon, expected_host_generation=1
+    )
+    assert broker.get_daemon_for_session("routed-here") is None
+
+    # Already let go: nothing to undo, and the reporter still owns its host.
+    assert await broker.detach_session(
+        "routed-here", expected_daemon=daemon, expected_host_generation=1
+    )
+    assert not await broker.detach_session(
+        "routed-here", expected_daemon=daemon, expected_host_generation=None
+    )
+
+    # Routed to another daemon (a window rebound elsewhere): untouched.
+    await broker.attach_session_to_daemon("routed-there", elsewhere)
+    assert not await broker.detach_session(
+        "routed-there", expected_daemon=daemon, expected_host_generation=1
+    )
+    assert broker.get_daemon_for_session("routed-there") is elsewhere
+
+    # A superseded reporter is refused even when there is nothing to detach.
+    successor = DaemonConn("detach-host", "owner", FakeWS())  # type: ignore[arg-type]
+    await _accept_owner(broker, successor, generation=2)
+    assert not await broker.detach_session(
+        "routed-here", expected_daemon=daemon, expected_host_generation=1
+    )
+
+    await broker.unregister_daemon(successor)
+    await broker.unregister_daemon(elsewhere)
+
+
+@pytest.mark.asyncio
 async def test_host_rtc_bindings_enforce_caps_and_expire_deterministically(monkeypatch):
     from spawn_server.ws import host_signal
 

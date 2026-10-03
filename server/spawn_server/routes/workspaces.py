@@ -19,8 +19,8 @@ from .sessions import (
 from .sessions import (
     create_session_row,
     dispatch_session_launch,
-    kill_and_delete_session,
-    stop_session,
+    mark_session_stopped,
+    send_session_kill,
 )
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
@@ -475,12 +475,14 @@ async def archive_workspace(
         raise HTTPException(status_code=409, detail="workspace_archived")
 
     layout = parse_workspace_layout(workspace.layout)
+    stopped: list[tuple[str, str]] = []
     for tile in layout_tiles(layout):
         if not isinstance(tile.get("session_id"), str) or tile.get("widget") is not None:
             continue
         session_row = await db.get(Session, tile["session_id"])
         if session_row is not None and session_row.owner_user_id == user.id:
-            await stop_session(db, session_row)
+            mark_session_stopped(session_row)
+            stopped.append((session_row.id, session_row.host_id))
 
     workspace.archived_at = _utcnow()
     workspace.updated_at = workspace.archived_at
@@ -488,6 +490,11 @@ async def archive_workspace(
     await _reindex_active(db, user)
     await db.commit()
     await db.refresh(workspace)
+    # Sent after the commit, as restore dispatches its restarts: each exit
+    # the daemons confirm must find its row already stopped, or it reads as
+    # a crash and pages the owner.
+    for session_id, host_id in stopped:
+        await send_session_kill(session_id, host_id)
     return _to_out(workspace)
 
 
@@ -573,9 +580,15 @@ async def delete_workspace(
         for tile in layout_tiles(layout)
         if isinstance(tile.get("session_id"), str) and tile.get("widget") is None
     ]
+    deleted: list[tuple[str, str]] = []
     for session_id in referenced:
         session_row = await db.get(Session, session_id)
         if session_row is not None and session_row.owner_user_id == user.id:
-            await kill_and_delete_session(db, session_row)
+            deleted.append((session_row.id, session_row.host_id))
+            await db.delete(session_row)
     await db.delete(workspace)
     await db.commit()
+    # After the commit, so an exit the daemon confirms finds no row to
+    # report as a crash.
+    for session_id, host_id in deleted:
+        await send_session_kill(session_id, host_id)
