@@ -52,7 +52,7 @@ import {
   workspaceTemplates,
 } from "@/lib/api";
 import type { Rect, Tile } from "@/lib/grid";
-import { GRID_SIZE } from "@/lib/grid";
+import { GRID_SIZE, isFilesWidget } from "@/lib/grid";
 import { sessionAgent } from "@/lib/sessions";
 import {
   addTab,
@@ -952,9 +952,10 @@ export function WorkspaceTabs({
       const created: string[] = [];
       try {
         for (const tile of tab.layout.tiles) {
-          // A widget is pure layout: its copy needs no round trip.
+          // A widget is pure layout: its copy needs no round trip. One from a
+          // newer SPAWN D is left out of the copy (see duplicateTab).
           if (tile.widget) {
-            copiedIds.set(tile.session_id, crypto.randomUUID());
+            if (isFilesWidget(tile.widget)) copiedIds.set(tile.session_id, crypto.randomUUID());
             continue;
           }
           const source = sessionsById.get(tile.session_id);

@@ -93,7 +93,7 @@ export type LegacySplitNode =
       b: LegacySplitNode;
     };
 
-export function isFilesWidget(widget: TileWidget | undefined): widget is FilesWidget {
+export function isFilesWidget(widget: TileWidget | null | undefined): widget is FilesWidget {
   return (
     widget?.kind === "files" &&
     typeof widget.host_id === "string" &&

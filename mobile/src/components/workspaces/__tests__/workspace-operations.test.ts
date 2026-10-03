@@ -283,6 +283,58 @@ describe("workspace lifecycle operations", () => {
     expect(result.agentLaunchesSkipped).toBe(0);
   });
 
+  test("leaves a pane from a newer SPAWN D out of a duplicate, never copied blind", async () => {
+    const harness = dependencyHarness();
+    harness.randomId.mockReturnValueOnce("tab-copy").mockReturnValueOnce("widget-copy");
+    const source = workspace("source");
+    source.layout.tabs[0] = {
+      id: "tab-source",
+      name: "Work",
+      host_id: null,
+      cwd: null,
+      layout: {
+        version: 3,
+        tiles: [
+          {
+            session_id: "widget-source",
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 24,
+            widget: { kind: "files", host_id: "host-1", path: "/work" },
+          },
+          {
+            session_id: "desktop-source",
+            x: 8,
+            y: 0,
+            w: 16,
+            h: 24,
+            widget: { kind: "desktop", display: "seat-1" },
+          },
+        ],
+      },
+    };
+    source.layout.active_tab = "tab-source";
+
+    const result = await duplicateWorkspaceDeep(
+      { workspace: source, sessions: [], agents: [], existingNames: [] },
+      harness.dependencies,
+    );
+
+    const tiles = result.workspace.layout.tabs[0]?.layout.tiles ?? [];
+    expect(tiles).toEqual([
+      {
+        session_id: "widget-copy",
+        x: 0,
+        y: 0,
+        w: 8,
+        h: 24,
+        widget: { kind: "files", host_id: "host-1", path: "/work" },
+      },
+    ]);
+    expect(harness.createSession).not.toHaveBeenCalled();
+  });
+
   test("deletes a partial duplicate when recreation fails", async () => {
     const harness = dependencyHarness();
     harness.randomId.mockReturnValueOnce("tab-copy");
