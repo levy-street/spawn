@@ -27,7 +27,7 @@ const listing = fileListing({
 async function chooseFolder(page: Page) {
   await page.getByRole("button", { name: /Change where it runs/ }).click();
   await page
-    .getByRole("menu", { name: "Where?" })
+    .getByRole("menu", { name: "Where this runs" })
     .getByRole("menuitem", { name: /Choose a folder/ })
     .click();
 }
@@ -129,4 +129,39 @@ test("the where chip says host and folder, and a narrow pane keeps just the fold
 
   await page.setViewportSize({ width: 1280, height: 800 });
   await expect(chip.getByText("~/projects/spawn")).toBeVisible();
+});
+
+test("the where chip's menu is called Where this runs, on a desktop and on a phone", async ({
+  page,
+}) => {
+  await mockApp(page, {
+    sessions: [session()],
+    workspaces: [
+      workspace({
+        layout: { version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }] },
+      }),
+    ],
+    files: () => listing,
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const chip = page.getByRole("button", { name: /Change where it runs/ });
+
+  // The same words as the phone app's sheet, said above the places.
+  await chip.click();
+  const menu = page.getByRole("menu", { name: "Where this runs" });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByText("Where this runs", { exact: true })).toBeVisible();
+  await expect(page.getByText("Where?", { exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+
+  // At phone width the menu is a bottom sheet, and its title says it once.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await chip.click();
+  const sheet = page.getByRole("dialog", { name: "Where this runs" });
+  await expect(sheet).toBeVisible();
+  await expect(sheet.getByRole("menu", { name: "Where this runs" })).toBeVisible();
+  await expect(sheet.getByText("Where this runs", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("Where?", { exact: true })).toHaveCount(0);
 });

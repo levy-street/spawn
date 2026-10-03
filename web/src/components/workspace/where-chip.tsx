@@ -46,9 +46,10 @@ export function WhereChip({
   return (
     <span ref={anchorRef} className="inline-flex min-w-0 shrink">
       <CascadeMenu
-        root={where.panel(`where-${session.id}`, onPick)}
+        // The panel's own title names the menu and the phone's sheet alike;
+        // the same words as the phone app's "Where this runs" sheet.
+        root={where.panel(`where-${session.id}`, onPick, "Where this runs")}
         align="end"
-        sheetTitle="Where this runs"
         renderTrigger={(props) => (
           <button
             {...props}
