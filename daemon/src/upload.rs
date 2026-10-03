@@ -354,6 +354,9 @@ impl UploadLifecycleHooks {
         self.cleanup.pause_if_armed();
     }
 
+    // `fetch_update` is renamed `try_update` in Rust 1.99; this keeps building on
+    // the older stable toolchains the daemon also supports.
+    #[allow(deprecated)]
     fn fail_unlink(&self) -> bool {
         #[cfg(test)]
         return self
@@ -366,6 +369,9 @@ impl UploadLifecycleHooks {
         false
     }
 
+    // `fetch_update` is renamed `try_update` in Rust 1.99; this keeps building on
+    // the older stable toolchains the daemon also supports.
+    #[allow(deprecated)]
     fn fail_fsync(&self) -> bool {
         #[cfg(test)]
         return self

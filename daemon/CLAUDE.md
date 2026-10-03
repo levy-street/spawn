@@ -82,6 +82,9 @@ vendor/          exact upstream crate sources for narrowly documented patches;
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
                  with closed-channel registry pruning (webrtc/PATCHES.md).
+                 SCTP and ICE also allow clippy::double_must_use at the
+                 crate root: Rust 1.99 Clippy flags the #[must_use] that
+                 async_trait puts on every boxed future it generates.
                  SCTP and ICE are workspace members so their tests use the
                  daemon's Cargo.lock; webrtc is excluded to avoid resolving
                  its optional OpenSSL features. Native daemon regressions
