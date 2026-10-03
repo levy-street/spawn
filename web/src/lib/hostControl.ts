@@ -248,7 +248,19 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   mutation: boolean;
   dispatched: boolean;
+  /** Set when this request opens a stream; see `StreamOpening`. */
+  opening?: StreamOpening;
   removeAbort?: () => void;
+}
+
+/**
+ * A stream-opening request's claim on its channel, counted in
+ * `openingStreams` only while the request is actually on a channel: from its
+ * dispatch until its stream is registered or it fails. One held for a swap
+ * has no channel yet, so it must not keep the spent one from being swapped.
+ */
+interface StreamOpening {
+  onChannel: boolean;
 }
 
 interface IncomingStream {
@@ -423,8 +435,9 @@ export class HostControlClient {
   private channelRequests = 0;
   private rotating = false;
   private held: Array<{ requestId: string; frame: string }> = [];
-  // Stream-opening requests whose stream is not registered yet. Their first
-  // frames are already on the way, so the channel is not idle.
+  // Stream-opening requests sent on the channel whose stream is not
+  // registered yet: their first frames are already on the way, so the channel
+  // is not idle. A held one is not counted (see `StreamOpening`).
   private openingStreams = 0;
   private consumerRefusals = 0;
   private refusalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -692,10 +705,22 @@ export class HostControlClient {
       channel.send(frame);
       pending.dispatched = true;
       this.channelRequests += 1;
+      if (pending.opening) {
+        pending.opening.onChannel = true;
+        this.openingStreams += 1;
+      }
     } catch (error) {
       this.finishPending(requestId);
       pending.reject(error instanceof Error ? error : new Error("Host control send failed"));
     }
+  }
+
+  /** A stream-opening request's claim ends: its stream is registered (and
+   *  holds the channel itself) or the request failed. */
+  private leaveChannel(opening: StreamOpening): void {
+    if (!opening.onChannel) return;
+    opening.onChannel = false;
+    this.openingStreams -= 1;
   }
 
   private flushHeld(): void {
@@ -803,6 +828,15 @@ export class HostControlClient {
     payload?: unknown,
     options: HostControlRequestOptions = {},
   ): Promise<T> {
+    return this.issueRequest<T>(operation, payload, options);
+  }
+
+  private issueRequest<T>(
+    operation: string,
+    payload: unknown,
+    options: HostControlRequestOptions = {},
+    opening?: StreamOpening,
+  ): Promise<T> {
     // A swap in progress is still ready: the request waits for the new channel.
     if (this.state !== "ready" || (!this.rotating && this.channel?.readyState !== "open")) {
       return Promise.reject(new Error("Host control channel is not ready"));
@@ -845,6 +879,7 @@ export class HostControlClient {
         timer,
         mutation: INDETERMINATE_REQUEST_OPERATIONS.has(operation),
         dispatched: false,
+        ...(opening ? { opening } : {}),
       };
       if (options.signal) {
         const onAbort = () => {
@@ -952,11 +987,11 @@ export class HostControlClient {
     payload: Record<string, unknown>,
     options?: HostControlRequestOptions,
   ): Promise<{ declaration: T; stream: ReadableStream<Uint8Array> }> {
-    this.openingStreams += 1;
+    const opening: StreamOpening = { onChannel: false };
     try {
-      return await this.openIncomingStream<T>(operation, payload, options);
+      return await this.openIncomingStream<T>(operation, payload, opening, options);
     } finally {
-      this.openingStreams -= 1;
+      this.leaveChannel(opening);
       this.noteSettled();
     }
   }
@@ -964,9 +999,10 @@ export class HostControlClient {
   private async openIncomingStream<T extends { stream_id: string; length: number; sha256: string }>(
     operation: string,
     payload: Record<string, unknown>,
+    opening: StreamOpening,
     options?: HostControlRequestOptions,
   ): Promise<{ declaration: T; stream: ReadableStream<Uint8Array> }> {
-    const declaration = await this.request<T>(operation, payload, options);
+    const declaration = await this.issueRequest<T>(operation, payload, options, opening);
     const { stream_id: streamId, length, sha256 } = declaration ?? ({} as T);
     this.pruneIncomingTombstones();
     if (
@@ -1364,20 +1400,22 @@ export class HostControlClient {
     },
     signal?: AbortSignal,
   ): Promise<string> {
-    // Held open until the stream is registered below; see `openingStreams`.
-    this.openingStreams += 1;
+    // Holds its channel until the stream is registered below; see `StreamOpening`.
+    const opening: StreamOpening = { onChannel: false };
     let streamId: string;
     try {
-      const begin = await this.request<{ stream_id: string }>("fs.write.begin", declaration, {
-        signal,
-        timeoutMs: this.streamTimeoutMs(),
-      });
+      const begin = await this.issueRequest<{ stream_id: string }>(
+        "fs.write.begin",
+        declaration,
+        { signal, timeoutMs: this.streamTimeoutMs() },
+        opening,
+      );
       streamId = begin.stream_id;
       if (typeof streamId !== "string" || this.outgoingStreams.has(streamId)) {
         throw new HostControlError("invalid_response", "Host returned an invalid write stream");
       }
     } catch (error) {
-      this.openingStreams -= 1;
+      this.leaveChannel(opening);
       this.noteSettled();
       throw error;
     }
@@ -1405,7 +1443,7 @@ export class HostControlClient {
       this.resetOutgoingTimeout(streamId, outgoing);
     });
     // Registered: the stream itself now keeps the channel from being swapped.
-    this.openingStreams -= 1;
+    this.leaveChannel(opening);
     void committed.catch(() => {});
     const reader = stream.getReader();
     let cleanup: Promise<void> | null = null;

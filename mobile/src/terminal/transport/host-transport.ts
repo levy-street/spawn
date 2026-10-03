@@ -110,7 +110,19 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   dispatched: boolean;
   indeterminate: boolean;
+  /** Set when this request opens a stream; see `StreamOpening`. */
+  opening?: StreamOpening;
   removeAbort?: () => void;
+}
+
+/**
+ * A stream-opening request's claim on its channel, counted in
+ * `#openingStreams` only while the request is actually on a channel: from its
+ * dispatch until its stream is registered or it fails. One held for a swap
+ * has no channel yet, so it must not keep the spent one from being swapped.
+ */
+interface StreamOpening {
+  onChannel: boolean;
 }
 
 interface PendingCommand {
@@ -199,8 +211,9 @@ class WebViewHostTransport implements StreamingHostTransport {
   #rotating = false;
   #rotationTimer: ReturnType<typeof setTimeout> | null = null;
   #held: Array<{ requestId: string; message: NativeToWorkerMessage }> = [];
-  // Stream-opening requests whose stream is not registered yet: their first
-  // frames are already on the way, so the channel is not idle.
+  // Stream-opening requests sent on the channel whose stream is not
+  // registered yet: their first frames are already on the way, so the channel
+  // is not idle. A held one is not counted (see `StreamOpening`).
   #openingStreams = 0;
   #consumerRefused = false;
   #consumerRefusals = 0;
@@ -416,6 +429,15 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   request<T>(operation: string, payload?: unknown, options: HostRequestOptions = {}): Promise<T> {
+    return this.#request<T>(operation, payload, options);
+  }
+
+  #request<T>(
+    operation: string,
+    payload: unknown,
+    options: HostRequestOptions = {},
+    opening?: StreamOpening,
+  ): Promise<T> {
     if (this.#state !== "ready") {
       return Promise.reject(
         new HostControlTransportError("not_ready", "Host transport is not ready."),
@@ -461,6 +483,7 @@ class WebViewHostTransport implements StreamingHostTransport {
         timer,
         dispatched: false,
         indeterminate: INDETERMINATE_OPERATIONS.has(operation),
+        ...(opening ? { opening } : {}),
       };
       if (options.signal) {
         const onAbort = () => {
@@ -492,6 +515,10 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#send(message);
       pending.dispatched = true;
       this.#channelRequests += 1;
+      if (pending.opening) {
+        pending.opening.onChannel = true;
+        this.#openingStreams += 1;
+      }
     } catch (error) {
       this.#finishPending(requestId);
       pending.reject(error instanceof Error ? error : new Error("Host-control send failed."));
@@ -614,32 +641,30 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   async readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile> {
-    const release = this.#holdForStream();
+    const opening: StreamOpening = { onChannel: false };
     try {
-      const declaration = await this.#beginIncoming("fs.read", { path }, options);
+      const declaration = await this.#beginIncoming("fs.read", { path }, opening, options);
       return {
         ...exposedDeclaration(declaration),
         stream: this.#streams.beginIncoming(declaration, options),
       };
     } finally {
-      release();
+      this.#releaseOpening(opening);
     }
   }
 
   /**
-   * Keep the channel from being swapped while a stream-opening request is out
-   * and until its stream is registered, in the same continuation as the
-   * response: the stream's first frames are already on their way.
+   * A stream-opening request keeps its channel from being swapped from its
+   * dispatch until its stream is registered, in the same continuation as the
+   * response: the stream's first frames are already on their way. Released
+   * once registered (the stream then holds the channel) or failed.
    */
-  #holdForStream(): () => void {
-    this.#openingStreams += 1;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
+  #releaseOpening(opening: StreamOpening): void {
+    if (opening.onChannel) {
+      opening.onChannel = false;
       this.#openingStreams -= 1;
-      this.#settled();
-    };
+    }
+    this.#settled();
   }
 
   async readRange(
@@ -659,19 +684,20 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (!Number.isSafeInteger(length) || length <= 0 || length > rangeLimit) {
       throw new HostControlTransportError("invalid_request", "Range length is invalid.");
     }
-    const release = this.#holdForStream();
+    const opening: StreamOpening = { onChannel: false };
     let declaration: HostReadDeclarationWire;
     let stream: ReadableStream<Uint8Array>;
     try {
       declaration = await this.#beginIncoming(
         "fs.read.range",
         { path, offset, length },
+        opening,
         options,
         rangeLimit,
       );
       stream = this.#streams.beginIncoming(declaration, options);
     } finally {
-      release();
+      this.#releaseOpening(opening);
     }
     const raw = declaration.raw;
     if (declaration.length > length || !Number.isSafeInteger(raw["file_size"])) {
@@ -728,11 +754,12 @@ class WebViewHostTransport implements StreamingHostTransport {
       ...options,
       timeoutMs: options.timeoutMs ?? PREVIEW_REQUEST_TIMEOUT_MS,
     };
-    const release = this.#holdForStream();
+    const opening: StreamOpening = { onChannel: false };
     try {
       const declaration = await this.#beginIncoming(
         "fs.preview",
         { path, max_pixels: maxPixels },
+        opening,
         requestOptions,
         this.#capabilities.limits.previewBytes,
       );
@@ -746,7 +773,7 @@ class WebViewHostTransport implements StreamingHostTransport {
         stream: this.#streams.beginIncoming(declaration, requestOptions),
       };
     } finally {
-      release();
+      this.#releaseOpening(opening);
     }
   }
 
@@ -761,18 +788,23 @@ class WebViewHostTransport implements StreamingHostTransport {
       throw new HostControlTransportError("invalid_digest", "Host write digest is invalid.");
     }
     options.onProgress?.({ phase: "declaring", transferred: 0, total: declaration.length });
-    const release = this.#holdForStream();
+    const opening: StreamOpening = { onChannel: false };
     let writing: Promise<HostWriteResult>;
     try {
-      const begin = await this.request<unknown>("fs.write.begin", declaration, {
-        timeoutMs: this.#streamTimeout,
-        ...(options.signal ? { signal: options.signal } : {}),
-      });
+      const begin = await this.#request<unknown>(
+        "fs.write.begin",
+        declaration,
+        {
+          timeoutMs: this.#streamTimeout,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+        opening,
+      );
       // `write` registers its stream before its first await, so the stream
-      // already holds the channel when this hold is released.
+      // already holds the channel when this claim is released.
       writing = this.#streams.write(parseHostWriteStreamId(begin), stream, declaration, options);
     } finally {
-      release();
+      this.#releaseOpening(opening);
     }
     return writing;
   }
@@ -882,14 +914,17 @@ class WebViewHostTransport implements StreamingHostTransport {
   async #beginIncoming(
     operation: "fs.read" | "fs.read.range" | "fs.preview",
     payload: Record<string, unknown>,
+    opening: StreamOpening,
     options: HostRequestOptions = {},
     declarationLimit?: number,
   ): Promise<HostReadDeclarationWire> {
     this.#requireCapability(operation);
-    const response = await this.request<unknown>(operation, payload, {
-      ...options,
-      timeoutMs: options.timeoutMs ?? this.#streamTimeout,
-    });
+    const response = await this.#request<unknown>(
+      operation,
+      payload,
+      { ...options, timeoutMs: options.timeoutMs ?? this.#streamTimeout },
+      opening,
+    );
     return parseHostReadDeclaration(
       response,
       declarationLimit ?? this.#capabilities?.limits.fileBytes,

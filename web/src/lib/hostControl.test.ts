@@ -2355,6 +2355,129 @@ describe("HostControlClient consumer channel rotation", () => {
     client.close();
   });
 
+  /** A channel at its budget with a read still open across the mark. */
+  async function consumerAtBudget(options = {}) {
+    const { client, connection } = await readyConsumer(options);
+    await pingRepeatedly(client, connection, CHANNEL_ROTATE_AFTER_REQUESTS - 1);
+    const first = connection.latest();
+    const reading = client.readFile("/private/slow.log");
+    first.answerLast({
+      stream_id: "slow-read",
+      path: "/private/slow.log",
+      name: "slow.log",
+      length: 0,
+      sha256: EMPTY_SHA256,
+    });
+    const read = await reading;
+    await pingRepeatedly(
+      client,
+      connection,
+      CHANNEL_REQUEST_BUDGET - CHANNEL_ROTATE_AFTER_REQUESTS,
+    );
+    expect(first.requests()).toHaveLength(CHANNEL_REQUEST_BUDGET);
+    const finishRead = async () => {
+      first.receive({
+        version: 1,
+        type: "stream.end",
+        stream_id: "slow-read",
+        length: 0,
+        sha256: EMPTY_SHA256,
+      });
+      await expect(collectAll(read.stream)).resolves.toHaveLength(0);
+      for (let tick = 0; tick < 5; tick += 1) await Promise.resolve();
+    };
+    return { client, connection, first, finishRead };
+  }
+
+  test("a stream opened at the budget waits for the swap instead of blocking it", async () => {
+    const { client, connection, first, finishRead } = await consumerAtBudget();
+    // Held, not sent: it has no claim on the spent channel.
+    const next = client.readFile("/private/next.log", { timeoutMs: 5_000 });
+    expect(first.requests()).toHaveLength(CHANNEL_REQUEST_BUDGET);
+
+    // The read on the spent channel ends: nothing is in flight there, so the
+    // swap starts now rather than when the held open times out.
+    await finishRead();
+    expect(first.closed).toBe(true);
+    expect(connection.channels).toHaveLength(2);
+    const second = connection.latest();
+    second.open();
+    second.hello();
+    expect(second.requests().map((frame) => frame.operation)).toEqual(["fs.read"]);
+    second.answerLast({
+      stream_id: "next-read",
+      path: "/private/next.log",
+      name: "next.log",
+      length: 0,
+      sha256: EMPTY_SHA256,
+    });
+    const opened = await next;
+    expect(opened.streamId).toBe("next-read");
+
+    // Once on the replacement, the open stream holds that channel as before.
+    second.receive({
+      version: 1,
+      type: "stream.end",
+      stream_id: "next-read",
+      length: 0,
+      sha256: EMPTY_SHA256,
+    });
+    await expect(collectAll(opened.stream)).resolves.toHaveLength(0);
+    expect(client.getState()).toBe("ready");
+    expect(connection.channels).toHaveLength(2);
+    client.close();
+  });
+
+  test("a write begun at the budget waits for the swap instead of blocking it", async () => {
+    const { client, connection, first, finishRead } = await consumerAtBudget({
+      streamTimeoutMs: 5_000,
+    });
+    const writing = client.writeStream(new Blob([]).stream(), {
+      dir: "/private",
+      name: "empty.txt",
+      length: 0,
+      sha256: EMPTY_SHA256,
+    });
+    expect(first.requests()).toHaveLength(CHANNEL_REQUEST_BUDGET);
+
+    await finishRead();
+    expect(first.closed).toBe(true);
+    const second = connection.latest();
+    expect(second).not.toBe(first);
+    second.open();
+    second.hello();
+    expect(second.requests().map((frame) => frame.operation)).toEqual(["fs.write.begin"]);
+    second.answerLast({ stream_id: "empty-write" });
+    await waitFor(() => second.sent.some((frame) => JSON.parse(frame).type === "stream.end"));
+    second.receive({
+      version: 1,
+      type: "stream.committed",
+      stream_id: "empty-write",
+      path: "/private/empty.txt",
+    });
+    await expect(writing).resolves.toBe("/private/empty.txt");
+    expect(client.getState()).toBe("ready");
+    client.close();
+  });
+
+  test("a held stream open that gives up leaves the channel free to swap", async () => {
+    const { client, connection, first, finishRead } = await consumerAtBudget();
+    const abandoned = client.readFile("/private/next.log", { timeoutMs: 1 });
+    await expect(abandoned).rejects.toThrow("timed out");
+    await finishRead();
+    expect(first.closed).toBe(true);
+    const second = connection.latest();
+    second.open();
+    second.hello();
+    // It was never sent, so nothing reaches either channel for it.
+    expect(second.sent).toHaveLength(0);
+    for (const channel of connection.channels)
+      expect(channel.sent.map((frame) => JSON.parse(frame).type)).not.toContain("cancel");
+    await pingRepeatedly(client, connection, 1);
+    expect(connection.channels).toHaveLength(2);
+    client.close();
+  });
+
   test("a held request that times out was never sent, so nothing is cancelled", async () => {
     const { client, connection } = await readyConsumer();
     await pingRepeatedly(client, connection, CHANNEL_ROTATE_AFTER_REQUESTS);
