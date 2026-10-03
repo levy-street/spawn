@@ -43,6 +43,8 @@ src/
                  release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs
                  (host_transcripts.rs locates an agent's own transcript files
                  for `agent.transcripts`; reading stays with host_files.rs),
+                 codex_home.rs (a skilled window's own CODEX_HOME, reconciled
+                 against the user's — see "A skilled window's home"),
                  upload.rs, sessions.rs, service.rs + service/ (launchd/systemd
                  dispatch, Windows Task Scheduler/Run watchdog and control
                  pipe), …
@@ -478,6 +480,28 @@ connection's, since peers keep opening and closing through a server outage
 leak — of slots, or of peers that never finish closing — shows while it is
 one peer. Never write the state file from the RTC path: that write is an
 fsync, and the offer path waits on the locks it would run under.
+
+## A skilled window's home
+
+A window given skills gets `<config_dir>/sessions/<session id>/`
+(`config::window_homes_dir`): its `skills/` and `skills.json`, and the
+`codex-home/` its `CODEX_HOME` names. Each start and restart reconciles it
+and never wipes it — the wipe this replaced deleted the Codex conversations
+of every skilled window on Restart. `skills/` is spawnd's and is rewritten
+(a link in its place is removed, not followed); `codex-home/` is drawn from
+the user's own Codex home (`codex_home.rs`): their `config.toml` merged with
+`toml_edit`, their trust and credential-store choices kept; their `sessions/`,
+`archived_sessions/`, `history.jsonl` and `session_index.jsonl` linked, so
+rollouts land where `codex resume` and `agent.transcripts` look; their
+`auth.json` linked — a hard link on Windows, never a copy, since a copy that
+refreshed would fork Codex's single-use refresh token — and not projected at
+all for a keyring or `auto` credential store. The source is the session
+environment's `CODEX_HOME` (else `~/.codex`), never one inside the window
+homes. Every link is re-pointed and verified on each apply; a real entry
+that could be the user's — a store a window kept before the links, a
+sign-in made in the window — is left alone, and a projected file is replaced
+only where nothing is lost (a link, symbolic or hard, or a byte-identical
+copy).
 
 ## Before calling a change done
 
