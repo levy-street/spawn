@@ -247,6 +247,11 @@ struct WriteCleanup {
     cancel_order: Option<u64>,
 }
 
+/// An import stream taken out of service by this caller (`end_import`).
+struct EndedImport {
+    stream: Option<crate::host_conversations::ImportStream>,
+}
+
 /// One stream v2 write (`conv.import.begin`): taken out of its slot by the
 /// one that ends it, so nothing can write through it afterwards.
 struct ActiveImport {
@@ -302,6 +307,9 @@ struct State {
     /// (`conv.import.begin`), by stream id, and the request each began as.
     imports: HashMap<String, Arc<ActiveImport>>,
     import_requests: HashMap<String, String>,
+    /// Begins being opened beside the control loop, each holding its place
+    /// among the channel's imports (`MAX_IMPORT_STREAMS`).
+    import_reservations: usize,
     /// v2 writes that ended, kept a while: whether the device's own
     /// `stream.cancel` ended it (a chunk it sent before that is dropped),
     /// or anything else did (a later frame on it fails closed).
@@ -1073,7 +1081,11 @@ impl Context {
     }
 
     /// The conversation carrier's operations (`host_conversations`), on a
-    /// pair-admitted channel only.
+    /// pair-admitted channel only. Every one runs beside the channel's
+    /// control loop, never on it: each may wait on a transfer's lock, which
+    /// a commit holds while it verifies and extracts up to 2 GiB and an
+    /// export while it stops a window, and the frames queued behind it —
+    /// another import's chunks among them — must keep moving.
     async fn carry(
         &self,
         request_id: &str,
@@ -1091,7 +1103,7 @@ impl Context {
                 )
                 .await;
         };
-        let answer = match operation {
+        match operation {
             conv::EXPORT_OP => {
                 return self
                     .begin_export(request_id, payload, ticket, carrier)
@@ -1102,6 +1114,53 @@ impl Context {
                     .begin_import(request_id, payload, ticket, carrier)
                     .await
             }
+            _ => {}
+        }
+        let Ok(permit) = Arc::clone(&self.long_tasks).try_acquire_owned() else {
+            return self
+                .error(
+                    request_id,
+                    "too_many_tasks",
+                    "too many long-running host operations",
+                )
+                .await;
+        };
+        let context = self.clone();
+        let request_id = request_id.to_string();
+        let operation = operation.to_string();
+        let payload = payload.cloned();
+        let task = async move {
+            let _permit = permit;
+            let _ticket = ticket;
+            let sent = match Self::carrier_answer(&carrier, &operation, payload.as_ref()).await {
+                Some(Ok(result)) => context.fitted_response(&request_id, result).await,
+                Some(Err(error)) => context.error(&request_id, error.code, &error.detail).await,
+                None => {
+                    context
+                        .error(
+                            &request_id,
+                            "unsupported_operation",
+                            "operation is not supported",
+                        )
+                        .await
+                }
+            };
+            if !sent && !context.closed.load(Ordering::Acquire) {
+                close_with_deadline_later(context.direct.transport());
+            }
+        };
+        self.spawn_session_task(task).await
+    }
+
+    /// One carrier operation that answers with a single response; `None` for
+    /// one this family does not have.
+    async fn carrier_answer(
+        carrier: &crate::host_conversations::Carrier,
+        operation: &str,
+        payload: Option<&Map<String, Value>>,
+    ) -> Option<crate::host_files::FsResult<Value>> {
+        use crate::host_conversations as conv;
+        Some(match operation {
             conv::PROBE_OP => match conv::ProbeRequest::parse(payload) {
                 Ok(request) => carrier.probe(request).await,
                 Err(error) => Err(error),
@@ -1129,20 +1188,8 @@ impl Context {
                 Err(error) => Err(error),
             },
             conv::TRANSFERS_OP => carrier.transfers().await,
-            _ => {
-                return self
-                    .error(
-                        request_id,
-                        "unsupported_operation",
-                        "operation is not supported",
-                    )
-                    .await
-            }
-        };
-        match answer {
-            Ok(result) => self.fitted_response(request_id, result).await,
-            Err(error) => self.error(request_id, error.code, &error.detail).await,
-        }
+            _ => return None,
+        })
     }
 
     fn carrier(&self) -> Option<crate::host_conversations::Carrier> {
@@ -1500,7 +1547,10 @@ impl Context {
     }
 
     /// `conv.import.begin`: a v2 write stream into this host's staging, or
-    /// the staged transfer resumed under a new stream.
+    /// the staged transfer resumed under a new stream. Opened beside the
+    /// control loop: it may wait on the transfer's lock and reads back every
+    /// byte already staged. Its place among the channel's imports is taken
+    /// before then, so two begins never both pass the cap.
     async fn begin_import(
         &self,
         request_id: &str,
@@ -1513,14 +1563,14 @@ impl Context {
             Err(error) => return self.error(request_id, error.code, &error.detail).await,
         };
         {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if Self::take_early_cancel(&state, request_id) {
                 drop(state);
                 return self
                     .error(request_id, "cancelled", "the import was cancelled")
                     .await;
             }
-            if state.imports.len() >= MAX_IMPORT_STREAMS {
+            if state.imports.len() + state.import_reservations >= MAX_IMPORT_STREAMS {
                 drop(state);
                 return self
                     .error(
@@ -1530,11 +1580,42 @@ impl Context {
                     )
                     .await;
             }
+            state.import_reservations += 1;
         }
+        let context = self.clone();
+        let request_id = request_id.to_string();
+        let task = async move {
+            let sent = context
+                .open_import(&request_id, request, ticket, carrier)
+                .await;
+            if !sent && !context.closed.load(Ordering::Acquire) {
+                close_with_deadline_later(context.direct.transport());
+            }
+        };
+        if self.spawn_session_task(task).await {
+            return true;
+        }
+        let mut state = self.state.lock().await;
+        state.import_reservations = state.import_reservations.saturating_sub(1);
+        false
+    }
+
+    async fn open_import(
+        &self,
+        request_id: &str,
+        request: crate::host_conversations::ImportRequest,
+        ticket: RequestTicket,
+        carrier: crate::host_conversations::Carrier,
+    ) -> bool {
         let stream_id = Uuid::new_v4().to_string();
         let opened = match carrier.begin_import(request, &stream_id).await {
             Ok(opened) => opened,
-            Err(error) => return self.error(request_id, error.code, &error.detail).await,
+            Err(error) => {
+                let mut state = self.state.lock().await;
+                state.import_reservations = state.import_reservations.saturating_sub(1);
+                drop(state);
+                return self.error(request_id, error.code, &error.detail).await;
+            }
         };
         let claim = opened.stream.claim();
         let window = opened.stream.window;
@@ -1547,10 +1628,22 @@ impl Context {
         });
         {
             let mut state = self.state.lock().await;
+            state.import_reservations = state.import_reservations.saturating_sub(1);
             if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
                 drop(state);
                 claim.release().await;
                 return true;
+            }
+            // Cancelled while it was being opened: its stream ends at once,
+            // and the staged transfer stays, for a resume.
+            if Self::take_early_cancel(&state, request_id) {
+                drop(state);
+                if let Some(stream) = active.stream.lock().await.take() {
+                    stream.end().await;
+                }
+                return self
+                    .error(request_id, "cancelled", "the import was cancelled")
+                    .await;
             }
             state
                 .import_requests
@@ -1558,7 +1651,8 @@ impl Context {
             state.imports.insert(stream_id.clone(), active);
         }
         // Someone else may end this stream — a resumed begin on any
-        // channel, or the transfer's cancel — and the device hears why.
+        // channel, or the transfer's cancel — and the device hears why,
+        // from whichever takes the stream out of service.
         let watcher = self.clone();
         let watched = stream_id.clone();
         let watch_claim = claim.clone();
@@ -1594,13 +1688,11 @@ impl Context {
         .await
     }
 
-    /// Take an import stream out of service: off the channel's map, its
-    /// id remembered, and the stream itself handed back (once).
-    async fn end_import(
-        &self,
-        stream_id: &str,
-        device_cancelled: bool,
-    ) -> Option<crate::host_conversations::ImportStream> {
+    /// Take an import stream out of service: off the channel's map and its
+    /// id remembered. `None` when another already did — the one that did
+    /// tells the device why, once — otherwise the stream itself, unless a
+    /// chunk that failed took it first.
+    async fn end_import(&self, stream_id: &str, device_cancelled: bool) -> Option<EndedImport> {
         let active = {
             let mut state = self.state.lock().await;
             let active = state.imports.remove(stream_id)?;
@@ -1615,7 +1707,16 @@ impl Context {
             active
         };
         let stream = active.stream.lock().await.take();
-        stream
+        Some(EndedImport { stream })
+    }
+
+    /// What a frame for an import stream that has ended gets: dropped when
+    /// the device's own cancel or the transfer's cancel ended it, the channel
+    /// closed otherwise; `None` for a stream that was never an import.
+    async fn ended_import(&self, stream_id: &str) -> Option<bool> {
+        let mut state = self.state.lock().await;
+        Self::prune_tombstones(&mut state);
+        state.ended_imports.get(stream_id).map(|(_, own)| *own)
     }
 
     /// A chunk for a v2 import: `None` when the stream is no import at all.
@@ -1642,7 +1743,12 @@ impl Context {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
         let mut slot = active.stream.lock().await;
-        let stream = slot.as_mut()?;
+        // Ended between the look-up and now — the transfer's cancel, a
+        // resumed begin: answered as a frame for that ended stream.
+        let Some(stream) = slot.as_mut() else {
+            drop(slot);
+            return Some(self.ended_import(stream_id).await.unwrap_or(false));
+        };
         match stream
             .take_chunk(&carrier, sequence, bytes, caught_up)
             .await
@@ -1669,14 +1775,26 @@ impl Context {
                     stream.end().await;
                 }
                 let cancelled = error.code == "transfer_cancelled";
-                let _ = self.end_import(stream_id, cancelled).await;
+                let ours = self.end_import(stream_id, cancelled).await.is_some();
                 if error.code == "superseded" {
                     // Refused as a frame for an unknown stream would be.
                     return Some(false);
                 }
                 if cancelled {
-                    // Told so once, by the cancel's own `stream.error`.
-                    return Some(true);
+                    // The transfer's cancel took the lock first. The chunk is
+                    // dropped, and whichever of this and the stream's watcher
+                    // took it out of service tells the device, once.
+                    if !ours {
+                        return Some(true);
+                    }
+                    return Some(
+                        self.stream_error(
+                            stream_id,
+                            "cancelled",
+                            "the transfer was ended elsewhere",
+                        )
+                        .await,
+                    );
                 }
                 Some(
                     self.stream_error(stream_id, error.code, &error.detail)
@@ -1702,7 +1820,10 @@ impl Context {
             }
         }
         let carrier = self.carrier()?;
-        let Some(stream) = self.end_import(stream_id, false).await else {
+        let Some(ended) = self.end_import(stream_id, false).await else {
+            return Some(self.ended_import(stream_id).await.unwrap_or(false));
+        };
+        let Some(stream) = ended.stream else {
             return Some(false);
         };
         let context = self.clone();
@@ -2325,8 +2446,10 @@ impl Context {
             .collect::<Vec<_>>();
         for stream_id in idle_imports {
             // The stream ends; the staged transfer stays, for a resume.
-            if let Some(stream) = self.end_import(&stream_id, false).await {
-                stream.end().await;
+            if let Some(ended) = self.end_import(&stream_id, false).await {
+                if let Some(stream) = ended.stream {
+                    stream.end().await;
+                }
                 if !self
                     .stream_error(&stream_id, "stream_timeout", "the import stream went idle")
                     .await
@@ -2852,8 +2975,10 @@ impl Context {
         };
         // A `stream.cancel` ends a v2 stream, not its transfer: the staged
         // bytes stay receiving, for a resume.
-        if let Some(stream) = self.end_import(stream_id, true).await {
-            stream.end().await;
+        if let Some(ended) = self.end_import(stream_id, true).await {
+            if let Some(stream) = ended.stream {
+                stream.end().await;
+            }
             return true;
         }
         if self
@@ -2926,7 +3051,11 @@ impl Context {
             .get(request_id)
             .cloned();
         if let Some(stream_id) = import {
-            if let Some(stream) = self.end_import(&stream_id, true).await {
+            if let Some(stream) = self
+                .end_import(&stream_id, true)
+                .await
+                .and_then(|ended| ended.stream)
+            {
                 stream.end().await;
             }
             return true;

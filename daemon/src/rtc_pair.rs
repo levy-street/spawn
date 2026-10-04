@@ -3080,6 +3080,123 @@ mod tests {
             assert_eq!(again["error"]["code"], "transfer_cancelled");
         }
 
+        /// The vectors' bundle three stream chunks long.
+        fn vector_bundle() -> Vec<u8> {
+            let vectors: Value = serde_json::from_str(include_str!(
+                "../../proto/conversation-bundle-v1-vectors.json"
+            ))
+            .unwrap();
+            let bundle = vectors["bundles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|bundle| {
+                    bundle["name"]
+                        .as_str()
+                        .is_some_and(|name| name.contains("three stream chunks"))
+                })
+                .unwrap();
+            STANDARD
+                .decode(bundle["bundle_b64"].as_str().unwrap())
+                .unwrap()
+        }
+
+        /// The answer to `request_id` on `ctl`, sent earlier.
+        async fn answer(ctl: &mut Ctl, request_id: &str) -> Value {
+            loop {
+                let frame = ctl.next().await;
+                if frame["type"] == "response" && frame["request_id"] == request_id {
+                    return frame;
+                }
+                ctl.stash.push_back(frame);
+            }
+        }
+
+        /// Whatever waits on a transfer's lock — held by a commit verifying
+        /// and extracting up to 2 GiB — waits beside the channel: the frames
+        /// behind it, another import's chunks among them, keep moving.
+        #[tokio::test]
+        async fn nothing_waiting_on_a_transfer_holds_up_its_channel() {
+            if !crate::host_conversations::SUPPORTED {
+                return;
+            }
+            let mut b = Host::new().await;
+            let cwd = b.folder("code/spawn");
+            let (mut ctl, _) = b.channel().await;
+            let transfer = Uuid::new_v4();
+            let held = crate::host_conversations::hold_import_lock(transfer).await;
+            ctl.send(json!({"version": 1, "type": "request", "request_id": "status",
+                "operation": "conv.import.status", "payload": {"transfer_id": transfer.to_string()}}))
+                .await;
+            ctl.send(
+                json!({"version": 1, "type": "request", "request_id": "begin",
+                "operation": "conv.import.begin",
+                "payload": import_payload(&transfer.to_string(), &cwd, 16_753)}),
+            )
+            .await;
+            // Both wait on the lock; the channel answers meanwhile.
+            tokio::time::timeout(Duration::from_secs(5), ctl.ok("ping", "ping", json!({})))
+                .await
+                .expect("the channel waited on a transfer's lock");
+            drop(held);
+            let status = answer(&mut ctl, "status").await;
+            assert_eq!(status["result"]["state"], "absent", "{status}");
+            let begun = answer(&mut ctl, "begin").await;
+            assert_eq!(begun["result"]["next_sequence"], 0, "{begun}");
+        }
+
+        /// A transfer's cancel that takes its lock while a chunk waits on it:
+        /// the chunk is dropped, the stream carrying the transfer hears
+        /// `cancelled` exactly once, and its channel stays open.
+        #[tokio::test]
+        async fn a_cancel_that_overtakes_a_chunk_is_told_once() {
+            if !crate::host_conversations::SUPPORTED {
+                return;
+            }
+            let bundle = vector_bundle();
+            let mut b = Host::new().await;
+            let cwd = b.folder("code/spawn");
+            let (mut writer, _) = b.channel().await;
+            let (mut other, _) = b.channel().await;
+            let transfer = Uuid::new_v4();
+            let opened = writer
+                .ok(
+                    "begin",
+                    "conv.import.begin",
+                    import_payload(&transfer.to_string(), &cwd, bundle.len() as u64),
+                )
+                .await;
+            let stream = opened["stream_id"].as_str().unwrap().to_string();
+            let held = crate::host_conversations::hold_import_lock(transfer).await;
+            // The cancel reaches the lock first, the chunk after it.
+            other
+                .send(
+                    json!({"version": 1, "type": "request", "request_id": "cancel",
+                    "operation": "conv.import.cancel",
+                    "payload": {"transfer_id": transfer.to_string()}}),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            writer
+                .send(
+                    json!({"version": 1, "type": "stream.chunk", "stream_id": stream,
+                    "sequence": 0, (BYTES_FIELD): STANDARD.encode(&bundle[..8192])}),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+            let cancelled = answer(&mut other, "cancel").await;
+            assert_eq!(cancelled["result"]["state"], "cancelled", "{cancelled}");
+            let told = writer.next().await;
+            assert_eq!(told["type"], "stream.error", "{told}");
+            assert_eq!(told["stream_id"], stream);
+            assert_eq!(told["error"]["code"], "cancelled");
+            // Told once: the channel answers, and nothing else came first.
+            let pong = writer.ok("ping", "ping", json!({})).await;
+            assert_eq!(pong["pong"], true);
+            assert!(writer.stash.is_empty(), "{:?}", writer.stash);
+        }
+
         /// A whole v2 read, acknowledged chunk by chunk as a device does.
         async fn read_stream(ctl: &mut Ctl, stream: String) -> (Vec<u8>, Value) {
             let mut bytes = Vec::new();

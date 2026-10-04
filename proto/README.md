@@ -1736,7 +1736,11 @@ the source with `conv.export` and writes it into the target with
 `conv.import.begin`, forwarding the source's digest, then settles both ends.
 Neither host hears of the other, and the server sees none of it. Every id is a
 canonical lower-case UUID; a `transfer_id` is a UUIDv4 the device chose, and
-the same one names the transfer on both hosts.
+the same one names the transfer on both hosts. A `conv.*` operation may wait
+on its transfer's lock (a commit holds it while it verifies and extracts),
+so the daemon runs each beside the channel's other frames: answers come by
+`request_id`, not in order, and a channel already running eight long
+operations answers another with `too_many_tasks`.
 
 `conv.probe {agent:"claude-code", conversation_id?, cwd}` — the target's facts
 before a move: `{agent, home, cwd, folder_exists, project_folder, store,

@@ -838,6 +838,13 @@ fn slot(role: Role, transfer: Uuid) -> Arc<Mutex<Slot>> {
     slot
 }
 
+/// Hold a transfer's import lock, as a commit verifying and extracting a
+/// large bundle does: for tests of what waits on it.
+#[cfg(test)]
+pub(crate) async fn hold_import_lock(transfer: Uuid) -> tokio::sync::OwnedMutexGuard<Slot> {
+    slot(Role::Import, transfer).lock_owned().await
+}
+
 type MoveLocks = StdMutex<HashMap<String, Weak<Mutex<()>>>>;
 
 /// One move of a conversation at a time, whatever transfer carries it: held

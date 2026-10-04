@@ -558,7 +558,11 @@ none of it.
 - **One lock per transfer** (`Slot`) decides commit against cancel, and a
   resumed begin or export supersedes the stream that carried the transfer,
   on whatever channel: a chunk on a superseded stream is refused, and its
-  channel hears `superseded`. Tombstones (`imported/`, `cancelled/`,
+  channel hears `superseded`. Whichever takes an import stream out of
+  service (`end_import` answers only its first caller) tells the device why,
+  once. Every `conv.*` operation runs as a session task beside the channel's
+  control loop (`carry`, `open_import`), never on it, since a transfer's
+  lock can be held across a commit of 2 GiB. Tombstones (`imported/`, `cancelled/`,
   `aborted/`) make each outcome final across restarts.
 - `conv.retire.commit` moves the holding to `retired/` (kept 30 days) only
   for the length and digest the target committed; `conv.retire.abort` puts
