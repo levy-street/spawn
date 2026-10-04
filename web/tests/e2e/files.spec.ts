@@ -1063,6 +1063,53 @@ test("a file's preview never covers its own row: its ⋯ stays in reach, and rea
   await expect(card).toBeHidden();
 });
 
+test("a file's preview never lies in the pointer's way: the next row takes its click, and the card is still reached by going to it", async ({
+  page,
+}) => {
+  // The Files page filling the window, so the card lies over the list. It
+  // used to hang from the strip of names whatever the pointer did, under the
+  // middle of every row below: a click, a pause long enough for the card,
+  // then a Shift-click on the next file landed on the card instead.
+  await mockApp(page, {
+    files: () => home([{ name: "a.txt" }, { name: "b.txt" }, { name: "c.txt" }, { name: "d.txt" }]),
+    fileRead: () => "A line.\n",
+  });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const card = page.locator("#file-preview-card");
+
+  // Clicked in the middle of a row, and waited on until its card is up.
+  await item(page, "a.txt").click();
+  await expect(card).toHaveAttribute("aria-label", "a.txt preview");
+  await item(page, "b.txt").click({ modifiers: ["Shift"], timeout: 2_000 });
+  for (const name of ["a.txt", "b.txt"]) {
+    await expect(item(page, name)).toHaveAttribute("aria-selected", "true");
+  }
+
+  // Resting without a click is the same: the card opens beside the pointer's
+  // column, never across it, and the row straight below is a click away.
+  const c = await item(page, "c.txt").boundingBox();
+  if (!c) throw new Error("no row");
+  const x = c.x + c.width / 2;
+  await page.mouse.move(x, c.y + c.height / 2);
+  await expect(card).toHaveAttribute("aria-label", "c.txt preview");
+  const cardBox = await card.boundingBox();
+  if (!cardBox) throw new Error("no card");
+  expect(cardBox.x > x || cardBox.x + cardBox.width < x).toBe(true);
+  await page.mouse.move(x, c.y + c.height * 1.5, { steps: 4 });
+  await item(page, "d.txt").click({ timeout: 2_000 });
+  await expect(item(page, "d.txt")).toHaveAttribute("aria-selected", "true");
+  await expect(item(page, "a.txt")).toHaveAttribute("aria-selected", "false");
+
+  // And the card is still the pointer's to reach: going to it keeps it.
+  await item(page, "b.txt").hover();
+  await expect(card).toHaveAttribute("aria-label", "b.txt preview");
+  const reach = await card.boundingBox();
+  if (!reach) throw new Error("no card");
+  await page.mouse.move(reach.x + reach.width / 2, reach.y + 40, { steps: 8 });
+  await page.waitForTimeout(700);
+  await expect(card).toHaveAttribute("aria-label", "b.txt preview");
+});
+
 test("another folder opens at its top, not where the last one was scrolled", async ({ page }) => {
   const homeFiles = [
     fileEntry({ name: "sub", path: "/Users/tester/sub", is_dir: true, size: null }),

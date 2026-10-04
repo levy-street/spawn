@@ -129,7 +129,12 @@ export function Popover({
         // card still wins; only a drawer's card clears Dialog's z-50.
         layer === "page" ? "z-[45]" : "z-[90]",
         "overflow-hidden rounded-lg border border-popover-border bg-popover text-popover-foreground shadow-xl shadow-black/50",
-        "animate-in fade-in-0 zoom-in-95 duration-100",
+        // `duration-100` times the opening animation, but it is a transition
+        // duration too, and with no property named every property takes it:
+        // a card moving to its next row glided there from the last one's
+        // place, a tenth of a second over rows it is not about and across
+        // the pointer's way to them. It moves at once, like it opens.
+        "animate-in fade-in-0 zoom-in-95 duration-100 transition-none",
         // pointer-events-auto also un-inherits the `pointer-events: none` a
         // modal Radix dialog puts on <body>, which this portal would take on.
         interactive ? "pointer-events-auto" : "pointer-events-none",

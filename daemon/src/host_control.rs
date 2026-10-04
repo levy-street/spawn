@@ -1502,7 +1502,7 @@ impl Context {
             }
             let signal = tokio::select! {
                 _ = token.cancelled() => continue,
-                signal = tokio::time::timeout(stream_ack_timeout(), signals.next()) => signal,
+                signal = tokio::time::timeout(self.stream_ack_timeout(), signals.next()) => signal,
             };
             match signal {
                 Ok(ReadSignal::Ack(value))
@@ -2496,6 +2496,22 @@ impl Context {
         }
     }
 
+    /// How long a full window waits for its device to acknowledge. Tests
+    /// shorten it so the timeout itself is quick to test; a test that holds
+    /// a window full across round trips of its own keeps the deployed
+    /// deadline (`keep_deployed_ack_deadline`).
+    fn stream_ack_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if !self
+            .files
+            .write_lifecycle_test_hooks()
+            .keeps_deployed_ack_deadline()
+        {
+            return Duration::from_millis(500);
+        }
+        STREAM_ACK_TIMEOUT
+    }
+
     /// Stream a source out under the ack window, verifying as it goes.
     ///
     /// Every stream-producing operation funnels through here. The window, the
@@ -2561,7 +2577,7 @@ impl Context {
             }
             sequence = sequence.saturating_add(1);
             while sequence.saturating_sub(acknowledged) >= STREAM_WINDOW_CHUNKS {
-                let signal = tokio::time::timeout(stream_ack_timeout(), signals.next()).await;
+                let signal = tokio::time::timeout(self.stream_ack_timeout(), signals.next()).await;
                 match signal {
                     Ok(ReadSignal::Ack(value)) if value >= acknowledged && value <= sequence => {
                         acknowledged = value;
@@ -3581,14 +3597,6 @@ fn spawn_bounded_close(
     tokio::spawn(async move {
         let _ = tokio::time::timeout(session_close_timeout(), close).await;
     })
-}
-
-fn stream_ack_timeout() -> Duration {
-    if cfg!(test) {
-        Duration::from_millis(500)
-    } else {
-        STREAM_ACK_TIMEOUT
-    }
 }
 
 fn write_reaper_interval() -> Duration {
