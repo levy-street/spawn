@@ -461,7 +461,10 @@ impl RtcSessions {
                                 .map(|binding| binding.generation())
                         },
                         Arc::clone(&pair.bulk),
-                        crate::host_conversations::Places::from_env(crate::run::login_shell_name),
+                        crate::host_conversations::Places::from_env(
+                            crate::run::login_shell_name,
+                            crate::run::window_path,
+                        ),
                     );
                     pair.register_host(install_host_control_channel(
                         dc,
