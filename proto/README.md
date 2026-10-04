@@ -1773,7 +1773,10 @@ superseding the stream that had it.
 `conv.import.begin {transfer_id, agent, conversation_id, cwd, length, sha256,
 stream?, from_host_id?}` opens a v2 write into the target's staging and
 answers `{stream_id, window, next_sequence, received}`; repeated with the same
-declaration it resumes (`resume_mismatch` otherwise). The target refuses a
+declaration it resumes (`resume_mismatch` otherwise). One channel carries at
+most two imports at once (`too_many_streams`): each may have a full window
+queued, and the channel's 64-frame normal queue keeps room for everything
+else, so a device opens a consumer channel per transfer. The target refuses a
 folder it does not have (`folder_missing`), one outside home
 (`outside_root`), a store that does not exist yet (`store_missing`) or that it
 cannot rename into (`store_unavailable`), more than 16 transfers staged at
