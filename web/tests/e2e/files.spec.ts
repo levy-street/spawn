@@ -134,6 +134,49 @@ test("a host's files open in Details: folders first, natural order, hidden files
   );
 });
 
+test("Details fits its panel: Kind goes first, then each row folds to the phone's two lines", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "src", is_dir: true, size: null },
+        { name: "a-long-name-for-a-narrow-panel-report.final.pdf", size: 3_400_000 },
+        { name: "notes.txt", size: 2048 },
+      ]),
+  });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const grid = page.getByRole("grid", { name: "Files" });
+  /** How far the grid could be scrolled sideways: never at all. */
+  const sideways = () => grid.evaluate((element) => element.scrollWidth - element.clientWidth);
+  const headers = () => grid.getByRole("columnheader").allInnerTexts();
+
+  // A phone: Name alone, and under each name what the phone's row says — a
+  // file's size and date, a folder's date.
+  await expect(item(page, "notes.txt")).toBeVisible();
+  await expect.poll(headers).toEqual(["Name"]);
+  await expect
+    .poll(() => names(page))
+    .toEqual(["src", "a-long-name-for-a-narrow-panel-report.final.pdf", "notes.txt"]);
+  await expect(item(page, "notes.txt")).toContainText(/2\.0 KB · .*2025/);
+  await expect(item(page, "a-long-name")).toContainText("3.2 MB · ");
+  await expect(item(page, "src")).toContainText("2025");
+  await expect(item(page, "src")).not.toContainText("·");
+  expect(await sideways()).toBe(0);
+  // Folded, Name still sorts.
+  await header(page, "Name").getByRole("button").click();
+  await expect(header(page, "Name")).toHaveAttribute("aria-sort", "descending");
+
+  // Wider: the columns come back, all but Kind until there is room for it.
+  await page.setViewportSize({ width: 900, height: 844 });
+  await expect.poll(headers).toEqual(["Name", "Date modified", "Size"]);
+  expect(await sideways()).toBe(0);
+  await page.setViewportSize({ width: 1400, height: 844 });
+  await expect.poll(headers).toEqual(["Name", "Date modified", "Size", "Kind"]);
+  expect(await sideways()).toBe(0);
+});
+
 test("Tree view lazily expands directories in place", async ({ page }) => {
   await mockApp(page, { files: treeFiles });
 
