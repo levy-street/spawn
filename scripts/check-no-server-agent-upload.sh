@@ -328,8 +328,11 @@ if re.search(r"\bstd::fs\b|\bcap_std\b|\bFile\b", carrier_sources["host_bundle"]
     raise SystemExit("no-server-agent-upload: the bundle format may not touch a file")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
+# Reviewed 2026-10-04: a read's acknowledgements and cancel no longer travel
+# through an mpsc queue (they coalesce in ReadSignals, which publishes
+# nothing), so the inventory narrowed to the write-cleanup sender.
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
-if sender_types != {"ReadSignal", "WriteCleanup"}:
+if sender_types != {"WriteCleanup"}:
     raise SystemExit(
         "no-server-agent-upload: protected host-control sender inventory changed: "
         + ", ".join(sorted(sender_types))

@@ -1552,7 +1552,10 @@ frame waiting behind the chunk it just wrote), so a sender that is slower
 than the disk hears about every chunk; the write transcript in the vectors
 is that rule. An
 acknowledgement below an earlier one, or above what was sent, closes the
-channel, as any malformed frame does.
+channel, as any malformed frame does; the same one again is valid. The
+daemon keeps only the highest acknowledgement of a read its sender has not
+yet looked at (v1 and v2 alike), so no pace or repetition of them queues or
+closes the channel (spike S4, F1).
 
 **Digest at the start or at the end.** `stream.digest` is `start` (the
 default and v1's behaviour: the declaration carries the whole stream's

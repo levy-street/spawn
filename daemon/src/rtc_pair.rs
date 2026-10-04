@@ -3144,6 +3144,44 @@ mod tests {
             assert!(a.gate.largest_let_through() <= crate::host_stream::BULK_WATERMARK);
         }
 
+        /// Acknowledgements are cumulative, so the same one again is valid,
+        /// and the daemon coalesces them: a device repeating its last one at
+        /// any pace — here hundreds at once, while the export waits on a
+        /// tight gate — never fills a queue and closes the channel (S4, F1).
+        #[tokio::test]
+        async fn repeated_acknowledgements_never_close_the_channel() {
+            if !crate::host_conversations::SUPPORTED {
+                return;
+            }
+            let mut a = Host::with_gate(BulkGate::with_watermark(1)).await;
+            let cwd = a.folder("code/spawn");
+            let record = conversation_lines(4000);
+            write_conversation(&a.project(&cwd), &record);
+            let (mut ctl, _) = a.channel().await;
+            let transfer = Uuid::new_v4().to_string();
+            let export = ctl
+                .ok("x", "conv.export", export_payload(&transfer, &cwd, 0))
+                .await;
+            let stream = export["stream_id"].as_str().unwrap().to_string();
+            for _ in 0..2 {
+                for _ in 0..200 {
+                    ctl.send(json!({"version": 1, "type": "stream.ack",
+                        "stream_id": stream, "sequence": 0}))
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let (bytes, digest) = read_stream(&mut ctl, stream).await;
+            assert_eq!(bytes.len() as u64, export["length"].as_u64().unwrap());
+            assert_eq!(digest, json!(format!("{:x}", Sha256::digest(&bytes))));
+            assert_eq!(
+                ctl.dc.ready_state(),
+                webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+            );
+            // And the channel still answers.
+            ctl.ok("ping", "ping", json!({})).await;
+        }
+
         /// A gate that lets a frame through only once everything before it
         /// is acknowledged still delivers every chunk: a channel's fall to
         /// its low threshold wakes it.

@@ -39,17 +39,12 @@ const MAX_EARLY_CANCELS: usize = 4096;
 const MAX_NORMAL_QUEUE: usize = 64;
 const MAX_FAST_QUEUE: usize = 64;
 const MAX_LONG_TASKS: usize = 8;
-const MAX_READ_SIGNALS: usize = 16;
 const STREAM_WINDOW_CHUNKS: u64 = 8;
 const STREAM_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WRITE_STREAMS: usize = 8;
 const MAX_STREAM_TOMBSTONES: usize = 4096;
 const MAX_ACTIVE_PUBLICATIONS: usize = 128;
-/// Acknowledgements a v2 read keeps queued while its pump waits on the
-/// association's bulk gate: a device acknowledges at most every chunk of a
-/// window, so twice the largest window and some is room enough.
-const MAX_V2_READ_SIGNALS: usize = 64;
 /// v2 writes one channel carries at once. Each may have a full window of
 /// chunks queued behind the others, and two windows of the largest size
 /// (32 frames) leave the 64-frame normal queue room for everything else; a
@@ -300,7 +295,7 @@ struct State {
     write_requests: HashMap<String, String>,
     cancelled_writes: HashMap<String, CancelledWrite>,
     finished_write_ids: HashMap<String, Instant>,
-    reads: HashMap<String, mpsc::Sender<ReadSignal>>,
+    reads: HashMap<String, Arc<ReadSignals>>,
     finished_read_ids: HashMap<String, Instant>,
     read_requests: HashMap<String, Arc<AtomicBool>>,
     /// Stream v2 writes carrying a conversation into this host
@@ -321,6 +316,79 @@ struct State {
 enum ReadSignal {
     Ack(u64),
     Cancel,
+    /// An acknowledgement below one already received: the channel closes,
+    /// as on any malformed frame.
+    Backwards,
+}
+
+/// What a read's device has said since its pump last looked. Cumulative
+/// acknowledgements coalesce to the highest, so however fast or often a
+/// device sends them — once per chunk, or the same one again — nothing
+/// queues, and no pace can fill a queue and close the channel (spike S4,
+/// F1). A cancel stays said.
+#[derive(Default)]
+struct ReadSignals {
+    said: StdMutex<Said>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct Said {
+    /// The highest acknowledgement the pump has not taken yet.
+    pending: Option<u64>,
+    /// The highest acknowledgement received at all.
+    highest: Option<u64>,
+    backwards: bool,
+    cancelled: bool,
+}
+
+impl ReadSignals {
+    fn said(&self) -> std::sync::MutexGuard<'_, Said> {
+        self.said
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn ack(&self, sequence: u64) {
+        {
+            let mut said = self.said();
+            if said.highest.is_some_and(|highest| sequence < highest) {
+                said.backwards = true;
+            } else {
+                said.highest = Some(sequence);
+                said.pending = Some(sequence);
+            }
+        }
+        self.changed.notify_one();
+    }
+
+    fn cancel(&self) {
+        self.said().cancelled = true;
+        self.changed.notify_one();
+    }
+
+    /// What was said since the last look, if anything; a cancel first.
+    fn take(&self) -> Option<ReadSignal> {
+        let mut said = self.said();
+        if said.cancelled {
+            return Some(ReadSignal::Cancel);
+        }
+        if said.backwards {
+            return Some(ReadSignal::Backwards);
+        }
+        said.pending.take().map(ReadSignal::Ack)
+    }
+
+    /// The next thing said. `notify_one` keeps a wake-up for a pump that is
+    /// not waiting yet, so nothing said between a look and the wait is lost.
+    async fn next(&self) -> ReadSignal {
+        loop {
+            if let Some(signal) = self.take() {
+                return signal;
+            }
+            self.changed.notified().await;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1227,12 +1295,12 @@ impl Context {
                 .error(request_id, "cancelled", "the export was cancelled")
                 .await;
         }
-        let (signal_tx, mut signal_rx) = mpsc::channel(MAX_V2_READ_SIGNALS);
+        let signals = Arc::new(ReadSignals::default());
         self.state
             .lock()
             .await
             .reads
-            .insert(stream_id.clone(), signal_tx);
+            .insert(stream_id.clone(), Arc::clone(&signals));
         let length = source.length();
         if !self
             .response(
@@ -1266,7 +1334,7 @@ impl Context {
             from,
             &claim,
             pair.bulk(),
-            &mut signal_rx,
+            &signals,
             &cancelled,
         )
         .await
@@ -1285,7 +1353,7 @@ impl Context {
         from: u64,
         claim: &crate::host_conversations::Claim,
         bulk: &Arc<crate::host_stream::BulkGate>,
-        signal_rx: &mut mpsc::Receiver<ReadSignal>,
+        signals: &ReadSignals,
         cancelled: &AtomicBool,
     ) -> bool {
         let channel = self.direct.transport();
@@ -1314,7 +1382,7 @@ impl Context {
                 }
                 return self.stream_error(stream_id, code, detail).await;
             }
-            while let Ok(signal) = signal_rx.try_recv() {
+            while let Some(signal) = signals.take() {
                 match signal {
                     ReadSignal::Ack(value)
                         if crate::host_stream::valid_ack(acknowledged, next, value) =>
@@ -1325,7 +1393,7 @@ impl Context {
                         claim.release().await;
                         return self.finish_read(stream_id).await;
                     }
-                    ReadSignal::Ack(_) => {
+                    ReadSignal::Ack(_) | ReadSignal::Backwards => {
                         claim.release().await;
                         let _ = self.finish_read(stream_id).await;
                         return false;
@@ -1386,19 +1454,19 @@ impl Context {
             }
             let signal = tokio::select! {
                 _ = token.cancelled() => continue,
-                signal = tokio::time::timeout(stream_ack_timeout(), signal_rx.recv()) => signal,
+                signal = tokio::time::timeout(stream_ack_timeout(), signals.next()) => signal,
             };
             match signal {
-                Ok(Some(ReadSignal::Ack(value)))
+                Ok(ReadSignal::Ack(value))
                     if crate::host_stream::valid_ack(acknowledged, next, value) =>
                 {
                     acknowledged = value;
                 }
-                Ok(Some(ReadSignal::Cancel)) => {
+                Ok(ReadSignal::Cancel) => {
                     claim.release().await;
                     return self.finish_read(stream_id).await;
                 }
-                Ok(Some(ReadSignal::Ack(_))) | Ok(None) => {
+                Ok(ReadSignal::Ack(_) | ReadSignal::Backwards) => {
                     claim.release().await;
                     let _ = self.finish_read(stream_id).await;
                     return false;
@@ -1839,12 +1907,12 @@ impl Context {
                 .await;
         }
         let stream_id = Uuid::new_v4().to_string();
-        let (signal_tx, mut signal_rx) = mpsc::channel(MAX_READ_SIGNALS);
+        let signals = Arc::new(ReadSignals::default());
         self.state
             .lock()
             .await
             .reads
-            .insert(stream_id.clone(), signal_tx);
+            .insert(stream_id.clone(), Arc::clone(&signals));
         if !self
             .response(
                 request_id,
@@ -1877,7 +1945,7 @@ impl Context {
         self.pump_stream(
             &stream_id,
             &mut reader,
-            &mut signal_rx,
+            &signals,
             stream.length,
             &expected,
             &cancelled,
@@ -1960,12 +2028,12 @@ impl Context {
         };
         let digest = format!("{:x}", Sha256::digest(&image.bytes));
         let stream_id = Uuid::new_v4().to_string();
-        let (signal_tx, mut signal_rx) = mpsc::channel(MAX_READ_SIGNALS);
+        let signals = Arc::new(ReadSignals::default());
         self.state
             .lock()
             .await
             .reads
-            .insert(stream_id.clone(), signal_tx);
+            .insert(stream_id.clone(), Arc::clone(&signals));
         if !self
             .response(
                 request_id,
@@ -1993,7 +2061,7 @@ impl Context {
         self.pump_stream(
             &stream_id,
             &mut reader,
-            &mut signal_rx,
+            &signals,
             length,
             &digest,
             &cancelled,
@@ -2314,7 +2382,7 @@ impl Context {
         &self,
         stream_id: &str,
         reader: &mut R,
-        signal_rx: &mut mpsc::Receiver<ReadSignal>,
+        signals: &ReadSignals,
         expected_length: u64,
         expected_sha256: &str,
         cancelled: &AtomicBool,
@@ -2331,7 +2399,7 @@ impl Context {
             if cancelled.load(Ordering::Acquire) {
                 return self.finish_read(stream_id).await;
             }
-            while let Ok(signal) = signal_rx.try_recv() {
+            while let Some(signal) = signals.take() {
                 match signal {
                     ReadSignal::Ack(value) if value >= acknowledged && value <= sequence => {
                         acknowledged = value;
@@ -2339,7 +2407,7 @@ impl Context {
                     ReadSignal::Cancel => {
                         return self.finish_read(stream_id).await;
                     }
-                    ReadSignal::Ack(_) => {
+                    ReadSignal::Ack(_) | ReadSignal::Backwards => {
                         let _ = self.finish_read(stream_id).await;
                         return false;
                     }
@@ -2369,17 +2437,15 @@ impl Context {
             }
             sequence = sequence.saturating_add(1);
             while sequence.saturating_sub(acknowledged) >= STREAM_WINDOW_CHUNKS {
-                let signal = tokio::time::timeout(stream_ack_timeout(), signal_rx.recv()).await;
+                let signal = tokio::time::timeout(stream_ack_timeout(), signals.next()).await;
                 match signal {
-                    Ok(Some(ReadSignal::Ack(value)))
-                        if value >= acknowledged && value <= sequence =>
-                    {
+                    Ok(ReadSignal::Ack(value)) if value >= acknowledged && value <= sequence => {
                         acknowledged = value;
                     }
-                    Ok(Some(ReadSignal::Cancel)) => {
+                    Ok(ReadSignal::Cancel) => {
                         return self.finish_read(stream_id).await;
                     }
-                    Ok(Some(ReadSignal::Ack(_))) | Ok(None) => {
+                    Ok(ReadSignal::Ack(_) | ReadSignal::Backwards) => {
                         let _ = self.finish_read(stream_id).await;
                         return false;
                     }
@@ -2441,12 +2507,12 @@ impl Context {
                 .await;
         }
         let stream_id = Uuid::new_v4().to_string();
-        let (signal_tx, mut signal_rx) = mpsc::channel(MAX_READ_SIGNALS);
+        let signals = Arc::new(ReadSignals::default());
         self.state
             .lock()
             .await
             .reads
-            .insert(stream_id.clone(), signal_tx);
+            .insert(stream_id.clone(), Arc::clone(&signals));
         let stat = &stream.stat;
         if !self
             .response(
@@ -2472,7 +2538,7 @@ impl Context {
         self.pump_stream(
             &stream_id,
             &mut reader,
-            &mut signal_rx,
+            &signals,
             length,
             &stream.sha256,
             &cancelled,
@@ -2766,17 +2832,18 @@ impl Context {
         ) else {
             return false;
         };
-        let (sender, finished) = {
+        let (signals, finished) = {
             let state = self.state.lock().await;
             (
                 state.reads.get(stream_id).cloned(),
                 state.finished_read_ids.contains_key(stream_id),
             )
         };
-        let Some(sender) = sender else {
+        let Some(signals) = signals else {
             return finished;
         };
-        sender.try_send(ReadSignal::Ack(sequence)).is_ok()
+        signals.ack(sequence);
+        true
     }
 
     async fn handle_stream_cancel(&self, object: &Map<String, Value>, arrival_order: u64) -> bool {
@@ -2841,7 +2908,8 @@ impl Context {
                 .is_ok();
         }
         if let Some(read) = read {
-            return read.try_send(ReadSignal::Cancel).is_ok();
+            read.cancel();
+            return true;
         }
         known
     }
@@ -2935,7 +3003,7 @@ impl Context {
             Err(_) => (Vec::new(), Vec::new()),
         };
         for read in reads {
-            let _ = read.try_send(ReadSignal::Cancel);
+            read.cancel();
         }
         for write in &writes {
             write.cancelled.cancel();

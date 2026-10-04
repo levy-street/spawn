@@ -578,7 +578,9 @@ none of it.
   bulk channels together buffer at most 32 KiB, so terminal echo always has
   most of the 128 KiB SCTP queue. A v2 write is acknowledged when the
   receiver catches up with its queue, on its last chunk, and never later than
-  half the window.
+  half the window. A read's acknowledgements (v1 and v2) coalesce to the
+  highest in `ReadSignals` rather than queue, so a device acknowledging at
+  any pace, or repeating one, never fills a queue and closes the channel.
 
 `scripts/check-no-server-agent-upload.sh` pins the three modules: no
 transport, nothing executed, a gate that never publishes, a format that
