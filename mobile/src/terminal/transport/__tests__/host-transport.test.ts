@@ -9,7 +9,10 @@ import { createHostPinStore, type HostPin } from "@/data/trust/host-pins";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
 import { decodeBridgeBytes, encodeBridgeBytes } from "@/terminal/transport/bridge";
 import { HOST_FILE_MAX_BYTES, HOST_STREAM_CHUNK_BYTES } from "@/terminal/transport/host-ctl-codec";
-import { createHostTransport } from "@/terminal/transport/host-transport";
+import {
+  createHostConsumerTransport,
+  createHostTransport,
+} from "@/terminal/transport/host-transport";
 import type { SignalChannelLike, WorkerEndpoint } from "@/terminal/transport/types";
 
 jest.mock("@/terminal/transport/signed-signalling", () => ({
@@ -1152,5 +1155,101 @@ describe("HostTransport streamed writes", () => {
       }),
     ).rejects.toMatchObject({ code: "file_too_large" });
     transport.close();
+  });
+});
+
+describe("HostTransport connection path", () => {
+  test("says how the host connection is carried, as the worker's stats last did", async () => {
+    const { bridge, transport } = await readyTransport();
+    const tool = createHostConsumerTransport(
+      { hostId: HOST_ID, hostIdentityPublicKey: "host-key", bridge },
+      transport,
+    );
+    try {
+      expect(transport.connectionInfo).toBeNull();
+      bridge.emit({ v: 1, type: "connection-info", info: { kind: "relay", rttMs: 84 } });
+      expect(transport.connectionInfo).toEqual({ kind: "relay", rttMs: 84 });
+      // A tool channel rides the same connection, so it reports the same path.
+      expect(tool.connectionInfo).toEqual({ kind: "relay", rttMs: 84 });
+
+      bridge.emit({ v: 1, type: "connection-info", info: { kind: "direct", rttMs: null } });
+      expect(tool.connectionInfo).toEqual({ kind: "direct", rttMs: null });
+
+      // Anything unreadable is not passed off as a path.
+      bridge.emit({
+        v: 1,
+        type: "connection-info",
+        info: { kind: "teleport", rttMs: 1 } as unknown as { kind: "direct"; rttMs: number },
+      });
+      expect(transport.connectionInfo).toBeNull();
+
+      bridge.emit({ v: 1, type: "connection-info", info: { kind: "stun", rttMs: 12 } });
+      transport.close();
+      expect(transport.connectionInfo).toBeNull();
+    } finally {
+      tool.close();
+      transport.close();
+    }
+  });
+});
+
+describe("HostTransport transfers between hosts", () => {
+  test("a file sent to another host can take another name there", async () => {
+    const bytes = Uint8Array.of(1, 2, 3);
+    const source = await readyTransport();
+    const destination = await readyTransport();
+    try {
+      const pending = source.transport.transferFileTo(
+        destination.transport,
+        "~/notes.txt",
+        "/Users/you",
+        { name: "notes (2).txt" },
+      );
+      respond(source.bridge, await waitForRequest(source.bridge, "fs.read"), {
+        stream_id: "read-stream",
+        path: "/Users/me/notes.txt",
+        name: "notes.txt",
+        length: bytes.byteLength,
+        sha256: digest(bytes),
+      });
+      const begin = await waitForRequest(destination.bridge, "fs.write.begin");
+      expect(begin.payload).toMatchObject({
+        dir: "/Users/you",
+        name: "notes (2).txt",
+        length: 3,
+        sha256: digest(bytes),
+        overwrite: false,
+      });
+      respond(destination.bridge, begin, { stream_id: "write-stream" });
+      source.bridge.stream({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "read-stream",
+        sequence: 0,
+        bytes_b64: encodeBridgeBytes(bytes),
+      });
+      source.bridge.stream({
+        version: 1,
+        type: "stream.end",
+        stream_id: "read-stream",
+        length: 3,
+        sha256: digest(bytes),
+      });
+      await waitForRequest(destination.bridge, "$host.stream.end");
+      destination.bridge.stream({
+        version: 1,
+        type: "stream.committed",
+        stream_id: "write-stream",
+        path: "/Users/you/notes (2).txt",
+      });
+      await expect(pending).resolves.toEqual({
+        path: "/Users/you/notes (2).txt",
+        length: 3,
+        sha256: digest(bytes),
+      });
+    } finally {
+      source.transport.close();
+      destination.transport.close();
+    }
   });
 });

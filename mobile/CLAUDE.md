@@ -71,6 +71,22 @@ scripts/, docs/   build helpers and app-specific notes
   `cockpit/host-offer-slots.tsx`, added in one change (a test holds the two
   together). `host/[id]/agents.tsx` is a redirect stub to Overview for one OTA
   cycle.
+- Uploads and sends between hosts go through one queue,
+  `data/stores/transfers.ts` (memory only: it names host paths), run one item
+  (a folder to make or a file to copy) at a time by
+  `components/files/transfer-engine.ts`. A batch is one transfer as the person
+  asked for it, and is what the banner counts. A taken name is settled per
+  picked item with the web's meaning (`transfer-plan.ts`, the same four
+  answers, "Ask each time" first): Keep both renames the picked folder and all
+  it holds, Skip leaves it out, Replace merges; what is inside waits until its
+  folder is made. Its runner, `components/files/transfers-runner.tsx`, and the
+  Transfers sheet are mounted once in `(drawer)/_layout.tsx`, beside the bottom
+  bar, so a transfer outlives the screen it was started from; the runner holds
+  its own channel to each host the queue needs, only while there is something
+  to move. An item cut off by the background retirement or by a connection lost
+  on screen is `interrupted`, not failed: the queue pauses and waits for Resume.
+  The file browser body never navigates: it asks its screen to show a folder
+  (`onOpenFolder`) or a window opened from one (`onWindowOpened`).
 - Every window the app opens — launcher, "New window here…"
   (`launcher/open-here-sheet.tsx`), template replay, workspace and pane
   duplicates — goes through `components/launcher/create-window.ts`: it names

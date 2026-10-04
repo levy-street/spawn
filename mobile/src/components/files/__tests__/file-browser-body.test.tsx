@@ -46,6 +46,8 @@ jest.mock("@/terminal/HostTransportSurface", () => {
 });
 
 jest.mock("@react-navigation/native", () => ({ useIsFocused: () => mockFocused }));
+// The send and open-here sheets reach the device-approval overlay, which routes.
+jest.mock("expo-router", () => ({ useRouter: () => ({ back: jest.fn(), push: jest.fn() }) }));
 
 interface MockListProps<T> {
   data: readonly T[];

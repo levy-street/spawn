@@ -1,5 +1,6 @@
 import { RefreshControl, ScrollView, StyleSheet, View } from "react-native";
 import { FileBrowserBody, type FolderNavigation } from "@/components/files/file-browser-body";
+import type { OpenedWindow } from "@/components/files/files-open-here";
 import { HOST_IDENTITY_BLOCKED_REASON } from "@/components/hosts/host-trust-copy";
 import { EmptyState } from "@/components/ui/empty-state";
 import type { IconName } from "@/components/ui/icon";
@@ -13,6 +14,8 @@ export interface FilesTabProps {
   onRefresh(): void;
   /** Opens the host's file browser at `path`, as a screen of its own. */
   onOpenFiles(path?: string): void;
+  /** Shows a window opened from one of the host's folders. */
+  onWindowOpened?(opened: OpenedWindow): void;
 }
 
 /** Why the host's files cannot be browsed from here, in the words the tab shows. */
@@ -69,6 +72,7 @@ export function FilesTab({
   refreshing,
   onRefresh,
   onOpenFiles,
+  onWindowOpened,
 }: FilesTabProps): React.JSX.Element {
   const theme = useTheme();
   const blocked = filesBlocked(host, identityConflict);
@@ -107,6 +111,7 @@ export function FilesTab({
         hostName={host.name}
         hostOS={host.os}
         onOpenFolder={({ path }: FolderNavigation) => onOpenFiles(path)}
+        {...(onWindowOpened === undefined ? {} : { onWindowOpened })}
       />
     </View>
   );

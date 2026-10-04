@@ -117,6 +117,10 @@ jest.mock("@/components/trust/device-approval-prompt", () => ({
   DeviceApprovalPrompt: () => null,
 }));
 
+// Transfers run under every screen; their runner and sheet have tests of their own.
+jest.mock("@/components/files/transfers-runner", () => ({ TransfersRunner: () => null }));
+jest.mock("@/components/files/transfers-sheet", () => ({ TransfersSheet: () => null }));
+
 jest.mock("@/data/queries/auth", () => ({
   useMeQuery: () => ({ data: undefined, error: null, isLoading: false, refetch: jest.fn() }),
 }));

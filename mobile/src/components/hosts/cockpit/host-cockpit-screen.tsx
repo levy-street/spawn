@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { StyleSheet, useWindowDimensions, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { runOnJS, withSpring } from "react-native-reanimated";
+import { OPEN_TERMINAL_HERE, START_AGENT_HERE } from "@/components/files/transfer-copy";
 import { AccessTab } from "@/components/hosts/cockpit/access-tab";
 import {
   COCKPIT_TAB_LABELS,
@@ -412,6 +413,10 @@ export function HostCockpitScreen({ hostId, tab }: HostCockpitScreenProps): Reac
                 identityConflict={identityConflict}
                 onOpenFiles={openFiles}
                 onRefresh={refresh}
+                onWindowOpened={({ workspaceId, sessionId }) => {
+                  router.push({ pathname: "/workspace/[id]", params: { id: workspaceId } });
+                  router.push(`/terminal/${sessionId}` as Href);
+                }}
                 refreshing={refreshing}
               />
             ) : tab === "sessions" ? (
@@ -486,13 +491,13 @@ export function HostCockpitScreen({ hostId, tab }: HostCockpitScreenProps): Reac
                     : []),
                   {
                     id: "shell",
-                    label: "Open a shell here",
+                    label: OPEN_TERMINAL_HERE,
                     icon: <Icon color="mutedForeground" name="SquareTerminal" />,
                     onPress: () => setOpenHere({ cwd: folderActions, run: "shell" }),
                   },
                   {
                     id: "agent",
-                    label: "Start an agent here…",
+                    label: START_AGENT_HERE,
                     icon: <Icon color="mutedForeground" name="Bot" />,
                     onPress: () => setOpenHere({ cwd: folderActions, run: "agent" }),
                   },

@@ -167,6 +167,7 @@ function connect(
   active = () => true,
   onRetired = () => {},
   timing?: { heartbeatMs: number; ownerSilenceMs: number },
+  page: string = crypto.randomUUID(),
 ) {
   const connection = new SharedDaemonConnection(
     key,
@@ -178,6 +179,7 @@ function connect(
     active,
     onRetired,
     timing,
+    page,
   );
   connections.push(connection);
   return connection;
@@ -532,4 +534,116 @@ test("a connection that retires itself says so, so its provider can rebuild it",
   await until(() => connection.isClosed());
   expect(retired).toBe(1);
   expect(connection.getSnapshot().state).toBe("closed");
+});
+
+test("every tab knows which page holds the connection, the same page for all its hosts", async () => {
+  const owner = connect(
+    "account:host",
+    () => true,
+    () => {},
+    undefined,
+    "page-a",
+  );
+  const other = connect(
+    "account:other",
+    () => true,
+    () => {},
+    undefined,
+    "page-a",
+  );
+  const follower = connect(
+    "account:host",
+    () => true,
+    () => {},
+    undefined,
+    "page-b",
+  );
+  await until(() => follower.getSnapshot().state === "ready");
+  expect(owner.ownerPage()).toBe("page-a");
+  expect(other.ownerPage()).toBe("page-a");
+  expect(follower.ownerPage()).toBe("page-a");
+  expect(follower.lastOwnerRelease()).toBeNull();
+});
+
+test("a follower learns the owner let go before its channels are retired", async () => {
+  const owner = connect(
+    "account:host",
+    () => true,
+    () => {},
+    undefined,
+    "page-a",
+  );
+  const follower = connect(
+    "account:host",
+    () => true,
+    () => {},
+    undefined,
+    "page-b",
+  );
+  await until(() => follower.getSnapshot().state === "ready");
+  const channel = follower.createChannel(label());
+  await until(() => channel.readyState === "open");
+  let seenAtClose: { page: string; at: number } | null = null;
+  channel.onclose = () => {
+    seenAtClose = follower.lastOwnerRelease();
+  };
+  const before = Date.now();
+  owner.close();
+  await until(() => channel.readyState === "closed");
+  expect(seenAtClose).not.toBeNull();
+  expect(seenAtClose!.page).toBe("page-a");
+  expect(seenAtClose!.at).toBeGreaterThanOrEqual(before);
+  // The follower took the connection over: it is the owner page now.
+  await until(() => follower.ownerPage() === "page-b");
+});
+
+test("an owner gone silent counts as letting go when a visible tab takes over", async () => {
+  connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+    "page-a",
+  );
+  const ownerBus = [...Bus.instances].at(-1)!;
+  const follower = connect(
+    "account:host",
+    () => true,
+    () => {},
+    FAST,
+    "page-b",
+  );
+  await until(() => follower.getSnapshot().state === "ready");
+  Bus.hung.add(ownerBus);
+  await until(() => follower.lastOwnerRelease()?.page === "page-a");
+  await until(() => follower.ownerPage() === "page-b");
+});
+
+test("a congested channel's queue moves on its low-water event alone, as it must in a hidden tab", async () => {
+  const scheduler = new DaemonSendScheduler();
+  const events = new EventTarget();
+  const bulk = Object.assign(new Channel("spawn.host.ctl/test"), {
+    bufferedAmountLowThreshold: 0,
+    addEventListener: events.addEventListener.bind(events),
+    removeEventListener: events.removeEventListener.bind(events),
+  });
+  await Bun.sleep(2);
+  const realSetTimeout = globalThis.setTimeout;
+  // Timers that never come, as in a background tab.
+  globalThis.setTimeout = (() => 0) as unknown as typeof setTimeout;
+  try {
+    bulk.bufferedAmount = 64 * 1024;
+    scheduler.enqueue(bulk as unknown as RTCDataChannel, "a", () => {});
+    await Bun.sleep(5);
+    expect(bulk.sent).toHaveLength(0);
+    expect(bulk.bufferedAmountLowThreshold).toBe(32 * 1024);
+    bulk.bufferedAmount = 0;
+    events.dispatchEvent(new Event("bufferedamountlow"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(bulk.sent).toEqual(["a"]);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    scheduler.close();
+  }
 });

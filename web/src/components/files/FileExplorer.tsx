@@ -10,6 +10,7 @@ export { formatSize } from "@/lib/files/format";
 export type FileExplorerHandle = {
   newFolder: () => void;
   upload: () => void;
+  uploadFolder: () => void;
   refresh: () => void;
   collapseAll: () => void;
 };
@@ -36,9 +37,20 @@ export const FileExplorer = forwardRef<
     className?: string;
     /** The folder on screen changed because someone navigated. */
     onPathChange?: (path: string) => void;
+    /** The workspace it sits in: a window opened from its folders lands there. */
+    workspaceId?: string | null;
   }
 >(function FileExplorer(
-  { hostId, rootPath, rootLabel, initialPath, hideHeader = false, className, onPathChange },
+  {
+    hostId,
+    rootPath,
+    rootLabel,
+    initialPath,
+    hideHeader = false,
+    className,
+    onPathChange,
+    workspaceId,
+  },
   handleRef,
 ) {
   const browserRef = useRef<FileBrowserHandle>(null);
@@ -47,6 +59,7 @@ export const FileExplorer = forwardRef<
     () => ({
       newFolder: () => browserRef.current?.newFolder(),
       upload: () => browserRef.current?.upload(),
+      uploadFolder: () => browserRef.current?.uploadFolder(),
       refresh: () => browserRef.current?.refresh(),
       collapseAll: () => browserRef.current?.collapseAll(),
     }),
@@ -62,6 +75,7 @@ export const FileExplorer = forwardRef<
       initialPath={initialPath}
       className={className}
       onPathChange={onPathChange}
+      workspaceId={workspaceId}
     />
   );
 });

@@ -98,6 +98,8 @@ export function FolderPicker({
   onBack,
   onOpenChange,
   onSelect,
+  selectUnchanged = false,
+  title,
 }: {
   open: boolean;
   host: Host | null;
@@ -113,6 +115,17 @@ export function FolderPicker({
   onBack?: () => void;
   onOpenChange: (open: boolean) => void;
   onSelect: (path: string) => void;
+  /**
+   * Confirming the folder it opened at is an answer too — for a picker whose
+   * answer is a destination (where a send goes), not a change to something
+   * already somewhere.
+   */
+  selectUnchanged?: boolean;
+  /**
+   * The question the picker answers, shown over it ("Where on mac-mini?") —
+   * for a step in a longer flow. Without one it is the plain folder chooser.
+   */
+  title?: string;
 }) {
   const { client, state } = useHostControl(host?.id ?? null, open && host?.status === "online");
   const pathFlavor = pathFlavorForHostOS(host?.os);
@@ -371,7 +384,8 @@ export function FolderPicker({
   const startedAt =
     homeDir && initialPath ? normalizeCwdForHost(initialPath, homeDir, pathFlavor) : null;
   const commit = () => {
-    if (startedAt === null || !pathsEqual(startedAt, listedPath, pathFlavor)) onSelect(listedPath);
+    if (selectUnchanged || startedAt === null || !pathsEqual(startedAt, listedPath, pathFlavor))
+      onSelect(listedPath);
     onOpenChange(false);
   };
 
@@ -493,7 +507,7 @@ export function FolderPicker({
     <div
       ref={panelRef}
       role="dialog"
-      aria-label={`Select a folder on ${host?.name ?? "host"}`}
+      aria-label={title ?? `Select a folder on ${host?.name ?? "host"}`}
       style={panelStyle}
       className={cn(
         // pointer-events-auto: opened from inside a modal Radix dialog, this
@@ -505,6 +519,10 @@ export function FolderPicker({
       )}
     >
       <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
+        {/* Said as the host cascade says its own steps' questions. */}
+        {title && (
+          <p className="shrink-0 px-1 text-[11px] font-medium text-muted-foreground">{title}</p>
+        )}
         {/* One row, two layers: the trail with its options menu, and the
             filter field growing leftward out of the button that opens it. The
             field is always mounted at the row's right edge so the toggle never

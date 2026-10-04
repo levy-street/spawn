@@ -1566,20 +1566,49 @@ export class HostControlClient {
     }
   }
 
+  /**
+   * Relay one file from this host to `destination` through this browser. The
+   * destination is told the source's length and SHA-256 up front and checks
+   * both before it commits, so the copy is verified end to end and neither
+   * host learns anything about the other.
+   */
   async transferFileTo(
     destination: HostControlClient,
     path: string,
     destDir: string,
     overwrite = false,
     signal?: AbortSignal,
+    options: {
+      /** The name it lands under; the source's own name when omitted. */
+      name?: string;
+      /** What the source declared, before the destination is asked for anything. */
+      onDeclared?: (source: { name: string; length: number; sha256: string }) => void;
+      /** Bytes relayed so far. */
+      onProgress?: (bytes: number) => void;
+    } = {},
   ): Promise<HostFileOp> {
     const source = await this.readFile(path, { signal, timeoutMs: this.streamTimeoutMs() });
+    options.onDeclared?.({ name: source.name, length: source.length, sha256: source.sha256 });
+    const onProgress = options.onProgress;
+    let relayed = 0;
+    // Counting rides the pipe, so a cancel downstream still reaches the source.
+    const stream = onProgress
+      ? source.stream.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            transform(chunk, controller) {
+              relayed += chunk.byteLength;
+              onProgress(relayed);
+              controller.enqueue(chunk);
+            },
+          }),
+        )
+      : source.stream;
     try {
       const destinationPath = await destination.writeStream(
-        source.stream,
+        stream,
         {
           dir: destDir,
-          name: source.name,
+          name: options.name ?? source.name,
           length: source.length,
           sha256: source.sha256,
           overwrite,
@@ -1588,7 +1617,7 @@ export class HostControlClient {
       );
       return { path: destinationPath };
     } catch (error) {
-      await source.stream.cancel(error).catch(() => {});
+      await stream.cancel(error).catch(() => {});
       throw error;
     }
   }
@@ -2621,15 +2650,28 @@ export class HostControlClient {
       if (channel.bufferedAmount <= STREAM_BUFFERED_HIGH_WATER) return;
       if (signal?.aborted) throw new DOMException("Host file write aborted", "AbortError");
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          signal?.removeEventListener("abort", onAbort);
-          resolve();
-        }, 10);
-        const onAbort = () => {
+        // The channel's low-water event wakes this where timers are throttled
+        // (a write running in a hidden tab); the timer is the fallback.
+        const listens = typeof channel.addEventListener === "function";
+        const settle = () => {
           clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
+          if (listens) channel.removeEventListener("bufferedamountlow", onLow);
+        };
+        const onLow = () => {
+          settle();
+          resolve();
+        };
+        const timer = setTimeout(onLow, 10);
+        const onAbort = () => {
+          settle();
           reject(new DOMException("Host file write aborted", "AbortError"));
         };
         signal?.addEventListener("abort", onAbort, { once: true });
+        if (listens) {
+          channel.bufferedAmountLowThreshold = STREAM_BUFFERED_HIGH_WATER;
+          channel.addEventListener("bufferedamountlow", onLow);
+        }
       });
     }
   }

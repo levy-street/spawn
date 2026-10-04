@@ -286,7 +286,12 @@ test("upload goes into the folder on screen", async ({ page }) => {
   });
 
   await expect.poll(() => uploadedDir).toBe("/Users/tester");
-  await expect(page.getByText("Uploaded /Users/tester/report.txt")).toBeVisible();
+  // It ran in the Transfers tray, which says so in its own words.
+  const tray = page.getByRole("region", { name: "Transfers" });
+  await expect(
+    tray.getByRole("listitem", { name: "Uploaded “report.txt” to Home on Mac" }),
+  ).toBeVisible();
+  await expect(tray.getByText("1 item · 5 B")).toBeVisible();
 });
 
 test("new folder, new file, rename and delete round-trip", async ({ page }) => {
@@ -582,12 +587,32 @@ test("Windows file operations preserve native drive paths", async ({ page }) => 
   expect(listed.some((path) => path?.startsWith("/C:"))).toBe(false);
 });
 
-test("right-click opens a context menu with download and send to host", async ({ page }) => {
+test("right-click downloads a file, and sends it into a folder on another host", async ({
+  page,
+}) => {
   const reads: Array<{ hostId: string; path: string }> = [];
-  const uploads: Array<{ hostId: string; dir: string | null }> = [];
+  const uploads: Array<{ hostId: string; dir: string | null; name: unknown }> = [];
   await mockApp(page, {
     hosts: [host, otherHost],
-    files: treeFiles,
+    files: (hostId, path) =>
+      hostId === OTHER_HOST_ID
+        ? fileListing({
+            path: path === "~" ? "/home/tester" : path,
+            home_dir: "/home/tester",
+            parent: "/home",
+            entries:
+              path === "/home/tester/Documents"
+                ? []
+                : [
+                    fileEntry({
+                      name: "Documents",
+                      path: "/home/tester/Documents",
+                      is_dir: true,
+                      size: null,
+                    }),
+                  ],
+          })
+        : treeFiles(hostId, path),
     fileRead: (hostId, path) => {
       reads.push({ hostId, path });
       return "hi";
@@ -597,11 +622,12 @@ test("right-click opens a context menu with download and send to host", async ({
         .request()
         .postData()
         ?.match(/name="dir"\r\n\r\n([^\r]*)/)?.[1];
-      uploads.push({ hostId, dir: dir ?? null });
+      const declaration = (await route.request().postDataJSON()) as { name?: unknown };
+      uploads.push({ hostId, dir: dir ?? null, name: declaration.name });
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        json: { path: "/home/tester/notes.txt" },
+        json: { path: `${dir}/notes.txt` },
       });
     },
   });
@@ -611,18 +637,37 @@ test("right-click opens a context menu with download and send to host", async ({
   await notes.click({ button: "right" });
 
   const downloadEvent = page.waitForEvent("download");
-  await page.getByRole("menuitem", { name: "Download" }).click();
-  expect((await downloadEvent).suggestedFilename()).toBe("notes.txt");
+  await page.getByRole("menuitem", { name: "Download", exact: true }).click();
+  const download = await downloadEvent;
+  expect(download.suggestedFilename()).toBe("notes.txt");
   await expect
     .poll(() => reads.at(-1))
     .toEqual({ hostId: HOST_ID, path: "/Users/tester/notes.txt" });
 
   await notes.click({ button: "right" });
-  await page.getByRole("menuitem", { name: "Linux box" }).click();
+  await page.getByRole("menuitem", { name: "Send to another host…" }).click();
+  // Which host, then which folder there, then what to do about a name taken.
+  await page.getByRole("menuitem", { name: /^Linux box/ }).click();
+  const picker = page.getByRole("dialog", { name: "Where on Linux box?" });
+  await picker.getByRole("option", { name: "Documents" }).click();
+  await expect(
+    picker.getByRole("listbox", { name: "Folders in /home/tester/Documents" }),
+  ).toBeVisible();
+  await picker.getByRole("button", { name: "Select this folder" }).click();
+  const confirm = page.getByRole("dialog", { name: "Send “notes.txt” to Linux box" });
+  await expect(confirm.getByText("Into Documents on Linux box")).toBeVisible();
+  await expect(confirm.getByText("Permissions aren't copied between hosts.")).toBeVisible();
+  await confirm.getByRole("tab", { name: "Keep both" }).click();
+  await confirm.getByRole("button", { name: "Send “notes.txt” to Linux box" }).click();
+
   await expect
-    .poll(() => reads.at(-1))
-    .toEqual({ hostId: HOST_ID, path: "/Users/tester/notes.txt" });
-  await expect.poll(() => uploads.at(-1)).toEqual({ hostId: OTHER_HOST_ID, dir: "/home/tester" });
+    .poll(() => uploads.at(-1))
+    .toEqual({ hostId: OTHER_HOST_ID, dir: "/home/tester/Documents", name: "notes.txt" });
+  await expect(
+    page
+      .getByRole("region", { name: "Transfers" })
+      .getByRole("listitem", { name: "Sent “notes.txt” from Mac to Documents on Linux box" }),
+  ).toBeVisible();
 });
 
 test("keyboard: arrows move, Enter opens, Backspace goes back up, F2 renames", async ({ page }) => {

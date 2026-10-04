@@ -2,6 +2,8 @@ import { Stack, usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
 
 import { AdminAccessBoundary, resolveAdminAccess } from "@/components/admin/admin-access";
+import { TransfersRunner } from "@/components/files/transfers-runner";
+import { TransfersSheet } from "@/components/files/transfers-sheet";
 import { AppHeaderLeadingProvider } from "@/components/layout/app-header";
 import { BottomChromeProvider } from "@/components/layout/bottom-chrome";
 import { PersistentBottomNav } from "@/components/nav/bottom-nav";
@@ -116,6 +118,11 @@ export default function AppStackLayout(): React.JSX.Element | null {
             operator happens to be, not on one screen. */}
           <PersistentBottomNav />
           <DeviceApprovalPrompt />
+          {/* Uploads and sends between hosts run here, under every screen, so one
+            carries on while the person goes elsewhere; the sheet that shows them is
+            opened from any host's files. Keyed to the account: a switch forgets them. */}
+          <TransfersRunner key={account.accountId ?? "signed-out"} />
+          <TransfersSheet />
         </BottomChromeProvider>
       </AppHeaderLeadingProvider>
     </AdminRouteBoundary>

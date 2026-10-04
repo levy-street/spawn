@@ -442,8 +442,8 @@ describe("host cockpit", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Actions for ~/dev/native" }));
     const sheet = screen.getByTestId("sheet-~/dev/native");
     expect(within(sheet).queryByText("Open in Files")).toBeNull();
-    expect(within(sheet).getByText("Open a shell here")).toBeOnTheScreen();
-    expect(within(sheet).getByText("Start an agent here…")).toBeOnTheScreen();
+    expect(within(sheet).getByText("Open terminal here")).toBeOnTheScreen();
+    expect(within(sheet).getByText("Start agent here…")).toBeOnTheScreen();
   });
 
   test("switching host keeps the tab", async () => {
@@ -489,11 +489,11 @@ describe("host cockpit", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Actions for ~/dev/native" }));
     const sheet = screen.getByTestId("sheet-~/dev/native");
     expect(within(sheet).getByText("Open in Files")).toBeOnTheScreen();
-    await fireEvent.press(within(sheet).getByText("Open a shell here"));
+    await fireEvent.press(within(sheet).getByText("Open terminal here"));
     expect(lastRequest()).toEqual({ cwd: "/Users/spawn/dev/native", run: "shell" });
 
     await fireEvent.press(screen.getByRole("button", { name: "Actions for ~" }));
-    await fireEvent.press(within(screen.getByTestId("sheet-~")).getByText("Start an agent here…"));
+    await fireEvent.press(within(screen.getByTestId("sheet-~")).getByText("Start agent here…"));
     expect(lastRequest()).toEqual({ cwd: "~", run: "agent" });
   });
 

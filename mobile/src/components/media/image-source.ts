@@ -94,3 +94,71 @@ export async function pickImage(
   const [first] = await pickImages(source, { ...options, multiple: false });
   return first ?? null;
 }
+
+/** A file picked to be uploaded as it is, byte for byte. */
+export interface PickedOriginal {
+  uri: string;
+  name: string;
+  mimeType: string | null;
+  /** What the picker said it weighs; null when it could not say. */
+  size: number | null;
+}
+
+/**
+ * Files for the host file browser, exactly as they are on the phone.
+ *
+ * "files" is the document picker over anything at all. "photos" is the photo
+ * library in its byte-exact mode: photos and videos, no editing, no
+ * recompression (quality 1 copies what the picker hands over on both
+ * platforms), the library's current representation rather than a more
+ * compatible re-encode, and videos passed through untranscoded (the picker's
+ * default, left alone). A terminal attachment wants a smaller JPEG; a file put
+ * on a host wants the original.
+ *
+ * Not yet checked on a device: Android's photo picker (`PickVisualMedia`)
+ * redacts location metadata for an app without ACCESS_MEDIA_LOCATION, which
+ * this app does not hold, so a geotagged photo may arrive without its
+ * location there. Asking for that permission is a native change (a store
+ * build); until a device says which, the claim is "the picker's bytes", not
+ * "the original's".
+ *
+ * The library is opened without asking for photo access first: the system
+ * picker hands over only what the person picks and needs no permission, and
+ * the app's photo-access wording is about terminal attachments, which this is
+ * not. Both pickers copy what was picked into the app's cache, which the
+ * upload then reads in pieces and deletes once it no longer needs it.
+ */
+export async function pickOriginalFiles(source: "files" | "photos"): Promise<PickedOriginal[]> {
+  if (source === "files") {
+    const result = await DocumentPicker.getDocumentAsync({
+      copyToCacheDirectory: true,
+      multiple: true,
+      type: "*/*",
+    });
+    if (result.canceled) return [];
+    return result.assets.map((asset) => ({
+      uri: asset.uri,
+      name: asset.name,
+      mimeType: asset.mimeType ?? null,
+      size: typeof asset.size === "number" ? asset.size : null,
+    }));
+  }
+  const result = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ["images", "videos"],
+    allowsEditing: false,
+    allowsMultipleSelection: true,
+    selectionLimit: 0,
+    quality: 1,
+    exif: false,
+    preferredAssetRepresentationMode:
+      ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current,
+    // Videos pass through untranscoded: that is the picker's own default.
+  });
+  if (result.canceled) return [];
+  return result.assets.map((asset) => ({
+    uri: asset.uri,
+    name: assetName(asset, asset.type === "video" ? "video" : "photo"),
+    mimeType: asset.mimeType ?? null,
+    size: typeof asset.fileSize === "number" ? asset.fileSize : null,
+  }));
+}

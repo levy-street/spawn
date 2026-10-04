@@ -1,8 +1,9 @@
-import { useLocalSearchParams, useNavigation, useRouter } from "expo-router";
+import { type Href, useLocalSearchParams, useNavigation, useRouter } from "expo-router";
 import { useCallback, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import type { FolderNavigation } from "@/components/files/file-browser-body";
 import { FileExplorer } from "@/components/files/file-explorer";
+import type { OpenedWindow } from "@/components/files/files-open-here";
 import { screensBackToFolder } from "@/components/files/folder-stack";
 import { normalizeCwdForHost, pathEquals, pathFlavorForHostOS } from "@/components/files/paths";
 import { HostIdentityConflict } from "@/components/hosts/host-identity-conflict";
@@ -66,6 +67,15 @@ export default function HostFilesRoute() {
       router.push({ pathname: "/host/[id]/files", params: { id: hostId, path } });
     },
     [homeDir, hostId, hostOS, navigation, router],
+  );
+
+  // A window opened from a folder shows in its workspace, as one opened from the host's page does.
+  const openWindow = useCallback(
+    ({ workspaceId, sessionId }: OpenedWindow) => {
+      router.push({ pathname: "/workspace/[id]", params: { id: workspaceId } });
+      router.push(`/terminal/${sessionId}` as Href);
+    },
+    [router],
   );
 
   const header = <AppHeader onBack={router.back} title="Files" />;
@@ -137,6 +147,7 @@ export default function HostFilesRoute() {
       hostOS={host.data.os}
       onBack={router.back}
       onOpenFolder={openFolder}
+      onWindowOpened={openWindow}
       {...(initialPath === undefined ? {} : { initialPath })}
     />
   );

@@ -6,6 +6,7 @@ import {
 } from "./daemon-channel";
 import type { HostControlClient, HostControlState } from "./hostControl";
 import type { SignedRtcRefusalReason } from "./signed-rtc-trust";
+import { browserTabId } from "./tab-id";
 
 export interface DaemonSnapshot {
   state: HostControlState;
@@ -25,6 +26,14 @@ export interface DaemonConnection {
   subscribe(listener: () => void): () => void;
   createChannel(label: string): DaemonChannel;
   retry(onlyIfFailed?: boolean): void;
+  /** The page (`browserTabId`) holding the physical connection, as last announced. */
+  ownerPage?(): string | null;
+  /**
+   * When a page that held the connection last let it go — it closed, went to
+   * sleep (pagehide, freeze), or fell silent and another tab took over — so a
+   * transfer that broke with it can say why.
+   */
+  lastOwnerRelease?(): { page: string; at: number } | null;
 }
 const INITIAL: DaemonSnapshot = {
   state: "idle",
@@ -59,6 +68,10 @@ type Wire = {
   sequence?: number;
   data?: ChannelBytes;
   snapshot?: DaemonSnapshot;
+  /** The announcing owner's page, shared by all of that page's connections. */
+  page?: string;
+  /** The owner is letting the connection go. */
+  released?: boolean;
 };
 type OwnedChannel = {
   channel: RTCDataChannel;
@@ -86,6 +99,8 @@ export class SharedDaemonConnection implements DaemonConnection {
   private ownerSeen = 0;
   private waitingSince = 0;
   private lastBeat = Date.now();
+  private ownerPageId: string | null = null;
+  private release: { page: string; at: number } | null = null;
   private lockAbort: AbortController | null = null;
   private releaseLock: (() => void) | null = null;
   private stopRoot: (() => void) | null = null;
@@ -101,6 +116,7 @@ export class SharedDaemonConnection implements DaemonConnection {
     private readonly isActive: () => boolean = () => true,
     private readonly onRetired: () => void = () => {},
     private readonly timing = { heartbeatMs: HEARTBEAT_MS, ownerSilenceMs: OWNER_SILENCE_MS },
+    private readonly page: string = browserTabId(),
   ) {
     try {
       this.bus = new BroadcastChannel(`spawn.daemon.v2:${key}`);
@@ -128,8 +144,15 @@ export class SharedDaemonConnection implements DaemonConnection {
       } else if (!this.root) {
         const heard = Math.max(this.ownerSeen, this.waitingSince);
         if (!this.lockAbort) this.elect();
-        else if (document.visibilityState === "visible" && now - heard > this.timing.ownerSilenceMs)
+        else if (
+          document.visibilityState === "visible" &&
+          now - heard > this.timing.ownerSilenceMs
+        ) {
+          // The owner went quiet without saying so: it is gone or asleep.
+          if (this.ownerPageId && this.ownerPageId !== this.page)
+            this.release = { page: this.ownerPageId, at: now };
           this.elect(true);
+        }
       }
       this.post({ type: "heartbeat" });
       if (this.root) {
@@ -149,6 +172,8 @@ export class SharedDaemonConnection implements DaemonConnection {
 
   getSnapshot = (): DaemonSnapshot => this.snapshot;
   isClosed = (): boolean => this.closed;
+  ownerPage = (): string | null => this.ownerPageId;
+  lastOwnerRelease = (): { page: string; at: number } | null => this.release;
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -284,6 +309,8 @@ export class SharedDaemonConnection implements DaemonConnection {
         type: "snapshot",
         owner: this.leader,
         term: this.term,
+        page: this.page,
+        released: true,
         snapshot: { ...INITIAL, state: "connecting" },
       });
     this.stopRoot?.();
@@ -313,6 +340,7 @@ export class SharedDaemonConnection implements DaemonConnection {
       type: "snapshot",
       owner: this.leader,
       term: this.term,
+      page: this.page,
       snapshot: {
         state: root.getState(),
         generation: root.getConnectionGeneration(),
@@ -373,6 +401,12 @@ export class SharedDaemonConnection implements DaemonConnection {
       const retireChildren = this.owner !== message.owner || this.epoch !== message.epoch;
       this.owner = message.owner;
       this.epoch = message.epoch!;
+      if (typeof message.page === "string" && message.page.length <= 64)
+        this.ownerPageId = message.page;
+      // Recorded before the children are retired, so a transfer that breaks
+      // with them already knows the tab holding its connection let it go.
+      if (message.released === true && this.ownerPageId)
+        this.release = { page: this.ownerPageId, at: Date.now() };
       this.publish(message.snapshot, retireChildren);
       return;
     }

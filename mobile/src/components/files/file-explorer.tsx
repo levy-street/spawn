@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { FileBrowserBody, type FolderNavigation } from "@/components/files/file-browser-body";
+import type { OpenedWindow } from "@/components/files/files-open-here";
 import { displayPath, normalizeCwdForHost, pathFlavorForHostOS } from "@/components/files/paths";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
@@ -18,6 +19,8 @@ export interface FileExplorerProps {
    * it the explorer changes folder in place, and back leaves it.
    */
   onOpenFolder?(navigation: FolderNavigation): void;
+  /** Shows a window opened from a folder; without it, none is offered. */
+  onWindowOpened?(opened: OpenedWindow): void;
 }
 
 /**
@@ -32,6 +35,7 @@ export function FileExplorer({
   initialPath,
   onBack,
   onOpenFolder,
+  onWindowOpened,
 }: FileExplorerProps) {
   const [inPlacePath, setInPlacePath] = useState(initialPath);
   const path = onOpenFolder ? initialPath : inPlacePath;
@@ -63,6 +67,7 @@ export function FileExplorer({
         onOpenFolder={onOpenFolder ?? ((navigation) => setInPlacePath(navigation.path))}
         onShowFolder={setShown}
         {...(path === undefined ? {} : { path })}
+        {...(onWindowOpened === undefined ? {} : { onWindowOpened })}
       />
     </Screen>
   );

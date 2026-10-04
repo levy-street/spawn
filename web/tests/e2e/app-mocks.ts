@@ -346,7 +346,14 @@ export interface AppMockOptions {
    * daemon error code.
    */
   files?: (hostId: string, path: string | null, cursor: number) => unknown;
-  fileRead?: (hostId: string, path: string) => string | Uint8Array;
+  /** A file's bytes; a promise holds the read open until it settles. */
+  fileRead?: (hostId: string, path: string) => string | Uint8Array | Promise<string | Uint8Array>;
+  /**
+   * Asked before a write starts, with its declaration (dir, name, length,
+   * sha256, overwrite); throw `new Error("host_error:<code>")` to refuse it the
+   * way a daemon does (`already_exists` for a name taken).
+   */
+  fileWriteBegin?: (hostId: string, declaration: Record<string, unknown>) => void | Promise<void>;
   /** Bytes of the PNG the host would render for a file it cannot stream. */
   filePreview?: (hostId: string, path: string, maxPixels: number) => string | Uint8Array;
   fileStat?: (hostId: string, path: string) => Record<string, unknown>;
@@ -505,8 +512,12 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           { path: payload.path },
         );
       }
+      if (operation === "fs.write.begin") {
+        await options.fileWriteBegin?.(hostId, payload);
+        return {};
+      }
       if (operation === "fs.read") {
-        const bytes = Buffer.from(options.fileRead?.(hostId, String(payload.path)) ?? "hi");
+        const bytes = Buffer.from((await options.fileRead?.(hostId, String(payload.path))) ?? "hi");
         return {
           path: payload.path,
           name:
@@ -519,7 +530,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         };
       }
       if (operation === "fs.read.range") {
-        const all = Buffer.from(options.fileRead?.(hostId, String(payload.path)) ?? "hi");
+        const all = Buffer.from((await options.fileRead?.(hostId, String(payload.path))) ?? "hi");
         const offset = Number(payload.offset ?? 0);
         const requested = Number(payload.length ?? all.length);
         const slice = all.subarray(offset, offset + requested);
@@ -724,6 +735,19 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
               return;
             }
             if (operation === "fs.write.begin") {
+              try {
+                await invoke()(this.getHostId(), "fs.write.begin", payload);
+              } catch (error) {
+                const code = /host_error:([a-z_]+)/.exec(String(error))?.[1] ?? "mock_failed";
+                this.emit({
+                  version: 1,
+                  type: "response",
+                  request_id: requestId,
+                  ok: false,
+                  error: { code, detail: String(error) },
+                });
+                return;
+              }
               const streamId = crypto.randomUUID();
               this.writes.set(streamId, { declaration: payload, chunks: [] });
               this.emit({
