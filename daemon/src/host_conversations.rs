@@ -102,8 +102,13 @@ pub(crate) fn is_carrier_op(operation: &str) -> bool {
 const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Housekeeping runs at most this often.
 const GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
-/// Transfers a host stages at once.
+/// Transfers a host stages at once, and the bytes they may declare together:
+/// two bundles of the largest size.
 const MAX_INCOMING: usize = 16;
+const MAX_INCOMING_BYTES: u64 = 2 * crate::host_bundle::BUNDLE_MAX;
+/// What an import leaves free on the filesystem beside what it needs: the
+/// staged bundle and the files extracted from it, both whole until commit.
+const SPACE_RESERVE: u64 = 256 * 1024 * 1024;
 /// Project folders one scan of a Claude store reads; a store with more is
 /// refused rather than half-searched, since a copy missed is a copy that
 /// would go on being resumable.
@@ -198,6 +203,9 @@ pub(crate) struct Places {
     login_shell: Arc<ShellNameFn>,
     #[cfg(test)]
     move_hook: Option<Arc<dyn Fn(MovePoint) + Send + Sync>>,
+    /// The free space a test's filesystem reports.
+    #[cfg(test)]
+    free_space: Option<u64>,
 }
 
 impl Places {
@@ -211,6 +219,8 @@ impl Places {
             login_shell: Arc::new(login_shell),
             #[cfg(test)]
             move_hook: None,
+            #[cfg(test)]
+            free_space: None,
         }
     }
 
@@ -222,6 +232,26 @@ impl Places {
             claude_store: Some(claude_store),
             login_shell: Arc::new(|| "bash".to_string()),
             move_hook: None,
+            free_space: None,
+        }
+    }
+
+    /// The space free to spawnd on the filesystem of `dir`, where it can be
+    /// read.
+    fn free_bytes(&self, dir: &Dir) -> Option<u64> {
+        #[cfg(test)]
+        if self.free_space.is_some() {
+            return self.free_space;
+        }
+        #[cfg(unix)]
+        {
+            let stat = rustix::fs::fstatvfs(dir).ok()?;
+            Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            None
         }
     }
 
@@ -922,10 +952,18 @@ fn exists(parent: &Dir, name: &OsStr) -> bool {
     parent.symlink_metadata(name).is_ok()
 }
 
-/// A regular file opened for reading without following a link.
+/// A regular file opened for reading without following a link, and without
+/// blocking: a FIFO planted where a `.git` pointer, a `commondir` or a
+/// conversation file is expected opens at once and is refused, rather than
+/// holding a thread — and the channel waiting on it — for good.
 fn open_file(parent: &Dir, name: &OsStr) -> FsResult<std::fs::File> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
     let file = parent
         .open_with(name, &options)
         .map_err(nofollow)?
@@ -1638,10 +1676,23 @@ fn write_tombstone(holdings: &Holdings, kind: &str, tombstone: &Tombstone) -> Fs
 // ---------------------------------------------------------------------------
 // Housekeeping
 
+/// Held by housekeeping for its whole pass, and by whatever builds or
+/// settles what housekeeping removes — a commit setting copies aside and
+/// dropping its staging, a cancel dropping its staging — so a pass never
+/// sees, and removes, one half-built: a set-aside slot whose `origin.json`
+/// is not written yet reads as one past keeping.
+fn holdings_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: StdMutex<()> = StdMutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Drop what is past keeping: retired holdings and set-aside copies after
-/// 30 days, finished transfers' records likewise, and staging a tombstone
-/// already settled. Never an unresolved `outgoing/`: only a device resolves
-/// a move.
+/// 30 days, finished transfers' records likewise, staging a tombstone
+/// already settled, and staging nothing has written for 30 days — cancelled
+/// first, so it can never commit, which a device resolving the move then
+/// finds. Never an unresolved `outgoing/`: only a device resolves a move,
+/// and only the target's answer says whether the source may put it back.
 fn collect_garbage(holdings: &Holdings, now: u64, force: bool) {
     static LAST: StdMutex<Option<Instant>> = StdMutex::new(None);
     if !force {
@@ -1653,6 +1704,7 @@ fn collect_garbage(holdings: &Holdings, now: u64, force: bool) {
         }
         *last = Some(Instant::now());
     }
+    let _holdings = holdings_lock();
     let expired = |at: u64| now.saturating_sub(at) > RETENTION.as_millis() as u64;
     for kind in [ABORTED, IMPORTED, CANCELLED] {
         let Ok(dir) = holdings.sub(kind) else {
@@ -1707,6 +1759,46 @@ fn collect_garbage(holdings: &Holdings, now: u64, force: bool) {
                 .any(|kind| matches!(read_tombstone(holdings, kind, name), Ok(Some(_))));
             if settled {
                 let _ = remove_tree(&dir, &name.to_string());
+                continue;
+            }
+            let Ok(Some((staging, record))) = incoming_record(holdings, name, false) else {
+                continue;
+            };
+            // A decided commit only ever rolls forward.
+            if record.state != "receiving" {
+                continue;
+            }
+            let written = staging
+                .symlink_metadata(STAGED)
+                .ok()
+                .and_then(|metadata| crate::host_files::modified_seconds(&metadata))
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .map_or(0, |seconds| seconds.saturating_mul(1000));
+            if !expired(record.created_at.max(written)) {
+                continue;
+            }
+            // Not while anything works on it: a begin, a commit, a cancel.
+            let slot = slot(Role::Import, name);
+            let Ok(_working) = slot.try_lock() else {
+                continue;
+            };
+            drop(staging);
+            let cancelled = write_tombstone(
+                holdings,
+                CANCELLED,
+                &Tombstone {
+                    version: 1,
+                    transfer_id: name.to_string(),
+                    conversation_id: Some(record.conversation_id.clone()),
+                    state: "cancelled".into(),
+                    at: now,
+                    length: None,
+                    sha256: None,
+                    result: None,
+                },
+            );
+            if cancelled.is_ok() {
+                let _ = remove_tree(&dir, &name.to_string());
             }
         }
     }
@@ -1730,6 +1822,8 @@ pub(crate) fn collect_held() {
         login_shell: Arc::new(String::new),
         #[cfg(test)]
         move_hook: None,
+        #[cfg(test)]
+        free_space: None,
     };
     if let Ok(holdings) = Holdings::open(&places) {
         collect_garbage(&holdings, now_ms(), false);
@@ -3177,6 +3271,7 @@ impl Carrier {
                     crate::host_stream::TransferState::Cancelled => Ok(status),
                     _ => {
                         let holdings = Holdings::open(places)?;
+                        let _holdings = holdings_lock();
                         // The tombstone first: from here on no commit can
                         // happen, whatever happens to the staging.
                         write_tombstone(
@@ -3268,15 +3363,31 @@ fn begin_sync(
         } else {
             crate::host_stream::chunk_offset(staged / crate::host_stream::CHUNK_BYTES)
         };
+        refuse_short_of_space(places, &holdings, request.length, keep)?;
         return Ok(keep);
     }
     refuse_live_here(places, &request.conversation_id)?;
-    if transfer_names(&incoming, "").len() >= MAX_INCOMING {
+    let staged: Vec<IncomingRecord> = transfer_names(&incoming, "")
+        .into_iter()
+        .filter_map(|other| incoming_record(&holdings, other, false).ok().flatten())
+        .map(|(_, record)| record)
+        .collect();
+    if staged.len() >= MAX_INCOMING {
         return Err(error(
             "too_many_transfers",
             "this host is already receiving as many conversations as it stages",
         ));
     }
+    let declared = staged.iter().fold(request.length, |total, record| {
+        total.saturating_add(record.length)
+    });
+    if declared > MAX_INCOMING_BYTES {
+        return Err(error(
+            "too_many_transfers",
+            "this host already stages as many bytes of conversations as it keeps for moves; resolve an unfinished one first",
+        ));
+    }
+    refuse_short_of_space(places, &holdings, request.length, 0)?;
     if operations.cancelled() {
         return Err(crate::host_files::cancelled_error());
     }
@@ -3320,6 +3431,33 @@ fn begin_sync(
     write_record(&staging, RECORD, &record)?;
     crate::platform::fsync_dir(&incoming)?;
     Ok(0)
+}
+
+/// An import needs the rest of its bundle and every file extracted from it,
+/// both whole until the commit, and leaves a reserve beside them: on the
+/// filesystem every Claude transcript on the host is written to, a move must
+/// never be what fills it.
+fn refuse_short_of_space(
+    places: &Places,
+    holdings: &Holdings,
+    length: u64,
+    staged: u64,
+) -> FsResult<()> {
+    let needed = length
+        .saturating_mul(2)
+        .saturating_sub(staged)
+        .saturating_add(SPACE_RESERVE);
+    match places.free_bytes(&holdings.root) {
+        Some(free) if free < needed => Err(error(
+            "insufficient_space",
+            format!(
+                "this host has {} MiB free where a move stages and needs {} MiB",
+                free >> 20,
+                needed >> 20
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Verify the staged bundle end to end and extract it, then commit. Bytes
@@ -3480,6 +3618,7 @@ fn finish_commit(
     transfer: Uuid,
     record: IncomingRecord,
 ) -> FsResult<Value> {
+    let _holdings = holdings_lock();
     let incoming = holdings.sub(INCOMING)?;
     let staging = incoming.open_dir_nofollow(transfer.to_string())?;
     let tree = optional_dir(&staging, OsStr::new(TREE))?;
@@ -3647,7 +3786,16 @@ impl Carrier {
                                 "the target committed something other than what this host declared",
                             ));
                         }
+                        // When it was retired goes with it: housekeeping
+                        // keeps a retired holding 30 days from then, and
+                        // must never find one without it.
                         let outgoing = holdings.sub(OUTGOING)?;
+                        let held = outgoing.open_dir_nofollow(transfer.to_string())?;
+                        let mut record = *record;
+                        let at = now_ms();
+                        record.retired_at = Some(at);
+                        write_record(&held, RECORD, &record)?;
+                        drop(held);
                         rename_noreplace(
                             &outgoing,
                             OsStr::new(&transfer.to_string()),
@@ -3656,11 +3804,6 @@ impl Carrier {
                         )?;
                         crate::platform::fsync_dir(&outgoing)?;
                         crate::platform::fsync_dir(&retired)?;
-                        let held = retired.open_dir_nofollow(transfer.to_string())?;
-                        let mut record = *record;
-                        let at = now_ms();
-                        record.retired_at = Some(at);
-                        write_record(&held, RECORD, &record)?;
                         Ok(retired_answer(Some(at)))
                     }
                 }
@@ -3835,14 +3978,28 @@ mod tests {
         }
 
         async fn with_window(shell: Option<u32>, stop: Stop) -> Self {
-            Self::build(shell, stop, None).await
+            Self::build(shell, stop, |_| {}).await
         }
 
         async fn with_hook(hook: MoveHook) -> Self {
-            Self::build(None, Arc::new(|| WindowStop::NotRunning), Some(hook)).await
+            Self::build(None, Arc::new(|| WindowStop::NotRunning), |places| {
+                places.move_hook = Some(hook);
+            })
+            .await
         }
 
-        async fn build(shell: Option<u32>, stop: Stop, hook: Option<MoveHook>) -> Self {
+        async fn with_free_space(free: u64) -> Self {
+            Self::build(None, Arc::new(|| WindowStop::NotRunning), |places| {
+                places.free_space = Some(free);
+            })
+            .await
+        }
+
+        async fn build(
+            shell: Option<u32>,
+            stop: Stop,
+            configure: impl FnOnce(&mut Places),
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let home = root.path().join("home");
             std::fs::create_dir_all(&home).unwrap();
@@ -3858,7 +4015,7 @@ mod tests {
             let stopped_run = Arc::clone(&incarnation);
             let current_run = Arc::clone(&incarnation);
             let mut places = Places::rooted(holdings.clone(), store.clone());
-            places.move_hook = hook;
+            configure(&mut places);
             let pair = PairWindows::new(
                 WindowShells::new(move |id| (id.to_string() == WINDOW).then_some(shell).flatten()),
                 move |_| {
@@ -5229,6 +5386,191 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prepared.entries, 1);
+    }
+
+    /// A target never stages what its disk cannot hold beside everything
+    /// else — the bundle and its extracted files, whole until the commit,
+    /// and a reserve — nor more than two of the largest bundles unresolved.
+    #[tokio::test]
+    async fn a_target_stages_only_what_it_has_room_for() {
+        let length = 100_000_u64;
+        let needed = 2 * length + SPACE_RESERVE;
+        let begin = |transfer: Uuid, length: u64| {
+            ImportRequest::parse(
+                json!({
+                    "transfer_id": transfer.to_string(),
+                    "agent": "claude-code",
+                    "conversation_id": ID,
+                    "mode": "retire",
+                    "cwd": "~/code/spawn",
+                    "length": length,
+                    "stream": {"digest": "end"},
+                })
+                .as_object(),
+            )
+            .unwrap()
+        };
+        let short = Host::with_free_space(needed - 1).await;
+        short.folder("code/spawn");
+        let refused = short
+            .carrier
+            .begin_import(begin(Uuid::new_v4(), length), "s")
+            .await;
+        assert_eq!(refused.err().unwrap().code, "insufficient_space");
+        assert_eq!(
+            std::fs::read_dir(short.holdings.join(INCOMING))
+                .unwrap()
+                .count(),
+            0
+        );
+        let enough = Host::with_free_space(needed).await;
+        enough.folder("code/spawn");
+        enough
+            .carrier
+            .begin_import(begin(Uuid::new_v4(), length), "s")
+            .await
+            .unwrap();
+
+        let roomy = Host::with_free_space(u64::MAX).await;
+        roomy.folder("code/spawn");
+        for _ in 0..2 {
+            roomy
+                .carrier
+                .begin_import(begin(Uuid::new_v4(), crate::host_bundle::BUNDLE_MAX), "s")
+                .await
+                .unwrap();
+        }
+        let refused = roomy
+            .carrier
+            .begin_import(begin(Uuid::new_v4(), 100), "s")
+            .await;
+        assert_eq!(refused.err().unwrap().code, "too_many_transfers");
+    }
+
+    /// Staging nothing has written for 30 days is cancelled — so it can
+    /// never commit, and a device resolving the move finds that — and then
+    /// dropped; never one decided, nor one anything works on.
+    #[tokio::test]
+    async fn abandoned_staging_is_cancelled_then_dropped() {
+        let target = Host::new().await;
+        let cwd = target.folder("code/spawn");
+        let bundle = retired_bundle(RECORD_BYTES, &[]).await;
+        let long_ago = now_ms() - RETENTION.as_millis() as u64 - 60_000;
+        let mut staged = Vec::new();
+        for _ in 0..3 {
+            let transfer = Uuid::new_v4();
+            let mut stream = target
+                .carrier
+                .begin_import(import(transfer, &cwd, &bundle, None), "s")
+                .await
+                .unwrap()
+                .stream;
+            stream
+                .take_chunk(
+                    &target.carrier,
+                    0,
+                    &bundle[..8192.min(bundle.len()) - 1],
+                    false,
+                )
+                .await
+                .ok();
+            stream.end().await;
+            let staging = target.holdings.join(INCOMING).join(transfer.to_string());
+            let mut record: Value =
+                serde_json::from_slice(&std::fs::read(staging.join(RECORD)).unwrap()).unwrap();
+            record["created_at"] = json!(long_ago);
+            std::fs::write(staging.join(RECORD), record.to_string()).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(staging.join(STAGED))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_millis(long_ago))
+                .unwrap();
+            staged.push((transfer, staging));
+        }
+        let (abandoned, abandoned_at) = &staged[0];
+        let (decided, decided_at) = &staged[1];
+        let (busy, busy_at) = &staged[2];
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(decided_at.join(RECORD)).unwrap()).unwrap();
+        record["state"] = json!("committing");
+        std::fs::write(decided_at.join(RECORD), record.to_string()).unwrap();
+        let working = slot(Role::Import, *busy);
+        let held = working.lock().await;
+        let holdings = Holdings::open(&target.carrier.pair.places).unwrap();
+        collect_garbage(&holdings, now_ms(), true);
+        drop(held);
+        assert!(!abandoned_at.exists());
+        assert_eq!(
+            target.carrier.import_status(*abandoned).await.unwrap(),
+            TransferStatus::cancelled()
+        );
+        assert!(decided_at.exists(), "a decided commit only rolls forward");
+        assert!(busy_at.exists(), "never while anything works on it");
+        let _ = (decided, busy);
+    }
+
+    /// A probe of a worktree whose `commondir` is a FIFO answers at once:
+    /// the open never waits for a writer that will not come.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_fifo_never_stalls_a_probe() {
+        let host = Host::new().await;
+        let repo = host.folder("code/spawn");
+        let gitdir = repo.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        let fifo = gitdir.join("commondir");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let worktree = host.folder("code/wt");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        // Were the probe to block on the FIFO, this would let it go after a
+        // second, so the test fails instead of hanging.
+        let release = fifo.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let answered = Arc::clone(&done);
+        let releaser = std::thread::spawn(move || {
+            use std::os::unix::fs::OpenOptionsExt;
+            let patience = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < patience {
+                if answered.load(Ordering::SeqCst) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(nix::libc::O_NONBLOCK)
+                    .open(&release)
+                    .is_ok()
+                {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        });
+        let started = Instant::now();
+        let answer = host
+            .carrier
+            .probe(
+                ProbeRequest::parse(
+                    json!({"agent": "claude-code", "cwd": worktree.to_string_lossy()}).as_object(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+        assert!(!releaser.join().unwrap(), "the probe waited on the FIFO");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert_eq!(answer["repository_root"], worktree.to_str().unwrap());
     }
 
     #[tokio::test]

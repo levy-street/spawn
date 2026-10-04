@@ -565,9 +565,14 @@ none of it.
   every copy back, sidecar first, never over anything. Housekeeping
   (`collect_held`, after each registration and beside the operations, at
   most every ten minutes) drops retired and set-aside copies and finished
-  transfers' records after 30 days; an unresolved `outgoing/` is never
-  collected — only a device resolves a move (`conv.transfers` lists what is
-  open).
+  transfers' records after 30 days, and cancels, then drops, staging nothing
+  has written for 30 days (never a decided commit, nor one whose transfer
+  lock is held); an unresolved `outgoing/` is never collected — only a device
+  resolves a move (`conv.transfers` lists what is open). It holds
+  `holdings_lock` for its pass, as a commit does while it sets copies aside
+  and a cancel while it drops staging. A begin refuses what the filesystem
+  cannot hold twice over plus a reserve (`insufficient_space`) and more than
+  4 GiB declared by unresolved transfers.
 - **Bulk is paced per association.** `PairContext` owns one `BulkGate`; every
   v2 stream's chunks go through it, one at a time and in turn, only while the
   bulk channels together buffer at most 32 KiB, so terminal echo always has

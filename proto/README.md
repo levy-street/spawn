@@ -1598,8 +1598,9 @@ already on their way are dropped — and the daemon decides commit and cancel
 under one lock, so a transfer reports exactly one of them from then on. Staged
 bytes outlive the channel that carried them by at least ten minutes, bounded
 in count and bytes as uploads are; a family may keep them longer (`conv.v2`
-keeps a transfer's staging until a device resolves the move, at most 16
-transfers at a time). A v2 write stream with nothing for 60 seconds ends with
+keeps a transfer's staging until a device resolves the move — at most 16
+transfers and two of the largest bundles, 4 GiB declared, at a time — and
+cancels staging nothing has written for 30 days). A v2 write stream with nothing for 60 seconds ends with
 `stream.error {code:"stream_timeout"}`; its transfer stays `receiving`.
 
 **Commit.** `stream.committed` follows the receiver's fsync of the file and
@@ -1718,7 +1719,10 @@ A writer carries a log (`.jsonl`) up to and including its last newline: a
 Claude Code killed mid-write leaves a torn last line, and the next append
 glues onto it, so a carried record ends at its last complete line. Files the
 allowlist does not know — or that a request's `include` leaves out, or that
-are links — stay where they are and are counted, never carried.
+are links — are counted (`skipped`), never carried. A retire takes the whole
+conversation out of the lookup path, so they leave the store with it: they
+stay in the source's holding, put back by an abort, or kept with the retired
+copy for its 30 days and then deleted with it.
 
 ### The conversation carrier (`conv.v2`)
 
@@ -1819,7 +1823,10 @@ else, so a device opens a consumer channel per transfer. The target refuses a
 folder it does not have (`folder_missing`), one outside home
 (`outside_root`), a store that does not exist yet (`store_missing`) or that it
 cannot rename into (`store_unavailable`), more than 16 transfers staged at
-once (`too_many_transfers`), a transfer already settled
+once or more than 4 GiB declared by unresolved transfers together
+(`too_many_transfers`), a bundle its filesystem has no room for — the rest of
+the bundle and its extracted files, both whole until the commit, and 256 MiB
+beside them (`insufficient_space`) — a transfer already settled
 (`transfer_committed`, `transfer_cancelled`), and — at the begin, and again
 at `stream.end` before the commit is decided — a conversation a Claude on
 the target holds (`conversation_live_here`): setting that copy aside, or
