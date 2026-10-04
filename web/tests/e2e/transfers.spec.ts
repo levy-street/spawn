@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Locator, type Page, test } from "@playwright/test";
 import {
   type AppMockOptions,
   fileEntry,
@@ -177,6 +177,57 @@ test("a name already at the destination is asked about in the tray", async ({ pa
     tray(page).getByRole("listitem", { name: "Sent “notes.txt” from Mac to Home on Linux box" }),
   ).toBeVisible();
   expect(written).toEqual([{ host: OTHER_HOST_ID, dir: "/home/tester", name: "notes (2).txt" }]);
+});
+
+/** Fails unless `inner` lies inside `outer` from its left edge to its right. */
+async function expectWithin(inner: Locator, outer: Locator) {
+  const [box, frame] = await Promise.all([inner.boundingBox(), outer.boundingBox()]);
+  if (!box || !frame) throw new Error("not laid out");
+  expect(box.x).toBeGreaterThanOrEqual(frame.x);
+  expect(box.x + box.width).toBeLessThanOrEqual(frame.x + frame.width);
+}
+
+test("a long name never pushes Cancel out of the send dialog", async ({ page }) => {
+  await mockApp(page, {
+    hosts: [host, { ...otherHost, name: "build-server", home_dir: "/home/builder" }],
+    files: (hostId, path) =>
+      hostId === OTHER_HOST_ID
+        ? fileListing({ path: "/home/builder", home_dir: "/home/builder", parent: "/home" })
+        : path === "/Users/tester" || path === "~"
+          ? fileListing({
+              entries: [
+                fileEntry({
+                  name: "staging-2026-10-03.db",
+                  path: "/Users/tester/staging-2026-10-03.db",
+                }),
+              ],
+            })
+          : treeFiles(hostId, path),
+  });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await item(page, "staging-2026-10-03.db").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Send to another host…" }).click();
+  await page.getByRole("menuitem", { name: /^build-server/ }).click();
+  await page
+    .getByRole("dialog", { name: "Where on build-server?" })
+    .getByRole("button", { name: "Select this folder" })
+    .click();
+
+  const label = "Send “staging-2026-10-03.db” to build-server";
+  const confirm = page.getByRole("dialog", { name: label });
+  const cancel = confirm.getByRole("button", { name: "Cancel" });
+  // Cut short to fit, the button still answers to the whole sentence.
+  const sendButton = confirm.getByRole("button", { name: label, exact: true });
+  await expect(cancel).toBeVisible();
+  for (const width of [1280, 390, 320]) {
+    await page.setViewportSize({ width, height: 800 });
+    await expectWithin(cancel, confirm);
+    await expectWithin(sendButton, confirm);
+  }
+  await cancel.click();
+  await expect(confirm).toBeHidden();
+  // Cancelled: nothing was sent.
+  await expect(tray(page)).toHaveCount(0);
 });
 
 test("a link has nothing of its own to download or send", async ({ page }) => {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react-native";
+import { fireEvent, render, screen, within } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -235,6 +235,44 @@ describe("sending to another host", () => {
     expect(
       useTransfersStore.getState().batches[0]?.items.map((item) => [item.kind, item.name]),
     ).toEqual([["folder", "empty"]]);
+  });
+
+  test("a long name gives way in the send button, and Cancel keeps its place", async () => {
+    const name = "staging-2026-10-03-full-snapshot-before-the-migration.db";
+    await render(
+      <Providers>
+        <SendToHostSheet
+          entries={[fileEntry(CODE, name, { size: 10 })]}
+          onDismiss={jest.fn()}
+          source={{ id: "src", name: "dream", publicKey: "k", os: "linux" }}
+          sourceFolder={CODE}
+          sourceHomeDir={HOME}
+          sourceTransport={
+            fakeHost({
+              home: HOME,
+              folders: { [CODE]: [fileEntry(CODE, name, { size: 10 })] },
+              capabilities: ["fs.list", "fs.read"],
+            }).transport
+          }
+          visible
+        />
+      </Providers>,
+    );
+    await fireEvent.press(screen.getByText("mac-mini"));
+    await fireEvent.press(await screen.findByText(`Choose ${THERE}/code`));
+    await screen.findByText("1 item · 10 B");
+
+    const label = `Send “${name}” to mac-mini`;
+    // Cut short to fit, the button still says the whole sentence to a screen reader.
+    const send = screen.getByRole("button", { name: label });
+    expect(send).toBe(screen.getByTestId("send-confirm"));
+    // It shrinks to what Cancel leaves, on one line cut in the middle, so
+    // the host it goes to still shows; Cancel never shrinks.
+    expect(send).toHaveStyle({ flexShrink: 1 });
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveStyle({ flexShrink: 0 });
+    const shown = within(send).getByText(label);
+    expect(shown).toHaveProp("numberOfLines", 1);
+    expect(shown).toHaveProp("ellipsizeMode", "middle");
   });
 
   test("a big send through the relay says so before it starts, and about how long (OD3)", async () => {
