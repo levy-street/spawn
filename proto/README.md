@@ -1492,8 +1492,8 @@ later (`fs.v2`, D4) — uses one stream primitive, specified here before any
 runtime builds it so that the daemon, the browser and the phone build one
 flow-control mechanism rather than three.
 [`stream-v2-vectors.json`](stream-v2-vectors.json) holds its chunking,
-window, acknowledgement and status cases and two complete frame transcripts
-(a write and a read, each resumed after its channel closed).
+window, acknowledgement, status and pacing cases and two complete frame
+transcripts (a write and a read, each resumed after its channel closed).
 
 **Opt-in, per stream.** A v2 stream exists only when an operation of a family
 that specifies it opens one: `conv.export` and `conv.import.begin` always,
@@ -1524,8 +1524,12 @@ continues its numbering.
 its sender may have unacknowledged. The daemon grants
 `min(asked, limits.stream_window_max)`, at least 1, and returns it as
 `window`. Until spike S4 measures terminal echo against bulk load,
-`stream_window_max` is 16 (128 KiB in flight). A sender sends chunk *s* only
-while *s* < acknowledged + window.
+`stream_window_max` is 16: 128 KiB of payload, but 16 frames of about 11 KB
+each on the wire (a full chunk is 10,924 base64 characters in a JSON frame),
+so about 176 KB. A sender sends chunk *s* only while *s* < acknowledged +
+window. The window bounds what a receiver holds unacknowledged; it does not
+bound what a sender puts in the association's send queue, which only bulk
+pacing does.
 
 **Acknowledgements, both ways.** `stream.ack`'s `sequence` is cumulative: the
 number of chunks the receiver has taken, which is the next sequence it
@@ -1561,8 +1565,15 @@ a new `stream_id` and the `next_sequence` to send; the device restarts its
 source at byte `next_sequence × chunk_bytes`. To resume a read, the device
 repeats it with `from_sequence`; the daemon serves the same bytes from that
 chunk on (a source that changed meanwhile fails with the family's error), and
-an end digest still covers the whole stream. A `stream.cancel` ends a stream,
-not its transfer: the staged bytes stay `receiving`. Only the family's own
+an end digest still covers the whole stream. A resumed begin or read
+supersedes any stream of the same transfer that is still open, on whatever
+channel, since a channel the device has given up on may not have closed yet:
+under the transfer's lock the daemon ends the old stream with `stream.error`
+`superseded`, refuses any later frame on it as it refuses a frame for an
+unknown stream, and only then reads `next_sequence` for its answer. At most
+one stream writes a transfer at a time, and no stale one writes past the
+point the new one starts from. A `stream.cancel` ends a stream, not its
+transfer: the staged bytes stay `receiving`. Only the family's own
 cancel (`conv.import.cancel`) makes a transfer `cancelled`, and the daemon
 decides commit and cancel under one lock, so a transfer reports exactly one
 of them from then on. Staged bytes outlive the channel that carried them by at
@@ -1571,18 +1582,35 @@ keep them longer (`conv.v1` keeps a transfer's record until a device resolves
 the move).
 
 **Commit.** `stream.committed` follows the receiver's fsync of the file and
-of its directory.
+of its directory. A write whose bytes fail the digest at commit
+(`integrity_mismatch`) is discarded, not kept for resuming: the receiver
+deletes its staging and forgets the transfer, whose status is `absent` from
+then on, so a repeated begin with the same id starts again from sequence 0
+instead of resuming over bytes that did not verify.
 
-**Bulk pacing.** Every v2 stream is bulk. The daemon writes a bulk stream's
-next chunk only while that DataChannel's `buffered_amount` is at or below a
-low watermark — 32 KiB until S4 measures — and otherwise waits for
-`on_buffered_amount_low`. Every channel of a device's connection shares one
-association-wide 128 KiB SCTP pending queue
-(`daemon/vendor/sctp/src/queue/pending_queue.rs`), so a transfer that filled
-it would hold terminal echo behind its own bytes; pacing on the buffered
-amount bounds what a transfer can put there, whatever its window. Terminal
-channels and control responses are never paced. A device paces its own
-writes the same way on `RTCDataChannel.bufferedAmount`.
+**Bulk pacing.** Every v2 stream is bulk, and bulk is paced per association,
+not per channel. Every channel of a device's connection — terminals, control,
+each consumer channel a bulk stream runs on — shares one association-wide
+128 KiB SCTP pending queue (`daemon/vendor/sctp/src/queue/pending_queue.rs`),
+and a writer that finds it full waits, terminal echo included. A per-channel
+watermark would not bound it: three bulk channels each held under 32 KiB, plus
+the frame each may add, already reach 128 KiB. So the daemon keeps one bulk
+gate per association. Bulk frames of every stream on it go out one at a
+time, taking the streams in turn, and the next goes out only while the sum of
+`buffered_amount` over every channel carrying a v2 stream on that association
+is at or below the bulk watermark — 32 KiB until S4 measures. Otherwise the
+gate waits for `on_buffered_amount_low` on any of them, with each such
+channel's low threshold set to the watermark. `buffered_amount` counts a
+message's bytes from the moment it is written until the peer acknowledges
+them, so it covers everything bulk has in the pending queue. However many
+bulk channels and streams are open, bulk therefore holds at most the
+watermark plus one frame of the queue (a frame is at most 16 KiB): 48 KiB of
+the 128 KiB, leaving at least 80 KiB for terminal channels and control
+responses, which are never paced. Because the count runs until acknowledgement,
+the watermark also caps bulk at about 32 KiB per round trip; S4 sizes it
+against that. A device paces its own writes the same way, with one gate per
+connection over the sum of `RTCDataChannel.bufferedAmount` across its bulk
+channels.
 
 ### Conversation bundle v1 (specified; not implemented)
 
@@ -1590,7 +1618,8 @@ What `conv.export` streams out of one host and `conv.import.begin` takes in on
 another: one conversation's own files, carried by a device over its two host
 channels. [`conversation-bundle-v1-vectors.json`](conversation-bundle-v1-vectors.json)
 holds three complete bundles (one three stream chunks long, which the stream
-v2 transcripts carry), the path allowlist cases, and manifests and headers a
+v2 transcripts carry), the path allowlist cases, the requests a target must
+refuse before any stream opens, and the manifests, headers and lengths a
 reader must refuse.
 
 ```text
@@ -1611,12 +1640,29 @@ mode, no link target, no owner.
 
 - `agent` is an agent kind. Version 1 defines `claude-code`; Codex gets its
   own allowlist when Codex conversations travel.
+- `conversation_id` is the conversation's id; for `claude-code`, a canonical
+  UUID, lower-case and hyphenated
+  (`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`), which is
+  how Claude Code names its record.
+- Both say what the device's `conv.import.begin` already said. The begin
+  carries `agent` and `conversation_id` itself, and the target refuses one
+  whose `agent` version 1 does not define or whose id is not a canonical UUID
+  with `invalid_request`, before any stream opens. The manifest's `agent` and
+  `conversation_id` must then equal the begin's byte for byte, or the reader
+  refuses the bundle with `invalid_manifest` before it accepts a byte of any
+  entry. So a bundle cannot rename the conversation it lands as, and no
+  destination is named by bundle text that nothing checked.
 - `entries` holds 1 to 4,096 entries. Exactly one is `conversation.jsonl`, and
   it is the last: the record that makes a conversation resumable lands after
   everything it refers to. The others come in ascending byte order of their
   paths, without duplicates.
 - `size` is an integer from 0 to 512 MiB, and a whole bundle is at most
   2 GiB. `sha256` is 64 lower-case hex digits over that entry's bytes.
+- A bundle is exactly 12 + M + the sum of the entries' sizes bytes long, and
+  the stream that carries it declares that length. Once it has read the
+  manifest, a reader refuses with `invalid_bundle` a declared length that
+  differs, which refuses both a byte after the last entry and an entry cut
+  short.
 - `path` is logical: relative, `/`-separated, every component matching
   `[A-Za-z0-9._-]{1,128}` and not starting with `.`. For `claude-code` it is
   one of `conversation.jsonl`; `sidecar/subagents/<name>.jsonl` or `.json` (a
@@ -1632,17 +1678,19 @@ So a bundle holds no modes, symlinks, directories or absolute paths:
 everything in it is a regular file's bytes under a name the allowlist knows.
 The target computes every destination itself — `<store>/projects/<folder>/<id>.jsonl`
 for the record and `<store>/projects/<folder>/<id>/<rest>` for
-`sidecar/<rest>`, where the store is the window's `CLAUDE_CONFIG_DIR` (or
-`~/.claude`) and the folder is [Claude Code's own rule](claude-project-folder.json)
-over the canonical folder the window opens in — and writes files 0600 and
-directories 0700, a script included. No path from the source reaches a
-filesystem call on the target.
+`sidecar/<rest>`, where `<id>` is the begin's validated `conversation_id`,
+the store is the window's `CLAUDE_CONFIG_DIR` (or `~/.claude`) and the
+folder is [Claude Code's own rule](claude-project-folder.json) over the
+canonical folder the window opens in — and writes files 0600 and directories
+0700, a script included. No path from the source reaches a filesystem call
+on the target.
 
 A reader checks the header, then the whole manifest, before it accepts a byte
 of any entry; then each entry's digest at that entry's end, and the whole
 bundle's — the stream's digest — before it commits. Its errors are
 `invalid_bundle`, `unsupported_version`, `invalid_manifest`, `invalid_path`,
-`path_not_allowed`, `entry_order`, `too_large` and `integrity_mismatch`.
+`path_not_allowed`, `entry_order`, `too_large` and `integrity_mismatch`; the
+begin's own are `invalid_request` and the stream's.
 
 ### Proposed P2-DATA-02 store contract (review pending; not implemented)
 

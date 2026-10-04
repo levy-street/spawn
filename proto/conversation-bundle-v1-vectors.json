@@ -1,5 +1,5 @@
 {
-  "description": "Conversation bundle v1: what conv.export streams and conv.import.begin accepts. A 12-byte header (magic SPCB, version 1, three zero bytes, manifest length as u32 big-endian), a UTF-8 JSON manifest of allowlisted logical paths with sizes and SHA-256, then each entry's bytes concatenated in manifest order. No modes, symlinks, directories or absolute paths: the target computes every destination. proto/README.md, 'Conversation bundle v1', is the specification; nothing implements it yet (daemon D2).",
+  "description": "Conversation bundle v1: what conv.export streams and conv.import.begin accepts. A 12-byte header (magic SPCB, version 1, three zero bytes, manifest length as u32 big-endian), a UTF-8 JSON manifest of allowlisted logical paths with sizes and SHA-256, then each entry's bytes concatenated in manifest order, and nothing after them. No modes, symlinks, directories or absolute paths: the target computes every destination from conv.import.begin's own agent and conversation_id, which it validates first ('requests'), and refuses a manifest that names any other ('manifests'; every manifest case is carried by the begin in 'request'). proto/README.md, 'Conversation bundle v1', is the specification; nothing implements it yet (daemon D2).",
   "limits": {
     "header_bytes": 12,
     "manifest_bytes_max": 1048576,
@@ -18,6 +18,7 @@
       "^sidecar/tool-results/[^/]+\\.(txt|json)$"
     ]
   },
+  "conversation_id_pattern": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
   "bundles": [
     {
       "name": "one conversation, no sidecar",
@@ -237,9 +238,89 @@
       "error": "path_not_allowed"
     }
   ],
+  "requests": [
+    {
+      "name": "a canonical id",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+      "error": null
+    },
+    {
+      "name": "another canonical id",
+      "agent": "claude-code",
+      "conversation_id": "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09",
+      "error": null
+    },
+    {
+      "name": "an upper-case id",
+      "agent": "claude-code",
+      "conversation_id": "6F1C2A9E-0B7D-4C55-8F3E-2D9A1B7C4E60",
+      "error": "invalid_request"
+    },
+    {
+      "name": "a braced id",
+      "agent": "claude-code",
+      "conversation_id": "{6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60}",
+      "error": "invalid_request"
+    },
+    {
+      "name": "an id without hyphens",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e0b7d4c558f3e2d9a1b7c4e60",
+      "error": "invalid_request"
+    },
+    {
+      "name": "a parent directory",
+      "agent": "claude-code",
+      "conversation_id": "..",
+      "error": "invalid_request"
+    },
+    {
+      "name": "a path",
+      "agent": "claude-code",
+      "conversation_id": "../../.ssh/authorized_keys",
+      "error": "invalid_request"
+    },
+    {
+      "name": "a flag",
+      "agent": "claude-code",
+      "conversation_id": "--dangerously-skip-permissions",
+      "error": "invalid_request"
+    },
+    {
+      "name": "an empty id",
+      "agent": "claude-code",
+      "conversation_id": "",
+      "error": "invalid_request"
+    },
+    {
+      "name": "no id",
+      "agent": "claude-code",
+      "conversation_id": null,
+      "error": "invalid_request"
+    },
+    {
+      "name": "an agent version 1 does not define",
+      "agent": "codex",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+      "error": "invalid_request"
+    },
+    {
+      "name": "an agent spelled otherwise",
+      "agent": "Claude-Code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+      "error": "invalid_request"
+    }
+  ],
+  "request": {
+    "agent": "claude-code",
+    "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60"
+  },
   "manifests": [
     {
       "name": "conversation.jsonl is not last",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -256,6 +337,8 @@
     },
     {
       "name": "sidecars out of byte order",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "sidecar/tool-results/b.txt",
@@ -277,6 +360,8 @@
     },
     {
       "name": "a path twice",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "sidecar/tool-results/a.txt",
@@ -298,6 +383,8 @@
     },
     {
       "name": "no conversation",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "sidecar/tool-results/a.txt",
@@ -309,11 +396,15 @@
     },
     {
       "name": "no entries",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [],
       "error": "entry_order"
     },
     {
       "name": "an entry over 512 MiB",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -325,6 +416,8 @@
     },
     {
       "name": "a negative size",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -336,6 +429,8 @@
     },
     {
       "name": "a fractional size",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -347,6 +442,8 @@
     },
     {
       "name": "an upper-case digest",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -358,6 +455,8 @@
     },
     {
       "name": "a short digest",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -369,6 +468,8 @@
     },
     {
       "name": "an entry with a mode",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -381,6 +482,8 @@
     },
     {
       "name": "a symlink entry",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "conversation.jsonl",
@@ -393,6 +496,8 @@
     },
     {
       "name": "an absolute path",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
       "entries": [
         {
           "path": "/home/me/.claude/projects/x/y.jsonl",
@@ -401,6 +506,148 @@
         }
       ],
       "error": "invalid_path"
+    },
+    {
+      "name": "the request's agent and id",
+      "agent": "claude-code",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": null
+    },
+    {
+      "name": "another conversation's id",
+      "agent": "claude-code",
+      "conversation_id": "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "the request's id in upper case",
+      "agent": "claude-code",
+      "conversation_id": "6F1C2A9E-0B7D-4C55-8F3E-2D9A1B7C4E60",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "a parent directory as the id",
+      "agent": "claude-code",
+      "conversation_id": "..",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "a path as the id",
+      "agent": "claude-code",
+      "conversation_id": "../6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "a flag as the id",
+      "agent": "claude-code",
+      "conversation_id": "--resume",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "an empty id",
+      "agent": "claude-code",
+      "conversation_id": "",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "an id that is not a string",
+      "agent": "claude-code",
+      "conversation_id": 7,
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "another agent",
+      "agent": "codex",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "the agent spelled otherwise",
+      "agent": "claude-code ",
+      "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
+    },
+    {
+      "name": "the conversation id left out",
+      "agent": "claude-code",
+      "entries": [
+        {
+          "path": "conversation.jsonl",
+          "size": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "error": "invalid_manifest"
     }
   ],
   "headers": [
@@ -433,6 +680,26 @@
       "name": "a manifest of exactly 1 MiB is allowed",
       "header_hex": "535043420100000000100000",
       "error": null
+    }
+  ],
+  "lengths": [
+    {
+      "name": "exactly 12 + M + the entries' sizes",
+      "declared_length": 317,
+      "bundle_b64": "U1BDQgEAAAAAAADQeyJhZ2VudCI6ImNsYXVkZS1jb2RlIiwiY29udmVyc2F0aW9uX2lkIjoiNmYxYzJhOWUtMGI3ZC00YzU1LThmM2UtMmQ5YTFiN2M0ZTYwIiwiZW50cmllcyI6W3sicGF0aCI6ImNvbnZlcnNhdGlvbi5qc29ubCIsInNpemUiOjk3LCJzaGEyNTYiOiI3MDk1MjdiYTBjMWM2Yzg3MDY4ZjE1ZTM3NWIxZTFlMGRiMTYxZjY4NTY1NGRhOTBiMGYyNmZjZmU5ZjViZGIyIn1dfXsidHlwZSI6InVzZXIiLCJ1dWlkIjoidTEiLCJtZXNzYWdlIjoiaGVsbG8ifQp7InR5cGUiOiJhc3Npc3RhbnQiLCJ1dWlkIjoiYTEiLCJwYXJlbnRVdWlkIjoidTEifQo=",
+      "error": null
+    },
+    {
+      "name": "a byte after the last entry",
+      "declared_length": 318,
+      "bundle_b64": "U1BDQgEAAAAAAADQeyJhZ2VudCI6ImNsYXVkZS1jb2RlIiwiY29udmVyc2F0aW9uX2lkIjoiNmYxYzJhOWUtMGI3ZC00YzU1LThmM2UtMmQ5YTFiN2M0ZTYwIiwiZW50cmllcyI6W3sicGF0aCI6ImNvbnZlcnNhdGlvbi5qc29ubCIsInNpemUiOjk3LCJzaGEyNTYiOiI3MDk1MjdiYTBjMWM2Yzg3MDY4ZjE1ZTM3NWIxZTFlMGRiMTYxZjY4NTY1NGRhOTBiMGYyNmZjZmU5ZjViZGIyIn1dfXsidHlwZSI6InVzZXIiLCJ1dWlkIjoidTEiLCJtZXNzYWdlIjoiaGVsbG8ifQp7InR5cGUiOiJhc3Npc3RhbnQiLCJ1dWlkIjoiYTEiLCJwYXJlbnRVdWlkIjoidTEifQoK",
+      "error": "invalid_bundle"
+    },
+    {
+      "name": "the last entry cut short",
+      "declared_length": 316,
+      "bundle_b64": "U1BDQgEAAAAAAADQeyJhZ2VudCI6ImNsYXVkZS1jb2RlIiwiY29udmVyc2F0aW9uX2lkIjoiNmYxYzJhOWUtMGI3ZC00YzU1LThmM2UtMmQ5YTFiN2M0ZTYwIiwiZW50cmllcyI6W3sicGF0aCI6ImNvbnZlcnNhdGlvbi5qc29ubCIsInNpemUiOjk3LCJzaGEyNTYiOiI3MDk1MjdiYTBjMWM2Yzg3MDY4ZjE1ZTM3NWIxZTFlMGRiMTYxZjY4NTY1NGRhOTBiMGYyNmZjZmU5ZjViZGIyIn1dfXsidHlwZSI6InVzZXIiLCJ1dWlkIjoidTEiLCJtZXNzYWdlIjoiaGVsbG8ifQp7InR5cGUiOiJhc3Npc3RhbnQiLCJ1dWlkIjoiYTEiLCJwYXJlbnRVdWlkIjoidTEifQ==",
+      "error": "invalid_bundle"
     }
   ]
 }
