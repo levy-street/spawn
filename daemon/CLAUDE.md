@@ -579,8 +579,9 @@ none of it.
   4 GiB declared by unresolved transfers.
 - **Bulk is paced per association.** `PairContext` owns one `BulkGate`; every
   v2 stream's chunks go through it, one at a time and in turn, only while the
-  bulk channels together buffer at most 32 KiB, so terminal echo always has
-  most of the 128 KiB SCTP queue. A v2 write is acknowledged when the
+  bulk channels together buffer at most 64 KiB (`BULK_WATERMARK`, measured by
+  spike S4), so terminal echo always has at least 48 KiB of the 128 KiB SCTP
+  queue; the window is at most 16 chunks (`WINDOW_MAX`, S4 too). A v2 write is acknowledged when the
   receiver catches up with its queue, on its last chunk, and never later than
   half the window. A read's acknowledgements (v1 and v2) coalesce to the
   highest in `ReadSignals` rather than queue, so a device acknowledging at

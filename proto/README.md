@@ -1177,7 +1177,10 @@ channel, and an older ID is forgotten rather than counted. Daemons before
 this window remembered every ID and closed the channel at its 4,097th, so a
 client that keeps one consumer open that long must reopen it for them. A
 `cancel` that arrives before its request is held, within the same bound,
-until the request arrives.
+until the request arrives. The `hello` can reach a browser before the
+channel's `open` event (spike S4 saw Chrome 148 deliver it 0.5 ms early, with
+`readyState` still `connecting`), so a client sends nothing from its `hello`
+handler until the channel is open.
 
 `spawn.host.ctl` requires one ordered, fully reliable DataChannel. An unordered
 channel, or one configured with `maxPacketLifeTime`/`maxRetransmits`, is rejected
@@ -1518,8 +1521,10 @@ protocol failure.
 sequence}`, `stream.end {stream_id, length, sha256}`, `stream.error
 {stream_id, error}`, `stream.cancel {stream_id}`, and `stream.committed
 {stream_id, length, sha256, result}`, where `result` is the family's.
-`bytes_b64` is standard base64 with padding. Binary chunk frames wait until
-spike S4 shows base64's extra third is worth a second codec.
+`bytes_b64` is standard base64 with padding. Spike S4 (2026-10-04) found
+base64 is not what limits a stream — about 40 MB/s of payload on one
+connection is CPU-bound with it, and latency is the network's — so binary
+chunk frames are deferred.
 
 **Chunks.** Every chunk carries exactly `chunk_bytes` (the hello's limit,
 8192) except the last, which carries 1 to `chunk_bytes`; an empty stream has
@@ -1531,10 +1536,13 @@ continues its numbering.
 **Window.** The request asks for a window in `stream.window`: how many chunks
 its sender may have unacknowledged. The daemon grants
 `min(asked, limits.stream_window_max)`, at least 1, and returns it as
-`window`. Until spike S4 measures terminal echo against bulk load,
-`stream_window_max` is 16: 128 KiB of payload, but 16 frames of about 11 KB
-each on the wire (a full chunk is 10,924 base64 characters in a JSON frame),
-so about 176 KB. A sender sends chunk *s* only while *s* < acknowledged +
+`window`. `stream_window_max` is 16, the value spike S4 measured terminal
+echo against bulk load for (2026-10-04): 128 KiB of payload, but 16 frames
+of about 11 KB each on the wire (a full chunk is 10,924 base64 characters in
+a JSON frame), so about 176 KB, which never binds below the bulk budget
+while bulk is paced; 8 already reaches the CPU ceiling at LAN round trips,
+and 32 bought nothing measurable. A larger maximum waits for an adaptive
+bulk budget. A sender sends chunk *s* only while *s* < acknowledged +
 window. The window bounds what a receiver holds unacknowledged; it does not
 bound what a sender puts in the association's send queue, which only bulk
 pacing does.
@@ -1618,24 +1626,29 @@ not per channel. Every channel of a device's connection — terminals, control,
 each consumer channel a bulk stream runs on — shares one association-wide
 128 KiB SCTP pending queue (`daemon/vendor/sctp/src/queue/pending_queue.rs`),
 and a writer that finds it full waits, terminal echo included. A per-channel
-watermark would not bound it: three bulk channels each held under 32 KiB, plus
-the frame each may add, already reach 128 KiB. So the daemon keeps one bulk
-gate per association. Bulk frames of every stream on it go out one at a
-time, taking the streams in turn, and the next goes out only while the sum of
-`buffered_amount` over every channel carrying a v2 stream on that association
-is at or below the bulk watermark — 32 KiB until S4 measures. Otherwise the
-gate waits for `on_buffered_amount_low` on any of them, with each such
-channel's low threshold set to the watermark. `buffered_amount` counts a
-message's bytes from the moment it is written until the peer acknowledges
-them, so it covers everything bulk has in the pending queue. However many
-bulk channels and streams are open, bulk therefore holds at most the
-watermark plus one frame of the queue (a frame is at most 16 KiB): 48 KiB of
-the 128 KiB, leaving at least 80 KiB for terminal channels and control
-responses, which are never paced. Because the count runs until acknowledgement,
-the watermark also caps bulk at about 32 KiB per round trip; S4 sizes it
-against that. A device paces its own writes the same way, with one gate per
-connection over the sum of `RTCDataChannel.bufferedAmount` across its bulk
-channels.
+watermark would not bound it: three bulk channels each held under 64 KiB, plus
+the frame each may add, overflow the 128 KiB. So the daemon keeps one bulk
+gate per association — S4 measured three parallel reads gated per channel
+adding 837 ms to terminal echo at p95, and gated as one adding 4 ms. Bulk
+frames of every stream on it go out one at a time, taking the streams in
+turn, and the next goes out only while the sum of `buffered_amount` over
+every channel carrying a v2 stream on that association is at or below the
+bulk watermark, 64 KiB. Otherwise the gate waits for `on_buffered_amount_low`
+on any of them, with each such channel's low threshold set to the watermark.
+`buffered_amount` counts a message's bytes from the moment it is written
+until the peer acknowledges them, so it covers everything bulk has in the
+pending queue. However many bulk channels and streams are open, bulk
+therefore holds at most the watermark plus one frame of the queue (a frame is
+at most 16 KiB): 80 KiB of the 128 KiB, leaving at least 48 KiB for terminal
+channels and control responses, which are never paced. Because the count
+runs until acknowledgement, the watermark also caps bulk at about 64 KiB per
+round trip. Spike S4 (2026-10-04) chose 64 KiB against that: twice 32 KiB's
+relayed throughput (0.46 to 0.91 MB/s at 55 ms) with no echo added on
+uncapped and 20 Mbit/s paths, and +21 ms p50 / +26 ms p95 while it fills an
+8 Mbit/s link, where 128 KiB cost +90 ms; unpaced, a window of 16 added
+134 ms at p95 there. A device paces its own writes the same way, with one gate
+per connection over the sum of `RTCDataChannel.bufferedAmount` across its
+bulk channels, at the same 64 KiB.
 
 ### Conversation bundle v1
 
@@ -1879,8 +1892,8 @@ declared a bundle, or is stranded: abort it),
 `store_too_large` (more project folders than a scan reads), `too_large` (an
 entry over 512 MiB, more than 4,096 entries, or a bundle over 2 GiB — refused
 before anything stops), and `file_changed` (a held file no longer matches
-what was declared). The hello's `limits` carry `stream_window_max`, 16 until spike
-S4 measures.
+what was declared). The hello's `limits` carry `stream_window_max`, 16 (spike
+S4).
 
 ### Proposed P2-DATA-02 store contract (review pending; not implemented)
 

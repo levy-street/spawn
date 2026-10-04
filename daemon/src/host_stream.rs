@@ -29,12 +29,19 @@ use webrtc::data_channel::RTCDataChannel;
 /// Every chunk but the last carries exactly this many bytes: the hello's
 /// `chunk_bytes`.
 pub(crate) const CHUNK_BYTES: u64 = 8192;
-/// The most chunks a sender may have unacknowledged, until spike S4 measures
-/// terminal echo against bulk load: the hello's `stream_window_max`.
+/// The most chunks a sender may have unacknowledged: the hello's
+/// `stream_window_max`. Spike S4 (2026-10-04) measured terminal echo against
+/// bulk load: with bulk paced, 16 never binds below the bulk budget, 8
+/// already reaches the CPU ceiling at LAN round trips, and 32 bought
+/// nothing measurable.
 pub(crate) const WINDOW_MAX: u64 = 16;
 /// What every bulk channel of one association may hold buffered together
-/// before the next bulk frame waits.
-pub(crate) const BULK_WATERMARK: usize = 32 * 1024;
+/// before the next bulk frame waits: one budget per connection, never per
+/// channel. S4 measured 64 KiB: twice 32 KiB's relayed throughput (0.46 to
+/// 0.91 MB/s at 55 ms) with no echo added on uncapped and 20 Mbit/s paths,
+/// and +21 ms p50 / +26 ms p95 filling an 8 Mbit/s link, where 128 KiB cost
+/// +90 ms.
+pub(crate) const BULK_WATERMARK: usize = 64 * 1024;
 /// How often a waiting gate looks again when no channel crossed its low
 /// threshold: several channels can each sit under the watermark while their
 /// sum does not, and none of them will say so.
@@ -428,7 +435,7 @@ mod tests {
         let vectors = vectors();
         let limits = &vectors["limits"];
         assert_eq!(limits["chunk_bytes"], CHUNK_BYTES);
-        assert_eq!(limits["window_max_until_measured"], WINDOW_MAX);
+        assert_eq!(limits["window_max"], WINDOW_MAX);
         assert_eq!(limits["bulk_low_watermark_bytes"], BULK_WATERMARK);
         assert_eq!(CHUNK_BYTES as usize, crate::host_files::STREAM_CHUNK_BYTES);
         // A full chunk's frame, as a daemon would send it, is the size the
