@@ -204,3 +204,99 @@ test("a file over the budget waits to be asked before streaming", async ({ page 
   // Nothing was pulled just because the file was opened.
   expect(reads).toBe(0);
 });
+
+test("no card lands on a dialog, and a card that does open sits below every dialog", async ({
+  page,
+}) => {
+  // The pointer comes to rest on a file row as Delete opens its confirm.
+  await mockApp(page, { files: previewFiles, fileRead: fileBytes });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+
+  // Select a file (a click opens it in the tree; Escape closes the viewer
+  // and leaves it selected), then rest on another file and press Delete
+  // before that one's card is due.
+  await row(page, "report.docx").click(LEFT_EDGE);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toBeHidden();
+  const notes = await row(page, "notes.txt").boundingBox();
+  if (!notes) throw new Error("no notes.txt row");
+  await page.mouse.move(notes.x + LEFT_EDGE.position.x, notes.y + LEFT_EDGE.position.y);
+  await page.getByRole("tree", { name: "Files" }).press("Delete");
+
+  const dialog = page.getByRole("dialog", { name: "Delete “report.docx” permanently?" });
+  await expect(dialog).toBeVisible();
+  // Well past the hover delay.
+  await page.waitForTimeout(800);
+  const card = page.locator("#file-preview-card");
+  await expect(card).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Cancel" }).click({ timeout: 2_000 });
+  await expect(dialog).toBeHidden();
+
+  // A card that does open sits below the dialog layer (z-50), so a dialog
+  // opened later — even one that never announces itself — covers it.
+  await row(page, "notes.txt").hover(LEFT_EDGE);
+  await expect(card).toBeVisible();
+  const z = await card.evaluate((el) => Number(getComputedStyle(el).zIndex));
+  expect(z).toBeLessThan(50);
+});
+
+test("a card due while any dialog is up stays shut, even one that leaves the pointer alone", async ({
+  page,
+}) => {
+  // The live bug: a menu item clicked over a row closes the menu and opens a
+  // surface that does not take the pointer (the Send flow's folder picker),
+  // so the row under the pointer starts its card and nothing cancels it; the
+  // card used to land over that surface and the dialog after it. Stood in for
+  // here by a bare `role="dialog"` that neither announces itself nor covers
+  // the list, opened as the pointer comes to rest.
+  await mockApp(page, { files: previewFiles, fileRead: fileBytes });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+
+  const notes = await row(page, "notes.txt").boundingBox();
+  if (!notes) throw new Error("no notes.txt row");
+  const at = { x: notes.x + LEFT_EDGE.position.x, y: notes.y + LEFT_EDGE.position.y };
+  await page.mouse.move(at.x, at.y);
+  await page.evaluate(() => {
+    const surface = document.createElement("div");
+    surface.id = "stand-in-surface";
+    surface.setAttribute("role", "dialog");
+    surface.setAttribute("aria-label", "Another surface");
+    document.body.append(surface);
+  });
+  // Resting, then a nudge within the row: whichever came first, the card
+  // opening or the surface, the card is not left up under it.
+  await page.waitForTimeout(800);
+  await page.mouse.move(at.x + 2, at.y);
+  await page.waitForTimeout(400);
+  const card = page.locator("#file-preview-card");
+  await expect(card).toHaveCount(0);
+
+  // With it gone, the same row previews as usual.
+  await page.evaluate(() => document.getElementById("stand-in-surface")?.remove());
+  await row(page, "readme.md").hover(LEFT_EDGE);
+  await row(page, "notes.txt").hover(LEFT_EDGE);
+  await expect(card).toBeVisible();
+});
+
+test("no card opens while a menu is open", async ({ page }) => {
+  await mockApp(page, { files: previewFiles, fileRead: fileBytes });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+
+  await row(page, "logo.svg").hover(LEFT_EDGE);
+  await row(page, "logo.svg").getByRole("button", { name: "logo.svg actions" }).click();
+  const menu = page.getByRole("menu");
+  await expect(menu).toBeVisible();
+
+  // Wandering onto another file while the menu is up previews nothing.
+  await row(page, "readme.md").hover(LEFT_EDGE);
+  await page.waitForTimeout(800);
+  await expect(page.locator("#file-preview-card")).toHaveCount(0);
+  await expect(menu).toBeVisible();
+
+  // With the menu gone, the same row previews as usual.
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  await row(page, "notes.txt").hover(LEFT_EDGE);
+  await row(page, "readme.md").hover(LEFT_EDGE);
+  await expect(page.locator("#file-preview-card")).toBeVisible();
+});
