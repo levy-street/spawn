@@ -1416,6 +1416,61 @@ async def test_a_launch_committed_after_the_reaper_reads_goes_out_after_its_kill
     await asyncio.wait_for(task, timeout=1)
 
 
+async def test_registration_has_finished_with_the_database_when_it_says_registered(
+    client, monkeypatch
+):
+    """`registered` ends a registration: the daemon, a successor connection,
+    a route or a test may act on the host the moment it is sent. Deciding
+    which reported workers to stop is a database read and must be over by
+    then. Run after it, its rollback — on the one connection the test
+    database shares — threw away a successor's generation reservation that
+    was still in flight, and the successor then failed its fencing check
+    instead of superseding this daemon."""
+    user_id, _ = await _signup(client, "ws-daemon-registered-settled@example.com")
+    host_id = await _create_host(user_id, name="returning")
+    sid = await _create_session_row(user_id, host_id, name="stopped-while-away")
+    await _set_session_status(sid, "killed")
+    done = _signal_when_registration_done(monkeypatch)
+    successor = "b" * 32
+    in_flight: list[Any] = []
+
+    class ReservesWhenRegistered(FakeDaemonWebSocket):
+        async def send_text(self, value: str) -> None:
+            await super().send_text(value)
+            if json.loads(value).get("type") == "registered" and not in_flight:
+                # A successor reserves its generation and has not committed
+                # yet when this daemon hears it is registered.
+                reservation = get_sessionmaker()()
+                in_flight.append(reservation)
+                reserved = await _allocate_host_generation(
+                    reservation, host_id, successor, commit=False
+                )
+                assert reserved is not None
+
+    token = auth.issue_daemon_token(host_id, user_id)
+    ws = ReservesWhenRegistered(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text({"type": "register", "version": "0.2.0", "existing_sessions": [sid]})
+    await asyncio.wait_for(done.wait(), timeout=2)
+
+    # The kill the host missed still goes out, and only after `registered`.
+    sent = [str(item.get("type")) for item in _sent_json(ws)]
+    assert _frames_for(ws, sid) == ["session.kill"]
+    assert sent.index("registered") < sent.index("session.kill")
+
+    reservation = in_flight[0]
+    await reservation.commit()
+    await reservation.close()
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_pending_connection_id == successor
+        assert host.daemon_pending_generation == host.daemon_generation + 1
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
 async def test_pending_daemon_cannot_evict_or_reroute_accepted_owner(client):
     user_id, _ = await _signup(client, "ws-daemon-pending-owner@example.com")
     host_id = await _create_host(user_id)
