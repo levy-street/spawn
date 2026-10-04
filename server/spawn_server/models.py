@@ -949,6 +949,16 @@ class HostAgentPolicy(Base):
     )
 
 
+#: A window whose conversation a device is carrying to another host. The row
+#: still names the host it is leaving, and stays so until the move commits
+#: (`POST /api/sessions/{id}/move` with `carried`) or is aborted
+#: (`POST /api/sessions/{id}/move/abort`). Transient lifecycle state in the
+#: free-text `status` column; no migration, and nothing about where it is going.
+SESSION_MOVING = "moving"
+#: What a carried move may begin from: every lifecycle state but a move.
+SESSION_MOVABLE_STATUSES = ("starting", "running", "exited", "killed")
+
+
 class Session(Base):
     """A PTY on a host. Always starts as the user's login shell in `cwd`."""
 
@@ -963,6 +973,8 @@ class Session(Base):
     )
     cwd: Mapped[str] = mapped_column(String(1024), nullable=False)
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # starting | running | exited | killed, or `SESSION_MOVING` while a device
+    # carries the window's conversation to another host.
     status: Mapped[str] = mapped_column(String(16), default="starting", nullable=False)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

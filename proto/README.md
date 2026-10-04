@@ -250,11 +250,13 @@ input.
 | GET    | `/api/sessions/{id}` |                                                                                   |
 | POST   | `/api/sessions`      | `{host_id, cwd, name?, skill_ids?, workspace_id?, tile?}`                          |
 | PATCH  | `/api/sessions/{id}` | rename: `{name?}`                                                                 |
-| POST   | `/api/sessions/{id}/restart` | respawn the login shell in the session's saved `cwd`                       |
-| POST   | `/api/sessions/{id}/move` | `{host_id, cwd, expected_host_id, agent_id?, agent_session_id?}`: run the same window on another host (below) |
+| POST   | `/api/sessions/{id}/restart` | respawn the login shell in the session's saved `cwd`; `409 move_in_progress` while it is moving, `409 move_conflict` when a move took it elsewhere first (below) |
+| POST   | `/api/sessions/{id}/move` | `{host_id, cwd, expected_host_id, agent_id?, agent_session_id?, carried?}`: run the same window on another host (below) |
+| POST   | `/api/sessions/{id}/move/begin` | `{expected_host_id}`: mark the window `moving` before a device carries its conversation (below) |
+| POST   | `/api/sessions/{id}/move/abort` | `{expected_host_id}`: end a carried move that will not commit; the window goes back as it was — running, or stopped if its exit was recorded (below) |
 | GET    | `/api/sessions/{id}/access` | list skill grants for a session                                             |
 | PATCH  | `/api/sessions/{id}/access` | replace grants with `{skill_ids?}`                                         |
-| DELETE | `/api/sessions/{id}` | hard-deletes the session row, then sends `session.kill` if its host is connected   |
+| DELETE | `/api/sessions/{id}` | hard-deletes the session row, then sends `session.kill` to the host the row named as it went, if connected; `409 move_in_progress` while it is moving |
 
 `/move` keeps the row — id, name, agent, skill grants, and everything clients
 key by the id — and replaces only its incarnation, the worker on one host. It
@@ -272,8 +274,85 @@ registers again — and `session.restart` with the usual fields to the new one,
 which ends any worker of that id already there. `expected_host_id` makes it a
 compare-and-set: a window that runs somewhere else than the client saw is
 `409 move_conflict`. Also `404` for a session or host that is not yours, `400
-same_host`, `409 target_offline`. No migration and no new execution parameter:
-the same lifecycle authority as restart.
+same_host`, `409 target_offline`, and `409 workspace_archived` when the
+window's tile is in an archived workspace, where nothing runs until it is
+restored (as `POST /api/sessions` answers there). No migration and no new
+execution parameter: the same lifecycle authority as restart.
+
+**Carried moves.** A move that brings the agent's conversation along is three
+requests around the device's own carry over its two host channels (the
+`conv.*` carrier operations, whose stream and bundle are specified below); the
+conversation never passes through the server, and the server is not the
+single writer's fence — the source's `conv.export` in retire mode is.
+
+1. `POST /move/begin {expected_host_id}` sets `status` to `moving`, a
+   compare-and-set on `host_id = expected_host_id` and a status a move may
+   begin from (`starting`, `running`, `exited`, `killed`: a stopped window
+   moves too); `activity_state` reads `moving` (label `Moving`). Nothing
+   else changes and **no frame reaches any host**; the server is not told
+   where the window is going. Refusals: `409
+   move_in_progress` (a move is already under way), `409 move_conflict` (the
+   window runs elsewhere), `409 source_offline` (the host it would leave is
+   not connected, so the conversation cannot come along: a fresh `/move` is
+   the alternative), `409 workspace_archived` (its tile is in an archived
+   workspace), `404`.
+2. While a window is `moving`: any `session.exit` from the host it names —
+   the retire's, or a crash before it; the server cannot tell them apart —
+   records `exited_at` and `exit_code`, keeps `moving`, raises no
+   `session.died` alert or push and publishes no `session.exit` to the panes
+   open on it (the data frame still goes out); a `session.started` leaves it
+   `moving`; a
+   registering host that reports it in `existing_sessions` adopts it and is
+   not told to stop it; a launch about to go to it is not sent. Restart,
+   delete, workspace archive and workspace delete answer `409
+   move_in_progress`, as do a fresh `/move` and a second begin; a workspace
+   restore leaves it alone. Renaming is unaffected.
+3. The commit is `/move` with `carried: true`: the same rebind and dispatch as
+   a fresh move, with the compare-and-set also requiring `moving`, and
+   `agent_session_id` naming the conversation the target has just taken in.
+   `409 move_conflict` when the move was aborted (or never begun) or the
+   window runs elsewhere; `409 target_offline` leaves it `moving` for a retry
+   or an abort. A commit is never refused for an archived workspace — the
+   target holds the conversation by then — but when the window's tile has
+   been placed in one meanwhile it lands on the target `killed`, with no
+   launch, and that workspace's restore starts it there; the device then
+   takes no control and types nothing.
+4. Or `POST /move/abort {expected_host_id}`, a compare-and-set on that host and
+   `moving` (`409 move_conflict` otherwise — after a commit, after another
+   abort). It puts the window back as it was, decided in the statement by
+   whether an exit was recorded while it moved:
+   - **none** (`exited_at` null — it was live as the move began, since every
+     create, restart, move and restore clears it and every exit and stop sets
+     it): nothing stopped it — the move was given up before the retire, the
+     retire refused (`conversation_live_elsewhere`), or the device lost it.
+     The row reads `running` again with its `foreground_command`, and **no
+     kill is sent**: the agent on the source carries on.
+   - **one**: the retire stopped it, or it had stopped before the move began.
+     The row reads `killed`, keeping that exit, and the ordinary best-effort
+     `session.kill` goes to the host it names (an offline host is told when
+     it registers again). Restart brings the window back on that host.
+
+   When the retire has run, the device sends the abort only once the target
+   has confirmed it cannot commit and the source has put the conversation
+   back (`conv.retire.abort`). An exit still on its way when the abort finds
+   none is recorded afterwards like any running window's; it raises no alert
+   when the exit handler read the window while it was still moving. A device
+   that knows its retire stopped the agent restarts the window after the
+   abort whatever status the abort answered.
+
+Restart, delete and archive are themselves fenced against moves from other
+devices: restart is a compare-and-set on the host it read (`409
+move_conflict` when the window moved meanwhile), and delete and archive act
+on the host the row names at the moment of their own write. Every launch
+re-reads the row under the daemon's lifecycle lock — which kills take too —
+and is not sent when the window is gone, moving, or names another host by
+then; a restart or `/move` whose launch was withheld answers `404`, `409
+move_in_progress` or `409 move_conflict` accordingly (the write it committed
+is published as a data frame), and a window withheld while moving that ran
+no worker there gets its stop time back, so an abort finds it stopped. A
+launch that passed the re-read went out first, and a move committed after it
+follows it with the kill. A re-read that fails sends the launch anyway, as
+before the check existed.
 
 `skill_ids` omitted grants every `enabled_by_default` skill. `workspace_id`
 transactionally appends a tile to that workspace (`tile` omitted → the server
@@ -287,7 +366,7 @@ Session shape (`SessionOut`):
   "host_id": "uuid",
   "host_name": "gpu-box-1",
   "cwd": "/home/me/projects/foo",
-  "status": "starting" | "running" | "exited" | "killed",
+  "status": "starting" | "running" | "exited" | "killed" | "moving",
   "started_at": "...",
   "exited_at": "...|null",
   "exit_code": "int|null",
@@ -854,7 +933,10 @@ first is an alert only when nobody asked for it either: archive writes
 finds the row stopped already and is recorded (`exit_code`, `exited_at`)
 without one. The same holds for a kill delivered to a returning host, and an
 exit from a host the window has moved away from does not touch the row at
-all.
+all. Any exit while the window is `moving` is recorded and keeps `moving`
+without an alert, whatever caused it — a crash before the retire included:
+the server cannot tell it from the retire the device carrying its
+conversation asked for.
 
 ### Server → browser
 
