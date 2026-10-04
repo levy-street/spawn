@@ -60,10 +60,11 @@ class DaemonConn:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Orders what starts and stops workers on this socket. Every launch
     # (`dispatch_session_launch`) holds it while it sends, and registration
-    # holds it from the database read that decides which workers to stop
-    # until those kills are sent. A launch committed after that read is
-    # therefore sent after the kills, and the daemon, which handles lifecycle
-    # frames in order, stops the old worker and not its replacement.
+    # holds it from the database read that decides which workers to stop,
+    # through `registered`, until those kills are sent. A launch committed
+    # after that read is therefore sent after the kills, and the daemon, which
+    # handles lifecycle frames in order, stops the old worker and not its
+    # replacement.
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     superseded_close_started: bool = False
     superseded_by_newer: bool = False
