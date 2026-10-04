@@ -103,7 +103,14 @@ test("arrow keys walk the folders without a click first", async ({ page }) => {
 
   // The trailing column takes focus on open, so the keyboard works straight
   // away: ArrowDown selects the first sibling, and its column opens.
-  await expect(dialog.getByRole("listbox", { name: "Folders in /Users/tester" })).toBeFocused();
+  const home = dialog.getByRole("listbox", { name: "Folders in /Users/tester" });
+  await expect(home).toBeFocused();
+  // Focus lands when the home folder is known, which can be before the host
+  // has listed what is in it, and a key pressed then has nothing to walk. A
+  // person sees the folders first; so does this test. The focus outlives
+  // their arrival.
+  await expect(home.getByRole("option", { name: "Desktop" })).toBeVisible();
+  await expect(home).toBeFocused();
   await page.keyboard.press("ArrowDown");
   await expect(dialog.getByRole("option", { name: "Desktop", selected: true })).toBeVisible();
   await expect(
