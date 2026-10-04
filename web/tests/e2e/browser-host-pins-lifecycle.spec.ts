@@ -222,7 +222,10 @@ async function installRoutes(
       return;
     }
     if (path === "/api/hosts" && request.method() === "GET") {
-      await route.fulfill({ status: 200, json: state.hostVisible ? [state.listedHost ?? host] : [] });
+      await route.fulfill({
+        status: 200,
+        json: state.hostVisible ? [state.listedHost ?? host] : [],
+      });
       return;
     }
     if (path === `/api/hosts/${HOST_ID}` && request.method() === "GET") {
