@@ -87,6 +87,7 @@ import {
   COLUMNS,
   type ColumnKey,
   columnTemplate,
+  detailsLayout,
   minimumTableWidth,
   resizeColumn,
 } from "@/lib/files/columns";
@@ -339,6 +340,9 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   const { sort, showHidden, view, setShowHidden } = prefs;
   const [columns, setColumnsLive] = useState(prefs.columns);
   useEffect(() => setColumnsLive(prefs.columns), [prefs.columns]);
+  // The list's own width, not the window's: the same browser is a page, a
+  // workspace pane and a session's aside.
+  const [listWidth, setListWidth] = useState<number | null>(null);
 
   // ---- Where the browser is -------------------------------------------------
   const root = rootPath ? trimTrailingSlash(normalizeAbsolutePath(rootPath, flavor), flavor) : null;
@@ -1596,9 +1600,14 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
 
   // ---- Rendering --------------------------------------------------------------
   const dense = layout !== "page";
-  const rowHeight = coarse ? 40 : dense ? 24 : 28;
-  const template = columnTemplate(columns);
-  const minWidth = view === "details" ? minimumTableWidth(columns) : undefined;
+  // Which columns fit is decided on the widths the person settled on; a drag
+  // in progress only redraws them, so the column being dragged never drops.
+  const fit = detailsLayout(prefs.columns, listWidth);
+  const stacked = view === "details" && fit.stacked;
+  // A folded row holds two lines: the name, and its size and date.
+  const rowHeight = stacked ? (coarse ? 52 : dense ? 40 : 44) : coarse ? 40 : dense ? 24 : 28;
+  const template = columnTemplate(columns, fit);
+  const minWidth = view === "details" && !stacked ? minimumTableWidth(columns, fit) : undefined;
   const focusIndex = selection.focus ? rowIndexByKey.get(selection.focus) : undefined;
   const activeId = focusIndex !== undefined ? `${listId}-r${focusIndex}` : undefined;
 
@@ -1761,7 +1770,14 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
     };
     if (view === "details") {
       return (
-        <DetailsRow key={row.entry.path} {...common} index={index} template={template} now={now} />
+        <DetailsRow
+          key={row.entry.path}
+          {...common}
+          index={index}
+          layout={fit}
+          template={template}
+          now={now}
+        />
       );
     }
     return (
@@ -1857,6 +1873,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   const header =
     view === "details" ? (
       <DetailsHeader
+        layout={fit}
         template={template}
         sort={sort}
         widths={columns}
@@ -2257,6 +2274,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
             scrollKey={cwd ?? ""}
             renderRow={renderRow}
             onRangeChange={onRangeChange}
+            onWidthChange={setListWidth}
             onKeyDown={onBrowserKeyDown}
             onFocus={(event) => {
               if (event.target === event.currentTarget) setListFocused(true);

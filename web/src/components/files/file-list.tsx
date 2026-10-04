@@ -6,6 +6,7 @@ import {
   type ReactNode,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
 } from "react";
 import { cn } from "@/lib/utils";
@@ -50,6 +51,11 @@ export const FileList = forwardRef<
     renderRow: (index: number, top: number) => ReactNode;
     /** Which rows are on screen, as they change. */
     onRangeChange?: (start: number, end: number) => void;
+    /**
+     * The width rows have — the scroller's, less any scrollbar — when it
+     * mounts and whenever it changes: what decides the Details columns.
+     */
+    onWidthChange?: (width: number) => void;
     /** Shown over an empty list: a skeleton, an empty state, an error. */
     children?: ReactNode;
   } & Omit<HTMLAttributes<HTMLDivElement>, "role" | "children">
@@ -67,6 +73,7 @@ export const FileList = forwardRef<
     scrollKey,
     renderRow,
     onRangeChange,
+    onWidthChange,
     children,
     className,
     ...rest
@@ -75,6 +82,20 @@ export const FileList = forwardRef<
 ) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const rows = useVirtualRows({ scrollRef, count, rowHeight, headerHeight, scrollKey });
+
+  // Measured before paint, so a narrow panel never shows a frame of columns
+  // it has no room for.
+  const onWidthChangeRef = useRef(onWidthChange);
+  onWidthChangeRef.current = onWidthChange;
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const report = () => onWidthChangeRef.current?.(element.clientWidth);
+    report();
+    const observer = new ResizeObserver(report);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   useImperativeHandle(
     ref,
