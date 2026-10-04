@@ -1,5 +1,6 @@
 import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
 import type { Page, Route } from "@playwright/test";
+import type { HMR_ACTIONS_SENT_TO_BROWSER } from "next/dist/server/dev/hot-reloader-types";
 import { autoPlace, type GridLayout, type Rect, remove as removeTile } from "../../src/lib/grid";
 import { encodeSignedSignalTranscript } from "../../src/lib/signed-signal";
 import { activeTab, allTiles, type LayoutV3, tabOfSession, withTabTiles } from "../../src/lib/tabs";
@@ -103,6 +104,57 @@ export async function pinKeyboard(page: Page, keyboard: "apple" | "pc") {
     Object.defineProperty(navigator, "platform", { get: () => values.platform });
     Object.defineProperty(navigator, "userAgent", { get: () => values.userAgent });
   }, pinned);
+}
+
+/**
+ * The dev-socket broadcasts Next's app router answers with
+ * `router.hmrRefresh()` (Next 15.5, client/dev/hot-reloader/app). Typed
+ * against Next's own action names, so a rename fails `tsc` instead of quietly
+ * letting the broadcast through.
+ */
+type RouterRefresh = `${
+  | HMR_ACTIONS_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES
+  | HMR_ACTIONS_SENT_TO_BROWSER.ADDED_PAGE
+  | HMR_ACTIONS_SENT_TO_BROWSER.REMOVED_PAGE}`;
+const ROUTER_REFRESHES: ReadonlySet<string> = new Set<RouterRefresh>([
+  "serverComponentChanges",
+  "addedPage",
+  "removedPage",
+]);
+
+function refreshesTheRouter(message: string | Buffer) {
+  if (typeof message !== "string") return false;
+  try {
+    const { action } = JSON.parse(message) as { action?: unknown };
+    return typeof action === "string" && ROUTER_REFRESHES.has(action);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Keeps the dev server's refresh broadcasts out of this page's navigations.
+ *
+ * Every worker shares one `next dev`, and it tells every open page to refetch
+ * its server components when a pages-router entry comes or goes ("addedPage"
+ * and "removedPage": seen when it first compiles its error page, on the first
+ * proxied request that fails) and when server components change
+ * ("serverComponentChanges": seen at startup and on a source edit). The router
+ * folds that refetch into a link navigation still in flight, and the address
+ * does not change until the dev server answers the refetch as well, which on
+ * a busy runner can take longer than an expectation waits. A production build
+ * sends none of these and no spec edits source, so here they only ever carry
+ * another test's request into this one. They are dropped; the rest of the dev
+ * socket (Fast Refresh, the page's pings) passes through as is.
+ */
+async function dropRouterRefreshes(page: Page) {
+  await page.routeWebSocket(/\/_next\/webpack-hmr/, (socket) => {
+    const server = socket.connectToServer();
+    server.onMessage((message) => {
+      if (refreshesTheRouter(message)) return;
+      socket.send(message);
+    });
+  });
 }
 
 export function session(overrides: Record<string, unknown> = {}) {
@@ -474,6 +526,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     return result ?? fallback;
   };
 
+  await dropRouterRefreshes(page);
   await page.exposeFunction(
     "__spawnHostControlRequest",
     async (hostId: string, operation: string, payload: Record<string, unknown>) => {

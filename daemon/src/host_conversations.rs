@@ -5716,13 +5716,37 @@ mod tests {
     fn only_exactly_the_process_seen_is_signalled() {
         let root = tempfile::tempdir().unwrap();
         let claude = root.path().join("claude");
-        std::fs::copy("/bin/sleep", &claude).unwrap();
+        // Copied by a `cp` child, never by this process: exec of a file still
+        // open for writing fails with ETXTBSY, and another test thread that
+        // forks while this process holds the copy open hands that descriptor
+        // to its child until the child's own exec.
+        let copied = std::process::Command::new("cp")
+            .arg("/bin/sleep")
+            .arg(&claude)
+            .status()
+            .unwrap();
+        assert!(copied.success(), "{copied}");
         let mut other = std::process::Command::new(&claude)
             .arg("60")
             .spawn()
             .unwrap();
         let table = crate::host_conv::SystemProcesses;
         let pid = other.id();
+        // It runs Claude, as the daemon judges a process. `spawn` can return
+        // before the child's exec has replaced its image (a vfork-style spawn
+        // in a threaded process), so `/proc/<pid>/exe` may still name this
+        // test binary for a moment: wait for the exec, not a sleep.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut runs = table.executable(pid);
+        while !runs.as_deref().is_some_and(crate::host_conv::is_claude) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+            runs = table.executable(pid);
+        }
+        assert!(
+            runs.as_deref().is_some_and(crate::host_conv::is_claude),
+            "{pid} runs {runs:?}"
+        );
         for unknown in [
             Holder { pid, start: None },
             Holder {

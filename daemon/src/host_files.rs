@@ -626,6 +626,9 @@ pub(crate) struct WriteLifecycleTestHooks {
     effect_boundary: [BlockingPause; 12],
     temporary_cleanup: BlockingPause,
     read_hashing: BlockingPause,
+    /// A full stream window waits for its device as long as a deployed
+    /// daemon's does, not the half second tests otherwise allow.
+    deployed_ack_deadline: AtomicBool,
 }
 
 #[cfg(test)]
@@ -681,6 +684,18 @@ impl WriteLifecycleTestHooks {
 
     pub(crate) fn release_read_hashing(&self) {
         self.read_hashing.release();
+    }
+
+    /// For a test that holds a stream's window full across round trips of
+    /// its own and is not about the acknowledgement deadline: on a slow
+    /// runner those round trips outlast the test deadline, and the stream
+    /// would time out from under the test.
+    pub(crate) fn keep_deployed_ack_deadline(&self) {
+        self.deployed_ack_deadline.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn keeps_deployed_ack_deadline(&self) -> bool {
+        self.deployed_ack_deadline.load(Ordering::Acquire)
     }
 
     pub(crate) fn arm_temporary_cleanup(&self) {
