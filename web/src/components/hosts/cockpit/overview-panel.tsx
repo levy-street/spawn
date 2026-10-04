@@ -18,6 +18,7 @@ import { type Host, type Session, sessions, workspaces } from "@/lib/api";
 import { bucketFill, bucketOf, capacityLabel, formatBytes, formatDuration } from "@/lib/fleet";
 import {
   folderSubtitle,
+  memoryFigure as formatMemoryFigure,
   hostFolders,
   hostTabHref,
   possessedLabel,
@@ -133,10 +134,9 @@ function RightNow({ host, reachable }: { host: Host; reachable: boolean }) {
       ? (sample.memory_used_bytes / sample.memory_total_bytes) * 100
       : null;
   const memoryBucket = memoryShare !== null ? bucketOf(memoryShare) : host.mem_bucket;
-  const memoryFigure =
-    sample && sample.memory_total_bytes > 0
-      ? `${formatBytes(sample.memory_used_bytes) ?? "0 B"} of ${formatBytes(sample.memory_total_bytes)}`
-      : null;
+  const memoryFigure = sample
+    ? formatMemoryFigure(sample.memory_used_bytes, sample.memory_total_bytes)
+    : null;
   return (
     <section
       ref={ref}
@@ -176,13 +176,19 @@ function RightNow({ host, reachable }: { host: Host; reachable: boolean }) {
         )}
         {sample && (
           // Exact figures only where exact figures arrived: the bars already
-          // say what the heartbeat's five-level reading knows.
+          // say what the heartbeat's five-level reading knows. Each is read
+          // whole, wrapping in a narrow column rather than cut short.
           <dl className="grid grid-cols-3 gap-x-6 gap-y-3 text-sm">
-            <Fact label="Memory" value={memoryFigure ?? "—"} />
-            <Fact label="Load" value={sample.load_one != null ? sample.load_one.toFixed(2) : "—"} />
+            <Fact label="Memory" value={memoryFigure ?? "—"} wrap />
+            <Fact
+              label="Load"
+              value={sample.load_one != null ? sample.load_one.toFixed(2) : "—"}
+              wrap
+            />
             <Fact
               label="Up"
               value={sample.uptime_seconds > 0 ? formatDuration(sample.uptime_seconds) : "—"}
+              wrap
             />
           </dl>
         )}

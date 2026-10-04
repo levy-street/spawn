@@ -227,7 +227,7 @@ export function fileListing(overrides: Record<string, unknown> = {}) {
 }
 
 /** Everything a current macOS daemon advertises. */
-const DEFAULT_HOST_CAPABILITIES = [
+export const DEFAULT_HOST_CAPABILITIES = [
   "ping",
   "fs.home",
   "fs.list",
@@ -350,6 +350,8 @@ export interface AppMockOptions {
   /** Bytes of the PNG the host would render for a file it cannot stream. */
   filePreview?: (hostId: string, path: string, maxPixels: number) => string | Uint8Array;
   fileStat?: (hostId: string, path: string) => Record<string, unknown>;
+  /** The host's `host.metrics` answer; add "host.metrics" to `capabilities` too. */
+  hostMetrics?: (hostId: string) => Record<string, unknown>;
   /** Records desktop actions so a spec can assert the exact path requested. */
   fileReveal?: (hostId: string, path: string) => void;
   fileOpen?: (hostId: string, path: string) => void;
@@ -602,6 +604,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         }
         return { path: `${String(payload.dir)}/${String(payload.name)}` };
       }
+      if (operation === "host.metrics" && options.hostMetrics) return options.hostMetrics(hostId);
       throw new Error(`unsupported mock host control operation: ${operation}`);
     },
   );

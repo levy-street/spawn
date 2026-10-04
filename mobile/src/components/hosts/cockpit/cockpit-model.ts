@@ -1,4 +1,4 @@
-import { relativeSeen } from "@/components/hosts/host-model";
+import { formatBytes, relativeSeen } from "@/components/hosts/host-model";
 import {
   HOST_IDENTITY_BLOCKED_REASON,
   HOST_IDENTITY_BLOCKED_STATUS,
@@ -57,6 +57,21 @@ export function cockpitStatusLine(
       : `Offline · last seen ${relativeSeen(host.last_seen_at, now)}`;
   }
   return live.reconnecting ? "Reconnecting…" : "Online";
+}
+
+/** A number and its unit on one line: "125 GiB" never breaks between them. */
+function unbroken(quantity: string): string {
+  return quantity.replaceAll(" ", "\u00a0");
+}
+
+/**
+ * "89 GiB of 125 GiB": the memory in use, worded so that a narrow Right now
+ * wraps it between the two amounts, never inside one. The browser words it
+ * the same.
+ */
+export function memoryFigure(usedBytes: number, totalBytes: number): string | null {
+  if (!(totalBytes > 0)) return null;
+  return `${unbroken(formatBytes(usedBytes))} of ${unbroken(formatBytes(totalBytes))}`;
 }
 
 /**

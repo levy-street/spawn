@@ -1,6 +1,6 @@
 import type { Session, Workspace } from "./api";
 import type { DaemonSnapshot } from "./daemon-connection";
-import { orderSessions } from "./fleet";
+import { formatBytes, orderSessions } from "./fleet";
 import { hostLiveStatus } from "./host-live-status";
 import { displayPath, HOST_HOME } from "./places";
 import { relativeTime } from "./sessions";
@@ -94,6 +94,22 @@ export function hostStatusLine(
     parts.push(`${Math.round(rtt)} ms`);
   }
   return { text: parts.join(" · "), tone: "active", retry: false, reason: null };
+}
+
+/** A number and its unit on one line: "125 GB" never breaks between them. */
+function unbroken(quantity: string): string {
+  return quantity.replaceAll(" ", "\u00a0");
+}
+
+/**
+ * "89 GB of 125 GB": the memory in use, worded so that a narrow Right now
+ * wraps it between the two amounts, never inside one, and never cuts it
+ * short. The phone words it the same.
+ */
+export function memoryFigure(usedBytes: number, totalBytes: number): string | null {
+  const total = totalBytes > 0 ? formatBytes(totalBytes) : null;
+  if (!total) return null;
+  return `${unbroken(formatBytes(usedBytes) ?? "0 B")} of ${unbroken(total)}`;
 }
 
 function isLive(session: Session): boolean {

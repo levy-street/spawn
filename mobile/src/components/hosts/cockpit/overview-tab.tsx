@@ -3,6 +3,7 @@ import { CapacityMeter } from "@/components/hosts/capacity-meter";
 import {
   hostFolders,
   isHomeFolder,
+  memoryFigure,
   runningHere,
   windowBlockedReason,
 } from "@/components/hosts/cockpit/cockpit-model";
@@ -13,7 +14,6 @@ import { HostMachineFacts } from "@/components/hosts/host-facts";
 import {
   type CapacityPresentation,
   capacityPresentation,
-  formatBytes,
   formatDuration,
   type HostMetrics,
   pluralize,
@@ -241,11 +241,7 @@ function RightNow({
         <View style={styles.figures} testID="host-right-now-figures">
           <Figure
             label="Memory"
-            value={
-              sample.memory_total_bytes > 0
-                ? `${formatBytes(sample.memory_used_bytes)} of ${formatBytes(sample.memory_total_bytes)}`
-                : "—"
-            }
+            value={memoryFigure(sample.memory_used_bytes, sample.memory_total_bytes) ?? "—"}
           />
           <Figure label="Load" value={sample.load_one == null ? "—" : sample.load_one.toFixed(2)} />
           <Figure
@@ -268,13 +264,24 @@ function RightNow({
   );
 }
 
+/**
+ * One exact figure, read whole: in a narrow column it wraps — between the
+ * amounts of "89 GiB of 125 GiB", never inside one — rather than being cut
+ * short, since a phone has nowhere else to show the rest.
+ */
 function Figure({ label, value }: { label: string; value: string }): React.JSX.Element {
   return (
-    <View accessible accessibilityLabel={`${label} ${value}`} style={styles.figure}>
+    <View
+      accessible
+      accessibilityLabel={`${label} ${value.replaceAll("\u00a0", " ")}`}
+      style={styles.figure}
+    >
       <Text color="mutedForeground" variant="caption">
         {label}
       </Text>
-      <Text variant="body">{value}</Text>
+      <Text testID={`host-figure-${label.toLowerCase()}`} variant="body">
+        {value}
+      </Text>
     </View>
   );
 }

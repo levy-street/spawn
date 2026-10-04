@@ -4,6 +4,7 @@ import {
   cockpitTab,
   groupSessionsByWorkspace,
   hostFolders,
+  memoryFigure,
   runningHere,
   stepCockpitTab,
   windowBlockedReason,
@@ -83,6 +84,12 @@ describe("host cockpit model", () => {
         now,
       ),
     ).toBe("Offline · never connected");
+  });
+
+  test("the memory figure keeps each amount on one line, so it wraps between them", () => {
+    const GiB = 1024 ** 3;
+    expect(memoryFigure(89 * GiB, 125 * GiB)).toBe("89\u00a0GiB of 125\u00a0GiB");
+    expect(memoryFigure(5 * GiB, 0)).toBeNull();
   });
 
   test("a changed identity is blocked, not reconnecting, in the browser's words", () => {
