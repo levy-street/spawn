@@ -58,6 +58,14 @@ class DaemonConn:
     host_generation: int | None = None
     session_ids: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Orders what starts and stops workers on this socket. Every launch
+    # (`dispatch_session_launch`) holds it while it sends, and registration
+    # holds it from the database read that decides which workers to stop,
+    # through `registered`, until those kills are sent. A launch committed
+    # after that read is therefore sent after the kills, and the daemon, which
+    # handles lifecycle frames in order, stops the old worker and not its
+    # replacement.
+    lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     superseded_close_started: bool = False
     superseded_by_newer: bool = False
     rtc_revocation_started: bool = False
@@ -501,18 +509,36 @@ class Broker:
     ) -> bool:
         async with self._lock:
             conn = self._daemon_by_session.get(session_id)
-            if expected_daemon is not None and (
-                conn is not expected_daemon
-                or expected_host_generation is None
-                or not self._is_accepted_daemon_owner_locked(
+            if expected_daemon is not None:
+                if expected_host_generation is None or not self._is_accepted_daemon_owner_locked(
                     expected_daemon, expected_host_generation
-                )
-            ):
-                return False
+                ):
+                    return False
+                if conn is None:
+                    # Already let go: stopping or deleting a session detaches
+                    # it before its daemon confirms the exit. There is nothing
+                    # to undo, and the reporter is still the accepted owner.
+                    return True
+                if conn is not expected_daemon:
+                    return False
             conn = self._daemon_by_session.pop(session_id, None)
             if conn is not None:
                 conn.session_ids.discard(session_id)
             return conn is not None
+
+    async def detach_session_from_host(self, session_id: str, host_id: str) -> bool:
+        """Stop routing a session to `host_id`'s daemon.
+
+        Routing to another host's daemon is left alone: once a window has
+        moved, its new host's routing is not the old host's to remove.
+        """
+        async with self._lock:
+            conn = self._daemon_by_session.get(session_id)
+            if conn is None or conn.host_id != host_id:
+                return False
+            self._daemon_by_session.pop(session_id, None)
+            conn.session_ids.discard(session_id)
+            return True
 
     def get_daemon_for_host(self, host_id: str) -> DaemonConn | None:
         return self._daemons_by_host.get(host_id)

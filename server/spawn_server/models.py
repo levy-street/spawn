@@ -532,7 +532,7 @@ class Host(Base):
     memory_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     gpu: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # How hard it is working — as a meter segment count in 0..=5, never a
-    # percentage. See migration 0042 and daemon/src/host_metrics.rs: the exact
+    # percentage. See migration 0055 and daemon/src/host_metrics.rs: the exact
     # figures exist, and deliberately never travel through this server.
     cpu_bucket: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     mem_bucket: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
@@ -1142,9 +1142,12 @@ class Workspace(Base):
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # The workspace's home: the host and folder it was created in. New
-    # sessions default here so the folder is chosen once, at creation.
-    # Nullable: pre-0034 workspaces, or a deleted host (SET NULL).
+    # The retired workspace home (0047): the host and folder it was created
+    # in. A workspace has no home host any more — each window runs on its own
+    # session's host and every new window asks where — so nothing opens here.
+    # Still stored and accepted for older clients; the web falls back to it
+    # only for the folder a workspace's icon is looked for in. Nullable: a
+    # workspace created empty, or a deleted host (SET NULL).
     host_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
     )
@@ -1153,8 +1156,8 @@ class Workspace(Base):
     # spawn_server.grid + routes/workspaces (proto/README.md, "Layout schema v3").
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # Sidebar ordering, contiguous from 0 per owner. Archived rows leave that
-    # space entirely — they order by `archived_at` and their `position` is
-    # stale until a restore appends them back at the end.
+    # space entirely — they order by `archived_at` — and their `position`
+    # keeps the slot a restore reinserts them at.
     position: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     # The workspace's mark: a small square thumbnail as a self-contained
     # `data:image/(png|webp);base64,...` URL, checked on every write by

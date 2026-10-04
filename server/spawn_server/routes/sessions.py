@@ -126,19 +126,23 @@ async def dispatch_session_launch(
         log.warning("%s: no daemon connection for host=%s", frame_type, host.id)
         return
 
-    await broker.attach_session_to_daemon(session_row.id, daemon)
-    try:
-        await daemon.send_text(
-            {
-                "type": frame_type,
-                "session_id": session_row.id,
-                "cwd": session_row.cwd,
-                "skills": skills or [],
-                "create_cwd": create_cwd,
-            }
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("%s dispatch failed: %s", frame_type, e)
+    # Held while registration decides which of this daemon's workers to stop
+    # and sends those kills (`DaemonConn.lifecycle_lock`): a launch committed
+    # after that decision goes out after the kills, never before them.
+    async with daemon.lifecycle_lock:
+        await broker.attach_session_to_daemon(session_row.id, daemon)
+        try:
+            await daemon.send_text(
+                {
+                    "type": frame_type,
+                    "session_id": session_row.id,
+                    "cwd": session_row.cwd,
+                    "skills": skills or [],
+                    "create_cwd": create_cwd,
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s dispatch failed: %s", frame_type, e)
 
 
 async def resolve_agent_id(db: AsyncSession, *, user: User, agent_id: str | None) -> str | None:
@@ -399,50 +403,52 @@ async def restart_session(
     return _to_out(session_row, host.name)
 
 
-async def stop_session(db: AsyncSession, session_row: Session) -> None:
-    """Send session.kill (best effort) and keep the row: the window stays.
+async def send_session_kill(session_id: str, host_id: str) -> None:
+    """Ask `host_id`'s daemon to end the session's worker there (best effort)
+    and stop routing the session to that daemon.
 
-    The counterpart to `kill_and_delete_session`, and the difference is the
-    whole point of archiving: the process tree, the PTY and the worker holding
-    them go away — nothing of this session runs on the host any more — while
-    the row it is addressed by survives, so the tile still points somewhere and
-    `session.restart` can bring the same session back in the same folder.
+    Sent only after the commit that stopped, deleted or moved the row. The
+    daemon confirms with `session.exit`, and that handler reads the row: one
+    still marked running reads as a crash and pages the owner with "was
+    killed". An offline host is sent nothing; when it registers again it is
+    told to stop any worker whose row says stopped or names another host
+    (`_stop_workers_left_running` in `ws/daemon.py`). A row deleted while its
+    host is offline leaves nothing to compare against, so that worker runs on.
+
+    Only `host_id` is addressed. For a move, pass the host the window left:
+    the session may already be routed to its new host (a launch there
+    attaches it), and that worker and its routing are left alone whichever
+    order the two are sent in.
     """
     broker = get_broker()
-    daemon = broker.get_daemon_for_session(session_row.id) or broker.get_daemon_for_host(
-        session_row.host_id
-    )
+    daemon = broker.get_daemon_for_session(session_id)
+    if daemon is None or daemon.host_id != host_id:
+        daemon = broker.get_daemon_for_host(host_id)
     if daemon is not None:
         try:
             await daemon.send_text(
-                {"type": "session.kill", "session_id": session_row.id, "signal": "TERM"}
+                {"type": "session.kill", "session_id": session_id, "signal": "TERM"}
             )
         except Exception as e:  # noqa: BLE001
             log.warning("session.kill dispatch failed: %s", e)
-    await broker.detach_session(session_row.id)
+    await broker.detach_session_from_host(session_id, host_id)
+
+
+def mark_session_stopped(session_row: Session) -> None:
+    """Write a session's stopped state and keep the row: the window stays.
+
+    What archiving does to each window; commit it, then `send_session_kill`.
+    The process tree, the PTY and the worker holding them go away — nothing of
+    this session runs on the host any more — while the row it is addressed by
+    survives, so the tile still points somewhere and `session.restart` can
+    bring the same session back in the same folder.
+    """
     # Written here rather than waited for: the daemon confirms the exit with a
     # status frame, but an offline host never will, and a stopped workspace
     # must not read as still running because its host was unreachable.
     session_row.status = "killed"
     session_row.exited_at = _utcnow()
     session_row.foreground_command = None
-
-
-async def kill_and_delete_session(db: AsyncSession, session_row: Session) -> None:
-    """Send session.kill (best effort), detach routing, delete the row."""
-    broker = get_broker()
-    daemon = broker.get_daemon_for_session(session_row.id) or broker.get_daemon_for_host(
-        session_row.host_id
-    )
-    if daemon is not None:
-        try:
-            await daemon.send_text(
-                {"type": "session.kill", "session_id": session_row.id, "signal": "TERM"}
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("session.kill dispatch failed: %s", e)
-    await broker.detach_session(session_row.id)
-    await db.delete(session_row)
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -454,5 +460,7 @@ async def delete_session(
     session_row = await db.get(Session, session_id)
     if session_row is None or session_row.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="session not found")
-    await kill_and_delete_session(db, session_row)
+    host_id = session_row.host_id
+    await db.delete(session_row)
     await db.commit()
+    await send_session_kill(session_id, host_id)

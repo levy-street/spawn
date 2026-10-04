@@ -600,6 +600,76 @@ async def test_archive_stops_its_sessions_and_leaves_them_where_they_are(client)
     await _unregister_daemon(daemon)
 
 
+class _ReadsRowOnKill(_FakeWS):
+    """A daemon socket that, the moment a kill reaches it, reads the row the
+    way the daemon's confirming `session.exit` will: on its own connection,
+    seeing only what is committed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: dict[str, str | None] = {}
+
+    async def send_text(self, value):
+        await super().send_text(value)
+        frame = json.loads(value)
+        if frame["type"] != "session.kill":
+            return
+        from spawn_server.db import get_sessionmaker
+        from spawn_server.models import Session
+
+        async with get_sessionmaker()() as session:
+            row = await session.get(Session, frame["session_id"])
+            self.seen[frame["session_id"]] = None if row is None else row.status
+
+
+async def test_stop_and_delete_kill_only_after_the_commit(file_sqlite_client):
+    """A kill that races its own commit lets the exit find the row still
+    running, which reads as a crash and pages the owner ("was killed").
+    Archive, workspace delete and session delete all commit first."""
+    client = file_sqlite_client
+    email = "ws-kill-order@example.com"
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host(email)
+    archived_pane = await _create_session_row(email, host_id)
+    deleted_pane = await _create_session_row(email, host_id)
+    closed_pane = await _create_session_row(email, host_id)
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    fake_ws = _ReadsRowOnKill()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
+    await get_broker().register_daemon(daemon)
+
+    workspace_ids = []
+    for name, pane in (("archived", archived_pane), ("deleted", deleted_pane)):
+        created = await client.post("/api/workspaces", json={"name": name}, headers=auth)
+        workspace_id = created.json()["workspace"]["id"]
+        patched = await client.patch(
+            f"/api/workspaces/{workspace_id}",
+            json={"layout": _envelope([_tile(pane, 0, 0, 24, 24)])},
+            headers=auth,
+        )
+        assert patched.status_code == 200, patched.text
+        workspace_ids.append(workspace_id)
+
+    archived = await client.post(f"/api/workspaces/{workspace_ids[0]}/archive", headers=auth)
+    assert archived.status_code == 200
+    assert (
+        await client.delete(f"/api/workspaces/{workspace_ids[1]}", headers=auth)
+    ).status_code == 204
+    assert (await client.delete(f"/api/sessions/{closed_pane}", headers=auth)).status_code == 204
+
+    assert fake_ws.seen == {archived_pane: "killed", deleted_pane: None, closed_pane: None}
+    assert [k["session_id"] for k in _frames(fake_ws, "session.kill")] == [
+        archived_pane,
+        deleted_pane,
+        closed_pane,
+    ]
+
+    await get_broker().unregister_daemon(daemon)
+
+
 async def test_archive_reindexes_the_rest_and_restore_reclaims_the_slot(client):
     """Positions are contiguous from 0, and a restored row comes back to its
     own place rather than to the end of the list."""
