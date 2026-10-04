@@ -1441,6 +1441,13 @@ fn probe_sync(
 ) -> FsResult<Value> {
     let destination = resolve_destination(files, &request.cwd)?;
     let store = Store::open(files, places);
+    // Whether a Claude here holds the conversation now, by the same
+    // fail-closed reading an import refuses on (`conversation_live_here`):
+    // which copy it holds is not said, so every copy carries it.
+    let live = request
+        .conversation_id
+        .as_deref()
+        .map(|id| !holders_now(places, None, id).elsewhere.is_empty());
     let mut duplicates = Vec::new();
     let mut duplicates_truncated = false;
     let (store_display, store_problem, destination_display, memory) = match &store {
@@ -1467,6 +1474,7 @@ fn probe_sync(
                         "path": path.to_string_lossy(),
                         "size": metadata.as_ref().map(cap_std::fs::Metadata::len),
                         "modified_at": metadata.as_ref().and_then(crate::host_files::modified_seconds),
+                        "live": live.unwrap_or(false),
                     }));
                 }
             }
@@ -1520,6 +1528,7 @@ fn probe_sync(
         "repository_root": destination.repository_root,
         "duplicates": duplicates,
         "duplicates_truncated": duplicates_truncated,
+        "live": live,
         "login_shell": (places.login_shell)(),
         "cli_version": claude_version(files),
     }))
@@ -1860,6 +1869,32 @@ fn holders_now(places: &Places, shell: Option<u32>, conversation_id: &str) -> Ho
         &crate::host_conv::SystemProcesses,
         &places.registry_stores(),
     )
+}
+
+/// A host a conversation is moving to refuses it while a Claude here holds
+/// it: setting that copy aside, or placing the carried record where it
+/// writes, would give the conversation two writers.
+fn live_here_error(holders: &Holders) -> FsError {
+    if holders.doubtful {
+        return error(
+            "conversation_live_here",
+            "a Claude Code session record on this host names the conversation and spawnd cannot confirm that its process has stopped; stop it here first, or remove the stale record from Claude's sessions folder",
+        );
+    }
+    error(
+        "conversation_live_here",
+        "a Claude on this host holds the conversation (a window, a background session, or an attached client); stop it here first",
+    )
+}
+
+/// Refuse while anything on this host holds `conversation_id`.
+fn refuse_live_here(places: &Places, conversation_id: &str) -> FsResult<()> {
+    let holders = holders_now(places, None, conversation_id);
+    if holders.elsewhere.is_empty() {
+        Ok(())
+    } else {
+        Err(live_here_error(&holders))
+    }
 }
 
 fn live_elsewhere_error(holders: &Holders) -> FsError {
@@ -3039,7 +3074,7 @@ fn import_status(
     }
     match incoming_record(&holdings, transfer, true)? {
         Some((_, record)) if record.state == "committing" => {
-            finish_commit(files, &holdings, transfer, record.clone())?;
+            finish_commit(files, places, &holdings, transfer, record.clone())?;
             Ok(TransferStatus::committed(record.length))
         }
         Some((staging, record)) => Ok(TransferStatus::receiving(
@@ -3209,7 +3244,7 @@ fn begin_sync(
     let incoming = holdings.sub(INCOMING)?;
     if let Some((staging, record)) = incoming_record(&holdings, transfer, true)? {
         if record.state == "committing" {
-            finish_commit(files, &holdings, transfer, record)?;
+            finish_commit(files, places, &holdings, transfer, record)?;
             return Err(error(
                 "transfer_committed",
                 "this transfer was committed already",
@@ -3226,6 +3261,7 @@ fn begin_sync(
                 "a resumed begin must declare what the first one did",
             ));
         }
+        refuse_live_here(places, &request.conversation_id)?;
         let staged = staged_length(&staging)?;
         let keep = if staged >= request.length {
             request.length
@@ -3234,6 +3270,7 @@ fn begin_sync(
         };
         return Ok(keep);
     }
+    refuse_live_here(places, &request.conversation_id)?;
     if transfer_names(&incoming, "").len() >= MAX_INCOMING {
         return Err(error(
             "too_many_transfers",
@@ -3308,14 +3345,19 @@ fn commit_import(
     let (staging, mut record) = incoming_record(&holdings, transfer, true)?
         .ok_or_else(|| error("transfer_not_found", "nothing is staged for this transfer"))?;
     if record.state == "committing" {
-        return finish_commit(files, &holdings, transfer, record);
+        return finish_commit(files, places, &holdings, transfer, record);
     }
+    // Before anything is decided: the staging stays, and a resumed begin
+    // whose stream ends again commits once nothing holds the conversation.
+    refuse_live_here(places, &record.conversation_id)?;
     let discard = |failure: FsError| -> FsError {
         let _ = remove_tree(&incoming, &transfer.to_string());
         failure
     };
     match extract(&staging, &record, expected_sha256) {
         Ok(has_sidecar) => {
+            // Again right before the commit is decided.
+            refuse_live_here(places, &record.conversation_id)?;
             record.state = "committing".into();
             record.verified_sha256 = Some(expected_sha256.to_string());
             record.has_sidecar = Some(has_sidecar);
@@ -3327,7 +3369,7 @@ fn commit_import(
         Err(failure) => return Err(discard(failure)),
     }
     drop(staging);
-    finish_commit(files, &holdings, transfer, record)
+    finish_commit(files, places, &holdings, transfer, record)
 }
 
 /// Read the staged bundle once: its whole digest, the reader's checks, and
@@ -3433,6 +3475,7 @@ fn create_entry(
 /// the tombstone, drop the staging. Safe to run again after any crash.
 fn finish_commit(
     files: &HostFileService,
+    places: &Places,
     holdings: &Holdings,
     transfer: Uuid,
     record: IncomingRecord,
@@ -3455,6 +3498,9 @@ fn finish_commit(
     let placed_sidecar = record.has_sidecar == Some(true) && !pending_sidecar;
     let mut set_aside = 0_usize;
     if pending_record {
+        // Decided, but not placed: it waits until nothing here holds the
+        // conversation, then rolls forward.
+        refuse_live_here(places, id)?;
         let superseded = holdings.sub(SUPERSEDED)?;
         let mut set: Option<Dir> = None;
         for copy in find_copies(&projects, id, &|| false)? {
@@ -4070,6 +4116,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(answer["login_shell"], "bash");
+        assert_eq!(answer["live"], false);
         #[cfg(unix)]
         assert_eq!(answer["cli_version"], "2.1.288");
         let duplicates = answer["duplicates"].as_array().unwrap();
@@ -5451,6 +5498,92 @@ mod tests {
             RECORD_BYTES
         );
         assert_eq!(outgoing_record(&host, transfer).unwrap()["state"], HELD);
+    }
+
+    /// A conversation a Claude on the target holds is never set aside or
+    /// written over: the probe says so, the begin refuses, and so does the
+    /// commit when the holder appeared since the begin. The staging stays,
+    /// and the move finishes once nothing holds the conversation.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_conversation_live_on_the_target_is_never_imported_over() {
+        let bundle = retired_bundle(RECORD_BYTES, &[]).await;
+        let length = bundle.len() as u64;
+        let target = Host::new().await;
+        let target_cwd = target.folder("code/spawn");
+        let copy = target.project(&target_cwd).join(format!("{ID}.jsonl"));
+        write_conversation(&target.project(&target_cwd), ID, b"{\"live\":1}\n", &[]);
+        let holder = live_holder(&target.store, ID);
+        let probe = target
+            .carrier
+            .probe(
+                ProbeRequest::parse(
+                    json!({"agent": "claude-code", "conversation_id": ID, "cwd": "~/code/spawn"})
+                        .as_object(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe["live"], true);
+        assert_eq!(probe["duplicates"][0]["live"], true);
+        let refused = carry_into(&target, Uuid::new_v4(), &target_cwd, &bundle).await;
+        assert_eq!(refused.err().unwrap().code, "conversation_live_here");
+        end(holder);
+
+        let transfer = Uuid::new_v4();
+        let mut stream = target
+            .carrier
+            .begin_import(import(transfer, &target_cwd, &bundle, None), "s")
+            .await
+            .unwrap()
+            .stream;
+        for (sequence, chunk) in bundle.chunks(8192).enumerate() {
+            stream
+                .take_chunk(&target.carrier, sequence as u64, chunk, false)
+                .await
+                .unwrap();
+        }
+        let holder = live_holder(&target.store, ID);
+        let refused = stream
+            .finish(&target.carrier, Some(length), Some(&sha(&bundle)))
+            .await;
+        assert_eq!(refused.err().unwrap().code, "conversation_live_here");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"{\"live\":1}\n");
+        assert_eq!(
+            target.carrier.import_status(transfer).await.unwrap(),
+            TransferStatus::receiving(length, length)
+        );
+        end(holder);
+        let probe = target
+            .carrier
+            .probe(
+                ProbeRequest::parse(
+                    json!({"agent": "claude-code", "conversation_id": ID, "cwd": "~/code/spawn"})
+                        .as_object(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe["live"], false);
+        // Resumed with nothing left to send, its end commits.
+        let resumed = target
+            .carrier
+            .begin_import(import(transfer, &target_cwd, &bundle, None), "again")
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.stream.next_sequence,
+            crate::host_stream::chunk_count(length)
+        );
+        let result = resumed
+            .stream
+            .finish(&target.carrier, Some(length), Some(&sha(&bundle)))
+            .await
+            .unwrap();
+        assert_eq!(result["set_aside"], 1);
+        assert_eq!(std::fs::read(&copy).unwrap(), RECORD_BYTES);
     }
 
     /// Two moves of one conversation at once — a double tap, two devices —

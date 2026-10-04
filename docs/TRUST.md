@@ -331,7 +331,9 @@ means for what each party learns and can do.
   from Claude Code's own folder rule, writes files 0600 and folders 0700,
   verifies every byte against the source's digests before anything lands,
   and sets an existing copy of the conversation aside rather than overwrite
-  it.
+  it. It refuses the conversation while a Claude there holds it, by the same
+  fail-closed reading the source uses, when the move begins and again right
+  before it commits.
 - **Set-aside copies.** The source keeps what it moved out for 30 days in
   spawnd's own configuration folder, outside the agent's lookup path, then
   deletes it; a move that does not finish puts the files back. A copy the

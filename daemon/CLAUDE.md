@@ -543,6 +543,10 @@ none of it.
   or its start differs from the recorded one): a start it cannot compare
   (macOS, an npm install's node Claude, no `procStart`) or another pid
   domain is a holder. Refusing a move is safe; missing a holder is not.
+- **The target is fenced too.** `conv.import.begin`, and the commit before
+  it is decided (and a `committing` roll-forward before it sets anything
+  aside), refuse with `conversation_live_here` while anything on the target
+  holds the conversation; `conv.probe` reports it as `live`.
 - **The target chooses every name.** An import stages raw bytes in
   `incoming/<transfer>/`, checks them as they arrive, verifies every entry
   and the whole digest again at `stream.end`, extracts 0600/0700 with every

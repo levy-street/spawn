@@ -1734,15 +1734,19 @@ the same one names the transfer on both hosts.
 `conv.probe {agent:"claude-code", conversation_id?, cwd}` — the target's facts
 before a move: `{agent, home, cwd, folder_exists, project_folder, store,
 store_ready, store_problem, destination, memory, repository_root, duplicates,
-duplicates_truncated, login_shell, cli_version}`. `cwd` is the folder with
+duplicates_truncated, live, login_shell, cli_version}`. `cwd` is the folder with
 every link resolved (what Claude Code files it under, inside home); `store`
 is `CLAUDE_CONFIG_DIR` or `~/.claude`; `destination` is
 `<store>/projects/<folder>` by Claude Code's own folder rule; `memory` is the
 memory folder of the folder's repository root (a linked worktree's main
 working tree, read from `.git` and `commondir`, never by running git), or of
 the folder itself outside a repository; `duplicates` names every copy of the
-conversation already on the host (`{folder, path, size, modified_at}`, at most
-16); `login_shell` is the shell the host's windows start, by name; and
+conversation already on the host (`{folder, path, size, modified_at, live}`,
+at most 16); `live` (null without a `conversation_id`) says whether a process
+on the target holds the conversation now, by the same fail-closed reading the
+source's fence uses — which copy it holds is not said, so every duplicate
+carries the same value — and an import is refused while it does;
+`login_shell` is the shell the host's windows start, by name; and
 `cli_version` is Claude Code's version, read from where it is installed and
 never by running it, or null. `store_ready` is false — with the reason — when
 the store is missing, outside home, behind a link, or on another filesystem
@@ -1815,8 +1819,15 @@ else, so a device opens a consumer channel per transfer. The target refuses a
 folder it does not have (`folder_missing`), one outside home
 (`outside_root`), a store that does not exist yet (`store_missing`) or that it
 cannot rename into (`store_unavailable`), more than 16 transfers staged at
-once (`too_many_transfers`), and a transfer already settled
-(`transfer_committed`, `transfer_cancelled`). At `stream.end` it verifies every
+once (`too_many_transfers`), a transfer already settled
+(`transfer_committed`, `transfer_cancelled`), and — at the begin, and again
+at `stream.end` before the commit is decided — a conversation a Claude on
+the target holds (`conversation_live_here`): setting that copy aside, or
+placing the carried record where it writes, would give the conversation two
+writers. A commit refused that way keeps its staging; a resumed begin then
+answers `next_sequence` at the chunk count, and its `stream.end` commits once
+nothing holds the conversation. A transfer already decided (`committing`)
+rolls forward only then. At `stream.end` it verifies every
 entry and the whole digest again, extracts the files 0600 and their folders
 0700, syncs each, sets every other copy of the conversation aside (never
 overwriting, never deleting one), renames the sidecar and then the record
