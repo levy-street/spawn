@@ -2,12 +2,16 @@ import { makeAgent } from "@/components/launcher/__tests__/fixtures";
 import {
   conversationOnRecord,
   planAgentRestart,
+  recordRefused,
   restartConversation,
   restartSessionAgent,
 } from "@/components/launcher/agent-restart";
 import type { Session } from "@/data/types/domain";
 import type { ConversationInspection } from "@/terminal/transport/conversation-codec";
 import type { AgentTranscriptReport } from "@/terminal/transport/types";
+
+// The app's own UUID source, for a restart that is not handed one.
+jest.mock("expo-crypto", () => ({ randomUUID: () => "6b1f9e3a-2c4d-4e8f-9a0b-1c2d3e4f5a6b" }));
 
 const claude = makeAgent({
   id: "11111111-1111-4111-8111-111111111111",
@@ -624,5 +628,190 @@ describe("restartSessionAgent with the host's records", () => {
       "done asking",
       "restart",
     ]);
+  });
+});
+
+/** What a server could put in `agent_session_id`: none of it is a UUID. */
+const REFUSED = [
+  "--dangerously-skip-permissions",
+  "-p",
+  "--settings=x",
+  "-",
+  "a b",
+  "conv-2",
+  "not-a-uuid",
+  `${recorded} --dangerously-skip-permissions`,
+  `-${recorded}`,
+];
+const fresh = "9d2f0c4b-6a1e-4b7d-8c3a-2e5f1b0d9a47";
+
+describe("a recorded id that is not a UUID", () => {
+  test("is refused for an agent launched under an id, unless the host answers", () => {
+    for (const bad of REFUSED) {
+      expect(recordRefused(claude, session({ agent_session_id: bad }), null)).toBe(true);
+      expect(restartConversation(claude, session({ agent_session_id: bad }), null)).toBeNull();
+      expect(recordRefused(claude, session({ agent_session_id: bad }), live())).toBe(false);
+      expect(recordRefused(codex, codexSession({ agent_session_id: bad }), null)).toBe(false);
+    }
+    expect(recordRefused(claude, session(), null)).toBe(false);
+    expect(recordRefused(claude, session({ agent_session_id: null }), null)).toBe(false);
+  });
+
+  test("planned alone, starts the agent afresh with no id on the line", () => {
+    for (const bad of REFUSED) {
+      expect(planAgentRestart(session({ agent_session_id: bad }), [claude])).toEqual({
+        kind: "agent",
+        agent: claude,
+        command: "claude",
+        resumes: false,
+      });
+      expect(planAgentRestart(session({ agent_session_id: bad }), [claude], null, true)).toEqual({
+        kind: "agent",
+        agent: claude,
+        command: "claude",
+        resumes: false,
+      });
+      const codexPlan = planAgentRestart(codexSession({ agent_session_id: bad }), [codex]);
+      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume --last");
+    }
+  });
+
+  test("restarts into a new conversation under a new id, written back in its place", async () => {
+    for (const bad of REFUSED) {
+      const pending = pendingStore();
+      const transcripts = jest.fn(async () => records([]));
+      const recordConversation = jest.fn(async (_id: string) => undefined);
+      const result = await restartSessionAgent({
+        session: session({ agent_session_id: bad }),
+        agents: [claude],
+        restart: async () => session({ status: "starting" }),
+        pending,
+        inspect: async () => null,
+        transcripts,
+        recordConversation,
+        newConversationId: () => fresh,
+      });
+      expect(recordConversation).toHaveBeenCalledTimes(1);
+      expect(recordConversation).toHaveBeenCalledWith(fresh);
+      expect(result.plan).toEqual({
+        kind: "agent",
+        agent: claude,
+        command: `claude --session-id ${fresh}`,
+        resumes: false,
+      });
+      // A new id has no record to look for.
+      expect(transcripts).not.toHaveBeenCalled();
+      expect(pending.queued.get(session().id)).toBe(`claude --session-id ${fresh}`);
+    }
+  });
+
+  test("without a UUID source of its own, the app's is used", async () => {
+    const pending = pendingStore();
+    const recordConversation = jest.fn(async (_id: string) => undefined);
+    await restartSessionAgent({
+      session: session({ agent_session_id: "--dangerously-skip-permissions" }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      recordConversation,
+    });
+    const appId = "6b1f9e3a-2c4d-4e8f-9a0b-1c2d3e4f5a6b";
+    expect(pending.queued.get(session().id)).toBe(`claude --session-id ${appId}`);
+    expect(recordConversation).toHaveBeenCalledWith(appId);
+  });
+
+  test("a UUID source that fails to give one starts the agent afresh with no id", async () => {
+    const pending = pendingStore();
+    const recordConversation = jest.fn(async (_id: string) => undefined);
+    await restartSessionAgent({
+      session: session({ agent_session_id: "--dangerously-skip-permissions" }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      recordConversation,
+      newConversationId: () => "--dangerously-skip-permissions",
+    });
+    expect(pending.queued.get(session().id)).toBe("claude");
+    expect(recordConversation).not.toHaveBeenCalled();
+  });
+
+  test("the host's answer still decides, and the refused record is replaced by it", async () => {
+    const recordConversation = jest.fn(async (_id: string) => undefined);
+    const pending = pendingStore();
+    await restartSessionAgent({
+      session: session({ agent_session_id: "--dangerously-skip-permissions" }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => live(),
+      transcripts: async () => records([moved]),
+      recordConversation,
+      newConversationId: () => fresh,
+    });
+    expect(recordConversation).toHaveBeenCalledWith(moved);
+    expect(pending.queued.get(session().id)).toBe(`claude --resume ${moved}`);
+
+    await restartSessionAgent({
+      session: session({ agent_session_id: "--dangerously-skip-permissions" }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => live({ conversation_id: null, source: "attach" }),
+      recordConversation,
+      newConversationId: () => fresh,
+    });
+    expect(pending.queued.get(session().id)).toBe("claude --continue");
+    expect(recordConversation).toHaveBeenCalledTimes(1);
+  });
+
+  test("a Codex window falls back to the latest conversation and writes nothing", async () => {
+    const recordConversation = jest.fn(async (_id: string) => undefined);
+    for (const bad of REFUSED) {
+      const pending = pendingStore();
+      await restartSessionAgent({
+        session: codexSession({ agent_session_id: bad }),
+        agents: [codex],
+        restart: async () => codexSession({ status: "starting" }),
+        pending,
+        inspect: async () => null,
+        recordConversation,
+        newConversationId: () => fresh,
+      });
+      expect(pending.queued.get(session().id)).toBe("codex resume --last");
+    }
+    expect(recordConversation).not.toHaveBeenCalled();
+  });
+
+  test("an id the host names that is not a UUID is no id either", () => {
+    // `parseConversationInspection` refuses such an answer outright; the
+    // planner holds the line on its own all the same.
+    for (const bad of REFUSED) {
+      expect(restartConversation(claude, session(), live({ conversation_id: bad }))).toBeNull();
+      const plan = planAgentRestart(session(), [claude], live({ conversation_id: bad }));
+      expect(plan.kind === "agent" ? plan.command : null).toBe("claude --continue");
+      const codexPlan = planAgentRestart(
+        codexSession(),
+        [codex],
+        live({ agent: "codex", conversation_id: bad, source: "open_file" }),
+      );
+      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume --last");
+    }
+  });
+
+  test("a recorded UUID in upper case is resumed lower-case, and the record set right", async () => {
+    const upper = recorded.toUpperCase();
+    expect(restartConversation(claude, session({ agent_session_id: upper }), null)).toBe(recorded);
+    const pending = pendingStore();
+    const recordConversation = jest.fn(async (_id: string) => undefined);
+    await restartSessionAgent({
+      session: session({ agent_session_id: upper }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending,
+      inspect: async () => null,
+      recordConversation,
+    });
+    expect(pending.queued.get(session().id)).toBe(`claude --resume ${recorded}`);
+    expect(recordConversation).toHaveBeenCalledWith(recorded);
   });
 });

@@ -22,6 +22,7 @@ import {
   type ConversationInspection,
   parseConversationInspection,
 } from "@/terminal/transport/conversation-codec";
+import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 import { verifyDaemonHost } from "@/terminal/transport/daemon-trust";
 import {
   AGENT_TRANSCRIPTS_OP,
@@ -636,11 +637,13 @@ class WebViewHostTransport implements StreamingHostTransport {
     options?: HostRequestOptions,
   ): Promise<AgentTranscriptReport> {
     this.#requireCapability(AGENT_TRANSCRIPTS_OP);
+    // A recorded id that is not a UUID is not asked about: the folder is.
+    const conversationId = canonicalConversationId(query.conversationId);
     const response = await this.request<unknown>(
       AGENT_TRANSCRIPTS_OP,
       {
         agent_kind: query.agentKind,
-        ...(query.conversationId ? { conversation_id: query.conversationId } : {}),
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         ...(query.cwd ? { cwd: query.cwd } : {}),
       },
       options,

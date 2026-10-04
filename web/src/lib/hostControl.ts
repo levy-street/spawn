@@ -1,6 +1,7 @@
 import {
   CONVERSATION_INSPECT_OP,
   type ConversationInspection,
+  canonicalConversationId,
   parseConversationInspection,
 } from "@/lib/conversation";
 import { parseCapabilities } from "@/lib/preview/capabilities";
@@ -1244,16 +1245,20 @@ export class HostControlClient {
    * then read with `readFile`, so a transcript is a host file like any
    * other and never crosses the server. Gated on `agent.transcripts`; an
    * older daemon answers `unsupported_operation` as an ordinary error.
+   * Conversation ids travel only as UUIDs (`canonicalConversationId`), both
+   * ways: one that is anything else is not asked about, and a file named
+   * with one is named with none.
    */
   async agentTranscripts(
     query: AgentTranscriptQuery,
     options?: HostControlRequestOptions,
   ): Promise<AgentTranscriptReport> {
+    const conversationId = canonicalConversationId(query.conversationId);
     const result = await this.request<AgentTranscriptReport>(
       AGENT_TRANSCRIPTS_OP,
       {
         agent_kind: query.agentKind,
-        ...(query.conversationId ? { conversation_id: query.conversationId } : {}),
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         ...(query.cwd ? { cwd: query.cwd } : {}),
       },
       options,
@@ -1276,7 +1281,13 @@ export class HostControlClient {
       this.failRtc();
       throw new HostControlError("invalid_response", "Host returned an invalid transcript report");
     }
-    return result;
+    return {
+      ...result,
+      transcripts: result.transcripts.map((file) => ({
+        ...file,
+        conversation_id: canonicalConversationId(file.conversation_id),
+      })),
+    };
   }
 
   /**

@@ -124,7 +124,10 @@ lifecycle state, exit codes, foreground executable basenames, activity
 timestamps, the agent definition a window was opened as, and an opaque
 conversation id for that agent (`agent_session_id`, what a restart resumes,
 never read by the server). It starts as the id the client handed the agent at
-launch. On a restart a device may replace it with the Claude Code id the
+launch. A device types it only when it is a canonical UUID, so a server that
+rewrites it cannot make a restart type a flag (`claude --resume
+--dangerously-skip-permissions`); a record that is anything else is replaced
+by a fresh id the device chose. On a restart a device may replace it with the Claude Code id the
 window's host named when asked which conversation the window is actually in
 (`conv.inspect`, over the device's host channel): an id the agent chose
 itself after `/clear`, `/branch` or `/resume`, or a background job's. Only

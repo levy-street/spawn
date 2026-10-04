@@ -1990,6 +1990,50 @@ describe("HostControlClient agent transcripts", () => {
     client.close();
   });
 
+  test("an id that is not a UUID is never asked about, and never named back", async () => {
+    const { client, pc } = await readyClient({}, hostId, WITH_TRANSCRIPTS);
+    const pending = client.agentTranscripts({
+      agentKind: "claude-code",
+      conversationId: "--dangerously-skip-permissions",
+      cwd: "/w",
+    });
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.payload).toEqual({ agent_kind: "claude-code", cwd: "/w" });
+    const file = {
+      path: "/home/me/.claude/projects/-w/x.jsonl",
+      name: "x.jsonl",
+      size: 1,
+      role: "conversation",
+    };
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          agent_kind: "claude-code",
+          supported: true,
+          transcripts: [
+            { ...file, conversation_id: "-p" },
+            { ...file, conversation_id: "45171E5A-5951-4D38-81E5-E1C0F9639D80" },
+            file,
+          ],
+          searched: [],
+          truncated: false,
+        },
+      }),
+    );
+    const report = await pending;
+    expect(report.transcripts.map((entry) => entry.conversation_id)).toEqual([
+      null,
+      "45171e5a-5951-4d38-81e5-e1c0f9639d80",
+      null,
+    ]);
+    client.close();
+  });
+
   test("a window without a recorded id asks by folder only", async () => {
     const { client, pc } = await readyClient({}, hostId, WITH_TRANSCRIPTS);
     void client

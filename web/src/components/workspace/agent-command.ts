@@ -1,4 +1,5 @@
 import type { Agent } from "@/lib/api";
+import { canonicalConversationId } from "@/lib/conversation";
 
 /**
  * Pure command construction for the agent switcher (§5.5). Everything the
@@ -151,7 +152,9 @@ export function newAgentConversationId(kind: string | null | undefined): string 
 /**
  * What starting an agent types when the window is to remember its
  * conversation: the run command with the id the CLI is told to use. Without a
- * grammar for the kind, or without an id, exactly the run command.
+ * grammar for the kind, or without an id, exactly the run command. Only a
+ * UUID is an id here (`canonicalConversationId`): anything else is typed as
+ * no id at all, never as a word after the agent's flags.
  */
 export function agentLaunchCommand(
   agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
@@ -159,7 +162,8 @@ export function agentLaunchCommand(
 ): string {
   const run = agentRunCommand(agent);
   const launch = agentConversationGrammar(agent.kind)?.launch;
-  return launch && conversationId ? `${run} ${launch(conversationId)}` : run;
+  const id = canonicalConversationId(conversationId);
+  return launch && id ? `${run} ${launch(id)}` : run;
 }
 
 /**
@@ -167,7 +171,7 @@ export function agentLaunchCommand(
  * conversation it names (`restartConversation` decides which), or the latest
  * one in this folder when there is none to name. Null when this kind of agent
  * cannot be resumed at all, so the caller falls back to a plain relaunch and
- * says so.
+ * says so. An id that is not a UUID names nothing (`canonicalConversationId`).
  */
 export function agentResumeCommand(
   agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
@@ -176,7 +180,8 @@ export function agentResumeCommand(
   const grammar = agentConversationGrammar(agent.kind);
   if (!grammar) return null;
   const run = agentRunCommand(agent);
-  if (conversationId && grammar.resume) return `${run} ${grammar.resume(conversationId)}`;
+  const id = canonicalConversationId(conversationId);
+  if (id && grammar.resume) return `${run} ${grammar.resume(id)}`;
   if (grammar.continueLatest) return `${run} ${grammar.continueLatest}`;
   return null;
 }

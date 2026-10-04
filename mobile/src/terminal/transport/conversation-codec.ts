@@ -1,3 +1,4 @@
+import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 
 /**
@@ -37,8 +38,6 @@ export interface ConversationInspection {
 }
 
 const STATES: ReadonlySet<string> = new Set(["running", "blocked", "idle", "unknown"]);
-/** The server's own rule for a conversation id (`AGENT_SESSION_ID_PATTERN`). */
-const CONVERSATION_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 const SHORT_TEXT = /^[\x21-\x7e]{1,64}$/;
 
 function nullableText(value: unknown, pattern: RegExp): string | null | undefined {
@@ -46,10 +45,19 @@ function nullableText(value: unknown, pattern: RegExp): string | null | undefine
   return typeof value === "string" && pattern.test(value) ? value : undefined;
 }
 
+/** A conversation id from the host: null, a UUID (`canonicalConversationId`),
+ *  or undefined when it is something else and the answer is malformed. */
+function nullableConversationId(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  return canonicalConversationId(value) ?? undefined;
+}
+
 /**
  * A daemon's answer, checked field by field. A state this client does not
  * know yet reads as `unknown` rather than as malformed, so a newer daemon
- * never breaks an older app; anything else malformed is refused.
+ * never breaks an older app; anything else malformed is refused. A
+ * conversation id that is not a UUID is malformed; one in upper case is read
+ * lower-case.
  */
 export function parseConversationInspection(value: unknown): ConversationInspection {
   const invalid = () =>
@@ -60,7 +68,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw invalid();
   const record = value as Record<string, unknown>;
   const agent = nullableText(record["agent"], SHORT_TEXT);
-  const conversationId = nullableText(record["conversation_id"], CONVERSATION_ID);
+  const conversationId = nullableConversationId(record["conversation_id"]);
   const cliVersion = nullableText(record["cli_version"], SHORT_TEXT);
   const liveElsewhere = record["live_elsewhere"];
   const source = record["source"];

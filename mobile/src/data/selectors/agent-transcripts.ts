@@ -1,5 +1,6 @@
 import { sessionAgent } from "@/data/selectors/agent";
 import type { AgentDef, Session } from "@/data/types/domain";
+import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 import type {
   AgentTranscriptFile,
   AgentTranscriptQuery,
@@ -15,7 +16,8 @@ import type {
  * what to ask for, and what to say about the answer.
  */
 
-/** What to ask the daemon for, or null when the window runs no agent. */
+/** What to ask the daemon for, or null when the window runs no agent. A
+ *  recorded id that is not a UUID is not asked about: the folder is. */
 export function transcriptQueryFor(
   session: Pick<Session, "foreground_command" | "agent_id" | "agent_session_id" | "cwd">,
   agents: readonly AgentDef[],
@@ -26,7 +28,7 @@ export function transcriptQueryFor(
     agent,
     query: {
       agentKind: agent.kind,
-      conversationId: session.agent_session_id ?? null,
+      conversationId: canonicalConversationId(session.agent_session_id),
       cwd: session.cwd,
     },
   };
