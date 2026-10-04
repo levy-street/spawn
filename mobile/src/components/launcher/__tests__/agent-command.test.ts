@@ -1,4 +1,5 @@
 import { makeAgent } from "@/components/launcher/__tests__/fixtures";
+import * as launcher from "@/components/launcher/agent-command";
 import {
   agentInstallAndRunCommand,
   agentRunCommand,
@@ -7,8 +8,23 @@ import {
   shellQuote,
   sortAgents,
 } from "@/components/launcher/agent-command";
+import * as selectors from "@/data/selectors/agent";
+import * as relaunch from "@/data/selectors/agent-relaunch";
 
 describe("launcher command construction", () => {
+  test("spells no line of its own: every builder is the relaunch module's", () => {
+    // The module the browser carries byte for byte, so a launch on the phone
+    // and a relaunch on either client cannot spell an agent two ways.
+    expect(launcher.shellQuote).toBe(relaunch.shellQuote);
+    expect(launcher.envPrefix).toBe(relaunch.envPrefix);
+    expect(launcher.agentRunCommand).toBe(relaunch.agentRunCommand);
+    expect(launcher.agentYoloAvailable).toBe(relaunch.agentYoloAvailable);
+    expect(launcher.agentLaunchCommand).toBe(relaunch.agentLaunchCommand);
+    expect(launcher.agentResumeCommand).toBe(relaunch.agentResumeCommand);
+    expect(launcher.agentInstallAndRunCommand).toBe(selectors.agentInstallAndRunCommand);
+    expect(launcher.sortAgents).toBe(selectors.sortAgents);
+  });
+
   test("quotes POSIX words and embedded quotes byte-for-byte", () => {
     expect(shellQuote("/usr/local/bin:x_1,y.z@host%2+=-")).toBe("/usr/local/bin:x_1,y.z@host%2+=-");
     expect(shellQuote("")).toBe("''");
