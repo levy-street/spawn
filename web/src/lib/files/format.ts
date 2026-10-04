@@ -56,3 +56,18 @@ export function formatTimestamp(seconds: number | null | undefined, locale?: str
     timeStyle: "short",
   });
 }
+
+/**
+ * The line under a name when the Details view has folded its columns away,
+ * read as the phone's file row reads it: a file's size and when it changed,
+ * a folder's date alone. Whatever the host did not say is left out.
+ */
+export function formatEntrySummary(
+  entry: { is_dir?: boolean | null; size?: number | null; modified_at?: number | null },
+  now: Date = new Date(),
+  locale?: string,
+): string {
+  const modified = formatModified(entry.modified_at, now, locale);
+  if (entry.is_dir === true) return modified;
+  return [formatSize(entry.size), modified].filter(Boolean).join(" · ");
+}

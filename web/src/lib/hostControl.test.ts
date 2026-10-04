@@ -2312,6 +2312,10 @@ async function pingRepeatedly(client, connection, count: number) {
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 describe("HostControlClient consumer channel rotation", () => {
+  // Every test here walks a channel to its budget, answering about 4,000
+  // requests one at a time: 1–3 s alone, but several times that on a loaded
+  // machine (one full run took 7 s while mobile's jest ran alongside), past
+  // bun's 5 s default. Each has 30 s, a limit for a hung test, not a slow one.
   test("a long-lived consumer swaps channels before the daemon's 4,096-id limit, unnoticed", async () => {
     const { client, connection, states } = await readyConsumer();
     await pingRepeatedly(client, connection, CHANNEL_ROTATE_AFTER_REQUESTS);
@@ -2343,7 +2347,7 @@ describe("HostControlClient consumer channel rotation", () => {
     expect(states).toEqual(["idle", "connecting", "ready"]);
     expect(client.hasCapability("host.metrics")).toBe(true);
     client.close();
-  });
+  }, 30_000);
 
   test("the swap waits for in-flight work, and past the budget requests wait for the swap", async () => {
     const { client, connection } = await readyConsumer();
@@ -2397,7 +2401,7 @@ describe("HostControlClient consumer channel rotation", () => {
     await expect(held).resolves.toEqual({ ok: 1 });
     expect(client.getState()).toBe("ready");
     client.close();
-  });
+  }, 30_000);
 
   /** A channel at its budget with a read still open across the mark. */
   async function consumerAtBudget(options = {}) {
@@ -2470,7 +2474,7 @@ describe("HostControlClient consumer channel rotation", () => {
     expect(client.getState()).toBe("ready");
     expect(connection.channels).toHaveLength(2);
     client.close();
-  });
+  }, 30_000);
 
   test("a write begun at the budget waits for the swap instead of blocking it", async () => {
     const { client, connection, first, finishRead } = await consumerAtBudget({
@@ -2502,7 +2506,7 @@ describe("HostControlClient consumer channel rotation", () => {
     await expect(writing).resolves.toBe("/private/empty.txt");
     expect(client.getState()).toBe("ready");
     client.close();
-  });
+  }, 30_000);
 
   test("a held stream open that gives up leaves the channel free to swap", async () => {
     const { client, connection, first, finishRead } = await consumerAtBudget();
@@ -2520,7 +2524,7 @@ describe("HostControlClient consumer channel rotation", () => {
     await pingRepeatedly(client, connection, 1);
     expect(connection.channels).toHaveLength(2);
     client.close();
-  });
+  }, 30_000);
 
   test("a held request that times out was never sent, so nothing is cancelled", async () => {
     const { client, connection } = await readyConsumer();
@@ -2535,7 +2539,7 @@ describe("HostControlClient consumer channel rotation", () => {
     for (const channel of connection.channels)
       expect(channel.sent.map((frame) => JSON.parse(frame).type)).not.toContain("cancel");
     client.close();
-  });
+  }, 30_000);
 
   test("a replacement that never says hello is retired instead of holding requests for ever", async () => {
     const { client, connection } = await readyConsumer({ connectTimeoutMs: 5 });
@@ -2550,7 +2554,7 @@ describe("HostControlClient consumer channel rotation", () => {
     connection.latest().hello();
     expect(client.getState()).toBe("ready");
     client.close();
-  });
+  }, 30_000);
 });
 
 describe("HostControlClient refused consumer channel", () => {
