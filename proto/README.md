@@ -1576,8 +1576,11 @@ digest — anything else fails with `resume_mismatch` — and the response names
 a new `stream_id` and the `next_sequence` to send; the device restarts its
 source at byte `next_sequence × chunk_bytes`. To resume a read, the device
 repeats it with `from_sequence`; the daemon serves the same bytes from that
-chunk on (a source that changed meanwhile fails with the family's error), and
-an end digest still covers the whole stream. A resumed begin or read
+chunk on — from byte `min(from_sequence × chunk_bytes, length)`, so a resume
+at the chunk count (every chunk already with the device) is answered with
+`stream.end` alone, and one past it fails with `resume_mismatch` — (a source
+that changed meanwhile fails with the family's error), and an end digest
+still covers the whole stream. A resumed begin or read
 supersedes any stream of the same transfer that is still open, on whatever
 channel, since a channel the device has given up on may not have closed yet:
 under the transfer's lock the daemon ends the old stream with `stream.error`

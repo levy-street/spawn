@@ -2055,12 +2055,16 @@ struct OpenEntry {
 }
 
 impl BundleSource {
+    /// The bundle from chunk `from_sequence` on: byte
+    /// `min(from_sequence × chunk_bytes, length)`, so a resume at the chunk
+    /// count — every chunk already with the device — serves no chunk and
+    /// only `stream.end`, whatever the length of the last chunk.
     fn new(
         root: &Dir,
         located: &[Located],
         encoded: &[u8],
         manifest: &Manifest,
-        from: u64,
+        from_sequence: u64,
     ) -> FsResult<Self> {
         let mut prefix = crate::host_bundle::header(encoded.len() as u32).to_vec();
         prefix.extend_from_slice(encoded);
@@ -2071,12 +2075,13 @@ impl BundleSource {
             at += entry.size;
         }
         let length = manifest.bundle_length(encoded.len() as u64);
-        if from > length {
+        if from_sequence > crate::host_stream::chunk_count(length) {
             return Err(error(
                 "resume_mismatch",
                 "a resume starts past the bundle's end",
             ));
         }
+        let from = crate::host_stream::chunk_offset(from_sequence).min(length);
         Ok(Self {
             root: root.try_clone()?,
             prefix,
@@ -2369,7 +2374,7 @@ impl Carrier {
         request: &ExportRequest,
     ) -> FsResult<(BundleSource, BundleRecord, usize, Option<&'static str>)> {
         let transfer = request.transfer_id;
-        let from = crate::host_stream::chunk_offset(request.from_sequence);
+        let from_sequence = request.from_sequence;
         let check = request.clone();
         let existing = self
             .blocking(move |_, places, _| {
@@ -2499,7 +2504,7 @@ impl Carrier {
                     &located,
                     bundle.manifest.as_bytes(),
                     &manifest,
-                    from,
+                    from_sequence,
                 )?;
                 Ok((source, bundle, manifest.entries.len()))
             })
@@ -4511,6 +4516,84 @@ mod tests {
         elsewhere.to_host_id = Uuid::new_v4();
         let refused = source.carrier.prepare_export(elsewhere, "d").await;
         assert_eq!(refused.err().unwrap().code, "resume_mismatch");
+    }
+
+    /// A record alone whose bundle is exactly `length` bytes long.
+    fn record_for_bundle_of(length: u64) -> Vec<u8> {
+        let bundle_of = |size: u64| {
+            let manifest = Manifest {
+                agent: CLAUDE_CODE.into(),
+                conversation_id: ID.into(),
+                entries: vec![crate::host_bundle::Entry {
+                    path: CONVERSATION.into(),
+                    size,
+                    sha256: "0".repeat(64),
+                }],
+            };
+            manifest.bundle_length(manifest.encode().len() as u64)
+        };
+        let overhead = bundle_of(length) - length;
+        let size = length - overhead;
+        assert_eq!(bundle_of(size), length);
+        let mut record = vec![b'x'; size as usize - 1];
+        record.push(b'\n');
+        record
+    }
+
+    /// Every resume the stream v2 vectors list, served by a held export of
+    /// exactly that length: from chunk `next` the bundle continues at
+    /// `min(next × 8192, length)` — at the chunk count, nothing but the end —
+    /// and past the chunk count there is nothing to resume.
+    #[tokio::test]
+    async fn an_export_resumes_at_every_point_the_vectors_name() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../proto/stream-v2-vectors.json")).unwrap();
+        let mut lengths = 0;
+        for case in vectors["chunking"].as_array().unwrap() {
+            let length = case["length"].as_u64().unwrap();
+            // Shorter than any bundle, or too long for a test to write.
+            if !(4096..=1 << 20).contains(&length) {
+                continue;
+            }
+            lengths += 1;
+            let source = Host::new().await;
+            let cwd = source.folder("code/spawn");
+            write_conversation(
+                &source.project(&cwd),
+                ID,
+                &record_for_bundle_of(length),
+                &[],
+            );
+            let transfer = Uuid::new_v4();
+            let first = source
+                .carrier
+                .prepare_export(export(transfer, Some(&cwd), 0), "first")
+                .await
+                .unwrap();
+            assert_eq!(first.source.length(), length);
+            let whole = drain(first.source);
+            assert_eq!(whole.len() as u64, length);
+            for resume in case["resume"].as_array().unwrap() {
+                let next = resume["next_sequence"].as_u64().unwrap();
+                let offset = resume["offset"].as_u64().unwrap() as usize;
+                let again = source
+                    .carrier
+                    .prepare_export(export(transfer, Some(&cwd), next), "again")
+                    .await
+                    .unwrap_or_else(|failure| {
+                        panic!("{length} from {next}: {} {}", failure.code, failure.detail)
+                    });
+                assert_eq!(again.sha256, first.sha256, "{length} from {next}");
+                assert_eq!(drain(again.source), whole[offset..], "{length} from {next}");
+            }
+            let past = case["chunks"].as_u64().unwrap() + 1;
+            let refused = source
+                .carrier
+                .prepare_export(export(transfer, Some(&cwd), past), "past")
+                .await;
+            assert_eq!(refused.err().unwrap().code, "resume_mismatch", "{length}");
+        }
+        assert!(lengths >= 4, "the vectors name lengths a bundle can have");
     }
 
     #[tokio::test]
