@@ -226,6 +226,12 @@ An end-to-end test that starts another Next server gives it its own disposable
 Use `SPAWN_NEXT_TSCONFIG_PATH` with a disposable config copy as well, so Next's
 generated type paths never rewrite the tracked `tsconfig.json`.
 
+In CI the suite compiles every page and route handler under `src/app` before
+its first test (`tests/e2e/global-setup.ts`), and the dev server Playwright
+starts keeps them compiled for the run (`SPAWN_E2E_KEEP_ROUTES`, read in
+`next.config.ts`), so nothing compiles or rebuilds under a test. A new route
+needs nothing more: the setup finds it.
+
 ## Keeping this file true
 
 Agents and people plan work from this file, so a stale version misroutes every

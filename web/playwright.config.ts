@@ -6,6 +6,8 @@ const baseURL = configuredBaseUrl ?? `http://127.0.0.1:${port}`;
 
 export default defineConfig({
   testDir: "./tests/e2e",
+  // In CI, every route compiles before the first test (see the file).
+  globalSetup: "./tests/e2e/global-setup.ts",
   timeout: 30_000,
   // One retry absorbs render-timing flakes under parallel-worker load (the
   // scrollback reconciliation specs are rAF-sensitive); trace on-first-retry
@@ -33,6 +35,8 @@ export default defineConfig({
         env: {
           ...process.env,
           SPAWN_API_PROXY_TARGET: "http://127.0.0.1:9",
+          // Compiled routes stay compiled for the run (next.config.ts).
+          SPAWN_E2E_KEEP_ROUTES: "1",
         },
         // In CI the dev server's own log (what it compiled, and how long
         // each request took) lands in the job log beside the tests waiting

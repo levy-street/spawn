@@ -45,6 +45,14 @@ const nextConfig: NextConfig = {
   // an unrelated npm lockfile.
   outputFileTracingRoot: path.resolve(process.cwd()),
   generateBuildId: buildId,
+  // The end-to-end suite's dev server (playwright.config.ts) keeps every
+  // route it has compiled for the whole run. `next dev` otherwise drops a
+  // route nobody asked for in a minute and rebuilds its client bundle, under
+  // whatever page another test is loading; tests/e2e/global-setup.ts says
+  // what that cost. Only that server sets the variable.
+  ...(process.env.SPAWN_E2E_KEEP_ROUTES === "1"
+    ? { onDemandEntries: { maxInactiveAge: 24 * 60 * 60 * 1000, pagesBufferLength: 1_000 } }
+    : {}),
   experimental: {
     // Next buffers proxied request bodies (rewrites share the middleware
     // pipeline) with a 10MB default, silently truncating larger uploads. The
