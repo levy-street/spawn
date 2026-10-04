@@ -832,13 +832,22 @@ export function FileBrowserBody({
         initialValue={nameMode?.kind === "rename" ? nameMode.entry.name : ""}
         onConfirm={(name) => {
           if (!transport || !nameMode) return;
+          // The folder on screen answers a name already taken before the host
+          // is asked; the host's mkdir would answer an old folder as made.
+          const held =
+            listingData && !listingGone
+              ? {
+                  entries: listingData.entries,
+                  complete: !listingData.truncated && !listingData.changedOnHost,
+                }
+              : null;
           void runMutation(
             () =>
               nameMode.kind === "folder"
-                ? createHostFolder(transport, folder, name, pathFlavor)
+                ? createHostFolder(transport, folder, name, pathFlavor, held)
                 : nameMode.kind === "file"
                   ? createHostFile(transport, folder, name)
-                  : renameHostEntry(transport, nameMode.entry.path, name),
+                  : renameHostEntry(transport, nameMode.entry, name, folder, pathFlavor, held),
             nameMode.kind === "rename" ? "rename" : "write",
             nameMode.kind === "rename"
               ? { typed: name, current: nameMode.entry.name }

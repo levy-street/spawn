@@ -23,6 +23,12 @@ export type ConfirmOptions = {
   confirmLabel?: string;
   cancelLabel?: string;
   destructive?: boolean;
+  /**
+   * Where the keyboard goes when the dialog closes, whatever the answer. A
+   * confirm has no trigger for the dialog to hand focus back to, so without
+   * this it lands on <body>, and keys stop reaching what the person was in.
+   */
+  returnFocus?: () => HTMLElement | null | undefined;
 };
 
 type PendingConfirm = ConfirmOptions & { resolve: (confirmed: boolean) => void };
@@ -80,6 +86,12 @@ export function ConfirmHost() {
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           (request.destructive ? cancelRef : confirmRef).current?.focus();
+        }}
+        onCloseAutoFocus={(event) => {
+          const target = request.returnFocus?.();
+          if (!target?.isConnected) return;
+          event.preventDefault();
+          target.focus();
         }}
       >
         <DialogHeader>

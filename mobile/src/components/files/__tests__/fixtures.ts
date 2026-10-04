@@ -29,6 +29,12 @@ export interface FakeHostOptions {
   refuseRemove?: ReadonlySet<string>;
   /** Runs before each request is answered: to hold it, or to throw the host's refusal. */
   before?: (operation: string, params: FakeRequestParams) => Promise<void> | void;
+  /**
+   * Answer changes as SPAWN D's file service does (daemon/src/host_files.rs):
+   * mkdir is `mkdir -p`, so a folder already there is answered as made, and
+   * every failure inside a mkdir or rename comes back `outcome_unknown`.
+   */
+  daemonEffects?: boolean;
 }
 
 const DEFAULT_CAPABILITIES = ["fs.list", "fs.mkdir", "fs.rename", "fs.remove", "fs.write.begin"];
@@ -43,6 +49,7 @@ export function fakeHost({
   capabilities = DEFAULT_CAPABILITIES,
   refuseRemove = new Set(),
   before,
+  daemonEffects = false,
 }: FakeHostOptions = {}) {
   const tree = new Map<string, HostDirEntry[]>(Object.entries(folders));
   if (!tree.has(home)) tree.set(home, []);
@@ -72,11 +79,22 @@ export function fakeHost({
         return { home_dir: home };
       case "fs.list":
         return list(String(params.path ?? home), Number(params.cursor ?? 0));
+      case "fs.stat": {
+        const path = String(params.path);
+        const entry = tree.get(parentOf(path))?.find((item) => item.path === path);
+        if (!entry) throw fsError("not_found");
+        return { path, name: entry.name, kind: entry.kind };
+      }
       case "fs.mkdir": {
         const path = String(params.path);
         const parent = tree.get(parentOf(path));
         if (!parent) throw fsError("not_found");
-        if (parent.some((entry) => entry.path === path)) throw fsError("already_exists");
+        const there = parent.find((entry) => entry.path === path);
+        if (there && daemonEffects) {
+          if (there.is_dir) return { path };
+          throw fsError("outcome_unknown");
+        }
+        if (there) throw fsError("already_exists");
         parent.push(folderEntry(parentOf(path), path.slice(path.lastIndexOf("/") + 1)));
         tree.set(path, []);
         return { path };
@@ -87,7 +105,10 @@ export function fakeHost({
         const parent = tree.get(parentPath) ?? [];
         const index = parent.findIndex((entry) => entry.path === path);
         const current = parent[index];
-        if (!current) throw fsError("not_found");
+        if (!current) throw fsError(daemonEffects ? "outcome_unknown" : "not_found");
+        if (daemonEffects && parent.some((entry) => entry.name === String(params.name))) {
+          throw fsError("outcome_unknown");
+        }
         const renamed = {
           ...current,
           name: String(params.name),

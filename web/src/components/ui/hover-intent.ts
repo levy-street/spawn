@@ -34,6 +34,11 @@ export type HoverIntent<T> = {
   /** Open now and stay open — the keyboard path. Hover cannot dismiss it. */
   pin: (value: T) => void;
   unpin: () => void;
+  /**
+   * The pointer has reached what is open: abandon a pending swap to another
+   * target, picked up on the way there, and keep what is showing.
+   */
+  hold: () => void;
   /** Close immediately, cancelling any pending open. */
   cancel: () => void;
   dispose: () => void;
@@ -83,6 +88,9 @@ export function createHoverIntent<T>(
     unpin() {
       clear();
       set(null, false);
+    },
+    hold() {
+      if (current !== null) clear();
     },
     cancel() {
       clear();
@@ -140,7 +148,8 @@ export function useHoverIntent<T>(options: { enabled?: boolean } = {}) {
     },
     [intent],
   );
+  const hold = useCallback(() => intent.hold(), [intent]);
   const cancel = useCallback(() => intent.cancel(), [intent]);
 
-  return { value: state.value, pinned: state.pinned, enter, pin, cancel };
+  return { value: state.value, pinned: state.pinned, enter, pin, hold, cancel };
 }

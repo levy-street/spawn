@@ -89,6 +89,28 @@ describe("createHoverIntent", () => {
     expect(last()).toEqual({ value: { path: "/b" }, pinned: false });
   });
 
+  test("reaching the open card keeps it, though a row crossed on the way asked to swap", () => {
+    // A card below its row is reached across the next row, which asks for
+    // its own card; arriving on this one abandons that.
+    const { time, intent, last } = harness();
+    intent.enter({ path: "/a" });
+    time.advance(HOVER_OPEN_DELAY_MS);
+    intent.enter({ path: "/b" });
+    time.advance(100);
+    intent.hold();
+    time.advance(HOVER_OPEN_DELAY_MS * 4);
+    expect(last()).toEqual({ value: { path: "/a" }, pinned: false });
+    expect(time.pendingCount()).toBe(0);
+  });
+
+  test("hold with nothing open leaves a pending open alone", () => {
+    const { time, intent, last } = harness();
+    intent.enter({ path: "/a" });
+    intent.hold();
+    time.advance(HOVER_OPEN_DELAY_MS);
+    expect(last()).toEqual({ value: { path: "/a" }, pinned: false });
+  });
+
   test("cancel closes at once, whenever the caller decides", () => {
     const { time, intent, last } = harness();
     intent.enter({ path: "/a" });
