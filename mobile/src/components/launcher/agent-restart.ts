@@ -1,14 +1,13 @@
 import { randomUUID } from "expo-crypto";
 
 import type { PendingLaunchStore } from "@/components/launcher/pending-launch";
+import { newAgentConversationId, sessionAgent } from "@/data/selectors/agent";
 import {
   agentConversationGrammar,
   agentLaunchCommand,
   agentResumeCommand,
   agentRunCommand,
-  newAgentConversationId,
-  sessionAgent,
-} from "@/data/selectors/agent";
+} from "@/data/selectors/agent-relaunch";
 import type { AgentDef, Session } from "@/data/types/domain";
 import type { ConversationInspection } from "@/terminal/transport/conversation-codec";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
@@ -50,6 +49,12 @@ import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/terminal/tra
  * trusted with what a device types; a record that is anything else is
  * neither resumed nor guessed at — the agent starts a new conversation under
  * a new id, written back in its place (`recordRefused`).
+ *
+ * The line itself comes from the relaunch module
+ * (`@/data/selectors/agent-relaunch`) that moves and account switches compose
+ * theirs with. A restart asks it for no permission mode and no note: the
+ * agent comes back in the mode its own conversation recorded, on the same
+ * host, exactly as it always has.
  */
 
 export type AgentRestartPlan =

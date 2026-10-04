@@ -1,14 +1,14 @@
-import type { Agent, Session } from "@/lib/api";
-import { type ConversationInspection, canonicalConversationId } from "@/lib/conversation";
-import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/lib/hostControl";
-import { sessionAgent } from "@/lib/sessions";
 import {
   agentConversationGrammar,
   agentLaunchCommand,
   agentResumeCommand,
   agentRunCommand,
-  newAgentConversationId,
-} from "./agent-command";
+} from "@/lib/agent-relaunch";
+import type { Agent, Session } from "@/lib/api";
+import { type ConversationInspection, canonicalConversationId } from "@/lib/conversation";
+import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/lib/hostControl";
+import { sessionAgent } from "@/lib/sessions";
+import { newAgentConversationId } from "./agent-command";
 import { pendingLaunch } from "./pending-launch";
 
 /**
@@ -47,6 +47,11 @@ import { pendingLaunch } from "./pending-launch";
  * trusted with what a device types; a record that is anything else is
  * neither resumed nor guessed at — the agent starts a new conversation under
  * a new id, written back in its place (`recordRefused`).
+ *
+ * The line itself comes from the relaunch module (`@/lib/agent-relaunch`)
+ * that moves and account switches compose theirs with. A restart asks it for
+ * no permission mode and no note: the agent comes back in the mode its own
+ * conversation recorded, on the same host, exactly as it always has.
  */
 
 export type AgentRestartPlan =

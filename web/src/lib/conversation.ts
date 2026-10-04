@@ -11,6 +11,8 @@
  * named, which a restart writes back to the window's `agent_session_id`.
  */
 
+import { canonicalConversationId } from "@/lib/agent-relaunch";
+
 /** The `conv.*` family, one versioned capability for every operation in it. */
 export const CONVERSATION_CAPABILITY = "conv.v1";
 export const CONVERSATION_INSPECT_OP = "conv.inspect";
@@ -35,25 +37,19 @@ export interface ConversationInspection {
 
 const STATES: ReadonlySet<string> = new Set(["running", "blocked", "idle", "unknown"]);
 const SHORT_TEXT = /^[\x21-\x7e]{1,64}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * A conversation id as SPAWN D will put it on a command line, or null when
- * the value is not one.
+ * A conversation id as SPAWN D will put it on a command line, lower-case, or
+ * null when the value is not one: a canonical UUID and nothing else, so a
+ * value the server or a host hands back (`--dangerously-skip-permissions`
+ * after `--resume`) can never be read as a flag. The server is not trusted
+ * with what a device types (docs/TRUST.md).
  *
- * Every agent that takes an id names its conversations with UUIDs (Claude
- * Code's `--session-id` and `--resume`, Codex's `resume`), and the id is typed
- * into the window's shell after the agent's own flags. So only a canonical
- * UUID, 8-4-4-4-12 hex digits written lower-case, is ever an id; anything
- * else is no id at all. That keeps the id from ever being read as a flag. The
- * server holds `agent_session_id`, and the server is not trusted with what a
- * device types (docs/TRUST.md): `claude --resume --dangerously-skip-permissions`
- * would read the second word as a flag, since `--resume` takes its value
- * optionally. The phone holds the same rule.
+ * One rule, kept in the relaunch module that composes every agent line
+ * (`@/lib/agent-relaunch`, which the phone carries byte for byte): the host's
+ * answers, transcript queries and Restart read ids through it here.
  */
-export function canonicalConversationId(value: unknown): string | null {
-  return typeof value === "string" && UUID.test(value) ? value.toLowerCase() : null;
-}
+export { canonicalConversationId };
 
 function nullableText(value: unknown, pattern: RegExp): string | null | undefined {
   if (value === null) return null;
