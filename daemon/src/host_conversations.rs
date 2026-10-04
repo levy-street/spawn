@@ -295,10 +295,10 @@ fn error_unavailable(detail: &str) -> FsError {
 }
 
 /// What a channel admitted through an authenticated device pair may do with
-/// this daemon's windows: name a window's shell (`conv.inspect`), stop it
-/// (`conv.export` in retire mode), and pace its bulk on the association's
-/// gate. Built in `rtc_pair.rs`, which owns the session registry; nothing
-/// here reaches the registry itself.
+/// this daemon's windows: name a window's shell (`conv.inspect`), tell which
+/// run of it is current, stop it (`conv.export` in retire mode), and pace its
+/// bulk on the association's gate. Built in `rtc_pair.rs`, which owns the
+/// session registry; nothing here reaches the registry itself.
 #[derive(Clone)]
 pub(crate) struct PairWindows {
     shells: WindowShells,

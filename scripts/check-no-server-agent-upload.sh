@@ -234,9 +234,9 @@ if control.count(expected_control_imports) != 1:
 # conversation carrier (conv.v2): a device carries one conversation's own
 # files between two of its hosts over two host channels, as stream v2 frames
 # host_control publishes through host_direct like every other read or write.
-# The carrier is handed a pid resolver, a stop for one window, the
-# association's bulk gate and its own paths, never the session registry or a
-# transport; it is pinned below to reach only the file capability, spawnd's
+# The carrier is handed a pid resolver, a resolver of which run of a window
+# is current, a stop for one window, the association's bulk gate and its own
+# paths, never the session registry or a transport; it is pinned below to reach only the file capability, spawnd's
 # config and private files, the read-only inspector and the two format
 # modules, and to execute nothing. host_stream only measures and waits (the
 # bulk gate never publishes) and host_bundle is pure byte rules.
@@ -368,10 +368,13 @@ if len(control_exports) != len(expected_control_exports) or any(
 # channel's windows (host_conv::WindowShells); it publishes nothing.
 # Reviewed 2026-10-04: `pair` became host_conversations::PairWindows — that
 # resolver, a stop for one window being retired, and the association's bulk
-# gate; it publishes nothing either.
+# gate; it publishes nothing either. Reviewed again the same day: its doc
+# names the read-only resolver of which run of a window is current (the
+# registry generation), which a retire compares to refuse a window started
+# again mid-move; only the comment changed in this block.
 lifetime_block = control[control.index("struct Context {"):control.index("impl Context {")]
 if hashlib.sha256(lifetime_block.encode()).hexdigest() != (
-    "7bd313f444fe8d6672e9e09b87cfeb9d2d22399518ebf05cb4f66745756fdb26"
+    "72d32411dccb450a4b973dd2c4e36254070dc1d95dfb8ab745a2f7adf92f0d4d"
 ):
     raise SystemExit("no-server-agent-upload: protected host retirement capability changed")
 if control.count("connected_signal: HostConnectedSignal") != 1:

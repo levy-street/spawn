@@ -508,9 +508,10 @@ struct Context {
     shutdown: CancellationToken,
     /// Present only on a channel admitted through an authenticated device
     /// pair (`rtc_pair.rs`): which shell each window's processes hang from,
-    /// a stop for a window being retired, and the association's bulk gate —
-    /// nothing else of the session registry. Device-intent operations are
-    /// refused without it (`requires_pair`).
+    /// which run of a window is current, a stop for a window being retired,
+    /// and the association's bulk gate — nothing else of the session
+    /// registry. Device-intent operations are refused without it
+    /// (`requires_pair`).
     pair: Option<crate::host_conversations::PairWindows>,
 }
 
