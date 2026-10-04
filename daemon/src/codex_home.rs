@@ -767,6 +767,15 @@ mod tests {
         }
     }
 
+    /// The window's home as an earlier start left it. spawnd only ever makes
+    /// it private, and on Windows an existing private directory is validated,
+    /// never repaired: one made with `fs::create_dir_all` inherits the temp
+    /// folder's DACL (and on a hosted runner the Administrators owner) and is
+    /// refused, as it would be in production.
+    fn made_by_an_earlier_start(fixture: &Fixture) {
+        crate::platform::create_private_dir_all(&fixture.codex_home).unwrap();
+    }
+
     fn apply(fixture: &Fixture, source: &Path) -> Vec<(&'static str, Outcome)> {
         apply_with(fixture, source, FileLink::native())
     }
@@ -1170,10 +1179,54 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
         );
     }
 
+    /// A conversation folder is a directory symlink on Windows too, which
+    /// needs Developer Mode or the privilege (a hosted runner has it): read
+    /// back to verify it, and re-pointed by removing the link, never the
+    /// folder it named. Without the privilege the window keeps its own.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_conversation_folder_is_linked_and_follows_a_new_codex_home() {
+        let fixture = fixture();
+        let outcomes = apply(&fixture, &fixture.source.clone());
+        if outcome(&outcomes, "sessions") == Outcome::Unlinked {
+            let probe = fixture.source.parent().unwrap().join("probe");
+            let error = std::os::windows::fs::symlink_dir(&fixture.source, &probe)
+                .expect_err("a directory symlink can be made here, yet the store was not linked");
+            assert!(
+                crate::platform::symlink_fixture_unavailable(&error),
+                "{error}"
+            );
+            return;
+        }
+        assert_eq!(outcome(&outcomes, "sessions"), Outcome::Linked);
+        let day = Path::new("sessions").join("2026").join("10").join("03");
+        let rollout = day.join("rollout-2026-10-03T10-00-00-abc.jsonl");
+        fs::create_dir_all(fixture.codex_home.join(&day)).unwrap();
+        fs::write(fixture.codex_home.join(&rollout), b"{}\n").unwrap();
+        assert!(fixture.source.join(&rollout).is_file());
+
+        // Restart.
+        let outcomes = apply(&fixture, &fixture.source.clone());
+        assert_eq!(outcome(&outcomes, "sessions"), Outcome::Current);
+
+        // A new CODEX_HOME.
+        let other = fixture.source.parent().unwrap().join("other-codex");
+        fs::create_dir_all(&other).unwrap();
+        let outcomes = apply(&fixture, &other);
+        assert_eq!(outcome(&outcomes, "sessions"), Outcome::Linked);
+        assert_eq!(
+            fs::read_link(fixture.codex_home.join("sessions")).unwrap(),
+            other.join("sessions")
+        );
+        assert!(fixture.source.join(&rollout).is_file());
+        assert!(!fixture.codex_home.join(&rollout).exists());
+    }
+
     #[test]
     fn a_store_the_window_kept_itself_is_never_touched() {
         for files in file_links() {
             let fixture = fixture();
+            made_by_an_earlier_start(&fixture);
             let own = fixture.codex_home.join("sessions/2026/09/01");
             fs::create_dir_all(&own).unwrap();
             fs::write(own.join("rollout-2026-09-01T10-00-00-old.jsonl"), b"{}\n").unwrap();
@@ -1307,7 +1360,7 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
             let fixture = fixture();
             let source = fixture.source.clone();
             let window_auth = fixture.codex_home.join(AUTH_FILE);
-            fs::create_dir_all(&fixture.codex_home).unwrap();
+            made_by_an_earlier_start(&fixture);
             // A copy an older spawnd left, or a sign-in made in the window.
             fs::write(&window_auth, b"{\"tokens\":\"window\"}").unwrap();
             fs::write(source.join(AUTH_FILE), b"{\"tokens\":\"user\"}").unwrap();
@@ -1337,7 +1390,7 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
             )
             .unwrap();
             // Whatever an older spawnd left there goes too.
-            fs::create_dir_all(&fixture.codex_home).unwrap();
+            made_by_an_earlier_start(&fixture);
             fs::write(fixture.codex_home.join(AUTH_FILE), b"{\"stale\":1}").unwrap();
             let outcomes = apply(&fixture, &fixture.source.clone());
             assert_eq!(
@@ -1357,7 +1410,7 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
     #[test]
     fn a_hard_link_to_an_earlier_source_is_relinked_to_the_new_one() {
         let fixture = fixture();
-        fs::create_dir_all(&fixture.codex_home).unwrap();
+        made_by_an_earlier_start(&fixture);
         let earlier = fixture.source.parent().unwrap().join("earlier-codex");
         fs::create_dir_all(&earlier).unwrap();
         fs::write(earlier.join(AUTH_FILE), b"{\"slot\":\"a\"}").unwrap();
@@ -1382,7 +1435,7 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
     #[test]
     fn the_config_replaces_a_link_rather_than_writing_through_it() {
         let fixture = fixture();
-        fs::create_dir_all(&fixture.codex_home).unwrap();
+        made_by_an_earlier_start(&fixture);
         let elsewhere = fixture.source.join("config.toml");
         fs::write(&elsewhere, "model = \"mine\"\n").unwrap();
         std::os::unix::fs::symlink(&elsewhere, fixture.codex_home.join("config.toml")).unwrap();

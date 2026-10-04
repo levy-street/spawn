@@ -1912,7 +1912,9 @@ mod tests {
     async fn codex_rollouts_a_window_kept_in_its_own_codex_home_are_found_too() {
         let temp = tempfile::tempdir().unwrap();
         let home = home(&temp).await;
-        let homes = home.join(".config/spawn/sessions");
+        // `searched` names folders the way the wire carries every path, in
+        // the host's own form: one component at a time, so `\` on Windows.
+        let homes = home.join(".config").join("spawn").join("sessions");
         let id = "01a0aec5-82ea-79e1-a933-49b8049810ca";
         let window = homes.join("2b1c5b7e-0000-4000-8000-000000000001");
         write(
@@ -1933,7 +1935,10 @@ mod tests {
         assert_eq!(
             report.searched,
             vec![
-                home.join(".codex/sessions").to_string_lossy().into_owned(),
+                home.join(".codex")
+                    .join("sessions")
+                    .to_string_lossy()
+                    .into_owned(),
                 homes.to_string_lossy().into_owned(),
             ]
         );
