@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import {
   agentLaunchCommand,
   agentResumeCommand,
+  canonicalConversationId,
   composeMoveNote,
   type MoveNoteFacts,
   type MoveNoteHost,
@@ -43,14 +44,21 @@ interface RelaunchCase {
 }
 
 interface Vectors {
-  limits: { longest_note_code_points: number };
+  limits: { longest_note_code_points: number; positional_line_bytes: number };
   shells: { login_shell: string | null; family: ShellFamily }[];
+  conversation_ids: { id: string | null; canonical: string | null }[];
   quoting: { family: ShellFamily; value: string; quoted: string }[];
   host_names: { name: string; shown: string }[];
   os: { os: string | null; shown: string | null }[];
   paths: { path: string | null; shown: string | null }[];
   notes: { name: string; facts: RawFacts; note: string }[];
-  delivery: { agent_kind: string; shell: string | null; state: string; delivery: NoteDelivery }[];
+  delivery: {
+    agent_kind: string;
+    shell: string | null;
+    state: string;
+    os: string | null;
+    delivery: NoteDelivery;
+  }[];
   relaunch: RelaunchCase[];
 }
 
@@ -73,6 +81,13 @@ describe("proto/agent-note-vectors.json", () => {
     "login shell %s",
     (_, entry) => {
       expect(shellFamily(entry.login_shell)).toBe(entry.family);
+    },
+  );
+
+  test.each(vectors.conversation_ids.map((entry) => [JSON.stringify(entry.id), entry] as const))(
+    "conversation id %s",
+    (_, entry) => {
+      expect(canonicalConversationId(entry.id)).toBe(entry.canonical);
     },
   );
 
@@ -109,7 +124,7 @@ describe("proto/agent-note-vectors.json", () => {
     for (const entry of vectors.delivery) {
       expect({
         ...entry,
-        delivery: noteDelivery(entry.agent_kind, shellFamily(entry.shell), entry.state),
+        delivery: noteDelivery(entry.agent_kind, shellFamily(entry.shell), entry.state, entry.os),
       }).toEqual(entry);
     }
   });
@@ -128,10 +143,85 @@ describe("proto/agent-note-vectors.json", () => {
       ).toEqual(entry.plan);
     },
   );
+});
 
-  test("no note is longer than the vectors' longest", () => {
-    const longest = Math.max(...vectors.notes.map((entry) => Array.from(entry.note).length));
-    expect(longest).toBe(vectors.limits.longest_note_code_points);
+const ID = "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60";
+const claude: RelaunchAgent = { kind: "claude-code", command: "claude", env: {} };
+const agents: RelaunchAgent[] = [
+  claude,
+  { ...claude, yolo: true, yolo_args: "--dangerously-skip-permissions" },
+  { kind: "codex", command: "codex", env: {} },
+];
+const running: MoveNoteFacts = {
+  from: { name: "dream", os: "linux" },
+  to: { name: "mac", os: "darwin" },
+  cwd: "~/code/spawn",
+  state: "running",
+};
+
+describe("the module's own bounds", () => {
+  test("no note is longer than the limit, which the longest possible note reaches", () => {
+    const limit = vectors.limits.longest_note_code_points;
+    const lengths: number[] = [];
+    for (const from of ["linux", "darwin", "windows", null]) {
+      for (const to of ["linux", "darwin", "windows", null]) {
+        for (const state of ["running", "blocked", "idle"]) {
+          const note = composeMoveNote({
+            from: { name: "a".repeat(60), os: from },
+            to: { name: "b".repeat(60), os: to },
+            cwd: `/${"c".repeat(159)}`,
+            memoryPath: `/${"m".repeat(159)}`,
+            state,
+          });
+          lengths.push(Array.from(note).length);
+        }
+      }
+    }
+    expect(Math.max(...lengths)).toBe(limit);
+    for (const entry of vectors.notes) {
+      expect(Array.from(entry.note).length).toBeLessThanOrEqual(limit);
+    }
+  });
+
+  test("a note rides the line only within the line's byte budget", () => {
+    const budget = vectors.limits.positional_line_bytes;
+    const seen = new Set<NoteDelivery>();
+    for (let length = 0; length <= 150; length += 1) {
+      const result = planRelaunch({
+        agent: claude,
+        conversation: { resume: ID },
+        permissionMode: "default",
+        shell: "/bin/zsh",
+        note: { ...running, cwd: `~/${"é".repeat(length)}`, memoryPath: `/${"m".repeat(150)}` },
+      });
+      const delivery = result?.note?.delivery;
+      if (delivery) seen.add(delivery);
+      if (delivery === "positional") {
+        expect(new TextEncoder().encode(result?.line).length).toBeLessThanOrEqual(budget);
+      } else {
+        expect(result?.line).toBe(`claude --resume ${ID} --permission-mode default`);
+      }
+    }
+    expect([...seen].sort()).toEqual(["positional", "typed"]);
+  });
+
+  test("an id that is not a canonical UUID is never typed: it is no id at all", () => {
+    const rejected = vectors.conversation_ids.filter((entry) => entry.canonical === null);
+    expect(rejected.map((entry) => entry.id)).toContain("--dangerously-skip-permissions");
+    for (const { id } of rejected) {
+      for (const agent of agents) {
+        for (const shell of [null, "/bin/bash", "fish", "pwsh"]) {
+          for (const permissionMode of [null, "default"]) {
+            for (const note of [null, running]) {
+              const ask = (conversation: RelaunchConversation) =>
+                planRelaunch({ agent, conversation, permissionMode, shell, note });
+              expect(ask({ resume: id })).toEqual(ask({ resume: null }));
+              expect(ask({ start: id })).toEqual(ask({ start: null }));
+            }
+          }
+        }
+      }
+    }
   });
 });
 

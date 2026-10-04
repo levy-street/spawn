@@ -38,20 +38,23 @@ export interface RelaunchAgent extends AgentYolo {
 /**
  * The shells a line is spelled for, by the login shell the target reports.
  * A note rides the line as the agent's first prompt only in the first three.
- * Every other line is spelled as for a POSIX shell — what every line was
- * before a target could say which shell it runs — and its note is typed into
- * the agent once the agent is ready.
+ * ksh is spelled as POSIX, but its note is typed: interactive ksh93 garbles
+ * a long line that holds multibyte characters as it is typed at the prompt,
+ * and its quoting with it, though it reads the same line back exactly under
+ * `-c`. Every other line is spelled as for a POSIX shell — what every line
+ * was before a target could say which shell it runs — and its note is typed
+ * into the agent once the agent is ready.
  */
-export type ShellFamily = "posix" | "fish" | "pwsh" | "cmd" | "nushell" | "unknown";
+export type ShellFamily = "posix" | "fish" | "pwsh" | "ksh" | "cmd" | "nushell" | "unknown";
 
 const SHELL_FAMILIES: ReadonlyMap<string, ShellFamily> = new Map<string, ShellFamily>([
   ["sh", "posix"],
   ["bash", "posix"],
   ["zsh", "posix"],
   ["dash", "posix"],
-  ["ksh", "posix"],
   ["mksh", "posix"],
   ["ash", "posix"],
+  ["ksh", "ksh"],
   ["fish", "fish"],
   ["pwsh", "pwsh"],
   ["powershell", "pwsh"],
@@ -73,7 +76,9 @@ export function shellFamily(loginShell: string | null | undefined): ShellFamily 
   return SHELL_FAMILIES.get(bare) ?? "unknown";
 }
 
-/** Whether a note can ride the line, quoted, as the agent's first prompt. */
+/** Whether a note can ride the line, quoted, as the agent's first prompt:
+ *  only in a shell whose quoting has been seen to hold when the line is typed
+ *  at its interactive prompt, which is how a device delivers it. */
 function quotesNotes(family: ShellFamily): boolean {
   return family === "posix" || family === "fish" || family === "pwsh";
 }
@@ -246,9 +251,28 @@ export function agentCanResume(kind: string | null | undefined): boolean {
   return Boolean(grammar && (grammar.resume || grammar.continueLatest));
 }
 
+/** A conversation id as Claude Code and Codex write one: a UUID, lower-case
+ *  and hyphenated. */
+const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The id a line may name, or null. The id comes from the server's record or
+ * a host's answer, and a CLI reads a word that starts with `-` as one of its
+ * own options: `--resume --dangerously-skip-permissions` would turn on the
+ * very mode an explicit `--permission-mode` is there to rule out. So only a
+ * canonical UUID ever reaches a line; anything else — a flag, a path, `..`,
+ * an upper-case or braced UUID, a word with spaces or quotes — is no id at
+ * all, and the line reopens the latest conversation in the folder or starts
+ * one the CLI names itself.
+ */
+export function canonicalConversationId(id: string | null | undefined): string | null {
+  return typeof id === "string" && CONVERSATION_ID.test(id) ? id : null;
+}
+
 /** What the agent comes back as: a conversation reopened — this one, or the
- *  latest one in the folder when there is none (null or empty) — or a fresh
- *  one started, under this id where the CLI takes one. */
+ *  latest one in the folder when there is none (null, empty, or anything but
+ *  a canonical UUID) — or a fresh one started, under this id where the CLI
+ *  takes one and the id is a canonical UUID. */
 export type RelaunchConversation = { resume: string | null } | { start: string | null };
 
 export interface RelaunchLineOptions {
@@ -266,7 +290,8 @@ export interface RelaunchLineOptions {
  * asked: a conversation to reopen for a CLI SPAWN D cannot resume, a
  * permission mode the CLI has no flag or no such mode for, a prompt the CLI
  * or the shell cannot take on the command line. Nothing asked for is ever
- * silently left off.
+ * silently left off, with one exception that is the point: an id that is
+ * not a canonical UUID is never typed (`canonicalConversationId`).
  */
 export function relaunchLine(
   agent: RelaunchAgent,
@@ -283,17 +308,14 @@ export function relaunchLine(
   if (prompt !== null && !(grammar?.positionalPrompt && quotesNotes(shell))) return null;
   const words = [runCommand(agent, spelling, mode === null)];
   if ("start" in conversation) {
-    if (conversation.start && grammar?.launch) {
-      words.push(`${grammar.launch} ${shellQuote(conversation.start, spelling)}`);
-    }
-  } else if (!grammar) {
-    return null;
-  } else if (conversation.resume && grammar.resume) {
-    words.push(`${grammar.resume} ${shellQuote(conversation.resume, spelling)}`);
-  } else if (grammar.continueLatest) {
-    words.push(grammar.continueLatest);
+    const id = canonicalConversationId(conversation.start);
+    if (id && grammar?.launch) words.push(`${grammar.launch} ${shellQuote(id, spelling)}`);
   } else {
-    return null;
+    if (!grammar) return null;
+    const id = canonicalConversationId(conversation.resume);
+    if (id && grammar.resume) words.push(`${grammar.resume} ${shellQuote(id, spelling)}`);
+    else if (grammar.continueLatest) words.push(grammar.continueLatest);
+    else return null;
   }
   if (mode !== null && grammar?.permissionMode) {
     words.push(`${grammar.permissionMode.flag} ${shellQuote(mode, spelling)}`);
@@ -329,8 +351,10 @@ export function agentResumeCommand(
 const NAME_LIMIT = 40;
 const PATH_LIMIT = 160;
 /** The only ASCII a host name keeps in a note. A name comes from the
- *  server's row, and the note speaks with SPAWN D's voice, so it carries
- *  words and nothing a shell or a reader would act on. */
+ *  server's row and the note speaks with SPAWN D's voice, so it keeps no
+ *  shell syntax, no markup, no quotes and no slash. It can still say a few
+ *  words of its own, up to 40 code points of them: the name is the server's
+ *  word, not the host's, until names travel end to end. */
 const NAME_ASCII = /^[A-Za-z0-9 ._()-]$/;
 
 /** Characters that space words apart: each is one plain space in a name. */
@@ -352,28 +376,39 @@ function spacing(cp: number): boolean {
 
 /**
  * Characters a reader cannot see or that steer a terminal or a line editor:
- * controls, bidirectional and zero-width formatting, lone surrogates,
- * variation selectors and tag characters (which can spell text no one sees),
- * private use and noncharacters. Spelled as ranges rather than Unicode
- * properties so every JavaScript engine draws the same line.
+ * controls; line and paragraph separators; every Default_Ignorable code
+ * point of Unicode 15 (soft hyphen, combining grapheme joiner, Hangul and
+ * Khmer fillers, Mongolian variation selectors, zero-width and
+ * bidirectional formatting, variation selectors, tag characters — which can
+ * spell text no one sees — shorthand and musical format controls); lone
+ * surrogates, the interlinear annotation controls, private use and
+ * noncharacters. Spelled as ranges rather than Unicode properties so every
+ * JavaScript engine draws the same line.
  */
 function invisible(cp: number): boolean {
   return (
     cp <= 0x1f ||
     (cp >= 0x7f && cp <= 0x9f) ||
     cp === 0xad ||
+    cp === 0x34f ||
     cp === 0x61c ||
-    cp === 0x180e ||
-    cp === 0xfeff ||
+    (cp >= 0x115f && cp <= 0x1160) ||
+    (cp >= 0x17b4 && cp <= 0x17b5) ||
+    (cp >= 0x180b && cp <= 0x180f) ||
     (cp >= 0x200b && cp <= 0x200f) ||
     (cp >= 0x2028 && cp <= 0x202e) ||
     (cp >= 0x2060 && cp <= 0x206f) ||
+    cp === 0x3164 ||
     (cp >= 0xd800 && cp <= 0xdfff) ||
     (cp >= 0xe000 && cp <= 0xf8ff) ||
     (cp >= 0xfdd0 && cp <= 0xfdef) ||
     (cp >= 0xfe00 && cp <= 0xfe0f) ||
-    (cp >= 0xfff9 && cp <= 0xfffb) ||
+    cp === 0xfeff ||
+    cp === 0xffa0 ||
+    (cp >= 0xfff0 && cp <= 0xfffb) ||
     (cp & 0xfffe) === 0xfffe ||
+    (cp >= 0x1bca0 && cp <= 0x1bca3) ||
+    (cp >= 0x1d173 && cp <= 0x1d17a) ||
     (cp >= 0xe0000 && cp <= 0xe0fff) ||
     cp >= 0xf0000
   );
@@ -499,25 +534,55 @@ export type NoteDelivery = "positional" | "typed" | "typed_no_enter";
 
 /**
  * Mid-turn, the note is the agent's first prompt where the CLI takes one on
- * its command line and the shell's quoting is one SPAWN D knows; elsewhere it
- * is typed and sent. Idle, it is typed and never sent: an idle agent would
- * otherwise spend a whole turn answering a note no one asked it about.
+ * its command line, the shell's quoting is one SPAWN D has seen hold at its
+ * prompt, and the target (`os`, from the server's row) is Linux or macOS;
+ * elsewhere it is typed and sent. On Windows the line can reach the agent
+ * through npm's `.cmd` shim, and cmd rewrites `%NAME%` even inside quotes, so
+ * until a Windows target is proven (spike S5) its note is typed, and so is a
+ * note for a host whose OS no one named. Idle, it is typed and never sent:
+ * an idle agent would otherwise spend a whole turn answering a note no one
+ * asked it about.
  */
 export function noteDelivery(
   agentKind: string | null | undefined,
   family: ShellFamily,
   state: string | null | undefined,
+  os: string | null | undefined,
 ): NoteDelivery {
   if (!midTurn(state)) return "typed_no_enter";
-  return agentConversationGrammar(agentKind)?.positionalPrompt && quotesNotes(family)
+  const target = noteOs(os);
+  return agentConversationGrammar(agentKind)?.positionalPrompt &&
+    quotesNotes(family) &&
+    (target === "Linux" || target === "macOS")
     ? "positional"
     : "typed";
+}
+
+/**
+ * The longest line a note may ride, in UTF-8 bytes. A device types the line
+ * the moment the fresh shell's transport opens, often before the shell's line
+ * editor has taken the terminal, so the line can wait in the kernel's
+ * canonical-mode buffer — 1,024 bytes on macOS (MAX_INPUT), where anything
+ * past it, Enter included, is dropped and the line never runs. busybox's
+ * line editor stops at 1,024 bytes too. Past this budget the note is typed
+ * into the agent instead.
+ */
+const POSITIONAL_LINE_BYTES = 900;
+
+function utf8Bytes(text: string): number {
+  let bytes = 0;
+  for (const char of text) {
+    const cp = char.codePointAt(0) ?? 0;
+    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  }
+  return bytes;
 }
 
 export interface RelaunchRequest {
   agent: RelaunchAgent;
   conversation: RelaunchConversation;
-  /** The permission mode the agent starts in; none keeps today's line. */
+  /** The permission mode the agent starts in; none keeps today's line, and
+   *  is refused with a note. */
   permissionMode?: string | null | undefined;
   /** The target's login shell as its daemon reported it; null when it did
    *  not say, which spells the line as for POSIX and types any note. */
@@ -533,18 +598,28 @@ export interface RelaunchPlan {
   note: { text: string; delivery: NoteDelivery } | null;
 }
 
-/** Everything a relaunch types, or null when the line cannot be said as
- *  asked (`relaunchLine`). */
+/**
+ * Everything a relaunch types, or null when the line cannot be said as asked
+ * (`relaunchLine`). A note says the conversation was carried here, and a
+ * carried conversation starts in the mode the Operator chose on this host,
+ * never the one its record carries: a note without a permission mode has no
+ * line, which is why Codex, with no mode to state until Codex carry, gets
+ * none. A note that would take the line past its byte budget is typed.
+ */
 export function planRelaunch(request: RelaunchRequest): RelaunchPlan | null {
   const family = shellFamily(request.shell);
   const facts = request.note ?? null;
+  const permissionMode = request.permissionMode ?? null;
+  if (facts && permissionMode === null) return null;
   const text = facts ? composeMoveNote(facts) : null;
-  const delivery = facts ? noteDelivery(request.agent.kind, family, facts.state) : null;
-  const line = relaunchLine(request.agent, request.conversation, {
-    shell: family,
-    permissionMode: request.permissionMode ?? null,
-    prompt: delivery === "positional" ? text : null,
-  });
+  let delivery = facts ? noteDelivery(request.agent.kind, family, facts.state, facts.to.os) : null;
+  const compose = (prompt: string | null) =>
+    relaunchLine(request.agent, request.conversation, { shell: family, permissionMode, prompt });
+  let line = compose(delivery === "positional" ? text : null);
+  if (line !== null && delivery === "positional" && utf8Bytes(line) > POSITIONAL_LINE_BYTES) {
+    delivery = "typed";
+    line = compose(null);
+  }
   if (line === null) return null;
   return { line, note: text !== null && delivery !== null ? { text, delivery } : null };
 }
