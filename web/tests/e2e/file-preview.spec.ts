@@ -32,6 +32,12 @@ function row(page: import("@playwright/test").Page, name: string) {
   return page.getByRole("treeitem").filter({ hasText: name }).first();
 }
 
+// These are about previews, not views: the hosts page opens in its Tree view,
+// where a single click on a file opens it, as it always has.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem("spawn.files.view.page", "tree"));
+});
+
 /** The card opens over the right of the list, so a row is hovered by its
  *  left edge — the part of it the card never covers. */
 const LEFT_EDGE = { position: { x: 40, y: 14 } };
@@ -102,18 +108,22 @@ test("next and previous step between files and skip folders", async ({ page }) =
   await mockApp(page, { files: previewFiles, fileRead: fileBytes });
   await page.goto(`/hosts/${HOST_ID}/files`);
 
-  await row(page, "logo.svg").click();
+  // Folders sort first, so the first file sits under "assets" — which the
+  // viewer must step over rather than into.
+  await row(page, "huge.txt").click();
   const dialog = page.getByRole("dialog");
   // The viewer names the file twice — title bar and footer path — so pin the
   // heading rather than any text match.
-  await expect(dialog.getByRole("heading", { name: "logo.svg" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "huge.txt" })).toBeVisible();
+  // First file: there is nothing before it, though a folder is.
+  await expect(dialog.getByRole("button", { name: "Previous file" })).toBeDisabled();
 
+  await dialog.getByRole("button", { name: "Next file" }).click();
+  await expect(dialog.getByRole("heading", { name: "logo.svg" })).toBeVisible();
   await dialog.getByRole("button", { name: "Next file" }).click();
   await expect(dialog.getByRole("heading", { name: "notes.txt" })).toBeVisible();
   await dialog.getByRole("button", { name: "Previous file" }).click();
   await expect(dialog.getByRole("heading", { name: "logo.svg" })).toBeVisible();
-  // First file: there is nothing before it.
-  await expect(dialog.getByRole("button", { name: "Previous file" })).toBeDisabled();
 });
 
 test("a capable host offers reveal and open, and calls them with the right path", async ({

@@ -2,10 +2,10 @@
 
 import { Download, ExternalLink, Loader2 } from "lucide-react";
 import { type ComponentType, type ReactNode, useEffect, useMemo, useState } from "react";
-import { formatSize } from "@/components/files/FileExplorer";
 import { FileIcon } from "@/components/files/file-icon";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { formatSize } from "@/lib/files/format";
 import type { HostDirEntry } from "@/lib/hostControl";
 import { tokenizeCode } from "@/lib/preview/code-tokenize";
 import type { CodeLanguage, FileTypeInfo } from "@/lib/preview/file-kinds";

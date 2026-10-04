@@ -142,3 +142,137 @@ export function appleArrowBytes(event: Chord): string | null {
   if (event.key === "ArrowRight") return "\x05";
   return null;
 }
+
+/**
+ * What a press means inside a file browser, or null to leave it alone.
+ *
+ * The map is Finder's on a Mac and Explorer's elsewhere, with two rules that
+ * keep it from ever taking a key that is somebody else's:
+ *
+ * - No ⌥/Alt+anything. ⌥/Alt+Arrow is the grid's (see `gridShortcut`), Alt
+ *   with a letter is a menu accelerator or, on Windows, AltGr typing a
+ *   character — matching on `key` with Alt down would turn a German `[` into
+ *   "Back". The one exception is ⌥⌘⌫, Finder's own "delete immediately".
+ * - Nothing while a text field has the key (`textHasKey`): a rename box or
+ *   the filter is typing, not navigating.
+ *
+ * Browser-reserved chords (⌘N, ⌘T, ⌘W, Ctrl+N, Ctrl+Shift+N…) are never
+ * bound; New folder takes ⇧⌘N / Ctrl+Shift+N only inside the desktop app,
+ * which has no tabs to open. Back and Forward are ⌘[ ⌘] / Ctrl+[ Ctrl+],
+ * never Alt+Arrow.
+ *
+ * Return renames on a Mac, as in Finder and VS Code; Enter opens elsewhere,
+ * as in Explorer. Delete permanently is the only delete there is until a host
+ * can move things to its Trash, so every delete chord asks first.
+ */
+export type ExplorerShortcut =
+  | {
+      kind: "move";
+      to: "prev" | "next" | "first" | "last" | "pageUp" | "pageDown";
+      /** Shift: extend the selection from its anchor. */
+      extend: boolean;
+      /** Ctrl+Arrow (not on a Mac): move the focus and leave the selection. */
+      keep: boolean;
+    }
+  | { kind: "expand" }
+  | { kind: "collapse" }
+  | { kind: "open" }
+  | { kind: "rename" }
+  | { kind: "up" }
+  | { kind: "back" }
+  | { kind: "forward" }
+  | { kind: "selectAll" }
+  | { kind: "toggleSelected" }
+  | { kind: "peek" }
+  | { kind: "delete" }
+  | { kind: "toggleHidden" }
+  | { kind: "filter" }
+  | { kind: "goToFolder" }
+  | { kind: "details" }
+  | { kind: "newFolder" }
+  | { kind: "escape" }
+  | { kind: "typeAhead"; text: string };
+
+export function explorerShortcut(
+  event: Chord,
+  options: { apple: boolean; textHasKey: boolean; desktopShell?: boolean },
+): ExplorerShortcut | null {
+  if (options.textHasKey) return null;
+  const { key, shiftKey: shift } = event;
+  const { apple } = options;
+  if (event.altKey) {
+    if (apple && event.metaKey && !event.ctrlKey && key === "Backspace") return { kind: "delete" };
+    return null;
+  }
+  // The platform's command key, alone of the two: ⌘ on a Mac, Ctrl elsewhere.
+  const command = apple ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  const bare = !event.ctrlKey && !event.metaKey;
+  const letter = key.length === 1 ? key.toLowerCase() : "";
+
+  const move = (to: Extract<ExplorerShortcut, { kind: "move" }>["to"]): ExplorerShortcut => ({
+    kind: "move",
+    to,
+    extend: shift,
+    keep: false,
+  });
+
+  switch (key) {
+    case "ArrowUp":
+      if (bare) return move("prev");
+      if (command && apple && !shift) return { kind: "up" };
+      if (command && !apple) return { kind: "move", to: "prev", extend: shift, keep: !shift };
+      return null;
+    case "ArrowDown":
+      if (bare) return move("next");
+      if (command && apple && !shift) return { kind: "open" };
+      if (command && !apple) return { kind: "move", to: "next", extend: shift, keep: !shift };
+      return null;
+    case "ArrowLeft":
+      return bare && !shift ? { kind: "collapse" } : null;
+    case "ArrowRight":
+      return bare && !shift ? { kind: "expand" } : null;
+    case "Home":
+      return bare ? move("first") : null;
+    case "End":
+      return bare ? move("last") : null;
+    case "PageUp":
+      return bare ? move("pageUp") : null;
+    case "PageDown":
+      return bare ? move("pageDown") : null;
+    case "Enter":
+      if (!bare || shift) return null;
+      return apple ? { kind: "rename" } : { kind: "open" };
+    case "F2":
+      return bare && !shift ? { kind: "rename" } : null;
+    case "Escape":
+      return bare ? { kind: "escape" } : null;
+    case "Backspace":
+      if (apple) return command && !shift ? { kind: "delete" } : null;
+      return bare && !shift ? { kind: "up" } : null;
+    case "Delete":
+      return bare ? { kind: "delete" } : null;
+    case " ":
+      if (bare && !shift) return { kind: "peek" };
+      if (!apple && command && !shift) return { kind: "toggleSelected" };
+      return null;
+  }
+
+  if (command) {
+    if (letter === "a" && !shift) return { kind: "selectAll" };
+    if (letter === "o" && apple && !shift) return { kind: "open" };
+    if (key === "[" && !shift) return { kind: "back" };
+    if (key === "]" && !shift) return { kind: "forward" };
+    if (letter === "f" && !shift) return { kind: "filter" };
+    if (letter === "g" && shift) return { kind: "goToFolder" };
+    if (letter === "i" && !shift) return { kind: "details" };
+    // ⇧⌘. is Finder's; Shift turns "." into ">" on most layouts.
+    if (apple && shift && (key === "." || key === ">")) return { kind: "toggleHidden" };
+    if (!apple && letter === "h" && !shift) return { kind: "toggleHidden" };
+    if (letter === "n" && shift && options.desktopShell) return { kind: "newFolder" };
+    return null;
+  }
+
+  // Type-ahead: one printable character, Shift allowed for capitals.
+  if (bare && [...key].length === 1 && key.trim() !== "") return { kind: "typeAhead", text: key };
+  return null;
+}

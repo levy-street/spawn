@@ -3,10 +3,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft } from "lucide-react";
 import Link from "next/link";
-import { useParams, useSearchParams } from "next/navigation";
+import { useParams } from "next/navigation";
 import { Suspense } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
-import { FileExplorer } from "@/components/files/FileExplorer";
+import { HostFilesBrowser } from "@/components/files/host-files-browser";
 import { AppShell } from "@/components/nav/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,7 +15,8 @@ import { hosts } from "@/lib/api";
 export default function HostFilesPage() {
   return (
     <AuthGate>
-      <AppShell>
+      {/* The browser scrolls its own list, so the page is exactly one screen tall. */}
+      <AppShell mainClassName="overflow-hidden !pb-0">
         <Suspense fallback={null}>
           <HostFiles />
         </Suspense>
@@ -27,8 +28,6 @@ export default function HostFilesPage() {
 function HostFiles() {
   const params = useParams<{ id: string }>();
   const id = params?.id;
-  const searchParams = useSearchParams();
-  const initialPath = searchParams?.get("path") ?? undefined;
 
   const hostQ = useQuery({
     queryKey: ["host", id],
@@ -40,8 +39,8 @@ function HostFiles() {
   if (!id) return null;
 
   return (
-    <div className="mx-auto flex h-full w-full max-w-3xl flex-col p-4 @md/shell:p-6">
-      <header className="mb-3 flex shrink-0 items-center gap-2">
+    <div className="flex h-[calc(var(--vv-height)-3rem)] w-full flex-col p-2 @md/shell:h-[calc(var(--vv-height)-2*var(--content-inset))] @md/shell:p-4">
+      <header className="mb-2 flex shrink-0 items-center gap-2">
         <Button
           asChild
           variant="ghost"
@@ -64,11 +63,11 @@ function HostFiles() {
           ))}
       </header>
 
-      <FileExplorer
+      {/* Where it opens — never from or into the URL — is the browser's own business. */}
+      <HostFilesBrowser
+        key={id}
         hostId={id}
-        rootLabel={host ? `${host.name} · ~` : "~"}
-        initialPath={initialPath}
-        className="min-h-0 flex-1 overflow-hidden rounded-xl border border-border"
+        className="overflow-hidden rounded-xl border border-border"
       />
     </div>
   );

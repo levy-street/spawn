@@ -14,6 +14,11 @@ export interface NameDialogProps {
   initialValue?: string;
   pending?: boolean;
   pathFlavor?: PathFlavor;
+  /**
+   * The host's refusal of the name last sent. It is shown here, where the name
+   * was typed, for as long as the field still says that name.
+   */
+  error?: string | null;
   onDismiss: () => void;
   onConfirm: (name: string) => void;
 }
@@ -25,15 +30,25 @@ export function NameDialog({
   initialValue = "",
   pending = false,
   pathFlavor = "posix",
+  error: hostError = null,
   onDismiss,
   onConfirm,
 }: NameDialogProps) {
   const [value, setValue] = useState(initialValue);
+  const [submitted, setSubmitted] = useState<string | null>(null);
   const error = validateLeafName(value, pathFlavor);
   const confirmedValue = pathFlavor === "windows" ? value : value.trim();
   useEffect(() => {
-    if (visible) setValue(initialValue);
+    if (!visible) return;
+    setValue(initialValue);
+    setSubmitted(null);
   }, [initialValue, visible]);
+  const submit = () => {
+    if (error || pending) return;
+    setSubmitted(value);
+    onConfirm(confirmedValue);
+  };
+  const message = error ?? (hostError && submitted === value ? hostError : null);
   return (
     <Dialog
       footer={
@@ -41,12 +56,7 @@ export function NameDialog({
           <Button disabled={pending} onPress={onDismiss} size="sm" variant="outline">
             Cancel
           </Button>
-          <Button
-            disabled={error !== null}
-            loading={pending}
-            onPress={() => onConfirm(confirmedValue)}
-            size="sm"
-          >
+          <Button disabled={error !== null} loading={pending} onPress={submit} size="sm">
             {confirmLabel}
           </Button>
         </>
@@ -63,16 +73,14 @@ export function NameDialog({
           autoCorrect={false}
           autoFocus
           onChangeText={setValue}
-          onSubmitEditing={() => {
-            if (!error && !pending) onConfirm(confirmedValue);
-          }}
+          onSubmitEditing={submit}
           placeholder="Name"
           returnKeyType="done"
           value={value}
         />
-        {error ? (
-          <Text color="destructive" variant="caption">
-            {error}
+        {message ? (
+          <Text accessibilityLiveRegion="polite" color="destructive" variant="caption">
+            {message}
           </Text>
         ) : null}
       </View>

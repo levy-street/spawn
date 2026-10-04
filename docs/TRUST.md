@@ -195,6 +195,7 @@ on a host it no longer owns.
 | Skill bodies | current: persisted in `skills`; carried in `session.create` / `session.restart` | endpoint-local replacement is not implemented |
 | ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
 | Host paths, directory entry names/sizes/mtimes, reads, writes, and detailed operation errors | former REST host-file routes plus `host.fs.*` frames | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source uses `spawn.host.ctl` only |
+| The folder a browser's file explorer is showing | current: in page memory and the tab's own `history.state`; in-app links hand the folder over in memory; an inbound `?path=` link (a phone's universal link) is read once and dropped from the address | never written into a URL by the web app, so never in server or Next request logs, prefetch/RSC requests, browser history or a Referer |
 | Host file previews (rendered thumbnails, decoded head slices) | current: `spawn.host.ctl` `fs.preview` / `fs.read.range` only | never server-visible; held in memory for the session, never written to disk, never logged |
 | Host desktop launches (`desktop.reveal`, `desktop.open`) | current: `spawn.host.ctl` only; the daemon records the operation name locally in `activity.rs` and never the path | never server-visible |
 | Cross-host file transfer | former server source-read/forward path | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source is browser-mediated across two host channels |

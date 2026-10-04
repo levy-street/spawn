@@ -52,12 +52,32 @@ export const DropdownMenu = forwardRef<
     side?: Side;
     className?: string;
     menuClassName?: string;
+    /**
+     * Told when the menu opens and closes — and that it closed, if it is
+     * unmounted while open — for a surface that must hold still meanwhile.
+     */
+    onOpenChange?: (open: boolean) => void;
   }
 >(function DropdownMenu(
-  { renderTrigger, children, align = "end", side = "bottom", className, menuClassName },
+  {
+    renderTrigger,
+    children,
+    align = "end",
+    side = "bottom",
+    className,
+    menuClassName,
+    onOpenChange,
+  },
   ref,
 ) {
   const [open, setOpen] = useState(false);
+  const onOpenChangeRef = useRef(onOpenChange);
+  onOpenChangeRef.current = onOpenChange;
+  useEffect(() => {
+    if (!open) return;
+    onOpenChangeRef.current?.(true);
+    return () => onOpenChangeRef.current?.(false);
+  }, [open]);
   const [coords, setCoords] = useState<MenuPlacement | null>(null);
   // When opened via openAt (right-click), position at this viewport point
   // instead of anchoring to the trigger.

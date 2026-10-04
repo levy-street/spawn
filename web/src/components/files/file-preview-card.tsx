@@ -1,7 +1,6 @@
 "use client";
 
 import { Loader2, Maximize2 } from "lucide-react";
-import { formatSize } from "@/components/files/FileExplorer";
 import { FileIcon } from "@/components/files/file-icon";
 import { PREVIEW_CARD_WIDTH_PX } from "@/components/files/preview-placement";
 import {
@@ -12,6 +11,7 @@ import {
   previewErrorNote,
 } from "@/components/files/preview-renderers";
 import { usePreview } from "@/components/files/use-preview";
+import { formatSize } from "@/lib/files/format";
 import type { HostControlClient, HostDirEntry } from "@/lib/hostControl";
 import type { FileActionCapabilities } from "@/lib/preview/capabilities";
 import { isTextKind } from "@/lib/preview/file-kinds";

@@ -1,5 +1,3 @@
-import type { HostDirEntry } from "@/components/files/types";
-
 export type PathFlavor = "posix" | "windows";
 
 interface WindowsRoot {
@@ -187,11 +185,74 @@ export function breadcrumbParts(
   return crumbs;
 }
 
-export function visibleEntries(
-  entries: readonly HostDirEntry[],
-  showDotfiles: boolean,
-): HostDirEntry[] {
-  return entries.filter((entry) => showDotfiles || !entry.name.startsWith("."));
+/**
+ * A folder as a person reads it: "~/code/spawn" inside home, the host's own
+ * spelling outside it. Display only; requests always carry the full path.
+ */
+export function displayPath(path: string, homeDir: string, flavor: PathFlavor = "posix"): string {
+  const home = homeRoot(homeDir, flavor);
+  const current = trimTrailingSlash(normalizeAbsolutePath(path, flavor), flavor);
+  if (!isWithinHome(current, home, flavor)) return current;
+  if (pathEquals(current, home, flavor)) return "~";
+  const separator = flavor === "windows" ? "\\" : "/";
+  const relative = current
+    .slice(home.length)
+    .replace(flavor === "windows" ? /^[\\/]+/u : /^\/+/u, "");
+  return `~${separator}${relative}`;
+}
+
+export type FolderInput =
+  | { path: string; error?: undefined }
+  | { path?: undefined; error: "empty" | "outside_root" };
+
+function isAbsoluteInput(input: string, flavor: PathFlavor): boolean {
+  // A drive letter is never read from the folder on screen, even drive-relative
+  // ("C:Work"), which then fails the inside-home check rather than becoming a
+  // folder name; nor is a leading separator, which is the drive's root.
+  if (flavor === "windows") return /^(?:[A-Za-z]:|[\\/])/u.test(input);
+  return input.startsWith("/");
+}
+
+/**
+ * What "Go to folder" accepts, the same on web and phone: `~` and `~/…` from
+ * home, a full path, or a path relative to the folder on screen, as a shell
+ * reads one. `..` is resolved first, and the result must be inside home.
+ * Whether the folder exists is the host's to say.
+ */
+export function resolveFolderInput(
+  input: string,
+  { homeDir, cwd, flavor = "posix" }: { homeDir: string; cwd?: string; flavor?: PathFlavor },
+): FolderInput {
+  const typed = input.trim();
+  if (!typed) return { error: "empty" };
+  const home = homeRoot(homeDir, flavor);
+  const homeRelative = flavor === "windows" ? /^~(?:[\\/]|$)/u : /^~(?:\/|$)/u;
+  const candidate = homeRelative.test(typed)
+    ? joinDirectory(home, typed.slice(1), flavor)
+    : isAbsoluteInput(typed, flavor)
+      ? normalizeAbsolutePath(typed, flavor)
+      : joinDirectory(cwd || home, typed, flavor);
+  const resolved = trimTrailingSlash(candidate, flavor);
+  if (!isWithinHome(resolved, home, flavor)) return { error: "outside_root" };
+  return { path: resolved };
+}
+
+/**
+ * Where a link into the file browser lands: the folder it names, or home when
+ * it names somewhere outside home, which the browser then says it cannot open.
+ */
+export function resolveLinkedFolder(
+  path: string | null | undefined,
+  homeDir: string,
+  flavor: PathFlavor = "posix",
+): { folder: string; outsideHome: boolean } {
+  const folder = normalizeCwdForHost(path, homeDir, flavor);
+  if (!path || path === "~") return { folder, outsideHome: false };
+  const homeRelative = flavor === "windows" ? /^~[\\/]/u : /^~\//u;
+  const named = homeRelative.test(path)
+    ? joinDirectory(homeRoot(homeDir, flavor), path.slice(2), flavor)
+    : path;
+  return { folder, outsideHome: !isWithinHome(named, homeDir, flavor) };
 }
 
 export function validateLeafName(name: string, flavor: PathFlavor = "posix"): string | null {

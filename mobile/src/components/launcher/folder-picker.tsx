@@ -1,4 +1,3 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Pressable, ScrollView, StyleSheet, View } from "react-native";
 import {
@@ -27,11 +26,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
 import type { RecentDirOut } from "@/data/api/schemas/hosts";
+import { useFileViewOptions } from "@/data/stores/explorer-prefs";
 import { haptics } from "@/lib/haptics";
 import type { HostTransport, TransportState } from "@/terminal/transport/types";
 import { borderWidth, chrome, spacing, useTheme } from "@/theme";
-
-const SHOW_HIDDEN_STORAGE_KEY = "spawn.folderPicker.showHidden";
 
 export interface FolderPickerProps {
   transport: HostTransport | null;
@@ -59,20 +57,11 @@ export function FolderPicker({
   const [typedPath, setTypedPath] = useState("");
   const [entries, setEntries] = useState<HostDirEntry[]>([]);
   const [filter, setFilter] = useState("");
-  const [showHidden, setShowHidden] = useState(false);
+  // One switch on this device: the file browser's "Show hidden files" is this one too.
+  const { showHidden, setShowHidden } = useFileViewOptions();
   const [truncated, setTruncated] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    void AsyncStorage.getItem(SHOW_HIDDEN_STORAGE_KEY).then((value) => {
-      if (active) setShowHidden(value === "true");
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
 
   useEffect(() => {
     if (!transport || transportState !== "ready") return;
@@ -239,7 +228,6 @@ export function FolderPicker({
           accessibilityLabel="Show hidden folders"
           onValueChange={(next) => {
             setShowHidden(next);
-            void AsyncStorage.setItem(SHOW_HIDDEN_STORAGE_KEY, String(next));
           }}
           value={showHidden}
         />

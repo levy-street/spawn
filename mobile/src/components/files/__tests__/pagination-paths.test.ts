@@ -1,11 +1,8 @@
-import {
-  HOST_DIRECTORY_PAGE_ENTRIES,
-  retainDirectoryPages,
-  validateDirectoryPage,
-} from "@/components/files/pagination";
+import { HOST_DIRECTORY_PAGE_ENTRIES, validateDirectoryPage } from "@/components/files/pagination";
 import {
   basename,
   breadcrumbParts,
+  displayPath,
   isWithinHome,
   joinDirectory,
   normalizeAbsolutePath,
@@ -13,8 +10,9 @@ import {
   parentDir,
   parentWithinHome,
   pathFlavorForHostOS,
+  resolveFolderInput,
+  resolveLinkedFolder,
   validateLeafName,
-  visibleEntries,
 } from "@/components/files/paths";
 import type { HostDirEntry, HostDirList } from "@/components/files/types";
 
@@ -33,12 +31,6 @@ const page = (names: string[], next: number | null, truncated = false): HostDirL
 });
 
 describe("file pagination and paths", () => {
-  it("preserves daemon order across explicit pages", () => {
-    const result = retainDirectoryPages([page(["z", "a"], 2), page(["m"], null)]);
-    expect(result.entries.map(({ name }) => name)).toEqual(["z", "a", "m"]);
-    expect(result.nextCursor).toBeNull();
-  });
-
   it("rejects oversized pages and non-advancing cursors", () => {
     expect(() =>
       validateDirectoryPage(
@@ -50,12 +42,6 @@ describe("file pagination and paths", () => {
       ),
     ).toThrow("invalid directory page");
     expect(() => validateDirectoryPage(page(["a"], 4), 4)).toThrow("invalid directory page");
-  });
-
-  it("stops at the retained entry budget", () => {
-    const result = retainDirectoryPages([page(["a", "b", "c"], 3)], 2);
-    expect(result.entries.map(({ name }) => name)).toEqual(["a", "b"]);
-    expect(result.limitReached).toBe(true);
   });
 
   it("clamps paths to home and derives breadcrumbs", () => {
@@ -116,12 +102,6 @@ describe("file pagination and paths", () => {
     ]);
   });
 
-  it("supports an explicit dotfile toggle without sorting", () => {
-    const entries = [entry("z"), entry(".env"), entry("a")];
-    expect(visibleEntries(entries, false).map(({ name }) => name)).toEqual(["z", "a"]);
-    expect(visibleEntries(entries, true).map(({ name }) => name)).toEqual(["z", ".env", "a"]);
-  });
-
   it("validates daemon-compatible leaf names", () => {
     expect(validateLeafName("folder")).toBeNull();
     expect(validateLeafName("../folder")).toBe("Names cannot contain slashes.");
@@ -146,5 +126,60 @@ describe("file pagination and paths", () => {
     }
     expect(validateLeafName("COM10", "windows")).toBeNull();
     expect(validateLeafName("name\\part", "posix")).toBe("Names cannot contain slashes.");
+  });
+
+  it("reads a folder the way a person does: ~ inside home, the full path outside", () => {
+    expect(displayPath("/home/me", "/home/me")).toBe("~");
+    expect(displayPath("/home/me/code/spawn/", "/home/me")).toBe("~/code/spawn");
+    expect(displayPath("/srv/data", "/home/me")).toBe("/srv/data");
+    expect(displayPath("c:\\users\\ada\\Work", "C:\\Users\\Ada", "windows")).toBe("~\\Work");
+  });
+
+  it("resolves Go to folder input inside home, and refuses anything above it", () => {
+    const at = (input: string, cwd = "/home/me/code") =>
+      resolveFolderInput(input, { homeDir: "/home/me", cwd });
+    expect(at("~")).toEqual({ path: "/home/me" });
+    expect(at(" ~/code/../docs/ ")).toEqual({ path: "/home/me/docs" });
+    expect(at("/home/me/code")).toEqual({ path: "/home/me/code" });
+    // No ~ and no leading slash: read from the folder on screen, as a shell does.
+    expect(at("spawn/web")).toEqual({ path: "/home/me/code/spawn/web" });
+    expect(at("../docs")).toEqual({ path: "/home/me/docs" });
+    expect(at("spawn", "")).toEqual({ path: "/home/me/spawn" });
+    expect(at("")).toEqual({ error: "empty" });
+    for (const outside of ["/etc", "~/../other", "../../other"]) {
+      expect(at(outside).error).toBe("outside_root");
+    }
+  });
+
+  it("resolves Windows input with either separator and refuses other drives", () => {
+    const at = (input: string) =>
+      resolveFolderInput(input, {
+        homeDir: "C:\\Users\\Ada",
+        cwd: "C:\\Users\\Ada\\Work",
+        flavor: "windows",
+      });
+    expect(at("~\\Work")).toEqual({ path: "C:\\Users\\Ada\\Work" });
+    expect(at("~/Work")).toEqual({ path: "C:\\Users\\Ada\\Work" });
+    expect(at("c:/users/ada/Work")).toEqual({ path: "c:\\users\\ada\\Work" });
+    expect(at("Notes")).toEqual({ path: "C:\\Users\\Ada\\Work\\Notes" });
+    expect(at("D:\\Work").error).toBe("outside_root");
+    expect(at("C:Work").error).toBe("outside_root");
+    // A leading separator is the drive's root, as the web reads it, never the folder on screen.
+    expect(at("\\Notes").error).toBe("outside_root");
+  });
+
+  it("knows a link that names somewhere outside home", () => {
+    expect(resolveLinkedFolder("/etc", "/home/me")).toEqual({
+      folder: "/home/me",
+      outsideHome: true,
+    });
+    expect(resolveLinkedFolder("~/code", "/home/me")).toEqual({
+      folder: "/home/me/code",
+      outsideHome: false,
+    });
+    expect(resolveLinkedFolder(undefined, "/home/me")).toEqual({
+      folder: "/home/me",
+      outsideHome: false,
+    });
   });
 });

@@ -340,7 +340,12 @@ export interface AppMockOptions {
   createSkill?: (body: unknown, route: Route) => Promise<void> | void;
   updateSkill?: (id: string, body: unknown, route: Route) => Promise<void> | void;
   deleteSkill?: (id: string, route: Route) => Promise<void> | void;
-  files?: (hostId: string, path: string | null) => unknown;
+  /**
+   * A folder's listing. `cursor` is the page asked for (0 for the first); a
+   * handler can throw `new Error("host_error:<code>")` to answer with that
+   * daemon error code.
+   */
+  files?: (hostId: string, path: string | null, cursor: number) => unknown;
   fileRead?: (hostId: string, path: string) => string | Uint8Array;
   /** Bytes of the PNG the host would render for a file it cannot stream. */
   filePreview?: (hostId: string, path: string, maxPixels: number) => string | Uint8Array;
@@ -470,7 +475,8 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       if (operation === "fs.home") return { home_dir: homeDir };
       if (operation === "fs.list") {
         return (
-          options.files?.(hostId, String(payload.path ?? "~")) ?? fileListing({ path: homeDir })
+          options.files?.(hostId, String(payload.path ?? "~"), Number(payload.cursor ?? 0)) ??
+          fileListing({ path: homeDir })
         );
       }
       if (operation === "fs.mkdir") {
@@ -584,6 +590,8 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           const route = {
             request: () => ({
               postData: () => `name="dir"\r\n\r\n${String(payload.dir ?? "")}\r\n`,
+              // The write's declaration: dir, name, length, sha256, overwrite.
+              postDataJSON: () => payload,
             }),
             fulfill: async (response: { json?: Record<string, unknown> }) => {
               result = response.json;
@@ -770,12 +778,14 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
               }
               this.emit({ version: 1, type: "response", request_id: requestId, ok: true, result });
             } catch (error) {
+              // A spec answers with a daemon error code by throwing "host_error:<code>".
+              const code = /host_error:([a-z_]+)/.exec(String(error))?.[1] ?? "mock_failed";
               this.emit({
                 version: 1,
                 type: "response",
                 request_id: requestId,
                 ok: false,
-                error: { code: "mock_failed", detail: String(error) },
+                error: { code, detail: String(error) },
               });
             }
             return;

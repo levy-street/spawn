@@ -1,11 +1,33 @@
 "use client";
 
-import { ChevronsDownUp, Ellipsis, FolderPlus, RefreshCw, Upload } from "lucide-react";
+import {
+  ChevronsDownUp,
+  Ellipsis,
+  ExternalLink,
+  FilePlus,
+  FolderPlus,
+  RefreshCw,
+  Search,
+  Upload,
+} from "lucide-react";
 import { useRef } from "react";
-import { FileExplorer, type FileExplorerHandle } from "@/components/files/FileExplorer";
+import { FileBrowser, type FileBrowserHandle } from "@/components/files/FileBrowser";
+import { useFilePrefs } from "@/components/files/use-file-prefs";
+import { useOpenHostFolder } from "@/components/files/use-open-host-folder";
 import { AgentIcon } from "@/components/icons/AgentIcon";
-import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import {
+  DropdownMenu,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import type { Session } from "@/lib/api";
+import {
+  FILTER_PLACEHOLDER,
+  NEW_FILE_LABEL,
+  NEW_FOLDER_LABEL,
+  SHOW_HIDDEN_LABEL,
+  UPLOAD_FILES_LABEL,
+} from "@/lib/files/copy";
 import { sessionTitle } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 
@@ -16,11 +38,13 @@ export function SessionFilesPanel({
   session: Session;
   className?: string;
 }) {
-  const explorerRef = useRef<FileExplorerHandle>(null);
+  const browserRef = useRef<FileBrowserHandle>(null);
+  const { showHidden } = useFilePrefs("aside");
+  const openHostFolder = useOpenHostFolder();
   return (
     <div className={cn("flex min-h-0 flex-col bg-background", className)}>
       {/* One row carries everything: identity, the working path, and the
-          explorer's actions folded into a menu — no second toolbar. */}
+          browser's actions folded into a menu — no second toolbar. */}
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border bg-card/70 px-2.5">
         <AgentIcon command={session.foreground_command} size={20} className="rounded-md" />
         <span className="min-w-0 truncate text-xs font-medium">{sessionTitle(session)}</span>
@@ -40,31 +64,51 @@ export function SessionFilesPanel({
             </button>
           )}
         >
-          <DropdownMenuItem onSelect={() => explorerRef.current?.newFolder()}>
+          <DropdownMenuItem onSelect={() => browserRef.current?.newFolder()}>
             <FolderPlus className="size-4" aria-hidden />
-            New folder
+            {NEW_FOLDER_LABEL}
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => explorerRef.current?.upload()}>
+          <DropdownMenuItem onSelect={() => browserRef.current?.newFile()}>
+            <FilePlus className="size-4" aria-hidden />
+            {NEW_FILE_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => browserRef.current?.upload()}>
             <Upload className="size-4" aria-hidden />
-            Upload files
+            {UPLOAD_FILES_LABEL}
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => explorerRef.current?.refresh()}>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => browserRef.current?.focusFilter()}>
+            <Search className="size-4" aria-hidden />
+            {FILTER_PLACEHOLDER}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            checked={showHidden}
+            onSelect={() => browserRef.current?.toggleHidden()}
+          >
+            {SHOW_HIDDEN_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => browserRef.current?.refresh()}>
             <RefreshCw className="size-4" aria-hidden />
             Refresh
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => explorerRef.current?.collapseAll()}>
+          <DropdownMenuItem onSelect={() => browserRef.current?.collapseAll()}>
             <ChevronsDownUp className="size-4" aria-hidden />
             Collapse all
           </DropdownMenuItem>
+          {/* The folder is handed over in memory, never put in the link. */}
+          <DropdownMenuItem onSelect={() => openHostFolder(session.host_id, session.cwd)}>
+            <ExternalLink className="size-4" aria-hidden />
+            Open in full browser
+          </DropdownMenuItem>
         </DropdownMenu>
       </div>
-      <FileExplorer
-        ref={explorerRef}
+      <FileBrowser
+        ref={browserRef}
         key={`${session.host_id}:${session.cwd}`}
         hostId={session.host_id}
+        layout="aside"
         rootPath={session.cwd}
-        dense
-        hideHeader
         className="min-h-0 flex-1"
       />
     </div>

@@ -137,7 +137,7 @@ order is `(y, x)` and drives the mobile stack and keyboard focus order.
 | `/login`, `/signup`, `/forgot-password`, `/reset-password`, `/verify-email` | account flows |
 | `/device` | daemon device-code approval |
 | `/hosts` | every host, its capacity, and what is running on it; exact figures over the host control channel for the cards on screen |
-| `/hosts/[id]`, `/hosts/[id]/files` | host detail and full host file explorer |
+| `/hosts/[id]`, `/hosts/[id]/files` | host detail and full host file explorer; the folder on screen is never in the URL (kept in the tab's `history.state`; an inbound `?path=` is read once and dropped) |
 | `/legion` | redirect to `/hosts` (the page's name before the rename) |
 | `/download`, `/security` | public product/support pages |
 | `/admin` | administrator-only accounts, invites, and email operations |
