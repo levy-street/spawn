@@ -46,13 +46,15 @@ import { patchHost, updateHost } from "@/data/api/endpoints/hosts";
 import { downloadSpawnWorker } from "@/data/api/endpoints/install";
 import { getProfile } from "@/data/api/endpoints/profile";
 import { getRelease } from "@/data/api/endpoints/release";
-import { createSession, patchSessionAccess } from "@/data/api/endpoints/sessions";
+import { createSession, moveSession, patchSessionAccess } from "@/data/api/endpoints/sessions";
 import { createSkill } from "@/data/api/endpoints/skills";
 import { deleteWorkspaceTemplate } from "@/data/api/endpoints/templates";
 import { listEndorsements } from "@/data/api/endpoints/trust";
 import { createWorkspace } from "@/data/api/endpoints/workspaces";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
+const UUID_B = "22222222-2222-4222-8222-222222222222";
+const UUID_C = "33333333-3333-4333-8333-333333333333";
 
 beforeEach(() => {
   jest.mocked(api).mockClear();
@@ -155,6 +157,26 @@ it("serializes session creation", async () => {
       body: `{"host_id":"${UUID_A}","cwd":"/work","skill_ids":null}`,
     }),
   );
+});
+
+it("moves a window by its own id, saying where it was seen", async () => {
+  await moveSession(UUID_A, {
+    host_id: UUID_B,
+    cwd: "/work",
+    expected_host_id: UUID_C,
+    agent_session_id: null,
+  });
+  expect(api).toHaveBeenCalledWith(
+    `/api/sessions/${UUID_A}/move`,
+    expect.objectContaining({
+      method: "POST",
+      body: `{"host_id":"${UUID_B}","cwd":"/work","expected_host_id":"${UUID_C}","agent_session_id":null}`,
+    }),
+  );
+  // A folder is required, as the server requires it.
+  expect(() =>
+    moveSession(UUID_A, { host_id: UUID_B, cwd: "", expected_host_id: UUID_C }),
+  ).toThrow();
 });
 
 it("preserves null session capability semantics", async () => {

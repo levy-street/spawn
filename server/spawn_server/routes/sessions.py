@@ -6,7 +6,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, grid, legion, schemas
@@ -401,6 +401,115 @@ async def restart_session(
         skills=skills,
     )
     return _to_out(session_row, host.name)
+
+
+@router.post("/{session_id}/move", response_model=schemas.SessionOut)
+async def move_session(
+    session_id: str,
+    body: schemas.SessionMove,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.SessionOut:
+    """Run the same window on another host.
+
+    The row is the window, so it stays: its id, name, agent, skill grants, and
+    everything clients key by its id — the tile, mutes, notification settings.
+    Only the incarnation changes, one worker and PTY on one host for another.
+    Nothing of the old incarnation travels; an agent window starts a new
+    conversation over there, named by `agent_session_id`. A shell whose agent
+    was started by hand is typed by the move (`agent_id`), as a create would
+    type it, so that conversation is remembered too.
+
+    The order is the point. The row is rebound first, so the old host's late
+    frames — the exit the kill below provokes above all — fail the
+    `host_id` fence in `ws/daemon.py` and change nothing: no "Shell exited", no
+    session.died alert for a window that only moved. The kill to the old host
+    is best effort; one that is offline is told to stop the worker when it
+    registers again, because the row then names another host
+    (`send_session_kill`). The target gets `session.restart`, the same frame
+    and fields a restart
+    sends, because a restart first ends any worker of this id already there —
+    left by an earlier move away and back. The data-changed frame is published
+    by `DataEventMiddleware` for this path, after the response, like every
+    other session mutation.
+
+    Authority is unchanged: a restart-class lifecycle request whose folder the
+    operator chose, as on create. No new execution parameter reaches the host.
+    """
+    session_row = await db.get(Session, session_id)
+    if session_row is None or session_row.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="session not found")
+    target = await db.get(Host, body.host_id)
+    if target is None or target.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="host not found")
+    # The agent the mover starts over there types the window, as on create —
+    # a shell someone started an agent in by hand becomes that agent's window,
+    # so its conversation is kept and a restart can resume it.
+    retyped = (
+        {"agent_id": await resolve_agent_id(db, user=user, agent_id=body.agent_id)}
+        if body.agent_id is not None
+        else {}
+    )
+    agent_id = retyped.get("agent_id", session_row.agent_id)
+    # Compare first: a client that saw the window somewhere it no longer runs
+    # is acting on a stale picture, even when it happens to name the host the
+    # window has since moved to.
+    if session_row.host_id != body.expected_host_id:
+        raise HTTPException(status_code=409, detail="move_conflict")
+    if target.id == session_row.host_id:
+        raise HTTPException(status_code=400, detail="same_host")
+    broker = get_broker()
+    if broker.get_daemon_for_host(target.id) is None:
+        raise HTTPException(status_code=409, detail="target_offline")
+
+    source_host_id = session_row.host_id
+    # Only an agent window has a conversation to name.
+    conversation = body.agent_session_id if agent_id is not None else None
+    result = await db.execute(
+        update(Session)
+        .where(
+            Session.id == session_row.id,
+            Session.owner_user_id == user.id,
+            Session.host_id == body.expected_host_id,
+        )
+        .values(
+            host_id=target.id,
+            cwd=body.cwd,
+            status="starting",
+            started_at=_utcnow(),
+            exited_at=None,
+            exit_code=None,
+            last_output_at=None,
+            last_input_at=None,
+            foreground_command=None,
+            agent_session_id=conversation,
+            **retyped,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        # Another device moved it between the read above and this write.
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="move_conflict")
+    await upsert_recent_dir(db, user=user, host_id=target.id, path=body.cwd)
+    await db.commit()
+    await db.refresh(session_row)
+
+    # Addressed to the host the window left only: its routing there goes, and
+    # the launch below attaches the window to the target.
+    await send_session_kill(session_row.id, source_host_id)
+
+    skills = await capabilities.get_session_launch_capabilities(
+        db, user=user, session_id=session_row.id
+    )
+    await dispatch_session_launch(
+        frame_type="session.restart",
+        session_row=session_row,
+        host=target,
+        create_cwd=True,
+        skills=skills,
+    )
+    return _to_out(session_row, target.name)
 
 
 async def send_session_kill(session_id: str, host_id: str) -> None:

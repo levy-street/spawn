@@ -43,7 +43,6 @@ import {
 } from "@/lib/grid";
 import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
 import { recordPaneFocus } from "@/lib/pane-focus";
-import { displayPath } from "@/lib/places";
 import { sessionAgent, sessionTitle } from "@/lib/sessions";
 import {
   addTab,
@@ -58,6 +57,7 @@ import {
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { moveWindow, moveWindowConfirmation, moveWindowError } from "./move-window";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
@@ -673,7 +673,8 @@ export function WorkspaceGrid({
           ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
           ...(skillIds.length > 0 && { skill_ids: skillIds }),
         });
-        if (agent) pendingLaunch.set(created.id, agentLaunchCommand(agent, conversation));
+        if (agent)
+          pendingLaunch.set(created.id, created.host_id, agentLaunchCommand(agent, conversation));
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});
           throw new Error("This tab is full — close a window before duplicating another.");
@@ -1634,63 +1635,45 @@ export function WorkspaceGrid({
     [commitLayout, queryClient, sessionsById],
   );
 
-  /** Move a session pane to `cwd` on another host: the tile keeps its rect,
-   *  the old session is closed (confirmed first), and the same kind of window
-   *  — agent and skills — starts over there in a conversation of its own. */
+  /** Move a session pane's window to `cwd` on another host. The window itself
+   *  moves — the same row — so its tile, name, skills, mutes and alert settings
+   *  never change hands. What ran in it stops here and starts fresh there: a
+   *  shell, or the same agent in a new conversation, which this device types
+   *  into the new shell as the one that moved it, taking the display to do so.
+   *  Every other device showing the window follows it without taking control. */
   const moveToHost = useCallback(
     async (sessionId: string, host: Host, cwd: string) => {
       const session = sessionsById.get(sessionId);
       if (!session || session.host_id === host.id) return;
+      // Read before asking: the confirmation says whether an agent starts over.
+      // Awaited rather than read from the hook, for the reason duplicatePane
+      // gives: an agent pane must not move as a bare shell.
+      const definitions = await queryClient
+        .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
+        .catch(() => []);
+      const agent = sessionAgent(session, definitions);
       const accepted = await confirm({
-        title: `Move ${sessionTitle(session)} to ${host.name}?`,
-        body: `This window's process is stopped here, and the same kind of window starts in ${displayPath(cwd)} on ${host.name}.`,
-        confirmLabel: "Move window",
+        ...moveWindowConfirmation({
+          title: sessionTitle(session),
+          hostName: host.name,
+          cwd,
+          agent: agent !== null,
+        }),
         destructive: true,
       });
       if (!accepted) return;
-      let created: Session;
       try {
-        // The same kind of window, with the same skills, in a conversation of
-        // its own: an agent's history lives on the machine it ran on.
-        const definitions = await queryClient
-          .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
-          .catch(() => []);
-        const agent = sessionAgent(session, definitions);
-        const conversation = agent ? newAgentConversationId(agent.kind) : null;
-        const access = await sessionAccess.get(sessionId).catch(() => null);
-        const skillIds = access?.skills.map((skill) => skill.id) ?? [];
-        // Created before anything is torn down, so a failure (host dropped
-        // offline, say) leaves the pane exactly as it was.
-        created = await sessionsApi.create({
-          host_id: host.id,
-          cwd,
-          ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
-          ...(skillIds.length > 0 && { skill_ids: skillIds }),
-        });
-        if (agent) pendingLaunch.set(created.id, agentLaunchCommand(agent, conversation));
+        await moveWindow({ queryClient, session, host, cwd, agent });
       } catch (error) {
-        onErrorRef.current?.(error instanceof Error ? error.message : String(error));
+        onErrorRef.current?.(moveWindowError(error, host.name));
+        // Refused or not, this tab's picture of the window may be stale.
+        queryClient.invalidateQueries({ queryKey: ["sessions"] });
         return;
       }
-      // Seed the cache so the swapped tile finds its session immediately
-      // instead of flashing "missing" until the next sessions poll.
-      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
-        current ? [...current, created] : [created],
-      );
-      commitLayout(
-        latestTilesRef.current.map((tile) =>
-          tile.session_id === sessionId ? { ...tile, session_id: created.id } : tile,
-        ),
-      );
-      setFocus(created.id, true);
-      try {
-        await sessionsApi.remove(sessionId);
-      } catch (error) {
-        onErrorRef.current?.(error instanceof Error ? error.message : String(error));
-      }
+      setFocus(sessionId, true);
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
     },
-    [commitLayout, queryClient, sessionsById, setFocus],
+    [queryClient, sessionsById, setFocus],
   );
 
   const moveMobile = useCallback(

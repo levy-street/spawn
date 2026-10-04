@@ -61,6 +61,11 @@ export interface TerminalSurfaceHandle {
 
 export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bridge" | "theme"> {
   style?: StyleProp<ViewStyle>;
+  /** Whether this surface's first ready counts as opening the session and
+   *  takes its display lease. True for a terminal someone opened; false for
+   *  one mounted because its window moved to another host — a reconnect,
+   *  which never takes control. Read at mount. */
+  claimDisplay?: boolean;
   onTransport?(transport: SessionTransport): void;
   onStateChange?(state: TransportState): void;
   onError?(error: TransportError): void;
@@ -102,6 +107,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       fontSize,
       hostId,
       style,
+      claimDisplay = true,
       onTransport,
       onStateChange,
       onError,
@@ -123,6 +129,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
     const initialTheme = useRef(theme.terminal);
     const workerLoaded = useRef(false);
     const retiredForBackground = useRef(false);
+    const claimsOnOpen = useRef(claimDisplay);
     const selectionSequence = useRef(0);
     const selectionWaiters = useRef(new Map<string, SelectionWaiter>());
     const callbacks = useRef({
@@ -216,8 +223,9 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
       // looking at is the one that controls it, and the view it came from
       // offers "Take control" instead. One claim per opening, on the first
       // ready; a reconnect is not an opening, so two open devices never trade
-      // the lease back and forth on their own.
-      let displayClaimOwed = true;
+      // the lease back and forth on their own — and a surface mounted because
+      // its window moved here is a reconnect (`claimDisplay`).
+      let displayClaimOwed = claimsOnOpen.current;
       const unsubscribers = [
         transport.on("state", (state) => {
           if (state === "ready" && displayClaimOwed) {

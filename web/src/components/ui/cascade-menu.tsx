@@ -60,7 +60,8 @@ export type CascadeItem = {
 
 export type CascadePanel = {
   id: string;
-  /** Shown in the back header (and as the sheet title on mobile). */
+  /** Names the menu: shown above the first panel (as the sheet's title when
+   *  the menu is a sheet) and in a nested panel's back header. */
   title?: string;
   /** Replaces the items with a spinner while async content loads. */
   loading?: boolean;
@@ -349,7 +350,9 @@ export const CascadeMenu = forwardRef<
           {panel.title ?? "Back"}
         </button>
       ) : (
-        panel.title != null && (
+        // A sheet already says the first panel's title above it.
+        panel.title != null &&
+        !asSheet && (
           <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground">
             {panel.title}
           </div>

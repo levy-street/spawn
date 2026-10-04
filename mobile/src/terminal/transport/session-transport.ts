@@ -89,11 +89,18 @@ class WebViewSessionTransport implements SessionTransport {
     this.sessionId = options.sessionId;
     this.#uploadCoordinator = new SessionUploadCoordinator(options.bridge);
   }
+  get hostId(): string {
+    // A transport without one never attaches: `prepare` refuses it.
+    return this.options.hostId ?? "";
+  }
   get state(): TransportState {
     return this.#state;
   }
   get daemonState(): TransportState {
     return this.#lease?.shared.transport.state ?? "idle";
+  }
+  get displayOwner(): boolean {
+    return this.#displayOwner;
   }
   prepare(): void {
     if (this.#lease) return;

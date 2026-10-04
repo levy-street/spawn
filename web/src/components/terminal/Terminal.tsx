@@ -226,6 +226,16 @@ export interface TerminalHandle {
 
 export interface TerminalProps {
   sessionId: string;
+  /** The host this terminal's incarnation runs on, null until it is known.
+   *  Fixed for the life of the instance once known: a window that moves to
+   *  another host gets a new Terminal (`LiveTerminalProvider` keys it by
+   *  incarnation), never this one re-pointed at another connection. */
+  hostId: string | null;
+  /** Whether mounting in the foreground counts as opening the session and
+   *  takes its display lease. True for a terminal someone opened; false for
+   *  one mounted because its window moved — a reconnect, which never takes
+   *  control — unless this device is the one that moved it. Read at mount. */
+  claimDisplayOnOpen?: boolean;
   /** When false, the Composer handles keystrokes instead of the terminal input channel. */
   rawInput?: boolean;
   /** On mobile soft keyboards, Return can be reserved for multiline prompts. */
@@ -258,6 +268,8 @@ export interface TerminalProps {
 export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
   {
     sessionId,
+    hostId,
+    claimDisplayOnOpen = true,
     rawInput = false,
     mobileReturnMode = "submit",
     mobileReturnBytes = ALT_ENTER,
@@ -294,8 +306,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // "Take control" instead. One claim per opening — mounting in the
   // foreground or being brought back to it — paid once the control channel
   // can carry it and the tab is visible. A reconnect is not an opening, so
-  // two open devices never trade the lease back and forth on their own.
-  const displayClaimOwedRef = useRef(active);
+  // two open devices never trade the lease back and forth on their own — and
+  // a terminal mounted for a window that moved here is a reconnect, unless
+  // this device moved it (`claimDisplayOnOpen`).
+  const displayClaimOwedRef = useRef(active && claimDisplayOnOpen);
   const payDisplayClaimRef = useRef<() => void>(() => {});
   // GPU renderer for the FOREGROUND terminal only. The DOM renderer rebuilds
   // row elements and forces style/layout/paint after every echo — measurable
@@ -1074,7 +1088,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     staleTime: 30_000,
     ...cachedListItem<Session>(queryClient, ["sessions"], sessionId),
   });
-  const signalingHostId = sessionIdentityQuery.data?.host_id ?? null;
+  // The incarnation's host, as the pool resolved it — not this query's view,
+  // which can name a host the window has since left (or not yet reached).
+  const signalingHostId = hostId;
   const hostIdentityQuery = useQuery({
     queryKey: ["host", signalingHostId],
     queryFn: () => hosts.get(signalingHostId as string),

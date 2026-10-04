@@ -18,6 +18,7 @@ import {
   TabActionsSheet,
   WorkspaceActionsSheet,
 } from "@/components/workspace-detail/action-sheets";
+import { moveWindowConfirmation } from "@/components/workspace-detail/move-window";
 import { type PaneGhost, usePaneDragValues } from "@/components/workspace-detail/pane-drag";
 import { PaneDragGhost } from "@/components/workspace-detail/pane-drag-ghost";
 import { PaneList } from "@/components/workspace-detail/pane-list";
@@ -34,7 +35,8 @@ import { WorkspaceFolderSheet } from "@/components/workspaces/workspace-folder-s
 import { canAddTab } from "@/data/layout/tabs";
 import { canAddTile } from "@/data/layout/tiles";
 import { useWorkspaceDetail } from "@/data/queries/workspace-detail";
-import { displayPath } from "@/data/selectors/places";
+import { sessionAgent } from "@/data/selectors/agent";
+import { sessionTitle } from "@/data/selectors/session";
 import { selectActiveTabId } from "@/data/selectors/workspace";
 import { useConnectionStore } from "@/data/stores/connection";
 import type { Host, Session, Workspace } from "@/data/types/domain";
@@ -201,18 +203,27 @@ export function WorkspaceDetail({
     [toast],
   );
 
-  /** Confirm, then move a pane to `cwd` on `host` as the same kind of window. */
+  /**
+   * Confirm, then move a pane's window to `cwd` on `host`. This device is the
+   * one that moved it, so it opens the window over there: the opening takes
+   * the display, and the agent's launch is typed into the new shell.
+   */
   const confirmMove = (target: { tile: Tile; session: Session }, host: Host, cwd: string) => {
     setConfirmation({
-      title: `Move to ${host.name}?`,
-      description: `This window's process is stopped here, and the same kind of window starts in ${displayPath(cwd)} there.`,
-      confirmLabel: "Move window",
+      ...moveWindowConfirmation({
+        title: sessionTitle(target.session, agents),
+        hostName: host.name,
+        cwd,
+        agent: sessionAgent(target.session, agents) !== null,
+      }),
       onConfirm: () => {
         setConfirmation(null);
-        if (!workspace) return;
         void run(
-          () => actions.movePaneToHost(workspace, target.tile, host, cwd, target.session, agents),
-          () => setPaneTarget(null),
+          () => actions.movePaneToHost(target.session, host, cwd, agents),
+          () => {
+            setPaneTarget(null);
+            onOpenTerminal(target.session.id);
+          },
         );
       },
     });

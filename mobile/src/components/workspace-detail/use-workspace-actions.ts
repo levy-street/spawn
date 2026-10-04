@@ -3,11 +3,13 @@ import { randomUUID } from "expo-crypto";
 import { useCallback } from "react";
 import { restartSessionAgent } from "@/components/launcher/agent-restart";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
+import { moveWindowError } from "@/components/workspace-detail/move-window";
 
 import {
   createSession,
   deleteSession,
   getSessionAccess,
+  moveSession,
   patchSession,
   restartSession,
 } from "@/data/api/endpoints/sessions";
@@ -152,72 +154,66 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       return commit(workspace, layout);
     },
     /**
-     * Re-point a pane at another machine. The shell cannot be carried across, so
-     * a fresh one is started on the new host — created before anything is torn
-     * down, so a host that has just dropped offline leaves the pane as it was —
-     * the tile keeps its place, and whatever agent was running is queued to run
-     * again over there.
+     * Move a pane's window to `cwd` on another host. The window itself moves —
+     * the same session — so its tile, name, skills and alert settings stay
+     * where they are. What ran in it stops here and starts fresh there: a
+     * shell, or the same agent in a new conversation (its history lives on the
+     * machine it ran on), queued for this device to type when it opens the
+     * window over there — into that host's shell only. Nothing changes if the server refuses: a host gone
+     * offline, or a move from another device that landed first.
      */
     movePaneToHost: async (
-      workspace: Workspace,
-      tile: Tile,
+      session: Session,
       host: Host,
       cwd: string,
-      session: Session | null,
       agents: readonly AgentDef[],
-    ) => {
-      const sourceTab = workspace.layout.tabs.find((tab) =>
-        tab.layout.tiles.some((candidate) => candidate.session_id === tile.session_id),
-      );
-      if (!sourceTab) throw new Error("That pane is no longer in this workspace.");
-      const movedAgent = sessionAgent(session ?? undefined, agents);
-      // Another host is another conversation: the agent's own state does not
-      // travel, so the window over there starts a fresh one under a new id.
-      const movedConversation = movedAgent
-        ? newAgentConversationId(movedAgent.kind, randomUUID)
-        : null;
-      const created = await createSession({
-        host_id: host.id,
-        cwd,
-        ...(session?.name ? { name: session.name } : {}),
-        // The window arrives on the new host as the same kind of window, so it
-        // is one even before its agent has taken the foreground over there.
-        ...(movedAgent ? { agent_id: movedAgent.id, agent_session_id: movedConversation } : {}),
-      });
-      const nextTab = {
-        ...sourceTab,
-        layout: {
-          ...sourceTab.layout,
-          tiles: sourceTab.layout.tiles.map((candidate) =>
-            candidate.session_id === tile.session_id
-              ? { ...candidate, session_id: created.id }
-              : candidate,
-          ),
-        },
-      };
-      let saved: Workspace;
+    ): Promise<Session> => {
+      const agent = sessionAgent(session, agents);
+      const conversation = agent ? newAgentConversationId(agent.kind, randomUUID) : null;
+      // A read already in flight left the server before the move. Landing
+      // after it, it would put the window back on the host it left.
+      await Promise.all([
+        client.cancelQueries({ queryKey: qk.sessions() }),
+        client.cancelQueries({ queryKey: qk.session(session.id), exact: true }),
+      ]);
+      let moved: Session;
       try {
-        saved = await commit(workspace, replaceTabLayout(workspace, sourceTab.id, nextTab));
+        moved = await moveSession(session.id, {
+          host_id: host.id,
+          cwd,
+          expected_host_id: session.host_id,
+          // The agent it starts over there is what the window is, even when
+          // nothing recorded it: someone typed `claude` into a shell.
+          ...(agent ? { agent_id: agent.id } : {}),
+          agent_session_id: conversation,
+        });
       } catch (error) {
-        await deleteSession(created.id).catch(() => undefined);
-        throw error;
+        // Refused or not, this screen's picture of the window may be stale.
+        await invalidateSessions();
+        throw new Error(moveWindowError(error, host.name));
       }
 
-      const agent = movedAgent;
       let launchError: Error | null = null;
       if (agent) {
         try {
-          await pendingLaunches.persist(created.id, agentLaunchCommand(agent, movedConversation));
+          await pendingLaunches.persist(
+            moved.id,
+            moved.host_id,
+            agentLaunchCommand(agent, conversation),
+          );
         } catch {
           launchError = new Error(
             `The window moved to ${host.name} as a shell, but ${agent.name} could not be queued.`,
           );
         }
       }
-      await deleteSession(tile.session_id).catch(() => undefined);
+      client.setQueryData(qk.session(moved.id), moved);
+      client.setQueryData<Session[]>(qk.sessions(), (current) =>
+        current?.map((item) => (item.id === moved.id ? moved : item)),
+      );
       await invalidateSessions();
       if (launchError) throw launchError;
-      return { workspace: saved, session: created };
+      return moved;
     },
     reorderPane: (workspace: Workspace, tabId: TabId, paneId: PaneId, offset: -1 | 1) => {
       const layout = reorderPaneLayout(workspace, tabId, paneId, offset);
@@ -290,7 +286,11 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       }
       if (agent) {
         try {
-          await pendingLaunches.persist(duplicate.id, agentLaunchCommand(agent, conversation));
+          await pendingLaunches.persist(
+            duplicate.id,
+            duplicate.host_id,
+            agentLaunchCommand(agent, conversation),
+          );
         } catch {
           await invalidateSessions();
           throw new Error(

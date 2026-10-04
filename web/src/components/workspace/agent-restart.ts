@@ -255,8 +255,10 @@ export async function restartSessionAgent({
   }
   const plan = planAgentRestart(record, agents, live, onRecord);
   // Queued before the restart so the new shell's first keystrokes are the
-  // command; forgotten again if the restart never happened.
-  if (plan.kind === "agent") pendingLaunch.set(session.id, plan.command);
+  // command — for the window as it runs here, so a move that lands first
+  // drops it rather than resuming the conversation over there; forgotten
+  // again if the restart never happened.
+  if (plan.kind === "agent") pendingLaunch.set(session.id, session.host_id, plan.command);
   try {
     await restart();
   } catch (error) {

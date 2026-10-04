@@ -40,8 +40,13 @@ export function useWherePanel({
   /** Reopens the cascade behind the browser; omitted where there is none. */
   onBack?: () => void;
 }): {
-  /** The panel for one choice: picking a place, or browsing to one, calls `onPick`. */
-  panel: (id: string, onPick: (host: Host, cwd: string) => void) => CascadePanel;
+  /**
+   * The panel for one choice: picking a place, or browsing to one, calls
+   * `onPick`. `title` names it — "Where?" for a window about to open, the
+   * where chip's "Where this runs" for one already running — and is what
+   * the menu, and on a phone its sheet, is called.
+   */
+  panel: (id: string, onPick: (host: Host, cwd: string) => void, title?: string) => CascadePanel;
   overlays: JSX.Element;
 } {
   const [browseHost, setBrowseHost] = useState<Host | null>(null);
@@ -112,9 +117,13 @@ export function useWherePanel({
     };
   };
 
-  const panel = (id: string, onPick: (host: Host, cwd: string) => void): CascadePanel => ({
+  const panel = (
+    id: string,
+    onPick: (host: Host, cwd: string) => void,
+    title = "Where?",
+  ): CascadePanel => ({
     id,
-    title: "Where?",
+    title,
     loading: hostsQ.isLoading || sessionsQ.isLoading,
     emptyLabel: "Connect a host before creating a window.",
     items: hostList.length
