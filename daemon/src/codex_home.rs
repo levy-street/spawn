@@ -446,7 +446,44 @@ fn rebased_path(path: &str, base: &Path) -> Option<String> {
     if from_home || Path::new(path).is_absolute() {
         return None;
     }
-    Some(base.join(path).to_string_lossy().into_owned())
+    Some(
+        resolved_against(Path::new(path), base)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(windows))]
+fn resolved_against(path: &Path, base: &Path) -> PathBuf {
+    base.join(path)
+}
+
+/// A Windows path that is not absolute is relative in one of three ways, and
+/// Codex (`AbsolutePathBuf::resolve_path_against_base`) resolves each against
+/// the config's folder: `notes.md` under it, `\notes.md` (or `/notes.md`) at
+/// the root of its drive, and `D:notes.md` under its folders on drive `D:`.
+/// Written down from the user's home, each still names that file from a
+/// window's home on another drive or in another folder.
+#[cfg(windows)]
+fn resolved_against(path: &Path, base: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut components = path.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) if !path.has_root() => prefix,
+        _ => return base.join(path),
+    };
+    let mut resolved = PathBuf::from(drive.as_os_str());
+    resolved.push(std::path::MAIN_SEPARATOR_STR);
+    if components.clone().next().is_none() {
+        return resolved;
+    }
+    resolved.extend(
+        base.components()
+            .filter(|component| !matches!(component, Component::Prefix(_))),
+    );
+    resolved.extend(components);
+    resolved
 }
 
 /// `config[key]` as a table, made one if it is absent (implicit, so it
@@ -783,17 +820,25 @@ mod tests {
         same_file(&source.join(name), &fixture.codex_home.join(name))
     }
 
+    /// A path that is absolute on this platform: `/home/me/…` has no drive,
+    /// so on Windows it is relative to one (`resolved_against`).
+    #[cfg(unix)]
+    const USERS_OWN_SKILL: &str = "/home/me/my-skill/SKILL.md";
+    #[cfg(windows)]
+    const USERS_OWN_SKILL: &str = r"C:\Users\me\my-skill\SKILL.md";
+
     #[test]
     fn the_users_config_survives_and_gains_the_windows_skills() {
         let fixture = fixture();
         fs::write(
             fixture.source.join("config.toml"),
-            r#"# my settings
+            format!(
+                r#"# my settings
 model = "gpt-5.5-codex"
 cli_auth_credentials_store = "file"
 
 [[skills.config]]
-path = "/home/me/my-skill/SKILL.md"
+path = {USERS_OWN_SKILL:?}
 enabled = false
 
 [projects."/work/repo"]
@@ -804,7 +849,8 @@ trust_level = "trusted"
 
 [mcp_servers.docs]
 command = "docs-mcp"
-"#,
+"#
+            ),
         )
         .unwrap();
         let plan = Plan {
@@ -841,7 +887,7 @@ command = "docs-mcp"
         assert_eq!(
             paths,
             vec![
-                "/home/me/my-skill/SKILL.md".to_string(),
+                USERS_OWN_SKILL.to_string(),
                 fixture.skill.to_string_lossy().into_owned(),
             ]
         );
@@ -969,6 +1015,55 @@ tls = {{ ca-certificate = "certs/ca.pem" }}
         assert_eq!(
             config(&fixture)["model_instructions_file"].as_str(),
             Some(&*user("instructions.md"))
+        );
+    }
+
+    /// Codex resolves a Windows path with no drive against the drive of the
+    /// config's folder, and one with a drive but no root against that
+    /// folder's folders on its own drive; from a window's home on another
+    /// drive or under another folder, either would name another file.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_relative_to_a_drive_still_names_the_users_file() {
+        use std::path::Component;
+
+        let base = Path::new(r"D:\codex");
+        let rebased = |path: &str| rebased_path(path, base).map(PathBuf::from);
+        assert_eq!(
+            rebased("/home/me/SKILL.md"),
+            Some(PathBuf::from(r"D:\home\me\SKILL.md"))
+        );
+        assert_eq!(
+            rebased(r"\home\me\SKILL.md"),
+            Some(PathBuf::from(r"D:\home\me\SKILL.md"))
+        );
+        assert_eq!(
+            rebased(r"E:notes\SKILL.md"),
+            Some(PathBuf::from(r"E:\codex\notes\SKILL.md"))
+        );
+        assert_eq!(rebased("E:"), Some(PathBuf::from(r"E:\")));
+        assert_eq!(rebased(r"C:\abs\SKILL.md"), None);
+        assert_eq!(rebased(r"\\server\share\SKILL.md"), None);
+        assert_eq!(rebased(r"~\prompts\compact.md"), None);
+
+        let fixture = fixture();
+        fs::write(
+            fixture.source.join("config.toml"),
+            "model_instructions_file = \"/shared/instructions.md\"\n",
+        )
+        .unwrap();
+        apply(&fixture, &fixture.source.clone());
+        let Some(Component::Prefix(drive)) = fixture.source.components().next() else {
+            panic!("a temp folder on Windows has a drive");
+        };
+        assert_eq!(
+            config(&fixture)["model_instructions_file"]
+                .as_str()
+                .map(PathBuf::from),
+            Some(PathBuf::from(format!(
+                r"{}\shared\instructions.md",
+                drive.as_os_str().to_string_lossy()
+            )))
         );
     }
 
