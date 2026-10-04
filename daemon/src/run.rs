@@ -1915,6 +1915,9 @@ async fn dispatch_loop(
                     // waiting on a person, and the dispatch loop is how every
                     // other frame on this socket gets handled.
                     tokio::spawn(prime_macos_permissions_once());
+                    // Conversations set aside by a move are kept 30 days,
+                    // then go, on a host that may never carry another.
+                    tokio::task::spawn_blocking(crate::host_conversations::collect_held);
                     if let Some(access_token) = access_token {
                         let persisted = run_isolated_credential_blocking(move || {
                             creds::replace_access_token(&access_token)

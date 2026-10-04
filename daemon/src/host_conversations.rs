@@ -1631,6 +1631,28 @@ fn collect_garbage(holdings: &Holdings, now: u64, force: bool) {
     }
 }
 
+/// Housekeeping for a host that may never carry another conversation: run
+/// after each registration (`run.rs`), at most every ten minutes, and never
+/// creating the holdings where there are none.
+pub(crate) fn collect_held() {
+    let Ok(config) = crate::config::config_dir() else {
+        return;
+    };
+    let path = config.join("conversations");
+    if !path.is_dir() {
+        return;
+    }
+    let places = Places {
+        holdings: Some(path),
+        claude_store: None,
+        registry_stores: None,
+        login_shell: Arc::new(String::new),
+    };
+    if let Ok(holdings) = Holdings::open(&places) {
+        collect_garbage(&holdings, now_ms(), false);
+    }
+}
+
 /// The transfers named in a holdings folder: `<uuid><suffix>` entries.
 fn transfer_names(dir: &Dir, suffix: &str) -> Vec<Uuid> {
     let Ok(entries) = dir.entries() else {

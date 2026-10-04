@@ -543,9 +543,12 @@ none of it.
   `aborted/`) make each outcome final across restarts.
 - `conv.retire.commit` moves the holding to `retired/` (kept 30 days) only
   for the length and digest the target committed; `conv.retire.abort` puts
-  every copy back, sidecar first, never over anything. An unresolved
-  `outgoing/` is never collected; only a device resolves a move
-  (`conv.transfers` lists what is open).
+  every copy back, sidecar first, never over anything. Housekeeping
+  (`collect_held`, after each registration and beside the operations, at
+  most every ten minutes) drops retired and set-aside copies and finished
+  transfers' records after 30 days; an unresolved `outgoing/` is never
+  collected — only a device resolves a move (`conv.transfers` lists what is
+  open).
 - **Bulk is paced per association.** `PairContext` owns one `BulkGate`; every
   v2 stream's chunks go through it, one at a time and in turn, only while the
   bulk channels together buffer at most 32 KiB, so terminal echo always has
