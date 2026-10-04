@@ -26,7 +26,6 @@ export const APP_ROUTE_MAP = {
   "/workspace/[id]": "workspace/[id]",
   "/hosts": "hosts/index",
   "/host/[id]": "host/[id]/index",
-  "/host/[id]/agents": "host/[id]/agents",
   "/host/[id]/files": "host/[id]/files",
   "/profile": "profile",
   "/device-approval": "device-approval",
@@ -100,8 +99,9 @@ export default function AppStackLayout(): React.JSX.Element | null {
               is pushed over, so animating it would animate the whole app. */}
             <Stack.Screen name="(tabs)" options={{ animation: "none", gestureEnabled: false }} />
             <Stack.Screen name="workspace/[id]" />
-            <Stack.Screen name="host/[id]/index" />
-            <Stack.Screen name="host/[id]/agents" />
+            {/* The host's page swipes between its tabs, so going back is kept to
+              the card's edge there rather than a swipe from anywhere. */}
+            <Stack.Screen name="host/[id]/index" options={{ fullScreenGestureEnabled: false }} />
             <Stack.Screen name="host/[id]/files" />
             <Stack.Screen name="profile" />
             <Stack.Screen name="device-approval" />

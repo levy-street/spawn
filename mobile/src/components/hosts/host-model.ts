@@ -200,6 +200,38 @@ export function hostConnectionLabel(host: HostOut, now = Date.now()): string {
   return `offline · last seen ${relativeSeen(host.last_seen_at, now)}`;
 }
 
+/**
+ * The instant a server timestamp names. Postgres says its zone; SQLite hands
+ * timestamps back without one, and they are UTC — read as this device's local
+ * time they would put a host's possession on the wrong day east or west of
+ * Greenwich. The browser reads them the same way (web/src/lib/host-cockpit.ts).
+ */
+export function serverInstant(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/iu.test(value) ? value : `${value}Z`;
+  const parsed = Date.parse(zoned);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * "Possessed September 14, 2026" — the day the host joined this account, as a
+ * person here reads a date. `timeZone` is for tests; the device's own is used.
+ */
+export function possessedLabel(
+  createdAt: string | null | undefined,
+  { locale, timeZone }: { locale?: string; timeZone?: string } = {},
+): string | null {
+  const instant = serverInstant(createdAt);
+  if (instant === null) return null;
+  const day = new Date(instant).toLocaleDateString(locale, {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    ...(timeZone === undefined ? {} : { timeZone }),
+  });
+  return `Possessed ${day}`;
+}
+
 export function relativeSeen(value: string | null, now = Date.now()): string {
   if (value === null) return "never";
   const timestamp = Date.parse(value);

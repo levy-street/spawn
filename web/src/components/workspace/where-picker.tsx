@@ -26,6 +26,7 @@ import { FolderPicker } from "./folder-picker";
 export function useWherePanel({
   workspaceId,
   tabId,
+  hostId,
   exclude,
   anchorRef,
   onBack,
@@ -33,6 +34,11 @@ export function useWherePanel({
   workspaceId?: string | null;
   /** The tab the window lands in; the workspace's active tab when omitted. */
   tabId?: string | null;
+  /**
+   * Only places on this host, and "Choose a folder…" browses it directly —
+   * for a window opened from the host's own page, where the host is settled.
+   */
+  hostId?: string | null;
   /** A place not to offer — where a pane being moved already runs. */
   exclude?: Place | null;
   /** What the folder browser hangs off — the cascade has closed by then. */
@@ -45,8 +51,18 @@ export function useWherePanel({
    * `onPick`. `title` names it — "Where?" for a window about to open, the
    * where chip's "Where this runs" for one already running — and is what
    * the menu, and on a phone its sheet, is called.
+   *
+   * `then`, for a question that comes after where: each place descends into
+   * the panel it returns instead of being the last step. Browsing still ends
+   * in `onPick` — the cascade has closed for the browser by then, so the
+   * caller opens it again at that panel.
    */
-  panel: (id: string, onPick: (host: Host, cwd: string) => void, title?: string) => CascadePanel;
+  panel: (
+    id: string,
+    onPick: (host: Host, cwd: string) => void,
+    title?: string,
+    then?: (host: Host, cwd: string) => CascadePanel,
+  ) => CascadePanel;
   overlays: JSX.Element;
 } {
   const [browseHost, setBrowseHost] = useState<Host | null>(null);
@@ -65,7 +81,7 @@ export function useWherePanel({
     enabled: Boolean(workspaceId),
     staleTime: 10_000,
   });
-  const hostList = hostsQ.data ?? [];
+  const hostList = (hostsQ.data ?? []).filter((host) => !hostId || host.id === hostId);
   const workspace = workspaceQ.data;
   const tab = workspace
     ? ((tabId ? tabById(workspace.layout, tabId) : null) ?? activeTab(workspace.layout))
@@ -121,6 +137,7 @@ export function useWherePanel({
     id: string,
     onPick: (host: Host, cwd: string) => void,
     title = "Where?",
+    then?: (host: Host, cwd: string) => CascadePanel,
   ): CascadePanel => ({
     id,
     title,
@@ -139,7 +156,9 @@ export function useWherePanel({
                 detail: `${host.name} · ${place.online ? placeReasonLabel(place.reason) : "offline"}`,
                 trailing: <HostUpdateBadge host={host} />,
                 disabled: !place.online,
-                onSelect: () => onPick(host, place.cwd),
+                ...(then
+                  ? { panel: then(host, place.cwd) }
+                  : { onSelect: () => onPick(host, place.cwd) }),
               },
             ];
           }),

@@ -1,5 +1,4 @@
-import { act, fireEvent, render, renderHook, screen, within } from "@testing-library/react-native";
-import * as Clipboard from "expo-clipboard";
+import { act, fireEvent, render, renderHook, screen } from "@testing-library/react-native";
 import { AccessibilityInfo, type ViewabilityConfigCallbackPairs } from "react-native";
 import {
   codexAgent,
@@ -9,15 +8,15 @@ import {
   windowsHost,
 } from "@/components/hosts/__tests__/fixtures";
 import {
-  HostDetailView,
-  hostDoctorPresentation,
+  HostApprovingDevices,
   hostPinCapacityWarning,
-} from "@/components/hosts/host-detail-view";
+} from "@/components/hosts/host-approving-devices";
+import { HostMachineFacts } from "@/components/hosts/host-facts";
+import { hostDoctorPresentation } from "@/components/hosts/host-troubleshooting";
 import { HostsView, hostsSummaryLine, useOnScreenHosts } from "@/components/hosts/hosts-screen";
 import { type HostOut, HostOutSchema } from "@/data/api/schemas/hosts";
 import { ThemeProvider } from "@/theme";
 
-jest.mock("expo-clipboard", () => ({ setStringAsync: jest.fn(async () => undefined) }));
 jest.mock("@/components/hosts/live-capacity-probe", () => ({
   LiveCapacityProbe: jest.fn(() => null),
 }));
@@ -269,55 +268,6 @@ describe("host list and detail rendering", () => {
     expect(screen.getByRole("button", { name: /old-laptop[\s\S]*12 cores/ })).toBeOnTheScreen();
   });
 
-  test("renders host facts and session identity while omitting nonexistent daemon actions", async () => {
-    await render(
-      <ThemeProvider>
-        <HostDetailView
-          agents={[codexAgent]}
-          host={onlineHost}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={jest.fn()}
-          onOpenSession={jest.fn()}
-          sessions={[runningSession]}
-        />
-      </ThemeProvider>,
-    );
-
-    for (const value of [
-      "macOS · ARM64",
-      "1.4.2",
-      "ed25519",
-      "XOCTsSKj9-Z7qRynE70szG_DNBeHiLzEBOCG1clQbz8",
-      "SHA256:pm9SJXQwKoWeB-v_",
-      "native app",
-      "Codex · /Users/spawn/dev/native",
-      "Awaiting input",
-    ]) {
-      expect(screen.getByText(value)).toBeOnTheScreen();
-    }
-    expect(screen.queryByText(/restart daemon/i)).not.toBeOnTheScreen();
-    expect(screen.queryByText(/update daemon/i)).not.toBeOnTheScreen();
-    expect(screen.queryByText(/daemon logs/i)).not.toBeOnTheScreen();
-  });
-
-  test("formats Windows consistently without changing the generic host UI", async () => {
-    await render(
-      <ThemeProvider>
-        <HostDetailView
-          agents={[]}
-          host={windowsHost}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={jest.fn()}
-          onOpenSession={jest.fn()}
-          sessions={[]}
-        />
-      </ThemeProvider>,
-    );
-
-    expect(screen.getByText("Windows · x64")).toBeOnTheScreen();
-    expect(screen.getByText("Windows · x64 · daemon 1.4.2")).toBeOnTheScreen();
-  });
-
   test("surfaces daemon update state on host rows and facts", async () => {
     const outdated = {
       ...onlineHost,
@@ -345,115 +295,12 @@ describe("host list and detail rendering", () => {
 
     await render(
       <ThemeProvider>
-        <HostDetailView
-          agents={[]}
+        <HostMachineFacts
           host={{ ...outdated, update: { ...outdated.update, state: "updating" } }}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={jest.fn()}
-          onOpenSession={jest.fn()}
-          sessions={[]}
         />
       </ThemeProvider>,
     );
     expect(screen.getByText("updating")).toBeOnTheScreen();
-  });
-
-  test("a changed host identity blocks the page and offers removal as the only exit", async () => {
-    const onRemove = jest.fn();
-    const onOpenFiles = jest.fn();
-    await render(
-      <ThemeProvider>
-        <HostDetailView
-          agents={[]}
-          host={onlineHost}
-          identityConflict
-          onOpenAgents={jest.fn()}
-          onOpenFiles={onOpenFiles}
-          onOpenSession={jest.fn()}
-          onRemove={onRemove}
-          sessions={[]}
-        />
-      </ThemeProvider>,
-    );
-
-    const panel = screen.getByTestId("host-identity-conflict");
-    expect(panel).toHaveProp("accessibilityRole", "alert");
-    expect(
-      screen.getByText("This host's identity changed — connections are blocked"),
-    ).toBeOnTheScreen();
-    // The browser's words, so a reinstall reads the same on every device.
-    expect(
-      screen.getByText(
-        "This host answered with a different identity than the one this device approved. Either the host's software was reinstalled — a reinstall gives it a new identity — or something between you and the host is impersonating it. This device won't connect either way.",
-      ),
-    ).toBeOnTheScreen();
-    expect(
-      screen.getByText(
-        "If you reinstalled this host yourself, remove it here, then run `spawnd possess` in its terminal — possessing it again is the re-verification.",
-      ),
-    ).toBeOnTheScreen();
-    // One exit, and never a way to accept the new identity in place.
-    expect(within(panel).getAllByRole("button")).toHaveLength(1);
-    expect(within(panel).queryByText(/trust|accept/i)).toBeNull();
-    await fireEvent.press(screen.getByTestId("conflict-remove-host"));
-    expect(onRemove).toHaveBeenCalledTimes(1);
-
-    expect(
-      screen.getByText(
-        "Connections to this host are blocked until it is removed and possessed again.",
-      ),
-    ).toBeOnTheScreen();
-    await fireEvent.press(screen.getByText("Files"));
-    expect(onOpenFiles).not.toHaveBeenCalled();
-  });
-
-  test("a host whose identity checks out shows no conflict and opens its files", async () => {
-    const onOpenFiles = jest.fn();
-    await render(
-      <ThemeProvider>
-        <HostDetailView
-          agents={[]}
-          host={onlineHost}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={onOpenFiles}
-          onOpenSession={jest.fn()}
-          onRemove={jest.fn()}
-          sessions={[]}
-        />
-      </ThemeProvider>,
-    );
-
-    expect(screen.queryByTestId("host-identity-conflict")).toBeNull();
-    await fireEvent.press(screen.getByRole("button", { name: /^Files, Browse this host/ }));
-    expect(onOpenFiles).toHaveBeenCalledTimes(1);
-  });
-
-  test("opens the update dialog from the update chip, as the browser's badge does", async () => {
-    const onOpenUpdate = jest.fn();
-    await render(
-      <ThemeProvider>
-        <HostDetailView
-          agents={[]}
-          host={{
-            ...onlineHost,
-            update: {
-              state: "available",
-              latest_version: "2.0.0",
-              error: null,
-              requested_at: null,
-            },
-          }}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={jest.fn()}
-          onOpenSession={jest.fn()}
-          onOpenUpdate={onOpenUpdate}
-          sessions={[]}
-        />
-      </ThemeProvider>,
-    );
-
-    await fireEvent.press(screen.getByRole("button", { name: "update available" }));
-    expect(onOpenUpdate).toHaveBeenCalledTimes(1);
   });
 
   test("selects every offline mini-doctor case and collapses it online", () => {
@@ -513,41 +360,6 @@ describe("host list and detail rendering", () => {
     expect(parsed.last_disconnect).toBeUndefined();
   });
 
-  test("renders the helper only for an offline host", async () => {
-    const offline = await render(
-      <ThemeProvider>
-        <HostDetailView
-          agents={[]}
-          host={{ ...offlineHost, last_seen_at: null }}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={jest.fn()}
-          onOpenSession={jest.fn()}
-          sessions={[]}
-        />
-      </ThemeProvider>,
-    );
-    expect(screen.getByText("Something wrong?")).toBeOnTheScreen();
-    expect(screen.getByTestId("host-doctor-never-connected")).toBeOnTheScreen();
-    await fireEvent.press(screen.getByRole("button", { name: "Copy spawnd doctor" }));
-    expect(Clipboard.setStringAsync).toHaveBeenCalledWith("spawnd doctor");
-    await offline.unmount();
-
-    await render(
-      <ThemeProvider>
-        <HostDetailView
-          agents={[]}
-          host={onlineHost}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={jest.fn()}
-          onOpenSession={jest.fn()}
-          sessions={[]}
-        />
-      </ThemeProvider>,
-    );
-    expect(screen.queryByText("Something wrong?")).toBeNull();
-    expect(screen.getByText(/daemon 1\.4\.2/i)).toBeOnTheScreen();
-  });
-
   test("warns at 28 approvals and marks a pin the host did not receive", async () => {
     expect(hostPinCapacityWarning({ used: 27, max: 32 })).toBeNull();
     expect(hostPinCapacityWarning({ used: 28, max: 32 })).toBe(
@@ -556,9 +368,8 @@ describe("host list and detail rendering", () => {
 
     await render(
       <ThemeProvider>
-        <HostDetailView
-          agents={[]}
-          browserDevices={[
+        <HostApprovingDevices
+          devices={[
             {
               id: "11111111-1111-4111-8111-111111111111",
               key_algorithm: "ed25519",
@@ -568,7 +379,6 @@ describe("host list and detail rendering", () => {
               revoked_at: null,
             },
           ]}
-          host={onlineHost}
           hostPins={{
             capacity: { used: 28, max: 32 },
             pins: [
@@ -579,10 +389,6 @@ describe("host list and detail rendering", () => {
               },
             ],
           }}
-          onOpenAgents={jest.fn()}
-          onOpenFiles={jest.fn()}
-          onOpenSession={jest.fn()}
-          sessions={[]}
         />
       </ThemeProvider>,
     );

@@ -9,6 +9,8 @@ import {
   formatHostPlatform,
   hostConnectionLabel,
   parseHostMetrics,
+  possessedLabel,
+  serverInstant,
 } from "@/components/hosts/host-model";
 
 describe("host presentation model", () => {
@@ -95,5 +97,30 @@ describe("host presentation model", () => {
     expect(hostConnectionLabel(offlineHost, Date.parse("2026-08-22T00:02:00Z"))).toBe(
       "offline · last seen 2m ago",
     );
+  });
+
+  test("a server timestamp without a zone is UTC, as SQLite stores it", () => {
+    // SQLite hands timestamps back without their zone. Read as this device's
+    // local time, a host possessed late in the evening UTC would be dated a
+    // day early east of Greenwich — and differ from the browser's date.
+    expect(serverInstant("2026-09-14T23:30:00.123456")).toBe(Date.UTC(2026, 8, 14, 23, 30, 0, 123));
+    expect(serverInstant("2026-09-14T23:30:00Z")).toBe(Date.UTC(2026, 8, 14, 23, 30));
+    expect(serverInstant("2026-09-15T09:30:00+10:00")).toBe(Date.UTC(2026, 8, 14, 23, 30));
+    expect(serverInstant("not a date")).toBeNull();
+    expect(serverInstant(null)).toBeNull();
+    expect(serverInstant(undefined)).toBeNull();
+  });
+
+  test("the possession date reads as the browser's does, on the day it was where you are", () => {
+    const sydney = { locale: "en-US", timeZone: "Australia/Sydney" };
+    expect(possessedLabel("2026-09-14T23:30:00.123456", sydney)).toBe(
+      "Possessed September 15, 2026",
+    );
+    expect(possessedLabel("2026-09-14T23:30:00Z", sydney)).toBe("Possessed September 15, 2026");
+    expect(possessedLabel("2026-09-14T23:30:00.123456", { locale: "en-US", timeZone: "UTC" })).toBe(
+      "Possessed September 14, 2026",
+    );
+    expect(possessedLabel(null)).toBeNull();
+    expect(possessedLabel("garbage")).toBeNull();
   });
 });

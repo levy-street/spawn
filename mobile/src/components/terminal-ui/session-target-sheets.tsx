@@ -2,12 +2,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { randomUUID } from "expo-crypto";
 import { useCallback, useState } from "react";
 
-import {
-  agentInstallAndLaunchCommand,
-  agentLaunchCommand,
-  newAgentConversationId,
-  shellQuote,
-} from "@/components/launcher/agent-command";
+import { agentInstallAndLaunchCommand, shellQuote } from "@/components/launcher/agent-command";
+import { agentStart } from "@/components/launcher/create-window";
 import { FolderPicker } from "@/components/launcher/folder-picker";
 import { pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
 import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
@@ -20,7 +16,6 @@ import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import { listAgents } from "@/data/api/endpoints/agents";
 import { listHostAgents, listRecentDirectories } from "@/data/api/endpoints/hosts";
 import { patchSession } from "@/data/api/endpoints/sessions";
-import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { qk } from "@/data/queryKeys";
@@ -130,12 +125,6 @@ export function SessionTargetSheets({
   const foreground = session.foreground_command;
   const atShell = isShellCommand(foreground) || !commandBasename(foreground);
 
-  const agentCommand = (agent: AgentOut, conversation: string | null): string =>
-    installed.has(agent.id)
-      ? agentLaunchCommand(agent, conversation)
-      : (agentInstallAndLaunchCommand(agent, conversation) ??
-        agentLaunchCommand(agent, conversation));
-
   const actions: ActionSheetAction[] = [
     {
       id: "shell",
@@ -165,13 +154,18 @@ export function SessionTargetSheets({
         selected: current,
         accessibilityRole: "radio",
         onPress: () => {
-          // A launch is a new conversation: named up front where the CLI lets
-          // us, so a restart later can resume this one rather than "the latest".
-          const conversation = newAgentConversationId(agent.kind, randomUUID);
-          void run(agentCommand(agent, conversation), `Running ${agent.name}`, {
-            agentId: agent.id,
-            conversationId: conversation,
-          });
+          // A launch is a new conversation, spelled the way every new window
+          // spells its agent's start (`create-window.ts`): named up front where
+          // the CLI lets us, so a restart later can resume this one rather
+          // than "the latest". An agent the host lacks installs first.
+          const start = agentStart(agent, randomUUID);
+          void run(
+            installed.has(agent.id)
+              ? start.command
+              : (agentInstallAndLaunchCommand(agent, start.conversationId) ?? start.command),
+            `Running ${agent.name}`,
+            { agentId: start.agentId, conversationId: start.conversationId },
+          );
         },
       };
     }),

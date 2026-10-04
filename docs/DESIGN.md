@@ -56,7 +56,10 @@ The workspace tab strip (`workspace-tabs.tsx`) is the same move again: the
 strip is a band of `--shell` and the selected tab is a `--background` shape
 cut into it (rounded top, flush bottom) — content rising into the chrome. An
 empty tab's canvas is `--card`, one step darker than the shell ground, so a
-fresh tab reads as a surface awaiting panes rather than more chrome.
+fresh tab reads as a surface awaiting panes rather than more chrome. A host's
+page draws its sections with the same figure (`RouteTabs`, below): the header
+and the section row sit on the shell band and the current section rises into
+the panel beneath it.
 
 Pane focus rides the same figure/ground idea rather than a fourth token: the
 focused pane is left as `--background`, the deepest surface in the stack, and
@@ -204,6 +207,7 @@ tokens only.
 | `toast.tsx` | `toast(msg, opts?)`, `toast.error(msg, opts?)`, `ToastHost` | transient outcome/error notices (replaces inline error banners). `ToastHost` is mounted once in the app shell; duplicates coalesce; errors linger longer. The stack sits top-right under the mobile header, newest at the top, capped at 5 — a sixth evicts the oldest, not the newest. `opts` adds a dimmer second line (`detail`) and a leading mark (`icon`) for notices where what happened and where it happened are different facts |
 | `dropdown-menu.tsx` | `DropdownMenu` (render-prop trigger, `openAt` handle, `onOpenChange` — also told when unmounted open), `DropdownMenuItem/Separator/Label` | single-level menus, kebabs, right-click menus |
 | `cascade-menu.tsx` | `CascadeMenu`, `CascadePanel`, `CascadeItem` | multi-step pick-one flows (the `+` new-session cascade). Panels are data; per-panel `loading`; items can be `heading` section labels; renders as a bottom sheet on small viewports |
+| `tabs.tsx` | `RouteTabs` (`label`, `tabs`, `current`), `Tabs` (`label`, `items`, `value`, `onValueChange`) | being in one of several places. `RouteTabs`: sections that are routes — links on a `--shell` band, the current one a `--background` shape cut into it (`tab-connected`) with `aria-current="page"`; a tab with a `disabledReason` stays in its place as an inert button that carries the reason. `Tabs`: a pick-one switch inside a panel (`role="tablist"`, a segmented track) whose selection follows the arrow keys. Arrows and Home/End move along both; only `Tabs`, a composite widget, takes one Tab stop — every `RouteTabs` link stays in the Tab order, as links in a `<nav>` do. A host's page sections; the install target in the possession flow |
 | `sheet.tsx` | `BottomSheet` | mobile bottom-sheet container (drag handle, scrim, `--vv-height` cap) |
 | `drawer.tsx` | `Drawer` | left slide-in panel (the mobile sidebar): scrim, drag-to-dismiss, focus trap |
 | `tooltip.tsx` | `RailTooltip` | collapsed-sidebar hover/focus hints |

@@ -39,6 +39,7 @@ function makeHost(id: string, name: string, overrides: Partial<Host> = {}): Host
     supports_account_chains: false,
     status: "online",
     last_seen_at: "2026-08-21T00:00:00Z",
+    created_at: null,
     session_count: 0,
     cpu_cores: 16,
     cpu_physical_cores: 8,

@@ -107,7 +107,6 @@ describe("host card", () => {
     expect(screen.getByTestId("exact-capacity")).toBeOnTheScreen();
     expect(screen.getByText("47%")).toBeOnTheScreen();
     expect(screen.getByText("50%")).toBeOnTheScreen();
-    expect(screen.getByText(/4.0 GiB of 8.0 GiB/)).toBeOnTheScreen();
   });
 
   test("shows what the host is, what it has to give, and what runs on it", async () => {

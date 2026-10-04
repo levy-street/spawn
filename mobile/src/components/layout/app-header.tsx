@@ -12,6 +12,8 @@ import { sizing } from "@/theme/sizing";
 export interface AppHeaderAction {
   icon: IconName;
   accessibilityLabel: string;
+  /** What pressing it does, or — for a disabled one — why it is shut. */
+  accessibilityHint?: string;
   onPress: () => void;
   disabled?: boolean;
   busy?: boolean;
@@ -172,6 +174,9 @@ export function AppHeader({
                   variant="ghost"
                   {...(action.busy === undefined ? {} : { loading: action.busy })}
                   {...(action.disabled === undefined ? {} : { disabled: action.disabled })}
+                  {...(action.accessibilityHint === undefined
+                    ? {}
+                    : { accessibilityHint: action.accessibilityHint })}
                   {...(action.testID === undefined ? {} : { testID: action.testID })}
                 />
               ))}

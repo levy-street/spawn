@@ -21,13 +21,18 @@ test("agent availability and refresh never offer installation or automation", as
     },
   });
   const writes: string[] = [];
+  const checks: string[] = [];
   page.on("request", (request) => {
-    if (request.url().includes(`/api/hosts/${HOST_ID}/agents`) && request.method() !== "GET") {
-      writes.push(`${request.method()} ${request.url()}`);
-    }
+    if (!request.url().includes(`/api/hosts/${HOST_ID}/agents`)) return;
+    if (request.method() === "GET") checks.push(request.url());
+    else writes.push(`${request.method()} ${request.url()}`);
   });
   await page.goto(`/hosts/${HOST_ID}`);
   const availability = page.getByRole("region", { name: "Agent availability" });
+  // Checking runs `which` on the host, so it waits to be asked.
+  await expect(availability.getByRole("button", { name: "Check agents" })).toBeVisible();
+  expect(checks).toEqual([]);
+  await availability.getByRole("button", { name: "Check agents" }).click();
   await expect(availability.getByText("Example agent", { exact: true })).toBeVisible();
   await expect(availability.getByText("not installed", { exact: true })).toBeVisible();
   await expect(availability.getByText(guidance)).toBeVisible();
@@ -37,7 +42,8 @@ test("agent availability and refresh never offer installation or automation", as
   const refreshed = page.waitForResponse((response) =>
     response.url().endsWith(`/api/hosts/${HOST_ID}/agents`),
   );
-  await availability.getByRole("button", { name: `Refresh agents for ${host.name}` }).click();
+  // Asked again only by a press, in words: "Check again".
+  await availability.getByRole("button", { name: "Check again" }).click();
   await refreshed;
   await expect(availability.getByRole("button")).toBeEnabled();
   expect(writes).toEqual([]);

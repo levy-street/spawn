@@ -176,6 +176,7 @@ Host shape:
   "host_key_fingerprint": "SHA256:short-base64url|null",
   "status": "online" | "offline",
   "last_seen_at": "2026-05-04T...",
+  "created_at": "2026-04-30T...",
   "session_count": 2,
   "cpu_cores": 64,
   "cpu_physical_cores": 32,
@@ -193,6 +194,8 @@ reports them registers; the two buckets are additionally null for any host that
 is `offline`, because a departed daemon's last reading is a stale reading and a
 live-looking meter on a dead machine is worse than no meter. `capacity_at` is
 what separates "idle" from "never reported", which are otherwise both null.
+`created_at` is when the host was possessed (the host page's "Possessed …");
+servers older than it omit the field.
 
 ### Profile
 

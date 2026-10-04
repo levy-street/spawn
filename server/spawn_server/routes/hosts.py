@@ -64,6 +64,7 @@ def _to_out(host: Host, session_count: int, *, now: datetime | None = None) -> s
             at=host.last_disconnect_at,
             reason=host.last_disconnect_reason,
         ),
+        created_at=host.created_at,
         session_count=session_count,
         supports_account_chains=host.supports_account_chains,
         cpu_cores=host.cpu_cores,

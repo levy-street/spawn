@@ -10,7 +10,6 @@ const DOCUMENTED_URLS = [
   "/workspace/[id]",
   "/hosts",
   "/host/[id]",
-  "/host/[id]/agents",
   "/host/[id]/files",
   "/profile",
   "/device-approval",
@@ -47,6 +46,7 @@ describe("native stack route map", () => {
     ["/legion", "/hosts"],
     ["/admin", "/admin"],
     [`/hosts/${HOST_ID}`, `/host/${HOST_ID}`],
+    [`/hosts/${HOST_ID}/sessions`, `/host/${HOST_ID}?tab=sessions`],
     [`/w/${WORKSPACE_ID}`, `/workspace/${WORKSPACE_ID}`],
   ])("keeps incoming %s links on the stack URL %s", (incoming, href) => {
     expect(resolveIncomingLink(incoming)?.href).toBe(href);

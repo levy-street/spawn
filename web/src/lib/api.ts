@@ -147,6 +147,9 @@ export const HostSchema = z.object({
   // Additive Phase C field. Older servers omit it; absence is deliberately
   // indistinguishable from an ordinary offline disconnect in the UI.
   last_disconnect: HostLastDisconnectSchema,
+  /** When this host was possessed. Older servers omit it, and the host page
+   *  then simply does not say. */
+  created_at: z.string().nullable().default(null),
   session_count: z.number().int(),
   /** Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path. */
   supports_account_chains: z.boolean().default(false),

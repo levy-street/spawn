@@ -1,5 +1,6 @@
 import { randomUUID } from "expo-crypto";
 
+import { type CreateWindowDependencies, createWindow } from "@/components/launcher/create-window";
 import { type PendingLaunchStore, pendingLaunches } from "@/components/launcher/pending-launch";
 import { createSession, getSessionAccess } from "@/data/api/endpoints/sessions";
 import {
@@ -17,12 +18,7 @@ import type {
   WorkspaceOut,
   WorkspaceTile,
 } from "@/data/api/schemas/workspaces";
-import {
-  agentLaunchCommand,
-  newAgentConversationId,
-  runningAgent,
-  sessionAgent,
-} from "@/data/selectors/agent";
+import { runningAgent, sessionAgent } from "@/data/selectors/agent";
 import { isFilesWidget } from "@/data/types/layout";
 
 export interface WorkspaceOperationResult {
@@ -69,6 +65,17 @@ const DEFAULT_DEPENDENCIES: WorkspaceOperationDependencies = {
   getSessionAccess,
   pending: pendingLaunches,
 };
+
+/** The window maker's share of these dependencies (`create-window.ts`). */
+function windowDependencies(
+  dependencies: WorkspaceOperationDependencies,
+): CreateWindowDependencies {
+  return {
+    createSession: dependencies.createSession,
+    newId: dependencies.randomId,
+    pending: dependencies.pending,
+  };
+}
 
 export function nextWorkspaceCopyName(name: string, existingNames: readonly string[]): string {
   const occupied = new Set(existingNames);
@@ -168,28 +175,26 @@ export async function instantiateWorkspaceTemplate(
       if (tile.run.kind === "files") continue;
       const storedCommand = tile.run.kind === "agent" ? tile.run.command?.trim() : undefined;
       const templateAgent = runningAgent(storedCommand ?? null, input.agents);
-      const conversation = templateAgent
-        ? newAgentConversationId(templateAgent.kind, dependencies.randomId)
-        : null;
-      const session = await dependencies.createSession({
-        host_id: place.hostId,
-        cwd: place.cwd,
-        ...(templateAgent ? { agent_id: templateAgent.id, agent_session_id: conversation } : {}),
-        workspace_id: workspaceId,
-        tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
-      });
-      if (tile.run.kind === "agent") {
-        const command = templateAgent
-          ? agentLaunchCommand(templateAgent, conversation)
-          : storedCommand;
-        if (command) {
-          try {
-            await dependencies.pending.persist(session.id, session.host_id, command);
-          } catch {
-            agentLaunchesSkipped += 1;
-          }
-        }
-      }
+      // The tab is active and the tile is the template's own, so the window
+      // lands exactly there; an agent this account no longer defines is still
+      // typed, by the command the template stored.
+      const opened = await createWindow(
+        {
+          host: { id: place.hostId },
+          cwd: place.cwd,
+          ...(templateAgent ? { agent: templateAgent } : {}),
+          ...(tile.run.kind === "agent" && !templateAgent
+            ? { command: storedCommand ?? null }
+            : {}),
+          workspace: {
+            kind: "workspace",
+            workspaceId,
+            tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
+          },
+        },
+        windowDependencies(dependencies),
+      );
+      if (opened.status === "created_unqueued") agentLaunchesSkipped += 1;
     }
   }
 
@@ -259,30 +264,24 @@ export async function duplicateWorkspaceDeep(
         if (!session) continue;
         const access = await dependencies.getSessionAccess(session.id);
         const currentAgent = sessionAgent(session, input.agents);
-        const conversation = currentAgent
-          ? newAgentConversationId(currentAgent.kind, dependencies.randomId)
-          : null;
-        const createdSession = await dependencies.createSession({
-          host_id: session.host_id,
-          cwd: session.cwd,
-          name: session.name,
-          ...(currentAgent ? { agent_id: currentAgent.id, agent_session_id: conversation } : {}),
-          skill_ids: access.skills.map((skill) => skill.id),
-          workspace_id: workspaceId,
-          tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
-        });
-        if (currentAgent) {
-          try {
-            await dependencies.pending.persist(
-              createdSession.id,
-              createdSession.host_id,
-              agentLaunchCommand(currentAgent, conversation),
-            );
-            queuedSessionIds.push(createdSession.id);
-          } catch {
-            agentLaunchesSkipped += 1;
-          }
-        }
+        // The same kind of window as its source, in a conversation of its own.
+        const opened = await createWindow(
+          {
+            host: { id: session.host_id },
+            cwd: session.cwd,
+            name: session.name,
+            ...(currentAgent ? { agent: currentAgent } : {}),
+            skillIds: access.skills.map((skill) => skill.id),
+            workspace: {
+              kind: "workspace",
+              workspaceId,
+              tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
+            },
+          },
+          windowDependencies(dependencies),
+        );
+        if (opened.status === "created_unqueued") agentLaunchesSkipped += 1;
+        else if (opened.pendingCommand) queuedSessionIds.push(opened.session.id);
       }
     }
     if (layout.active_tab) {

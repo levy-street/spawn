@@ -21,6 +21,15 @@ const POLL_INTERVAL_MS = 2_000;
 const POLL_LIMIT_MS = 3 * 60_000;
 const AUTO_OPEN_KEY_PREFIX = "spawn.hostUpdate.seen.";
 const ACTION_STATES = new Set(["available", "updating", "failed", "unsupported"]);
+
+/**
+ * Whether "Update SPAWN D…" has anything to do for this host: an update to
+ * install, one under way, one that failed, or a host too old to update
+ * itself. The phone asks the same (`hostNeedsUpdatePrompt`).
+ */
+export function hostNeedsUpdatePrompt(host: Pick<Host, "update">): boolean {
+  return ACTION_STATES.has(host.update.state);
+}
 const AUTO_OPEN_STATES = new Set(["available", "failed", "unsupported"]);
 const autoOpenedHosts = new Set<string>();
 

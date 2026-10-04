@@ -929,6 +929,9 @@ class HostOut(BaseModel):
     status: str
     last_seen_at: datetime | None = None
     last_disconnect: HostDisconnectOut = Field(default_factory=HostDisconnectOut)
+    # When this host was possessed: the row's own creation, which the profile
+    # already serves. Additive — a client older than it ignores the field.
+    created_at: datetime | None = None
     session_count: int = 0
     # Mesh R9: true once this host's daemon validates account-scoped chains;
     # the legacy per-host device-endorsement path is refused for such hosts.

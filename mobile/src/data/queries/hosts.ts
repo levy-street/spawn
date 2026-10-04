@@ -15,7 +15,6 @@ import {
   updateHost,
 } from "@/data/api/endpoints/hosts";
 import { listSessions } from "@/data/api/endpoints/sessions";
-import { listSkills } from "@/data/api/endpoints/skills";
 import { getHostPins } from "@/data/api/endpoints/trust";
 import type {
   HostAgentList,
@@ -30,7 +29,6 @@ import { activeDeviceIdentityAccount, subscribeDeviceIdentityAccount } from "@/l
 const HOSTS_REFRESH_MS = 10_000;
 const HOST_REFRESH_MS = 30_000;
 const SESSIONS_REFRESH_MS = 5_000;
-const HOST_AGENTS_REFRESH_MS = 60_000;
 const HOST_AGENTS_STALE_MS = 30_000;
 const HOST_UPDATE_POLL_MS = 2_000;
 const HOST_UPDATE_POLL_LIMIT_MS = 3 * 60 * 1_000;
@@ -208,11 +206,12 @@ export function useHostIdentityConflictQuery(
   });
 }
 
-export function useHostsQuery() {
+export function useHostsQuery({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.hosts(),
     queryFn: listHosts,
     refetchInterval: HOSTS_REFRESH_MS,
+    enabled,
   });
 }
 
@@ -326,22 +325,28 @@ export function useHostSessionsQuery(hostId: string) {
   });
 }
 
-export function useHostAgentsQuery(hostId: string, enabled: boolean) {
+/**
+ * Which agents a host has, checked when a person asks rather than on a timer.
+ * The check is the server asking the host to run each agent's version probe
+ * (`host.agents.check`), which is execution the server chooses the targets of
+ * (docs/DAEMON_COMMAND_AUTHORITY.md) — so a host's page never repeats it on
+ * its own, and opening the page does not start one.
+ */
+export function useHostAgentsQuery(hostId: string) {
   return useQuery({
     queryKey: qk.hostAgents(hostId),
     queryFn: () => listHostAgents(hostId),
-    enabled: enabled && hostId.length > 0,
-    refetchInterval: HOST_AGENTS_REFRESH_MS,
+    // Never on its own — not on mount, not when a "hosts" frame invalidates
+    // the key, not when the network returns: only the caller's `refetch()`,
+    // from a person's press, runs the probe. An answer already cached (from
+    // a window's agent sheet, say) is still read.
+    enabled: false,
     staleTime: HOST_AGENTS_STALE_MS,
   });
 }
 
 export function useAgentsQuery() {
   return useQuery({ queryKey: qk.agents(), queryFn: listAgents, staleTime: HOST_AGENTS_STALE_MS });
-}
-
-export function useSkillsQuery() {
-  return useQuery({ queryKey: qk.skills(), queryFn: listSkills, staleTime: HOST_AGENTS_STALE_MS });
 }
 
 export function useRenameHostMutation() {

@@ -56,6 +56,26 @@ scripts/, docs/   build helpers and app-specific notes
   `data/queries/` with its key in `queryKeys.ts`. Components never fetch
   directly.
 - Client-only state: `data/stores/`.
+- A host's page is `components/hosts/cockpit/`: one screen at `host/[id]` with
+  `UnderlineTabs` (Overview, Files, Sessions, Access), the tab in `?tab=` and
+  changed in place so back leaves the page. Files is the file browser itself
+  (`components/files/file-browser-body.tsx`) at home; a folder opened from it
+  is pushed as `host/[id]/files?path=`, one screen per folder, and that route
+  keeps its own identity-conflict gate so a link cannot open what the page
+  shuts. Something a host offers appears
+  there only through the capability registry, `data/selectors/host-offers.ts`
+  (`deriveHostOffers`, `useHostOffers` in `data/stores/host-capabilities.ts`):
+  a slot lights only when the host's own hello names its capability family
+  (never on the OS or a shared prefix) and this build ships its view — the
+  slot is in `SHIPPED_HOST_OFFERS` and its renderer in
+  `cockpit/host-offer-slots.tsx`, added in one change (a test holds the two
+  together). `host/[id]/agents.tsx` is a redirect stub to Overview for one OTA
+  cycle.
+- Every window the app opens — launcher, "New window here…"
+  (`launcher/open-here-sheet.tsx`), template replay, workspace and pane
+  duplicates — goes through `components/launcher/create-window.ts`: it names
+  the agent's conversation, asks the server for the window and queues the
+  agent's command. Anything every new window must carry is added there, once.
 - Realtime: the subprotocol names in `data/realtime/` (`spawn.v3`,
   `spawn.alerts.v1`) are the compatibility contract with the server, not a
   version — a server that requires a different one refuses the socket with a
@@ -100,10 +120,19 @@ scripts/, docs/   build helpers and app-specific notes
   signed in; at an always-fast cadence they were most of the server's request
   volume (2026-09-22).
 - Exact host figures (`host.metrics`) travel only over the host's own E2E
-  channel, and only for host cards on screen in the focused Hosts tab of a
-  foregrounded app, every three seconds (`components/hosts/hosts-screen.tsx`).
-  A card scrolled away, a card pushed over the tab, or a backgrounded app asks
-  nothing and holds no channel open; there is no opt-in switch.
+  channel, and only while someone can see them, every three seconds
+  (`components/hosts/live-host-metrics.ts`): for host cards on screen in the
+  focused Hosts tab (`components/hosts/hosts-screen.tsx`), and on a host's
+  Overview while it is the tab in front (`cockpit/host-cockpit-screen.tsx`).
+  A card scrolled away, a page pushed over, another tab or a backgrounded app
+  asks nothing; the host's page holds its one channel only while it is on
+  screen in a foregrounded app (the Files tab's browser holds its own on the
+  same terms, only while Files is in front). There is no opt-in switch.
+- A host's agent availability (`GET /api/hosts/{id}/agents`) makes the server
+  run version probes on the host, so it is checked when a person asks and
+  never on a timer, on opening a page, or when a realtime frame or a returning
+  network invalidates it: the query is disabled and only a press refetches it
+  (`cockpit/host-agents-section.tsx`).
 - The fleet is "Hosts" in copy and identifiers. The retired `/legion` address
   survives only as the `(drawer)/legion.tsx` redirect stub (one OTA cycle) and
   the `lib/linking.ts` alias; the profile client is `data/api/*/profile.ts`.

@@ -1,6 +1,6 @@
 import { StyleSheet, View } from "react-native";
 import type { CapacityPresentation } from "@/components/hosts/host-model";
-import { capacityLabel, formatBytes, formatDuration } from "@/components/hosts/host-model";
+import { capacityLabel } from "@/components/hosts/host-model";
 import { Text } from "@/components/ui/text";
 import { borderWidth, opacity, spacing, useTheme } from "@/theme";
 
@@ -89,10 +89,11 @@ function ExactMeter({
 export interface CapacityMeterProps {
   capacity: CapacityPresentation;
   /**
-   * Both meters on one line, without the coarse word labels or the exact
-   * reading's memory, load and uptime line — the shape a list row has room for,
-   * and the same height whichever resolution it is showing. The readings are
-   * still spoken: each meter names its value for assistive tech either way.
+   * Both meters on one line, without the coarse word labels — the shape a
+   * list row has room for, and the same height whichever resolution it is
+   * showing. The readings are still spoken: each meter names its value for
+   * assistive tech either way. The exact memory, load and uptime figures are
+   * the host page's to show (`cockpit/overview-tab.tsx`), as labelled facts.
    */
   compact?: boolean;
 }
@@ -125,11 +126,6 @@ export function CapacityMeter({ capacity, compact = false }: CapacityMeterProps)
     <View style={styles.stack} testID="exact-capacity">
       <ExactMeter label="CPU" percent={capacity.cpuPercent} />
       <ExactMeter label="MEM" percent={capacity.memoryPercent} />
-      <Text color="mutedForeground" variant="caption">
-        {formatBytes(capacity.memoryUsedBytes)} of {formatBytes(capacity.memoryTotalBytes)}
-        {capacity.loadOne === null ? "" : ` · load ${capacity.loadOne.toFixed(2)}`} · uptime{" "}
-        {formatDuration(capacity.uptimeSeconds)}
-      </Text>
     </View>
   );
 }

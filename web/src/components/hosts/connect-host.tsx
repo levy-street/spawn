@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PaceBar } from "@/components/ui/pace-bar";
 import { StatusDot } from "@/components/ui/status";
+import { Tabs } from "@/components/ui/tabs";
 import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { ApiError, auth, type DevicePendingApproval, type Host, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -351,32 +352,15 @@ export function ConnectHostSection(props: {
                 Install on {activeTarget?.label ?? "macOS / Linux"}
               </h3>
             </div>
-            <div
-              role="tablist"
-              aria-label="Install target"
-              className="flex flex-wrap gap-1 rounded-lg bg-muted/60 p-1"
-            >
-              {targetRows.map((target) => {
-                const selected = target.id === activeTarget?.id;
-                return (
-                  <Button
-                    key={target.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={selected}
-                    variant={selected ? "secondary" : "ghost"}
-                    size="sm"
-                    className="h-8 flex-1 whitespace-nowrap px-2 text-xs"
-                    onClick={() => {
-                      setChosenTarget(target.id);
-                      setCopyPulse(false);
-                    }}
-                  >
-                    {target.label}
-                  </Button>
-                );
-              })}
-            </div>
+            <Tabs
+              label="Install target"
+              items={targetRows.map((target) => ({ value: target.id, label: target.label }))}
+              value={activeTarget?.id}
+              onValueChange={(target) => {
+                setChosenTarget(target);
+                setCopyPulse(false);
+              }}
+            />
             {/* One line, as it will be typed. Wrapping broke a shell pipeline
                 across two rows mid-word on any narrow sheet, which reads as two
                 commands and hides the copy button below the fold of the chip;

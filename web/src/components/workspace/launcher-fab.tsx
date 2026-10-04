@@ -15,22 +15,13 @@ import { AgentIcon } from "@/components/icons/AgentIcon";
 import { HostUpdateDialog, useHostUpdate } from "@/components/release/HostUpdateDialog";
 import { CascadeMenu, type CascadeMenuHandle } from "@/components/ui/cascade-menu";
 import { toast } from "@/components/ui/toast";
-import {
-  type Agent,
-  ApiError,
-  agents,
-  type Host,
-  sessions,
-  type Workspace,
-  workspaces,
-} from "@/lib/api";
+import { type Agent, ApiError, agents, type Host, type Workspace, workspaces } from "@/lib/api";
 import { autoPlace, GRID_SIZE, type Rect, type Tile } from "@/lib/grid";
 import { activeTab, tabById, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { createWindow } from "./create-window";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { queryAllInPane, queryInPane, usePaneScope } from "./pane-scope";
-import { pendingLaunch } from "./pending-launch";
 import { useWherePanel } from "./where-picker";
 import {
   addPaneTiles,
@@ -214,51 +205,15 @@ export function LauncherFab({
         return { sessionId: null };
       }
       // A tap, or a drop on bare canvas: nothing was aimed at, so the pane
-      // joins an even band instead of halving the biggest occupant. The
-      // reshaped siblings have to land before the create — the server refuses
-      // a tile that overlaps what it still thinks is there.
-      if (!placed) {
-        const tab = tabById(layout, tabId) ?? activeTab(layout);
-        const added = addPaneTiles(tab.layout.tiles, PENDING_TILE_ID);
-        if (!added) throw new ApiError(409, "workspace_full", "workspace_full");
-        const landed = added.find((tile) => tile.session_id === PENDING_TILE_ID);
-        if (landed) {
-          placed = { x: landed.x, y: landed.y, w: landed.w, h: landed.h };
-          layout = (
-            await workspaces.update(workspace.id, {
-              layout: withActiveTab(
-                withTabTiles(
-                  layout,
-                  tab.id,
-                  added.filter((tile) => tile.session_id !== PENDING_TILE_ID),
-                ),
-                tabId,
-              ),
-            })
-          ).layout;
-        }
-      }
-      // The conversation the agent starts under, recorded with the window so
-      // a restart can resume it; null for a CLI that names its own.
-      const conversation =
-        choice.kind === "agent" ? newAgentConversationId(choice.agent.kind) : null;
-      const session = await sessions.create({
-        host_id: host.id,
+      // joins an even band of the tab on screen instead of halving the
+      // biggest occupant — createWindow makes that room before the create.
+      const created = await createWindow({
+        host,
         cwd,
-        ...(choice.kind === "agent" && {
-          agent_id: choice.agent.id,
-          agent_session_id: conversation,
-        }),
-        workspace_id: workspace.id,
-        tile: placed,
+        agent: choice.kind === "agent" ? choice.agent : null,
+        workspace: { id: workspace.id, tabId, tile: placed },
       });
-      if (choice.kind === "agent")
-        pendingLaunch.set(
-          session.id,
-          session.host_id,
-          agentLaunchCommand(choice.agent, conversation),
-        );
-      return { sessionId: session.id };
+      return { sessionId: created.session.id };
     },
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });

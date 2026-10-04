@@ -197,6 +197,48 @@ async def test_stale_host_status_and_disconnect_shape_on_all_host_routes(client)
         assert persisted.last_disconnect_reason == "stale"
 
 
+async def test_every_host_route_says_when_the_host_was_possessed(client):
+    """The host page reads "Possessed <date>" off the host itself, the same
+    instant the profile lists — the row's creation, never the last heartbeat."""
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    token = await _signup(client, "possessed-on@example.com")
+    possessed = datetime(2026, 9, 14, 8, 30, tzinfo=UTC)
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "possessed-on@example.com"))
+        ).scalar_one()
+        host = Host(
+            owner_user_id=user.id,
+            name="dream",
+            status="offline",
+            created_at=possessed,
+            last_seen_at=possessed + timedelta(days=12),
+        )
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    headers = {"Authorization": f"Bearer {token}"}
+    listed = await client.get("/api/hosts", headers=headers)
+    got = await client.get(f"/api/hosts/{host_id}", headers=headers)
+    patched = await client.patch(
+        f"/api/hosts/{host_id}", headers=headers, json={"name": "dream-renamed"}
+    )
+    profile = await client.get("/api/profile", headers=headers)
+    assert listed.status_code == got.status_code == patched.status_code == 200
+    list_host = next(item for item in listed.json() if item["id"] == host_id)
+    profile_host = next(item for item in profile.json()["hosts"] if item["id"] == host_id)
+    for payload in (list_host, got.json(), patched.json()):
+        served = datetime.fromisoformat(payload["created_at"])
+        # SQLite hands timestamps back without their zone; they are UTC.
+        assert (served if served.tzinfo else served.replace(tzinfo=UTC)) == possessed
+        assert payload["created_at"] == profile_host["created_at"]
+
+
 def _stage_daemon_manifest(tmp_path: Path) -> None:
     from spawn_server import release
 

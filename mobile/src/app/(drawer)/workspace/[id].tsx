@@ -1,6 +1,8 @@
 import { type Href, useLocalSearchParams, useRouter } from "expo-router";
+import { useEffect } from "react";
 
 import { WorkspaceDetail } from "@/components/workspace-detail/workspace-detail";
+import { rememberLastWorkspace } from "@/data/stores/last-workspace";
 
 function firstParam(value: string | string[] | undefined): string {
   return Array.isArray(value) ? (value[0] ?? "") : (value ?? "");
@@ -10,6 +12,9 @@ export default function WorkspaceDetailRoute() {
   const params = useLocalSearchParams<{ id?: string | string[] }>();
   const router = useRouter();
   const workspaceId = firstParam(params.id);
+
+  // Offered first wherever a window is opened from outside a workspace.
+  useEffect(() => rememberLastWorkspace(workspaceId), [workspaceId]);
 
   return (
     <WorkspaceDetail

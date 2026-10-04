@@ -20,15 +20,18 @@ src/
                   claude-plan-calculator/ and tmux-cheatsheet/ are its two
                   hand-built tool pages; docs/ renders design documents from
                   ../docs on-site; llms.txt/ serves the AI-crawler summary;
-                  hosts/ is the Hosts page, each host's page and its files —
-                  `/legion` is a redirect to it in next.config.ts)
+                  hosts/ is the Hosts page and each host's page — a layout
+                  with one route per section: Overview, files/, sessions/,
+                  access/ — and `/legion` is a redirect to it in
+                  next.config.ts)
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ grimoire/ hosts/ icons/ nav/
                   release/ onboarding/ profile/ session/ settings/ terminal/
                   trust/ ui/ workspace/
                   (grimoire/ is the frame and templates of the SEO pages;
                   hosts/ holds the sidebar's Hosts strip, the Hosts page's
-                  cards and the shared host connection provider)
+                  cards, the shared host connection provider, and cockpit/ —
+                  the frame and sections of a host's own page)
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files (lib/files/ is
@@ -119,6 +122,22 @@ from the catalogue. Every claim about spawnd survives a diff against
   `/legion` redirect, the server's `legion_days` table, and the
   `spawn.sidebar.legionOpen` storage key. `scripts/check-product-vocabulary.sh`
   enforces this across `src/` here and in `mobile/`.
+- A window is opened in one place: `createWindow` in
+  `components/workspace/create-window.ts`. Every "+" — the menus, the
+  launcher, a duplicate, a template, "New window here…" on a host's page —
+  calls it to create the session, record its agent and conversation, and
+  queue the agent's launch, so whatever has to be settled with a host before
+  a window starts is settled once. A list of skills is granted as given,
+  empty included (a duplicate carries exactly its source's, through
+  `duplicateWindow`); only an omitted list means the account's defaults.
+  Widgets (the file explorer pane) are layout, not windows, and are placed
+  by their surface.
+- A host's page grows by capability, never by OS: anything beyond Overview,
+  Files, Sessions and Access — a Desktop tab, or a section of Overview for
+  its conversations, Claude accounts or boxes — is a slot in
+  `lib/host-offers.ts`, keyed by one versioned capability family the host
+  advertises on this device's own connection, and lit only once this build
+  ships its view. The phone keeps the same slots on the same families.
 - Polling idles when nothing is pending. A `refetchInterval` under ten seconds
   is for a state a person is waiting on right now — a live ceremony, a blocked
   session — and gives way to the idle cadence the moment that state clears

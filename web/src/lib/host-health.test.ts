@@ -15,6 +15,7 @@ const baseHost = (overrides: Partial<Host> = {}): Host => ({
   status: "offline",
   last_seen_at: "2026-08-25T00:00:00Z",
   last_disconnect: null,
+  created_at: null,
   session_count: 0,
   supports_account_chains: false,
   cpu_cores: null,

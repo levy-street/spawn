@@ -544,10 +544,12 @@ test("keyboard: arrows move, Enter opens, Backspace goes back up, F2 renames", a
   await page.keyboard.press("Backspace");
   await expect(item(page, "projects")).toHaveAttribute("aria-selected", "true");
 
-  // Back and Forward walk the trail.
-  await page.getByRole("button", { name: "Back" }).click();
+  // Back and Forward walk the trail. (The browser's own: the host page's
+  // header has a Back of its own, out of the page.)
+  const toolbar = page.getByRole("toolbar", { name: "Files toolbar" });
+  await toolbar.getByRole("button", { name: "Back" }).click();
   await expect(item(page, "readme.md")).toBeVisible();
-  await page.getByRole("button", { name: "Forward" }).click();
+  await toolbar.getByRole("button", { name: "Forward" }).click();
   await expect(item(page, "notes.txt")).toBeVisible();
 
   // Type-ahead jumps to a name; F2 renames it.
@@ -624,7 +626,10 @@ test("Go to folder takes ~ paths and says why it cannot go somewhere", async ({ 
   await field.fill("spawn");
   await field.press("Enter");
   await expect(item(page, "main.rs")).toBeVisible();
-  await page.getByRole("button", { name: "Back" }).click();
+  await page
+    .getByRole("toolbar", { name: "Files toolbar" })
+    .getByRole("button", { name: "Back" })
+    .click();
   await expect(item(page, "readme.md")).toBeVisible();
 
   await page.getByRole("button", { name: "Go to folder" }).click();
