@@ -454,6 +454,17 @@ export function giveUpBody(source: string, target: string | null): string {
   return `The window stops on ${source}. Its conversation stays where it is now — set aside on ${source}, or already on ${target ?? "the host it was going to"} — until you resolve the move from ${source}'s page.`;
 }
 
+/**
+ * A move settled from a host's page: the window is not on screen here, so the
+ * agent the settling device owes it resumes once the window is opened here
+ * (opening takes its display, and the queued line is typed).
+ */
+export function resumeWhenOpenedLine(host: string): string {
+  return `Claude Code resumes on ${host} when you open the window.`;
+}
+
+export const OPEN_WINDOW_LABEL = "Open window";
+
 export function resolveOutcomeCopy(
   outcome: ResolveOutcome,
   names: { source: string; target: string | null },
@@ -481,6 +492,57 @@ export function resolveOutcomeCopy(
     case "failed":
       return "SPAWN D couldn't resolve the move. Try again in a moment.";
   }
+}
+
+/** A settled Resolve said as a toast (`resolveToast`). */
+export interface ResolveToast {
+  message: string;
+  detail: string | null;
+  /** Stays until dismissed: it carries something to act on. */
+  persistent: boolean;
+  /** Offer to open the window, where this device's resume for it waits. */
+  openWindow: boolean;
+}
+
+/**
+ * What a host's page says once Resolve settles a move: the row it was
+ * pressed on goes with the move, so the outcome is a toast rather than the
+ * dialog's line. Null for an outcome the dialog keeps — one that still asks
+ * for something (a host to come back, a try again, taking the window to its
+ * conversation). `waiting` is whether this device has the window's resume
+ * queued, to type when the window is opened here: then the toast says so and
+ * offers to open it.
+ */
+export function resolveToast(
+  outcome: ResolveOutcome,
+  names: { source: string; target: string | null },
+  waiting: boolean,
+): ResolveToast | null {
+  switch (outcome.kind) {
+    case "finished":
+    case "put_back":
+    case "given_up":
+    case "elsewhere":
+    case "gone":
+      break;
+    default:
+      return null;
+  }
+  const message = resolveOutcomeCopy(outcome, names);
+  const conflicts =
+    outcome.kind === "put_back" && outcome.conflicts ? conflictsLine(names.source) : null;
+  const resumes =
+    waiting &&
+    ((outcome.kind === "finished" && !outcome.archived) ||
+      (outcome.kind === "put_back" && outcome.restarted));
+  const host =
+    outcome.kind === "finished" ? (names.target ?? "the host it was going to") : names.source;
+  return {
+    message,
+    detail: conflicts ?? (resumes ? resumeWhenOpenedLine(host) : null),
+    persistent: conflicts !== null || resumes,
+    openWindow: resumes,
+  };
 }
 
 // ---- the host's page ------------------------------------------------------------------

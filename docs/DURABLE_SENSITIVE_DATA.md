@@ -169,7 +169,10 @@ itself writes, served to a device only over `spawn.host.ctl`: located by
   discard (it was killed meanwhile) lapses three minutes after it was
   written. So a record outlives its move only while a confirmed relaunch can
   still be owed, and never becomes something typed later into a live Claude
-  Code.
+  Code. A move put back — by the device that moved it or by one that
+  resolves it — keeps only the resume line for the window on its source
+  (no note: nothing moved), written as the restart is asked for, the way an
+  ordinary restart's is, under the same 15-minute lapse.
 
 This changes none of the declarations above: `phase2_opaque_server_blob_fallback`
 stays forbidden, and a conversation backup, if ever built, needs its own

@@ -33,7 +33,12 @@
  * (`giveUpMove`): the server's move ends and neither host is touched.
  */
 
-import { planRelaunch, type RelaunchAgent, type RelaunchPlan } from "@/lib/agent-relaunch";
+import {
+  canonicalConversationId,
+  planRelaunch,
+  type RelaunchAgent,
+  type RelaunchPlan,
+} from "@/lib/agent-relaunch";
 import type { ConversationState } from "@/lib/conversation";
 import {
   abortRetire,
@@ -48,6 +53,7 @@ import {
   windowRuns,
 } from "./conv";
 import { defaultPermissionMode, readTargetSettings } from "./permission-modes";
+import { putBackLine, readPutBackFacts } from "./put-back";
 import {
   type MoveServerPort,
   readAfterCommitConflict,
@@ -73,6 +79,9 @@ export interface ResolveRequest {
   /** The folder the mover picked on the target, when this browser knows it. */
   targetCwd?: string | null;
   agent: RelaunchAgent;
+  /** The conversation the window's row names, for a put-back with no
+   *  transfer to name it. */
+  conversationId?: string | null;
   /** Whether the server still has the window moving: false settles the hosts only. */
   serverMoving: boolean;
   /** Only this transfer (the host cockpit's list); otherwise the window's newest. */
@@ -92,7 +101,10 @@ export interface ResolvePorts {
   launcher: {
     prepareOn(hostId: string, plan: RelaunchPlan | null): Promise<void>;
     abandon(): void;
-    restartOnSource(): Promise<void>;
+    /** Restart the window on the source, `line` queued for this device to
+     *  type there (it takes the window's display to do it); with no line,
+     *  the ordinary restart. */
+    restartOnSource(line: string | null): Promise<void>;
     refetch(): void;
   };
 }
@@ -128,6 +140,7 @@ async function abortOnServer(
   ports: ResolvePorts,
   retireRan: boolean,
   conflicts: boolean,
+  put: { source: CarrierClient; conversationId: string | null },
 ): Promise<ResolveOutcome> {
   if (!request.serverMoving) return { kind: "put_back", restarted: false, conflicts };
   let status: string;
@@ -144,12 +157,35 @@ async function abortOnServer(
   const restart = status === "killed" || retireRan;
   if (restart) {
     try {
-      await ports.launcher.restartOnSource();
+      await ports.launcher.restartOnSource(await resumeLine(request, ports, put));
     } catch {
       // The stopped pane offers Restart itself.
     }
   }
   return { kind: "put_back", restarted: restart, conflicts };
+}
+
+/**
+ * Whoever puts a move back leaves the window running its agent: the line
+ * that resumes the conversation on the source, its mode explicit
+ * (`put-back.ts`). Null when there is no conversation to name — the
+ * restart then goes the ordinary way.
+ */
+async function resumeLine(
+  request: ResolveRequest,
+  ports: ResolvePorts,
+  put: { source: CarrierClient; conversationId: string | null },
+): Promise<string | null> {
+  const conversationId = canonicalConversationId(
+    put.conversationId ?? request.conversationId ?? null,
+  );
+  if (!conversationId) return null;
+  const facts = await readPutBackFacts(
+    put.source,
+    { conversationId, cwd: request.cwd },
+    ports.readText,
+  );
+  return putBackLine(request.agent, conversationId, facts);
 }
 
 /** The folder a resolver starts the window in on the target when it was
@@ -355,7 +391,7 @@ export async function resolveMove(
   }
   if (!outgoing) {
     if (!request.serverMoving || !request.sessionId || request.transferId)
-      return abortOnServer(request, ports, false, false);
+      return abortOnServer(request, ports, false, false, { source, conversationId: null });
     // A retire may be under way: its record lands only once the window has
     // stopped. Never decided on one empty listing.
     const sleep = ports.sleep ?? ((ms: number) => new Promise((done) => setTimeout(done, ms)));
@@ -374,7 +410,7 @@ export async function resolveMove(
       // The source confirms nothing is moving only when it answered both
       // times and the window neither stopped nor started meanwhile.
       if (before === null || after === null || before !== after) return { kind: "source_busy" };
-      return abortOnServer(request, ports, false, false);
+      return abortOnServer(request, ports, false, false, { source, conversationId: null });
     }
   }
   // A host's page knows the transfer, not the window: the source's record
@@ -440,7 +476,10 @@ async function putBackFromSource(
       return { kind: "source_unreachable" };
   }
   // The source listed the transfer: its retire ran, and stopped the window.
-  return abortOnServer(request, ports, true, conflicts);
+  return abortOnServer(request, ports, true, conflicts, {
+    source,
+    conversationId: outgoing.conversationId,
+  });
 }
 
 /**

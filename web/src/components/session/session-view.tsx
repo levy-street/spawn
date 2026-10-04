@@ -42,7 +42,11 @@ import {
   ResumingGuard,
 } from "@/components/workspace/move-overlay";
 import { MoveResolveDialog } from "@/components/workspace/move-resolve-dialog";
-import { useMoveFor, useMoves } from "@/components/workspace/moves-provider";
+import {
+  useDismissWhenResolved,
+  useMoveFor,
+  useMoves,
+} from "@/components/workspace/moves-provider";
 import { useMoveNoteDelivery } from "@/components/workspace/use-move-note";
 import { usePendingLaunchDrain } from "@/hooks/usePendingLaunchDrain";
 import {
@@ -114,6 +118,8 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const session = sessionQ.data;
   const daemonConnection = useDaemonConnection(session?.host_id ?? null);
   const moving = session ? sessionMoving(session) : false;
+  // A card saying the window stays "Moving" goes once it is resolved underneath.
+  useDismissWhenResolved(covering, moving);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const sessionHost = hostsQ.data?.find((host) => host.id === session?.host_id) ?? null;
 

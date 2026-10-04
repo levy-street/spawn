@@ -194,6 +194,7 @@ export async function restartSessionAgent({
   transcripts,
   doneAsking,
   recordConversation,
+  claimDisplay = false,
 }: {
   session: Session;
   agents: readonly Agent[];
@@ -214,6 +215,9 @@ export async function restartSessionAgent({
    *  other devices agree. Best effort, and only for an agent SPAWN D launches
    *  under an id. */
   recordConversation?: (conversationId: string) => Promise<unknown>;
+  /** The resume is this device's to type wherever the display is — a move
+   *  put back (`pendingLaunch.claim`); an ordinary restart waits for it. */
+  claimDisplay?: boolean;
 }): Promise<AgentRestartResult> {
   const agent = sessionAgent(session, agents);
   let live: ConversationInspection | null = null;
@@ -263,7 +267,10 @@ export async function restartSessionAgent({
   // command — for the window as it runs here, so a move that lands first
   // drops it rather than resuming the conversation over there; forgotten
   // again if the restart never happened.
-  if (plan.kind === "agent") pendingLaunch.set(session.id, session.host_id, plan.command);
+  if (plan.kind === "agent") {
+    if (claimDisplay) pendingLaunch.claim(session.id, session.host_id, plan.command);
+    else pendingLaunch.set(session.id, session.host_id, plan.command);
+  }
   try {
     await restart();
   } catch (error) {

@@ -853,8 +853,12 @@ export class FakeLauncher implements MoveLauncherPort {
     this.queued = false;
   }
 
-  async restartOnSource(): Promise<void> {
+  /** The line a put-back asked to have typed on the source. */
+  restartLine: string | null | undefined;
+
+  async restartOnSource(line: string | null): Promise<void> {
     this.events.push("restart");
+    this.restartLine = line;
   }
 
   refetch(): void {

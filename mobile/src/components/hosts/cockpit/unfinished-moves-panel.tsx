@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { type Href, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { formatFileSize } from "@/components/files/format";
@@ -135,6 +136,7 @@ export function unfinishedMoveRows({
  */
 export function UnfinishedMovesPanel({ host }: HostOfferSlotProps): React.JSX.Element | null {
   const client = useQueryClient();
+  const router = useRouter();
   const [transport, setTransport] = useState<HostTransport | null>(null);
   const [state, setState] = useState<TransportState>("idle");
   const [transfers, setTransfers] = useState<ConversationTransfers | null>(null);
@@ -169,6 +171,10 @@ export function UnfinishedMovesPanel({ host }: HostOfferSlotProps): React.JSX.El
       void client.invalidateQueries({ queryKey: qk.sessions() });
       void refresh();
     },
+    // The window is not on this page: a move settled here says that its
+    // agent resumes when the window is opened, and opens it on request —
+    // the opening takes its display and types the resume.
+    openWindow: (session) => router.push(`/terminal/${session.id}` as Href),
   });
 
   const name = (id: string | null) => (id ? hostMap.get(id)?.name : null) ?? copy.MOVE_ANOTHER_HOST;

@@ -186,8 +186,16 @@ from the catalogue. Every claim about spawnd survives a diff against
   asked queues what is typed after it (`move-launch.ts`). Exactly one tab
   runs a move, queues its relaunch and restarts a window put back: each is a
   Web Lock claim one tab takes for good, never a timeout that lets a second
-  tab do it too. The orchestrator, carrier and resolver in `lib/move/` are
-  framework-free and tested against `lib/move/fakes.ts`; once the target has
+  tab do it too. Whoever settles a move — the mover, or any device that
+  resolves it — leaves the window running its agent: the resume (put back,
+  the line from `lib/move/put-back.ts`, mode explicit) is queued with
+  `pendingLaunch.claim`, and that device's view of the window takes the
+  display to type it (`usePendingLaunchDrain`) rather than waiting for Take
+  control; with no view of it (a host's page), the outcome says so and
+  offers to open the window. A card saying the window stays "Moving" goes
+  once its row stops reading moving (`useDismissWhenResolved`). The
+  orchestrator, carrier and resolver in `lib/move/` are framework-free and
+  tested against `lib/move/fakes.ts`; once the target has
   committed, a move only finishes, and a refusal from the server is read
   again rather than believed (`lib/move/server.ts`). Every string a move says
   is in `lib/move/copy.ts`, which the phone mirrors string for string

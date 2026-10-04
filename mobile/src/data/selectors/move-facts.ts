@@ -1,4 +1,10 @@
-import { type AgentYolo, agentYoloAvailable } from "@/data/selectors/agent-relaunch";
+import {
+  type AgentYolo,
+  agentYoloAvailable,
+  type RelaunchAgent,
+  relaunchLine,
+  shellFamily,
+} from "@/data/selectors/agent-relaunch";
 import type { ConnectionInfo } from "@/terminal/transport/types";
 
 /**
@@ -253,4 +259,40 @@ export function defaultPermissionMode(
     }
   }
   return "default";
+}
+
+/** What the source says about itself, for a put-back's line: either may be unknown. */
+export interface PutBackFacts {
+  /** Its login shell (`conv.probe`), which spells the line. */
+  readonly loginShell: string | null;
+  /** Its Claude Code settings file, for `permissions.defaultMode`. */
+  readonly settings: string | null;
+}
+
+export const NO_PUT_BACK_FACTS: PutBackFacts = { loginShell: null, settings: null };
+
+/**
+ * What brings Claude Code back on the source when a move is put back.
+ * Whoever puts a move back — this device that moved it, or any device that
+ * resolves it — leaves the window running its agent: the conversation that
+ * was moving, resumed with an explicit `--permission-mode` like every line
+ * typed after a move, never the mode its record ran in. The mode is the one
+ * a fresh window starts in there (`defaultPermissionMode`), the line spelled
+ * for the source's shell. Null when it cannot be said with a mode (an agent
+ * with no permission-mode flag): the restart then goes the ordinary way. The
+ * browser composes the same line (web `lib/move/put-back.ts`).
+ */
+export function putBackLine(
+  agent: RelaunchAgent,
+  conversationId: string,
+  facts: PutBackFacts,
+): string | null {
+  return relaunchLine(
+    agent,
+    { resume: conversationId },
+    {
+      shell: shellFamily(facts.loginShell),
+      permissionMode: defaultPermissionMode(agent, facts.settings),
+    },
+  );
 }

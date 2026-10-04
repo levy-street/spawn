@@ -288,6 +288,15 @@ export const moveGiveUpBody = (from: string, to: string | null) =>
 export const moveGivenUp = (from: string) =>
   `The move was given up and the window is back on ${from}. Resolve its conversation from ${from}'s page once both hosts can be reached.`;
 export const moveResolvedFinished = (to: string) => `Moved to ${to}.`;
+
+/**
+ * A move settled from a host's page: the window is not on screen, so the
+ * agent this device owes it resumes once the window is opened here (opening
+ * takes its display, and the queued line is typed).
+ */
+export const moveResumeWhenOpened = (host: string) =>
+  `Claude Code resumes on ${host} when you open the window.`;
+export const MOVE_OPEN_WINDOW = "Open window";
 export const moveResolveSourceOffline = (from: string) =>
   `${from} is offline, so this move can't be finished or put back until it's back.`;
 /** `to` is null where this device cannot name the host it was going to. */

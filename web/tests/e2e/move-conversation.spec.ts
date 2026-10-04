@@ -14,7 +14,12 @@ import {
   WORKSPACE_ID,
   workspace,
 } from "./app-mocks";
-import { handleSessionRtcSignal, installSessionRtcMock, sendPty } from "./session-rtc-mock";
+import {
+  handleSessionRtcSignal,
+  installSessionRtcMock,
+  sendPty,
+  setDisplayControl,
+} from "./session-rtc-mock";
 
 // A Claude Code window on dream (Linux) moves to Mac (macOS) with its
 // conversation, over the mock daemon pair's conversation carrier.
@@ -428,4 +433,157 @@ test("a key pressed while the note waits takes the terminal back: nothing reache
   ).toBeVisible();
   const typed = ptyText(messages);
   expect(typed.slice(typed.indexOf(line) + line.length)).not.toContain("q");
+});
+
+/** dream's record of a move to Mac it set aside, which Mac never committed. */
+const HELD_TRANSFER = {
+  transfer_id: "55555555-5555-4555-8555-555555555555",
+  conversation_id: CONVERSATION,
+  session_id: SESSION_ID,
+  to_host_id: HOST_ID,
+  state: "held",
+  created_at: 1,
+  length: 100,
+  sha256: "b".repeat(64),
+};
+
+/** A worker that ends — stopped by a retire, or restarted — drops the view's
+ *  channel, and the view attaches anew to whatever runs next. */
+async function workerEnds(page: Page) {
+  await page.evaluate(() =>
+    (
+      window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
+    ).__spawnRtcTest.replaceRtcGeneration(),
+  );
+}
+
+const MOVING = {
+  status: "moving",
+  activity_state: "moving",
+  activity_label: "Moving",
+  // The retire stopped Claude on dream before the move went quiet.
+  exited_at: "2026-10-04T00:00:00Z",
+};
+
+test("put back from here while another device holds the display, Claude Code comes back: this view takes the display and types the resume", async ({
+  page,
+}) => {
+  const { store, messages } = await openMoveWorkspace(page, {
+    conversations: {
+      transfers: (hostId) => ({
+        outgoing: hostId === DREAM_ID ? [HELD_TRANSFER] : [],
+        incoming: [],
+        truncated: false,
+      }),
+    },
+    restartSession: async (id, route, current) => {
+      const restarted = current.sessions.find((item) => item.id === id);
+      if (restarted) Object.assign(restarted, { status: "running", exited_at: null });
+      await route.fulfill({ json: restarted });
+      await workerEnds(page);
+    },
+  });
+  // Opened here, so this view held the display — until another device took it.
+  const terminal = page.locator('[data-session-id][data-input-ready="true"]');
+  await expect(terminal).toBeVisible();
+  await setDisplayControl(page, { owner: false, cols: 100, rows: 30, viewers: 2 });
+  await expect(terminal).toHaveCount(0);
+
+  // That device moves the window; its move goes quiet part-way.
+  const row = store.sessions.find((item) => item.id === SESSION_ID);
+  if (!row) throw new Error("no window");
+  Object.assign(row, MOVING);
+  await workerEnds(page);
+  const pane = page.getByRole("region", { name: "Moving to another host…" });
+  await expect(pane).toBeVisible({ timeout: 15_000 });
+  const before = ptyText(messages).length;
+
+  await pane.getByRole("button", { name: "Resolve" }).click();
+  const dialog = page.getByRole("dialog", { name: "Finish or put back this move?" });
+  await dialog.getByRole("button", { name: "Resolve" }).click();
+  await expect(dialog).toContainText("Back on dream — nothing was lost.", { timeout: 20_000 });
+  expect(store.requests.moves.map((move) => move.kind)).toEqual(["abort"]);
+
+  // The restarted shell's first line is the resume, its mode said outright,
+  // typed here though another device had the display: this view took it.
+  const line = `claude --resume ${CONVERSATION} --permission-mode default\r`;
+  await expect.poll(() => ptyText(messages).slice(before), { timeout: 15_000 }).toContain(line);
+  await expect(terminal).toBeVisible();
+});
+
+test("Resolve on a host's page says how it ended, and the window put back resumes Claude Code when opened", async ({
+  page,
+}) => {
+  let aborted = () => false;
+  const { store, messages } = await openMoveWorkspace(page, {
+    window: claudeWindow(MOVING),
+    conversations: {
+      transfers: (hostId) => ({
+        outgoing: hostId === DREAM_ID && !aborted() ? [HELD_TRANSFER] : [],
+        incoming: [],
+        truncated: false,
+      }),
+    },
+  });
+  aborted = () =>
+    store.requests.conversations.some((call) => call.operation === "conv.retire.abort");
+  await page.goto(`/hosts/${DREAM_ID}`);
+  const section = page.getByRole("region", { name: "Unfinished moves" });
+  const item = section
+    .getByRole("listitem")
+    .filter({ hasText: "Conversation 6f1c2a9e moving to Mac" });
+  await item.getByRole("button", { name: "Resolve" }).click();
+  const dialog = page.getByRole("dialog", { name: "Finish or put back this move?" });
+  await dialog.getByRole("button", { name: "Resolve" }).click();
+
+  // The row goes with the move; how it ended is said all the same.
+  await expect(page.getByText("Back on dream — nothing was lost.")).toBeVisible({
+    timeout: 20_000,
+  });
+  await expect(
+    page.getByText("Claude Code resumes on dream when you open the window."),
+  ).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+  await expect(section).toHaveCount(0);
+  expect(store.requests.moves.map((move) => move.kind)).toEqual(["abort"]);
+
+  // Opening the window takes its display and types the resume there.
+  const before = ptyText(messages).length;
+  await page.getByRole("button", { name: "Open window" }).click();
+  await expect(page).toHaveURL(new RegExp(`/w/${WORKSPACE_ID}.*focus=${SESSION_ID}`));
+  await expect
+    .poll(() => ptyText(messages).slice(before), { timeout: 15_000 })
+    .toContain(`claude --resume ${CONVERSATION} --permission-mode default\r`);
+});
+
+test("a card saying the window stays moving goes once the move is resolved underneath it", async ({
+  page,
+}) => {
+  // Another device began moving the window just before this one asked.
+  const { store } = await openMoveWorkspace(page, {
+    moveSession: async (kind, id, _body, route, current) => {
+      if (kind !== "begin") return false;
+      const row = current.sessions.find((item) => item.id === id);
+      if (row) Object.assign(row, MOVING);
+      await route.fulfill({ status: 409, json: { detail: "move_in_progress" } });
+      return true;
+    },
+  });
+  await pickMac(page);
+  await page.getByRole("button", { name: "Move with conversation" }).click();
+  const card = page.getByRole("region", { name: "Moving to Mac…" });
+  await expect(card).toContainText(
+    "This window is moving to another host. Finish or cancel the move first.",
+  );
+  await expect(card.getByRole("button", { name: "Resolve" })).toBeVisible();
+  const chip = page.getByRole("button", { name: /^Runs in .* on dream\. Change where it runs$/ });
+  await expect(chip).toBeDisabled();
+
+  // That device's move is resolved — from it, or from a host's page.
+  const row = store.sessions.find((item) => item.id === SESSION_ID);
+  if (!row) throw new Error("no window");
+  Object.assign(row, { status: "running", activity_state: "quiet", activity_label: "Quiet" });
+  // No Dismiss: the card goes on its own, and the chip with it.
+  await expect(card).toHaveCount(0, { timeout: 15_000 });
+  await expect(chip).toBeEnabled();
 });

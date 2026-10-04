@@ -28,10 +28,12 @@ import {
   movedToast,
 } from "@/lib/move/copy";
 import {
+  awaitingResolve,
   type HubBus,
   type HubMove,
   MoveHub,
   type MoveRecord,
+  resolvedUnderneath,
   webLockClaims,
 } from "@/lib/move/move-hub";
 import {
@@ -42,7 +44,7 @@ import {
 } from "@/lib/move/orchestrator";
 import { displayPath } from "@/lib/places";
 import { browserTabId } from "@/lib/tab-id";
-import { createLocalLaunch, moveServer } from "./move-launch";
+import { createLocalLaunch, moveServer, readHostText } from "./move-launch";
 
 /**
  * Moves outlive the page they were started from: the hub lives here, beside
@@ -85,6 +87,29 @@ export function useMoveFor(sessionId: string | null | undefined): HubMove | null
   const moves = useContext(MovesListContext);
   if (!sessionId) return null;
   return moves.find((move) => move.sessionId === sessionId) ?? null;
+}
+
+/**
+ * A card over a window saying it stays "Moving" until it is resolved goes
+ * once the server's row stops being moving — resolved here, from another
+ * device, or from a host's page — instead of staying, untrue, over the pane
+ * with its where chip held until someone presses Dismiss
+ * (`resolvedUnderneath`). The rows are fetched afresh as the card appears, so
+ * the row it is judged by is no older than the card.
+ */
+export function useDismissWhenResolved(covering: HubMove | null, serverMoving: boolean): void {
+  const moves = useContext(MovesContext);
+  const queryClient = useQueryClient();
+  const card = awaitingResolve(covering);
+  const seen = useRef<string | null>(null);
+  useEffect(() => {
+    if (card) void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+  }, [card, queryClient]);
+  useEffect(() => {
+    const next = resolvedUnderneath(card, serverMoving, seen.current);
+    seen.current = next.seen;
+    if (next.dismiss && card) moves?.dismiss(card);
+  }, [card, serverMoving, moves]);
 }
 
 const READY_MS = 15_000;
@@ -191,7 +216,12 @@ export function MovesProvider({ children }: { children: ReactNode }) {
         clientsByMove.set(plan.transferId, opened);
         return new MoveOrchestrator(
           plan,
-          { server: moveServer, hosts: hostsPort(plan, connectionsRef, opened), launcher },
+          {
+            server: moveServer,
+            hosts: hostsPort(plan, connectionsRef, opened),
+            launcher,
+            readText: readHostText,
+          },
           (view) => {
             emit(view);
             // Its channels go once the move is over; a paused move keeps them.

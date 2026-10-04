@@ -8,6 +8,7 @@ import {
   type ResolveDeps,
   type ResolveOutcome,
   resolveMove,
+  resolveToast,
 } from "@/components/workspace-detail/move-resolve";
 import { MoveResolveSheet, type MoveResolveState } from "@/components/workspace-detail/move-sheets";
 import { sessionAgent } from "@/data/selectors/agent";
@@ -36,6 +37,7 @@ export function useResolveMove({
   deps,
   onResolving,
   onSettled,
+  openWindow,
 }: {
   agents: readonly AgentDef[];
   hosts: readonly Host[];
@@ -47,6 +49,13 @@ export function useResolveMove({
   /** It ended — the caller refreshes what it lists. `finished` when this
    *  device finished it and the window runs on its new host. */
   onSettled?: (session: Session | null, outcome: ResolveOutcome) => void;
+  /**
+   * For a screen that does not show the window (a host's page): a move this
+   * device settled leaves the window's resume queued here, and the toast
+   * says it resumes when the window is opened, with this to open it. Screens
+   * that show the window open it themselves (`onSettled`).
+   */
+  openWindow?: (session: Session) => void;
 }): {
   open: (session: Session) => void;
   openTask: (task: ResolveTask) => void;
@@ -100,13 +109,20 @@ export function useResolveMove({
   const settle = useCallback(
     (target: Session | null, outcome: ResolveOutcome) => {
       onSettled?.(target, outcome);
-      if (
-        outcome.kind === "finished" ||
-        outcome.kind === "restored" ||
-        outcome.kind === "settled" ||
-        outcome.kind === "given_up"
-      ) {
-        toast.success(outcome.message);
+      const said = resolveToast(
+        outcome,
+        (hostId) => hostMap.get(hostId)?.name ?? copy.MOVE_ANOTHER_HOST,
+        openWindow !== undefined,
+      );
+      if (said) {
+        const window = said.openWindow;
+        toast.success(said.message, {
+          ...(said.detail ? { detail: said.detail } : {}),
+          ...(said.persistent ? { persistent: true } : {}),
+          ...(window && openWindow
+            ? { actions: [{ label: copy.MOVE_OPEN_WINDOW, onPress: () => openWindow(window) }] }
+            : {}),
+        });
         setTask(null);
         setState({ kind: "confirm" });
         return;
@@ -115,7 +131,7 @@ export function useResolveMove({
       // the sheet says so, and what can still be done.
       setState({ kind: "outcome", outcome });
     },
-    [onSettled, toast],
+    [hostMap, onSettled, openWindow, toast],
   );
 
   const run = useCallback(

@@ -81,3 +81,31 @@ export function moveUnderWay(phase: MovePhase): boolean {
     phase.step === "restoring"
   );
 }
+
+/**
+ * Whether a move's phase holds the window "moving" until something settles
+ * it: a held failure — paused, or left for Resolve — which the sheet says
+ * stays so until the person goes on, puts it back or resolves it.
+ */
+export function holdsWindowMoving(phase: MovePhase): boolean {
+  return phase.step === "failed" && phase.failure.held;
+}
+
+/**
+ * Whether such a move has been settled underneath this device: the server's
+ * row was seen moving while it was held, and no longer is — resolved from
+ * another device or a host's page. Its sheet then says something untrue and
+ * the move is let go. A row never seen moving decides nothing. `card` names
+ * the held move (null when none), `seen` the one whose row was last seen
+ * moving, carried from call to call. The browser keeps the same rule for its
+ * card (web `move-hub.ts`, `resolvedUnderneath`).
+ */
+export function resolvedUnderneath(
+  card: string | null,
+  serverMoving: boolean,
+  seen: string | null,
+): { seen: string | null; dismiss: boolean } {
+  if (card === null) return { seen: null, dismiss: false };
+  if (serverMoving) return { seen: card, dismiss: false };
+  return { seen, dismiss: seen === card };
+}

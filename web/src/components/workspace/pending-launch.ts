@@ -20,7 +20,13 @@
  *  (mobile `PENDING_LAUNCH_TTL_MS`). */
 export const PENDING_LAUNCH_TTL_MS = 15 * 60 * 1_000;
 
-type QueuedLaunch = { hostId: string; command: string; expiresAt: number };
+type QueuedLaunch = {
+  hostId: string;
+  command: string;
+  expiresAt: number;
+  /** Queued by this device to type itself: its view takes the display. */
+  claims: boolean;
+};
 
 const queued = new Map<string, QueuedLaunch>();
 
@@ -40,7 +46,33 @@ export const pendingLaunch = {
   /** Queue `command` for the window as it runs on `hostId` — the host the
    *  caller just created, restarted or moved it on. */
   set(sessionId: string, hostId: string, command: string, now: number = Date.now()): void {
-    queued.set(sessionId, { hostId, command, expiresAt: now + PENDING_LAUNCH_TTL_MS });
+    queued.set(sessionId, {
+      hostId,
+      command,
+      expiresAt: now + PENDING_LAUNCH_TTL_MS,
+      claims: false,
+    });
+  },
+  /**
+   * Queue `command` for this device to type itself, wherever the display is:
+   * what a device that moved a window, or settled a move — finished it, or put
+   * it back — owes the window. Its view of the window takes the display as an
+   * opening does (`usePendingLaunchDrain`), so the agent comes back even
+   * while another device is looking at the window, instead of waiting for
+   * someone to press Take control.
+   */
+  claim(sessionId: string, hostId: string, command: string, now: number = Date.now()): void {
+    queued.set(sessionId, {
+      hostId,
+      command,
+      expiresAt: now + PENDING_LAUNCH_TTL_MS,
+      claims: true,
+    });
+  },
+  /** Whether the command waiting for the window as it runs on `hostId` was
+   *  queued to take the display (`claim`). */
+  claims(sessionId: string, hostId: string, now: number = Date.now()): boolean {
+    return waiting(sessionId, hostId, now)?.claims === true;
   },
   /** Whether a command is waiting for the window as it runs on `hostId`,
    *  without claiming it. A pane that has no terminal handle yet asks this

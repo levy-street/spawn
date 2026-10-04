@@ -72,19 +72,48 @@ export interface HubMove extends MoveRecord {
   lost: boolean;
 }
 
+/**
+ * The transfer of a move that ended saying the window stays "Moving" until
+ * someone resolves it — ended, with Resolve on offer — or null.
+ */
+export function awaitingResolve(move: HubMove | null): string | null {
+  if (!move || move.view.phase !== "ended" || !move.view.actions.includes("resolve")) return null;
+  return move.transferId;
+}
+
+/**
+ * Whether such a card has gone stale: the server's row was seen moving while
+ * it was up, and no longer is — resolved here, from another device, or from a
+ * host's page. Then it says something untrue and holds the pane's where chip
+ * for nothing, so it is dismissed. A row never seen moving decides nothing:
+ * the list a pane reads can predate the move's begin. `seen` is the card
+ * whose row was last seen moving, carried from call to call.
+ */
+export function resolvedUnderneath(
+  card: string | null,
+  serverMoving: boolean,
+  seen: string | null,
+): { seen: string | null; dismiss: boolean } {
+  if (card === null) return { seen: null, dismiss: false };
+  if (serverMoving) return { seen: card, dismiss: false };
+  return { seen, dismiss: seen === card };
+}
+
 /** The window as it will run on the target, for what is typed there. */
 export type LaunchTarget = Pick<
   MoveRecord,
   "sessionId" | "targetHostId" | "targetName" | "targetCwd"
 >;
-/** The window put back, and the conversation it comes back to. */
-export type LaunchSource = Pick<MoveRecord, "sessionId" | "conversationId">;
+/** The window put back, where, and the conversation it comes back to. */
+export type LaunchSource = Pick<MoveRecord, "sessionId" | "sourceHostId" | "conversationId">;
 
 /** What this tab can do for one of its windows. */
 export interface LocalLaunch {
   prepare(target: LaunchTarget, plan: RelaunchPlan | null): Promise<void>;
   abandon(sessionId: string): void;
-  restartOnSource(source: LaunchSource): Promise<void>;
+  /** Restart the window put back, `line` queued for this tab to type: its
+   *  view of the window takes the display to type it. */
+  restartOnSource(source: LaunchSource, line: string | null): Promise<void>;
   refetch(): void;
 }
 
@@ -103,7 +132,14 @@ type HubMessage =
       plan: RelaunchPlan | null;
     }
   | { type: "abandon"; to: string; transferId: string }
-  | { type: "restart"; to: string; transferId: string; nonce: string; deadline: number }
+  | {
+      type: "restart";
+      to: string;
+      transferId: string;
+      nonce: string;
+      deadline: number;
+      line: string | null;
+    }
   /** A prepare or restart answered: `done` when this tab did it. */
   | { type: "answer"; to: string; nonce: string; done: boolean }
   | { type: "bye" };
@@ -376,7 +412,7 @@ export class MoveHub {
     return {
       prepare: (plan) => local.prepare(record, plan),
       abandon: () => local.abandon(record.sessionId),
-      restartOnSource: () => local.restartOnSource(record),
+      restartOnSource: (line) => local.restartOnSource(record, line),
       refetch: () => local.refetch(),
     };
   }
@@ -450,7 +486,7 @@ export class MoveHub {
         this.post({ type: "abandon", to: record.requester, transferId: record.transferId });
         if (this.held.has(launchClaim(record.transferId))) local.abandon(record.sessionId);
       },
-      restartOnSource: async () => {
+      restartOnSource: async (line) => {
         const name = restartClaim(record.transferId);
         if (this.held.has(name)) return;
         const answer = await this.ask({
@@ -459,9 +495,10 @@ export class MoveHub {
           transferId: record.transferId,
           nonce: nonce(),
           deadline: Date.now() + this.timing.handshakeMs,
+          line,
         });
         if (answer === true) return;
-        if (await this.take(name, answer === false)) await local.restartOnSource(record);
+        if (await this.take(name, answer === false)) await local.restartOnSource(record, line);
       },
       refetch: () => local.refetch(),
     };
@@ -577,7 +614,7 @@ export class MoveHub {
       }
       case "restart":
         this.answerAsked(message, restartClaim(message.transferId), (asked) =>
-          this.options.local.restartOnSource(asked.record),
+          this.options.local.restartOnSource(asked.record, message.line ?? null),
         );
         return;
       case "answer":

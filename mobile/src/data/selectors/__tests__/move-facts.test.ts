@@ -6,12 +6,14 @@ import {
   formatCarryDuration,
   formatCarryProgress,
   joinHostPath,
+  NO_PUT_BACK_FACTS,
   olderVersion,
   PERMISSION_MODE_CHOICES,
   PERMISSION_MODES,
   parseGitDirPointer,
   parseGitHead,
   parseLooseRef,
+  putBackLine,
 } from "@/data/selectors/move-facts";
 
 describe("how long a carry takes", () => {
@@ -149,5 +151,36 @@ describe("versions and modes", () => {
     expect(PERMISSION_MODE_CHOICES.bypassPermissions.description).toBe(
       "Never asks — what a yolo window runs in",
     );
+  });
+});
+
+describe("the line a put-back types on the source", () => {
+  const CONVERSATION = "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60";
+  const CLAUDE = { kind: "claude-code", command: "claude", env: {} };
+
+  it("resumes the conversation that was moving, its mode said outright (the browser's line)", () => {
+    expect(putBackLine(CLAUDE, CONVERSATION, NO_PUT_BACK_FACTS)).toBe(
+      `claude --resume ${CONVERSATION} --permission-mode default`,
+    );
+  });
+
+  it("starts in the source's own default mode, never the record's", () => {
+    const settings = JSON.stringify({ permissions: { defaultMode: "acceptEdits" } });
+    expect(putBackLine(CLAUDE, CONVERSATION, { loginShell: "/bin/zsh", settings })).toBe(
+      `claude --resume ${CONVERSATION} --permission-mode acceptEdits`,
+    );
+  });
+
+  it("a yolo window keeps skipping its prompts, the flag giving way to the mode", () => {
+    const yolo = { ...CLAUDE, yolo: true, yolo_args: "--dangerously-skip-permissions" };
+    const line = putBackLine(yolo, CONVERSATION, NO_PUT_BACK_FACTS);
+    expect(line).toBe(`claude --resume ${CONVERSATION} --permission-mode bypassPermissions`);
+    expect(line).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("an agent with no mode flag gets no line: the ordinary restart", () => {
+    expect(
+      putBackLine({ kind: "codex", command: "codex", env: {} }, CONVERSATION, NO_PUT_BACK_FACTS),
+    ).toBeNull();
   });
 });

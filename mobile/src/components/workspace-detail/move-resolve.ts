@@ -1,9 +1,10 @@
 import type { MoveArrival } from "@/components/launcher/pending-agent-input";
-import type {
-  MoveChannel,
-  MoveChannelLease,
-  MoveDeps,
-  MoveHost,
+import {
+  type MoveChannel,
+  type MoveChannelLease,
+  type MoveDeps,
+  type MoveHost,
+  putBackResume,
 } from "@/components/workspace-detail/move-conversation";
 import * as copy from "@/components/workspace-detail/move-copy";
 import { ApiError } from "@/data/api/client";
@@ -50,8 +51,14 @@ export type ResolveOutcome =
   /** The target had committed: the window now runs there, its resume
    *  queued for this device to type. */
   | { readonly kind: "finished"; readonly session: Session; readonly message: string }
-  /** Put back on the source and restarted where the retire had stopped it. */
-  | { readonly kind: "restored"; readonly session: Session | null; readonly message: string }
+  /** Put back on the source and restarted where the retire had stopped it:
+   *  `restarted` when it was, its resume queued for this device to type. */
+  | {
+      readonly kind: "restored";
+      readonly session: Session | null;
+      readonly message: string;
+      readonly restarted: boolean;
+    }
   /**
    * A host this needs did not answer, or the source could not confirm that
    * nothing is moving: nothing changed. `giveUp` is what giving the move up
@@ -66,6 +73,52 @@ export type ResolveOutcome =
   | { readonly kind: "given_up"; readonly session: Session | null; readonly message: string }
   /** The server refused for a reason this device cannot act on. */
   | { readonly kind: "failed"; readonly message: string };
+
+/** A settled Resolve said as a toast (`resolveToast`). */
+export interface ResolveToast {
+  readonly message: string;
+  readonly detail: string | null;
+  /** Stays until dismissed: it carries something to act on. */
+  readonly persistent: boolean;
+  /** The window to offer to open, where this device's resume for it waits. */
+  readonly openWindow: Session | null;
+}
+
+/**
+ * What a settled Resolve says as a toast: null for an outcome the sheet
+ * keeps, one that still asks for something. `offerWindow` is for a screen
+ * that does not show the window (a host's page): where this device has the
+ * window's resume queued — a move it finished, or one it put back and
+ * restarted — the toast says the agent resumes when the window is opened and
+ * offers to open it, as the browser's host page does (web `resolveToast`).
+ */
+export function resolveToast(
+  outcome: ResolveOutcome,
+  hostName: (hostId: string) => string,
+  offerWindow: boolean,
+): ResolveToast | null {
+  if (
+    outcome.kind !== "finished" &&
+    outcome.kind !== "restored" &&
+    outcome.kind !== "settled" &&
+    outcome.kind !== "given_up"
+  ) {
+    return null;
+  }
+  const window = !offerWindow
+    ? null
+    : outcome.kind === "finished" && outcome.session.status !== "killed"
+      ? outcome.session
+      : outcome.kind === "restored" && outcome.restarted
+        ? outcome.session
+        : null;
+  return {
+    message: outcome.message,
+    detail: window ? copy.moveResumeWhenOpened(hostName(window.host_id)) : null,
+    persistent: window !== null,
+    openWindow: window,
+  };
+}
 
 export interface ResolveDeps
   extends Pick<MoveDeps, "channels" | "server" | "launches" | "restart" | "sleep"> {}
@@ -170,7 +223,7 @@ export async function resolveMove(
     // A source that cannot carry never retired anything: the move only
     // needs its server mark taken off.
     if (!channel.hasCapability(CONVERSATION_CARRIER_CAPABILITY)) {
-      return await undoServer(request, deps, fromName, false);
+      return await undoServer(request, deps, fromName, false, { channel, conversationId: null });
     }
     const listed = async () =>
       (await channel.conversationTransfers(TIMEOUT)).outgoing.filter(
@@ -198,7 +251,7 @@ export async function resolveMove(
           giveUp: copy.moveGiveUpBody(fromName, null),
         };
       }
-      return await undoServer(request, deps, fromName, false);
+      return await undoServer(request, deps, fromName, false, { channel, conversationId: null });
     }
 
     // Newest first: an earlier one for the same window was given up before
@@ -207,7 +260,10 @@ export async function resolveMove(
       const outcome = await settleTransfer(request, deps, source, transfer, fromName);
       if (outcome) return outcome;
     }
-    return await undoServer(request, deps, fromName, true);
+    return await undoServer(request, deps, fromName, true, {
+      channel,
+      conversationId: mine[0]?.conversationId ?? null,
+    });
   } finally {
     source?.release();
   }
@@ -295,7 +351,10 @@ async function settleTransfer(
   } catch (error) {
     const reason = codeOf(error);
     if (reason === "already_exists") {
-      await undoServer(request, deps, fromName, true).catch(() => null);
+      await undoServer(request, deps, fromName, true, {
+        channel: source.channel,
+        conversationId: transfer.conversationId,
+      }).catch(() => null);
       return {
         kind: "stranded",
         message: copy.moveConflicts(fromName),
@@ -420,12 +479,15 @@ async function finish(
 }
 
 /** Take the server's mark off and, where the source's retire had stopped
- *  the window, restart it there with its conversation resumed. */
+ *  the window, restart it there with its conversation resumed: whoever puts
+ *  a move back leaves the window running its agent, the line queued for this
+ *  device to type with its mode said outright (`putBackResume`). */
 async function undoServer(
   request: ResolveRequest,
   deps: ResolveDeps,
   fromName: string,
   retired: boolean,
+  put: { channel: MoveChannel | null; conversationId: string | null },
 ): Promise<ResolveOutcome> {
   const { session } = request;
   let restored: Session;
@@ -440,10 +502,17 @@ async function undoServer(
     }
     return { kind: "failed", message: copy.MOVE_RESOLVE_FAILED };
   }
-  if (restored.status === "killed" || retired) {
-    await deps.restart(restored).catch(() => undefined);
+  const restarted = restored.status === "killed" || retired;
+  if (restarted) {
+    const line = await putBackResume(
+      put.channel,
+      request.agent,
+      put.conversationId ?? session.agent_session_id,
+      session.cwd,
+    );
+    await deps.restart(restored, line).catch(() => undefined);
   }
-  return { kind: "restored", session: restored, message: copy.moveBackOn(fromName) };
+  return { kind: "restored", session: restored, message: copy.moveBackOn(fromName), restarted };
 }
 
 /**
@@ -504,7 +573,7 @@ export async function settleLeftover(
       return { ...sourceSilent(fromName), giveUp: null };
     }
   }
-  return { kind: "restored", session: null, message: copy.moveBackOn(fromName) };
+  return { kind: "restored", session: null, message: copy.moveBackOn(fromName), restarted: false };
 }
 
 /**
@@ -538,7 +607,12 @@ export async function settleIncoming(
         return { kind: "failed", message: copy.MOVE_RESOLVE_FAILED };
       }
     }
-    return { kind: "restored", session: null, message: copy.moveBackOn(sourceName) };
+    return {
+      kind: "restored",
+      session: null,
+      message: copy.moveBackOn(sourceName),
+      restarted: false,
+    };
   } finally {
     lease.release();
   }

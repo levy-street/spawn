@@ -49,6 +49,7 @@ import {
   outcomeUnknown,
   type TransferStatus,
 } from "./conv";
+import { putBackLine, readPutBackFacts } from "./put-back";
 import {
   type MoveServerPort,
   readAfterCommitConflict,
@@ -107,8 +108,10 @@ export interface MoveLauncherPort {
   prepare(plan: RelaunchPlan | null): Promise<void>;
   /** The commit did not happen, or nothing should be typed: drop the queue. */
   abandon(): void;
-  /** Put back: restart the window on the source and resume its conversation. */
-  restartOnSource(): Promise<void>;
+  /** Put back: restart the window on the source, `line` queued for this
+   *  device to type there — it takes the window's display to do it — or,
+   *  when no line could be said, the ordinary restart. */
+  restartOnSource(line: string | null): Promise<void>;
   /** The server's picture of the window may be stale. */
   refetch(): void;
 }
@@ -121,6 +124,9 @@ export interface MovePorts {
   sleep?: (ms: number) => Promise<void>;
   /** How long a carry may hear nothing before it is lost. */
   silenceMs?: number;
+  /** Reads at most `limit` bytes of a file on a host as text (`fs.read`):
+   *  the source's settings, for the mode a put-back resumes in. */
+  readText?: (client: CarrierClient, path: string, limit: number) => Promise<string | null>;
 }
 
 export type MovePhase =
@@ -774,13 +780,26 @@ export class MoveOrchestrator {
     const restart = retireStopped || (status === "killed" && this.plan.wasRunning);
     if (restart) {
       try {
-        await this.ports.launcher.restartOnSource();
+        await this.ports.launcher.restartOnSource(await this.putBackLine());
       } catch {
         // The stopped pane offers Restart itself.
       }
       return "put_back_restarted";
     }
     return status === "killed" ? "put_back_stopped" : "put_back";
+  }
+
+  /** The line that resumes the conversation back on the source
+   *  (`put-back.ts`), its mode explicit; asked of the source, which has just
+   *  answered the abort. */
+  private async putBackLine(): Promise<string | null> {
+    const source = await this.ports.hosts.source().catch(() => null);
+    const facts = await readPutBackFacts(
+      source,
+      { conversationId: this.plan.conversationId, cwd: this.plan.source.cwd },
+      this.ports.readText,
+    );
+    return putBackLine(this.plan.agent, this.plan.conversationId, facts);
   }
 
   /** The target has the conversation: settle the source, then the server. */

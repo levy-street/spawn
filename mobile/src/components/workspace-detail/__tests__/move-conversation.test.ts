@@ -668,7 +668,14 @@ describe("the move, when a channel goes mid-carry", () => {
       "target:conv.import.cancel",
       "source:conv.retire.abort",
       "server:abort",
+      // The source's shell and settings, for the line that resumes it there.
+      "source:conv.probe",
       "restart",
+    ]);
+    // Claude Code comes back in the conversation that was moving, its mode
+    // said outright — never the mode its record ran in.
+    expect(w.restartLines).toEqual([
+      `claude --resume ${CONVERSATION_ID} --permission-mode default`,
     ]);
     expect(phases.at(-2)).toEqual({ step: "restoring" });
     expect(move.phase).toEqual({ step: "restored", message: "Back on dream — nothing was lost." });

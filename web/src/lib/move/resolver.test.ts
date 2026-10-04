@@ -51,6 +51,7 @@ function setup({ incoming }: { incoming?: "committed" | "receiving" | null } = {
   }
   const events: string[] = [];
   let prepared: { hostId: string; line: string | null } | null = null;
+  let restartLine: string | null | undefined;
   const files = new Map<string, string>();
   const waits: number[] = [];
   const ports: ResolvePorts & { sleep: (ms: number) => Promise<void> } = {
@@ -70,8 +71,9 @@ function setup({ incoming }: { incoming?: "committed" | "receiving" | null } = {
         prepared = { hostId, line: plan?.line ?? null };
       },
       abandon: () => events.push("abandon"),
-      restartOnSource: async () => {
+      restartOnSource: async (line: string | null) => {
         events.push("restart");
+        restartLine = line;
       },
       refetch: () => events.push("refetch"),
     },
@@ -87,6 +89,7 @@ function setup({ incoming }: { incoming?: "committed" | "receiving" | null } = {
           : null,
     cwd: "/home/me/code/spawn",
     agent: { kind: "claude-code", command: "claude", env: {} },
+    conversationId: CONVERSATION,
     serverMoving: true,
   };
   return {
@@ -99,6 +102,7 @@ function setup({ incoming }: { incoming?: "committed" | "receiving" | null } = {
     files,
     waits,
     prepared: () => prepared,
+    restartLine: () => restartLine,
   };
 }
 
@@ -150,7 +154,9 @@ describe("resolveMove", () => {
   });
 
   test("mid-copy: cancelled on the target first, then the source puts it back and the window restarts there", async () => {
-    const { source, target, server, ports, request, events } = setup({ incoming: "receiving" });
+    const { source, target, server, ports, request, events, restartLine } = setup({
+      incoming: "receiving",
+    });
     const outcome = await resolveMove(request, ports);
     expect(outcome).toEqual({ kind: "put_back", restarted: true, conflicts: false });
     expect(target.cancelled.has(TRANSFER)).toBe(true);
@@ -159,6 +165,25 @@ describe("resolveMove", () => {
     expect(server.rows.get(SESSION)?.status).toBe("killed");
     expect(events).toContain("restart");
     expect(target.operations.indexOf("conv.import.cancel")).toBeGreaterThanOrEqual(0);
+    // Whoever puts it back leaves Claude Code running there: the conversation
+    // that was moving, resumed in a mode said outright.
+    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode default`);
+  });
+
+  test("a put-back from another device resumes in the source's own mode, spelled for its shell", async () => {
+    const { source, ports, request, files, restartLine } = setup({ incoming: "receiving" });
+    source.loginShell = "/usr/bin/fish";
+    files.set("~/.claude/settings.json", JSON.stringify({ permissions: { defaultMode: "plan" } }));
+    expect(await resolveMove(request, ports)).toMatchObject({ kind: "put_back", restarted: true });
+    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode plan`);
+    expect(source.operations).toContain("conv.probe");
+  });
+
+  test("a source that cannot say its shell or settings still gets the line, in manual mode", async () => {
+    const { source, ports, request, restartLine } = setup({ incoming: "receiving" });
+    source.loginShell = null;
+    expect(await resolveMove(request, ports)).toMatchObject({ kind: "put_back", restarted: true });
+    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode default`);
   });
 
   test("the target cannot be reached: nothing is guessed, the source keeps the files aside", async () => {
@@ -177,12 +202,14 @@ describe("resolveMove", () => {
   });
 
   test("no transfer on the source, read again after the stop had time: the server's abort, and its answer says whether to restart", async () => {
-    const { source, server, ports, request, events, waits } = setup();
+    const { source, server, ports, request, events, waits, restartLine } = setup();
     source.outgoing.clear();
     const outcome = await resolveMove(request, ports);
     expect(outcome).toEqual({ kind: "put_back", restarted: true, conflicts: false });
     expect(server.rows.get(SESSION)?.status).toBe("killed");
     expect(events).toContain("restart");
+    // No transfer names the conversation: the window's own record does.
+    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode default`);
     // Never on one empty listing: waited out a window's stop, and asked again.
     expect(waits.reduce((sum, ms) => sum + ms, 0)).toBeGreaterThanOrEqual(10_000);
     expect(source.operations.filter((op) => op === "conv.transfers").length).toBeGreaterThan(1);

@@ -12,11 +12,14 @@ import {
   findPackedRef,
   formatCarryDuration,
   joinHostPath,
+  NO_PUT_BACK_FACTS,
   olderVersion,
   type PermissionMode,
+  type PutBackFacts,
   parseGitDirPointer,
   parseGitHead,
   parseLooseRef,
+  putBackLine,
 } from "@/data/selectors/move-facts";
 import { displayPath } from "@/data/selectors/places";
 import type { AgentDef, Session } from "@/data/types/domain";
@@ -134,8 +137,12 @@ export interface MoveDeps {
   readonly channels: MoveChannels;
   readonly server: MoveServer;
   readonly launches: MoveLaunches;
-  /** Restart the window where it is, its resume queued (`restartSessionAgent`). */
-  restart(session: Session): Promise<unknown>;
+  /**
+   * Restart the window where it is with `line` queued for this device to
+   * type — a put-back's resume, its mode explicit (`putBackLine`) — or,
+   * without one, the ordinary restart (`restartSessionAgent`).
+   */
+  restart(session: Session, line: string | null): Promise<unknown>;
   newTransferId(): string;
   sleep?(ms: number): Promise<void>;
 }
@@ -228,6 +235,45 @@ async function quietly<T>(work: Promise<T>): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Ask the source for its shell and settings, for the line a put-back types
+ * there (`putBackLine`). Never throws: a source that cannot answer leaves a
+ * POSIX line in the agent's default mode.
+ */
+export async function readPutBackFacts(
+  channel: MoveChannel | null,
+  query: { conversationId: string; cwd: string },
+): Promise<PutBackFacts> {
+  if (!channel) return NO_PUT_BACK_FACTS;
+  const options = { timeoutMs: PREFLIGHT_TIMEOUT_MS };
+  const probe = await quietly(channel.conversationProbe(query, options));
+  if (!probe) return NO_PUT_BACK_FACTS;
+  const settings = probe.store
+    ? await quietly(
+        channel
+          .readHead(joinHostPath(probe.store, "settings.json"), SETTINGS_LIMIT, options)
+          .then(text),
+      )
+    : null;
+  return { loginShell: probe.loginShell, settings };
+}
+
+/**
+ * The line that leaves a window put back running its agent: the conversation
+ * that was moving, resumed on the source in the mode a fresh window starts in
+ * there. Null for no agent or no conversation to name: the ordinary restart.
+ */
+export async function putBackResume(
+  channel: MoveChannel | null,
+  agent: AgentDef | null,
+  conversationId: string | null | undefined,
+  cwd: string,
+): Promise<string | null> {
+  const id = canonicalConversationId(conversationId);
+  if (!agent || !id) return null;
+  return putBackLine(agent, id, await readPutBackFacts(channel, { conversationId: id, cwd }));
 }
 
 /** The commit a folder is on, read from its `.git` without running git. */
@@ -1593,7 +1639,15 @@ export class MoveRun {
       this.#knownStopped ||
       (this.#retireHeld && wasRunning) ||
       (restored.status === "killed" && wasRunning);
-    if (retireStopped) await this.deps.restart(restored).catch(() => undefined);
+    if (retireStopped) {
+      const line = await putBackResume(
+        this.#source.channel,
+        this.plan.request.agent,
+        this.plan.conversationId,
+        session.cwd,
+      );
+      await this.deps.restart(restored, line).catch(() => undefined);
+    }
     return restored;
   }
 }

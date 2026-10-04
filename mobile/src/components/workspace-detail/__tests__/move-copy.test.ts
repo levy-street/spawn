@@ -80,6 +80,8 @@ const RENDERED: Record<string, string> = {
   incoming: copy.moveIncomingRow("6f1c2a9e", from),
   stranded: copy.moveStrandedRow("6f1c2a9e"),
   noteCopied: copy.ARRIVAL_NOTE_COPIED,
+  resumeWhenOpened: copy.moveResumeWhenOpened(from),
+  openWindow: copy.MOVE_OPEN_WINDOW,
 };
 
 describe("what a move says", () => {
@@ -166,6 +168,8 @@ describe("what a move says", () => {
       incoming: "Conversation 6f1c2a9e arriving from dream",
       stranded: "Conversation 6f1c2a9e couldn't be put back whole",
       noteCopied: "Copied the move note.",
+      resumeWhenOpened: "Claude Code resumes on dream when you open the window.",
+      openWindow: "Open window",
     });
   });
 

@@ -1,4 +1,4 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { type Href, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
@@ -9,8 +9,15 @@ import * as copy from "@/components/workspace-detail/move-copy";
 import { MoveProgressSheet, moveStepLine } from "@/components/workspace-detail/move-sheets";
 import { moveWindowFresh } from "@/components/workspace-detail/move-window";
 import { getHost } from "@/data/api/endpoints/hosts";
+import { listSessions } from "@/data/api/endpoints/sessions";
 import { qk } from "@/data/queryKeys";
-import { moveUnderWay, useMovesStore } from "@/data/stores/moves";
+import { isMovingSession } from "@/data/selectors/session";
+import {
+  holdsWindowMoving,
+  moveUnderWay,
+  resolvedUnderneath,
+  useMovesStore,
+} from "@/data/stores/moves";
 import { subscribeDeviceIdentityAccount } from "@/lib/crypto/identity";
 
 const KEEP_AWAKE_TAG = "spawn-move-conversation";
@@ -58,6 +65,39 @@ export function MoveRunner(): React.JSX.Element | null {
   const underWay = Object.values(moves).some((entry) => moveUnderWay(entry.phase));
 
   useEffect(() => subscribeDeviceIdentityAccount(() => useMovesStore.getState().reset()), []);
+
+  // A move held "moving" here that another device or a host's page has
+  // settled since: its sheet would say the window stays moving, untrue, and
+  // Try again would chase a transfer that is gone. Once the server's row,
+  // seen moving while it was held, no longer is, the move is let go. The
+  // rows are read while anything is held.
+  const held = Object.values(moves).filter(
+    (entry) => holdsWindowMoving(entry.phase) && !entry.run.running,
+  );
+  const rows = useQuery({
+    queryKey: qk.sessions(),
+    queryFn: () => listSessions(),
+    enabled: held.length > 0,
+    refetchInterval: held.length > 0 ? 5_000 : false,
+  });
+  const seenMoving = useRef(new Map<string, string | null>());
+  useEffect(() => {
+    for (const [sessionId, entry] of Object.entries(moves)) {
+      const card =
+        holdsWindowMoving(entry.phase) && !entry.run.running
+          ? `${sessionId}:${entry.run.transferId}`
+          : null;
+      const row = rows.data?.find((session) => session.id === sessionId);
+      if (card !== null && !row) continue;
+      const next = resolvedUnderneath(
+        card,
+        row ? isMovingSession(row) : false,
+        seenMoving.current.get(sessionId) ?? null,
+      );
+      seenMoving.current.set(sessionId, next.seen);
+      if (next.dismiss) useMovesStore.getState().remove(sessionId);
+    }
+  }, [moves, rows.data]);
 
   useEffect(() => {
     if (!underWay) return;

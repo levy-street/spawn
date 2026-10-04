@@ -1,6 +1,7 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useDaemonConnections } from "@/components/hosts/DaemonConnectionsProvider";
 import { Button } from "@/components/ui/button";
@@ -13,19 +14,21 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
-import { agents as agentsApi, type Host, hosts, type Session } from "@/lib/api";
+import { toast } from "@/components/ui/toast";
+import { agents as agentsApi, type Host, hosts, type Session, workspaces } from "@/lib/api";
 import { HostControlClient } from "@/lib/hostControl";
-import type { CarrierClient } from "@/lib/move/conv";
 import {
   CANCEL_LABEL,
   conflictsLine,
   DISMISS_LABEL,
   GIVE_UP_LABEL,
   giveUpBody,
+  OPEN_WINDOW_LABEL,
   RESOLVE_LABEL,
   RESOLVE_TITLE,
   resolveBody,
   resolveOutcomeCopy,
+  resolveToast,
   resolvingLine,
   TRY_AGAIN_LABEL,
   takeThereLabel,
@@ -37,17 +40,11 @@ import {
   resolveMove,
   takeWindowToConversation,
 } from "@/lib/move/resolver";
-import { sessionAgent } from "@/lib/sessions";
-import { createLocalLaunch, moveServer } from "./move-launch";
+import { sessionAgent, sessionHref } from "@/lib/sessions";
+import { createLocalLaunch, moveServer, readHostText } from "./move-launch";
+import { pendingLaunch } from "./pending-launch";
 
 const READY_MS = 10_000;
-
-/** A host's file as text, read over the resolver's own channel. */
-async function readText(client: CarrierClient, path: string, limit: number) {
-  if (!(client instanceof HostControlClient)) return null;
-  const head = await client.readHead(path, limit, { timeoutMs: READY_MS });
-  return new TextDecoder().decode(head.bytes);
-}
 
 /**
  * Resolve a move that did not finish, from any device: the source's own
@@ -59,6 +56,16 @@ async function readText(client: CarrierClient, path: string, limit: number) {
  *
  * `session` is the moving window, or null for a transfer the host's page
  * found with no window moving (`transferId` names it).
+ *
+ * Whoever settles the move leaves the window running its agent: finished,
+ * the resume is queued for the window on its new host; put back, the window
+ * is restarted with the line that resumes its conversation, mode explicit.
+ * Either is this device's to type, and its view of the window takes the
+ * display to type it (`pendingLaunch.claim`). In the window's own pane that
+ * view is right here. On a host's page (`inPane` false) there is none: the
+ * outcome is a toast, since the row it came from goes with the move, and
+ * says that the agent resumes when the window is opened here, with the way
+ * to open it.
  */
 export function MoveResolveDialog({
   open,
@@ -67,6 +74,7 @@ export function MoveResolveDialog({
   source,
   transferId,
   targetCwd,
+  inPane = true,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -75,8 +83,12 @@ export function MoveResolveDialog({
   transferId?: string;
   /** The folder the mover picked, when this browser heard it. */
   targetCwd?: string | null;
+  /** In the window's own pane, whose terminal types what the move owes it.
+   *  False on a host's page. */
+  inPane?: boolean;
 }) {
   const queryClient = useQueryClient();
+  const router = useRouter();
   const connections = useDaemonConnections();
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const [busy, setBusy] = useState(false);
@@ -93,9 +105,13 @@ export function MoveResolveDialog({
   const run = async (choice: Choice) => {
     setBusy(true);
     const opened: HostControlClient[] = [];
+    const settle = (result: ResolveOutcome) => {
+      if (!inPane && settledHere(result)) return;
+      setOutcome(result);
+    };
     try {
       if (choice === "give_up" && session) {
-        setOutcome(
+        settle(
           await giveUpMove(
             { sessionId: session.id, source: { hostId: source.id, name: source.name, os: null } },
             moveServer,
@@ -123,7 +139,7 @@ export function MoveResolveDialog({
           await client.waitUntilReady(READY_MS);
           return client;
         },
-        readText,
+        readText: readHostText,
         launcher: {
           prepareOn: (hostId, plan) => {
             const target = hostById(hostId);
@@ -140,12 +156,16 @@ export function MoveResolveDialog({
           abandon: () => {
             if (session) launch.abandon(session.id);
           },
-          restartOnSource: async () => {
+          restartOnSource: async (line) => {
             if (!session) return;
-            await launch.restartOnSource({
-              sessionId: session.id,
-              conversationId: session.agent_session_id ?? "",
-            });
+            await launch.restartOnSource(
+              {
+                sessionId: session.id,
+                sourceHostId: source.id,
+                conversationId: session.agent_session_id ?? "",
+              },
+              line,
+            );
           },
           refetch: () => launch.refetch(),
         },
@@ -153,7 +173,7 @@ export function MoveResolveDialog({
       if (choice === "take_there" && session && outcome?.kind === "on_target") {
         const target = hostById(outcome.targetHostId);
         if (!target) return;
-        setOutcome(
+        settle(
           await takeWindowToConversation(
             {
               sessionId: session.id,
@@ -180,6 +200,7 @@ export function MoveResolveDialog({
           cwd: session?.cwd ?? "~",
           targetCwd: targetCwd ?? null,
           agent,
+          conversationId: session?.agent_session_id ?? null,
           serverMoving: session?.status === "moving",
           ...(transferId ? { transferId } : {}),
           windowOf: (id) => {
@@ -191,12 +212,67 @@ export function MoveResolveDialog({
         },
         ports,
       );
-      setOutcome(result);
+      settle(result);
     } finally {
       for (const client of opened) client.close();
       setBusy(false);
       void queryClient.invalidateQueries({ queryKey: ["sessions"] });
     }
+  };
+
+  /**
+   * On a host's page, an outcome that asks for nothing more is said as a
+   * toast and the dialog closes: true when it did. Where this device has the
+   * window's resume waiting, the toast offers to open the window, and opening
+   * it takes the display and types it.
+   */
+  const settledHere = (result: ResolveOutcome): boolean => {
+    const host =
+      result.kind === "finished"
+        ? result.targetHostId
+        : result.kind === "put_back"
+          ? source.id
+          : null;
+    const waiting = session !== null && host !== null && pendingLaunch.claims(session.id, host);
+    const said = resolveToast(
+      result,
+      {
+        source: source.name,
+        target:
+          result.kind === "finished"
+            ? (hostById(result.targetHostId)?.name ?? targetName)
+            : targetName,
+      },
+      waiting,
+    );
+    if (!said) return false;
+    const windowId = session?.id ?? null;
+    const openWindow = async () => {
+      if (!windowId) return;
+      const list = await queryClient
+        .ensureQueryData({ queryKey: ["workspaces"], queryFn: () => workspaces.list() })
+        .catch(() => []);
+      router.push(sessionHref(windowId, list));
+    };
+    toast(said.message, {
+      ...(said.detail ? { detail: said.detail } : {}),
+      ...(said.persistent ? { persistent: true } : {}),
+      ...(said.openWindow && windowId
+        ? {
+            actions: [
+              {
+                label: OPEN_WINDOW_LABEL,
+                variant: "primary" as const,
+                onClick: () => void openWindow(),
+              },
+            ],
+          }
+        : {}),
+    });
+    onOpenChange(false);
+    setOutcome(null);
+    setTargetName(null);
+    return true;
   };
 
   // A host that cannot answer — gone for good, or only away — always leaves

@@ -348,9 +348,13 @@ export function WorkspaceDetail({
     onSettled: (session, outcome) => {
       void actions.refreshSessions();
       if (!session) return;
-      // Finished here: this device opens it, takes control and types its
-      // resume.
-      if (outcome.kind === "finished" && outcome.session.status !== "killed") {
+      // Finished or put back here: this device opens it, takes control and
+      // types its resume — whoever settles a move leaves the window running
+      // its agent.
+      if (
+        (outcome.kind === "finished" && outcome.session.status !== "killed") ||
+        (outcome.kind === "restored" && outcome.restarted)
+      ) {
         onOpenTerminal(session.id);
       }
     },

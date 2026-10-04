@@ -28,13 +28,16 @@ import {
   needsNewerSpawnLine,
   notARepositoryWarning,
   notConnectedBlock,
+  OPEN_WINDOW_LABEL,
   olderClaudeWarning,
   outgoingMoveRow,
   puttingBackLine,
   RESOLVE_TITLE,
   resolveBody,
   resolveOutcomeCopy,
+  resolveToast,
   resolvingLine,
+  resumeWhenOpenedLine,
   sameCommitLine,
   sourceOfflineBody,
   startingLine,
@@ -213,6 +216,8 @@ describe("what a move says", () => {
       incoming: incomingMoveRow("6f1c2a9e", from),
       stranded: strandedMoveRow("6f1c2a9e"),
       noteCopied: NOTE_COPIED_TOAST,
+      resumeWhenOpened: resumeWhenOpenedLine(from),
+      openWindow: OPEN_WINDOW_LABEL,
     }).toEqual({
       checking: "Checking dream and mac…",
       title: "Move Claude Code to mac?",
@@ -293,6 +298,81 @@ describe("what a move says", () => {
       incoming: "Conversation 6f1c2a9e arriving from dream",
       stranded: "Conversation 6f1c2a9e couldn't be put back whole",
       noteCopied: "Copied the move note.",
+      resumeWhenOpened: "Claude Code resumes on dream when you open the window.",
+      openWindow: "Open window",
     });
+  });
+});
+
+describe("resolveToast", () => {
+  const names = { source: "dream", target: "mac" };
+
+  test("a put-back from a host's page says the outcome and offers the window its resume waits in", () => {
+    expect(
+      resolveToast({ kind: "put_back", restarted: true, conflicts: false }, names, true),
+    ).toEqual({
+      message: "Back on dream — nothing was lost.",
+      detail: "Claude Code resumes on dream when you open the window.",
+      persistent: true,
+      openWindow: true,
+    });
+  });
+
+  test("a finished move offers the window on its new host", () => {
+    expect(
+      resolveToast({ kind: "finished", targetHostId: "t", archived: false }, names, true),
+    ).toEqual({
+      message: "Moved to mac.",
+      detail: "Claude Code resumes on mac when you open the window.",
+      persistent: true,
+      openWindow: true,
+    });
+  });
+
+  test("nothing waiting, or nothing to resume, offers nothing", () => {
+    expect(
+      resolveToast({ kind: "put_back", restarted: true, conflicts: false }, names, false),
+    ).toEqual({
+      message: "Back on dream — nothing was lost.",
+      detail: null,
+      persistent: false,
+      openWindow: false,
+    });
+    expect(
+      resolveToast({ kind: "put_back", restarted: false, conflicts: false }, names, true)
+        ?.openWindow,
+    ).toBe(false);
+    expect(
+      resolveToast({ kind: "finished", targetHostId: "t", archived: true }, names, true)
+        ?.openWindow,
+    ).toBe(false);
+  });
+
+  test("files left over stay on screen, and the window is still offered", () => {
+    const toast = resolveToast({ kind: "put_back", restarted: true, conflicts: true }, names, true);
+    expect(toast?.detail).toBe(
+      "Some of this conversation's files couldn't be put back on dream because files with those names are there. Sort them out by hand in Claude Code's projects folder on dream.",
+    );
+    expect(toast?.persistent).toBe(true);
+    expect(toast?.openWindow).toBe(true);
+  });
+
+  test("the outcomes that still ask for something stay in the dialog", () => {
+    for (const outcome of [
+      { kind: "source_unreachable" },
+      { kind: "target_unreachable", targetHostId: null },
+      { kind: "source_busy" },
+      { kind: "on_target", targetHostId: "t", cwd: "~", conversationId: "c" },
+      { kind: "failed" },
+    ] as ResolveOutcome[]) {
+      expect(resolveToast(outcome, names, true)).toBeNull();
+    }
+    for (const outcome of [
+      { kind: "given_up" },
+      { kind: "elsewhere" },
+      { kind: "gone" },
+    ] as ResolveOutcome[]) {
+      expect(resolveToast(outcome, names, false)?.message).toBe(resolveOutcomeCopy(outcome, names));
+    }
   });
 });

@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  awaitingResolve,
   type HubBus,
   type HubClaims,
+  type HubMove,
   type LocalLaunch,
   MoveHub,
   type MoveRecord,
+  resolvedUnderneath,
 } from "./move-hub";
 import type { MoveLauncherPort, MoveOrchestrator, MovePlan, MoveView } from "./orchestrator";
 
@@ -118,8 +121,9 @@ function local(log: string[], tab: string): LocalLaunch {
       log.push(`${tab}:prepare`);
     },
     abandon: () => log.push(`${tab}:abandon`),
-    restartOnSource: async () => {
+    restartOnSource: async (_source, line) => {
       log.push(`${tab}:restart`);
+      if (line) log.push(`${tab}:line ${line}`);
     },
     refetch: () => {},
   };
@@ -153,9 +157,10 @@ function slow(log: string[], tab: string, ms: number): LocalLaunch {
       log.push(`${tab}:prepare`);
     },
     abandon: () => log.push(`${tab}:abandon`),
-    restartOnSource: async () => {
+    restartOnSource: async (_source, line) => {
       await wait();
       log.push(`${tab}:restart`);
+      if (line) log.push(`${tab}:line ${line}`);
     },
     refetch: () => {},
   };
@@ -290,6 +295,7 @@ describe("MoveHub", () => {
   });
 
   test("a restart on the source is done by exactly one tab", async () => {
+    const RESUME = "claude --resume 0b1e5a27-9f3c-4d1e-8a6b-2c4d5e6f7a8b --permission-mode default";
     const bus = new Bus();
     const log: string[] = [];
     const locks = new Locks();
@@ -297,7 +303,7 @@ describe("MoveHub", () => {
       ({
         start: async () => {
           log.push(`${tab}:run`);
-          await launcher.restartOnSource();
+          await launcher.restartOnSource(RESUME);
         },
       }) as unknown as MoveOrchestrator;
     const timing = { ...TIMING, handshakeMs: 100 };
@@ -324,6 +330,8 @@ describe("MoveHub", () => {
     asking.start(plan(), record());
     await settle(600);
     expect(log.filter((line) => line.endsWith(":restart"))).toEqual(["A:restart"]);
+    // The runner's line reaches the tab that types it, mode and all.
+    expect(log).toContain(`A:line ${RESUME}`);
     asking.close();
     owner.close();
   });
@@ -401,5 +409,47 @@ describe("MoveHub", () => {
     expect(watching.forSession(SESSION)?.lost).toBe(true);
     asking.close();
     watching.close();
+  });
+});
+
+describe("a card that says the window stays Moving", () => {
+  const ended = (actions: string[]) =>
+    ({
+      transferId: "t1",
+      mine: true,
+      lost: false,
+      view: { phase: "ended", actions },
+    }) as unknown as HubMove;
+
+  test("is the one that offers Resolve and nothing ended otherwise", () => {
+    expect(awaitingResolve(ended(["resolve"]))).toBe("t1");
+    expect(awaitingResolve(ended(["retry"]))).toBeNull();
+    expect(awaitingResolve(ended([]))).toBeNull();
+    expect(awaitingResolve(null)).toBeNull();
+    expect(
+      awaitingResolve({
+        ...ended(["cancel"]),
+        view: { phase: "copying", actions: ["cancel"] },
+      } as unknown as HubMove),
+    ).toBeNull();
+  });
+
+  test("goes once the row it held moving is resolved underneath it", () => {
+    // Seen moving: kept.
+    let state = resolvedUnderneath("t1", true, null);
+    expect(state).toEqual({ seen: "t1", dismiss: false });
+    // Resolved from another device or a host's page: the row runs again.
+    state = resolvedUnderneath("t1", false, state.seen);
+    expect(state.dismiss).toBe(true);
+  });
+
+  test("a row never seen moving decides nothing: the list can predate the move", () => {
+    expect(resolvedUnderneath("t1", false, null)).toEqual({ seen: null, dismiss: false });
+    // Seen moving for an earlier card says nothing about this one.
+    expect(resolvedUnderneath("t2", false, "t1")).toEqual({ seen: "t1", dismiss: false });
+  });
+
+  test("no card forgets what was seen", () => {
+    expect(resolvedUnderneath(null, false, "t1")).toEqual({ seen: null, dismiss: false });
   });
 });

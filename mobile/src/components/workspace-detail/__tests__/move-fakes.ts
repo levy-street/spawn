@@ -502,6 +502,8 @@ export interface World {
   /** What a later opening of the window on `hostId` would type, if anything. */
   typable(sessionId: string, hostId: string): string | null;
   restarts: Session[];
+  /** The line each restart was handed to queue, in order (null: the ordinary restart). */
+  restartLines: (string | null)[];
   deps: MoveDeps;
 }
 
@@ -559,6 +561,7 @@ export function world(options: { sessionStatus?: string } = {}): World {
   const queued: World["queued"] = [];
   const launches: World["launches"] = new Map();
   const restarts: Session[] = [];
+  const restartLines: (string | null)[] = [];
   const lease = (daemon: FakeDaemon): MoveChannelLease => ({
     channel: daemon,
     release: () => undefined,
@@ -586,9 +589,10 @@ export function world(options: { sessionStatus?: string } = {}): World {
         if (record?.provisional && record.hostId === hostId) launches.delete(sessionId);
       },
     },
-    restart: async (restarted) => {
+    restart: async (restarted, line) => {
       log.push("restart");
       restarts.push(restarted);
+      restartLines.push(line);
     },
     newTransferId: () => TRANSFER_ID,
     sleep: async () => undefined,
@@ -597,7 +601,19 @@ export function world(options: { sessionStatus?: string } = {}): World {
     const record = launches.get(sessionId);
     return record && !record.provisional && record.hostId === hostId ? record.line : null;
   };
-  return { log, source, target, server, unreachable, queued, launches, typable, restarts, deps };
+  return {
+    log,
+    source,
+    target,
+    server,
+    unreachable,
+    queued,
+    launches,
+    typable,
+    restarts,
+    restartLines,
+    deps,
+  };
 }
 
 /** The built-in definition as the server lists it: named by its slug, so

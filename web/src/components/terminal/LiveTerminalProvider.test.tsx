@@ -150,6 +150,8 @@ type Mount = {
 };
 const mounts: Mount[] = [];
 const typed: string[] = [];
+/** Display claims a view was asked to make (`claimDisplay`). */
+const claimed: string[] = [];
 
 mock.module("./Terminal", () => {
   return {
@@ -167,6 +169,7 @@ mock.module("./Terminal", () => {
           ({
             sendInput: (bytes: Uint8Array | string) =>
               typed.push(typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes)),
+            claimDisplay: () => claimed.push(latest.current.hostId ?? ""),
             focus: () => {},
           }) as unknown as TerminalHandle,
         [],
@@ -277,6 +280,7 @@ afterAll(() => {
 beforeEach(() => {
   mounts.length = 0;
   typed.length = 0;
+  claimed.length = 0;
   m.pending.pendingLaunch.clear(WINDOW);
   m.incarnation.openIntent.clear(m.incarnation.incarnationKey(WINDOW, MAC));
 });
@@ -433,6 +437,61 @@ describe("a warm terminal whose window moves to another host", () => {
     await pane.report(open(DREAM), true);
     expect(typed).toEqual([]);
     expect(m.pending.pendingLaunch.has(WINDOW, DREAM)).toBe(false);
+    await pane.unmount();
+  });
+});
+
+describe("a window put back by this device while another device holds its display", () => {
+  const closed = (hostId: string) =>
+    ({ socketState: "closed", v3: true, dcOpen: false, hostId }) as SessionConnectionInfo;
+  const RESUME = "claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default";
+
+  test("takes the display once on the restarted shell and types the resume", async () => {
+    const pane = await renderPane(DREAM);
+    // Another device has the display; the window is stopped while it moves.
+    await pane.report(open(DREAM), false);
+    await pane.report(closed(DREAM));
+    // Resolve put it back from here: the resume is this device's to type.
+    m.pending.pendingLaunch.claim(WINDOW, DREAM, RESUME);
+    // The restarted worker attaches; the view claims rather than waits.
+    await pane.report(open(DREAM), false);
+    expect(claimed).toEqual([DREAM]);
+    expect(typed).toEqual([]);
+    // The claim lands: typed once, with its mode.
+    await pane.report(null, true);
+    expect(typed).toEqual([`${RESUME}\r`]);
+    // Nothing left to claim for: losing the display later is not fought.
+    await pane.report(null, false);
+    expect(claimed).toEqual([DREAM]);
+    await pane.unmount();
+  });
+
+  test("claims once per attachment, so a device that takes the display back is not fought", async () => {
+    const pane = await renderPane(DREAM);
+    await pane.report(closed(DREAM), false);
+    m.pending.pendingLaunch.claim(WINDOW, DREAM, RESUME);
+    await pane.report(open(DREAM), false);
+    await pane.report(null, true);
+    // Typed on the claim.
+    expect(typed).toHaveLength(1);
+
+    // A second claimed launch on the same attachment, the display elsewhere:
+    // one claim for it, not one per display change.
+    m.pending.pendingLaunch.claim(WINDOW, DREAM, RESUME);
+    await pane.report(null, false);
+    await pane.report(null, true);
+    await pane.report(null, false);
+    expect(claimed).toEqual([DREAM]);
+    await pane.unmount();
+  });
+
+  test("an ordinary queued launch still waits for someone to take control", async () => {
+    const pane = await renderPane(DREAM);
+    await pane.report(closed(DREAM), false);
+    m.pending.pendingLaunch.set(WINDOW, DREAM, "claude --resume old");
+    await pane.report(open(DREAM), false);
+    expect(claimed).toEqual([]);
+    expect(typed).toEqual([]);
     await pane.unmount();
   });
 });

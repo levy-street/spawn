@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { attachedLaunchHost, pendingLaunch } from "@/components/workspace/pending-launch";
@@ -24,6 +24,11 @@ const PENDING_LAUNCH_HANDLE_TRIES = 50;
  * host is dropped. The handle can lag the transport by a render or two, so the
  * command is only claimed once something can type it; a claim that could not
  * be typed is a launch silently lost.
+ *
+ * A command this device queued to type itself (`pendingLaunch.claim`: it
+ * moved the window, or settled its move) does not wait for someone to press
+ * Take control: the view takes the display as an opening does, once per
+ * attachment — so a device that has since taken it back is not fought over.
  */
 export function usePendingLaunchDrain({
   sessionId,
@@ -40,10 +45,16 @@ export function usePendingLaunchDrain({
 }): void {
   const attachedHost = attachedLaunchHost(session, connInfo);
   const owner = displayState?.owner === true;
+  /** This attachment has claimed the display for a launch already. */
+  const claimedRef = useRef(false);
   useEffect(() => {
-    if (attachedHost === null) return;
+    if (attachedHost === null) {
+      claimedRef.current = false;
+      return;
+    }
     pendingLaunch.observe(sessionId, attachedHost);
-    if (!owner || !pendingLaunch.has(sessionId, attachedHost)) return;
+    if (!pendingLaunch.has(sessionId, attachedHost)) return;
+    if (!owner && (claimedRef.current || !pendingLaunch.claims(sessionId, attachedHost))) return;
     let cancelled = false;
     let tries = 0;
     const attempt = () => {
@@ -51,6 +62,12 @@ export function usePendingLaunchDrain({
       const handle = getHandle();
       if (!handle) {
         if (tries++ < PENDING_LAUNCH_HANDLE_TRIES) window.setTimeout(attempt, 100);
+        return;
+      }
+      if (!owner) {
+        // Typed once the display is this view's, on the run that follows.
+        claimedRef.current = true;
+        handle.claimDisplay();
         return;
       }
       const command = pendingLaunch.take(sessionId, attachedHost);

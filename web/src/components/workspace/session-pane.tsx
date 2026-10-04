@@ -64,7 +64,7 @@ import {
   ResumingGuard,
 } from "./move-overlay";
 import { MoveResolveDialog } from "./move-resolve-dialog";
-import { useMoveFor, useMoves } from "./moves-provider";
+import { useDismissWhenResolved, useMoveFor, useMoves } from "./moves-provider";
 import { useMoveNoteDelivery } from "./use-move-note";
 import { WhereChip, type WhereChipHandle } from "./where-chip";
 
@@ -173,6 +173,9 @@ export function SessionPane({
   const moveCovers = covering !== null;
   const [resolveOpen, setResolveOpen] = useState(false);
   const otherHosts = hostList.some((host) => host.id !== session?.host_id);
+  // A card saying the window stays "Moving" until it is resolved goes once
+  // the move is resolved underneath it, and the where chip with it.
+  useDismissWhenResolved(covering, moving);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);

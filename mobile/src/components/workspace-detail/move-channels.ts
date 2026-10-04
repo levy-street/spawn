@@ -155,14 +155,27 @@ export function createMoveDeps(client: QueryClient, agents: readonly AgentDef[])
         ]);
       },
     },
-    restart: async (session) =>
-      restartSessionAgent({
+    restart: async (session, line) => {
+      if (line) {
+        // A put-back's resume, queued before the restart as a restart queues
+        // its own: the new shell's first keystrokes, typed by this device when
+        // it opens the window (which takes its display).
+        await pendingLaunches.persist(session.id, session.host_id, line);
+        try {
+          return remember(await restartSession(session.id));
+        } catch (error) {
+          await pendingLaunches.clear(session.id).catch(() => undefined);
+          throw error;
+        }
+      }
+      return restartSessionAgent({
         session,
         agents,
         restart: async (sessionId) => remember(await restartSession(sessionId)),
         pending: pendingLaunches,
         ...restartConversationHooks(client, session),
-      }),
+      });
+    },
     newTransferId: () => randomUUID().toLowerCase(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   };

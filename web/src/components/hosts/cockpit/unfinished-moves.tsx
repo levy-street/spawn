@@ -41,7 +41,8 @@ interface Row {
  * this host the server still has moving with no transfer here yet — except
  * a move this browser is carrying right now, which is not unfinished but
  * under way: resolving it would tear it down. Draws nothing when there is
- * nothing unfinished.
+ * nothing unfinished, but for a Resolve that has just settled the last row:
+ * its outcome is said all the same (`MoveResolveDialog`, `inPane` false).
  */
 export function UnfinishedMoves({ host }: { host: Host }) {
   const connection = useDaemonConnection(host.id);
@@ -133,7 +134,23 @@ export function UnfinishedMoves({ host }: { host: Host }) {
       session,
     });
   }
-  if (rows.length === 0) return null;
+  // Mounted on its own, outside the rows: settling a move takes its row away,
+  // and the dialog says how it ended (or still asks for something) after.
+  const dialog = resolving?.source ? (
+    <MoveResolveDialog
+      open
+      onOpenChange={(open) => {
+        if (open) return;
+        setResolving(null);
+        setRound((n) => n + 1);
+      }}
+      session={resolving.session}
+      source={resolving.source}
+      inPane={false}
+      {...(resolving.transferId ? { transferId: resolving.transferId } : {})}
+    />
+  ) : null;
+  if (rows.length === 0) return dialog;
 
   return (
     <CockpitSection
@@ -157,19 +174,7 @@ export function UnfinishedMoves({ host }: { host: Host }) {
           </li>
         ))}
       </ul>
-      {resolving?.source && (
-        <MoveResolveDialog
-          open
-          onOpenChange={(open) => {
-            if (open) return;
-            setResolving(null);
-            setRound((n) => n + 1);
-          }}
-          session={resolving.session}
-          source={resolving.source}
-          {...(resolving.transferId ? { transferId: resolving.transferId } : {})}
-        />
-      )}
+      {dialog}
     </CockpitSection>
   );
 }

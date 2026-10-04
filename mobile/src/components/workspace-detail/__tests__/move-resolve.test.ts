@@ -4,6 +4,7 @@ import {
   giveUpMove,
   guessTargetCwd,
   resolveMove,
+  resolveToast,
   settleIncoming,
   settleLeftover,
 } from "@/components/workspace-detail/move-resolve";
@@ -114,9 +115,26 @@ describe("resolveMove", () => {
       "target:conv.import.cancel",
       "source:conv.retire.abort",
       "server:abort",
+      "source:conv.probe",
       "restart",
     ]);
     expect(w.source.outgoing.size).toBe(0);
+    // Whoever puts it back leaves Claude Code running there: the conversation
+    // that was moving, resumed in a mode said outright, for this device to type.
+    expect(w.restartLines).toEqual([
+      `claude --resume ${CONVERSATION_ID} --permission-mode default`,
+    ]);
+    expect(outcome).toMatchObject({ kind: "restored", restarted: true });
+  });
+
+  it("a put-back from another device resumes in the source's own mode, spelled for its shell", async () => {
+    const w = world();
+    await abandoned(w);
+    w.source.probe = { ...w.source.probe, store: "~/.claude", loginShell: "/usr/bin/fish" };
+    w.source.files.set("~/.claude/settings.json", '{"permissions":{"defaultMode":"plan"}}');
+    const outcome = await resolveMove({ session: w.server.session, agent: CLAUDE, hosts }, w.deps);
+    expect(outcome).toMatchObject({ kind: "restored", restarted: true });
+    expect(w.restartLines).toEqual([`claude --resume ${CONVERSATION_ID} --permission-mode plan`]);
   });
 
   it("a cancel the target does not answer as cancelled leaves the source's files where they are", async () => {
@@ -144,6 +162,7 @@ describe("resolveMove", () => {
     ]);
     expect(w.server.session.status).toBe("running");
     expect(w.restarts).toEqual([]);
+    expect(outcome).toMatchObject({ kind: "restored", restarted: false });
   });
 
   it("no record, the window stopped, its conversation still in place: put back and restarted", async () => {
@@ -159,6 +178,10 @@ describe("resolveMove", () => {
     expect(w.log).toContain("server:abort");
     expect(w.server.session.status).toBe("killed");
     expect(w.restarts).toHaveLength(1);
+    // No transfer names the conversation: the window's own record does.
+    expect(w.restartLines).toEqual([
+      `claude --resume ${CONVERSATION_ID} --permission-mode default`,
+    ]);
   });
 
   it("no record, the window stopped and its conversation gone from the source: nothing decided, Give up offered", async () => {
@@ -416,5 +439,70 @@ describe("guessTargetCwd", () => {
     expect(guessTargetCwd("/home/me", "/home/me")).toBe("~");
     expect(guessTargetCwd("/srv/app", "/home/me")).toBe("/srv/app");
     expect(guessTargetCwd("/home/meow/x", "/home/me")).toBe("/home/meow/x");
+  });
+});
+
+describe("what a settled Resolve says", () => {
+  const names = (id: string) => (id === SOURCE_ID ? "dream" : id === TARGET_ID ? "mac" : "?");
+
+  it("a put-back on a host's page says the window's agent resumes when it is opened, and offers it", async () => {
+    const w = world();
+    await abandoned(w);
+    const outcome = await resolveMove({ session: w.server.session, agent: CLAUDE, hosts }, w.deps);
+    expect(resolveToast(outcome, names, true)).toEqual({
+      message: "Back on dream — nothing was lost.",
+      detail: "Claude Code resumes on dream when you open the window.",
+      persistent: true,
+      openWindow: expect.objectContaining({ id: SESSION_ID }),
+    });
+    // A screen showing the window opens it itself: only the outcome.
+    expect(resolveToast(outcome, names, false)).toEqual({
+      message: "Back on dream — nothing was lost.",
+      detail: null,
+      persistent: false,
+      openWindow: null,
+    });
+  });
+
+  it("a finished move offers the window on its new host", async () => {
+    const w = world();
+    w.source.conversationRetireCommit = async () => {
+      throw new Error("source went quiet");
+    };
+    await abandoned(w, { committed: true });
+    w.source.conversationRetireCommit = Object.getPrototypeOf(w.source).conversationRetireCommit;
+    const outcome = await resolveMove({ session: w.server.session, agent: CLAUDE, hosts }, w.deps);
+    expect(resolveToast(outcome, names, true)).toMatchObject({
+      message: "Moved to mac.",
+      detail: "Claude Code resumes on mac when you open the window.",
+      openWindow: expect.objectContaining({ id: SESSION_ID }),
+    });
+  });
+
+  it("nothing restarted offers nothing, and what still asks for something stays on the sheet", () => {
+    expect(
+      resolveToast(
+        {
+          kind: "restored",
+          session: null,
+          message: "Back on dream — nothing was lost.",
+          restarted: false,
+        },
+        names,
+        true,
+      ),
+    ).toMatchObject({ openWindow: null, detail: null });
+    expect(
+      resolveToast({ kind: "unreachable", message: "x", giveUp: null }, names, true),
+    ).toBeNull();
+    expect(resolveToast({ kind: "failed", message: "x" }, names, true)).toBeNull();
+    expect(
+      resolveToast({ kind: "settled", message: copy.MOVE_CONFLICT_SETTLED }, names, true),
+    ).toEqual({
+      message: copy.MOVE_CONFLICT_SETTLED,
+      detail: null,
+      persistent: false,
+      openWindow: null,
+    });
   });
 });

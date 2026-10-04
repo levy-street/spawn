@@ -220,6 +220,13 @@ export interface TerminalHandle {
   pasteText: (text: string) => void;
   /** Promote this browser to the shared PTY geometry controller. */
   takeControl: () => void;
+  /**
+   * Owe the display the claim an opening makes: taken as soon as this view
+   * can carry it — in the foreground, its tab visible, its transport open —
+   * and on the next open if not before. For a device that has a line of its
+   * own to type into the window (`pendingLaunch.claim`).
+   */
+  claimDisplay: () => void;
   /** Open the native file picker to upload files to this session. */
   openUpload: () => void;
   /** Scroll the viewport back to the live edge (bottom of the buffer). */
@@ -3378,6 +3385,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pasteDataTransfer,
       pasteText,
       takeControl: () => takeControlNowRef.current(),
+      claimDisplay: () => {
+        displayClaimOwedRef.current = true;
+        payDisplayClaimRef.current();
+      },
       openUpload: () => fileInputRef.current?.click(),
       snapToLiveEdge,
     }),
