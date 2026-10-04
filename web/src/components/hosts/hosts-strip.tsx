@@ -296,6 +296,7 @@ export function HostsStrip({
       <Popover
         id="host-hover-card"
         interactive
+        layer="drawer"
         open={hoveredRow !== null && open && !collapsed}
         anchor={hoverAnchor}
         side="right"
