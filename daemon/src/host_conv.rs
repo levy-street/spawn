@@ -2094,9 +2094,21 @@ mod tests {
         assert!(SystemProcesses
             .start_identity(child.id())
             .is_some_and(|start| start.bytes().all(|byte| byte.is_ascii_digit())));
-        assert!(SystemProcesses
-            .executable(child.id())
-            .is_some_and(|path| path.ends_with("sleep")));
+        // `spawn` can return before the child's exec has replaced its image
+        // (a vfork-style spawn in a threaded process), so `/proc/<pid>/exe`
+        // may still name this test binary for a moment: wait for the exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut runs = SystemProcesses.executable(child.id());
+        while !runs.as_ref().is_some_and(|path| path.ends_with("sleep"))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            runs = SystemProcesses.executable(child.id());
+        }
+        assert!(
+            runs.as_ref().is_some_and(|path| path.ends_with("sleep")),
+            "{runs:?}"
+        );
         assert!(SystemProcesses
             .pid_domain()
             .is_some_and(|domain| domain.starts_with("linux:")));

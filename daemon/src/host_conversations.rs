@@ -5732,10 +5732,21 @@ mod tests {
             .unwrap();
         let table = crate::host_conv::SystemProcesses;
         let pid = other.id();
-        // It runs Claude, as the daemon judges a process.
-        assert!(table
-            .executable(pid)
-            .is_some_and(|path| crate::host_conv::is_claude(&path)));
+        // It runs Claude, as the daemon judges a process. `spawn` can return
+        // before the child's exec has replaced its image (a vfork-style spawn
+        // in a threaded process), so `/proc/<pid>/exe` may still name this
+        // test binary for a moment: wait for the exec, not a sleep.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut runs = table.executable(pid);
+        while !runs.as_deref().is_some_and(crate::host_conv::is_claude) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+            runs = table.executable(pid);
+        }
+        assert!(
+            runs.as_deref().is_some_and(crate::host_conv::is_claude),
+            "{pid} runs {runs:?}"
+        );
         for unknown in [
             Holder { pid, start: None },
             Holder {
