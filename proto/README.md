@@ -1745,14 +1745,19 @@ never by running it, or null. `store_ready` is false — with the reason — whe
 the store is missing, outside home, behind a link, or on another filesystem
 from spawnd's holdings.
 
-`conv.export {transfer_id, agent, conversation_id, mode, session_id?, cwd?,
-to_host_id?, include?, stream?, from_sequence?}` opens a v2 read and answers
-`{stream_id, transfer_id, length, sha256, window, next_sequence, entries,
-skipped, stopped}`. `include` lists `conversation` (required), `subagents`,
-`tool_results` and `workflows`, all by default. `mode:"snapshot"` reads a
-bounded prefix where it lies and stops nothing. `mode:"retire"` — which names
-the window it leaves (`session_id`) — is the single-writer fence, in this
-order: it refuses with `conversation_live_elsewhere` while a live Claude
+`conv.export {transfer_id, agent, conversation_id, mode:"retire", session_id,
+to_host_id, cwd?, include?, stream?, from_sequence?}` opens a v2 read and
+answers `{stream_id, transfer_id, mode:"retire", length, sha256, window,
+next_sequence, entries, skipped, stopped}`. `session_id` names the window the
+conversation leaves and `to_host_id` the host it goes to; both are required,
+and the source records them so that any device resolving the move later knows
+whom to ask. `include` lists `conversation` (required), `subagents`,
+`tool_results` and `workflows`, all by default. A conversation leaves a host
+only by retiring it, so that it is never resumable on two hosts at once:
+`mode:"snapshot"` — a copy that would leave the source running — is reserved
+for a later copies feature the owner has not approved (OD7) and is refused
+with `unsupported_operation`; any other mode is `invalid_request`. Retiring
+is the single-writer fence, in this order: it refuses with `conversation_live_elsewhere` while a live Claude
 registry record or background-roster worker outside the window holds the
 conversation (a background session, the job an attach client or agent view
 shows, another window), and with `conversation_changed` when the window is
@@ -1770,10 +1775,14 @@ without it, `conversation_ambiguous`. A repeated export with the same
 `transfer_id` — and `from_sequence` — resumes the same bytes, on any channel,
 superseding the stream that had it.
 
-`conv.import.begin {transfer_id, agent, conversation_id, cwd, length, sha256,
-stream?, from_host_id?}` opens a v2 write into the target's staging and
-answers `{stream_id, window, next_sequence, received}`; repeated with the same
-declaration it resumes (`resume_mismatch` otherwise). One channel carries at
+`conv.import.begin {transfer_id, agent, conversation_id, mode:"retire", cwd,
+length, sha256, stream?, from_host_id?}` opens a v2 write into the target's
+staging and answers `{stream_id, window, next_sequence, received}`; repeated
+with the same declaration it resumes (`resume_mismatch` otherwise). The
+device forwards the export's `mode` as it forwards its digest, and a target
+imports only what a retire carried: `mode:"snapshot"` is refused with
+`unsupported_operation`, and anything else, or no mode, with
+`invalid_request`. One channel carries at
 most two imports at once (`too_many_streams`): each may have a full window
 queued, and the channel's 64-frame normal queue keeps room for everything
 else, so a device opens a consumer channel per transfer. The target refuses a
@@ -1805,17 +1814,20 @@ final; the other then fails with `transfer_committed` or `transfer_aborted`.
 `{outgoing:[{transfer_id, conversation_id, session_id, to_host_id, state,
 created_at, length, sha256}], incoming:[{transfer_id, conversation_id,
 from_host_id, state, received, next_sequence, length, created_at}],
-truncated}` — so any device can resolve a move another one started: a
-committed import commits the retire, anything else cancels the import and
-then aborts the retire.
+truncated}` — so any device can resolve a move another one started: it asks
+the outgoing transfer's `to_host_id` — never another host, and never on the
+strength of an answer it could not get — and a committed import there commits
+the retire, while anything else cancels the import there and, once that host
+has answered `cancelled`, aborts the retire. A device that cannot reach the
+target leaves the move unresolved.
 
 Other errors: `window_unavailable` (a worker the daemon has not adopted yet;
 nothing was stopped), `transfer_not_found`, `transfer_incomplete` (a retire
 commit for a transfer that never declared a bundle: abort it),
 `store_too_large` (more project folders than a scan reads), `too_large` (an
 entry over 512 MiB, more than 4,096 entries, or a bundle over 2 GiB — refused
-before anything stops), and `file_changed` (a snapshot's file changed while
-it was read). The hello's `limits` carry `stream_window_max`, 16 until spike
+before anything stops), and `file_changed` (a held file no longer matches
+what was declared). The hello's `limits` carry `stream_window_max`, 16 until spike
 S4 measures.
 
 ### Proposed P2-DATA-02 store contract (review pending; not implemented)

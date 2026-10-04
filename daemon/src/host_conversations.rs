@@ -104,9 +104,6 @@ const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const GC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Transfers a host stages at once.
 const MAX_INCOMING: usize = 16;
-/// Snapshot exports remembered for a resume, and for how long after use.
-const MAX_SNAPSHOTS: usize = 32;
-const SNAPSHOT_RETENTION: Duration = Duration::from_secs(10 * 60);
 /// Project folders one scan of a Claude store reads; a store with more is
 /// refused rather than half-searched, since a copy missed is a copy that
 /// would go on being resumable.
@@ -343,12 +340,23 @@ fn text<'a>(payload: Option<&'a Map<String, Value>>, key: &str) -> Option<&'a st
         .filter(|value| value.len() <= 4096 && !value.as_bytes().contains(&0))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
-    /// A bounded prefix, read where it lies; nothing stops.
-    Snapshot,
-    /// The fence: the window stops and the files leave the lookup path.
-    Retire,
+/// The one way a conversation leaves a host: `retire`, the fence — the
+/// window stops and the files leave Claude's lookup path, so the
+/// conversation is never resumable on two hosts at once. `snapshot`, a copy
+/// that leaves the source running, is reserved for a later copies feature
+/// the owner has not approved (OD7) and is refused by both ends: the source
+/// never makes one, and a target imports only what a retire carried.
+fn retire_mode(payload: Option<&Map<String, Value>>, what: &str) -> FsResult<()> {
+    match text(payload, "mode") {
+        Some("retire") => Ok(()),
+        Some("snapshot") => Err(error(
+            "unsupported_operation",
+            format!(
+                "{what} only a retired conversation: a snapshot would leave it resumable on two hosts, and copies are not offered"
+            ),
+        )),
+        _ => Err(error("invalid_request", "mode must be retire")),
+    }
 }
 
 /// What of the sidecar travels. The record always does.
@@ -437,10 +445,12 @@ impl Include {
 pub(crate) struct ExportRequest {
     pub transfer_id: Uuid,
     pub conversation_id: String,
-    pub mode: Mode,
-    pub session_id: Option<Uuid>,
+    /// The window the conversation leaves.
+    pub session_id: Uuid,
     pub cwd: Option<String>,
-    pub to_host_id: Option<Uuid>,
+    /// The host it goes to: recorded so that a device resolving an
+    /// unfinished move asks that host before it puts anything back.
+    pub to_host_id: Uuid,
     include: Include,
     pub stream: StreamRequest,
     pub from_sequence: u64,
@@ -450,18 +460,19 @@ impl ExportRequest {
     pub(crate) fn parse(payload: Option<&Map<String, Value>>) -> FsResult<Self> {
         let transfer_id = transfer_id(payload)?;
         let conversation_id = conversation(payload)?;
-        let mode = match text(payload, "mode") {
-            Some("snapshot") => Mode::Snapshot,
-            Some("retire") => Mode::Retire,
-            _ => return Err(error("invalid_request", "mode must be snapshot or retire")),
-        };
-        let session_id = optional_uuid(payload, "session_id")?;
-        if mode == Mode::Retire && session_id.is_none() {
-            return Err(error(
+        retire_mode(payload, "this host exports")?;
+        let session_id = optional_uuid(payload, "session_id")?.ok_or_else(|| {
+            error(
                 "invalid_request",
                 "retiring a conversation names the window it leaves",
-            ));
-        }
+            )
+        })?;
+        let to_host_id = optional_uuid(payload, "to_host_id")?.ok_or_else(|| {
+            error(
+                "invalid_request",
+                "retiring a conversation names the host it goes to",
+            )
+        })?;
         let stream = StreamRequest::parse(payload.and_then(|payload| payload.get("stream")))
             .ok_or_else(|| error("invalid_request", "stream is {window?, digest?}"))?;
         let from_sequence = match payload.and_then(|payload| payload.get("from_sequence")) {
@@ -473,10 +484,9 @@ impl ExportRequest {
         Ok(Self {
             transfer_id,
             conversation_id,
-            mode,
             session_id,
             cwd: text(payload, "cwd").map(str::to_string),
-            to_host_id: optional_uuid(payload, "to_host_id")?,
+            to_host_id,
             include: Include::parse(payload.and_then(|payload| payload.get("include")))?,
             stream,
             from_sequence,
@@ -499,6 +509,8 @@ impl ImportRequest {
     pub(crate) fn parse(payload: Option<&Map<String, Value>>) -> FsResult<Self> {
         let transfer_id = transfer_id(payload)?;
         let conversation_id = conversation(payload)?;
+        // The device forwards the export's mode, as it forwards its digest.
+        retire_mode(payload, "this host imports")?;
         let cwd = text(payload, "cwd")
             .filter(|cwd| !cwd.trim().is_empty())
             .ok_or_else(|| {
@@ -1802,8 +1814,9 @@ struct Located {
     location: Vec<OsString>,
 }
 
-/// Where a conversation's files are read from: spawnd's holding of a
-/// retired copy, or the store, for a snapshot.
+/// Where a conversation's files are found: spawnd's holding of a retired
+/// copy, which is what streams, or the store, measured before anything
+/// stops.
 #[derive(Clone, Copy, Debug)]
 enum Layout<'a> {
     /// `files/<slot>/conversation.jsonl` and `files/<slot>/sidecar/`.
@@ -2197,21 +2210,6 @@ pub(crate) struct PreparedExport {
     pub claim: Claim,
 }
 
-/// In-memory records of snapshot exports, so a resume reads the same prefix.
-struct Snapshot {
-    conversation_id: String,
-    store: Vec<OsString>,
-    folder: String,
-    located: Vec<Located>,
-    bundle: BundleRecord,
-    used: Instant,
-}
-
-fn snapshots() -> &'static StdMutex<HashMap<Uuid, Snapshot>> {
-    static SNAPSHOTS: OnceLock<StdMutex<HashMap<Uuid, Snapshot>>> = OnceLock::new();
-    SNAPSHOTS.get_or_init(Default::default)
-}
-
 enum Existing {
     None,
     Outgoing(Box<OutgoingRecord>),
@@ -2245,7 +2243,8 @@ fn existing_export(holdings: &Holdings, transfer: Uuid) -> FsResult<Existing> {
 fn same_export(record: &OutgoingRecord, request: &ExportRequest) -> bool {
     record.conversation_id == request.conversation_id
         && record.agent == CLAUDE_CODE
-        && record.session_id.as_deref() == request.session_id.map(|id| id.to_string()).as_deref()
+        && record.session_id.as_deref() == Some(request.session_id.to_string().as_str())
+        && record.to_host_id.as_deref() == Some(request.to_host_id.to_string().as_str())
         && record.include == request.include.names()
 }
 
@@ -2341,9 +2340,8 @@ fn move_back(
 }
 
 impl Carrier {
-    /// Prepare `conv.export`: in retire mode the fence and the move out of
-    /// the lookup path (once per transfer; a resume finds the holding); in
-    /// snapshot mode a bounded prefix where it lies. The returned source
+    /// Prepare `conv.export`: the fence and the move out of the lookup path
+    /// (once per transfer; a resume finds the holding). The returned source
     /// starts at the request's `from_sequence`, and `stream_id` carries the
     /// transfer from now on.
     pub(crate) async fn prepare_export(
@@ -2353,17 +2351,7 @@ impl Carrier {
     ) -> FsResult<PreparedExport> {
         let slot = slot(Role::Export, request.transfer_id);
         let mut guard = Arc::clone(&slot).lock_owned().await;
-        let from = crate::host_stream::chunk_offset(request.from_sequence);
-        let (source, bundle, entries, stopped) = match request.mode {
-            Mode::Retire => self.prepare_retire(&request, from).await?,
-            Mode::Snapshot => {
-                let request = request.clone();
-                self.blocking(move |files, places, operations| {
-                    prepare_snapshot(files, places, operations, &request, from)
-                })
-                .await?
-            }
-        };
+        let (source, bundle, entries, stopped) = self.prepare_retire(&request).await?;
         let claim = guard.start(&slot, stream_id);
         drop(guard);
         Ok(PreparedExport {
@@ -2379,9 +2367,9 @@ impl Carrier {
     async fn prepare_retire(
         &self,
         request: &ExportRequest,
-        from: u64,
     ) -> FsResult<(BundleSource, BundleRecord, usize, Option<&'static str>)> {
         let transfer = request.transfer_id;
+        let from = crate::host_stream::chunk_offset(request.from_sequence);
         let check = request.clone();
         let existing = self
             .blocking(move |_, places, _| {
@@ -2524,12 +2512,7 @@ impl Carrier {
     /// Claude processes and confirm each gone; check again; then move every
     /// copy out of the lookup path into the holding.
     async fn retire_fresh(&self, request: &ExportRequest) -> FsResult<&'static str> {
-        let session = request.session_id.ok_or_else(|| {
-            error(
-                "invalid_request",
-                "retiring a conversation names the window it leaves",
-            )
-        })?;
+        let session = request.session_id;
         let conversation_id = request.conversation_id.clone();
         let preferred_cwd = request.cwd.clone();
         // Where the files are, before anything stops: a move that could not
@@ -2634,7 +2617,7 @@ impl Carrier {
             agent: CLAUDE_CODE.to_string(),
             conversation_id: conversation_id.clone(),
             session_id: Some(session.to_string()),
-            to_host_id: request.to_host_id.map(|id| id.to_string()),
+            to_host_id: Some(request.to_host_id.to_string()),
             created_at: now_ms(),
             state: "moving".to_string(),
             include: request
@@ -2682,106 +2665,6 @@ impl Carrier {
         .await?;
         Ok(stopped)
     }
-}
-
-fn prepare_snapshot(
-    files: &HostFileService,
-    places: &Places,
-    operations: &HostFileOperations,
-    request: &ExportRequest,
-    from: u64,
-) -> FsResult<(BundleSource, BundleRecord, usize, Option<&'static str>)> {
-    let now = Instant::now();
-    let mut snapshots = snapshots()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    snapshots.retain(|_, snapshot| now.duration_since(snapshot.used) < SNAPSHOT_RETENTION);
-    let known = snapshots.get_mut(&request.transfer_id);
-    let (store, folder, located, bundle) = match known {
-        Some(snapshot) => {
-            if snapshot.conversation_id != request.conversation_id {
-                return Err(error(
-                    "resume_mismatch",
-                    "this transfer carries another conversation",
-                ));
-            }
-            snapshot.used = now;
-            (
-                Store::at(files, snapshot.store.clone())?,
-                snapshot.folder.clone(),
-                snapshot.located.clone(),
-                snapshot.bundle.clone(),
-            )
-        }
-        None => {
-            if request.from_sequence > 0 {
-                return Err(error(
-                    "resume_mismatch",
-                    "there is no such transfer to resume",
-                ));
-            }
-            if snapshots.len() >= MAX_SNAPSHOTS {
-                return Err(error(
-                    "too_many_transfers",
-                    "too many snapshots are being carried from this host",
-                ));
-            }
-            let store = Store::open(files, places)?;
-            let projects = store.projects()?.ok_or_else(|| {
-                error(
-                    "conversation_not_found",
-                    "this host has no record of that conversation",
-                )
-            })?;
-            let copies = find_copies(&projects, &request.conversation_id, &|| {
-                operations.cancelled()
-            })?;
-            let preferred = request
-                .cwd
-                .as_deref()
-                .and_then(|cwd| resolve_destination(files, cwd).ok())
-                .map(|destination| destination.folder);
-            let carried = carried_copy(&copies, preferred.as_deref())?;
-            let folder = copies[carried].folder.clone();
-            let project = projects.open_dir_nofollow(&folder)?;
-            let layout = Layout::Store {
-                id: &request.conversation_id,
-            };
-            let (located, skipped) = locate_entries(&project, layout, request.include, operations)?;
-            let bundle = declare(&project, &located, &request.conversation_id, skipped)?;
-            snapshots.insert(
-                request.transfer_id,
-                Snapshot {
-                    conversation_id: request.conversation_id.clone(),
-                    store: store.components.clone(),
-                    folder: folder.clone(),
-                    located: located.clone(),
-                    bundle: bundle.clone(),
-                    used: now,
-                },
-            );
-            (store, folder, located, bundle)
-        }
-    };
-    drop(snapshots);
-    let projects = store
-        .projects()?
-        .ok_or_else(|| error("file_changed", "Claude's store lost its projects"))?;
-    let project = projects.open_dir_nofollow(&folder)?;
-    let manifest = Manifest::decode(
-        bundle.manifest.as_bytes(),
-        CLAUDE_CODE,
-        &request.conversation_id,
-    )
-    .map_err(bundle_error)?;
-    let source = BundleSource::new(
-        &project,
-        &located,
-        bundle.manifest.as_bytes(),
-        &manifest,
-        from,
-    )?;
-    Ok((source, bundle.clone(), manifest.entries.len(), None))
 }
 
 // ---------------------------------------------------------------------------
@@ -3731,6 +3614,7 @@ mod tests {
     const ID: &str = "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60";
     const OTHER_ID: &str = "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09";
     const WINDOW: &str = "33333333-3333-4333-8333-333333333333";
+    const TARGET_HOST: &str = "44444444-4444-4444-8444-444444444444";
 
     type Stop = Arc<dyn Fn() -> WindowStop + Send + Sync>;
 
@@ -3807,14 +3691,15 @@ mod tests {
         }
     }
 
-    fn export(transfer: Uuid, mode: &str, cwd: Option<&Path>, from: u64) -> ExportRequest {
+    fn export(transfer: Uuid, cwd: Option<&Path>, from: u64) -> ExportRequest {
         ExportRequest::parse(
             json!({
                 "transfer_id": transfer.to_string(),
                 "agent": "claude-code",
                 "conversation_id": ID,
-                "mode": mode,
+                "mode": "retire",
                 "session_id": WINDOW,
+                "to_host_id": TARGET_HOST,
                 "cwd": cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
                 "stream": {"window": 16, "digest": "end"},
                 "from_sequence": from,
@@ -3824,12 +3709,28 @@ mod tests {
         .unwrap()
     }
 
+    /// A conversation retired out of a fresh host, as a target receives it.
+    async fn retired_bundle(record: &[u8], sidecar: &[(&str, &[u8])]) -> Vec<u8> {
+        let source = Host::new().await;
+        let cwd = source.folder("code/spawn");
+        write_conversation(&source.project(&cwd), ID, record, sidecar);
+        drain(
+            source
+                .carrier
+                .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "s")
+                .await
+                .unwrap()
+                .source,
+        )
+    }
+
     fn import(transfer: Uuid, cwd: &Path, bundle: &[u8], sha256: Option<&str>) -> ImportRequest {
         ImportRequest::parse(
             json!({
                 "transfer_id": transfer.to_string(),
                 "agent": "claude-code",
                 "conversation_id": ID,
+                "mode": "retire",
                 "cwd": cwd.to_string_lossy(),
                 "length": bundle.len(),
                 "sha256": sha256,
@@ -4061,7 +3962,7 @@ mod tests {
             write_conversation(&project, ID, &record, &sidecar);
             let prepared = host
                 .carrier
-                .prepare_export(export(Uuid::new_v4(), "snapshot", Some(&cwd), 0), "s")
+                .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "s")
                 .await
                 .unwrap();
             assert_eq!(prepared.sha256, bundle["sha256"].as_str().unwrap());
@@ -4079,7 +3980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_snapshot_carries_a_conversation_to_another_host() {
+    async fn a_retired_conversation_lands_on_another_host() {
         let source = Host::new().await;
         let cwd = source.folder("code/spawn");
         write_conversation(&source.project(&cwd), ID, RECORD_BYTES, SIDECAR_FILES);
@@ -4092,21 +3993,21 @@ mod tests {
         let transfer = Uuid::new_v4();
         let prepared = source
             .carrier
-            .prepare_export(export(transfer, "snapshot", Some(&cwd), 0), "s")
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
             .await
             .unwrap();
         assert_eq!(prepared.entries, 7);
-        // run.sh, notes.md, and the link stay behind.
+        // run.sh, notes.md, and the link are not carried.
         assert_eq!(prepared.skipped, if cfg!(unix) { 3 } else { 2 });
-        assert_eq!(source.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(source.stops.load(Ordering::SeqCst), 1);
         let sha256 = prepared.sha256.clone();
         let bundle = drain(prepared.source);
         assert_eq!(sha(&bundle), sha256);
         let carried = entries(&bundle);
         assert_eq!(carried.last().unwrap().0, CONVERSATION);
         assert_eq!(carried.last().unwrap().1, RECORD_BYTES);
-        // A snapshot moves nothing.
-        assert!(source.project(&cwd).join(format!("{ID}.jsonl")).exists());
+        // The source can no longer resume it.
+        assert!(!source.project(&cwd).join(format!("{ID}.jsonl")).exists());
 
         let target = Host::new().await;
         let target_cwd = target.folder("work/spawn");
@@ -4172,7 +4073,7 @@ mod tests {
         let transfer = Uuid::new_v4();
         let prepared = source
             .carrier
-            .prepare_export(export(transfer, "retire", Some(&cwd), 0), "s")
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
             .await
             .unwrap();
         assert_eq!(prepared.stopped, Some("not_running"));
@@ -4200,7 +4101,7 @@ mod tests {
         // One move of a conversation at a time.
         let second = source
             .carrier
-            .prepare_export(export(Uuid::new_v4(), "retire", Some(&cwd), 0), "s2")
+            .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "s2")
             .await;
         assert_eq!(second.err().unwrap().code, "transfer_unresolved");
 
@@ -4256,7 +4157,7 @@ mod tests {
         );
         let resumed = source
             .carrier
-            .prepare_export(export(transfer, "retire", Some(&cwd), 1), "s3")
+            .prepare_export(export(transfer, Some(&cwd), 1), "s3")
             .await;
         assert_eq!(resumed.err().unwrap().code, "transfer_committed");
     }
@@ -4278,7 +4179,7 @@ mod tests {
         // leave the lookup path.
         let prepared = source
             .carrier
-            .prepare_export(export(transfer, "retire", Some(&cwd), 0), "s")
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
             .await
             .unwrap();
         let carried = entries(&drain(prepared.source));
@@ -4330,7 +4231,7 @@ mod tests {
         // Without the window's folder, two copies are one too many.
         let ambiguous = source
             .carrier
-            .prepare_export(export(Uuid::new_v4(), "retire", None, 0), "s2")
+            .prepare_export(export(Uuid::new_v4(), None, 0), "s2")
             .await;
         assert_eq!(ambiguous.err().unwrap().code, "conversation_ambiguous");
         assert_eq!(
@@ -4361,7 +4262,7 @@ mod tests {
         let transfer = Uuid::new_v4();
         let prepared = source
             .carrier
-            .prepare_export(export(transfer, "retire", Some(&cwd), 0), "s")
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
             .await
             .unwrap();
         let bundle = drain(prepared.source);
@@ -4404,20 +4305,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_copy_already_on_the_target_is_set_aside() {
-        let source = Host::new().await;
-        let cwd = source.folder("code/spawn");
-        write_conversation(
-            &source.project(&cwd),
-            ID,
-            RECORD_BYTES,
-            &[("tool-results/new.txt", b"new")],
-        );
-        let prepared = source
-            .carrier
-            .prepare_export(export(Uuid::new_v4(), "snapshot", Some(&cwd), 0), "s")
-            .await
-            .unwrap();
-        let bundle = drain(prepared.source);
+        let bundle = retired_bundle(RECORD_BYTES, &[("tool-results/new.txt", b"new")]).await;
 
         let target = Host::new().await;
         let target_cwd = target.folder("code/spawn");
@@ -4594,7 +4482,7 @@ mod tests {
         let transfer = Uuid::new_v4();
         let first = source
             .carrier
-            .prepare_export(export(transfer, "retire", Some(&cwd), 0), "first")
+            .prepare_export(export(transfer, Some(&cwd), 0), "first")
             .await
             .unwrap();
         let whole = drain(first.source);
@@ -4605,44 +4493,24 @@ mod tests {
         // the same whole-stream digest, and the first stream is told.
         let again = source
             .carrier
-            .prepare_export(export(transfer, "retire", Some(&cwd), 2), "second")
+            .prepare_export(export(transfer, Some(&cwd), 2), "second")
             .await
             .unwrap();
         assert!(first.claim.token().is_cancelled());
         assert_eq!(first.claim.reason(), Some("superseded"));
         assert_eq!(again.sha256, first.sha256);
         assert_eq!(drain(again.source), whole[2 * 8192..]);
-        // Snapshots resume too, within the daemon's lifetime.
-        let snapshot = Uuid::new_v4();
-        let target_cwd = source.folder("code/other");
-        write_conversation(&source.project(&target_cwd), ID, &big, &[]);
-        let mut request = export(snapshot, "snapshot", Some(&target_cwd), 0);
-        let whole = drain(
-            source
-                .carrier
-                .prepare_export(request.clone(), "a")
-                .await
-                .unwrap()
-                .source,
-        );
-        request.from_sequence = 1;
-        assert_eq!(
-            drain(
-                source
-                    .carrier
-                    .prepare_export(request, "b")
-                    .await
-                    .unwrap()
-                    .source
-            ),
-            whole[8192..]
-        );
         // There is nothing to resume for a transfer never begun.
         let unknown = source
             .carrier
-            .prepare_export(export(Uuid::new_v4(), "snapshot", Some(&cwd), 3), "c")
+            .prepare_export(export(Uuid::new_v4(), Some(&cwd), 3), "c")
             .await;
         assert_eq!(unknown.err().unwrap().code, "resume_mismatch");
+        // A resume names the same move: the same window and target.
+        let mut elsewhere = export(transfer, Some(&cwd), 1);
+        elsewhere.to_host_id = Uuid::new_v4();
+        let refused = source.carrier.prepare_export(elsewhere, "d").await;
+        assert_eq!(refused.err().unwrap().code, "resume_mismatch");
     }
 
     #[tokio::test]
@@ -4656,7 +4524,7 @@ mod tests {
         let bundle = drain(
             source
                 .carrier
-                .prepare_export(export(Uuid::new_v4(), "snapshot", Some(&cwd), 0), "s")
+                .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "s")
                 .await
                 .unwrap()
                 .source,
@@ -4712,17 +4580,7 @@ mod tests {
     /// before the cancel; the rounds between race them on several threads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancel_and_commit_exclude_each_other() {
-        let source = Host::new().await;
-        let cwd = source.folder("code/spawn");
-        write_conversation(&source.project(&cwd), ID, RECORD_BYTES, SIDECAR_FILES);
-        let bundle = drain(
-            source
-                .carrier
-                .prepare_export(export(Uuid::new_v4(), "snapshot", Some(&cwd), 0), "s")
-                .await
-                .unwrap()
-                .source,
-        );
+        let bundle = retired_bundle(RECORD_BYTES, SIDECAR_FILES).await;
         let target = Host::new().await;
         let target_cwd = target.folder("code/spawn");
         let record = target.project(&target_cwd).join(format!("{ID}.jsonl"));
@@ -4808,17 +4666,7 @@ mod tests {
 
     #[tokio::test]
     async fn bytes_that_fail_their_checks_are_forgotten() {
-        let source = Host::new().await;
-        let cwd = source.folder("code/spawn");
-        write_conversation(&source.project(&cwd), ID, RECORD_BYTES, &[]);
-        let bundle = drain(
-            source
-                .carrier
-                .prepare_export(export(Uuid::new_v4(), "snapshot", Some(&cwd), 0), "s")
-                .await
-                .unwrap()
-                .source,
-        );
+        let bundle = retired_bundle(RECORD_BYTES, &[]).await;
         let target = Host::new().await;
         let target_cwd = target.folder("code/spawn");
         // A digest declared at the start that the bytes do not have.
@@ -4892,6 +4740,7 @@ mod tests {
                     "transfer_id": Uuid::new_v4().to_string(),
                     "agent": case["agent"],
                     "conversation_id": case["conversation_id"],
+                    "mode": "retire",
                     "cwd": "~",
                     "length": 100,
                     "stream": {"digest": "end"},
@@ -4909,11 +4758,16 @@ mod tests {
             "transfer_id": Uuid::new_v4().to_string(),
             "agent": "claude-code",
             "conversation_id": ID,
+            "mode": "retire",
             "cwd": "~/code/spawn",
             "length": 100,
             "stream": {"digest": "end"},
         });
         for (change, code) in [
+            // Only what a retire carried lands: never a second resumable
+            // copy of a conversation still resumable where it came from.
+            (json!({"mode": "snapshot"}), "unsupported_operation"),
+            (json!({"mode": null}), "invalid_request"),
             (
                 json!({"transfer_id": "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09"}),
                 "invalid_request",
@@ -5000,24 +4854,28 @@ mod tests {
     async fn exports_refuse_what_they_cannot_carry() {
         for (payload, code) in [
             (json!({"mode": "move"}), "invalid_request"),
-            (
-                json!({"mode": "retire", "session_id": null}),
-                "invalid_request",
-            ),
+            (json!({"mode": null}), "invalid_request"),
+            // Reserved for a copies feature nobody has approved: a snapshot
+            // would leave the conversation resumable here too.
+            (json!({"mode": "snapshot"}), "unsupported_operation"),
+            (json!({"session_id": null}), "invalid_request"),
+            // A move names where it goes, so whoever resolves it asks there.
+            (json!({"to_host_id": null}), "invalid_request"),
+            (json!({"to_host_id": "dream"}), "invalid_request"),
             (json!({"include": ["subagents"]}), "invalid_request"),
             (
                 json!({"include": ["conversation", "memory"]}),
                 "invalid_request",
             ),
             (json!({"stream": {"digest": "sideways"}}), "invalid_request"),
-            (json!({"to_host_id": "dream"}), "invalid_request"),
         ] {
             let mut request = json!({
                 "transfer_id": Uuid::new_v4().to_string(),
                 "agent": "claude-code",
                 "conversation_id": ID,
-                "mode": "snapshot",
+                "mode": "retire",
                 "session_id": WINDOW,
+                "to_host_id": TARGET_HOST,
             });
             for (key, value) in payload.as_object().unwrap() {
                 request[key] = value.clone();
@@ -5033,7 +4891,7 @@ mod tests {
         let host = Host::new().await;
         let missing = host
             .carrier
-            .prepare_export(export(Uuid::new_v4(), "retire", None, 0), "s")
+            .prepare_export(export(Uuid::new_v4(), None, 0), "s")
             .await;
         assert_eq!(missing.err().unwrap().code, "conversation_not_found");
         // Nothing stopped for a conversation that is not here.
@@ -5041,11 +4899,14 @@ mod tests {
         // Only what was asked for travels.
         let cwd = host.folder("code/spawn");
         write_conversation(&host.project(&cwd), ID, RECORD_BYTES, SIDECAR_FILES);
+        let first = Uuid::new_v4();
         let mut request = json!({
-            "transfer_id": Uuid::new_v4().to_string(),
+            "transfer_id": first.to_string(),
             "agent": "claude-code",
             "conversation_id": ID,
-            "mode": "snapshot",
+            "mode": "retire",
+            "session_id": WINDOW,
+            "to_host_id": TARGET_HOST,
             "include": ["conversation", "tool_results"],
         });
         let prepared = host
@@ -5061,6 +4922,7 @@ mod tests {
             carried,
             vec!["sidecar/tool-results/toolu_01.txt", CONVERSATION]
         );
+        host.carrier.retire_abort(first).await.unwrap();
         request["transfer_id"] = json!(Uuid::new_v4().to_string());
         request["include"] = json!(["conversation"]);
         let prepared = host
@@ -5212,25 +5074,19 @@ mod tests {
         record_for(&host.store, background.id(), ID);
         let refused = host
             .carrier
-            .prepare_export(export(Uuid::new_v4(), "retire", Some(&cwd), 0), "s")
+            .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "s")
             .await;
         assert_eq!(refused.err().unwrap().code, "conversation_live_elsewhere");
         // Nothing stopped, nothing moved.
         assert_eq!(host.stops.load(Ordering::SeqCst), 0);
         assert!(host.project(&cwd).join(format!("{ID}.jsonl")).exists());
         assert!(crate::host_conv::SystemProcesses.alive(background.id()));
-        // A snapshot reads around it.
-        assert!(host
-            .carrier
-            .prepare_export(export(Uuid::new_v4(), "snapshot", Some(&cwd), 0), "s")
-            .await
-            .is_ok());
         background.kill().unwrap();
         background.wait().unwrap();
         // Once it is gone, the record it left is not believed.
         let prepared = host
             .carrier
-            .prepare_export(export(Uuid::new_v4(), "retire", Some(&cwd), 0), "s")
+            .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "s")
             .await
             .unwrap();
         assert_eq!(prepared.stopped, Some("not_running"));
@@ -5273,7 +5129,7 @@ mod tests {
         record_for(&host.store, agent, OTHER_ID);
         let changed = host
             .carrier
-            .prepare_export(export(Uuid::new_v4(), "retire", Some(&cwd), 0), "s")
+            .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "s")
             .await;
         assert_eq!(changed.err().unwrap().code, "conversation_changed");
         assert_eq!(host.stops.load(Ordering::SeqCst), 0);
@@ -5282,7 +5138,7 @@ mod tests {
         let transfer = Uuid::new_v4();
         let prepared = host
             .carrier
-            .prepare_export(export(transfer, "retire", Some(&cwd), 0), "s")
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
             .await
             .unwrap();
         assert_eq!(prepared.stopped, Some("stopped"));

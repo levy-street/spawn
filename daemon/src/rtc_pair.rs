@@ -2484,7 +2484,9 @@ mod tests {
         const BYTES_FIELD: &str = concat!("bytes", "_b64");
 
         const ID: &str = "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60";
+        const OTHER_ID: &str = "0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09";
         const WINDOW_ID: &str = "33333333-3333-4333-8333-333333333333";
+        const TARGET_HOST: &str = "44444444-4444-4444-8444-444444444444";
 
         /// One host: a temporary home with Claude's store and spawnd's
         /// holdings, served to one device's connection.
@@ -2680,9 +2682,13 @@ mod tests {
         }
 
         fn write_conversation(project: &Path, record: &[u8]) {
-            std::fs::create_dir_all(project.join(ID).join("tool-results")).unwrap();
-            std::fs::write(project.join(format!("{ID}.jsonl")), record).unwrap();
-            std::fs::write(project.join(ID).join("tool-results/t.txt"), b"output\n").unwrap();
+            write_conversation_of(ID, project, record);
+        }
+
+        fn write_conversation_of(id: &str, project: &Path, record: &[u8]) {
+            std::fs::create_dir_all(project.join(id).join("tool-results")).unwrap();
+            std::fs::write(project.join(format!("{id}.jsonl")), record).unwrap();
+            std::fs::write(project.join(id).join("tool-results/t.txt"), b"output\n").unwrap();
         }
 
         fn conversation_lines(lines: usize) -> Vec<u8> {
@@ -2788,10 +2794,15 @@ mod tests {
             }
         }
 
-        fn export_payload(transfer: &str, mode: &str, cwd: &Path, from: u64) -> Value {
+        fn export_payload(transfer: &str, cwd: &Path, from: u64) -> Value {
+            export_payload_of(ID, transfer, cwd, from)
+        }
+
+        fn export_payload_of(id: &str, transfer: &str, cwd: &Path, from: u64) -> Value {
             json!({
-                "transfer_id": transfer, "agent": "claude-code", "conversation_id": ID,
-                "mode": mode, "session_id": WINDOW_ID, "cwd": cwd.to_string_lossy(),
+                "transfer_id": transfer, "agent": "claude-code", "conversation_id": id,
+                "mode": "retire", "session_id": WINDOW_ID, "to_host_id": TARGET_HOST,
+                "cwd": cwd.to_string_lossy(),
                 "stream": {"window": 16, "digest": "end"}, "from_sequence": from,
             })
         }
@@ -2799,8 +2810,8 @@ mod tests {
         fn import_payload(transfer: &str, cwd: &Path, length: u64) -> Value {
             json!({
                 "transfer_id": transfer, "agent": "claude-code", "conversation_id": ID,
-                "cwd": cwd.to_string_lossy(), "length": length, "sha256": null,
-                "stream": {"window": 16, "digest": "end"},
+                "mode": "retire", "cwd": cwd.to_string_lossy(), "length": length,
+                "sha256": null, "stream": {"window": 16, "digest": "end"},
             })
         }
 
@@ -2843,10 +2854,11 @@ mod tests {
                 .ok(
                     "export",
                     "conv.export",
-                    export_payload(&transfer, "retire", &cwd_a, 0),
+                    export_payload(&transfer, &cwd_a, 0),
                 )
                 .await;
             assert_eq!(export["sha256"], Value::Null);
+            assert_eq!(export["mode"], "retire");
             assert_eq!(export["window"], 16);
             assert_eq!(export["stopped"], "not_running");
             let length = export["length"].as_u64().unwrap();
@@ -2927,7 +2939,7 @@ mod tests {
                 .ok(
                     "export",
                     "conv.export",
-                    export_payload(&transfer, "retire", &cwd_a, 0),
+                    export_payload(&transfer, &cwd_a, 0),
                 )
                 .await;
             let length = export["length"].as_u64().unwrap();
@@ -2984,7 +2996,7 @@ mod tests {
                 .ok(
                     "resume-out",
                     "conv.export",
-                    export_payload(&transfer, "retire", &cwd_a, next),
+                    export_payload(&transfer, &cwd_a, next),
                 )
                 .await;
             assert_eq!(export["next_sequence"], next);
@@ -3094,23 +3106,21 @@ mod tests {
             let mut a = Host::new().await;
             let cwd = a.folder("code/spawn");
             let record = conversation_lines(6000);
+            // Two conversations of the same length, moving at once.
             write_conversation(&a.project(&cwd), &record);
+            write_conversation_of(OTHER_ID, &a.project(&cwd), &record);
             let (mut one, _) = a.channel().await;
             let (mut two, _) = a.channel().await;
             let first = Uuid::new_v4().to_string();
             let second = Uuid::new_v4().to_string();
             let x = one
-                .ok(
-                    "x",
-                    "conv.export",
-                    export_payload(&first, "snapshot", &cwd, 0),
-                )
+                .ok("x", "conv.export", export_payload(&first, &cwd, 0))
                 .await;
             let y = two
                 .ok(
                     "y",
                     "conv.export",
-                    export_payload(&second, "snapshot", &cwd, 0),
+                    export_payload_of(OTHER_ID, &second, &cwd, 0),
                 )
                 .await;
             let count = crate::host_stream::chunk_count(x["length"].as_u64().unwrap());
@@ -3120,10 +3130,10 @@ mod tests {
                 read_stream(&mut two, y["stream_id"].as_str().unwrap().to_string()),
             );
             assert_eq!(bytes_x.len() as u64, x["length"].as_u64().unwrap());
+            assert_eq!(bytes_y.len() as u64, y["length"].as_u64().unwrap());
             assert!(bytes_x.len() as u64 > (count - 1) * 8192);
-            assert_eq!(bytes_x, bytes_y);
-            assert_eq!(digest_x, digest_y);
             assert_eq!(digest_x, json!(format!("{:x}", Sha256::digest(&bytes_x))));
+            assert_eq!(digest_y, json!(format!("{:x}", Sha256::digest(&bytes_y))));
             assert!(a.gate.largest_let_through() <= crate::host_stream::BULK_WATERMARK);
         }
 
@@ -3142,11 +3152,7 @@ mod tests {
             let (mut ctl, _) = a.channel().await;
             let transfer = Uuid::new_v4().to_string();
             let export = ctl
-                .ok(
-                    "x",
-                    "conv.export",
-                    export_payload(&transfer, "snapshot", &cwd, 0),
-                )
+                .ok("x", "conv.export", export_payload(&transfer, &cwd, 0))
                 .await;
             let (bytes, digest) =
                 read_stream(&mut ctl, export["stream_id"].as_str().unwrap().to_string()).await;

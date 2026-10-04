@@ -1240,6 +1240,9 @@ impl Context {
                 json!({
                     "stream_id": stream_id,
                     "transfer_id": transfer.to_string(),
+                    // Forwarded by the device in the target's begin: a
+                    // target imports only what a retire carried.
+                    "mode": "retire",
                     "length": length,
                     "sha256": if digest_at_start { Some(sha256.as_str()) } else { None },
                     "window": window,

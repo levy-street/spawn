@@ -301,6 +301,12 @@ means for what each party learns and can do.
   operations (`conv.v2`) do not exist on a legacy host channel, and the server
   has no frame that reaches them. SPAWN D never copies, mirrors or continues a
   conversation on another host by itself.
+- **A move, never a copy.** A conversation leaves a host only by being
+  retired out of it, so it is never resumable on two hosts at once. A
+  snapshot — a copy that would leave the source running — is reserved for a
+  later copies feature the owner has not approved, and both ends refuse it:
+  the source never makes one, and the destination imports only what a retire
+  carried.
 - **What crosses.** One conversation's own files: Claude Code's record and
   the sidecar beside it that the bundle's allowlist names (helpers' records,
   workflows, spilled tool output). Never `memory/`, `file-history/`,

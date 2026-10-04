@@ -354,6 +354,7 @@
               "transfer_id": "9b2f5c1e-7a40-4d3b-8e61-0c4f2a7d9e15",
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+              "mode": "retire",
               "cwd": "~/code/spawn",
               "length": 16753,
               "sha256": "cc08614a77b5663da499ec4ebe6b165c1c03b80b63ae5c31b078021ef0dcf265",
@@ -448,6 +449,7 @@
               "transfer_id": "9b2f5c1e-7a40-4d3b-8e61-0c4f2a7d9e15",
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+              "mode": "retire",
               "cwd": "~/code/spawn",
               "length": 16753,
               "sha256": "cc08614a77b5663da499ec4ebe6b165c1c03b80b63ae5c31b078021ef0dcf265",
@@ -559,6 +561,8 @@
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
               "mode": "retire",
+              "session_id": "33333333-3333-4333-8333-333333333333",
+              "to_host_id": "44444444-4444-4444-8444-444444444444",
               "stream": {
                 "window": 16,
                 "digest": "end"
@@ -628,6 +632,8 @@
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
               "mode": "retire",
+              "session_id": "33333333-3333-4333-8333-333333333333",
+              "to_host_id": "44444444-4444-4444-8444-444444444444",
               "stream": {
                 "window": 16,
                 "digest": "end"

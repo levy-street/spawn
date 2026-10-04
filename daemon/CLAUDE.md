@@ -516,6 +516,10 @@ channels of Linux and macOS daemons; Windows does not advertise it until
 spike S5 proves cross-OS resume. Nothing is executed, and the server sees
 none of it.
 
+- **A move, never a copy.** `conv.export` accepts only `mode:"retire"`, and
+  `conv.import.begin` only the `mode:"retire"` the device forwards from it: a
+  snapshot, which would leave the conversation resumable on two hosts, is
+  reserved for an owner-approved copies feature and refused at both ends.
 - **The source is the fence.** `conv.export {mode:"retire"}` refuses with
   `conversation_live_elsewhere` while a live record or background-roster
   worker outside the window holds the conversation (`host_conv::holders`),
