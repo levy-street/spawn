@@ -3314,8 +3314,6 @@ async fn prime_macos_permissions_once() {
     spawnd::permissions::clear_gate(&shared);
 }
 
-/// The user's login shell: `$SHELL` from the daemon's environment when it
-/// names an executable file, else the platform default.
 /// The login shell this daemon's windows start, by name alone (`bash`,
 /// `zsh`, `pwsh.exe`): what a device needs to quote a line for it.
 pub(crate) fn login_shell_name() -> String {
@@ -3328,6 +3326,8 @@ pub(crate) fn login_shell_name() -> String {
         .to_string()
 }
 
+/// The user's login shell: `$SHELL` from the daemon's environment when it
+/// names an executable file, else the platform default.
 fn resolve_login_shell(env: &BTreeMap<String, String>) -> String {
     #[cfg(unix)]
     if let Some(shell) = env_get_ci(env, "SHELL").map(|value| value.trim()) {
