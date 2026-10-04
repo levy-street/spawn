@@ -865,6 +865,12 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
     if (viewing !== null) hover.cancel();
   }, [viewing, hover.cancel]);
 
+  // A name being typed (New folder, New file, Rename) has its message under
+  // it, where a card would lie: the card goes, and none opens until it is done.
+  useEffect(() => {
+    if (renaming !== null || creating !== null) hover.cancel();
+  }, [renaming, creating, hover.cancel]);
+
   // A dialog opening (a delete confirm, the viewer) takes the window; a card
   // left floating over it would sit on its buttons.
   useDismissOnModalOpen(hover.value !== null, hover.cancel);
@@ -1699,11 +1705,13 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
             props.onClick();
           }}
           onDoubleClick={(event) => event.stopPropagation()}
-          // The kebab sits on the path to the card: hovering it suppresses a
-          // preview that has not opened yet, but never dismisses one already
-          // open, or the card could not be reached at all.
+          // Reaching for a row's actions puts its preview away. Only a card
+          // beside the panel stays, since the kebab is on the way to it;
+          // a preview not yet open never opens.
           onPointerEnter={() => {
-            if (hover.value === null) hover.cancel();
+            if (hover.value === null || (hoverPlacement?.overlay && !hover.pinned)) {
+              hover.cancel();
+            }
           }}
           aria-label={`${row.entry.name} actions`}
           className="z-10 grid size-5 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover/filerow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100"
@@ -1741,7 +1749,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       if (!hover.pinned) hover.cancel();
       return;
     }
-    if (renaming || menu || dropDir || viewing) return;
+    if (renaming || creating || menu || dropDir || viewing) return;
     hover.enter({ path: row.entry.path });
   };
 
@@ -2430,29 +2438,34 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       )}
 
       {/* Hover preview. Anchored to the panel's edges but the row's vertical
-          extent, so it tracks the row without sliding sideways, and pinned
-          to the right when it is lying over the panel. */}
+          extent, so it tracks the row without sliding sideways: beside the
+          panel, or lying over it under the row (over the row when the room
+          is there), never on the row itself. */}
       <Popover
         open={hoverEntry !== null}
         anchor={hoverPlacement?.anchor ?? null}
-        side="right"
+        side={hoverPlacement?.side ?? "right"}
         align="start"
-        flip={!hoverPlacement?.overlay}
         interactive
         id="file-preview-card"
         ariaLabel={hoverEntry ? `${hoverEntry.name} preview` : undefined}
+        // Reaching the card across the next row must not swap it for that
+        // row's card.
+        onPointerEnter={hover.hold}
       >
         {hoverEntry && (
-          <FilePreviewCard
-            hostId={hostId}
-            entry={hoverEntry}
-            client={client}
-            caps={caps}
-            onOpen={() => {
-              hover.cancel();
-              setViewing(hoverEntry.path);
-            }}
-          />
+          <div style={hoverPlacement?.maxWidth ? { maxWidth: hoverPlacement.maxWidth } : undefined}>
+            <FilePreviewCard
+              hostId={hostId}
+              entry={hoverEntry}
+              client={client}
+              caps={caps}
+              onOpen={() => {
+                hover.cancel();
+                setViewing(hoverEntry.path);
+              }}
+            />
+          </div>
         )}
       </Popover>
 

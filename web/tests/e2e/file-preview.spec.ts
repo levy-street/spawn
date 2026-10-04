@@ -38,8 +38,8 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => window.localStorage.setItem("spawn.files.view.page", "tree"));
 });
 
-/** The card opens over the right of the list, so a row is hovered by its
- *  left edge — the part of it the card never covers. */
+/** The card can lie over the right of the list, under the row it is about,
+ *  so another row is hovered by its left edge — the part the card never covers. */
 const LEFT_EDGE = { position: { x: 40, y: 14 } };
 
 test("hovering a vector file previews the rendered image", async ({ page }) => {

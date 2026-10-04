@@ -880,6 +880,77 @@ test("a name already taken is said as that, though the host itself only says it 
   expect(disk.get("/Users/tester/solo.md")).toBe("file");
 });
 
+test("a file's preview never covers its own row: its ⋯ stays in reach, and reaching for it puts the card away", async ({
+  page,
+}) => {
+  // The Files page filling a wide window: the card lies over the list.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "notes.txt", size: 20 },
+        { name: "solo-zx1.md", size: 40 },
+        { name: "zeta.txt", size: 30 },
+        { name: "zeta2.txt", size: 30 },
+        { name: "zeta3.txt", size: 30 },
+      ]),
+    fileRead: () => "# Notes\n\nA line.\n",
+  });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const row = item(page, "solo-zx1.md");
+  await expect(row).toBeVisible();
+
+  // Rest on the name, as a person does.
+  await row.getByText("solo-zx1.md", { exact: true }).hover();
+  const card = page.locator("#file-preview-card");
+  await expect(card).toBeVisible();
+  await expect(card.getByText("solo-zx1.md", { exact: true })).toBeVisible();
+  const rowBox = await row.boundingBox();
+  const cardBox = await card.boundingBox();
+  if (!rowBox || !cardBox) throw new Error("no boxes");
+  const clearOfRow =
+    cardBox.y >= rowBox.y + rowBox.height - 0.5 || cardBox.y + cardBox.height <= rowBox.y + 0.5;
+  expect(clearOfRow).toBe(true);
+
+  // On the way down onto the card the pointer crosses the next file's row;
+  // arriving keeps this card rather than swapping to that one.
+  const name = await row.getByText("solo-zx1.md", { exact: true }).boundingBox();
+  if (!name) throw new Error("no name");
+  await page.mouse.move(cardBox.x - 20, rowBox.y + rowBox.height + 10, { steps: 6 });
+  await page.mouse.move(cardBox.x + 80, cardBox.y + 60, { steps: 6 });
+  await page.waitForTimeout(700);
+  await expect(card.getByText("solo-zx1.md", { exact: true })).toBeVisible();
+  await page.mouse.move(name.x + name.width / 2, name.y + name.height / 2, { steps: 10 });
+  await expect(card.getByText("solo-zx1.md", { exact: true })).toBeVisible();
+
+  // The row's ⋯ is the row's, not the card's.
+  const kebab = row.getByRole("button", { name: "solo-zx1.md actions" });
+  const kebabBox = await kebab.boundingBox();
+  if (!kebabBox) throw new Error("no kebab");
+  const at = { x: kebabBox.x + kebabBox.width / 2, y: kebabBox.y + kebabBox.height / 2 };
+  const hit = await page.evaluate(
+    ({ x, y }) =>
+      document.elementFromPoint(x, y)?.closest("[data-path]")?.getAttribute("data-path"),
+    at,
+  );
+  expect(hit).toBe("/Users/tester/solo-zx1.md");
+
+  // Moving along the row to it puts the card away, and it opens the row's menu.
+  await page.mouse.move(at.x, at.y, { steps: 12 });
+  await expect(card).toBeHidden();
+  await page.mouse.click(at.x, at.y);
+  await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menuitem", { name: "Rename" })).toHaveCount(0);
+
+  // A rename field's message lies under its row: no card stays over it.
+  await item(page, "notes.txt").getByText("notes.txt", { exact: true }).click();
+  await expect(card).toBeVisible();
+  await page.keyboard.press("F2");
+  await expect(page.getByLabel("Rename entry")).toBeFocused();
+  await expect(card).toBeHidden();
+});
+
 test("another folder opens at its top, not where the last one was scrolled", async ({ page }) => {
   const homeFiles = [
     fileEntry({ name: "sub", path: "/Users/tester/sub", is_dir: true, size: null }),
