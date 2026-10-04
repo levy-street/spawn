@@ -21,8 +21,9 @@ import { cn } from "@/lib/utils";
  * The hover preview.
  *
  * Fixed width and capped height. It is placed beside or under its row, never
- * on it (`previewPlacement`), so it cannot cover the row's kebab or a rename
- * field's message. Inside, it can be scrolled and opened; anything more is
+ * on it and never in the pointer's column (`previewPlacement`), so it cannot
+ * cover the row's kebab or a rename field's message, or take the click meant
+ * for the next row. Inside, it can be scrolled and opened; anything more is
  * the viewer dialog's.
  */
 export function FilePreviewCard({

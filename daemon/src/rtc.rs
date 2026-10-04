@@ -11351,6 +11351,12 @@ mod tests {
             .unwrap();
         let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
         let write_hooks = files.write_lifecycle_test_hooks();
+        // Both reads hold a full window from their setup until the stall: the
+        // ack read across the cancel read's request, hash and eight chunks,
+        // both across the stalled chunk's arrival. On a slow runner that
+        // outlasted the half-second test deadline, and the ack read's
+        // `stream_timeout` arrived where the cancel read's response belonged.
+        write_hooks.keep_deployed_ack_deadline();
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "d".repeat(32),
@@ -11389,7 +11395,9 @@ mod tests {
             json!({"path": "ack.bin"}),
         )
         .await;
-        let ack_stream_id = ack_read["result"]["stream_id"].as_str().unwrap();
+        let ack_stream_id = ack_read["result"]["stream_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("ack read did not return a stream id: {ack_read}"));
         for sequence in 0..8 {
             let (_, chunk) = receive_host_control(&mut messages).await;
             assert_eq!(chunk["stream_id"], ack_stream_id);
@@ -11404,7 +11412,9 @@ mod tests {
             json!({"path": "cancel.bin"}),
         )
         .await;
-        let cancel_stream_id = cancel_read["result"]["stream_id"].as_str().unwrap();
+        let cancel_stream_id = cancel_read["result"]["stream_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("cancel read did not return a stream id: {cancel_read}"));
         for sequence in 0..8 {
             let (_, chunk) = receive_host_control(&mut messages).await;
             assert_eq!(chunk["stream_id"], cancel_stream_id);
@@ -11579,6 +11589,11 @@ mod tests {
         let path = root.path().join("growing.log");
         tokio::fs::write(&path, &original).await.unwrap();
         let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        // The window stays full while the file grows; that is not the
+        // acknowledgement deadline's test.
+        files
+            .write_lifecycle_test_hooks()
+            .keep_deployed_ack_deadline();
         let (browser_pc, daemon_pc, channel, mut messages) =
             paired_host_endpoint(files, host_control_test_binding(), "growing-read").await;
         let started = request_host_control(

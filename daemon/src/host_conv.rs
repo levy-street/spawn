@@ -160,6 +160,8 @@ pub(crate) trait ProcessTable {
     /// `root` and every process under it, breadth first (nearest the shell
     /// first), at most `MAX_WINDOW_PROCESSES`. Empty when `root` is gone.
     fn tree(&self, root: u32) -> Vec<Process>;
+    /// Still running: one that has exited, whether or not its parent has
+    /// reaped it yet, is not.
     fn alive(&self, pid: u32) -> bool;
     /// The value Claude records as `procStart`, where this platform can
     /// compute it the way Claude does.
@@ -362,6 +364,8 @@ impl Liveness {
         match (recorded_start, table.start_identity(pid)) {
             (Some(recorded), Some(actual)) if recorded == actual => Self::Confirmed,
             (Some(_), Some(_)) => Self::Gone,
+            // Reaped between the two readings, and its start with it.
+            (_, None) if !table.alive(pid) => Self::Gone,
             _ => Self::Possible,
         }
     }
@@ -892,7 +896,10 @@ mod system {
     pub(super) struct Stat {
         pub ppid: u32,
         pub session: u32,
-        pub zombie: bool,
+        /// Exited, though /proc still lists it: a zombie (`Z`), or one its
+        /// parent is reaping this instant (`X`), which a reader catches
+        /// between the zombie and its release. Neither runs.
+        pub exited: bool,
         /// Field 22, clock ticks after boot: what Claude records as
         /// `procStart` on Linux.
         pub start: String,
@@ -913,7 +920,7 @@ mod system {
             return None;
         }
         Some(Stat {
-            zombie: *fields.first()? == "Z",
+            exited: matches!(*fields.first()?, "Z" | "X"),
             ppid: fields.get(1)?.parse().ok()?,
             session: fields.get(3)?.parse().ok()?,
             start,
@@ -935,7 +942,7 @@ mod system {
                 else {
                     continue;
                 };
-                let Some(stat) = stat(pid).filter(|stat| !stat.zombie) else {
+                let Some(stat) = stat(pid).filter(|stat| !stat.exited) else {
                     continue;
                 };
                 children.entry(stat.ppid).or_default().push(pid);
@@ -945,7 +952,7 @@ mod system {
         }
 
         fn alive(&self, pid: u32) -> bool {
-            stat(pid).is_some_and(|stat| !stat.zombie)
+            stat(pid).is_some_and(|stat| !stat.exited)
         }
 
         fn start_identity(&self, pid: u32) -> Option<String> {
@@ -1202,6 +1209,10 @@ mod tests {
         /// macOS: Claude's `procStart` cannot be reproduced, only the
         /// daemon's own reading of a start.
         claude_start_unknown: bool,
+        /// Reaped the moment its start is read: running when first asked,
+        /// gone from then on.
+        reaped_when_read: HashSet<u32>,
+        reaped: std::cell::RefCell<HashSet<u32>>,
     }
 
     impl FakeTable {
@@ -1247,10 +1258,16 @@ mod tests {
         }
 
         fn alive(&self, pid: u32) -> bool {
-            self.processes.iter().any(|(p, _, _)| *p == pid) && !self.dead.contains(&pid)
+            self.processes.iter().any(|(p, _, _)| *p == pid)
+                && !self.dead.contains(&pid)
+                && !self.reaped.borrow().contains(&pid)
         }
 
         fn start_identity(&self, pid: u32) -> Option<String> {
+            if self.reaped_when_read.contains(&pid) {
+                self.reaped.borrow_mut().insert(pid);
+                return None;
+            }
             if self.claude_start_unknown {
                 return None;
             }
@@ -1969,6 +1986,20 @@ mod tests {
         assert!(found.doubtful);
     }
 
+    /// A holder reaped between the reading of its pid and of its start is
+    /// gone, not in doubt: a retire that has just stopped a window's Claude
+    /// must not be refused because its parent reaped it as it was looked at.
+    #[test]
+    fn a_holder_reaped_as_it_is_read_is_gone() {
+        let mut table = FakeTable::window();
+        table.spawn(3001, 1, Some(3001), CLAUDE, "6");
+        table.reaped_when_read.insert(3001);
+        let store = store_with(&[record(3001, CONVERSATION, "busy", "6")]);
+        let found = holders_of(&table, &store, CONVERSATION);
+        assert!(found.elsewhere.is_empty(), "{:?}", found.elsewhere);
+        assert!(!found.doubtful);
+    }
+
     #[test]
     fn a_record_from_another_machine_or_namespace_holds_its_conversation() {
         // Another pid namespace (a container) or machine (a shared home)
@@ -2068,8 +2099,17 @@ mod tests {
         assert_eq!(stat.ppid, 3312136);
         assert_eq!(stat.session, 3312136);
         assert_eq!(stat.start, "276309329");
-        assert!(!stat.zombie);
+        assert!(!stat.exited);
         assert!(system::parse_stat("1 (x) Z 0 0 0").is_none());
+        // A zombie has exited, and so has one its parent is reaping this
+        // instant (`X`): /proc lists both, and neither runs.
+        for state in ["Z", "X"] {
+            let stat = system::parse_stat(&format!(
+                "3312138 (claude) {state} 3312136 3312138 3312136 34817 3312138 4194560 1 2 3 4 5 6 7 8 20 0 12 0 276309329 1 2",
+            ))
+            .unwrap();
+            assert!(stat.exited, "{state}");
+        }
     }
 
     /// The real process table against this very test: its own tree, in its
@@ -2094,9 +2134,21 @@ mod tests {
         assert!(SystemProcesses
             .start_identity(child.id())
             .is_some_and(|start| start.bytes().all(|byte| byte.is_ascii_digit())));
-        assert!(SystemProcesses
-            .executable(child.id())
-            .is_some_and(|path| path.ends_with("sleep")));
+        // `spawn` can return before the child's exec has replaced its image
+        // (a vfork-style spawn in a threaded process), so `/proc/<pid>/exe`
+        // may still name this test binary for a moment: wait for the exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut runs = SystemProcesses.executable(child.id());
+        while !runs.as_ref().is_some_and(|path| path.ends_with("sleep"))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            runs = SystemProcesses.executable(child.id());
+        }
+        assert!(
+            runs.as_ref().is_some_and(|path| path.ends_with("sleep")),
+            "{runs:?}"
+        );
         assert!(SystemProcesses
             .pid_domain()
             .is_some_and(|domain| domain.starts_with("linux:")));
