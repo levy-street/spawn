@@ -1005,7 +1005,9 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   // reconciliation record. Time stands still while it is up, so it leaves
   // when the test moves the clock, not while the page is still busy taking
   // in a 20 MB file.
-  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1_000);
+  // A margin of seconds: the page clock keeps running between the read and
+  // the pause, and pausing at a time already past throws.
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 5_000);
   await page.locator('input[type="file"]').setInputFiles({
     name: "too-large.bin",
     mimeType: "application/octet-stream",
