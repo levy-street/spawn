@@ -1993,69 +1993,94 @@ async def _read_workers_to_stop(
     return stop, [sid for sid in unclaimed if sid not in known]
 
 
-async def _stop_workers_left_running(
+@asynccontextmanager
+async def _decide_workers_to_stop(
     conn: DaemonConn, host: Host, reported: list[str], known: set[str]
-) -> None:
-    """Send the kills this host missed while it was away.
+) -> AsyncIterator[list[str]]:
+    """Decide which reported workers missed their kill while this host was
+    away, and hold `conn.lifecycle_lock` until the caller has sent `registered`
+    and then those kills (`_stop_workers_left_running`).
 
-    Runs after `registered`, when routes can already reach this daemon, so
+    Entered once the host is routable and its fencing decision is final, so
     the decision is not taken from the read that chose which sessions to
     adopt: a window restarted, restored or moved back since then must not be
     stopped, and one stopped or deleted since then, whose own kill found no
     daemon, must be. `known` is every reported id that read found a row for
     in this account.
 
-    The read and the kills happen under `conn.lifecycle_lock`, which every
-    launch also holds while it sends. A launch whose commit this read did not
-    see therefore reaches the daemon after these kills, and the daemon, which
-    handles lifecycle frames in order, stops the old worker and not the new
-    one. Each worker's exit comes back as an ordinary `session.exit`, which
-    raises no alert: the row is "killed" already, no longer this host's, or
-    gone.
+    The read is taken before `registered` goes out, never after it:
+    `registered` is where the registration ends, for the daemon and for
+    anything waiting on it, and a transaction still open then overlaps
+    whatever they do next to the host's rows. (On the one connection the test
+    database shares, this read's rollback once discarded a successor's
+    generation reservation still in flight, and the successor failed its
+    fencing check.)
 
-    A window stopped after the host became routable and before this read is
+    Every launch holds `conn.lifecycle_lock` while it sends. A launch whose
+    commit this read did not see therefore reaches the daemon after
+    `registered` and these kills, and the daemon, which handles lifecycle
+    frames in order, stops the old worker and not the new one.
+
+    Yields no ids when nothing was reported, when launches held the lock too
+    long, when this connection no longer owns its host (a newer
+    registration decides), or when the read failed; those workers are left
+    for the host's next registration.
+    """
+    acquired = False
+    if reported:
+        try:
+            async with asyncio.timeout(HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS):
+                await conn.lifecycle_lock.acquire()
+            acquired = True
+        except TimeoutError:
+            log.warning(
+                "host=%s: launches held its lifecycle lock too long; "
+                "reported sessions left for its next registration",
+                host.id,
+            )
+    try:
+        stop: list[str] = []
+        decided = await _read_workers_to_stop(conn, host, reported, known) if acquired else None
+        if decided is not None:
+            stop, unclaimed = decided
+            if unclaimed:
+                # Server log only: no frame or field carries this count to a
+                # device yet.
+                log.warning(
+                    "host=%s runs %d session(s) with no window in this account; "
+                    "left running ids=%s",
+                    host.id,
+                    len(unclaimed),
+                    unclaimed[:_UNCLAIMED_SESSION_LOG_IDS],
+                )
+        yield stop
+    finally:
+        if acquired:
+            conn.lifecycle_lock.release()
+
+
+async def _stop_workers_left_running(conn: DaemonConn, host: Host, stop: list[str]) -> None:
+    """Send the kills this host missed while it was away, as decided by
+    `_decide_workers_to_stop` and under the lock it holds, after `registered`.
+
+    Each worker's exit comes back as an ordinary `session.exit`, which raises
+    no alert: the row is "killed" already, no longer this host's, or gone.
+
+    A window stopped after the host became routable and before that read is
     sent two kills, its route's and this one. The second TERM reaches the
     same worker, or none (the daemon answers `kill_failed`, which is only
     logged), and changes nothing.
     """
-    if not reported:
-        return
-    try:
-        async with asyncio.timeout(HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS):
-            await conn.lifecycle_lock.acquire()
-    except TimeoutError:
-        log.warning(
-            "host=%s: launches held its lifecycle lock too long; "
-            "reported sessions left for its next registration",
+    for sid in stop:
+        await _bounded_send_text(
+            conn, {"type": "session.kill", "session_id": sid, "signal": "TERM"}
+        )
+    if stop:
+        log.info(
+            "stopping %d session(s) stopped, moved or deleted while host=%s was away",
+            len(stop),
             host.id,
         )
-        return
-    try:
-        decided = await _read_workers_to_stop(conn, host, reported, known)
-        if decided is None:
-            return
-        stop, unclaimed = decided
-        for sid in stop:
-            await _bounded_send_text(
-                conn, {"type": "session.kill", "session_id": sid, "signal": "TERM"}
-            )
-        if stop:
-            log.info(
-                "stopping %d session(s) stopped, moved or deleted while host=%s was away",
-                len(stop),
-                host.id,
-            )
-        if unclaimed:
-            # Server log only: no frame or field carries this count to a
-            # device yet.
-            log.warning(
-                "host=%s runs %d session(s) with no window in this account; left running ids=%s",
-                host.id,
-                len(unclaimed),
-                unclaimed[:_UNCLAIMED_SESSION_LOG_IDS],
-            )
-    finally:
-        conn.lifecycle_lock.release()
 
 
 def _rtc_binding_frame(
@@ -2374,17 +2399,19 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             registered_payload["access_token"] = auth_mod.issue_daemon_token(
                                 host.id, host.owner_user_id
                             )
-                        await _bounded_send_text(conn, registered_payload)
-                        registered = True
+                        # The kills that could not be delivered while this
+                        # host was away: decided afresh now that it is
+                        # routable, and before `registered` ends the
+                        # registration; sent after it (see the function).
+                        async with _decide_workers_to_stop(
+                            conn, host, reported_existing, known_existing
+                        ) as left_running:
+                            await _bounded_send_text(conn, registered_payload)
+                            registered = True
+                            await _stop_workers_left_running(conn, host, left_running)
                         await publish_data_changed(host.owner_user_id, "hosts", host.id)
                         conn.durable_owner_valid_until = (
                             time.monotonic() + DURABLE_OWNERSHIP_CACHE_SECONDS
-                        )
-                        # The kills that could not be delivered while this
-                        # host was away, decided afresh now that it is
-                        # routable (see the function).
-                        await _stop_workers_left_running(
-                            conn, host, reported_existing, known_existing
                         )
                         if conn.keeps_peers_across_reconnect:
                             await _reconcile_live_bindings(conn, live_bindings)

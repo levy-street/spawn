@@ -33,6 +33,7 @@ import {
   LiveTerminalWriteBuffer,
   PostRenderLiveWriteBuffer,
 } from "@/components/terminal/live-write-buffer";
+import { socketAcceptingInput } from "@/components/terminal/terminal-input";
 import { openTerminalLink } from "@/components/terminal/terminal-link";
 import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
 import { UploadProgressBar } from "@/components/terminal/upload-progress-bar";
@@ -3026,7 +3027,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (!rawInput) return;
     const enc = new TextEncoder();
     onDataDisposableRef.current = term.onData((d) => {
-      if (displayOwnerRef.current !== true || !socket.dcOpen) return;
+      // The live socket, not one captured here: the render that marks the
+      // terminal ready commits before this effect could re-run (see
+      // socketAcceptingInput).
+      const live = socketAcceptingInput(socketRef, displayOwnerRef);
+      if (!live) return;
       const filtered = stripDeviceAttributeResponses(d);
       const mapped = rewriteMobileReturn(
         filtered,
@@ -3037,7 +3042,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) {
-        if (!socket.sendBinary(enc.encode(withAttachments))) return;
+        if (!live.sendBinary(enc.encode(withAttachments))) return;
       }
       if (latencyHudRef.current && withAttachments === d && /^[\x20-\x7e]$/.test(d)) {
         latencyHudRef.current.noteKeystroke(performance.now());
@@ -3070,7 +3075,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       onDataDisposableRef.current?.dispose();
       onDataDisposableRef.current = null;
     };
-  }, [appendAttachmentsForSubmit, rawInput, socket, schedulePredictionSweep]);
+  }, [appendAttachmentsForSubmit, rawInput, schedulePredictionSweep]);
 
   // Resend the last known size on (re)connection so the daemon's PTY matches.
   useEffect(() => {
