@@ -334,17 +334,24 @@ means for what each party learns and can do.
   it. It refuses the conversation while a Claude there holds it, by the same
   fail-closed reading the source uses, when the move begins and again right
   before it commits.
-- **Set-aside copies.** The source keeps what it moved out for 30 days in
-  spawnd's own configuration folder, outside the agent's lookup path, then
-  deletes it; a move that does not finish puts the files back. A copy the
-  destination set aside is kept the same way. These are files on the hosts
+- **Set-aside copies.** Once a move commits, the source keeps what it moved
+  out for 30 days in spawnd's own configuration folder, outside the agent's
+  lookup path, then deletes it — including files of the conversation the
+  bundle does not carry. A move that does not finish stays held out of the
+  lookup path until a device resolves it: the device asks the destination
+  the move named, and only once that host has cancelled the transfer does
+  the source's abort put the files back. Nothing resolves a move on its own,
+  since only the destination knows whether it committed; a destination drops
+  staging nothing has written for 30 days, cancelled first. A copy the
+  destination set aside is kept 30 days too. These are files on the hosts
   that held them, readable by anyone who can read that user's files there.
 - **What the server and TURN learn.** The conversation, its file names, sizes,
   digests and paths travel only inside the encrypted host channels. The
-  server learns that the window moved — its host changes, as for any move —
-  and the signaling timing of the device's two connections. TURN, when the
-  device's connections are relayed, learns the volume and timing of two
-  correlated flows.
+  server learns that the window stopped on the source (the stop reports the
+  session's exit, as any stop does) and that it moved — its host changes, as
+  for any move — and the signaling timing of the device's two connections.
+  TURN, when the device's connections are relayed, learns the volume and
+  timing of two correlated flows.
 
 A carried conversation is text written on one host that an agent on another
 reads and acts on: see residual risk 6.
@@ -681,9 +688,13 @@ worthless:
 6. **A carried conversation.** A conversation carried between hosts is text
    written on one host that an agent on another reads and acts on. A
    compromised source host can try to steer the destination's agent through
-   it. SPAWN D carries conversations only at the Operator's request, tells the
-   agent where the record came from, starts it in the permission mode the
-   Operator chose, and never continues a conversation elsewhere on its own.
+   it. The daemons carry a conversation only at a device's request and never
+   continue one elsewhere on their own; they cannot see what the agent is
+   told. The clients that carry conversations (milestone M6, not yet
+   shipped) are what must tell the agent where the record came from and
+   start it in the permission mode the Operator chose — the relaunch module
+   both clients carry can already compose that line, and no client resumes
+   a carried conversation until it does.
 
 ## Open source
 
