@@ -2122,11 +2122,16 @@ A line that cannot be said as asked — a mode the CLI has no flag, or no such
 mode, for; a note the CLI or the shell cannot take on the command line — is
 not composed at all, never composed with that part left off. Restart asks for
 no mode and no note: the agent comes back on the same host in the mode its
-own conversation recorded, as it always has. A note means the conversation
-was carried, so a relaunch with a note and no explicit mode is not composed
-either: every resume SPAWN D types after a move or an account switch carries
-an explicit mode, and a carried record can never bring back a mode the
-Operator did not choose on the receiving host. Codex has no mode to state
+own conversation recorded, as it always has. A move put back is a Restart
+too — the window comes back on the host it never left, its conversation put
+back where it was by the source's own retire abort, so the record is the one
+that host wrote and its mode is the one the window ran in before the move
+(the browser's `lib/move/put-back.ts`, the phone's `putBackLine`). A note
+means the conversation was carried, so a relaunch with a note and no
+explicit mode is not composed either: every resume SPAWN D types where a
+move or an account switch has carried a conversation carries an explicit
+mode, and a carried record can never bring back a mode the Operator did not
+choose on the receiving host. Codex has no mode to state
 until Codex carry gives it an approval grammar, so until then a Codex
 conversation has no move line at all.
 

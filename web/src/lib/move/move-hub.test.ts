@@ -295,7 +295,7 @@ describe("MoveHub", () => {
   });
 
   test("a restart on the source is done by exactly one tab", async () => {
-    const RESUME = "claude --resume 0b1e5a27-9f3c-4d1e-8a6b-2c4d5e6f7a8b --permission-mode default";
+    const RESUME = "claude --resume 0b1e5a27-9f3c-4d1e-8a6b-2c4d5e6f7a8b";
     const bus = new Bus();
     const log: string[] = [];
     const locks = new Locks();

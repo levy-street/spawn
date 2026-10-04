@@ -41,7 +41,8 @@ export async function readHostText(
  * (`openIntent`), the relaunch line (`pendingLaunch.claim`), and the note
  * with the names its banners use (`pendingNote`). Put back, the window is
  * restarted on the host it never left with the line that resumes the
- * conversation that was moving, its mode explicit (`put-back.ts`).
+ * conversation that was moving, in the mode its record carries there
+ * (`put-back.ts`).
  *
  * Whoever settles a move leaves the window running its agent: the line is
  * claimed, so this tab's view of the window takes the display to type it even

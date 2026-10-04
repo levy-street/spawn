@@ -1,3 +1,4 @@
+import { agentResumeCommand } from "@/data/selectors/agent-relaunch";
 import {
   compareFolders,
   defaultPermissionMode,
@@ -158,29 +159,35 @@ describe("the line a put-back types on the source", () => {
   const CONVERSATION = "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60";
   const CLAUDE = { kind: "claude-code", command: "claude", env: {} };
 
-  it("resumes the conversation that was moving, its mode said outright (the browser's line)", () => {
+  it("resumes the conversation that was moving with no mode of its own: Claude Code restores the one its record carries (the browser's line)", () => {
+    const line = putBackLine(CLAUDE, CONVERSATION, NO_PUT_BACK_FACTS);
+    // The window ran in auto mode before the move; the record on the source
+    // says so, and a resume without a mode brings it back — never manual
+    // mode, or the source's default, said over it.
+    expect(line).toBe(`claude --resume ${CONVERSATION}`);
+    expect(line).not.toContain("--permission-mode");
+  });
+
+  it("is the line Restart types on that host, spelled for the source's shell", () => {
     expect(putBackLine(CLAUDE, CONVERSATION, NO_PUT_BACK_FACTS)).toBe(
-      `claude --resume ${CONVERSATION} --permission-mode default`,
+      agentResumeCommand(CLAUDE, CONVERSATION),
+    );
+    const pwsh = { ...CLAUDE, env: { CLAUDE_CONFIG_DIR: "C:\\Users\\me\\claude" } };
+    expect(putBackLine(pwsh, CONVERSATION, { loginShell: "pwsh.exe" })).toBe(
+      `$env:CLAUDE_CONFIG_DIR='C:\\Users\\me\\claude'; claude --resume '${CONVERSATION}'`,
     );
   });
 
-  it("starts in the source's own default mode, never the record's", () => {
-    const settings = JSON.stringify({ permissions: { defaultMode: "acceptEdits" } });
-    expect(putBackLine(CLAUDE, CONVERSATION, { loginShell: "/bin/zsh", settings })).toBe(
-      `claude --resume ${CONVERSATION} --permission-mode acceptEdits`,
-    );
-  });
-
-  it("a yolo window keeps skipping its prompts, the flag giving way to the mode", () => {
+  it("a yolo window comes back skipping its prompts, as Restart brings it back", () => {
     const yolo = { ...CLAUDE, yolo: true, yolo_args: "--dangerously-skip-permissions" };
-    const line = putBackLine(yolo, CONVERSATION, NO_PUT_BACK_FACTS);
-    expect(line).toBe(`claude --resume ${CONVERSATION} --permission-mode bypassPermissions`);
-    expect(line).not.toContain("--dangerously-skip-permissions");
+    expect(putBackLine(yolo, CONVERSATION, NO_PUT_BACK_FACTS)).toBe(
+      `claude --dangerously-skip-permissions --resume ${CONVERSATION}`,
+    );
   });
 
-  it("an agent with no mode flag gets no line: the ordinary restart", () => {
+  it("an agent that cannot be resumed gets no line: the ordinary restart", () => {
     expect(
-      putBackLine({ kind: "codex", command: "codex", env: {} }, CONVERSATION, NO_PUT_BACK_FACTS),
+      putBackLine({ kind: "aider", command: "aider", env: {} }, CONVERSATION, NO_PUT_BACK_FACTS),
     ).toBeNull();
   });
 });

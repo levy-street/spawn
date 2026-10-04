@@ -481,7 +481,7 @@ async function finish(
 /** Take the server's mark off and, where the source's retire had stopped
  *  the window, restart it there with its conversation resumed: whoever puts
  *  a move back leaves the window running its agent, the line queued for this
- *  device to type with its mode said outright (`putBackResume`). */
+ *  device to type, in the mode its record carries there (`putBackResume`). */
 async function undoServer(
   request: ResolveRequest,
   deps: ResolveDeps,

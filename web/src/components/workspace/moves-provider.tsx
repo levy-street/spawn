@@ -44,7 +44,7 @@ import {
 } from "@/lib/move/orchestrator";
 import { displayPath } from "@/lib/places";
 import { browserTabId } from "@/lib/tab-id";
-import { createLocalLaunch, moveServer, readHostText } from "./move-launch";
+import { createLocalLaunch, moveServer } from "./move-launch";
 
 /**
  * Moves outlive the page they were started from: the hub lives here, beside
@@ -220,7 +220,6 @@ export function MovesProvider({ children }: { children: ReactNode }) {
             server: moveServer,
             hosts: hostsPort(plan, connectionsRef, opened),
             launcher,
-            readText: readHostText,
           },
           (view) => {
             emit(view);

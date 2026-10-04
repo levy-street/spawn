@@ -124,9 +124,6 @@ export interface MovePorts {
   sleep?: (ms: number) => Promise<void>;
   /** How long a carry may hear nothing before it is lost. */
   silenceMs?: number;
-  /** Reads at most `limit` bytes of a file on a host as text (`fs.read`):
-   *  the source's settings, for the mode a put-back resumes in. */
-  readText?: (client: CarrierClient, path: string, limit: number) => Promise<string | null>;
 }
 
 export type MovePhase =
@@ -789,16 +786,15 @@ export class MoveOrchestrator {
     return status === "killed" ? "put_back_stopped" : "put_back";
   }
 
-  /** The line that resumes the conversation back on the source
-   *  (`put-back.ts`), its mode explicit; asked of the source, which has just
-   *  answered the abort. */
+  /** The line that resumes the conversation back on the source in the mode
+   *  its record carries there (`put-back.ts`), spelled for the shell the
+   *  source names — asked of it, as it has just answered the abort. */
   private async putBackLine(): Promise<string | null> {
     const source = await this.ports.hosts.source().catch(() => null);
-    const facts = await readPutBackFacts(
-      source,
-      { conversationId: this.plan.conversationId, cwd: this.plan.source.cwd },
-      this.ports.readText,
-    );
+    const facts = await readPutBackFacts(source, {
+      conversationId: this.plan.conversationId,
+      cwd: this.plan.source.cwd,
+    });
     return putBackLine(this.plan.agent, this.plan.conversationId, facts);
   }
 

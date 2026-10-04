@@ -166,24 +166,31 @@ describe("resolveMove", () => {
     expect(events).toContain("restart");
     expect(target.operations.indexOf("conv.import.cancel")).toBeGreaterThanOrEqual(0);
     // Whoever puts it back leaves Claude Code running there: the conversation
-    // that was moving, resumed in a mode said outright.
-    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode default`);
+    // that was moving, in the mode it ran in there — the line names none, so
+    // Claude Code restores the one its record carries.
+    expect(restartLine()).toBe(`claude --resume ${CONVERSATION}`);
   });
 
-  test("a put-back from another device resumes in the source's own mode, spelled for its shell", async () => {
+  test("a put-back from another device names no mode, whatever the source's settings say, and is spelled for its shell", async () => {
     const { source, ports, request, files, restartLine } = setup({ incoming: "receiving" });
     source.loginShell = "/usr/bin/fish";
+    // A default the person set on dream never overrides the mode the window
+    // was in when it began to move.
     files.set("~/.claude/settings.json", JSON.stringify({ permissions: { defaultMode: "plan" } }));
+    request.agent = { ...request.agent, env: { CLAUDE_CONFIG_DIR: "/home/me/Claude's" } };
     expect(await resolveMove(request, ports)).toMatchObject({ kind: "put_back", restarted: true });
-    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode plan`);
+    // fish quotes with a backslash where POSIX shells close and reopen.
+    expect(restartLine()).toBe(
+      `CLAUDE_CONFIG_DIR='/home/me/Claude\\'s' claude --resume ${CONVERSATION}`,
+    );
     expect(source.operations).toContain("conv.probe");
   });
 
-  test("a source that cannot say its shell or settings still gets the line, in manual mode", async () => {
+  test("a source that cannot say its shell still gets the line, as for POSIX", async () => {
     const { source, ports, request, restartLine } = setup({ incoming: "receiving" });
     source.loginShell = null;
     expect(await resolveMove(request, ports)).toMatchObject({ kind: "put_back", restarted: true });
-    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode default`);
+    expect(restartLine()).toBe(`claude --resume ${CONVERSATION}`);
   });
 
   test("the target cannot be reached: nothing is guessed, the source keeps the files aside", async () => {
@@ -209,7 +216,7 @@ describe("resolveMove", () => {
     expect(server.rows.get(SESSION)?.status).toBe("killed");
     expect(events).toContain("restart");
     // No transfer names the conversation: the window's own record does.
-    expect(restartLine()).toBe(`claude --resume ${CONVERSATION} --permission-mode default`);
+    expect(restartLine()).toBe(`claude --resume ${CONVERSATION}`);
     // Never on one empty listing: waited out a window's stop, and asked again.
     expect(waits.reduce((sum, ms) => sum + ms, 0)).toBeGreaterThanOrEqual(10_000);
     expect(source.operations.filter((op) => op === "conv.transfers").length).toBeGreaterThan(1);

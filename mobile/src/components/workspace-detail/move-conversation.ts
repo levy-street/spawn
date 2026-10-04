@@ -139,8 +139,9 @@ export interface MoveDeps {
   readonly launches: MoveLaunches;
   /**
    * Restart the window where it is with `line` queued for this device to
-   * type — a put-back's resume, its mode explicit (`putBackLine`) — or,
-   * without one, the ordinary restart (`restartSessionAgent`).
+   * type — a put-back's resume, in the mode its record carries
+   * (`putBackLine`) — or, without one, the ordinary restart
+   * (`restartSessionAgent`).
    */
   restart(session: Session, line: string | null): Promise<unknown>;
   newTransferId(): string;
@@ -238,32 +239,26 @@ async function quietly<T>(work: Promise<T>): Promise<T | null> {
 }
 
 /**
- * Ask the source for its shell and settings, for the line a put-back types
- * there (`putBackLine`). Never throws: a source that cannot answer leaves a
- * POSIX line in the agent's default mode.
+ * Ask the source for its shell, for the line a put-back types there
+ * (`putBackLine`). Never throws: a source that cannot answer leaves a POSIX
+ * line.
  */
 export async function readPutBackFacts(
   channel: MoveChannel | null,
   query: { conversationId: string; cwd: string },
 ): Promise<PutBackFacts> {
   if (!channel) return NO_PUT_BACK_FACTS;
-  const options = { timeoutMs: PREFLIGHT_TIMEOUT_MS };
-  const probe = await quietly(channel.conversationProbe(query, options));
-  if (!probe) return NO_PUT_BACK_FACTS;
-  const settings = probe.store
-    ? await quietly(
-        channel
-          .readHead(joinHostPath(probe.store, "settings.json"), SETTINGS_LIMIT, options)
-          .then(text),
-      )
-    : null;
-  return { loginShell: probe.loginShell, settings };
+  const probe = await quietly(
+    channel.conversationProbe(query, { timeoutMs: PREFLIGHT_TIMEOUT_MS }),
+  );
+  return probe ? { loginShell: probe.loginShell } : NO_PUT_BACK_FACTS;
 }
 
 /**
  * The line that leaves a window put back running its agent: the conversation
- * that was moving, resumed on the source in the mode a fresh window starts in
- * there. Null for no agent or no conversation to name: the ordinary restart.
+ * that was moving, resumed on the source in the mode its record carries there
+ * — the one the window ran in before the move. Null for no agent or no
+ * conversation to name: the ordinary restart.
  */
 export async function putBackResume(
   channel: MoveChannel | null,

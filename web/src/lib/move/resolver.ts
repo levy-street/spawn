@@ -157,7 +157,7 @@ async function abortOnServer(
   const restart = status === "killed" || retireRan;
   if (restart) {
     try {
-      await ports.launcher.restartOnSource(await resumeLine(request, ports, put));
+      await ports.launcher.restartOnSource(await resumeLine(request, put));
     } catch {
       // The stopped pane offers Restart itself.
     }
@@ -167,24 +167,19 @@ async function abortOnServer(
 
 /**
  * Whoever puts a move back leaves the window running its agent: the line
- * that resumes the conversation on the source, its mode explicit
- * (`put-back.ts`). Null when there is no conversation to name — the
+ * that resumes the conversation on the source in the mode its record carries
+ * there (`put-back.ts`). Null when there is no conversation to name — the
  * restart then goes the ordinary way.
  */
 async function resumeLine(
   request: ResolveRequest,
-  ports: ResolvePorts,
   put: { source: CarrierClient; conversationId: string | null },
 ): Promise<string | null> {
   const conversationId = canonicalConversationId(
     put.conversationId ?? request.conversationId ?? null,
   );
   if (!conversationId) return null;
-  const facts = await readPutBackFacts(
-    put.source,
-    { conversationId, cwd: request.cwd },
-    ports.readText,
-  );
+  const facts = await readPutBackFacts(put.source, { conversationId, cwd: request.cwd });
   return putBackLine(request.agent, conversationId, facts);
 }
 

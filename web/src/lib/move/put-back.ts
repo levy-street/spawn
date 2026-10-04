@@ -3,65 +3,56 @@
  *
  * Whoever puts a move back — the device that moved the window, or any other
  * device resolving it — leaves the window running its agent again: the
- * conversation that was moving, resumed with an explicit `--permission-mode`
- * like every line SPAWN D types after a move, never the mode its record ran
- * in. The mode is the one a fresh window of this agent starts in there
- * (`defaultPermissionMode`): bypass permissions for a yolo window, else the
- * source's own `permissions.defaultMode`, else manual mode. The line is
- * spelled for the source's login shell. The phone composes the same line
- * (mobile `move-facts.ts`, `putBackLine`).
+ * conversation that was moving, resumed on the host it never left, the way
+ * Restart resumes it. The line names no permission mode, so Claude Code
+ * comes back in the mode the conversation's own record carries there — the
+ * mode the window ran in before the move (auto mode, say, when that is where
+ * the person left it), never a default a device guessed for the source.
+ *
+ * A carried resume says its mode outright so that a record cannot bring a
+ * mode onto a host where nobody chose it (`agent-relaunch.ts`, `planRelaunch`).
+ * A put-back carries nothing: the target never committed, the source's
+ * retire put the files back where they were, and the record is the one that
+ * host wrote. The line is spelled for the source's login shell. The phone
+ * composes the same line (mobile `move-facts.ts`, `putBackLine`).
  */
 
 import { type RelaunchAgent, relaunchLine, shellFamily } from "@/lib/agent-relaunch";
 import { type CarrierClient, probeConversation } from "./conv";
-import { defaultPermissionMode, readTargetSettings } from "./permission-modes";
 
-/** What the source says about itself, for the line: either may be unknown. */
+/** What the source says about itself, for the line: unknown when it cannot say. */
 export interface PutBackFacts {
   /** Its login shell (`conv.probe`), which spells the line. */
   loginShell: string | null;
-  /** Its Claude Code settings file, for `permissions.defaultMode`. */
-  settings: string | null;
 }
 
-export const NO_PUT_BACK_FACTS: PutBackFacts = { loginShell: null, settings: null };
+export const NO_PUT_BACK_FACTS: PutBackFacts = { loginShell: null };
 
 /**
- * The line that resumes `conversationId` on the source, or null when it
- * cannot be said with a mode (an agent with no permission-mode flag) — the
- * caller then restarts the ordinary way.
+ * The line that resumes `conversationId` on the source in the mode its
+ * record carries, or null when the agent cannot be resumed — the caller
+ * then restarts the ordinary way.
  */
 export function putBackLine(
   agent: RelaunchAgent,
   conversationId: string,
   facts: PutBackFacts,
 ): string | null {
-  return relaunchLine(
-    agent,
-    { resume: conversationId },
-    {
-      shell: shellFamily(facts.loginShell),
-      permissionMode: defaultPermissionMode(agent, facts.settings),
-    },
-  );
+  return relaunchLine(agent, { resume: conversationId }, { shell: shellFamily(facts.loginShell) });
 }
 
 /**
- * Ask the source for its shell and settings. Never throws: a source that
- * cannot answer leaves a POSIX line in the agent's default mode.
+ * Ask the source for its shell. Never throws: a source that cannot answer
+ * leaves a POSIX line.
  */
 export async function readPutBackFacts(
   source: CarrierClient | null,
   query: { conversationId: string; cwd: string },
-  readText?: (client: CarrierClient, path: string, limit: number) => Promise<string | null>,
 ): Promise<PutBackFacts> {
   if (!source) return NO_PUT_BACK_FACTS;
   try {
     const probe = await probeConversation(source, query);
-    const settings = await readTargetSettings(probe.store, (path, limit) =>
-      readText ? readText(source, path, limit) : Promise.resolve(null),
-    );
-    return { loginShell: probe.loginShell, settings };
+    return { loginShell: probe.loginShell };
   } catch {
     return NO_PUT_BACK_FACTS;
   }

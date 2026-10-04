@@ -504,9 +504,10 @@ test("put back from here while another device holds the display, Claude Code com
   await expect(dialog).toContainText("Back on dream — nothing was lost.", { timeout: 20_000 });
   expect(store.requests.moves.map((move) => move.kind)).toEqual(["abort"]);
 
-  // The restarted shell's first line is the resume, its mode said outright,
-  // typed here though another device had the display: this view took it.
-  const line = `claude --resume ${CONVERSATION} --permission-mode default\r`;
+  // The restarted shell's first line is the resume, typed here though another
+  // device had the display: this view took it. It names no mode, so Claude
+  // Code comes back in the one it ran in on dream, which its record carries.
+  const line = `claude --resume ${CONVERSATION}\r`;
   await expect.poll(() => ptyText(messages).slice(before), { timeout: 15_000 }).toContain(line);
   await expect(terminal).toBeVisible();
 });
@@ -553,7 +554,7 @@ test("Resolve on a host's page says how it ended, and the window put back resume
   await expect(page).toHaveURL(new RegExp(`/w/${WORKSPACE_ID}.*focus=${SESSION_ID}`));
   await expect
     .poll(() => ptyText(messages).slice(before), { timeout: 15_000 })
-    .toContain(`claude --resume ${CONVERSATION} --permission-mode default\r`);
+    .toContain(`claude --resume ${CONVERSATION}\r`);
 });
 
 test("a card saying the window stays moving goes once the move is resolved underneath it", async ({

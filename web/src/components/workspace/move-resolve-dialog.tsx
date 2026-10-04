@@ -59,7 +59,8 @@ const READY_MS = 10_000;
  *
  * Whoever settles the move leaves the window running its agent: finished,
  * the resume is queued for the window on its new host; put back, the window
- * is restarted with the line that resumes its conversation, mode explicit.
+ * is restarted with the line that resumes its conversation in the mode its
+ * record carries there.
  * Either is this device's to type, and its view of the window takes the
  * display to type it (`pendingLaunch.claim`). In the window's own pane that
  * view is right here. On a host's page (`inPane` false) there is none: the

@@ -120,21 +120,26 @@ describe("resolveMove", () => {
     ]);
     expect(w.source.outgoing.size).toBe(0);
     // Whoever puts it back leaves Claude Code running there: the conversation
-    // that was moving, resumed in a mode said outright, for this device to type.
-    expect(w.restartLines).toEqual([
-      `claude --resume ${CONVERSATION_ID} --permission-mode default`,
-    ]);
+    // that was moving, for this device to type, in the mode it ran in there —
+    // the line names none, so Claude Code restores the one its record carries.
+    expect(w.restartLines).toEqual([`claude --resume ${CONVERSATION_ID}`]);
     expect(outcome).toMatchObject({ kind: "restored", restarted: true });
   });
 
-  it("a put-back from another device resumes in the source's own mode, spelled for its shell", async () => {
+  it("a put-back from another device names no mode, whatever the source's settings say, and is spelled for its shell", async () => {
     const w = world();
     await abandoned(w);
     w.source.probe = { ...w.source.probe, store: "~/.claude", loginShell: "/usr/bin/fish" };
+    // A default the person set on dream never overrides the mode the window
+    // was in when it began to move.
     w.source.files.set("~/.claude/settings.json", '{"permissions":{"defaultMode":"plan"}}');
-    const outcome = await resolveMove({ session: w.server.session, agent: CLAUDE, hosts }, w.deps);
+    const agent = { ...CLAUDE, env: { CLAUDE_CONFIG_DIR: "/home/me/Claude's" } };
+    const outcome = await resolveMove({ session: w.server.session, agent, hosts }, w.deps);
     expect(outcome).toMatchObject({ kind: "restored", restarted: true });
-    expect(w.restartLines).toEqual([`claude --resume ${CONVERSATION_ID} --permission-mode plan`]);
+    // fish quotes with a backslash where POSIX shells close and reopen.
+    expect(w.restartLines).toEqual([
+      `CLAUDE_CONFIG_DIR='/home/me/Claude\\'s' claude --resume ${CONVERSATION_ID}`,
+    ]);
   });
 
   it("a cancel the target does not answer as cancelled leaves the source's files where they are", async () => {
@@ -179,9 +184,7 @@ describe("resolveMove", () => {
     expect(w.server.session.status).toBe("killed");
     expect(w.restarts).toHaveLength(1);
     // No transfer names the conversation: the window's own record does.
-    expect(w.restartLines).toEqual([
-      `claude --resume ${CONVERSATION_ID} --permission-mode default`,
-    ]);
+    expect(w.restartLines).toEqual([`claude --resume ${CONVERSATION_ID}`]);
   });
 
   it("no record, the window stopped and its conversation gone from the source: nothing decided, Give up offered", async () => {

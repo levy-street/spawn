@@ -261,38 +261,34 @@ export function defaultPermissionMode(
   return "default";
 }
 
-/** What the source says about itself, for a put-back's line: either may be unknown. */
+/** What the source says about itself, for a put-back's line: unknown when it cannot say. */
 export interface PutBackFacts {
   /** Its login shell (`conv.probe`), which spells the line. */
   readonly loginShell: string | null;
-  /** Its Claude Code settings file, for `permissions.defaultMode`. */
-  readonly settings: string | null;
 }
 
-export const NO_PUT_BACK_FACTS: PutBackFacts = { loginShell: null, settings: null };
+export const NO_PUT_BACK_FACTS: PutBackFacts = { loginShell: null };
 
 /**
  * What brings Claude Code back on the source when a move is put back.
  * Whoever puts a move back — this device that moved it, or any device that
  * resolves it — leaves the window running its agent: the conversation that
- * was moving, resumed with an explicit `--permission-mode` like every line
- * typed after a move, never the mode its record ran in. The mode is the one
- * a fresh window starts in there (`defaultPermissionMode`), the line spelled
- * for the source's shell. Null when it cannot be said with a mode (an agent
- * with no permission-mode flag): the restart then goes the ordinary way. The
- * browser composes the same line (web `lib/move/put-back.ts`).
+ * was moving, resumed on the host it never left the way Restart resumes it.
+ * The line names no permission mode, so Claude Code comes back in the mode
+ * the conversation's own record carries there — the mode the window ran in
+ * before the move (auto mode, say), never a default a device guessed for
+ * the source. A carried resume says its mode outright so that a record
+ * cannot bring a mode onto a host where nobody chose it; a put-back carries
+ * nothing — the target never committed and the source's retire put the
+ * files back — so the record is the one that host wrote. Spelled for the
+ * source's shell. Null when the agent cannot be resumed: the restart then
+ * goes the ordinary way. The browser composes the same line (web
+ * `lib/move/put-back.ts`).
  */
 export function putBackLine(
   agent: RelaunchAgent,
   conversationId: string,
   facts: PutBackFacts,
 ): string | null {
-  return relaunchLine(
-    agent,
-    { resume: conversationId },
-    {
-      shell: shellFamily(facts.loginShell),
-      permissionMode: defaultPermissionMode(agent, facts.settings),
-    },
-  );
+  return relaunchLine(agent, { resume: conversationId }, { shell: shellFamily(facts.loginShell) });
 }

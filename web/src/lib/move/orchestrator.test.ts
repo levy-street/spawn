@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { FakeHost, FakeHosts, FakeLauncher, FakeServer } from "./fakes";
-import { MoveOrchestrator, type MovePlan, type MovePorts, type MoveView } from "./orchestrator";
+import { MoveOrchestrator, type MovePlan, type MoveView } from "./orchestrator";
 
 const SOURCE = "11111111-1111-4111-8111-111111111111";
 const TARGET = "22222222-2222-4222-8222-222222222222";
@@ -17,8 +17,8 @@ function setup({
   running = true,
   state = "running" as MovePlan["state"],
   targetShell = "/bin/zsh" as string | null,
-  readText = undefined as MovePorts["readText"],
   yolo = false,
+  permissionMode = "default",
 } = {}) {
   const source = new FakeHost(SOURCE);
   const target = new FakeHost(TARGET);
@@ -52,14 +52,14 @@ function setup({
     source: { hostId: SOURCE, name: "dream", os: "linux", cwd: "/home/me/code/spawn" },
     target: { hostId: TARGET, name: "mac", os: "darwin", cwd: "/Users/me/code/spawn" },
     state,
-    permissionMode: "default",
+    permissionMode,
     targetShell,
     memoryPath: "~/.claude/projects/-Users-me-code-spawn/memory",
     wasRunning: running,
   };
   const move = new MoveOrchestrator(
     plan,
-    { server, hosts, launcher, sleep: async () => {}, ...(readText ? { readText } : {}) },
+    { server, hosts, launcher, sleep: async () => {} },
     (view) => views.push(view),
   );
   return { source, target, server, hosts, launcher, views, move, bytes, plan };
@@ -295,26 +295,23 @@ describe("putting a move back", () => {
     expect(order.indexOf("conv.import.cancel")).toBeGreaterThanOrEqual(0);
     expect(server.rows.get(SESSION)?.status).toBe("killed");
     expect(launcher.events).toContain("restart");
-    // Claude Code comes back in the conversation that was moving, its mode
-    // said outright — never the mode its record ran in.
-    expect(launcher.restartLine).toBe(`claude --resume ${CONVERSATION} --permission-mode default`);
+    // Claude Code comes back in the conversation that was moving, in the
+    // mode it ran in there: the line names none, so the record restores it.
+    expect(launcher.restartLine).toBe(`claude --resume ${CONVERSATION}`);
   });
 
-  test("a put-back resumes in the source's own default mode, or bypass for a yolo window", async () => {
-    const settings = new Map([
-      ["~/.claude/settings.json", JSON.stringify({ permissions: { defaultMode: "acceptEdits" } })],
-    ]);
-    const { move, launcher } = setup({
-      length: 8 * 400,
-      readText: async (_client, path) => settings.get(path) ?? null,
-    });
+  test("a put-back names no mode, whatever the move would have started in, and a yolo window keeps its flag", async () => {
+    // The person picked plan mode for the target; the window goes back to
+    // dream in the mode it ran in there, not the one it was going to.
+    const { move, launcher, source } = setup({ length: 8 * 400, permissionMode: "plan" });
     const started = move.start();
     while (move.getView().phase !== "copying") await new Promise((r) => setTimeout(r, 0));
     await move.cancel();
     await started;
-    expect(launcher.restartLine).toBe(
-      `claude --resume ${CONVERSATION} --permission-mode acceptEdits`,
-    );
+    expect(launcher.restartLine).toBe(`claude --resume ${CONVERSATION}`);
+    expect(launcher.restartLine).not.toContain("--permission-mode");
+    // Spelled for the shell dream names.
+    expect(source.operations).toContain("conv.probe");
 
     const yolo = setup({ length: 8 * 400, yolo: true });
     const going = yolo.move.start();
@@ -322,7 +319,7 @@ describe("putting a move back", () => {
     await yolo.move.cancel();
     await going;
     expect(yolo.launcher.restartLine).toBe(
-      `claude --resume ${CONVERSATION} --permission-mode bypassPermissions`,
+      `claude --dangerously-skip-permissions --resume ${CONVERSATION}`,
     );
   });
 
