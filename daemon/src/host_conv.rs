@@ -292,8 +292,8 @@ const CLAUDE_CODE: &str = "claude-code";
 const CODEX: &str = "codex";
 
 /// One process, named so that it cannot be mistaken for a later one given
-/// the same pid: the start Claude records as `procStart`, where this
-/// platform can compute it.
+/// the same pid: its start as this daemon reads it (`ProcessTable::identity`),
+/// where that can be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Holder {
     pub pid: u32,
@@ -302,20 +302,74 @@ pub(crate) struct Holder {
 
 /// Who holds one conversation on this host, and what a window's stop must
 /// take down — what retiring a conversation out of a window rests on
-/// (`conv.export` in retire mode, `host_conversations`).
+/// (`conv.export` in retire mode, `host_conversations`), and what a host
+/// receiving one checks first. It fails closed: a process is counted as
+/// holding the conversation unless something rules it out.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Holders {
-    /// The window's own Claude processes — by their executable, or a live
-    /// record — whatever conversation each is in: a window being retired
-    /// stops all of them, then confirms each gone.
+    /// The window's own Claude processes — by their executable, or a record
+    /// that names their pid — whatever conversation each is in: a window
+    /// being retired stops all of them, then confirms each gone. Only a
+    /// process whose start was read is here: one that cannot be told from a
+    /// later process given its pid is never signalled.
     pub window_agents: Vec<Holder>,
-    /// Live processes outside the window that hold the conversation: a
-    /// background session (its own record, or the supervisor's roster), a
-    /// job an attach client or agent view shows, another window. A retire
-    /// refuses while any does.
+    /// Processes outside the window that hold, or may hold, the
+    /// conversation: a background session (its own record, or the
+    /// supervisor's roster), a job an attach client or agent view shows,
+    /// another window. A retire refuses while any does, and so does a host
+    /// the conversation is moving to.
     pub elsewhere: Vec<Holder>,
+    /// Whether any of `elsewhere` is only possible, not confirmed: a live
+    /// pid whose start cannot be compared with the one recorded, or a record
+    /// from another pid namespace or machine.
+    pub doubtful: bool,
     /// What `conv.inspect` answers for the window, when it has a shell.
     pub inspection: Option<Inspection>,
+}
+
+/// Whether the process a record or the roster names is still the one that
+/// wrote it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Liveness {
+    /// Not running, or a later process given the same pid: its start
+    /// differs from the recorded one.
+    Gone,
+    /// Running, and started when the record says.
+    Confirmed,
+    /// Nothing rules it out: a live pid whose start cannot be compared with
+    /// the record's (none recorded, none readable, or macOS's `lstart`
+    /// text), or a record written in another pid namespace or on another
+    /// machine sharing this home, whose pid means nothing here.
+    Possible,
+}
+
+impl Liveness {
+    fn of(
+        pid: u32,
+        recorded_start: Option<&str>,
+        recorded_domain: Option<&str>,
+        domain: Option<&str>,
+        table: &dyn ProcessTable,
+    ) -> Self {
+        if let (Some(ours), Some(theirs)) = (domain, recorded_domain) {
+            if ours != theirs {
+                return Self::Possible;
+            }
+        }
+        if !table.alive(pid) {
+            return Self::Gone;
+        }
+        match (recorded_start, table.start_identity(pid)) {
+            (Some(recorded), Some(actual)) if recorded == actual => Self::Confirmed,
+            (Some(_), Some(_)) => Self::Gone,
+            _ => Self::Possible,
+        }
+    }
+
+    /// The pid is this host's to compare with a window's processes.
+    fn local(self, recorded_domain: Option<&str>, domain: Option<&str>) -> bool {
+        !matches!((domain, recorded_domain), (Some(ours), Some(theirs)) if ours != theirs)
+    }
 }
 
 /// Who holds `conversation_id`, read from the window's process tree (when
@@ -337,35 +391,75 @@ pub(crate) fn holders(
         None => HashSet::new(),
     };
     let domain = table.pid_domain();
-    let records: Vec<SessionRecord> = stores
+    let records: Vec<(SessionRecord, Liveness)> = stores
         .iter()
         .flat_map(|store| read_records(store))
-        .filter(|record| record_is_live(record, table, domain.as_deref()))
+        .map(|record| {
+            let liveness = Liveness::of(
+                record.pid,
+                record.proc_start.as_deref(),
+                record.pid_domain.as_deref(),
+                domain.as_deref(),
+                table,
+            );
+            (record, liveness)
+        })
+        .filter(|(_, liveness)| *liveness != Liveness::Gone)
         .collect();
-    let recorded: HashSet<u32> = records.iter().map(|record| record.pid).collect();
-    let mut holding: Vec<Holder> = records
+    // Pids some record says are Claude, whatever conversation each is in.
+    let recorded: HashSet<u32> = records
         .iter()
-        .filter(|record| record.parked == Parked::No && record.conversation_id == conversation_id)
-        .map(|record| Holder {
-            pid: record.pid,
-            start: table.identity(record.pid),
+        .filter(|(record, liveness)| {
+            liveness.local(record.pid_domain.as_deref(), domain.as_deref())
+        })
+        .map(|(record, _)| record.pid)
+        .collect();
+    let mut elsewhere: Vec<(Holder, Liveness)> = records
+        .iter()
+        .filter(|(record, _)| {
+            record.parked == Parked::No && record.conversation_id == conversation_id
+        })
+        .filter(|(record, liveness)| {
+            !(liveness.local(record.pid_domain.as_deref(), domain.as_deref())
+                && window.contains(&record.pid))
+        })
+        .map(|(record, liveness)| {
+            (
+                Holder {
+                    pid: record.pid,
+                    start: table.identity(record.pid),
+                },
+                *liveness,
+            )
         })
         .collect();
-    holding.extend(
+    elsewhere.extend(
         stores
             .iter()
             .flat_map(|store| read_roster(store))
             .filter(|worker| worker.conversation_id == conversation_id)
-            .filter(|worker| same_process(worker.pid, worker.proc_start.as_deref(), table))
-            .map(|worker| Holder {
-                pid: worker.pid,
-                start: table.identity(worker.pid),
+            .map(|worker| {
+                let liveness =
+                    Liveness::of(worker.pid, worker.proc_start.as_deref(), None, None, table);
+                (worker, liveness)
+            })
+            .filter(|(worker, liveness)| {
+                *liveness != Liveness::Gone && !window.contains(&worker.pid)
+            })
+            .map(|(worker, liveness)| {
+                (
+                    Holder {
+                        pid: worker.pid,
+                        start: table.identity(worker.pid),
+                    },
+                    liveness,
+                )
             }),
     );
-    let mut elsewhere: Vec<Holder> = holding
-        .into_iter()
-        .filter(|holder| !window.contains(&holder.pid))
-        .collect();
+    let doubtful = elsewhere
+        .iter()
+        .any(|(_, liveness)| *liveness == Liveness::Possible);
+    let mut elsewhere: Vec<Holder> = elsewhere.into_iter().map(|(holder, _)| holder).collect();
     elsewhere.sort_by_key(|holder| holder.pid);
     elsewhere.dedup_by_key(|holder| holder.pid);
     let shell = tree.first().map(|process| process.pid);
@@ -378,30 +472,46 @@ pub(crate) fn holders(
                     .executable(process.pid)
                     .is_some_and(|path| is_claude(&path))
         })
-        .map(|process| Holder {
-            pid: process.pid,
-            start: table.identity(process.pid),
+        // A process whose start cannot be read is gone, or cannot be told
+        // from a later one given its pid: it is never signalled. If it was
+        // the window's Claude and lives on, its record still holds the
+        // conversation when the retire looks again.
+        .filter_map(|process| {
+            table.identity(process.pid).map(|start| Holder {
+                pid: process.pid,
+                start: Some(start),
+            })
         })
         .collect();
     Holders {
         window_agents,
         elsewhere,
+        doubtful,
         inspection: shell_pid.map(|shell| inspect(shell, table, stores)),
     }
 }
 
-/// Whether `holder` is still that same process: alive, and started when it
-/// was first seen. Where no start could be read, alive and Claude.
+/// Whether `holder` may still be running: alive, and not shown to be a
+/// later process given its pid. Where its start was not seen, or cannot be
+/// read now, nothing rules it out, and it is counted as running.
 pub(crate) fn still_running(holder: &Holder, table: &dyn ProcessTable) -> bool {
     if !table.alive(holder.pid) {
         return false;
     }
     match (&holder.start, table.identity(holder.pid)) {
         (Some(seen), Some(now)) => *seen == now,
-        _ => table
-            .executable(holder.pid)
-            .is_some_and(|path| is_claude(&path)),
+        _ => true,
     }
+}
+
+/// Whether `holder` is exactly the process seen: alive, and started when it
+/// was first seen. Only such a process is ever signalled.
+pub(crate) fn is_same_process(holder: &Holder, table: &dyn ProcessTable) -> bool {
+    table.alive(holder.pid)
+        && holder
+            .start
+            .as_ref()
+            .is_some_and(|seen| table.identity(holder.pid).as_ref() == Some(seen))
 }
 
 fn from_record(
@@ -1087,6 +1197,9 @@ mod tests {
         executables: HashMap<u32, PathBuf>,
         open: HashMap<u32, Vec<PathBuf>>,
         domain: Option<String>,
+        /// macOS: Claude's `procStart` cannot be reproduced, only the
+        /// daemon's own reading of a start.
+        claude_start_unknown: bool,
     }
 
     impl FakeTable {
@@ -1136,6 +1249,13 @@ mod tests {
         }
 
         fn start_identity(&self, pid: u32) -> Option<String> {
+            if self.claude_start_unknown {
+                return None;
+            }
+            self.starts.get(&pid).cloned()
+        }
+
+        fn identity(&self, pid: u32) -> Option<String> {
             self.starts.get(&pid).cloned()
         }
 
@@ -1767,6 +1887,131 @@ mod tests {
         assert_eq!(found.elsewhere.len(), 1);
     }
 
+    const NODE: &str = "/home/me/.nvm/versions/node/v24.1.0/bin/node";
+
+    /// What cannot be ruled out holds the conversation: a live pid whose
+    /// start cannot be compared with its record's — an npm install's Claude
+    /// running under node on macOS, a record without a start, a start that
+    /// cannot be read — and a record from another pid namespace or machine.
+    #[test]
+    fn a_holder_that_cannot_be_ruled_out_is_counted() {
+        // macOS: Claude records `lstart` text, which is never reproduced,
+        // and an npm install's executable is node.
+        let mut table = FakeTable::window();
+        table.claude_start_unknown = true;
+        table.spawn(3001, 1, Some(3001), NODE, "6");
+        let store = store_with(&[record(
+            3001,
+            CONVERSATION,
+            "busy",
+            "Sat Oct  4 07:21:03 2026",
+        )]);
+        let found = holders_of(&table, &store, CONVERSATION);
+        assert_eq!(found.elsewhere.len(), 1);
+        assert!(found.doubtful);
+        // The same Claude in the window is one of its agents: stopped and
+        // confirmed by the daemon's own reading of its start.
+        let mut table = FakeTable::window();
+        table.claude_start_unknown = true;
+        table.spawn(1001, SHELL, Some(WINDOW_TTY), NODE, "77");
+        let store = store_with(&[record(
+            1001,
+            CONVERSATION,
+            "busy",
+            "Sat Oct  4 07:21:03 2026",
+        )]);
+        let found = holders_of(&table, &store, CONVERSATION);
+        assert!(found.elsewhere.is_empty());
+        assert_eq!(
+            found.window_agents,
+            vec![Holder {
+                pid: 1001,
+                start: Some("77".into())
+            }]
+        );
+        // Linux, a record without a start, a live pid that is not Claude's
+        // executable: nothing says it is a later process.
+        let mut table = FakeTable::window();
+        table.spawn(3001, 1, Some(3001), "/usr/bin/python3", "6");
+        let mut bare = record(3001, CONVERSATION, "busy", "6");
+        bare.as_object_mut().unwrap().remove("procStart");
+        let store = store_with(&[bare]);
+        let found = holders_of(&table, &store, CONVERSATION);
+        assert_eq!(found.elsewhere.len(), 1);
+        assert!(found.doubtful);
+        // A start that differs rules it out; a pid not running does too.
+        let store = store_with(&[record(3001, CONVERSATION, "busy", "5")]);
+        assert!(holders_of(&table, &store, CONVERSATION)
+            .elsewhere
+            .is_empty());
+        table.dead.insert(3001);
+        let store = store_with(&[record(3001, CONVERSATION, "busy", "6")]);
+        assert!(holders_of(&table, &store, CONVERSATION)
+            .elsewhere
+            .is_empty());
+        // A background worker in the roster without a start.
+        let mut table = FakeTable::window();
+        table.spawn(3001, 1, Some(3001), NODE, "6");
+        let store = store_with(&[]);
+        roster(store.path(), &[(3001, CONVERSATION, "6")]);
+        let roster_path = store.path().join("daemon").join("roster.json");
+        let mut text: Value =
+            serde_json::from_slice(&std::fs::read(&roster_path).unwrap()).unwrap();
+        text["workers"][&CONVERSATION[..8]]
+            .as_object_mut()
+            .unwrap()
+            .remove("procStart");
+        std::fs::write(&roster_path, text.to_string()).unwrap();
+        let found = holders_of(&table, &store, CONVERSATION);
+        assert_eq!(found.elsewhere.len(), 1);
+        assert!(found.doubtful);
+    }
+
+    #[test]
+    fn a_record_from_another_machine_or_namespace_holds_its_conversation() {
+        // Another pid namespace (a container) or machine (a shared home)
+        // writing the same store: its pid means nothing here, alive or not,
+        // in the window or not.
+        let mut table = FakeTable::window();
+        table.domain = Some("linux:here:pid:[1]".into());
+        table.spawn(1001, SHELL, Some(WINDOW_TTY), CLAUDE, "77");
+        let mut foreign = record(1001, CONVERSATION, "busy", "77");
+        foreign["pidDomain"] = "linux:there:pid:[2]".into();
+        let store = store_with(&[foreign.clone()]);
+        let found = holders_of(&table, &store, CONVERSATION);
+        assert_eq!(found.elsewhere.len(), 1);
+        assert!(found.doubtful);
+        foreign["pid"] = 4242.into();
+        let store = store_with(&[foreign]);
+        assert_eq!(holders_of(&table, &store, CONVERSATION).elsewhere.len(), 1);
+        // One of this namespace is judged by its pid as before.
+        let mut local = record(4242, CONVERSATION, "busy", "1");
+        local["pidDomain"] = "linux:here:pid:[1]".into();
+        let store = store_with(&[local]);
+        assert!(holders_of(&table, &store, CONVERSATION)
+            .elsewhere
+            .is_empty());
+    }
+
+    #[test]
+    fn a_window_process_whose_start_cannot_be_read_is_never_an_agent() {
+        // Gone between the walk and the read, or unreadable: it cannot be
+        // told from a later process given its pid, so it is not signalled.
+        let mut table = FakeTable::window();
+        table.spawn(1001, SHELL, Some(WINDOW_TTY), CLAUDE, "77");
+        table.spawn(1002, SHELL, Some(WINDOW_TTY), CLAUDE, "78");
+        table.starts.remove(&1002);
+        let store = store_with(&[]);
+        let found = holders_of(&table, &store, CONVERSATION);
+        assert_eq!(
+            found.window_agents,
+            vec![Holder {
+                pid: 1001,
+                start: Some("77".into())
+            }]
+        );
+    }
+
     #[test]
     fn a_process_is_still_running_only_as_itself() {
         let mut table = FakeTable::window();
@@ -1781,27 +2026,26 @@ mod tests {
         table.starts.insert(1001, "77".into());
         table.dead.insert(1001);
         assert!(!still_running(&seen, &table));
-        // Without a start to compare, alive and Claude.
+        // Without a start to compare, nothing rules out that it is still
+        // the process seen, whatever it runs: still running, never signalled.
         let mut table = FakeTable::window();
         table.spawn(1001, SHELL, Some(WINDOW_TTY), CLAUDE, "77");
-        table.starts.clear();
-        assert!(still_running(
-            &Holder {
-                pid: 1001,
-                start: None
-            },
-            &table
-        ));
+        let unknown = Holder {
+            pid: 1001,
+            start: None,
+        };
+        assert!(still_running(&unknown, &table));
+        assert!(!is_same_process(&unknown, &table));
         table
             .executables
             .insert(1001, PathBuf::from("/usr/bin/vim"));
-        assert!(!still_running(
-            &Holder {
-                pid: 1001,
-                start: None
-            },
-            &table
-        ));
+        assert!(still_running(&unknown, &table));
+        assert!(is_same_process(&seen, &table));
+        table.starts.clear();
+        assert!(still_running(&seen, &table));
+        assert!(!is_same_process(&seen, &table));
+        table.dead.insert(1001);
+        assert!(!still_running(&unknown, &table));
     }
 
     #[test]

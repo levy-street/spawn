@@ -1686,8 +1686,11 @@ fn transfer_names(dir: &Dir, suffix: &str) -> Vec<Uuid> {
 // Signals
 
 /// Ask `holder` to stop; true when it was delivered or the process is gone.
-/// On Linux the pidfd pins the process the start identity was checked
-/// against, so a pid recycled meanwhile is never signalled.
+/// Only exactly the process seen is signalled (`host_conv::is_same_process`):
+/// one whose start cannot be read, or differs, never is. On Linux the pidfd
+/// pins the process the start is checked against, so a pid recycled meanwhile
+/// is never signalled; elsewhere the check and the signal are microseconds
+/// apart.
 fn signal(holder: &Holder, table: &dyn ProcessTable, kill: bool) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -1698,8 +1701,8 @@ fn signal(holder: &Holder, table: &dyn ProcessTable, kill: bool) -> bool {
         let signal = if kill { Signal::KILL } else { Signal::TERM };
         match pidfd_open(pid, PidfdFlags::empty()) {
             Ok(pidfd) => {
-                if !crate::host_conv::still_running(holder, table) {
-                    return true;
+                if !crate::host_conv::is_same_process(holder, table) {
+                    return !table.alive(holder.pid);
                 }
                 matches!(
                     pidfd_send_signal(&pidfd, signal),
@@ -1709,8 +1712,8 @@ fn signal(holder: &Holder, table: &dyn ProcessTable, kill: bool) -> bool {
             Err(rustix::io::Errno::SRCH) => true,
             // A kernel before pidfds: the identity check, then the pid.
             Err(_) => {
-                if !crate::host_conv::still_running(holder, table) {
-                    return true;
+                if !crate::host_conv::is_same_process(holder, table) {
+                    return !table.alive(holder.pid);
                 }
                 matches!(
                     rustix::process::kill_process(pid, signal),
@@ -1725,8 +1728,8 @@ fn signal(holder: &Holder, table: &dyn ProcessTable, kill: bool) -> bool {
         let Some(pid) = i32::try_from(holder.pid).ok().and_then(Pid::from_raw) else {
             return true;
         };
-        if !crate::host_conv::still_running(holder, table) {
-            return true;
+        if !crate::host_conv::is_same_process(holder, table) {
+            return !table.alive(holder.pid);
         }
         let signal = if kill { Signal::KILL } else { Signal::TERM };
         matches!(
@@ -1742,7 +1745,8 @@ fn signal(holder: &Holder, table: &dyn ProcessTable, kill: bool) -> bool {
 }
 
 /// TERM, a grace, KILL, a grace: then every one of `agents` must be gone,
-/// judged by pid and start, not by a pid file.
+/// judged by pid and start, not by a pid file. One that cannot be told from
+/// the process seen counts as still there.
 async fn stop_agents(agents: Vec<Holder>) -> FsResult<()> {
     if agents.is_empty() {
         return Ok(());
@@ -1796,7 +1800,13 @@ fn holders_now(places: &Places, shell: Option<u32>, conversation_id: &str) -> Ho
     )
 }
 
-fn live_elsewhere_error() -> FsError {
+fn live_elsewhere_error(holders: &Holders) -> FsError {
+    if holders.doubtful {
+        return error(
+            "conversation_live_elsewhere",
+            "a Claude Code session record on this host names the conversation and spawnd cannot confirm that its process has stopped (a background session, an attached client, another window, or another machine or container sharing this home); stop it there first, or remove the stale record from Claude's sessions folder",
+        );
+    }
     error(
         "conversation_live_elsewhere",
         "another process on this host holds the conversation (a background session, an attached client, or another window); stop it there first",
@@ -2584,7 +2594,7 @@ impl Carrier {
             .blocking(move |_, places, _| Ok(holders_now(places, shell, &conversation_id)))
             .await?;
         if !before.elsewhere.is_empty() {
-            return Err(live_elsewhere_error());
+            return Err(live_elsewhere_error(&before));
         }
         if let Some(inspection) = &before.inspection {
             if inspection
@@ -2638,11 +2648,9 @@ impl Carrier {
             retired_at: None,
         };
         self.blocking(move |files, places, _| {
-            if !holders_now(places, None, &conversation_id)
-                .elsewhere
-                .is_empty()
-            {
-                return Err(live_elsewhere_error());
+            let now = holders_now(places, None, &conversation_id);
+            if !now.elsewhere.is_empty() {
+                return Err(live_elsewhere_error(&now));
             }
             let holdings = Holdings::open(places)?;
             let outgoing = holdings.sub(OUTGOING)?;
@@ -2657,13 +2665,11 @@ impl Carrier {
             move_out(&holdings, &store, transfer, &record)?;
             // Something that resumed it between the check and the move holds
             // a file now outside the lookup path: put everything back.
-            if !holders_now(places, None, &conversation_id)
-                .elsewhere
-                .is_empty()
-            {
+            let after = holders_now(places, None, &conversation_id);
+            if !after.elsewhere.is_empty() {
                 move_back(&holdings, files, transfer, &record)?;
                 remove_tree(&outgoing, &transfer.to_string())?;
-                return Err(live_elsewhere_error());
+                return Err(live_elsewhere_error(&after));
             }
             Ok(())
         })
@@ -5141,6 +5147,42 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    /// A process that cannot be told from the one seen is never signalled,
+    /// even when it runs Claude: a pid recycled during a window's stop by
+    /// another window's Claude must not get TERM, then KILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_exactly_the_process_seen_is_signalled() {
+        let root = tempfile::tempdir().unwrap();
+        let claude = root.path().join("claude");
+        std::fs::copy("/bin/sleep", &claude).unwrap();
+        let mut other = std::process::Command::new(&claude)
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let table = crate::host_conv::SystemProcesses;
+        let pid = other.id();
+        for unknown in [
+            Holder { pid, start: None },
+            Holder {
+                pid,
+                start: Some("1".into()),
+            },
+        ] {
+            assert!(!signal(&unknown, &table, true), "{unknown:?}");
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(table.alive(pid), "{unknown:?} was signalled");
+        }
+        let seen = Holder {
+            pid,
+            start: table.identity(pid),
+        };
+        assert!(signal(&seen, &table, true));
+        other.wait().unwrap();
+        // Gone: nothing to signal, and nothing held.
+        assert!(signal(&seen, &table, true));
     }
 
     #[cfg(target_os = "linux")]

@@ -527,11 +527,17 @@ none of it.
   `stop_window`: TERM then KILL through `shutdown_if_current`, the exit
   forwarder reporting `session.exit` as for any stop), signals every Claude
   process of the window itself (a pidfd on Linux, so a recycled pid is never
-  signalled) and confirms each gone by pid and start, checks again, and only
+  signalled; a process whose start was not read is never signalled at all)
+  and confirms each gone by pid and start, checks again, and only
   then moves every copy of the conversation out of Claude's lookup path into
   `<config>/conversations/outgoing/<transfer>/`. The record is written before
   any file moves and the bundle is declared once, so a resume after a crash
   or a lost channel reads the same bytes.
+- **It fails closed.** `host_conv::holders` counts a registry record or
+  roster worker as a holder unless its process is shown gone (not running,
+  or its start differs from the recorded one): a start it cannot compare
+  (macOS, an npm install's node Claude, no `procStart`) or another pid
+  domain is a holder. Refusing a move is safe; missing a holder is not.
 - **The target chooses every name.** An import stages raw bytes in
   `incoming/<transfer>/`, checks them as they arrive, verifies every entry
   and the whole digest again at `stream.end`, extracts 0600/0700 with every

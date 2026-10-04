@@ -319,7 +319,14 @@ means for what each party learns and can do.
   an attached client, another window), stops the window and every Claude
   process in it, confirms each gone by its process id and start time, and
   moves the conversation's files out of Claude's lookup path. From then on no
-  Claude on the source can resume it, so two hosts never write it at once.
+  Claude on the source can resume it. The fence fails closed: a process
+  Claude's own session registry names is counted as holding the conversation
+  unless the daemon can show it has gone, so an unreadable start, a Claude
+  running under another executable name, or a record from another machine or
+  container sharing the home refuses the move rather than slipping past it;
+  and only a process the daemon identified exactly is ever signalled. What it
+  cannot see is a Claude that keeps no session record (versions before the
+  registry), launched under another executable name.
 - **The destination chooses every path.** It computes where the record lands
   from Claude Code's own folder rule, writes files 0600 and folders 0700,
   verifies every byte against the source's digests before anything lands,

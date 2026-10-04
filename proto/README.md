@@ -1760,18 +1760,28 @@ only by retiring it, so that it is never resumable on two hosts at once:
 `mode:"snapshot"` — a copy that would leave the source running — is reserved
 for a later copies feature the owner has not approved (OD7) and is refused
 with `unsupported_operation`; any other mode is `invalid_request`. Retiring
-is the single-writer fence, in this order: it refuses with `conversation_live_elsewhere` while a live Claude
-registry record or background-roster worker outside the window holds the
-conversation (a background session, the job an attach client or agent view
-shows, another window), and with `conversation_changed` when the window is
-now in another conversation; it stops the window's worker (TERM, then KILL,
-through the session registry), then every Claude process of the window
-itself, and confirms each is gone by its pid and start — never by a pid file
-or the session's exit — or fails with `agent_still_running`; it checks again
-that nothing holds the conversation; and it moves every copy of the
+is the single-writer fence, in this order: it refuses with
+`conversation_live_elsewhere` while a Claude registry record or
+background-roster worker outside the window holds the conversation (a
+background session, the job an attach client or agent view shows, another
+window), and with `conversation_changed` when the window is now in another
+conversation; it stops the window's worker (TERM, then KILL, through the
+session registry), then every Claude process of the window itself, and
+confirms each is gone by its pid and start — never by a pid file or the
+session's exit — or fails with `agent_still_running`; it checks again that
+nothing holds the conversation; and it moves every copy of the
 conversation out of Claude's lookup path into the daemon's holding before it
 reads a byte (`stopped` says how the window went: `stopped`,
-`not_running`, `lingering`). One move of a conversation at a time:
+`not_running`, `lingering`). The fence fails closed: a record or roster
+worker counts as holding the conversation unless its process is shown to be
+gone — not running, or a later process given the same pid, its start
+differing from the one recorded. A live pid whose start cannot be compared
+(none recorded, none readable, or macOS, where Claude records `ps` text the
+daemon does not reproduce), or a record written in another pid namespace or
+on another machine sharing the home, is a holder; the refusal says so, and
+names removing a stale record as the way out. Only a process whose start the
+daemon read is ever signalled, and one that cannot be told from it counts as
+still running. One move of a conversation at a time:
 `transfer_unresolved` names an earlier one still open. With several copies,
 the one in the window's folder (`cwd`) travels and all leave the lookup path;
 without it, `conversation_ambiguous`. A repeated export with the same
