@@ -58,6 +58,7 @@ import { FilePreviewCard } from "@/components/files/file-preview-card";
 import { FileViewerDialog } from "@/components/files/file-viewer-dialog";
 import { PathBar, type PathBarHandle } from "@/components/files/PathBar";
 import { type PreviewPlacement, previewPlacement } from "@/components/files/preview-placement";
+import { SortMenuItems } from "@/components/files/sort-menu";
 import { TREE_INDENT_PX, TreeEntryRow, TreeStatusRow } from "@/components/files/TreeView";
 import { isFinalListError, useDirectoryListings } from "@/components/files/use-directory-listings";
 import { type FileBrowserView, useFilePrefs } from "@/components/files/use-file-prefs";
@@ -90,7 +91,6 @@ import {
   renameChecked,
 } from "@/lib/files/change-check";
 import {
-  COLUMNS,
   type ColumnKey,
   columnTemplate,
   detailsLayout,
@@ -106,7 +106,6 @@ import {
   deletingNotice,
   EMPTY_FOLDER,
   FILTER_PLACEHOLDER,
-  FOLDERS_ON_TOP_LABEL,
   HIDE_HIDDEN_LABEL,
   listErrorCopy,
   NEW_FILE_LABEL,
@@ -116,7 +115,6 @@ import {
   POLLED_REFRESH_NOTE,
   partialDeleteNotice,
   SHOW_HIDDEN_LABEL,
-  SORT_ORDER_LABELS,
   statusSummary,
   TRUNCATED_ROW_LABEL,
   truncationNotice,
@@ -151,7 +149,7 @@ import {
   toggleFocused,
   toggleKey,
 } from "@/lib/files/selection";
-import { FIRST_ORDER, SORT_KEYS, type SortOrder, sortEntries, toggleSort } from "@/lib/files/sort";
+import { sortEntries, toggleSort } from "@/lib/files/sort";
 import { flattenTree, outermostItems, type TreeRow } from "@/lib/files/tree";
 import { pushTypeAhead, type TypeAheadState, typeAheadMatch } from "@/lib/files/type-ahead";
 import { HostControlClient, HostControlError, type HostDirEntry } from "@/lib/hostControl";
@@ -186,8 +184,8 @@ import { cn } from "@/lib/utils";
  *   the filter, the view switch, New, view options, the details pane), the
  *   Details view by default, and a status bar.
  * - `pane` — a workspace's file explorer window: the dense tree by default,
- *   no toolbar of its own (the pane's header carries its actions), the rest
- *   on the background's context menu.
+ *   no toolbar of its own (the pane's header carries its actions, the filter
+ *   and the sort), the rest on the background's context menu.
  * - `aside` — a session's files: the dense tree only.
  *
  * Every listing comes through `useDirectoryListings` (a v1 host is drained
@@ -2012,8 +2010,6 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   );
 
   const showFilterRow = layout !== "page" && (filterOpen || filter !== "");
-  const sortOrders: SortOrder[] =
-    FIRST_ORDER[sort.key] === "asc" ? ["asc", "desc"] : ["desc", "asc"];
   const viewToggle = (target: FileBrowserView, label: string, Icon: typeof List) => (
     <Button
       variant="ghost"
@@ -2158,35 +2154,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
                   </Button>
                 )}
               >
-                <DropdownMenuLabel>Sort by</DropdownMenuLabel>
-                {SORT_KEYS.map((key) => (
-                  <DropdownMenuItem
-                    key={key}
-                    checked={sort.key === key}
-                    onSelect={() =>
-                      sort.key !== key && prefs.setSort({ ...sort, key, order: FIRST_ORDER[key] })
-                    }
-                  >
-                    {COLUMNS.find((column) => column.key === key)?.label ?? key}
-                  </DropdownMenuItem>
-                ))}
-                <DropdownMenuSeparator />
-                {/* Worded for the field, its first-click direction first. */}
-                {sortOrders.map((order) => (
-                  <DropdownMenuItem
-                    key={order}
-                    checked={sort.order === order}
-                    onSelect={() => prefs.setSort({ ...sort, order })}
-                  >
-                    {SORT_ORDER_LABELS[sort.key][order]}
-                  </DropdownMenuItem>
-                ))}
-                <DropdownMenuItem
-                  checked={sort.foldersFirst}
-                  onSelect={() => prefs.setSort({ ...sort, foldersFirst: !sort.foldersFirst })}
-                >
-                  {FOLDERS_ON_TOP_LABEL}
-                </DropdownMenuItem>
+                <SortMenuItems sort={sort} onSort={prefs.setSort} />
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   checked={showHidden}
