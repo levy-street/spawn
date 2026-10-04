@@ -720,6 +720,130 @@ async def test_a_carried_move_aborted_after_the_source_exit_stays_quiet(client, 
         assert row is not None and row.status == "killed"
 
 
+async def test_a_carried_move_aborted_before_anything_stopped_leaves_it_running(
+    client, monkeypatch
+):
+    """Begin, then an abort with no exit recorded in between: the source never
+    retired, and its worker never stopped. The window is back as it was —
+    "running", still routed to the daemon that runs it, sent no kill — and a
+    crash after that is news again, as for any running window."""
+    from spawn_server.ws.broker import get_broker
+
+    pushed = _record_pushes(monkeypatch)
+    user_id, access_token = await _signup(client, "alert-moving-abort-live@example.com")
+    owner = {"Authorization": f"Bearer {access_token}"}
+    host_id = await _create_host(user_id)
+    pty_id = await _create_session_row(user_id, host_id)
+
+    ws = FakeDaemonWebSocket()
+    task = asyncio.create_task(daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id)))  # type: ignore[arg-type]
+    async with _AlertCollector(user_id) as alerts:
+        ws.queue_text({**REGISTER, "existing_sessions": [pty_id]})
+        await _wait_until(lambda: bool(_sent_frames(ws, "registered")))
+        ws.queue_text({"type": "session.foreground", "session_id": pty_id, "command": "claude"})
+
+        async def foreground_recorded() -> bool:
+            async with get_sessionmaker()() as session:
+                row = await session.get(Session, pty_id)
+                return row is not None and row.foreground_command == "claude"
+
+        for _ in range(200):
+            if await foreground_recorded():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the foreground was never recorded")
+        r = await client.post(
+            f"/api/sessions/{pty_id}/move/begin",
+            json={"expected_host_id": host_id},
+            headers=owner,
+        )
+        assert r.status_code == 200, r.text
+        r = await client.post(
+            f"/api/sessions/{pty_id}/move/abort",
+            json={"expected_host_id": host_id},
+            headers=owner,
+        )
+        assert r.status_code == 200, r.text
+        assert (r.json()["status"], r.json()["exited_at"]) == ("running", None)
+        assert r.json()["foreground_command"] == "claude"
+        assert _sent_frames(ws, "session.kill") == []
+        routed = get_broker().get_daemon_for_session(pty_id)
+        assert routed is not None and routed.host_id == host_id
+        assert alerts.events == []
+
+        ws.queue_text({"type": "session.exit", "session_id": pty_id, "signal": "KILL"})
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert [event["event"] for event in alerts.events] == ["session.died"]
+    assert [payload["event"] for payload in pushed] == ["session.died"]
+    assert _sent_frames(ws, "session.kill") == []
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, pty_id)
+        assert row is not None and row.status == "killed"
+
+
+async def test_an_exit_read_while_moving_and_written_after_the_abort_stays_quiet(
+    client, monkeypatch
+):
+    """The source's exit is read while the window is moving, and the abort
+    that put it back running (nothing had been recorded yet) commits before
+    the exit's write. The exit is recorded as what it is, and the alert the
+    move suppressed at the read stays suppressed: the device carrying the
+    conversation stopped it."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.dml import Update
+
+    pushed = _record_pushes(monkeypatch)
+    user_id, _ = await _signup(client, "alert-moving-abort-race@example.com")
+    host_id = await _create_host(user_id)
+    pty_id = await _create_session_row(user_id, host_id, status="moving")
+
+    real_execute = AsyncSession.execute
+    armed = False
+    raced = False
+
+    async def execute(self, statement, *args, **kwargs):
+        nonlocal raced
+        if (
+            armed
+            and not raced
+            and isinstance(statement, Update)
+            and statement.table.name == "sessions"
+        ):
+            raced = True
+            # What the abort writes when no exit has been recorded.
+            async with get_sessionmaker()() as other:
+                row = await other.get(Session, pty_id)
+                assert row is not None and row.exited_at is None
+                row.status = "running"
+                await other.commit()
+        return await real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", execute)
+    ws = FakeDaemonWebSocket()
+    task = asyncio.create_task(daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id)))  # type: ignore[arg-type]
+    async with _AlertCollector(user_id) as alerts:
+        ws.queue_text({**REGISTER, "existing_sessions": [pty_id]})
+        await _wait_until(lambda: bool(_sent_frames(ws, "registered")))
+        armed = True
+        ws.queue_text({"type": "session.exit", "session_id": pty_id, "signal": "TERM"})
+        await _wait_until(lambda: raced)
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=2)
+    monkeypatch.setattr(AsyncSession, "execute", real_execute)
+
+    assert alerts.events == []
+    assert pushed == []
+    assert ws.closed is None
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, pty_id)
+        assert row is not None
+        assert row.status == "killed"
+        assert row.exited_at is not None
+
+
 async def test_an_exit_read_before_a_move_began_still_keeps_it_moving(client, monkeypatch):
     """Begin commits between the exit handler's read (the row says running)
     and its write. The status is decided in the statement, so the move is

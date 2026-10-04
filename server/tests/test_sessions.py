@@ -1431,10 +1431,10 @@ async def test_a_moving_window_refuses_restart_delete_and_a_fresh_move(client):
 
 
 async def test_move_abort_stops_the_window_where_it_was_and_a_commit_after_it_is_refused(client):
-    """Abort returns the window to its host, stopped: "killed", keeping the
-    exit the source reported while it moved, with a kill to that host for
-    anything the retire did not reach. A commit after it, or a second abort,
-    is stale; Restart brings the window back there."""
+    """An abort after the source reported an exit while the window moved — its
+    retire stopped it — leaves the window on its host, stopped: "killed",
+    keeping that exit, with the ordinary kill to that host. A commit after
+    it, or a second abort, is stale; Restart brings the window back there."""
     auth, dream, mac, _skill_id, _claude, session_id = await _move_fixture(
         client, "session-move-abort@example.com"
     )
@@ -1497,32 +1497,82 @@ async def test_move_abort_stops_the_window_where_it_was_and_a_commit_after_it_is
         assert daemons.frames("mac") == []
 
 
-async def test_move_abort_of_a_move_whose_source_never_reported_stops_it_now(client):
-    """A move given up before the source stopped anything (its retire was
-    refused, or the device lost it) still reads "killed" afterwards, stamped
-    now, and the kill makes that true on the host; an offline host is left to
-    its next registration."""
+async def test_move_abort_before_anything_stopped_the_window_puts_it_back_running(client):
+    """A move given up before the source stopped anything — cancelled before
+    the retire, a retire refused (`conversation_live_elsewhere`), the device
+    lost — finds no exit recorded while it moved: the worker on the source is
+    alive, mid-turn perhaps. The abort puts the window back as it was,
+    "running" with its foreground, and sends no kill to anyone, whether or not
+    the host is connected."""
     auth, dream, _mac, _skill_id, _claude, session_id = await _move_fixture(
-        client, "session-move-abort-unreported@example.com"
+        client, "session-move-abort-unretired@example.com"
     )
-    async with _Daemons({"dream": dream}) as daemons:
+
+    def begin():
+        return client.post(
+            f"/api/sessions/{session_id}/move/begin",
+            json={"expected_host_id": dream},
+            headers=auth,
+        )
+
+    def abort():
+        return client.post(
+            f"/api/sessions/{session_id}/move/abort",
+            json={"expected_host_id": dream},
+            headers=auth,
+        )
+
+    await _write_row(session_id, status="running", foreground_command="claude")
+    async with _Daemons({"dream": dream}, watched=session_id) as daemons:
+        r = await begin()
+        assert r.status_code == 200, r.text
+        r = await abort()
+        assert r.status_code == 200, r.text
+        back = r.json()
+        assert (back["status"], back["host_id"], back["cwd"]) == ("running", dream, "/repo")
+        assert back["activity_state"] not in ("moving", "killed", "exited")
+        assert (back["exited_at"], back["exit_code"]) == (None, None)
+        assert back["foreground_command"] == "claude"
+        assert back["agent_session_id"] == "conv-dream"
+        assert daemons.log == []
+
+        # The same with the host gone meanwhile: the abort is never held
+        # hostage by the host it names, and still stops nothing.
+        r = await begin()
+        assert r.status_code == 200, r.text
+    r = await abort()
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "running"
+    assert daemons.log == []
+    row = await _row(session_id)
+    assert (row.status, row.host_id, row.exited_at) == ("running", dream, None)
+
+
+async def test_move_abort_of_a_window_stopped_before_the_move_leaves_it_stopped(client):
+    """A stopped window moves too. Given up, it is still stopped: "killed",
+    with the exit it had, and the ordinary kill goes to its host, where it
+    stops nothing."""
+    auth, dream, _mac, _skill_id, _claude, session_id = await _move_fixture(
+        client, "session-move-abort-stopped@example.com"
+    )
+    exited_at = datetime(2026, 10, 4, 8, 0, tzinfo=UTC)
+    await _write_row(session_id, status="exited", exited_at=exited_at, exit_code=0)
+    async with _Daemons({"dream": dream}, watched=session_id) as daemons:
         r = await client.post(
             f"/api/sessions/{session_id}/move/begin",
             json={"expected_host_id": dream},
             headers=auth,
         )
         assert r.status_code == 200, r.text
-    # dream drops off; the abort is never held hostage by the host it names.
-    r = await client.post(
-        f"/api/sessions/{session_id}/move/abort",
-        json={"expected_host_id": dream},
-        headers=auth,
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["status"] == "killed"
-    assert r.json()["exited_at"] is not None
-    assert r.json()["exit_code"] is None
-    assert daemons.log == []
+        r = await client.post(
+            f"/api/sessions/{session_id}/move/abort",
+            json={"expected_host_id": dream},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert (r.json()["status"], r.json()["exit_code"]) == ("killed", 0)
+        assert datetime.fromisoformat(r.json()["exited_at"]).replace(tzinfo=UTC) == exited_at
+        assert daemons.log == [("dream", "session.kill", dream)]
 
 
 async def test_a_move_begun_after_a_restart_read_the_window_refuses_the_restart(
@@ -1560,16 +1610,24 @@ async def test_a_move_begun_after_a_restart_read_the_window_refuses_the_restart(
         assert daemons.log == []
 
 
-async def test_a_restart_committed_before_a_move_began_does_not_reach_the_host(client, monkeypatch):
+async def test_a_restart_overtaken_by_a_begin_before_its_launch_is_refused(client, monkeypatch):
     """The other order: the restart has committed and a begin lands before its
     launch goes out. The launch re-reads the row under the daemon's lifecycle
-    lock and is not sent; the window stays moving, the source's retire to
-    settle."""
+    lock and is not sent, and the restart says so — `409 move_in_progress`,
+    not a "starting" its caller would type a resume into — with a data frame
+    for the write it did commit. The window stays moving, and an abort then
+    finds it as it really is: still running when it was (no kill), stopped
+    when it had stopped before the restart (killed, with its old exit)."""
     auth, dream, _mac, _skill_id, _claude, session_id = await _move_fixture(
         client, "session-move-race-restart-dispatch@example.com"
     )
+    user_id = await _user_id("session-move-race-restart-dispatch@example.com")
 
+    import asyncio
+
+    from spawn_server.redis import user_alert_channel
     from spawn_server.routes import capabilities as capabilities_mod
+    from tests.test_data_events import _ChannelTap
 
     real_launch_capabilities = capabilities_mod.get_session_launch_capabilities
 
@@ -1577,15 +1635,56 @@ async def test_a_restart_committed_before_a_move_began_does_not_reach_the_host(c
         await _write_row(session_id, status="moving")
         return await real_launch_capabilities(*args, **kwargs)
 
-    async with _Daemons({"dream": dream}) as daemons:
-        monkeypatch.setattr(capabilities_mod, "get_session_launch_capabilities", begin_meanwhile)
-        r = await client.post(f"/api/sessions/{session_id}/restart", headers=auth)
-        monkeypatch.setattr(
-            capabilities_mod, "get_session_launch_capabilities", real_launch_capabilities
+    def abort():
+        return client.post(
+            f"/api/sessions/{session_id}/move/abort",
+            json={"expected_host_id": dream},
+            headers=auth,
         )
-        assert r.status_code == 200, r.text
-        assert daemons.log == []
-        assert (await _row(session_id)).status == "moving"
+
+    stopped_at = datetime(2026, 10, 4, 7, 0, tzinfo=UTC)
+    async with _Daemons({"dream": dream}, watched=session_id) as daemons:
+        for before, after_abort in (
+            ({"status": "running", "exited_at": None}, "running"),
+            ({"status": "exited", "exited_at": stopped_at, "exit_code": 1}, "killed"),
+        ):
+            await _write_row(session_id, **before)
+            daemons.log.clear()
+            monkeypatch.setattr(
+                capabilities_mod, "get_session_launch_capabilities", begin_meanwhile
+            )
+            async with _ChannelTap(user_alert_channel(user_id)) as tap:
+                r = await client.post(f"/api/sessions/{session_id}/restart", headers=auth)
+                # Published by the route itself; waited for, not yielded to,
+                # so a real Redis has time to deliver it.
+                for _ in range(200):
+                    if ("data", "sessions", session_id) in [
+                        (f.get("type"), f.get("resource"), f.get("id")) for f in tap.frames
+                    ]:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError("the refused restart published no data frame")
+            monkeypatch.setattr(
+                capabilities_mod, "get_session_launch_capabilities", real_launch_capabilities
+            )
+            assert r.status_code == 409 and r.json()["detail"] == "move_in_progress"
+            assert daemons.log == []
+            row = await _row(session_id)
+            assert row.status == "moving"
+            # The restart's commit cleared it; the withheld launch put back
+            # when the window had stopped, and left a live one's alone.
+            assert _aware(row.exited_at) == before["exited_at"]
+
+            r = await abort()
+            assert r.status_code == 200, r.text
+            assert r.json()["status"] == after_abort
+            expected_log = [] if after_abort == "running" else [("dream", "session.kill", dream)]
+            assert daemons.log == expected_log
+
+
+def _aware(value):
+    return value if value is None or value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 async def test_a_restart_raced_by_a_move_never_reaches_the_host_the_window_left(
@@ -1638,9 +1737,83 @@ async def test_a_restart_raced_by_a_move_never_reaches_the_host_the_window_left(
         monkeypatch.setattr(
             capabilities_mod, "get_session_launch_capabilities", real_launch_capabilities
         )
-        assert r.status_code == 200, r.text
+        # Nothing restarted, and the caller is told: it was moved meanwhile.
+        assert r.status_code == 409 and r.json()["detail"] == "move_conflict"
         assert daemons.frames("dream") == []
         assert (await _row(session_id)).host_id == mac
+
+
+async def test_a_move_overtaken_before_its_launch_is_refused_and_starts_nothing(
+    client, monkeypatch
+):
+    """A move has committed (rebound, the old host told to stop) and another
+    device acts on the window before the launch reaches the target. The
+    launch is withheld and the mover hears it — `409 move_in_progress` for a
+    move begun from the target, `404` for a window closed meanwhile — rather
+    than a "starting" it would take control of and type into. A window
+    withheld this way never ran on the target, so an abort there finds it
+    stopped."""
+    auth, dream, mac, _skill_id, _claude, session_id = await _move_fixture(
+        client, "session-move-overtaken@example.com"
+    )
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Session
+    from spawn_server.routes import capabilities as capabilities_mod
+
+    real_launch_capabilities = capabilities_mod.get_session_launch_capabilities
+
+    def move():
+        return client.post(
+            f"/api/sessions/{session_id}/move",
+            json={"host_id": mac, "cwd": "/work", "expected_host_id": dream},
+            headers=auth,
+        )
+
+    async def begin_meanwhile(*args, **kwargs):
+        await _write_row(session_id, status="moving")
+        return await real_launch_capabilities(*args, **kwargs)
+
+    async def close_meanwhile(*args, **kwargs):
+        async with get_sessionmaker()() as other:
+            row = await other.get(Session, session_id)
+            assert row is not None
+            await other.delete(row)
+            await other.commit()
+        return await real_launch_capabilities(*args, **kwargs)
+
+    async with _Daemons({"dream": dream, "mac": mac}, watched=session_id) as daemons:
+        monkeypatch.setattr(capabilities_mod, "get_session_launch_capabilities", begin_meanwhile)
+        r = await move()
+        monkeypatch.setattr(
+            capabilities_mod, "get_session_launch_capabilities", real_launch_capabilities
+        )
+        assert r.status_code == 409 and r.json()["detail"] == "move_in_progress"
+        assert daemons.log == [("dream", "session.kill", mac)]
+        row = await _row(session_id)
+        assert (row.host_id, row.status) == (mac, "moving")
+        assert row.exited_at is not None
+
+        r = await client.post(
+            f"/api/sessions/{session_id}/move/abort",
+            json={"expected_host_id": mac},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert (r.json()["host_id"], r.json()["status"]) == (mac, "killed")
+        assert daemons.log[1:] == [("mac", "session.kill", mac)]
+
+        # Back on dream, and closed this time before the launch.
+        await _write_row(session_id, host_id=dream, status="running", exited_at=None)
+        daemons.log.clear()
+        monkeypatch.setattr(capabilities_mod, "get_session_launch_capabilities", close_meanwhile)
+        r = await move()
+        monkeypatch.setattr(
+            capabilities_mod, "get_session_launch_capabilities", real_launch_capabilities
+        )
+        assert r.status_code == 404
+        assert daemons.log == [("dream", "session.kill", mac)]
+        assert await _row(session_id) is None
 
 
 async def test_a_delete_raced_by_a_move_kills_where_the_window_went(client, monkeypatch):

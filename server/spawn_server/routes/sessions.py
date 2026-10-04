@@ -6,11 +6,12 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import delete, desc, func, select, update
+from sqlalchemy import case, delete, desc, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, grid, legion, schemas
+from ..data_events import publish_data_changed
 from ..db import get_session, get_sessionmaker
 from ..models import (
     SESSION_MOVABLE_STATUSES,
@@ -124,8 +125,21 @@ async def upsert_recent_dir(db: AsyncSession, *, user: User, host_id: str, path:
         await db.delete(stale)
 
 
-async def _launch_still_addressed(session_id: str, host_id: str) -> bool:
-    """Whether a launch about to go to `host_id` is still that host's to run.
+#: Why `dispatch_session_launch` withheld a launch, read afresh under the
+#: daemon's lifecycle lock after the commit that asked for it: the window is
+#: gone, a carried move began from that host since, or another move took the
+#: window to another host. A caller that answers for the launch refuses with
+#: `launch_withheld_refusal`.
+LAUNCH_WITHHELD_GONE = "gone"
+LAUNCH_WITHHELD_MOVING = "moving"
+LAUNCH_WITHHELD_MOVED = "moved"
+
+
+async def _launch_withheld(
+    session_id: str, host_id: str, *, stopped_since: datetime | None
+) -> str | None:
+    """Why a launch about to go to `host_id` is no longer that host's to run,
+    or None when it still is.
 
     Read afresh, under the daemon's lifecycle lock, after the commit that
     asked for the launch: a move that landed in between names another host,
@@ -134,6 +148,15 @@ async def _launch_still_addressed(session_id: str, host_id: str) -> bool:
     (`send_session_kill`), so a move committed after this read sends its kill
     to the old host after this launch, never before it, and the daemon, which
     handles lifecycle frames in order, ends the worker this starts.
+
+    A window withheld because a move began keeps the move's abort honest. The
+    caller's commit cleared `exited_at`, and an abort reads a null `exited_at`
+    as a worker still running there (`abort_move`). When none was —
+    `stopped_since` is when the window last stopped on this host, or now for
+    one this host never ran — that time is written back, so an abort finds
+    the window stopped rather than "running" with nothing behind it. None
+    means a worker of the window does run there, the one this launch was to
+    replace, and the row is left as it is.
 
     A read that fails sends the launch anyway, as before this check existed:
     a window left "starting" with nothing started is worse than the race.
@@ -147,8 +170,44 @@ async def _launch_still_addressed(session_id: str, host_id: str) -> bool:
             ).one_or_none()
     except SQLAlchemyError as e:
         log.warning("could not re-read session=%s before its launch: %s", session_id, e)
-        return True
-    return row is not None and row.host_id == host_id and row.status != SESSION_MOVING
+        return None
+    if row is None:
+        return LAUNCH_WITHHELD_GONE
+    if row.host_id != host_id:
+        return LAUNCH_WITHHELD_MOVED
+    if row.status != SESSION_MOVING:
+        return None
+    if stopped_since is not None:
+        try:
+            async with get_sessionmaker()() as fresh:
+                await fresh.execute(
+                    update(Session)
+                    .where(
+                        Session.id == session_id,
+                        Session.host_id == host_id,
+                        Session.status == SESSION_MOVING,
+                        Session.exited_at.is_(None),
+                    )
+                    .values(exited_at=stopped_since)
+                    .execution_options(synchronize_session=False)
+                )
+                await fresh.commit()
+        except SQLAlchemyError as e:
+            log.warning(
+                "could not record that session=%s is stopped on host=%s: %s", session_id, host_id, e
+            )
+    return LAUNCH_WITHHELD_MOVING
+
+
+def launch_withheld_refusal(reason: str) -> HTTPException:
+    """What a request that asked for a launch answers when the launch was
+    withheld (`dispatch_session_launch`): the write it committed was overtaken
+    before the launch went out, so it did not happen as asked."""
+    if reason == LAUNCH_WITHHELD_GONE:
+        return _session_not_found()
+    if reason == LAUNCH_WITHHELD_MOVING:
+        return _move_in_progress()
+    return _move_conflict()
 
 
 async def dispatch_session_launch(
@@ -157,27 +216,44 @@ async def dispatch_session_launch(
     session_row: Session,
     host: Host,
     create_cwd: bool,
+    stopped_since: datetime | None,
     skills: list[dict] | None = None,
-) -> None:
+) -> str | None:
+    """Send `frame_type` for the window to `host`'s daemon, after the commit
+    that asked for it. Returns why it was withheld (`LAUNCH_WITHHELD_*`), or
+    None when it went out — or could not: no daemon connected, or the send
+    failed, which leaves the row as the caller wrote it, as it always has.
+
+    `stopped_since`: when the window last stopped on this host — the row's
+    `exited_at` before the caller's write cleared it, or now for a host that
+    never ran it (a create, a move's target) — and None when a worker of the
+    window runs there still, which this launch replaces (a restart of a live
+    window). Used only when a move began meanwhile (`_launch_withheld`).
+    """
     broker = get_broker()
     daemon = broker.get_daemon_for_host(host.id)
     if daemon is None:
         log.warning("%s: no daemon connection for host=%s", frame_type, host.id)
-        return
+        return None
 
     # Held while registration decides which of this daemon's workers to stop
     # and sends those kills (`DaemonConn.lifecycle_lock`): a launch committed
     # after that decision goes out after the kills, never before them.
     async with daemon.lifecycle_lock:
-        if not await _launch_still_addressed(session_row.id, host.id):
+        withheld = await _launch_withheld(session_row.id, host.id, stopped_since=stopped_since)
+        if withheld is not None:
             log.info(
-                "%s: session=%s moved, began moving or went before its launch reached "
-                "host=%s; not sent",
+                "%s: session=%s %s before its launch reached host=%s; not sent",
                 frame_type,
                 session_row.id,
+                {
+                    LAUNCH_WITHHELD_GONE: "went",
+                    LAUNCH_WITHHELD_MOVING: "began moving",
+                    LAUNCH_WITHHELD_MOVED: "moved",
+                }[withheld],
                 host.id,
             )
-            return
+            return withheld
         await broker.attach_session_to_daemon(session_row.id, daemon)
         try:
             await daemon.send_text(
@@ -191,6 +267,7 @@ async def dispatch_session_launch(
             )
         except Exception as e:  # noqa: BLE001
             log.warning("%s dispatch failed: %s", frame_type, e)
+    return None
 
 
 async def resolve_agent_id(db: AsyncSession, *, user: User, agent_id: str | None) -> str | None:
@@ -398,11 +475,14 @@ async def create_session(
     )
 
     # Dispatch session.create to the daemon; it spawns the user's login shell.
+    # Nothing can withhold it but a device that already knows this window's
+    # id, and none does before this answer.
     await dispatch_session_launch(
         frame_type="session.create",
         session_row=session_row,
         host=host,
         create_cwd=True,
+        stopped_since=_utcnow(),
         skills=skills,
     )
 
@@ -447,6 +527,17 @@ def _move_conflict() -> HTTPException:
     return HTTPException(status_code=409, detail="move_conflict")
 
 
+def _workspace_archived() -> HTTPException:
+    return HTTPException(status_code=409, detail="workspace_archived")
+
+
+async def _in_archived_workspace(db: AsyncSession, *, user: User, session_id: str) -> bool:
+    # Imported here: workspaces.py needs this module's session helpers.
+    from . import workspaces as workspaces_routes
+
+    return await workspaces_routes.archived_workspace_holds(db, user.id, session_id)
+
+
 async def _owned_session(db: AsyncSession, *, user: User, session_id: str) -> Session:
     session_row = await db.get(Session, session_id)
     if session_row is None or session_row.owner_user_id != user.id:
@@ -467,7 +558,13 @@ async def restart_session(
     sending the restart to the host the window has left; the move has started
     the window afresh over there already. A window that is moving is refused
     with `409 move_in_progress`: its move ends with a commit or an abort, and
-    "Resume" after an abort is this route.
+    "Resume" after an abort that left the window stopped is this route.
+
+    The same answers come when the move lands after this commit and before
+    the launch goes out: the launch is withheld (`dispatch_session_launch`),
+    nothing restarts, and the caller hears so — `409 move_in_progress`, `409
+    move_conflict`, or `404` when the window was closed meanwhile — rather
+    than a "starting" it would type a resume into.
     """
     session_row = await _owned_session(db, user=user, session_id=session_id)
     if session_row.status == SESSION_MOVING:
@@ -481,6 +578,9 @@ async def restart_session(
     if daemon is None:
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
+    # When the window stopped there, or None while a worker of it runs there
+    # still, the one this restart replaces (`dispatch_session_launch`).
+    stopped_since = session_row.exited_at
     result = await db.execute(
         update(Session)
         .where(
@@ -511,13 +611,21 @@ async def restart_session(
         db, user=user, session_id=session_row.id
     )
 
-    await dispatch_session_launch(
+    withheld = await dispatch_session_launch(
         frame_type="session.restart",
         session_row=session_row,
         host=host,
         create_cwd=True,
+        stopped_since=stopped_since,
         skills=skills,
     )
+    if withheld is not None:
+        # Overtaken between the commit and the launch: nothing restarted, and
+        # the caller must not type into a shell that never started. The data
+        # frame a refusal does not get from the middleware goes out here, for
+        # the write this request did commit.
+        await publish_data_changed(user.id, "sessions", session_id)
+        raise launch_withheld_refusal(withheld)
     return _to_out(session_row, host.name)
 
 
@@ -546,7 +654,9 @@ async def begin_move(
     way, `409 move_conflict` when the window runs somewhere else than the
     client saw, `409 source_offline` when the host it would leave is not
     connected — its conversation cannot come along, and a fresh `/move` is
-    the way to start it elsewhere.
+    the way to start it elsewhere — and `409 workspace_archived` when the
+    window's tile is in an archived workspace, where nothing runs until it is
+    restored.
 
     While it is moving, restart, archive, delete, a fresh move and a second
     begin are refused with `409 move_in_progress`; only the commit or
@@ -578,6 +688,12 @@ async def begin_move(
         if state is None:
             raise _session_not_found()
         raise _move_in_progress() if state[0] == SESSION_MOVING else _move_conflict()
+    # Asked after the write, in its transaction: an archive that stopped the
+    # window before it is seen here, and one after it finds the window moving
+    # and refuses (`workspaces._refuse_moved_since`).
+    if await _in_archived_workspace(db, user=user, session_id=session_id):
+        await db.rollback()
+        raise _workspace_archived()
     await db.commit()
     await db.refresh(session_row)
     host = await db.get(Host, session_row.host_id)
@@ -591,25 +707,42 @@ async def abort_move(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.SessionOut:
-    """End a carried move that will not commit: the window stays where it was,
-    stopped.
+    """End a carried move that will not commit: the window is put back where
+    it was, as it was.
 
     Any device may send it — the mover after a failed carry, or another device
-    resolving a move that did not finish — and only after the target has
-    confirmed it cannot commit: the source host still holds the window's
-    conversation set aside until the device aborts the retire there, and the
+    resolving a move that did not finish. When the source's retire has run,
+    the device sends it only once the target has confirmed it cannot commit
+    and the source has put the conversation back (`conv.retire.abort`): the
     server neither knows nor decides that part.
 
     A compare-and-set on the host the client saw and on "moving": a move that
-    has committed, or was aborted already, is `409 move_conflict`. The row
-    reads "killed" — stopped by the owner, so the exit that confirms it raises
-    no alert — keeping any exit the source already reported, and a
-    best-effort `session.kill` goes to the host it names, to end whatever the
-    retire did not reach (a host that is offline is told when it registers
-    again). Restart then brings the window back there, resuming its
-    conversation once the source has put it back.
+    has committed, or was aborted already, is `409 move_conflict`. What the
+    window goes back to is decided in the statement, from the one thing the
+    server saw while it moved — whether its host reported an exit:
+
+    - None recorded (`exited_at` is null): nothing stopped it. The move was
+      given up before the retire, the retire refused
+      (`conversation_live_elsewhere`), or the device lost it first, and the
+      worker on the source still runs the agent, perhaps mid-turn. The row
+      reads "running" again, foreground and all, and **no kill is sent**.
+      `exited_at` is null here exactly when the window was live as the move
+      began (create, restart, move and restore clear it; every exit and every
+      stop sets it) and has not exited since.
+    - One recorded: the retire stopped it, or it was stopped before the move
+      began (a stopped window moves too). The row reads "killed", keeping
+      that exit, and the ordinary best-effort `session.kill` goes to the host
+      it names; there is nothing left for it to stop, and a host that is
+      offline is told when it registers again. Restart brings the window back
+      there, resuming its conversation now that the source has it back.
+
+    An exit the source sends after an abort that found none — the retire's
+    own, still on its way — is recorded as an exit like any other; one the
+    exit handler had already read while the window was moving raises no
+    alert.
     """
     session_row = await _owned_session(db, user=user, session_id=session_id)
+    nothing_stopped = Session.exited_at.is_(None)
     result = await db.execute(
         update(Session)
         .where(
@@ -619,20 +752,22 @@ async def abort_move(
             Session.status == SESSION_MOVING,
         )
         .values(
-            status="killed",
-            exited_at=func.coalesce(Session.exited_at, _utcnow()),
-            foreground_command=None,
+            status=case((nothing_stopped, "running"), else_="killed"),
+            foreground_command=case((nothing_stopped, Session.foreground_command), else_=None),
         )
+        .returning(Session.status)
         .execution_options(synchronize_session=False)
     )
-    if result.rowcount != 1:
+    restored = result.scalar_one_or_none()
+    if restored is None:
         if await _after_missed_write(db, user=user, session_id=session_id) is None:
             raise _session_not_found()
         raise _move_conflict()
     await db.commit()
     await db.refresh(session_row)
 
-    await send_session_kill(session_row.id, session_row.host_id)
+    if restored == "killed":
+        await send_session_kill(session_row.id, session_row.host_id)
     host = await db.get(Host, session_row.host_id)
     return _to_out(session_row, host.name if host is not None else None)
 
@@ -661,6 +796,14 @@ async def move_session(
     abort. Either kind types a shell whose agent was started by hand
     (`agent_id`), as a create would type it, so its conversation is
     remembered too.
+
+    Nothing runs in an archived workspace. A fresh move of a window whose tile
+    is in one is `409 workspace_archived`, as a new window there would be. A
+    carried commit is not refused — the target has taken the conversation in
+    by then, and refusing would strand it — but the window goes there
+    stopped ("killed") and nothing is launched; restoring its workspace
+    starts it on its new host. (A move cannot begin in an archived workspace,
+    so this takes a tile placed there while the window moved.)
 
     The order is the point. The row is rebound first, so the old host's late
     frames — the exit the kill below provokes above all — fail the
@@ -746,6 +889,18 @@ async def move_session(
         if not body.carried and state[0] == SESSION_MOVING:
             raise _move_in_progress()
         raise _move_conflict()
+    # Asked after the write, in its transaction, as begin asks.
+    archived = await _in_archived_workspace(db, user=user, session_id=session_id)
+    if archived and not body.carried:
+        await db.rollback()
+        raise _workspace_archived()
+    if archived:
+        await db.execute(
+            update(Session)
+            .where(Session.id == session_row.id)
+            .values(status="killed", exited_at=_utcnow())
+            .execution_options(synchronize_session=False)
+        )
     await upsert_recent_dir(db, user=user, host_id=target.id, path=body.cwd)
     await db.commit()
     await db.refresh(session_row)
@@ -753,17 +908,27 @@ async def move_session(
     # Addressed to the host the window left only: its routing there goes, and
     # the launch below attaches the window to the target.
     await send_session_kill(session_row.id, source_host_id)
+    if archived:
+        return _to_out(session_row, target.name)
 
     skills = await capabilities.get_session_launch_capabilities(
         db, user=user, session_id=session_row.id
     )
-    await dispatch_session_launch(
+    withheld = await dispatch_session_launch(
         frame_type="session.restart",
         session_row=session_row,
         host=target,
         create_cwd=True,
+        stopped_since=_utcnow(),
         skills=skills,
     )
+    if withheld is not None:
+        # Another device moved, began moving or deleted the window between
+        # this commit and the launch: it does not run here, and the mover must
+        # not take control or type into it. Published here for the rebind this
+        # request did commit; a refusal gets no frame from the middleware.
+        await publish_data_changed(user.id, "sessions", session_id)
+        raise launch_withheld_refusal(withheld)
     return _to_out(session_row, target.name)
 
 

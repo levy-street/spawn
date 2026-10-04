@@ -1943,9 +1943,10 @@ async def _sort_existing_sessions(
       now name another of the owner's hosts — that window runs there now.
       A row that is "moving" and names this host is adopted and never
       stopped: this host is the one the move is leaving, and its worker is
-      the move's own retire to end (or, if the move is aborted, the abort's
-      kill). Stopping it here would be the server acting as the move's fence,
-      which it is not. A row "moving" from another host is stopped like any
+      the move's own retire to end — or, if the move is aborted before
+      anything stopped it, the window's own again, running as before.
+      Stopping it here would be the server acting as the move's fence, which
+      it is not. A row "moving" from another host is stopped like any
       row that names another host.
     - unclaimed: ids with no row in this account. They are left running, and
       their count and first ids go to the server log only; no device is told.
@@ -2795,11 +2796,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 # A window that is moving is a device carrying
                                 # its conversation away from here: the source's
                                 # retire stops the shell and the agent, or the
-                                # shell went anyway. Either way the exit is
-                                # recorded and is not news — the row stays
-                                # "moving", the owner is not paged, and no pane
-                                # is told the shell exited — until the move
-                                # commits or is aborted.
+                                # shell went anyway — a crash before any
+                                # retire included; the server cannot tell
+                                # them apart. Either way the exit is recorded
+                                # and is not news — the row stays "moving",
+                                # the owner is not paged, and no pane is told
+                                # the shell exited — until the move commits
+                                # or is aborted. The recorded exit is what
+                                # tells an abort the window stopped.
                                 moving_at_read = session_row.status == SESSION_MOVING
                                 exit_status = "killed" if sig or stopped_by_server else "exited"
                                 # How long this circle stayed open. Read here
@@ -2821,9 +2825,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     )
                                     .values(
                                         # Decided in the statement: a move
-                                        # begun, or a stop or an abort
-                                        # committed, after the read above is
-                                        # kept, never overwritten.
+                                        # begun, or a stop or an abort that
+                                        # left the window stopped, committed
+                                        # after the read above is kept, never
+                                        # overwritten. An abort that put the
+                                        # window back running (it had no exit
+                                        # yet) takes this one as any running
+                                        # window would, without the alert when
+                                        # it was moving as read.
                                         status=case(
                                             (Session.status == SESSION_MOVING, SESSION_MOVING),
                                             (Session.status == "killed", "killed"),

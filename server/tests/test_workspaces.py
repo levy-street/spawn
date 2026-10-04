@@ -840,10 +840,19 @@ async def test_archive_raced_by_a_move_stops_the_window_where_it_went(client, mo
         await _unregister_daemon(new)
 
 
+async def _place_in(client, auth, workspace_id: str, session_ids: list[str]) -> None:
+    tiles = [_tile(sid, 12 * index, 0, 12, 24) for index, sid in enumerate(session_ids)]
+    patched = await client.patch(
+        f"/api/workspaces/{workspace_id}", json={"layout": _envelope(tiles)}, headers=auth
+    )
+    assert patched.status_code == 200, patched.text
+
+
 async def test_restore_leaves_a_moving_window_to_its_move(client):
-    """A stopped window moves too, so an archived workspace can hold one that
-    is moving. Restoring the workspace restarts the others and leaves that
-    one to its move's commit or abort."""
+    """A move cannot begin in an archived workspace, but an archived workspace
+    stays editable, so a moving window's tile can be placed in one. Restoring
+    the workspace restarts the others and leaves that one to its move's
+    commit or abort."""
     email = "ws-restore-moving@example.com"
     token = await _signup(client, email)
     auth = {"Authorization": f"Bearer {token}"}
@@ -852,10 +861,13 @@ async def test_restore_leaves_a_moving_window_to_its_move(client):
     still = await _create_session_row(email, host_id)
     fake_ws, daemon = await _register_daemon(host_id)
     try:
-        workspace_id = await _workspace_with(client, auth, [still, moving], "put away")
+        workspace_id = await _workspace_with(client, auth, [still], "put away")
+        elsewhere = await _workspace_with(client, auth, [moving], "elsewhere")
         r = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=auth)
         assert r.status_code == 200, r.text
         await _begin_move(client, auth, moving, host_id)
+        await _place_in(client, auth, elsewhere, [])
+        await _place_in(client, auth, workspace_id, [still, moving])
 
         restored = await client.post(f"/api/workspaces/{workspace_id}/unarchive", headers=auth)
         assert restored.status_code == 200, restored.text
@@ -863,6 +875,132 @@ async def test_restore_leaves_a_moving_window_to_its_move(client):
         assert (await client.get(f"/api/sessions/{moving}", headers=auth)).json()[
             "status"
         ] == "moving"
+    finally:
+        await _unregister_daemon(daemon)
+
+
+async def test_nothing_moves_into_running_in_an_archived_workspace(client):
+    """Nothing runs in an archived workspace. A move does not begin there and
+    a fresh move does not start the window elsewhere (`409
+    workspace_archived`, as a new window there would be), each changing and
+    sending nothing. A carried commit whose window's tile has been placed in
+    one is not refused — the target holds the conversation by then — but the
+    window lands there stopped, with no launch, and its workspace's restore
+    starts it on its new host."""
+    email = "ws-archived-move@example.com"
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    left = await _create_host(email, name="left")
+    new = await _create_host(email, name="new")
+    archived_window = await _create_session_row(email, left)
+    carried = await _create_session_row(email, left)
+    left_ws, left_daemon = await _register_daemon(left)
+    new_ws, new_daemon = await _register_daemon(new)
+    try:
+        workspace_id = await _workspace_with(client, auth, [archived_window], "put away")
+        active_id = await _workspace_with(client, auth, [carried], "active")
+        r = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=auth)
+        assert r.status_code == 200, r.text
+        left_ws.sent_text.clear()
+
+        r = await client.post(
+            f"/api/sessions/{archived_window}/move/begin",
+            json={"expected_host_id": left},
+            headers=auth,
+        )
+        assert r.status_code == 409 and r.json()["detail"] == "workspace_archived"
+        r = await client.post(
+            f"/api/sessions/{archived_window}/move",
+            json={"host_id": new, "cwd": "/work", "expected_host_id": left},
+            headers=auth,
+        )
+        assert r.status_code == 409 and r.json()["detail"] == "workspace_archived"
+        row = (await client.get(f"/api/sessions/{archived_window}", headers=auth)).json()
+        assert (row["host_id"], row["status"], row["cwd"]) == (left, "killed", "/repo")
+        assert left_ws.sent_text == [] and new_ws.sent_text == []
+
+        await _begin_move(client, auth, carried, left)
+        await _place_in(client, auth, active_id, [])
+        await _place_in(client, auth, workspace_id, [archived_window, carried])
+        r = await client.post(
+            f"/api/sessions/{carried}/move",
+            json={
+                "host_id": new,
+                "cwd": "/work",
+                "expected_host_id": left,
+                "carried": True,
+            },
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        assert (r.json()["host_id"], r.json()["status"]) == (new, "killed")
+        assert r.json()["exited_at"] is not None
+        assert [f["session_id"] for f in _frames(left_ws, "session.kill")] == [carried]
+        assert new_ws.sent_text == []
+
+        restored = await client.post(f"/api/workspaces/{workspace_id}/unarchive", headers=auth)
+        assert restored.status_code == 200, restored.text
+        assert [f["session_id"] for f in _frames(new_ws, "session.restart")] == [carried]
+    finally:
+        await _unregister_daemon(left_daemon)
+        await _unregister_daemon(new_daemon)
+
+
+async def test_a_begin_raced_by_an_archive_is_refused(client, monkeypatch):
+    """An archive that commits between a begin's read (the workspace still
+    active) and its write: the begin is asked about the archive after its own
+    write and refuses, so no window is left moving in an archived workspace,
+    and the window stays as the archive left it."""
+    email = "ws-archived-begin-race@example.com"
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host(email)
+    window = await _create_session_row(email, host_id)
+    fake_ws, daemon = await _register_daemon(host_id)
+
+    from datetime import UTC, datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.dml import Update
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Session, Workspace
+
+    real_execute = AsyncSession.execute
+    raced = False
+
+    try:
+        workspace_id = await _workspace_with(client, auth, [window], "raced")
+
+        async def execute(self, statement, *args, **kwargs):
+            nonlocal raced
+            if not raced and isinstance(statement, Update) and statement.table.name == "sessions":
+                raced = True
+                async with get_sessionmaker()() as other:
+                    workspace = await other.get(Workspace, workspace_id)
+                    row = await other.get(Session, window)
+                    assert workspace is not None and row is not None
+                    workspace.archived_at = datetime.now(UTC)
+                    row.status = "killed"
+                    row.exited_at = datetime.now(UTC)
+                    await other.commit()
+            return await real_execute(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(AsyncSession, "execute", execute)
+        try:
+            r = await client.post(
+                f"/api/sessions/{window}/move/begin",
+                json={"expected_host_id": host_id},
+                headers=auth,
+            )
+        finally:
+            monkeypatch.setattr(AsyncSession, "execute", real_execute)
+        assert raced
+        assert r.status_code == 409 and r.json()["detail"] == "workspace_archived"
+        assert (await client.get(f"/api/sessions/{window}", headers=auth)).json()[
+            "status"
+        ] == "killed"
+        assert fake_ws.sent_text == []
     finally:
         await _unregister_daemon(daemon)
 

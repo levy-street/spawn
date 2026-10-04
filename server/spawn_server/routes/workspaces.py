@@ -127,6 +127,29 @@ def _layout_session_ids(layout: dict) -> list[str]:
     return ids
 
 
+async def archived_workspace_holds(db: AsyncSession, owner_user_id: str, session_id: str) -> bool:
+    """Whether one of the owner's archived workspaces has a tile for this
+    window.
+
+    Nothing runs in an archived workspace — archive stopped every window in
+    it, and restore is what starts them again — so a move into one would
+    quietly undo the archive, as a new window would (`create_session`'s
+    `409 workspace_archived`). Read in the caller's transaction after its own
+    write to the window, so an archive that stopped the window first is seen,
+    and one that comes after finds the window already changed."""
+    layouts = (
+        await db.execute(
+            select(Workspace.layout).where(
+                Workspace.owner_user_id == owner_user_id,
+                Workspace.archived_at.is_not(None),
+            )
+        )
+    ).scalars()
+    return any(
+        session_id in _layout_session_ids(parse_workspace_layout(layout)) for layout in layouts
+    )
+
+
 async def _refuse_while_moving(db: AsyncSession, user: User, session_ids: list[str]) -> None:
     """`409 move_in_progress` when any of these windows is moving.
 
@@ -437,6 +460,7 @@ async def create_workspace(
             session_row=session_row,
             host=host,
             create_cwd=True,
+            stopped_since=_utcnow(),
             skills=skills,
         )
         session_out = session_to_out(session_row, host.name)
@@ -580,14 +604,14 @@ async def unarchive_workspace(
     for index, row in enumerate(rows):
         row.position = index
 
-    launches: list[tuple[Session, Host]] = []
+    launches: list[tuple[Session, Host, datetime | None]] = []
     for session_id in _layout_session_ids(parse_workspace_layout(workspace.layout)):
         session_row = await db.get(Session, session_id)
         if session_row is None or session_row.owner_user_id != user.id:
             continue
         # A window that is moving is left to its move, which ends with a
-        # commit (it starts on its new host) or an abort (it stays stopped
-        # here, for its own Restart).
+        # commit or an abort. (A move cannot begin in an archived workspace,
+        # but a moving window's tile can be placed in one.)
         if session_row.status == SESSION_MOVING:
             continue
         host = await db.get(Host, session_row.host_id)
@@ -616,14 +640,18 @@ async def unarchive_workspace(
             .execution_options(synchronize_session=False)
         )
         if result.rowcount == 1:
-            launches.append((session_row, host))
+            # When the window stopped, for a launch a move withholds; the
+            # object keeps the values it was read with until refreshed.
+            launches.append((session_row, host, session_row.exited_at))
 
     await db.commit()
     await db.refresh(workspace)
 
     # Dispatched after the commit, exactly as workspace creation does: the
     # rows are in their restarting state before any daemon can call back.
-    for session_row, host in launches:
+    # A launch a move or a close overtakes is withheld and leaves that window
+    # as the other device left it; the restore itself still stands.
+    for session_row, host, stopped_since in launches:
         await db.refresh(session_row)
         skills = await capabilities.get_session_launch_capabilities(
             db, user=user, session_id=session_row.id
@@ -633,6 +661,7 @@ async def unarchive_workspace(
             session_row=session_row,
             host=host,
             create_cwd=True,
+            stopped_since=stopped_since,
             skills=skills,
         )
     return _to_out(workspace)
