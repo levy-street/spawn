@@ -133,8 +133,29 @@ function rowNames(): string[] {
     .map((row) => String(row.props["testID"]).replace(/^file-row-/u, ""));
 }
 
+/**
+ * Long enough for a 200 ms drawer exit and a 150 ms dialog exit to finish on a
+ * runner that is ten times slower than a desk, and short of the 5 s a test has.
+ */
+const OVERLAY_SETTLE_MS = 3000;
+
+/**
+ * Opens the folder's ⋯ menu once whatever the last step raised has finished
+ * leaving. A drawer raised again while its own exit still plays is taken down
+ * when that exit ends, and a dialog's exit is what releases the drawer it was
+ * raised from (overlay-stack.ts). Pressed in the middle of either, the menu can
+ * close again before its rows are read.
+ */
 async function openFolderActions() {
+  await waitFor(
+    () => {
+      expect(screen.queryByTestId("sheet-overlay")).toBeNull();
+      expect(screen.queryByTestId("dialog-window")).toBeNull();
+    },
+    { timeout: OVERLAY_SETTLE_MS },
+  );
   await fireEvent.press(screen.getByRole("button", { name: "Folder actions" }));
+  await screen.findByTestId("sheet-content");
 }
 
 afterEach(() => {
