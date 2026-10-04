@@ -1794,6 +1794,13 @@ byte for byte (`web/src/lib/agent-relaunch.ts`,
 message and the server never sees either, but every client has to type
 exactly the same thing.
 
+The vectors' expected values come from a reference written apart from that
+module, [`tools/relaunch-vectors/relaunch_ref.py`](../tools/relaunch-vectors/relaunch_ref.py):
+`python3 tools/relaunch-vectors/generate.py` rewrites the file from it, and
+`scripts/test-all.sh` runs it with `--check`, which fails when the file is not
+what it would write. A rule changes in the reference and the module together;
+both clients' tests then say whether the two agree.
+
 **The line** is `<environment><command>[ <yolo arguments>][ <conversation>][
 <mode>][ <note>]`:
 
