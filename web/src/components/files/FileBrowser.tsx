@@ -161,6 +161,7 @@ import {
   explorerShortcut,
   keystrokeBelongsToText,
 } from "@/lib/keyboard-chords";
+import { menuOrDialogOpen } from "@/lib/modal-layer";
 import {
   isPathWithin,
   joinPath,
@@ -776,7 +777,17 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
     query.addEventListener("change", apply);
     return () => query.removeEventListener("change", apply);
   }, []);
-  const hover = useHoverIntent<{ path: string }>({ enabled: fineHover });
+  // The card is the lowest thing on screen: while any menu or dialog is up —
+  // this browser's own, or one opened from anywhere else — none opens, and
+  // one already up goes. Asked again as the delay runs out, which is the race
+  // that matters: a menu item clicked over a row closes the menu, the pointer
+  // is suddenly resting on that row, and the dialog the item opened is up
+  // before the card's delay is.
+  const overlayUp = useCallback(
+    () => menuOrDialogOpen(document, listRef.current?.element ?? null),
+    [],
+  );
+  const hover = useHoverIntent<{ path: string }>({ enabled: fineHover, blocked: overlayUp });
   const hoverEntry = useMemo(() => {
     const path = hover.value?.path;
     return path ? (rowByKey.get(path)?.entry ?? null) : null;
@@ -846,7 +857,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       return true;
     };
     const onMove = (event: PointerEvent) => {
-      if (outside(event.clientX, event.clientY)) hover.cancel();
+      if (outside(event.clientX, event.clientY) || overlayUp()) hover.cancel();
     };
     const onWindowOut = (event: PointerEvent) => {
       if (event.relatedTarget === null) hover.cancel();
@@ -859,7 +870,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       document.removeEventListener("pointerout", onWindowOut);
       window.removeEventListener("blur", hover.cancel);
     };
-  }, [hover.value, hover.pinned, hover.cancel]);
+  }, [hover.value, hover.pinned, hover.cancel, overlayUp]);
 
   useEffect(() => {
     if (viewing !== null) hover.cancel();
@@ -872,8 +883,9 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   }, [renaming, creating, hover.cancel]);
 
   // A dialog opening (a delete confirm, the viewer) takes the window; a card
-  // left floating over it would sit on its buttons.
-  useDismissOnModalOpen(hover.value !== null, hover.cancel);
+  // left floating over it would sit on its buttons. Listened for while closed
+  // too: a card still waiting on its delay is dropped, not opened over it.
+  useDismissOnModalOpen(true, hover.cancel);
 
   // Losing the channel closes the card and the viewer and drops every cached
   // preview for this host, so a reconnect cannot show bytes from a session
