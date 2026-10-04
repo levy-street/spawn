@@ -1,5 +1,8 @@
 import { relativeSeen } from "@/components/hosts/host-model";
-import { HOST_IDENTITY_BLOCKED_REASON } from "@/components/hosts/host-trust-copy";
+import {
+  HOST_IDENTITY_BLOCKED_REASON,
+  HOST_IDENTITY_BLOCKED_STATUS,
+} from "@/components/hosts/host-trust-copy";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
@@ -36,13 +39,18 @@ export function stepCockpitTab(current: CockpitTab, delta: -1 | 1): CockpitTab |
 /**
  * The line under the host's name: whether this device can reach it right now.
  * The server's word decides offline; this device's own connection decides
- * whether an online host is reachable from here.
+ * whether an online host is reachable from here. A host whose identity changed
+ * is blocked before anything else — every connection would be refused again,
+ * so it is not "reconnecting" and there is nothing to retry. The browser's
+ * line says the same.
  */
 export function cockpitStatusLine(
   host: Pick<HostOut, "status" | "last_seen_at">,
   live: Pick<HostLiveStatus, "reconnecting">,
+  identityConflict = false,
   now = Date.now(),
 ): string {
+  if (identityConflict) return HOST_IDENTITY_BLOCKED_STATUS;
   if (host.status !== "online") {
     return host.last_seen_at === null
       ? "Offline · never connected"

@@ -4,6 +4,7 @@ import type { Session, Workspace } from "@/lib/api";
 import {
   folderSubtitle,
   groupHostSessions,
+  type HostStatusLine,
   hostFolders,
   hostSessionGroupTitle,
   hostStatusLine,
@@ -134,6 +135,21 @@ describe("hostStatusLine", () => {
       retry: true,
       reason: "Too many views of dream are open.",
     });
+  });
+
+  test("a changed identity is blocked, not reconnecting, and offers no Retry", () => {
+    const blocked: HostStatusLine = {
+      text: "Blocked · identity changed",
+      tone: "blocked",
+      retry: false,
+      reason: null,
+    };
+    // What the connection says while every attempt is refused.
+    const refused = { state: "error" as const, error: "Can't reach dream from this device." };
+    expect(hostStatusLine(dream, refused, true)).toEqual(blocked);
+    expect(hostStatusLine(dream, { state: "connecting", error: null }, true)).toEqual(blocked);
+    expect(hostStatusLine({ ...dream, status: "offline" }, null, true)).toEqual(blocked);
+    expect(hostStatusLine(dream, refused, false).text).toBe("Reconnecting…");
   });
 
   test("offline is the server's word, whatever this device holds", () => {

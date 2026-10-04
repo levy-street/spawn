@@ -70,14 +70,29 @@ describe("host cockpit model", () => {
 
   test("the status line says whether this device can reach the host now", () => {
     const now = Date.parse("2026-08-22T03:00:00Z");
-    expect(cockpitStatusLine(onlineHost, { reconnecting: false }, now)).toBe("Online");
-    expect(cockpitStatusLine(onlineHost, { reconnecting: true }, now)).toBe("Reconnecting…");
+    expect(cockpitStatusLine(onlineHost, { reconnecting: false }, false, now)).toBe("Online");
+    expect(cockpitStatusLine(onlineHost, { reconnecting: true }, false, now)).toBe("Reconnecting…");
     expect(
-      cockpitStatusLine({ ...onlineHost, status: "offline" }, { reconnecting: true }, now),
+      cockpitStatusLine({ ...onlineHost, status: "offline" }, { reconnecting: true }, false, now),
     ).toBe("Offline · last seen 3h ago");
     expect(
-      cockpitStatusLine({ status: "offline", last_seen_at: null }, { reconnecting: false }, now),
+      cockpitStatusLine(
+        { status: "offline", last_seen_at: null },
+        { reconnecting: false },
+        false,
+        now,
+      ),
     ).toBe("Offline · never connected");
+  });
+
+  test("a changed identity is blocked, not reconnecting, in the browser's words", () => {
+    const now = Date.parse("2026-08-22T03:00:00Z");
+    expect(cockpitStatusLine(onlineHost, { reconnecting: true }, true, now)).toBe(
+      "Blocked · identity changed",
+    );
+    expect(
+      cockpitStatusLine({ ...onlineHost, status: "offline" }, { reconnecting: false }, true, now),
+    ).toBe("Blocked · identity changed");
   });
 
   test("Running here leads with who needs a person, then what is working, and stops at six", () => {

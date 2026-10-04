@@ -4,6 +4,7 @@ import { orderSessions } from "./fleet";
 import { hostLiveStatus } from "./host-live-status";
 import { displayPath, HOST_HOME } from "./places";
 import { relativeTime } from "./sessions";
+import { HOST_IDENTITY_BLOCKED_STATUS } from "./signed-rtc-trust";
 import { tabOfSession } from "./tabs";
 
 /**
@@ -40,7 +41,7 @@ export function hostTabSegment(pathname: string | null | undefined, hostId: stri
 
 export interface HostStatusLine {
   text: string;
-  tone: "active" | "warning" | "offline";
+  tone: "active" | "warning" | "offline" | "blocked";
   /** This device lost a host the server still sees; Retry is the way back. */
   retry: boolean;
   /** Why, when the connection said: shown beside Retry, not in the line. */
@@ -58,11 +59,19 @@ export interface HostStatusLine {
  * host the server sees is only reachable from here if the pair connection is
  * up, and the path it took is a fact about this device, not the host. A path
  * through a STUN-discovered address is still direct; only TURN is relayed.
+ *
+ * A host whose identity changed is blocked before anything else: its
+ * connection would only be refused again, so the line says so and offers no
+ * Retry, under the panel that says only removing it helps.
  */
 export function hostStatusLine(
   host: { name: string; status: string; last_seen_at: string | null },
   snapshot: Pick<DaemonSnapshot, "state" | "error" | "info"> | null,
+  identityBlocked = false,
 ): HostStatusLine {
+  if (identityBlocked) {
+    return { text: HOST_IDENTITY_BLOCKED_STATUS, tone: "blocked", retry: false, reason: null };
+  }
   if (host.status !== "online") {
     const seen = relativeTime(host.last_seen_at);
     return {

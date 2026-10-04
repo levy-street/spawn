@@ -75,6 +75,12 @@ export const HOST_IDENTITY_BLOCKED_REASON =
   "Connections to this host are blocked until it is removed and possessed again.";
 
 /**
+ * The host page's status line while that panel is up: blocked, not
+ * reconnecting, since no retry gets past it. The phone's says the same.
+ */
+export const HOST_IDENTITY_BLOCKED_STATUS = "Blocked · identity changed";
+
+/**
  * The trust decision for one live RTC connection generation.
  * - `signed`   — offers are signed with this browser's identity. Either a
  *   local pin matched (host fully verified), or the host is unpinned and the
