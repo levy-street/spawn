@@ -54,6 +54,7 @@ jest.mock("@/lib/auth-gate", () => ({
 
 // Transfers run under every screen; their runner and sheet have tests of their own.
 jest.mock("@/components/files/transfers-runner", () => ({ TransfersRunner: () => null }));
+jest.mock("@/components/workspace-detail/move-runner", () => ({ MoveRunner: () => null }));
 jest.mock("@/components/files/transfers-sheet", () => ({ TransfersSheet: () => null }));
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";

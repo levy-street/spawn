@@ -8,7 +8,7 @@ import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import type { HostLiveStatus } from "@/data/selectors/host-live";
 import { displayPath, HOST_HOME } from "@/data/selectors/places";
-import { attentionRank } from "@/data/selectors/session";
+import { attentionRank, isLiveSession } from "@/data/selectors/session";
 
 /**
  * A host's page, in tabs. The browser gives each its own address
@@ -87,9 +87,7 @@ export function windowBlockedReason(
   return null;
 }
 
-export function isLiveSession(session: Pick<SessionOut, "status">): boolean {
-  return session.status !== "exited" && session.status !== "killed";
-}
+export { isLiveSession };
 
 function lastActive(session: SessionOut): number {
   const stamps = [session.last_activity_at, session.last_input_at, session.started_at];

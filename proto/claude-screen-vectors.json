@@ -1,0 +1,1766 @@
+{
+ "version": 2,
+ "description": "Where Claude Code is, read off the screen of the window it was resumed in after a move, so a device types the move note only at Claude Code's empty prompt while it is not working, and shows a banner instead of pressing a key in every question Claude Code asks (folder trust, Bypass Permissions, resume from a summary, signing in, a tool's permission, any other numbered choice). Both clients (web/src/lib/move/screen.ts, mobile/src/data/selectors/claude-screen.ts) embed exactly this table, minus description, source, checked_against and fixtures, and classify every fixture as expected. proto/README.md, 'Reading Claude Code's screen after a move', states the rules; version moves whenever a state's meaning or the way a screen is read changes.",
+ "source": "Captured fixtures come from Claude Code 2.1.289 driven in a sandboxed HOME and CLAUDE_CONFIG_DIR against a local stub of the Messages API on 127.0.0.1, never Anthropic, and rendered by xterm.js at 50 and 100 columns. The rest are laid out as those captures and spike S1's (2.1.288 in the same kind of sandbox) are, with Claude Code's wording read out of the installed 2.1.288 and 2.1.289 binaries with grep, each shell's own not-found message, or text a person, Claude's reply or a host's name can put on the screen; each fixture's source says which. A fixture's lines are the screen's logical lines (a row xterm wrapped joined to the row before it), top to bottom, as a client reads them.",
+ "checked_against": [
+  "2.1.288",
+  "2.1.289"
+ ],
+ "states": [
+  "agent_ready",
+  "busy",
+  "trust_prompt",
+  "bypass_prompt",
+  "resume_summary_prompt",
+  "login_required",
+  "dialog",
+  "conversation_not_found",
+  "agent_missing",
+  "unknown"
+ ],
+ "asks_person": [
+  "trust_prompt",
+  "bypass_prompt",
+  "resume_summary_prompt",
+  "login_required",
+  "dialog"
+ ],
+ "read_below_last_line_containing": [
+  "--permission-mode"
+ ],
+ "edge_characters": "│┃║╭╮╰╯",
+ "input_box": {
+  "rule": "^\\s*[─━]{10,}(?:\\s+\\S.*?\\s+[─━]{1,4})?\\s*$",
+  "prompt": "^\\s*[❯>](?:\\s.*)?$",
+  "empty_prompt": "^\\s*[❯>]\\s*$",
+  "footer_lines_max": 2,
+  "context_lines_above": 4
+ },
+ "while_input_shows": [
+  {
+   "state": "login_required",
+   "any": [
+    "Not logged in",
+    "Invalid API key",
+    "Authentication required"
+   ]
+  },
+  {
+   "state": "busy",
+   "any": [
+    "esc to interr",
+    "enter to interrupt"
+   ],
+   "line_regex": [
+    "^\\s*\\S\\s+\\S+…\\s*(?:\\(\\d|$)"
+   ]
+  }
+ ],
+ "bottom_lines": 14,
+ "bottom": [
+  {
+   "state": "conversation_not_found",
+   "any": [
+    "No conversation found with session ID",
+    "No conversation found to continue"
+   ]
+  },
+  {
+   "state": "agent_missing",
+   "line_regex": [
+    "(?:^|[\\s:])claude: (?:command )?not found\\b",
+    "command not found: claude\\b",
+    "Unknown command:? '?claude'?(?:\\s|$)",
+    "The term 'claude' is not recognized",
+    "'claude' is not recognized as an internal or external command",
+    "Command `claude` not found"
+   ]
+  },
+  {
+   "state": "trust_prompt",
+   "any": [
+    "Yes, I trust this folder",
+    "Quick safety check: Is this a project you created or one you trust?"
+   ]
+  },
+  {
+   "state": "bypass_prompt",
+   "all": [
+    "Bypass Permissions mode",
+    "Yes, I accept"
+   ]
+  },
+  {
+   "state": "resume_summary_prompt",
+   "any": [
+    "Resume from summary",
+    "Resume full session as-is"
+   ]
+  },
+  {
+   "state": "login_required",
+   "any": [
+    "Select login method",
+    "Not logged in",
+    "Choose the text style that looks best with your terminal",
+    "Authentication required",
+    "Browser didn't open? Use the url below to sign in"
+   ]
+  },
+  {
+   "state": "dialog",
+   "any": [
+    "Do you want to proceed?",
+    "Do you want to use this API key?"
+   ],
+   "line_regex": [
+    "^\\s*❯\\s*\\d+\\.\\s"
+   ]
+  }
+ ],
+ "fixtures": [
+  {
+   "name": "fresh start, empty prompt (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "                              ◐ medium · /effort",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "working on a turn (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "✻ Polishing… (3s · ↓ 14 tokens)",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · esc to interrupt · ← for a…"
+   ],
+   "expect": "busy"
+  },
+  {
+   "name": "turn finished, prompt empty again (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "resumed with the note as its first prompt, answered (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "❯ [SPAWN D] This conversation just moved from     ",
+    "  dream (Linux) to mac (macOS) and continues in   ",
+    "  ~/code/spawn. Files were not copied, so         ",
+    "  anything not pushed from dream is missing here. ",
+    "  Background tasks and dream-only MCP tools did   ",
+    "  not come along. You were in the middle of a     ",
+    "  task: check whether your last action took       ",
+    "  effect, then carry on.                          ",
+    "",
+    "● STUB-REPLY",
+    "",
+    "✻ Crunched for 0s · done 9:40 AM",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "resumed without a note, waiting (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "❯ [SPAWN D] This conversation just moved from     ",
+    "  dream (Linux) to mac (macOS) and continues in   ",
+    "  ~/code/spawn. Files were not copied, so         ",
+    "  anything not pushed from dream is missing here. ",
+    "  Background tasks and dream-only MCP tools did   ",
+    "  not come along. You were in the middle of a     ",
+    "  task: check whether your last action took       ",
+    "  effect, then carry on.                          ",
+    "",
+    "● STUB-REPLY",
+    "",
+    "✻ Crunched for 0s · done 9:40 AM",
+    "                              ◐ medium · /effort",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "Claude Code quit back to the shell (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode default",
+    "",
+    "Resume this session with:",
+    "claude --resume 3167a087-ab08-4d3a-a7c6-87b568071b49",
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "resume of an id with no record (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "No conversation found with session ID:",
+    "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "conversation_not_found"
+  },
+  {
+   "name": "folder trust dialog, 'No, exit' selected first (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js; the sandbox folder's rows replaced by one",
+   "cols": 50,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode default",
+    "",
+    "──────────────────────────────────────────────────",
+    " Accessing workspace:",
+    " /home/me/code/spawn",
+    " Quick safety check: Is this a project you",
+    " created or one you trust? (Like your own code, a",
+    " well-known open source project, or work from",
+    " your team). If not, take a moment to review",
+    " what's in this folder first.",
+    "",
+    " Claude Code'll be able to read, edit, and",
+    " execute files here.",
+    "",
+    " Security guide",
+    "",
+    " ❯ No, exit",
+    "   Yes, I trust this folder",
+    "",
+    " Enter to confirm · Esc to cancel"
+   ],
+   "expect": "trust_prompt"
+  },
+  {
+   "name": "Bypass Permissions warning, 'No, exit' selected first (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode bypassPermissions",
+    "",
+    "──────────────────────────────────────────────────",
+    "  WARNING: Claude Code running in Bypass",
+    "  Permissions mode",
+    "",
+    "  In Bypass Permissions mode, Claude Code will",
+    "  not ask for your approval before running",
+    "  potentially dangerous commands.",
+    "  This mode should only be used in a sandboxed",
+    "  container/VM that has restricted internet",
+    "  access and can easily be restored if damaged.",
+    "",
+    "  By proceeding, you accept all responsibility",
+    "  for actions taken while running in Bypass",
+    "  Permissions mode.",
+    "",
+    "  https://code.claude.com/docs/en/security",
+    "",
+    "  ❯ No, exit",
+    "    Yes, I accept",
+    "",
+    "  Enter to confirm · Esc to cancel"
+   ],
+   "expect": "bypass_prompt"
+  },
+  {
+   "name": "bash has no claude (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "bash: claude: command not found",
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "Claude Code's own tool-permission prompt (50 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 50,
+   "note": "Version 1 read this as unknown, having no state for it; version 2 names any question Claude Code asks that the table does not name otherwise 'dialog' (here 'Do you want to proceed?' over a numbered choice): a banner, never a key.",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ TOOL please                                     ",
+    "",
+    "  Fetching a URL",
+    "  ⎿  $ curl -s http://127.0.0.1:9/s1-never",
+    "",
+    "──────────────────────────────────────────────────",
+    " Bash command",
+    " Tip: auto mode handles these prompts for you — ",
+    " choose \"switch to auto mode\" below",
+    " Fetch a URL",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " curl -s http://127.0.0.1:9/s1-never",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " This command requires approval",
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. Yes, and don’t ask again for: curl *",
+    "   3. Yes, and switch to auto mode · auto mode ",
+    "      handles these prompts for you",
+    "   4. No",
+    "",
+    " Esc to cancel · Tab to amend"
+   ],
+   "expect": "dialog"
+  },
+  {
+   "name": "fresh start, empty prompt (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "                                                                                ◐ medium · /effort",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "❯  ",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for agents"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "working on a turn (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                                                                       ",
+    "",
+    "●",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "✻ Unfurling… (3s · ↓ 14 tokens)",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "❯  ",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "  ⏸ manual mode on · esc to interrupt · ← for agents"
+   ],
+   "expect": "busy"
+  },
+  {
+   "name": "turn finished, prompt empty again (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                                                                       ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6 slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18 slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30 slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Brewed for 20s · done 9:42 AM",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "❯  ",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for agents"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "resumed with the note as its first prompt, answered (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                                                                       ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6 slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18 slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30 slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Brewed for 20s · done 9:42 AM",
+    "",
+    "❯ [SPAWN D] This conversation just moved from dream (Linux) to mac (macOS) and continues in         ",
+    "  ~/code/spawn. Files were not copied, so anything not pushed from dream is missing here.           ",
+    "  Background tasks and dream-only MCP tools did not come along. You were in the middle of a task:   ",
+    "  check whether your last action took effect, then carry on.                                        ",
+    "",
+    "● STUB-REPLY",
+    "",
+    "✻ Cooked for 0s · done 9:42 AM",
+    "",
+    "",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "❯  ",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for agents"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "resumed without a note, waiting (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                                                                       ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6 slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18 slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30 slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Brewed for 20s · done 9:42 AM",
+    "",
+    "❯ [SPAWN D] This conversation just moved from dream (Linux) to mac (macOS) and continues in         ",
+    "  ~/code/spawn. Files were not copied, so anything not pushed from dream is missing here.           ",
+    "  Background tasks and dream-only MCP tools did not come along. You were in the middle of a task:   ",
+    "  check whether your last action took effect, then carry on.                                        ",
+    "",
+    "● STUB-REPLY",
+    "",
+    "✻ Cooked for 0s · done 9:42 AM",
+    "",
+    "",
+    "                                                                                ◐ medium · /effort",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "❯  ",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for agents"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "Claude Code quit back to the shell (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode default",
+    "",
+    "Resume this session with:",
+    "claude --resume 30668fdc-6eec-44a6-a50d-cde2f500014c",
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "resume of an id with no record (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "No conversation found with session ID: 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "conversation_not_found"
+  },
+  {
+   "name": "folder trust dialog, 'No, exit' selected first (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js; the sandbox folder's rows replaced by one",
+   "cols": 100,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode default",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    " Accessing workspace:",
+    " /home/me/code/spawn",
+    " Quick safety check: Is this a project you created or one you trust? (Like your own code, a",
+    " well-known open source project, or work from your team). If not, take a moment to review what's in",
+    " this folder first.",
+    "",
+    " Claude Code'll be able to read, edit, and execute files here.",
+    "",
+    " Security guide",
+    "",
+    " ❯ No, exit",
+    "   Yes, I trust this folder",
+    "",
+    " Enter to confirm · Esc to cancel"
+   ],
+   "expect": "trust_prompt"
+  },
+  {
+   "name": "Bypass Permissions warning, 'No, exit' selected first (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode bypassPermissions",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    "  WARNING: Claude Code running in Bypass Permissions mode",
+    "",
+    "  In Bypass Permissions mode, Claude Code will not ask for your approval before running",
+    "  potentially dangerous commands.",
+    "  This mode should only be used in a sandboxed container/VM that has restricted internet access",
+    "  and can easily be restored if damaged.",
+    "",
+    "  By proceeding, you accept all responsibility for actions taken while running in Bypass",
+    "  Permissions mode.",
+    "",
+    "  https://code.claude.com/docs/en/security",
+    "",
+    "  ❯ No, exit",
+    "    Yes, I accept",
+    "",
+    "  Enter to confirm · Esc to cancel"
+   ],
+   "expect": "bypass_prompt"
+  },
+  {
+   "name": "bash has no claude (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "bash: claude: command not found",
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "Claude Code's own tool-permission prompt (100 columns)",
+   "source": "captured: Claude Code 2.1.289 against a local stub API, rendered by xterm.js",
+   "cols": 100,
+   "note": "Version 1 read this as unknown, having no state for it; version 2 names any question Claude Code asks that the table does not name otherwise 'dialog' (here 'Do you want to proceed?' over a numbered choice): a banner, never a key.",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ TOOL please                                                                                       ",
+    "",
+    "  Fetching a URL",
+    "  ⎿  $ curl -s http://127.0.0.1:9/s1-never",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────────────────────────",
+    " Bash command",
+    " Tip: auto mode handles these prompts for you — choose \"switch to auto mode\" below",
+    " Fetch a URL",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " curl -s http://127.0.0.1:9/s1-never",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " This command requires approval",
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. Yes, and don’t ask again for: curl *",
+    "   3. Yes, and switch to auto mode · auto mode handles these prompts for you",
+    "   4. No",
+    "",
+    " Esc to cancel · Tab to amend"
+   ],
+   "expect": "dialog"
+  },
+  {
+   "name": "working, footer cut short on a narrow phone",
+   "source": "the 50-column capture with its footer as a 36-column grid truncates it",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "✻ Polishing… (3s · ↓ 14 tokens)",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · esc to interr…"
+   ],
+   "expect": "busy"
+  },
+  {
+   "name": "working, footer cut before its hint; the spinner still says so",
+   "source": "the 50-column capture with only the spinner row left to tell",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "✻ Polishing… (3s · ↓ 14 tokens)",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · …"
+   ],
+   "expect": "busy"
+  },
+  {
+   "name": "someone already typed into the prompt",
+   "source": "the 50-column capture with text in the input",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "                              ◐ medium · /effort",
+    "──────────────────────────────────────────────────",
+    "❯ hello there",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "prompt up but not signed in",
+   "source": "the 50-column capture with the footer Claude Code 2.1.289 shows without credentials (strings: 'Not logged in \\u00b7 Run /login')",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "                              ◐ medium · /effort",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  Not logged in · Run /login"
+   ],
+   "expect": "login_required"
+  },
+  {
+   "name": "legacy folder trust dialog",
+   "source": "Claude Code 1.x wording (move.md, spike 1)",
+   "note": "Version 1 read this as trust_prompt. Its wording is quoted from the move design notes for an older release; no installed release (2.1.263 to 2.1.289) carries it, so version 2 names no state from it, and the screen stands for a numbered question in a rounded box the table does not name: a dialog, never typed into.",
+   "lines": [
+    "me@mac:~/code/spawn$ claude",
+    "╭──────────────────────────────────────────────╮",
+    "│ Do you trust the files in this folder?       │",
+    "│                                              │",
+    "│ /home/me/code/spawn                          │",
+    "│                                              │",
+    "│ ❯ 1. Yes, proceed                            │",
+    "│   2. No, exit                                │",
+    "╰──────────────────────────────────────────────╯",
+    "   Enter to confirm · Esc to exit"
+   ],
+   "expect": "dialog"
+  },
+  {
+   "name": "resume from summary or in full",
+   "source": "strings of Claude Code 2.1.289 ('Resume from summary (recommended)', 'Resume full session as-is'), laid out as the captured dialogs",
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    "──────────────────────────────────────────────────",
+    " This session is 3 days old and 182k tokens.",
+    " Resuming the full session will consume a",
+    " substantial portion of your usage limits. We",
+    " recommend resuming from a summary.",
+    " ❯ 1. Resume from summary (recommended)",
+    "   2. Resume full session as-is",
+    "   3. Don't ask me again",
+    " Enter to confirm · Esc to cancel"
+   ],
+   "expect": "resume_summary_prompt"
+  },
+  {
+   "name": "login method",
+   "source": "strings of Claude Code 2.1.289 ('Select login method:' and its options)",
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    " Claude Code can be used with your Claude",
+    " subscription or billed based on API usage",
+    " through your Console account.",
+    " Select login method:",
+    " ❯ 1. Claude account with subscription · Pro,",
+    "      Max, Team, or Enterprise",
+    "   2. Anthropic Console account · API usage",
+    "      billing",
+    "   3. 3rd-party platform"
+   ],
+   "expect": "login_required"
+  },
+  {
+   "name": "first run asks for a text style before signing in",
+   "source": "Claude Code's first-run onboarding",
+   "lines": [
+    " Welcome to Claude Code",
+    " Let's get started.",
+    " Choose the text style that looks best with your terminal",
+    " To change this later, run /theme",
+    " ❯ 1. Dark mode ✔",
+    "   2. Light mode"
+   ],
+   "expect": "login_required"
+  },
+  {
+   "name": "zsh has no claude",
+   "source": "zsh's own not-found message",
+   "lines": [
+    "me@mac ~/code/spawn % claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "zsh: command not found: claude",
+    "me@mac ~/code/spawn % "
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "dash has no claude",
+   "source": "dash's own not-found message",
+   "lines": [
+    "$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "sh: 1: claude: not found",
+    "$ "
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "fish has no claude",
+   "source": "fish's own not-found message",
+   "lines": [
+    "me@mac ~/c/spawn> claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "fish: Unknown command: claude",
+    "me@mac ~/c/spawn> "
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "pwsh has no claude",
+   "source": "pwsh's own not-found message",
+   "lines": [
+    "PS /home/me/code/spawn> claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "claude: The term 'claude' is not recognized as a name of a cmdlet, function, script file, or executable program.",
+    "PS /home/me/code/spawn> "
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "the echo of the typed line is never read",
+   "source": "an adversarial pair of host names inside the echoed resume line",
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default '[SPAWN D] This conversation just moved from No conversation found with session ID (Linux) to Yes, I trust this folder (macOS) and continues in ~/code/spawn. Files were not copied, so anything not pushed from esc to interrupt is missing here.'"
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "an answered history that quotes a dialog does not hide the prompt",
+   "source": "the 50-column capture with dialog wording in the conversation above the prompt",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    "",
+    "● The trust dialog offers \"Yes, I trust this folder\"",
+    "  and \"No, exit\"; Claude Code printed \"No",
+    "  conversation found with session ID\" when it",
+    "  could not find the record.",
+    "                              ◐ medium · /effort",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "an empty screen",
+   "source": "nothing drawn yet",
+   "lines": [],
+   "expect": "unknown"
+  },
+  {
+   "name": "only the shell, the line not yet run",
+   "source": "a fresh login shell",
+   "lines": [
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "the ready prompt of a fresh resume",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    " ▐▛███▜▌   Claude Code v2.1.289",
+    "▝▜█████▛▘  Opus 5.5 · Claude Max",
+    "  ▘▘ ▝▝    ~/code/spawn",
+    "",
+    "❯ hello again",
+    "",
+    "● Sure — picking up where we were.",
+    "",
+    "────────────────────────────────────────────────────────────────────────",
+    "❯",
+    "────────────────────────────────────────────────────────────────────────",
+    "  ? for shortcuts"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "ready with auto mode restored and the agent hint",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "● STUB-REPLY",
+    "",
+    "✻ Cooked for 0s · done 7:38 PM",
+    "",
+    "◐ medium · /effort",
+    "─────────────────────────────────────────────────────────────── stub-reply ─",
+    "❯",
+    "──────────────────────────────────────────────────────────────────────────────",
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "ready on a Windows console that draws the prompt as >",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "────────────────────────────────────────",
+    ">",
+    "────────────────────────────────────────",
+    "  ? for shortcuts"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "ready under Claude Code's own update notice",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "───────────────────────────────────────────────────────",
+    "❯",
+    "───────────────────────────────────────────────────────",
+    "  ? for shortcuts                Update installed · Restart to apply"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "busy: the spinner row while the resumed turn runs",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "❯ [SPAWN D] This conversation just moved from dream (Linux) to mac (macOS)…",
+    "",
+    "✻ Wrangling… (3s · ↓ 2 tokens · esc to interrupt)",
+    "",
+    "────────────────────────────────────────────────────────────────────────",
+    "❯",
+    "────────────────────────────────────────────────────────────────────────",
+    "  ? for shortcuts"
+   ],
+   "expect": "busy"
+  },
+  {
+   "name": "busy: the footer form 2.1.288 draws",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "* Flambéing…",
+    "  ⎿  Tip: Use Plan Mode to prepare for a complex request before making changes.",
+    "────────────────────────────────────────────────────────────────────────",
+    "❯",
+    "────────────────────────────────────────────────────────────────────────",
+    "  esc to interrupt · ← for agents"
+   ],
+   "expect": "busy"
+  },
+  {
+   "name": "busy with a draft typed while it works",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "✢ Blanching…",
+    "────────────────────────────────────────────────────────────────────────",
+    "❯ also check the tests",
+    "────────────────────────────────────────────────────────────────────────",
+    "  enter to interrupt and send · ctrl+x then enter to queue"
+   ],
+   "expect": "busy"
+  },
+  {
+   "name": "the folder trust dialog",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "────────────────────────────────────────────────────────────────────────",
+    " Accessing workspace:",
+    "",
+    " /Users/me/code/spawn",
+    "",
+    " Quick safety check: Is this a project you created or one you trust? (Like your own code, a",
+    " well-known open source project, or work from your team). If not, take a moment to review what's",
+    " in this folder first.",
+    "",
+    " Claude Code'll be able to read, edit, and execute files here.",
+    "",
+    " Security guide",
+    "",
+    " ❯ No, exit",
+    "   Yes, I trust this folder",
+    "",
+    " Enter to confirm · Esc to cancel"
+   ],
+   "expect": "trust_prompt"
+  },
+  {
+   "name": "the resume-from-summary dialog of a long conversation",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "────────────────────────────────────────────────────────────────────────",
+    " This session is 3 days old and 412.3k tokens.",
+    "",
+    " Resuming the full session will consume a substantial portion of your usage limits. We recommend",
+    " resuming from a summary.",
+    "",
+    " ❯ 1. Resume from summary (recommended)",
+    "   2. Resume full session as-is",
+    "   3. Don't ask me again"
+   ],
+   "expect": "resume_summary_prompt"
+  },
+  {
+   "name": "the resume dialog when a summary is already made",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    " This session is 2 hours old and 180k tokens.",
+    " ❯ 1. Resume from summary (instant, recommended)",
+    "   2. Resume full session as-is",
+    "   3. Don't ask me again"
+   ],
+   "expect": "resume_summary_prompt"
+  },
+  {
+   "name": "the sign-in method screen",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    " Claude Code can be used with your Claude subscription or billed based on API usage through your",
+    " Console account.",
+    "",
+    " Select login method:",
+    "",
+    " ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise",
+    "",
+    "   2. Anthropic Console account · API usage billing"
+   ],
+   "expect": "login_required"
+  },
+  {
+   "name": "first run on a host where Claude Code was never set up",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    " Welcome to Claude Code v2.1.289",
+    "",
+    " Let's get started.",
+    "",
+    " Choose the text style that looks best with your terminal",
+    " To change this later, run /theme",
+    "",
+    " ❯ 1. Dark mode ✔",
+    "   2. Light mode"
+   ],
+   "expect": "login_required"
+  },
+  {
+   "name": "a resumed turn refused for a signed-out host",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "❯ [SPAWN D] This conversation just moved from dream (Linux) to mac (macOS)…",
+    "  ⎿  Not logged in · Please run /login",
+    "",
+    "────────────────────────────────────────────────────────────────────────",
+    "❯",
+    "────────────────────────────────────────────────────────────────────────",
+    "  ? for shortcuts"
+   ],
+   "expect": "login_required"
+  },
+  {
+   "name": "a permission prompt is a dialog: never answered",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    " Bash command",
+    "",
+    "   touch s1-tool-ran.txt",
+    "   Creating a marker file",
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. Yes, and always allow access to proj/ from this project",
+    "   3. No, and tell Claude what to do differently (esc)"
+   ],
+   "expect": "dialog"
+  },
+  {
+   "name": "the environment API key question",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    " Detected a custom API key in your environment",
+    "",
+    " ANTHROPIC_API_KEY: sk-ant-...AAAAAAAA",
+    "",
+    " Do you want to use this API key?",
+    "",
+    "   Yes",
+    " ❯ No (recommended)"
+   ],
+   "expect": "dialog"
+  },
+  {
+   "name": "the resume line names a conversation the host does not have",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "me@mac spawn % claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "No conversation found with session ID: 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    "me@mac spawn %"
+   ],
+   "expect": "conversation_not_found"
+  },
+  {
+   "name": "bash cannot find claude",
+   "source": "bash's own not-found message",
+   "lines": [
+    "me@dream:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "bash: claude: command not found",
+    "me@dream:~/code/spawn$"
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "zsh cannot find claude",
+   "source": "zsh's own not-found message",
+   "lines": [
+    "me@mac spawn % claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "zsh: command not found: claude",
+    "me@mac spawn %"
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "dash cannot find claude",
+   "source": "dash's own not-found message",
+   "lines": [
+    "$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "sh: 1: claude: not found",
+    "$"
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "fish cannot find claude",
+   "source": "fish's own not-found message",
+   "lines": [
+    "me@box ~/c/spawn> claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "fish: Unknown command: claude",
+    "me@box ~/c/spawn>"
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "PowerShell cannot find claude",
+   "source": "PowerShell's own not-found message",
+   "lines": [
+    "PS C:\\Users\\me\\code\\spawn> claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    "claude: The term 'claude' is not recognized as a name of a cmdlet, function, script file, or",
+    "executable program.",
+    "PS C:\\Users\\me\\code\\spawn>"
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "cmd cannot find claude",
+   "source": "cmd's own not-found message",
+   "lines": [
+    "C:\\Users\\me\\code\\spawn>claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    "'claude' is not recognized as an internal or external command,",
+    "operable program or batch file."
+   ],
+   "expect": "agent_missing"
+  },
+  {
+   "name": "the shell before Claude Code draws anything",
+   "source": "a shell echoing the resume line, Claude Code not yet drawn",
+   "lines": [
+    "me@mac spawn % claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default"
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "a prompt holding a placeholder or a draft is not an empty prompt",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "────────────────────────────────────────────────────────────────────────",
+    "❯ Try \"fix lint errors\"",
+    "────────────────────────────────────────────────────────────────────────",
+    "  ? for shortcuts"
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "a prompt glyph in the conversation is not the input box",
+   "source": "a lone prompt glyph in the conversation, no input box under it",
+   "lines": [
+    "❯",
+    "● Done."
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "a dialog wins over the prompt still drawn under it",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "────────────────────────────────────────────────────────────────────────",
+    "❯",
+    "────────────────────────────────────────────────────────────────────────",
+    " Quick safety check: Is this a project you created or one you trust? (Like your own code, a",
+    " ❯ No, exit",
+    "   Yes, I trust this folder"
+   ],
+   "expect": "trust_prompt"
+  },
+  {
+   "name": "Claude's own words about a missing command do not make it missing while its prompt is up",
+   "source": "laid out as spike S1 captured Claude Code 2.1.288 in its stub-API sandbox; wording from the 2.1.288 and 2.1.289 binaries' strings",
+   "lines": [
+    "● The CI log says `zsh: command not found: claude`, so the runner has no Claude Code.",
+    "",
+    "────────────────────────────────────────────────────────────────────────",
+    "❯",
+    "────────────────────────────────────────────────────────────────────────",
+    "  ? for shortcuts"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "a named conversation's label in the top rule (50 columns)",
+   "source": "the 50-column capture with its top rule labelled as Claude Code labels a named conversation's: the prompt's top border text, ' <name> ', set at the rule's end (2.1.289's strings; spike S1 captured '… stub-reply ─' from 2.1.288)",
+   "lines": [
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "❯ [SPAWN D] This conversation just moved from     ",
+    "  dream (Linux) to mac (macOS) and continues in   ",
+    "  ~/code/spawn. Files were not copied, so         ",
+    "  anything not pushed from dream is missing here. ",
+    "  Background tasks and dream-only MCP tools did   ",
+    "  not come along. You were in the middle of a     ",
+    "  task: check whether your last action took       ",
+    "  effect, then carry on.                          ",
+    "",
+    "● STUB-REPLY",
+    "",
+    "✻ Crunched for 0s · done 9:40 AM",
+    "                              ◐ medium · /effort",
+    "───────────────────────────────────── stub-reply ─",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "browsing prompt history: the rule's label at its start, the prompt filled",
+   "source": "the 50-column capture with the label 2.1.289 sets at the rule's start while the person steps through earlier prompts (its strings: 'History n/m', two rule characters in), and the earlier prompt in the input",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "                              ◐ medium · /effort",
+    "── History 1/1 ───────────────────────────────────",
+    "❯ SLOW please",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "a recap line under the footer",
+   "source": "the 50-column capture with the away recap spike S1's log shows after the footer (2.1.288: '※  recap:   STUB-REPLY (disable recaps in /config)'; 2.1.289's strings draw '※', 'recap: ' and the recap)",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…",
+    "",
+    "※ recap: STUB-REPLY (disable recaps in /config)"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "an input box left in the conversation with Claude Code's quit lines under it",
+   "source": "the 50-column capture with the lines Claude Code 2.1.289 leaves when it quits (captured) under its box, as a renderer that draws in the shell's own screen leaves a box in the conversation: more than two lines under the bottom rule",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…",
+    "",
+    "Resume this session with:",
+    "claude --resume 3167a087-ab08-4d3a-a7c6-87b568071b49",
+    "me@mac:~/code/spawn$ "
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "a numbered request in the conversation above the empty prompt",
+   "source": "the 50-column capture with a person's numbered request in the conversation: '❯ 1.' is also how a dialog marks its first choice",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ 1. fix the flaky test",
+    "  2. then push",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "Claude asks 'Do you want to proceed?' in its reply, just above the empty prompt",
+   "source": "the 50-column capture with the permission prompt's question in Claude's own reply, inside the four lines read above the box",
+   "lines": [
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "",
+    "❯ [SPAWN D] This conversation just moved from     ",
+    "  dream (Linux) to mac (macOS) and continues in   ",
+    "  ~/code/spawn. Files were not copied, so         ",
+    "  anything not pushed from dream is missing here. ",
+    "  Background tasks and dream-only MCP tools did   ",
+    "  not come along. You were in the middle of a     ",
+    "  task: check whether your last action took       ",
+    "  effect, then carry on.                          ",
+    "",
+    "● Do you want to proceed? I'd split the module.",
+    "",
+    "✻ Crunched for 0s · done 9:40 AM",
+    "                              ◐ medium · /effort",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "a reply naming --permission-mode above the empty prompt",
+   "source": "the 50-column capture with Claude's reply quoting a resume line's flag: everything above it goes unread, the input box under it still reads",
+   "lines": [
+    "",
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ SLOW please                                     ",
+    "",
+    "● slow-0 slow-1 slow-2 slow-3 slow-4 slow-5 slow-6",
+    "  slow-7 slow-8 slow-9 slow-10 slow-11 slow-12",
+    "  slow-13 slow-14 slow-15 slow-16 slow-17 slow-18",
+    "  slow-19 slow-20 slow-21 slow-22 slow-23 slow-24",
+    "  slow-25 slow-26 slow-27 slow-28 slow-29 slow-30",
+    "  slow-31 slow-32 slow-33 slow-34 slow-35 slow-36",
+    "  slow-37 slow-38 slow-39",
+    "",
+    "✻ Cogitated for 20s · done 9:40 AM",
+    "● Start it with claude --permission-mode plan to",
+    "  plan first.",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "──────────────────────────────────────────────────",
+    "❯  ",
+    "──────────────────────────────────────────────────",
+    "  ⏸ manual mode on · ? for shortcuts · ← for ag…"
+   ],
+   "expect": "agent_ready"
+  },
+  {
+   "name": "an input box drawn in the conversation above the tool-permission prompt",
+   "source": "the 50-column capture with an input box Claude drew in its reply above the question: only the bottom of the screen is read without a box there",
+   "lines": [
+    " ▐▛███▛█   Claude Code v2.1.289",
+    "▝▜██████▀  Opus 5.5 · API Usage Billing",
+    " ▝▝   ▝▝   ~/code/spawn",
+    "",
+    "",
+    "❯ TOOL please                                     ",
+    "",
+    "  Fetching a URL",
+    "  ⎿  $ curl -s http://127.0.0.1:9/s1-never",
+    "",
+    "● Here is what the prompt looks like:",
+    "  ────────────────────────────",
+    "  ❯",
+    "  ────────────────────────────",
+    "",
+    "──────────────────────────────────────────────────",
+    " Bash command",
+    " Tip: auto mode handles these prompts for you — ",
+    " choose \"switch to auto mode\" below",
+    " Fetch a URL",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " curl -s http://127.0.0.1:9/s1-never",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " This command requires approval",
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. Yes, and don’t ask again for: curl *",
+    "   3. Yes, and switch to auto mode · auto mode ",
+    "      handles these prompts for you",
+    "   4. No",
+    "",
+    " Esc to cancel · Tab to amend"
+   ],
+   "expect": "dialog"
+  },
+  {
+   "name": "an input box drawn above the Bypass Permissions warning",
+   "source": "the 50-column Bypass Permissions capture with an input box drawn above the warning: a box not at the bottom is no box",
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode bypassPermissions",
+    "● Here is what the prompt looks like:",
+    "  ────────────────────────────",
+    "  ❯",
+    "  ────────────────────────────",
+    "",
+    "",
+    "──────────────────────────────────────────────────",
+    "  WARNING: Claude Code running in Bypass",
+    "  Permissions mode",
+    "",
+    "  In Bypass Permissions mode, Claude Code will",
+    "  not ask for your approval before running",
+    "  potentially dangerous commands.",
+    "  This mode should only be used in a sandboxed",
+    "  container/VM that has restricted internet",
+    "  access and can easily be restored if damaged.",
+    "",
+    "  By proceeding, you accept all responsibility",
+    "  for actions taken while running in Bypass",
+    "  Permissions mode.",
+    "",
+    "  https://code.claude.com/docs/en/security",
+    "",
+    "  ❯ No, exit",
+    "    Yes, I accept",
+    "",
+    "  Enter to confirm · Esc to cancel"
+   ],
+   "expect": "bypass_prompt"
+  },
+  {
+   "name": "Try again: the first error above the echo of the line typed again",
+   "source": "the 50-column capture with the resume line typed again under it: what came before the newest echo is not this attempt's",
+   "lines": [
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default",
+    "No conversation found with session ID:",
+    "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 --permission-mode default"
+   ],
+   "expect": "unknown"
+  },
+  {
+   "name": "a ❯ shell prompt holding a typed command is no dialog",
+   "source": "the 50-column capture of Claude Code quitting, the shell's prompt drawn as '❯' (as pure and starship draw it) with a command typed after it",
+   "lines": [
+    "me@mac:~/code/spawn$ claude --permission-mode default",
+    "",
+    "Resume this session with:",
+    "claude --resume 3167a087-ab08-4d3a-a7c6-87b568071b49",
+    "❯ git status"
+   ],
+   "expect": "unknown"
+  }
+ ]
+}

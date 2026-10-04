@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { classifyClaudeScreen } from "@/data/selectors/claude-screen";
 import { runWorker, spctFrame } from "./worker-harness";
 
 /**
@@ -46,6 +47,7 @@ interface Harness {
   decodeBase64: jest.Mock;
   encodeBase64: jest.Mock;
   resetSessionGeneration?: () => void;
+  readScreen?: () => { lines: string[]; cols: number; alternate: boolean };
   receiveSessionCtl?: (value: unknown) => void | Promise<void>;
 }
 
@@ -202,6 +204,68 @@ function bufferLines(term: XTerm): string[] {
       worker.resetSessionGeneration?.();
       await settle();
       expect(noticePosts(worker)).toEqual([]);
+    });
+  });
+});
+
+(xtermPresent ? describe : describe.skip)("the screen as a device reads it after a move", () => {
+  test("logical lines of whichever buffer shows, a wrapped row joined to the one before", async () => {
+    const term = realTerminal(6, 20);
+    await runWorker(harness(term), async (worker) => {
+      await new Promise<void>((done) =>
+        term.write("me$ claude --resume 6f1c2a9e-0b7d\r\nNo conversation found\r\n", done),
+      );
+      expect(worker.readScreen?.()).toEqual({
+        lines: ["me$ claude --resume 6f1c2a9e-0b7d", "No conversation found", "", ""],
+        cols: 20,
+        alternate: false,
+      });
+      // Claude Code draws on the alternate screen.
+      await new Promise<void>((done) => term.write("\x1b[?1049h\x1b[H❯ ", done));
+      expect(worker.readScreen?.()).toMatchObject({
+        lines: ["❯ ", "", "", "", "", ""],
+        alternate: true,
+      });
+    });
+  });
+
+  // Host names are the server's to choose, and the note naming them rides
+  // the resume line the shell echoes back.
+  const echo =
+    "me@mac:~/code/spawn$ claude --resume 6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60 " +
+    "--permission-mode default '[SPAWN D] This conversation just moved from No conversation " +
+    "found with session ID (Linux) to Yes, I trust this folder (macOS).'";
+
+  function physicalRows(term: XTerm): string[] {
+    const buffer = term.buffer.active;
+    const rows: string[] = [];
+    for (let y = buffer.baseY; y < buffer.baseY + term.rows; y += 1) {
+      rows.push(buffer.getLine(y)?.translateToString(true) ?? "");
+    }
+    return rows;
+  }
+
+  test("a wrapped echo is one line, so the names inside it are never the screen's", async () => {
+    const term = realTerminal(10, 50);
+    await runWorker(harness(term), async (worker) => {
+      await new Promise<void>((done) => term.write(echo, done));
+      // Read row by row, the host names would pass for Claude Code's words.
+      expect(classifyClaudeScreen(physicalRows(term))).not.toBe("unknown");
+      const lines = worker.readScreen?.().lines ?? [];
+      expect(lines[0]).toBe(echo);
+      expect(classifyClaudeScreen(lines)).toBe("unknown");
+    });
+  });
+
+  test("a line that began above the screen is read from its start", async () => {
+    const term = realTerminal(4, 50);
+    await runWorker(harness(term), async (worker) => {
+      await new Promise<void>((done) => term.write(`${echo}\r\n`, done));
+      expect(term.buffer.active.baseY).toBeGreaterThan(0);
+      expect(classifyClaudeScreen(physicalRows(term))).not.toBe("unknown");
+      const lines = worker.readScreen?.().lines ?? [];
+      expect(lines[0]).toBe(echo);
+      expect(classifyClaudeScreen(lines)).toBe("unknown");
     });
   });
 });

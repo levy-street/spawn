@@ -14,14 +14,18 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
+import { useDaemonConnections } from "@/components/hosts/DaemonConnectionsProvider";
 import { Trident } from "@/components/icons/BrandMark";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
+import { agentBrandName } from "@/lib/agent-identity";
 import {
+  type Agent,
   agents as agentsApi,
   type Host,
+  hosts as hostsApi,
   type Session,
   sessions as sessionsApi,
   type Workspace,
@@ -41,6 +45,8 @@ import {
   validate,
 } from "@/lib/grid";
 import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
+import { CONVERSATION_CARRIER_CAPABILITY } from "@/lib/move/conv";
+import { freshAgentLine, needsNewerSpawnLine } from "@/lib/move/copy";
 import { recordPaneFocus } from "@/lib/pane-focus";
 import { sessionAgent, sessionTitle } from "@/lib/sessions";
 import {
@@ -56,7 +62,9 @@ import {
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { duplicateWindow } from "./create-window";
+import { MoveDialog } from "./move-dialog";
 import { moveWindow, moveWindowConfirmation, moveWindowError } from "./move-window";
+import { useMoves } from "./moves-provider";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
 import { type PaneSlotTarget, SessionPane } from "./session-pane";
@@ -1618,14 +1626,26 @@ export function WorkspaceGrid({
     [commitLayout, queryClient, sessionsById],
   );
 
-  /** Move a session pane's window to `cwd` on another host. The window itself
-   *  moves — the same row — so its tile, name, skills, mutes and alert settings
-   *  never change hands. What ran in it stops here and starts fresh there: a
-   *  shell, or the same agent in a new conversation, which this device types
-   *  into the new shell as the one that moved it, taking the display to do so.
-   *  Every other device showing the window follows it without taking control. */
-  const moveToHost = useCallback(
-    async (sessionId: string, host: Host, cwd: string) => {
+  const connections = useDaemonConnections();
+  const movesApi = useMoves();
+  const [moveDialog, setMoveDialog] = useState<{
+    session: Session;
+    agent: Agent;
+    source: Host;
+    target: Host;
+    cwd: string;
+  } | null>(null);
+
+  /** Move a session pane's window to `cwd` on another host, starting what
+   *  ran in it afresh there. The window itself moves — the same row — so its
+   *  tile, name, skills, mutes and alert settings never change hands. What
+   *  ran in it stops here and starts fresh there: a shell, or the same agent
+   *  in a new conversation, which this device types into the new shell as the
+   *  one that moved it, taking the display to do so. Every other device
+   *  showing the window follows it without taking control. `ask` is false
+   *  when the person already chose a fresh start ("Start fresh instead"). */
+  const moveFresh = useCallback(
+    async (sessionId: string, host: Host, cwd: string, ask: boolean, agentLine?: string) => {
       const session = sessionsById.get(sessionId);
       if (!session || session.host_id === host.id) return;
       // Read before asking: the confirmation says whether an agent starts over.
@@ -1635,16 +1655,19 @@ export function WorkspaceGrid({
         .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
         .catch(() => []);
       const agent = sessionAgent(session, definitions);
-      const accepted = await confirm({
-        ...moveWindowConfirmation({
-          title: sessionTitle(session),
-          hostName: host.name,
-          cwd,
-          agent: agent !== null,
-        }),
-        destructive: true,
-      });
-      if (!accepted) return;
+      if (ask) {
+        const accepted = await confirm({
+          ...moveWindowConfirmation({
+            title: sessionTitle(session),
+            hostName: host.name,
+            cwd,
+            agent: agent !== null,
+            ...(agentLine ? { agentLine } : {}),
+          }),
+          destructive: true,
+        });
+        if (!accepted) return;
+      }
       try {
         await moveWindow({ queryClient, session, host, cwd, agent });
       } catch (error) {
@@ -1657,6 +1680,63 @@ export function WorkspaceGrid({
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
     },
     [queryClient, sessionsById, setFocus],
+  );
+
+  /**
+   * A place on another host was picked for a pane. A Claude Code window
+   * whose two hosts carry conversations (`conv.v2`, on this device's own
+   * connections) opens the Move dialog: its conversation can come along. So
+   * does one whose source is offline or whose target this device cannot
+   * reach, for the dialog to say so and offer a fresh start. Every other
+   * window moves fresh, and an agent window says why its conversation stays.
+   */
+  const moveToHost = useCallback(
+    async (sessionId: string, host: Host, cwd: string) => {
+      const session = sessionsById.get(sessionId);
+      if (!session || session.host_id === host.id) return;
+      const [definitions, hostList] = await Promise.all([
+        queryClient
+          .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
+          .catch(() => []),
+        queryClient
+          .ensureQueryData({ queryKey: ["hosts"], queryFn: hostsApi.list })
+          .catch(() => []),
+      ]);
+      const agent = sessionAgent(session, definitions);
+      const source = hostList.find((item) => item.id === session.host_id) ?? null;
+      if (agent?.kind === "claude-code" && source) {
+        const snapshot = (id: string) => connections.get(id)?.getSnapshot() ?? null;
+        const sourceState = snapshot(source.id);
+        const targetState = snapshot(host.id);
+        const carries = (state: typeof sourceState) =>
+          state?.capabilities.includes(CONVERSATION_CARRIER_CAPABILITY) === true;
+        const reachable =
+          source.status === "online" &&
+          sourceState?.state === "ready" &&
+          targetState?.state === "ready";
+        if (!reachable || (carries(sourceState) && carries(targetState))) {
+          setMoveDialog({ session, agent, source, target: host, cwd });
+          return;
+        }
+        const older = [source, host].filter((item) => !carries(snapshot(item.id)));
+        await moveFresh(
+          sessionId,
+          host,
+          cwd,
+          true,
+          needsNewerSpawnLine(older.map((item) => item.name).join(" and "), host.name),
+        );
+        return;
+      }
+      await moveFresh(
+        sessionId,
+        host,
+        cwd,
+        true,
+        agent ? freshAgentLine(agentBrandName(agent), host.name) : undefined,
+      );
+    },
+    [connections, moveFresh, queryClient, sessionsById],
   );
 
   const moveMobile = useCallback(
@@ -2020,11 +2100,32 @@ export function WorkspaceGrid({
           onRemoveFromWorkspace={removeFromWorkspace}
           onConvertToFiles={(id) => void convertToFiles(id)}
           onMoveToHost={(id, host, cwd) => void moveToHost(id, host, cwd)}
+          onMoveFresh={(id, host, cwd) => void moveFresh(id, host, cwd, false)}
           workspaceId={workspace.id}
           registerHandle={registerHandle}
           onError={onError ?? (() => {})}
         />
       ))}
+      {moveDialog && (
+        <MoveDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setMoveDialog(null);
+          }}
+          session={moveDialog.session}
+          agent={moveDialog.agent}
+          source={moveDialog.source}
+          target={moveDialog.target}
+          cwd={moveDialog.cwd}
+          onStartFresh={() =>
+            void moveFresh(moveDialog.session.id, moveDialog.target, moveDialog.cwd, false)
+          }
+          onConfirmed={(move) => {
+            movesApi?.start(move);
+            setFocus(move.plan.sessionId, true);
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -6,6 +6,7 @@ import { TransfersProvider } from "@/components/files/transfers-provider";
 import { DaemonConnectionsProvider } from "@/components/hosts/DaemonConnectionsProvider";
 import { ReleaseWatcher } from "@/components/release/ReleaseWatcher";
 import { LiveTerminalProvider } from "@/components/terminal/LiveTerminalProvider";
+import { MovesProvider } from "@/components/workspace/moves-provider";
 import { useViewportInset } from "@/lib/viewport";
 import { SOCKET_UNAUTHORIZED_EVENT } from "@/lib/ws";
 
@@ -59,7 +60,9 @@ export function AppProviders({ children }: { children: ReactNode }) {
       <ReleaseWatcher />
       <DaemonConnectionsProvider>
         <TransfersProvider>
-          <LiveTerminalProvider>{children}</LiveTerminalProvider>
+          <MovesProvider>
+            <LiveTerminalProvider>{children}</LiveTerminalProvider>
+          </MovesProvider>
         </TransfersProvider>
       </DaemonConnectionsProvider>
     </QueryClientProvider>

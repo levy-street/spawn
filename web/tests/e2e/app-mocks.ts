@@ -287,9 +287,40 @@ export interface AppMockStore {
     workspacePatches: Array<{ id: string; body: JsonRecord }>;
     workspaceArchives: Array<{ id: string; restoring: boolean }>;
     agents: JsonRecord[];
+    /** Move routes the app called: begin, the carried or fresh commit, abort. */
+    moves: Array<{ kind: "begin" | "commit" | "abort"; id: string; body: JsonRecord }>;
+    /** Conversation-carrier operations each host was asked. */
+    conversations: Array<{ hostId: string; operation: string; payload: JsonRecord }>;
   };
   setWorkspaceFull(value: boolean): void;
   failNextWorkspacePatch(status?: number, detail?: string): void;
+}
+
+/**
+ * A daemon pair's conversation carrier, as D2 speaks it. The page-side mock
+ * channel runs the streams (window, acknowledgements, digest at the end);
+ * these hooks decide what each host answers. Throw `host_error:<code>` to
+ * refuse as a daemon does.
+ */
+export interface MockConversations {
+  inspect?: (hostId: string, sessionId: string) => JsonRecord;
+  probe?: (hostId: string, payload: JsonRecord) => JsonRecord;
+  /** The bundle the source exports. */
+  bundle?: string;
+  /** How the source's retire went: `stopped`, `not_running`, `lingering`. */
+  stopped?: string;
+  exportBegin?: (hostId: string, payload: JsonRecord) => void | Promise<void>;
+  importBegin?: (hostId: string, payload: JsonRecord) => void | Promise<void>;
+  /** Hold the export after this many chunks, until `releaseExport(page)`. */
+  holdAfterChunks?: number;
+  transfers?: (hostId: string) => JsonRecord;
+  importStatus?: (hostId: string, transferId: string) => JsonRecord;
+}
+
+export async function releaseExport(page: Page): Promise<void> {
+  await page.evaluate(() =>
+    (globalThis as typeof globalThis & { __spawnMoveRelease?: () => void }).__spawnMoveRelease?.(),
+  );
 }
 
 export interface AppMockOptions {
@@ -371,6 +402,21 @@ export interface AppMockOptions {
   fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
   fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
   fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+  /** The conversation carrier (`conv.v1`, `conv.v2`): see `MockConversations`. */
+  conversations?: MockConversations;
+  /**
+   * The move routes (`/move/begin`, `/move`, `/move/abort`). Without one the
+   * mock answers as the server does: begin marks the window moving, a commit
+   * rebinds it ("starting"), an abort puts it back ("running", or "killed"
+   * when `exited` was set on the row).
+   */
+  moveSession?: (
+    kind: "begin" | "commit" | "abort",
+    id: string,
+    body: JsonRecord,
+    route: Route,
+    store: AppMockStore,
+  ) => Promise<boolean> | boolean;
   extraBrowserDevices?: Array<Record<string, unknown>>;
   hostPins?: Record<string, string[]>;
   endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
@@ -425,6 +471,8 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       workspacePatches: [],
       workspaceArchives: [],
       agents: [],
+      moves: [],
+      conversations: [],
     },
     setWorkspaceFull(value) {
       workspaceFull = value;
@@ -481,6 +529,129 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         (item) => item.id === hostId,
       );
       const homeDir = selected?.home_dir ?? "/Users/tester";
+      const conversation = options.conversations;
+      if (operation.startsWith("conv.") || operation === "agent.transcripts") {
+        // The page's mock channel runs a stream's frames itself and asks here
+        // for its declaration and its commit: logged as the operation the app sent.
+        const sent =
+          operation === "conv.export.declare"
+            ? "conv.export"
+            : operation === "conv.import.declare"
+              ? "conv.import.begin"
+              : operation === "conv.import.commit"
+                ? "conv.import.end"
+                : operation;
+        store.requests.conversations.push({ hostId, operation: sent, payload });
+      }
+      const bundle = Buffer.from(conversation?.bundle ?? "x".repeat(100));
+      if (operation === "conv.inspect") {
+        return (
+          conversation?.inspect?.(hostId, String(payload.session_id)) ?? {
+            agent: "claude-code",
+            conversation_id: null,
+            state: "unknown",
+            cli_version: null,
+            live_elsewhere: false,
+            source: "none",
+          }
+        );
+      }
+      if (operation === "agent.transcripts") {
+        return {
+          agent_kind: String(payload.agent_kind ?? "claude-code"),
+          supported: true,
+          transcripts: payload.conversation_id
+            ? [
+                {
+                  path: `${homeDir}/.claude/projects/x/${String(payload.conversation_id)}.jsonl`,
+                  name: `${String(payload.conversation_id)}.jsonl`,
+                  size: bundle.length,
+                  role: "conversation",
+                  conversation_id: payload.conversation_id,
+                },
+              ]
+            : [],
+          searched: [],
+          truncated: false,
+        };
+      }
+      if (operation === "conv.probe") {
+        return (
+          conversation?.probe?.(hostId, payload) ?? {
+            agent: "claude-code",
+            home: homeDir,
+            cwd: payload.cwd,
+            folder_exists: true,
+            project_folder: "-x",
+            store: "~/.claude",
+            store_ready: true,
+            store_problem: null,
+            destination: "~/.claude/projects/-x",
+            memory: "~/.claude/projects/-x/memory",
+            repository_root: null,
+            duplicates: [],
+            duplicates_truncated: false,
+            live: payload.conversation_id ? false : null,
+            login_shell: "/bin/zsh",
+            cli_version: "2.1.289",
+          }
+        );
+      }
+      if (operation === "conv.export.declare") {
+        await conversation?.exportBegin?.(hostId, payload);
+        return {
+          length: bundle.length,
+          end_sha256: createHash("sha256").update(bundle).digest("hex"),
+          bytes_b64: bundle.toString("base64"),
+          stopped: conversation?.stopped ?? "stopped",
+          hold_after: conversation?.holdAfterChunks ?? null,
+        };
+      }
+      if (operation === "conv.import.declare") {
+        await conversation?.importBegin?.(hostId, payload);
+        return {};
+      }
+      if (operation === "conv.import.commit") {
+        const bytes = Buffer.from(String(payload.bytes_b64 ?? ""), "base64");
+        if (
+          bytes.length !== Number(payload.length) ||
+          createHash("sha256").update(bytes).digest("hex") !== payload.sha256
+        ) {
+          throw new Error("host_error:integrity_mismatch");
+        }
+        return {
+          transfer_id: payload.transfer_id,
+          conversation_id: payload.conversation_id,
+          cwd: payload.cwd,
+          project_folder: "-x",
+          path: "~/.claude/projects/-x/x.jsonl",
+          memory: "~/.claude/projects/-x/memory",
+          set_aside: 0,
+        };
+      }
+      if (operation === "conv.transfers") {
+        return (
+          conversation?.transfers?.(hostId) ?? { outgoing: [], incoming: [], truncated: false }
+        );
+      }
+      if (operation === "conv.import.status") {
+        return (
+          conversation?.importStatus?.(hostId, String(payload.transfer_id)) ?? {
+            state: "absent",
+            received: 0,
+            next_sequence: 0,
+          }
+        );
+      }
+      if (operation === "conv.import.cancel") {
+        return { state: "cancelled", received: 0, next_sequence: 0 };
+      }
+      if (operation === "conv.retire.commit") {
+        return { state: "retired", retired_at: 1, kept_until: 2 };
+      }
+      if (operation === "conv.retire.abort") {
+        return { state: "aborted", restored: 1 };
+      }
       if (operation === "fs.home") return { home_dir: homeDir };
       if (operation === "fs.list") {
         return (
@@ -681,6 +852,23 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           string,
           { declaration: Record<string, unknown>; chunks: string[] }
         >();
+        /** Stream v2 reads (`conv.export`): a window the device acknowledges into. */
+        private readonly reads = new Map<
+          string,
+          {
+            chunks: string[];
+            next: number;
+            acked: number;
+            sha256: string;
+            length: number;
+            holdAfter: number | null;
+          }
+        >();
+        /** Stream v2 writes (`conv.import.begin`): acknowledged as they land. */
+        private readonly imports = new Map<
+          string,
+          { declaration: Record<string, unknown>; chunks: string[] }
+        >();
 
         constructor(
           private readonly getHostId: () => string,
@@ -697,6 +885,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
             type: "hello",
             protocol: "spawn.host.ctl",
             capabilities,
+            limits: { chunk_bytes: 8192, stream_window_max: 16 },
           });
         }
 
@@ -718,6 +907,34 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           );
         }
 
+        /** Send what a v2 read's window allows, then its end with the digest. */
+        private pump(streamId: string) {
+          const read = this.reads.get(streamId);
+          if (!read) return;
+          while (read.next < read.chunks.length && read.next < read.acked + 16) {
+            if (read.holdAfter !== null && read.next >= read.holdAfter) return;
+            const sequence = read.next;
+            read.next += 1;
+            this.emit({
+              version: 1,
+              type: "stream.chunk",
+              stream_id: streamId,
+              sequence,
+              bytes_b64: read.chunks[sequence],
+            });
+          }
+          if (read.next >= read.chunks.length) {
+            this.reads.delete(streamId);
+            this.emit({
+              version: 1,
+              type: "stream.end",
+              stream_id: streamId,
+              length: read.length,
+              sha256: read.sha256,
+            });
+          }
+        }
+
         private async handle(frame: Record<string, unknown>) {
           const type = frame.type;
           if (type === "request") {
@@ -732,6 +949,78 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
                 ok: true,
                 result: { pong: true },
               });
+              return;
+            }
+            if (operation === "conv.export" || operation === "conv.import.begin") {
+              let declared: Record<string, unknown>;
+              try {
+                declared = await invoke()(
+                  this.getHostId(),
+                  operation === "conv.export" ? "conv.export.declare" : "conv.import.declare",
+                  payload,
+                );
+              } catch (error) {
+                const code = /host_error:([a-z_]+)/.exec(String(error))?.[1] ?? "mock_failed";
+                this.emit({
+                  version: 1,
+                  type: "response",
+                  request_id: requestId,
+                  ok: false,
+                  error: { code, detail: String(error) },
+                });
+                return;
+              }
+              const streamId = crypto.randomUUID();
+              if (operation === "conv.import.begin") {
+                this.imports.set(streamId, { declaration: payload, chunks: [] });
+                this.emit({
+                  version: 1,
+                  type: "response",
+                  request_id: requestId,
+                  ok: true,
+                  result: { stream_id: streamId, window: 16, next_sequence: 0, received: 0 },
+                });
+                return;
+              }
+              const binary = atob(String(declared.bytes_b64 ?? ""));
+              const chunks: string[] = [];
+              for (let offset = 0; offset < binary.length; offset += 8192)
+                chunks.push(btoa(binary.slice(offset, offset + 8192)));
+              const read = {
+                chunks,
+                next: 0,
+                acked: 0,
+                sha256: String(declared.end_sha256),
+                length: Number(declared.length),
+                holdAfter: typeof declared.hold_after === "number" ? declared.hold_after : null,
+              };
+              this.reads.set(streamId, read);
+              this.emit({
+                version: 1,
+                type: "response",
+                request_id: requestId,
+                ok: true,
+                result: {
+                  stream_id: streamId,
+                  transfer_id: payload.transfer_id,
+                  mode: "retire",
+                  length: read.length,
+                  sha256: null,
+                  window: 16,
+                  next_sequence: 0,
+                  entries: 1,
+                  skipped: 0,
+                  stopped: declared.stopped,
+                },
+              });
+              const release = () => {
+                read.holdAfter = null;
+                this.pump(streamId);
+              };
+              (
+                globalThis as typeof globalThis & { __spawnMoveRelease?: () => void }
+              ).__spawnMoveRelease = release;
+              this.pump(streamId);
               return;
             }
             if (operation === "fs.write.begin") {
@@ -818,6 +1107,60 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
             return;
           }
           const streamId = String(frame.stream_id ?? "");
+          if (type === "stream.ack" && this.reads.has(streamId)) {
+            const read = this.reads.get(streamId);
+            if (read) read.acked = Number(frame.sequence);
+            this.pump(streamId);
+            return;
+          }
+          const imported = this.imports.get(streamId);
+          if (imported && type === "stream.chunk") {
+            imported.chunks.push(String(frame.bytes_b64 ?? ""));
+            this.emit({
+              version: 1,
+              type: "stream.ack",
+              stream_id: streamId,
+              sequence: imported.chunks.length,
+            });
+            return;
+          }
+          if (imported && type === "stream.end") {
+            this.imports.delete(streamId);
+            const bytes = imported.chunks.map((chunk) => atob(chunk)).join("");
+            try {
+              const result = await invoke()(this.getHostId(), "conv.import.commit", {
+                ...imported.declaration,
+                bytes_b64: btoa(bytes),
+                length: frame.length,
+                sha256: frame.sha256,
+              });
+              this.emit({
+                version: 1,
+                type: "stream.committed",
+                stream_id: streamId,
+                length: frame.length,
+                sha256: frame.sha256,
+                result,
+              });
+            } catch (error) {
+              const code = /host_error:([a-z_]+)/.exec(String(error))?.[1] ?? "mock_failed";
+              this.emit({
+                version: 1,
+                type: "stream.error",
+                stream_id: streamId,
+                error: { code, detail: String(error) },
+              });
+            }
+            return;
+          }
+          if (
+            type === "stream.cancel" &&
+            (this.reads.has(streamId) || this.imports.has(streamId))
+          ) {
+            this.reads.delete(streamId);
+            this.imports.delete(streamId);
+            return;
+          }
           if (type === "stream.chunk") {
             this.writes.get(streamId)?.chunks.push(String(frame.bytes_b64 ?? ""));
             return;
@@ -1624,6 +1967,75 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         session_id: accessMatch[1],
         skills: ids.length ? store.skills.filter((item) => ids.includes(String(item.id))) : [],
       });
+      return;
+    }
+    const moveMatch = path.match(/^\/api\/sessions\/([^/]+)\/move(\/begin|\/abort)?$/);
+    if (moveMatch && method === "POST") {
+      const id = moveMatch[1];
+      const kind =
+        moveMatch[2] === "/begin" ? "begin" : moveMatch[2] === "/abort" ? "abort" : "commit";
+      const body = await readBody();
+      store.requests.moves.push({ kind, id, body });
+      if (options.moveSession && (await options.moveSession(kind, id, body, route, store))) return;
+      const selected = findById(store.sessions, id);
+      if (!selected) {
+        await json(route, { detail: "session not found" }, 404);
+        return;
+      }
+      if (selected.host_id !== body.expected_host_id) {
+        await json(route, { detail: "move_conflict" }, 409);
+        return;
+      }
+      if (kind === "begin") {
+        if (selected.status === "moving") {
+          await json(route, { detail: "move_in_progress" }, 409);
+          return;
+        }
+        const hostRow = store.hosts.find((item) => item.id === selected.host_id);
+        if (hostRow?.status !== "online") {
+          await json(route, { detail: "source_offline" }, 409);
+          return;
+        }
+        Object.assign(selected, {
+          status: "moving",
+          activity_state: "moving",
+          activity_label: "Moving",
+        });
+        await json(route, selected);
+        return;
+      }
+      if (kind === "abort") {
+        if (selected.status !== "moving") {
+          await json(route, { detail: "move_conflict" }, 409);
+          return;
+        }
+        Object.assign(selected, {
+          status: selected.exited_at ? "killed" : "running",
+          activity_state: selected.exited_at ? "killed" : "quiet",
+          activity_label: selected.exited_at ? "Killed" : "Quiet",
+        });
+        await json(route, selected);
+        return;
+      }
+      if (body.carried === true && selected.status !== "moving") {
+        await json(route, { detail: "move_conflict" }, 409);
+        return;
+      }
+      const target = store.hosts.find((item) => item.id === body.host_id);
+      Object.assign(selected, {
+        host_id: body.host_id,
+        host_name: target?.name ?? null,
+        cwd: body.cwd,
+        status: "starting",
+        activity_state: "starting",
+        activity_label: "Starting",
+        exited_at: null,
+        exit_code: null,
+        foreground_command: null,
+        agent_session_id: body.agent_session_id ?? null,
+        ...(typeof body.agent_id === "string" ? { agent_id: body.agent_id } : {}),
+      });
+      await json(route, selected);
       return;
     }
     const restartMatch = path.match(/^\/api\/sessions\/([^/]+)\/restart$/);

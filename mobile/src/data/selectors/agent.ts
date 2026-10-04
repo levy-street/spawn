@@ -103,6 +103,19 @@ function brandFor(value: string | null | undefined): Brand | null {
   return BRANDS.find(({ needle }) => normalized.includes(needle))?.brand ?? null;
 }
 
+/**
+ * An agent as people read its name: the brand's ("Claude Code", "Codex")
+ * for the agents SPAWN D knows, else the custom definition's own name —
+ * never a built-in definition's slug ("claude-code").
+ */
+export function agentDisplayName(agent: Pick<AgentDef, "kind" | "command" | "name">): string {
+  return (
+    brandFor(agent.kind)?.displayName ??
+    brandFor(commandBasename(agent.command))?.displayName ??
+    (agent.name.trim() || agent.kind)
+  );
+}
+
 export function identifyAgent(
   foregroundCommand: string | null,
   agents: readonly AgentDef[],

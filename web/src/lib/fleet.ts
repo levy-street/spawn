@@ -59,8 +59,9 @@ export interface FleetSummary {
   rows: FleetHostRow[];
 }
 
+/** Running here now: not over, and not on its way to another host. */
 function isLive(session: Session): boolean {
-  return session.status !== "exited" && session.status !== "killed";
+  return session.status !== "exited" && session.status !== "killed" && session.status !== "moving";
 }
 
 /**

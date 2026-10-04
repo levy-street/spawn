@@ -985,6 +985,16 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
           text: documentSelection() || (state.term?.getSelection() ?? ""),
         });
         return true;
+      case "read-screen":
+        // The live screen as logical lines, for the device's own reading of
+        // where an agent is after a move (claude-screen.ts). Only on request,
+        // and only from the document that draws it: nothing leaves the device.
+        api.post({
+          type: "screen",
+          requestId: message.requestId,
+          ...(api.readScreen?.() ?? { lines: [], cols: 0, alternate: false }),
+        });
+        return true;
       case "focus":
         api.focusDisplayView?.();
         refocusTerminal();
@@ -1388,6 +1398,30 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     }
     reportAgentNotice(null);
   }
+
+  /** The rows on screen — whichever buffer is showing, since Claude Code
+   *  draws on the alternate one — with a row the terminal wrapped joined to
+   *  the one before it, and a line that began above the first visible row
+   *  read from its start: the echo of a long resume line scrolled half out
+   *  of view still carries its marker, so the host names inside it are never
+   *  read as the screen's. Asked for by the device only (claude-screen.ts);
+   *  the browser reads its screen the same way (readScreenLines). */
+  api.readScreen = () => {
+    const term = state.term;
+    if (!term) return { lines: [], cols: 0, alternate: false };
+    const buffer = term.buffer.active;
+    const lines = [];
+    const end = buffer.baseY + term.rows;
+    let start = buffer.baseY;
+    while (start > 0 && buffer.getLine(start)?.isWrapped) start -= 1;
+    for (let y = start; y < end; y += 1) {
+      const line = buffer.getLine(y);
+      const text = line?.translateToString(true) ?? "";
+      if (line?.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
+      else lines.push(text);
+    }
+    return { lines, cols: term.cols, alternate: buffer === term.buffer.alternate };
+  };
 
   function scheduleAgentNoticeScan() {
     if (agentNoticeTimer !== null) return;
@@ -2120,18 +2154,25 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       return text;
     }
 
-    function sendFrame(frame) {
+    function sendFrame(frame, bulk) {
       if (!state.ctl || state.ctl.readyState !== "open") {
         throw new Error("Host-control channel is not ready.");
       }
-      return state.ctl.send(encodeFrame(frame));
+      // A stream's chunks and end are bulk: a tool channel paces them in its
+      // connection's bulk gate. An RTCDataChannel ignores the flag.
+      return state.ctl.send(encodeFrame(frame), bulk === true);
     }
+
+    // A tool channel's bulk frames wait here per channel, then in its
+    // connection's one bulk gate (worker-host-consumers.js); a channel may
+    // hold up to the gate's watermark, so one stream alone can fill it.
+    const highWater = api.bulkHighWater || BUFFERED_HIGH_WATER;
 
     async function waitForWritable() {
       const channel = state.ctl;
       if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
-      if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
-      channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
+      if (channel.bufferedAmount <= highWater) return;
+      channel.bufferedAmountLowThreshold = highWater / 2;
       await new Promise((resolve, reject) => {
         const cleanup = () => {
           clearTimeout(timer);
@@ -2143,7 +2184,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
           reject(new Error("Host stream backpressure timed out."));
         }, STREAM_TIMEOUT_MS);
         const onWritable = () => {
-          if (channel.bufferedAmount > BUFFERED_HIGH_WATER) return;
+          if (channel.bufferedAmount > highWater) return;
           cleanup();
           resolve();
         };
@@ -2213,8 +2254,9 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
           if (!["ack", "cancel", "chunk", "end"].includes(type)) {
             throw new Error("Unknown host stream command.");
           }
-          if (type === "chunk" || type === "end") await waitForWritable();
-          await sendFrame(streamFrame(type, message.payload));
+          const bulk = type === "chunk" || type === "end";
+          if (bulk) await waitForWritable();
+          await sendFrame(streamFrame(type, message.payload), bulk);
           postResponse(message.requestId, true, { sent: true });
           return;
         }
@@ -2301,6 +2343,19 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   const api = globalThis.spawnWorker;
   const consumers = new Map();
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  // One bulk gate per connection (proto/README.md, "Bulk pacing"): a bulk
+  // frame — a stream's chunk or end — goes out only while the bytes buffered
+  // on every tool channel that has carried bulk sum to at most 64 KiB, so
+  // however many streams run, terminal channels keep room in the
+  // association's 128 KiB queue (spike S4).
+  const BULK_WATERMARK = 64 * 1024;
+  const CONTROL_HIGH_WATER = 32 * 1024;
+
+  function bulkBuffered() {
+    let total = 0;
+    for (const entry of consumers.values()) if (entry.bulk) total += entry.dc.bufferedAmount;
+    return total;
+  }
 
   function post(id, message) {
     const entry = consumers.get(id);
@@ -2355,9 +2410,16 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     }
     // A bounded queue and native buffer for this consumer. Service one frame
     // per turn so bulk work yields to terminal channels and sibling tools.
-    if (entry.queue.length && entry.dc.bufferedAmount <= 32 * 1024) {
+    const head = entry.queue[0];
+    const room = head
+      ? head.bulk
+        ? bulkBuffered() + (entry.bulk ? 0 : entry.dc.bufferedAmount) <= BULK_WATERMARK
+        : entry.dc.bufferedAmount <= CONTROL_HIGH_WATER
+      : false;
+    if (room) {
       const item = entry.queue.shift();
       entry.queued -= item.bytes;
+      if (item.bulk) entry.bulk = true;
       try {
         entry.dc.send(item.text);
         item.resolve();
@@ -2412,6 +2474,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       onBuffered: null,
       opened: false,
       hello: false,
+      bulk: false,
     };
     const channel = new EventTarget();
     Object.defineProperties(channel, {
@@ -2424,7 +2487,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
         },
       },
     });
-    channel.send = (text) =>
+    channel.send = (text, bulk) =>
       new Promise((resolve, reject) => {
         const bytes = new TextEncoder().encode(text).byteLength;
         if (
@@ -2436,13 +2499,14 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
           reject(new Error("Host consumer send queue is unavailable."));
           return;
         }
-        entry.queue.push({ text, bytes, resolve, reject });
+        entry.queue.push({ text, bytes, bulk: bulk === true, resolve, reject });
         entry.queued += bytes;
         if (entry.timer === null) entry.timer = setTimeout(() => drain(id), 0);
       });
     entry.channel = channel;
     const protocol = {
       state: { ctl: channel },
+      bulkHighWater: BULK_WATERMARK,
       decodeBase64: api.decodeBase64,
       post: (message) => {
         if (consumers.get(id) !== entry) return;

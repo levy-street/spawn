@@ -137,11 +137,20 @@ describe("parsing what a newer server sends", () => {
   });
 
   test("an unknown session status reads as starting instead of failing the list", () => {
-    const list = SessionSchema.array().parse([session("running"), session("moving", "moving")]);
+    const list = SessionSchema.array().parse([
+      session("running"),
+      session("migrating", "migrating"),
+    ]);
     expect(list.map((item) => item.status)).toEqual(["running", "starting"]);
     expect(list[1]?.activity_state).toBe("unknown");
     for (const status of SESSION_STATUSES)
       expect(SessionSchema.parse(session(status)).status).toBe(status);
+  });
+
+  test("a window being moved reads as moving, status and activity both", () => {
+    const moving = SessionSchema.parse(session("moving", "moving"));
+    expect(moving.status).toBe("moving");
+    expect(moving.activity_state).toBe("moving");
   });
 
   test("a session status that is not text is still refused", () => {

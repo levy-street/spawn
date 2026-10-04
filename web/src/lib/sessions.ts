@@ -74,7 +74,19 @@ export function sessionActivityDetail(session: Session): string {
   return age ? `${label} · ${age}` : label;
 }
 
+/**
+ * A device is carrying the window's conversation to another host. Nothing
+ * runs in it meanwhile: its exit is not "Shell exited", it is neither live,
+ * waiting nor dead for attention — lists draw it with the neutral tone and
+ * the server's label, "Moving", as the phone does — no terminal attaches to
+ * the host it is leaving, and the only thing to do with it is Resolve.
+ */
+export function sessionMoving(session: Pick<Session, "status">): boolean {
+  return session.status === "moving";
+}
+
 export function sessionActivityTone(session: Session): SessionActivityTone {
+  if (sessionMoving(session)) return "idle";
   switch (session.activity_state) {
     case "active":
       return "active";
@@ -106,6 +118,7 @@ export function relativeTime(value: string | null | undefined): string | null {
 
 /** Attention states a multi-pane workspace should surface at a glance. */
 export function sessionNeedsAttention(session: Session): "waiting" | "dead" | null {
+  if (sessionMoving(session)) return null;
   if (session.status === "exited" || session.status === "killed") return "dead";
   if (session.activity_state === "waiting") return "waiting";
   return null;

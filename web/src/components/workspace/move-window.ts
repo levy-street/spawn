@@ -1,6 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { incarnationKey, openIntent } from "@/components/terminal/incarnation";
 import { type Agent, ApiError, type Host, type Session, sessions } from "@/lib/api";
+import { failureCopy } from "@/lib/move/copy";
 import { displayPath } from "@/lib/places";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { pendingLaunch } from "./pending-launch";
@@ -20,14 +21,20 @@ export function moveWindowConfirmation({
   hostName,
   cwd,
   agent,
+  agentLine,
 }: {
   title: string;
   hostName: string;
   cwd: string;
   /** Whether the window runs an agent, which starts a new conversation. */
   agent: boolean;
+  /** Why that agent's conversation stays behind, in its own words
+   *  (`lib/move/copy.ts`: `freshAgentLine`, `needsNewerSpawnLine`). */
+  agentLine?: string;
 }): { title: string; body: string; confirmLabel: string } {
-  const after = agent ? "Its agent starts a new conversation there." : "A new shell starts there.";
+  const after =
+    agentLine ??
+    (agent ? "Its agent starts a new conversation there." : "A new shell starts there.");
   return {
     title: `Move ${title} to ${hostName}?`,
     body: `The window moves to ${displayPath(cwd)} on ${hostName}, and what runs in it here stops. ${after}`,
@@ -45,6 +52,10 @@ export function moveWindowError(error: unknown, hostName: string): string {
     return `${hostName} is offline, so the window stayed where it was.`;
   }
   if (code === "same_host") return `This window already runs on ${hostName}.`;
+  // A fresh move is refused while the window moves, and in an archived
+  // workspace: said in words, as the phone says them, never as the code.
+  if (code === "move_in_progress" || code === "workspace_archived")
+    return failureCopy(code, { source: "", target: hostName, cwd: "" }).message;
   return error instanceof Error ? error.message : String(error);
 }
 

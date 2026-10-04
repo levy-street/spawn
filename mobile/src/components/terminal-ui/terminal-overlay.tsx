@@ -41,10 +41,12 @@ import {
 import { TerminalNotice } from "@/components/terminal-ui/terminal-notice";
 import { TranscriptsSheet } from "@/components/terminal-ui/transcripts-sheet";
 import { UploadProgressBar } from "@/components/terminal-ui/upload-progress-bar";
+import { useMoveArrival } from "@/components/terminal-ui/use-move-arrival";
 import { useTerminalTransfers } from "@/components/terminal-ui/use-terminal-transfers";
 import { DeviceApprovalOverlay } from "@/components/trust/device-approval-overlay";
 import { Confirm } from "@/components/ui/confirm";
 import { Text } from "@/components/ui/text";
+import * as moveCopy from "@/components/workspace-detail/move-copy";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import {
@@ -91,6 +93,9 @@ export interface TerminalOverlayProps {
   agents?: readonly AgentDef[];
   /** Reports its own outcome and must not reject: the window is already gone. */
   onKill: () => Promise<void>;
+  /** This screen showed the window moving and now follows it: a reconnect,
+   *  which never takes control (the device that moved it does). */
+  reconnect?: boolean;
 }
 
 function safeTerminalLink(url: string): boolean {
@@ -132,6 +137,7 @@ export function TerminalOverlay({
   restartDetail,
   agents = [],
   onKill,
+  reconnect = false,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
@@ -229,7 +235,7 @@ export function TerminalOverlay({
   // the window moved to while this screen was open is a reconnect and owes
   // nothing; a restart from here is an opening again (`reopen`). The browser
   // keeps the same rule: its terminal's owed claim outlives reconnects.
-  const [incarnation, setIncarnation] = useState({ hostId: host.id, claimOwed: true });
+  const [incarnation, setIncarnation] = useState({ hostId: host.id, claimOwed: !reconnect });
   if (incarnation.hostId !== host.id) {
     setIncarnation({ hostId: host.id, claimOwed: false });
     setDisplay(null);
@@ -292,6 +298,16 @@ export function TerminalOverlay({
     onFocusTerminal: () => surfaceRef.current?.focus(),
   });
 
+  // After a move: the note this device owes the agent, typed only at its
+  // ready prompt, and the banners for whatever Claude Code asks first.
+  const arrival = useMoveArrival({
+    sessionId: session.id,
+    hostId: incarnation.hostId,
+    surface: () => surfaceRef.current,
+    onNotice: transfers.setNotice,
+  });
+  const beginArrival = arrival.begin;
+
   const handleTransport = useCallback(
     (transport: SessionTransport): void => {
       scrollUnsubscribeRef.current?.();
@@ -308,12 +324,13 @@ export function TerminalOverlay({
             updateFollow({ type: "input-sent" });
             armLaunchFocus();
           }
+          if (result.status === "sent" || result.status === "missing") void beginArrival();
           const notice = pendingLaunchNotice(result);
           if (notice) transfers.setNotice(notice);
         },
       });
     },
-    [armLaunchFocus, session.status, transfers.setNotice, updateFollow],
+    [armLaunchFocus, beginArrival, session.status, transfers.setNotice, updateFollow],
   );
 
   const handleConnectionState = (next: TransportState): void => {
@@ -620,9 +637,25 @@ export function TerminalOverlay({
             visible={selectionVisible}
           />
         </View>
-        {agentNotice === "update_installed" &&
-        session.status === "running" &&
-        !isShellCommand(session.foreground_command) ? (
+        {arrival.state?.guard ? (
+          <TerminalNotice
+            action={{ label: moveCopy.ARRIVAL_USE_TERMINAL, onPress: arrival.takeOver }}
+            message={moveCopy.MOVE_RESUMING}
+          />
+        ) : arrival.state?.banner ? (
+          <TerminalNotice
+            action={
+              arrival.state.banner.kind === "not_found"
+                ? { label: moveCopy.MOVE_TRY_AGAIN, onPress: arrival.retry }
+                : arrival.state.banner.kind === "note_failed"
+                  ? { label: moveCopy.ARRIVAL_COPY_NOTE, onPress: () => void arrival.copyNote() }
+                  : null
+            }
+            message={arrival.state.banner.message}
+          />
+        ) : agentNotice === "update_installed" &&
+          session.status === "running" &&
+          !isShellCommand(session.foreground_command) ? (
           <TerminalNotice
             action={{
               label: restarting ? "Restarting…" : `Restart ${updatedAgentName}`,
@@ -637,7 +670,7 @@ export function TerminalOverlay({
       </View>
       <TerminalAccessoryBar
         commands={pinnedCommands}
-        disabled={connectionState !== "ready" || !hostKey}
+        disabled={connectionState !== "ready" || !hostKey || arrival.state?.guard === true}
         onAttach={() => setAttachVisible(true)}
         onCommand={runCommand}
         onDismissKeyboard={() => surfaceRef.current?.blur()}

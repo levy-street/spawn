@@ -48,10 +48,10 @@ describe("what each host last advertised", () => {
     expect(result.current).toBeNull();
   });
 
-  test("a hello alone lights nothing this build has no view for", async () => {
+  test("a hello lights only what this build has a view for", async () => {
     recordHostCapabilities("host-1", ["screen.v1", "conv.v2", "agent.accounts.v1", "box.v1"]);
     const { result } = await renderHook(() => useHostOffers("host-1"));
-    expect(result.current.slots).toEqual([]);
+    expect(result.current.slots.map((slot) => slot.id)).toEqual(["moves"]);
     expect(result.current.has("desktop")).toBe(false);
   });
 

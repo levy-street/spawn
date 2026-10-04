@@ -247,6 +247,30 @@
     reportAgentNotice(null);
   }
 
+  /** The rows on screen — whichever buffer is showing, since Claude Code
+   *  draws on the alternate one — with a row the terminal wrapped joined to
+   *  the one before it, and a line that began above the first visible row
+   *  read from its start: the echo of a long resume line scrolled half out
+   *  of view still carries its marker, so the host names inside it are never
+   *  read as the screen's. Asked for by the device only (claude-screen.ts);
+   *  the browser reads its screen the same way (readScreenLines). */
+  api.readScreen = () => {
+    const term = state.term;
+    if (!term) return { lines: [], cols: 0, alternate: false };
+    const buffer = term.buffer.active;
+    const lines = [];
+    const end = buffer.baseY + term.rows;
+    let start = buffer.baseY;
+    while (start > 0 && buffer.getLine(start)?.isWrapped) start -= 1;
+    for (let y = start; y < end; y += 1) {
+      const line = buffer.getLine(y);
+      const text = line?.translateToString(true) ?? "";
+      if (line?.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
+      else lines.push(text);
+    }
+    return { lines, cols: term.cols, alternate: buffer === term.buffer.alternate };
+  };
+
   function scheduleAgentNoticeScan() {
     if (agentNoticeTimer !== null) return;
     agentNoticeTimer = setTimeout(() => {

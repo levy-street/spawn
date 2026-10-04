@@ -28,7 +28,10 @@ export type { WorkspaceIconSource };
 /** The domain layout retains future fields that strict wire schemas cannot describe yet. */
 export type Workspace = Omit<WorkspaceOut, "layout"> & { layout: WorkspaceLayoutV3 };
 
-export type KnownProcessStatus = "starting" | "running" | "exited" | "killed";
+/** "moving": a device is carrying the window's conversation to another host
+ *  (`/move/begin`); neither live, waiting nor dead until it lands or is put
+ *  back. */
+export type KnownProcessStatus = "starting" | "running" | "exited" | "killed" | "moving";
 export type KnownActivityState =
   | "starting"
   | "active"
@@ -37,6 +40,7 @@ export type KnownActivityState =
   | "input_sent"
   | "exited"
   | "killed"
+  | "moving"
   | "unknown";
 export type ActivityTone = "active" | "waiting" | "idle" | "offline";
 export type Attention = "waiting" | "dead" | null;

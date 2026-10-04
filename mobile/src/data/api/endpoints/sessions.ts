@@ -5,6 +5,7 @@ import {
   type SessionCreate,
   SessionCreateSchema,
   type SessionMove,
+  SessionMoveFenceSchema,
   SessionMoveSchema,
   type SessionOut,
   SessionOutSchema,
@@ -55,6 +56,33 @@ export function moveSession(sessionId: string, body: SessionMove): Promise<Sessi
   return api(`/api/sessions/${pathPart(sessionId)}/move`, {
     method: "POST",
     body: jsonBody(SessionMoveSchema.parse(body)),
+    schema: SessionOutSchema,
+  });
+}
+
+/**
+ * Mark a window as moving: this device is about to carry its conversation to
+ * another host. Lifecycle metadata only — no host hears of it, and the server
+ * is not told where the window goes until the commit (`moveSession` with
+ * `carried`). Refused with `move_in_progress`, `move_conflict`,
+ * `source_offline` or `workspace_archived`.
+ */
+export function beginSessionMove(sessionId: string, expectedHostId: string): Promise<SessionOut> {
+  return api(`/api/sessions/${pathPart(sessionId)}/move/begin`, {
+    method: "POST",
+    body: jsonBody(SessionMoveFenceSchema.parse({ expected_host_id: expectedHostId })),
+    schema: SessionOutSchema,
+  });
+}
+
+/**
+ * End a carried move that will not commit: "running" when nothing stopped
+ * the window, "killed" when an exit was recorded (restart it there).
+ */
+export function abortSessionMove(sessionId: string, expectedHostId: string): Promise<SessionOut> {
+  return api(`/api/sessions/${pathPart(sessionId)}/move/abort`, {
+    method: "POST",
+    body: jsonBody(SessionMoveFenceSchema.parse({ expected_host_id: expectedHostId })),
     schema: SessionOutSchema,
   });
 }

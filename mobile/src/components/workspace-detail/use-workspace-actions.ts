@@ -4,13 +4,13 @@ import { useCallback } from "react";
 import { restartSessionAgent } from "@/components/launcher/agent-restart";
 import { createWindow } from "@/components/launcher/create-window";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
-import { moveWindowError } from "@/components/workspace-detail/move-window";
+import { createMoveDeps } from "@/components/workspace-detail/move-channels";
+import { moveWindowFresh } from "@/components/workspace-detail/move-window";
 
 import {
   createSession,
   deleteSession,
   getSessionAccess,
-  moveSession,
   patchSession,
   restartSession,
 } from "@/data/api/endpoints/sessions";
@@ -33,7 +33,7 @@ import {
   useWorkspaceReorder,
 } from "@/data/queries/workspace-detail";
 import { qk } from "@/data/queryKeys";
-import { agentLaunchCommand, newAgentConversationId, sessionAgent } from "@/data/selectors/agent";
+import { sessionAgent } from "@/data/selectors/agent";
 import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import type { PaneId, TabId, Tile, WorkspaceLayoutV3 } from "@/data/types/layout";
 
@@ -163,59 +163,8 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
      * window over there — into that host's shell only. Nothing changes if the server refuses: a host gone
      * offline, or a move from another device that landed first.
      */
-    movePaneToHost: async (
-      session: Session,
-      host: Host,
-      cwd: string,
-      agents: readonly AgentDef[],
-    ): Promise<Session> => {
-      const agent = sessionAgent(session, agents);
-      const conversation = agent ? newAgentConversationId(agent.kind, randomUUID) : null;
-      // A read already in flight left the server before the move. Landing
-      // after it, it would put the window back on the host it left.
-      await Promise.all([
-        client.cancelQueries({ queryKey: qk.sessions() }),
-        client.cancelQueries({ queryKey: qk.session(session.id), exact: true }),
-      ]);
-      let moved: Session;
-      try {
-        moved = await moveSession(session.id, {
-          host_id: host.id,
-          cwd,
-          expected_host_id: session.host_id,
-          // The agent it starts over there is what the window is, even when
-          // nothing recorded it: someone typed `claude` into a shell.
-          ...(agent ? { agent_id: agent.id } : {}),
-          agent_session_id: conversation,
-        });
-      } catch (error) {
-        // Refused or not, this screen's picture of the window may be stale.
-        await invalidateSessions();
-        throw new Error(moveWindowError(error, host.name));
-      }
-
-      let launchError: Error | null = null;
-      if (agent) {
-        try {
-          await pendingLaunches.persist(
-            moved.id,
-            moved.host_id,
-            agentLaunchCommand(agent, conversation),
-          );
-        } catch {
-          launchError = new Error(
-            `The window moved to ${host.name} as a shell, but ${agent.name} could not be queued.`,
-          );
-        }
-      }
-      client.setQueryData(qk.session(moved.id), moved);
-      client.setQueryData<Session[]>(qk.sessions(), (current) =>
-        current?.map((item) => (item.id === moved.id ? moved : item)),
-      );
-      await invalidateSessions();
-      if (launchError) throw launchError;
-      return moved;
-    },
+    movePaneToHost: (session: Session, host: Host, cwd: string, agents: readonly AgentDef[]) =>
+      moveWindowFresh(client, session, host, cwd, agents),
     reorderPane: (workspace: Workspace, tabId: TabId, paneId: PaneId, offset: -1 | 1) => {
       const layout = reorderPaneLayout(workspace, tabId, paneId, offset);
       reorder.schedule(workspace, layout);
@@ -300,5 +249,9 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       return saved;
     },
     flushReorders: () => reorder.flush(),
+    /** What a move with its conversation and its resolver reach outside
+     *  themselves (`move-channels.ts`). */
+    moveDeps: (agents: readonly AgentDef[]) => createMoveDeps(client, agents),
+    refreshSessions: invalidateSessions,
   };
 }

@@ -18,12 +18,23 @@ import {
   TabActionsSheet,
   WorkspaceActionsSheet,
 } from "@/components/workspace-detail/action-sheets";
+import { moveHostOf } from "@/components/workspace-detail/move-channels";
+import {
+  type MovePlan,
+  MoveRun,
+  previewMove,
+  releasePlan,
+} from "@/components/workspace-detail/move-conversation";
+import * as moveCopy from "@/components/workspace-detail/move-copy";
+import { launchMove } from "@/components/workspace-detail/move-runner";
+import { MoveConfirmSheet, type MoveConfirmState } from "@/components/workspace-detail/move-sheets";
 import { moveWindowConfirmation } from "@/components/workspace-detail/move-window";
 import { type PaneGhost, usePaneDragValues } from "@/components/workspace-detail/pane-drag";
 import { PaneDragGhost } from "@/components/workspace-detail/pane-drag-ghost";
 import { PaneList } from "@/components/workspace-detail/pane-list";
 import { RenameDialog } from "@/components/workspace-detail/rename-dialog";
 import { TabStrip } from "@/components/workspace-detail/tab-strip";
+import { useResolveMove } from "@/components/workspace-detail/use-resolve-move";
 import { useWorkspaceActions } from "@/components/workspace-detail/use-workspace-actions";
 import {
   WorkspaceErrorBanner,
@@ -35,7 +46,8 @@ import { WorkspaceFolderSheet } from "@/components/workspaces/workspace-folder-s
 import { canAddTab } from "@/data/layout/tabs";
 import { canAddTile } from "@/data/layout/tiles";
 import { useWorkspaceDetail } from "@/data/queries/workspace-detail";
-import { sessionAgent } from "@/data/selectors/agent";
+import { agentDisplayName, sessionAgent } from "@/data/selectors/agent";
+import { displayPath } from "@/data/selectors/places";
 import { sessionTitle } from "@/data/selectors/session";
 import { selectActiveTabId } from "@/data/selectors/workspace";
 import { useConnectionStore } from "@/data/stores/connection";
@@ -63,6 +75,16 @@ interface ConfirmationState {
   description: string;
   confirmLabel: string;
   onConfirm: () => void;
+}
+
+/** A Claude Code window on its way through the Move dialog. */
+interface MoveConfirmation {
+  target: { tile: Tile; session: Session };
+  host: Host;
+  cwd: string;
+  state: MoveConfirmState;
+  /** Bumped per dialog: an answer for an earlier one is let go. */
+  attempt: number;
 }
 
 const TAB_FULL_MESSAGE = "This tab is full. A tab can contain up to 16 panes.";
@@ -102,6 +124,8 @@ export function WorkspaceDetail({
   const [workspaceActionsVisible, setWorkspaceActionsVisible] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [confirmation, setConfirmation] = useState<ConfirmationState | null>(null);
+  const [moveConfirmation, setMoveConfirmation] = useState<MoveConfirmation | null>(null);
+  const moveAttempt = useRef(0);
   const [launcherTabId, setLauncherTabId] = useState<string | null>(null);
   const [fileUpdatePrompt, setFileUpdatePrompt] = useState<{
     hostId: string;
@@ -227,6 +251,113 @@ export function WorkspaceDetail({
         );
       },
     });
+  };
+
+  /**
+   * Where a window is moved to another host decides what the move means. A
+   * Claude Code window goes through the Move dialog, which checks both hosts
+   * first and carries its conversation where they both can; any other agent
+   * starts a new conversation there, and says so; a shell is the ordinary
+   * confirm.
+   */
+  const chooseMove = (target: { tile: Tile; session: Session }, host: Host, cwd: string) => {
+    const agent = sessionAgent(target.session, agents);
+    const from = hostsById.get(target.session.host_id);
+    if (agent?.kind === "claude-code" && from) {
+      const attempt = ++moveAttempt.current;
+      setMoveConfirmation({
+        target,
+        host,
+        cwd,
+        attempt,
+        state: { kind: "checking", from: from.name, to: host.name },
+      });
+      void previewMove(
+        {
+          session: target.session,
+          agent,
+          from: moveHostOf(from),
+          to: moveHostOf(host),
+          cwd,
+        },
+        actions.moveDeps(agents),
+      )
+        .catch(
+          (): MoveConfirmState => ({
+            kind: "blocked",
+            reason: moveCopy.moveCheckFailed(host.name),
+            startFresh: "instead",
+          }),
+        )
+        .then((state) => {
+          if (moveAttempt.current !== attempt) {
+            if (state.kind === "ready") releasePlan(state.plan);
+            return;
+          }
+          setMoveConfirmation((current) =>
+            current?.attempt === attempt ? { ...current, state } : current,
+          );
+        });
+      return;
+    }
+    if (agent) {
+      setConfirmation({
+        title: moveWindowConfirmation({
+          title: sessionTitle(target.session, agents),
+          hostName: host.name,
+          cwd,
+          agent: true,
+        }).title,
+        description: moveCopy.moveAgentStartsFresh(
+          displayPath(cwd),
+          host.name,
+          agentDisplayName(agent),
+        ),
+        confirmLabel: "Move window",
+        onConfirm: () => {
+          setConfirmation(null);
+          void run(
+            () => actions.movePaneToHost(target.session, host, cwd, agents),
+            () => {
+              setPaneTarget(null);
+              onOpenTerminal(target.session.id);
+            },
+          );
+        },
+      });
+      return;
+    }
+    confirmMove(target, host, cwd);
+  };
+
+  const closeMoveConfirmation = (keepPlan = false) => {
+    moveAttempt.current += 1;
+    setMoveConfirmation((current) => {
+      if (!keepPlan && current?.state.kind === "ready") releasePlan(current.state.plan);
+      return null;
+    });
+  };
+
+  /** Finish or undo a move that has not landed, from this device: asked
+   *  first, then settled from the hosts' own records. */
+  const resolveDeps = useMemo(() => actions.moveDeps(agents), [actions, agents]);
+  const resolver = useResolveMove({
+    agents,
+    hosts,
+    deps: resolveDeps,
+    onSettled: (session, outcome) => {
+      void actions.refreshSessions();
+      if (!session) return;
+      // Finished here: this device opens it, takes control and types its
+      // resume.
+      if (outcome.kind === "finished" && outcome.session.status !== "killed") {
+        onOpenTerminal(session.id);
+      }
+    },
+  });
+  const resolve = (session: Session) => {
+    setPaneTarget(null);
+    resolver.open(session);
   };
 
   /*
@@ -473,6 +604,7 @@ export function WorkspaceDetail({
           onMove={(tile) => setMoveTile(tile)}
           onMoveToHost={(tile, session) => setHostTarget({ tile, session })}
           onRemove={(tile) => confirmRemove(workspace, tile)}
+          onResolve={resolve}
           onRename={(session) =>
             setRenameTarget({ kind: "session", id: session.id, value: session.name ?? "" })
           }
@@ -531,8 +663,11 @@ export function WorkspaceDetail({
           onSelect={(host, cwd) => {
             const target = hostTarget;
             setHostTarget(null);
-            if (target) confirmMove(target, host, cwd);
+            if (target) chooseMove(target, host, cwd);
           }}
+          {...(hostTarget && sessionAgent(hostTarget.session, agents)?.kind === "claude-code"
+            ? { message: moveCopy.MOVE_PICKER_CARRY_MESSAGE }
+            : {})}
           session={hostTarget?.session ?? null}
           sessions={sessions}
           tabSessionIds={
@@ -553,11 +688,39 @@ export function WorkspaceDetail({
               const target = browseTarget;
               setBrowseTarget(null);
               const host = hosts.find((candidate) => candidate.id === folder.hostId);
-              if (target && host) confirmMove(target, host, folder.path);
+              if (target && host) chooseMove(target, host, folder.path);
             }}
             visible
           />
         ) : null}
+        {resolver.sheet}
+        <MoveConfirmSheet
+          onCancel={() => closeMoveConfirmation()}
+          onMove={(mode) => {
+            const current = moveConfirmation;
+            if (current?.state.kind !== "ready") return;
+            const plan: MovePlan = current.state.plan;
+            closeMoveConfirmation(true);
+            setPaneTarget(null);
+            launchMove(new MoveRun(plan, mode, actions.moveDeps(agents)));
+          }}
+          onStartFresh={() => {
+            const current = moveConfirmation;
+            closeMoveConfirmation();
+            if (!current) return;
+            void run(
+              () =>
+                actions.movePaneToHost(current.target.session, current.host, current.cwd, agents),
+              () => {
+                setPaneTarget(null);
+                onOpenTerminal(current.target.session.id);
+              },
+            );
+          }}
+          state={moveConfirmation?.state ?? null}
+          toName={moveConfirmation?.host.name ?? ""}
+          visible={moveConfirmation !== null}
+        />
         <MovePaneSheet
           onDismiss={() => setMoveTile(null)}
           onMove={(tabId) => {

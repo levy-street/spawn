@@ -1,6 +1,7 @@
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
+import { MOVE_MOVING_STATUS, MOVE_RESOLVE } from "@/components/workspace-detail/move-copy";
 import { UNSUPPORTED_PANE_TITLE } from "@/components/workspace-detail/pane-list";
 import { canMovePaneToTab, canRemoveTab } from "@/data/layout/tabs";
 import { canAddTile, orderedTiles } from "@/data/layout/tiles";
@@ -32,6 +33,8 @@ export interface PaneActionsSheetProps {
   /** The agent's own record of the conversation, read from the host. */
   onTranscripts: (session: Session) => void;
   onRemove: (tile: Tile) => void;
+  /** Finish or undo a move of this window that has not landed. */
+  onResolve?: (session: Session) => void;
 }
 
 export function PaneActionsSheet({
@@ -49,6 +52,7 @@ export function PaneActionsSheet({
   onRestart,
   onTranscripts,
   onRemove,
+  onResolve,
 }: PaneActionsSheetProps) {
   const tab = workspace.layout.tabs.find((candidate) => candidate.id === target?.tabId) ?? null;
   const tile = target?.tile ?? null;
@@ -64,7 +68,20 @@ export function PaneActionsSheet({
       )
     : false;
   const actions: ActionSheetAction[] = [];
+  // A window being carried to another host offers Resolve and nothing that
+  // would act on it: no Close, Restart, Move or Duplicate until it lands or
+  // is put back. Its name and its place in the layout can still change.
+  const moving = session?.status === "moving";
 
+  if (session && moving) {
+    actions.push({
+      id: "resolve",
+      label: MOVE_RESOLVE,
+      detail: MOVE_MOVING_STATUS,
+      icon: <Icon name="ArrowRightLeft" />,
+      onPress: () => onResolve?.(session),
+    });
+  }
   if (session) {
     actions.push({
       id: "rename",
@@ -83,14 +100,14 @@ export function PaneActionsSheet({
         ...(canMove ? {} : { detail: "No other tab has room" }),
         onPress: () => onMove(tile),
       },
-      unsupported
+      unsupported || moving
         ? {
             // A pane from a newer SPAWN D is never copied blind.
             id: "duplicate",
             label: "Duplicate",
             icon: <Icon name="Copy" />,
             disabled: true,
-            detail: "Needs a newer SPAWN D",
+            detail: moving ? MOVE_MOVING_STATUS : "Needs a newer SPAWN D",
             onPress: () => undefined,
           }
         : {
@@ -125,7 +142,7 @@ export function PaneActionsSheet({
       },
     );
   }
-  if (session && tile) {
+  if (session && tile && !moving) {
     actions.push({
       id: "move-host",
       label: "Move to another host…",
@@ -134,7 +151,7 @@ export function PaneActionsSheet({
       onPress: () => onMoveToHost(tile, session),
     });
   }
-  if (session) {
+  if (session && !moving) {
     actions.push({
       id: "restart",
       label: "Restart",
@@ -150,7 +167,7 @@ export function PaneActionsSheet({
       onPress: () => onTranscripts(session),
     });
   }
-  if (tile) {
+  if (tile && !moving) {
     actions.push({
       id: "remove",
       label: session ? "Close session" : "Remove pane",
@@ -228,6 +245,8 @@ export interface MovePaneHostSheetProps {
   onSelect: (host: Host, cwd: string) => void;
   /** Browse any host for a folder that is not in the list. */
   onBrowse: () => void;
+  /** What moving it means for this window, when it means more than a shell. */
+  message?: string;
 }
 
 /**
@@ -247,6 +266,7 @@ export function MovePaneHostSheet({
   onDismiss,
   onSelect,
   onBrowse,
+  message = "The window keeps its name and skills; what runs in it here stops.",
 }: MovePaneHostSheetProps) {
   const others = hosts.filter((host) => host.id !== session?.host_id);
   const places = suggestPlaces({ sessions, hosts: others, tabSessionIds, limit: 6 });
@@ -278,7 +298,7 @@ export function MovePaneHostSheet({
   return (
     <ActionSheet
       actions={actions}
-      message="The window keeps its name and skills; what runs in it here stops."
+      message={message}
       onDismiss={onDismiss}
       title="Where this runs"
       visible={visible && session !== null}

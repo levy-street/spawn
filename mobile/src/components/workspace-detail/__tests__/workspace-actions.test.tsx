@@ -65,6 +65,19 @@ const mockWorkspaceActions = {
   removePane: jest.fn(async () => mockWorkspace),
   duplicatePane: jest.fn(async () => mockWorkspace),
   flushReorders: jest.fn(async () => null),
+  refreshSessions: jest.fn(async () => undefined),
+  moveDeps: jest.fn(() => ({
+    channels: { open: jest.fn(async () => Promise.reject(new Error("offline"))) },
+    server: {
+      begin: jest.fn(),
+      commit: jest.fn(),
+      abort: jest.fn(),
+      get: jest.fn(async () => null),
+    },
+    launches: { queue: jest.fn(), confirm: jest.fn(), discard: jest.fn() },
+    restart: jest.fn(),
+    newTransferId: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  })),
 };
 
 jest.mock("@/components/gestures/tab-pager", () => ({

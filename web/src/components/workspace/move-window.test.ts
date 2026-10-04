@@ -60,6 +60,14 @@ describe("moveWindowError", () => {
   });
 
   test("passes anything else through as it was said", () => {
+    assert.equal(
+      moveWindowError(refused(409, "move_in_progress"), "mac"),
+      "This window is moving to another host. Finish or cancel the move first.",
+    );
+    assert.equal(
+      moveWindowError(refused(409, "workspace_archived"), "mac"),
+      "This window's workspace is archived. Restore it first.",
+    );
     assert.equal(moveWindowError(refused(404, "host not found"), "mac"), "host not found");
     assert.equal(moveWindowError(new Error("Failed to fetch"), "mac"), "Failed to fetch");
   });

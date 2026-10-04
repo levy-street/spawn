@@ -187,6 +187,8 @@ export interface HostControlLimits {
   readonly previewPixels: readonly (128 | 256 | 512 | 1024)[];
   readonly normalQueue: number | null;
   readonly fastQueue: number | null;
+  /** Stream v2's largest window (`stream_window_max`), null before conv.v2. */
+  readonly streamWindowMax: number | null;
 }
 
 export interface HostCapabilities {
@@ -228,6 +230,78 @@ export interface AgentTranscriptQuery {
   readonly agentKind: string;
   readonly conversationId?: string | null;
   readonly cwd?: string | null;
+}
+
+/** `conv.export`: retire a conversation out of a host and read its bundle. */
+export interface ConversationExportRequest {
+  /** A canonical UUIDv4 the device chose; the same names it on the target. */
+  readonly transferId: string;
+  readonly conversationId: string;
+  /** The window the conversation leaves. */
+  readonly sessionId: string;
+  /** The host it goes to, recorded so any device can resolve the move. */
+  readonly toHostId: string;
+  /** The window's folder: the copy filed under it is the one that travels. */
+  readonly cwd?: string | null;
+  /** 0, or the target's `next_sequence` to resume. */
+  readonly fromSequence: number;
+}
+
+export interface ConversationExportStream {
+  readonly declaration: import("@/terminal/transport/conversation-codec").ConversationExportDeclaration;
+  readonly reader: import("@/terminal/transport/stream-v2").StreamV2Reader;
+}
+
+/** `conv.import.begin`: stage a carried conversation on a host. */
+export interface ConversationImportRequest {
+  readonly transferId: string;
+  readonly conversationId: string;
+  /** The folder it lands in on this host (must exist). */
+  readonly cwd: string;
+  readonly length: number;
+  /** Null: the digest comes in `stream.end`, forwarded from the source. */
+  readonly sha256: string | null;
+  readonly fromHostId: string;
+}
+
+export interface ConversationImportStream {
+  readonly opened: import("@/terminal/transport/conversation-codec").ConversationImportOpened;
+  readonly writer: import("@/terminal/transport/stream-v2").StreamV2Writer;
+}
+
+/** The carrier's operations (`conv.v2`), one host's half each. */
+export interface ConversationCarrierTransport {
+  conversationProbe(
+    request: { conversationId?: string | null; cwd: string },
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").ConversationProbe>;
+  conversationExport(
+    request: ConversationExportRequest,
+    options?: HostRequestOptions,
+  ): Promise<ConversationExportStream>;
+  conversationImport(
+    request: ConversationImportRequest,
+    options?: HostRequestOptions,
+  ): Promise<ConversationImportStream>;
+  conversationImportStatus(
+    transferId: string,
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").ConversationTransferStatus>;
+  conversationImportCancel(
+    transferId: string,
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").ConversationTransferStatus>;
+  conversationRetireCommit(
+    request: { transferId: string; length: number; sha256: string },
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").RetireAnswer>;
+  conversationRetireAbort(
+    transferId: string,
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").RetireAnswer>;
+  conversationTransfers(
+    options?: HostRequestOptions,
+  ): Promise<import("@/terminal/transport/conversation-codec").ConversationTransfers>;
 }
 
 export interface HostReadableFile {
@@ -402,7 +476,7 @@ export interface HostTransport {
 }
 
 /** Production host-control surface. HostTransport keeps stream members optional for test doubles. */
-export interface StreamingHostTransport extends HostTransport {
+export interface StreamingHostTransport extends HostTransport, ConversationCarrierTransport {
   readonly capabilities: HostCapabilities | null;
   hasCapability(operation: string): boolean;
   inspectConversation(

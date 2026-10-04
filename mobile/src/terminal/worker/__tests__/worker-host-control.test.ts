@@ -36,14 +36,17 @@ describe("offline host-control worker", () => {
     );
   });
 
-  test("keeps host writes under the 32 KiB SCTP high-water mark", () => {
+  test("keeps the root channel's writes under 32 KiB and a tool channel's under the bulk gate", () => {
     expect(TERMINAL_WORKER_HTML).toContain("const BUFFERED_HIGH_WATER = 32 * 1024");
-    expect(TERMINAL_WORKER_HTML).toContain("channel.bufferedAmount <= BUFFERED_HIGH_WATER");
+    expect(TERMINAL_WORKER_HTML).toContain(
+      "const highWater = api.bulkHighWater || BUFFERED_HIGH_WATER",
+    );
+    expect(TERMINAL_WORKER_HTML).toContain("channel.bufferedAmount <= highWater");
+    expect(TERMINAL_WORKER_HTML).toContain("const BULK_WATERMARK = 64 * 1024");
     expect(TERMINAL_WORKER_HTML).toContain('"bufferedamountlow"');
     expect(TERMINAL_WORKER_HTML).toContain("const STREAM_TIMEOUT_MS = 60_000");
-    expect(TERMINAL_WORKER_HTML).toContain(
-      'if (type === "chunk" || type === "end") await waitForWritable()',
-    );
+    expect(TERMINAL_WORKER_HTML).toContain('const bulk = type === "chunk" || type === "end"');
+    expect(TERMINAL_WORKER_HTML).toContain("if (bulk) await waitForWritable()");
   });
 
   test("does not acknowledge a chunk until worker backpressure clears", async () => {

@@ -28,6 +28,7 @@ export function useWherePanel({
   tabId,
   hostId,
   exclude,
+  avoidHostId,
   anchorRef,
   onBack,
 }: {
@@ -41,6 +42,8 @@ export function useWherePanel({
   hostId?: string | null;
   /** A place not to offer — where a pane being moved already runs. */
   exclude?: Place | null;
+  /** No place on this host: "Move to another host…" offers only the others. */
+  avoidHostId?: string | null;
   /** What the folder browser hangs off — the cascade has closed by then. */
   anchorRef?: RefObject<HTMLElement | null>;
   /** Reopens the cascade behind the browser; omitted where there is none. */
@@ -81,7 +84,9 @@ export function useWherePanel({
     enabled: Boolean(workspaceId),
     staleTime: 10_000,
   });
-  const hostList = (hostsQ.data ?? []).filter((host) => !hostId || host.id === hostId);
+  const hostList = (hostsQ.data ?? []).filter(
+    (host) => (!hostId || host.id === hostId) && host.id !== avoidHostId,
+  );
   const workspace = workspaceQ.data;
   const tab = workspace
     ? ((tabId ? tabById(workspace.layout, tabId) : null) ?? activeTab(workspace.layout))

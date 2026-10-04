@@ -183,10 +183,10 @@ describe("what runs here", () => {
     const waiting = session(DREAM, { activity_state: "waiting" });
     const exited = session(DREAM, { status: "exited" });
     const elsewhere = session(MAC, { activity_state: "waiting" });
-    expect(runningHere([quiet, waiting, exited, elsewhere], DREAM).map((item) => item.id)).toEqual([
-      waiting.id,
-      quiet.id,
-    ]);
+    const moving = session(DREAM, { status: "moving", activity_state: "moving" });
+    expect(
+      runningHere([quiet, waiting, exited, elsewhere, moving], DREAM).map((item) => item.id),
+    ).toEqual([waiting.id, quiet.id]);
     expect(runningHere([quiet, waiting], DREAM, 1)).toHaveLength(1);
   });
 

@@ -1,4 +1,5 @@
 import type { ComponentType } from "react";
+import { UnfinishedMovesPanel } from "@/components/hosts/cockpit/unfinished-moves-panel";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { HostOfferSlot, HostOfferSlotId, HostOffers } from "@/data/selectors/host-offers";
 
@@ -10,17 +11,21 @@ export interface HostOfferSlotProps {
 /**
  * What each lit slot draws on a host's page, registered by the milestone that
  * brings its feature: the Claude accounts panel, the conversations a host
- * holds, its boxes, and the entry to its desktop — which on a phone opens a
- * full-screen view of its own rather than a swipe tab, since a desktop is
- * dragged across and a swipe would fight it. A slot is registered here in the
- * same change that adds it to `SHIPPED_HOST_OFFERS`, so the registry never
- * lights a slot this build has no view for.
+ * holds, the moves it holds that did not finish, its boxes, and the entry to
+ * its desktop — which on a phone opens a full-screen view of its own rather
+ * than a swipe tab, since a desktop is dragged across and a swipe would fight
+ * it. A slot is registered here in the same change that adds it to
+ * `SHIPPED_HOST_OFFERS`, so the registry never lights a slot this build has
+ * no view for.
  *
- * Empty for now: no feature behind a slot has shipped, so even a host that
- * advertised one draws nothing here yet.
+ * Unfinished moves is the first: a host that carries conversations
+ * (conv.v2) lists the moves it holds that did not finish, with Resolve — the
+ * browser's `moves` slot, under the same label.
  */
-export const SLOT_RENDERERS: Partial<Record<HostOfferSlotId, ComponentType<HostOfferSlotProps>>> =
-  {};
+export const SLOT_RENDERERS: Partial<Record<HostOfferSlotId, ComponentType<HostOfferSlotProps>>> = {
+  // Moves that did not finish, from the host's own records (conv.v2).
+  moves: UnfinishedMovesPanel,
+};
 
 function Slots({
   host,

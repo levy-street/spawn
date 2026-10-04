@@ -32,6 +32,7 @@ import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { HostOffers } from "@/data/selectors/host-offers";
 import { displayPath } from "@/data/selectors/places";
+import { isLiveSession } from "@/data/selectors/session";
 import { opacity, spacing, useTheme } from "@/theme";
 
 export interface OverviewTabProps {
@@ -81,9 +82,7 @@ export function OverviewTab({
   const online = host.status === "online";
   const capacity = capacityPresentation(host, online ? metrics : null);
   const running = runningHere(sessions);
-  const liveCount = sessions.filter(
-    (session) => session.status !== "exited" && session.status !== "killed",
-  ).length;
+  const liveCount = sessions.filter(isLiveSession).length;
   const folders = hostFolders(sessions);
   // A folder opens in Files, which needs a live connection this device
   // trusts; its menu opens a window there, which needs the host online.

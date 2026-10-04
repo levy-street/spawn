@@ -1,5 +1,6 @@
 import {
   createPendingLaunchStore,
+  PENDING_LAUNCH_PROVISIONAL_MS,
   PENDING_LAUNCH_TTL_MS,
   type PendingLaunchStorage,
 } from "@/components/launcher/pending-launch";
@@ -162,5 +163,50 @@ describe("pending agent launches", () => {
     await store.persist("session-5", HOST, "aider");
     await store.abandon?.("session-5");
     await expect(store.take("session-5", HOST)).resolves.toEqual({ status: "missing" });
+  });
+
+  test("a provisional record is never typable until confirmed, and is left in place meanwhile", async () => {
+    const storage = new MemoryStorage();
+    let now = 1_000;
+    const store = createPendingLaunchStore(storage, { now: () => now });
+    await store.persist("session-move", HOST, "claude --resume x", { provisional: true });
+    await expect(store.take("session-move", HOST)).resolves.toEqual({ status: "provisional" });
+    // Asked again, still there and still not claimed.
+    await expect(store.take("session-move", HOST)).resolves.toEqual({ status: "provisional" });
+    await store.confirm?.("session-move", HOST);
+    now += 10;
+    await expect(store.take("session-move", HOST)).resolves.toMatchObject({
+      status: "ready",
+      record: { command: "claude --resume x" },
+    });
+  });
+
+  test("a provisional record survives an app restart unconfirmed: never typed, and it lapses", async () => {
+    const storage = new MemoryStorage();
+    await createPendingLaunchStore(storage, { now: () => 1_000 }).persist(
+      "session-move",
+      HOST,
+      "claude --resume x",
+      { provisional: true },
+    );
+    const restarted = createPendingLaunchStore(storage, {
+      now: () => 1_000 + PENDING_LAUNCH_PROVISIONAL_MS,
+    });
+    await expect(restarted.take("session-move", HOST)).resolves.toEqual({ status: "stale" });
+    expect(storage.values.size).toBe(0);
+  });
+
+  test("discard drops only a provisional record for that host", async () => {
+    const storage = new MemoryStorage();
+    const store = createPendingLaunchStore(storage, { now: () => 1_000 });
+    await store.persist("session-move", HOST, "claude --resume x", { provisional: true });
+    await store.discard?.("session-move", "elsewhere");
+    await expect(store.take("session-move", HOST)).resolves.toEqual({ status: "provisional" });
+    await store.discard?.("session-move", HOST);
+    await expect(store.take("session-move", HOST)).resolves.toEqual({ status: "missing" });
+    // A confirmed one — a restart's resume queued since — is never discarded.
+    await store.persist("session-move", HOST, "claude --resume y");
+    await store.discard?.("session-move", HOST);
+    await expect(store.take("session-move", HOST)).resolves.toMatchObject({ status: "ready" });
   });
 });

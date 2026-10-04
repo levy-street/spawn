@@ -126,6 +126,55 @@ These regressions are preferable to deploying an unreviewed account-wide key
 distribution and recovery system merely to preserve today's centralized
 convenience.
 
+### Addendum: agent conversation records (M6, moving a window with its conversation)
+
+An agent's record of a conversation — Claude Code's
+`<store>/projects/<folder>/<id>.jsonl` and the sidecar beside it — is not an
+object of this store and never becomes one. It is a host-local file the agent
+itself writes, served to a device only over `spawn.host.ctl`: located by
+`agent.transcripts`, read with `fs.read`, and carried by the `conv.v2` family
+(`proto/README.md`, "The conversation carrier").
+
+- A device copies a conversation record only between two hosts that are both
+  online, and only at the Operator's explicit request each time: the Move
+  dialog's confirmation is that request. Nothing carries one automatically, on
+  a schedule, or in the background, and a move whose source is offline offers a
+  new conversation instead.
+- The device pipes the bytes from one host channel to the other as they
+  arrive; it stores none of them, in memory beyond the stream window or
+  anywhere durable.
+- There is no server ciphertext of a conversation, no server queue, and no
+  relay copy: the server holds only the window's transient `moving` status
+  while a device carries it, and the conversation id the window resumes once
+  the move commits.
+- The source keeps its retired copy outside the agent's lookup path for 30
+  days, and a target cancels staging that nothing has written for 30 days;
+  both are host-local and resolvable from any device (`conv.transfers`,
+  `conv.import.status`).
+- What a device keeps of a move is the note it composed and the resume line
+  (host names and OS from the server, the folder and memory folder the
+  target named), never conversation bytes, and only until the relaunch is
+  typed: the browser in memory (lost with the tab), the phone in its secure
+  storage for at most 15 minutes, so a relaunch survives the app being
+  backgrounded while the target starts.
+- On the phone these are the durable pending-launch records it already keeps
+  for a new window's agent (`mobile/src/components/launcher/pending-launch.ts`,
+  and its sibling `pending-agent-input.ts` for the note, under a key prefix
+  of its own), with the same 15-minute lapse, binding to the window's
+  incarnation on the target, and claim before anything is typed. A move, or
+  a Resolve that finishes one, writes both **provisional** before the
+  server's carried commit: nothing types a provisional record, the commit's
+  answer confirms it, every other end — a refusal, retries spent, Close, the
+  app sent to the background — discards it, and one the app could not
+  discard (it was killed meanwhile) lapses three minutes after it was
+  written. So a record outlives its move only while a confirmed relaunch can
+  still be owed, and never becomes something typed later into a live Claude
+  Code.
+
+This changes none of the declarations above: `phase2_opaque_server_blob_fallback`
+stays forbidden, and a conversation backup, if ever built, needs its own
+decision.
+
 ## Trust boundaries and authorization
 
 The host operating-system account, `spawnd`, its worker processes, and an

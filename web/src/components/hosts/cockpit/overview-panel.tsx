@@ -33,17 +33,21 @@ import { CockpitSection, Fact } from "./cockpit-section";
 import { useHostCockpit } from "./host-cockpit";
 import { HostSessionRow } from "./host-session-row";
 import { OpenHereMenu } from "./open-here-menu";
+import { UnfinishedMoves } from "./unfinished-moves";
 
 /** Windows "Running here" lists before deferring to the Sessions tab. */
 const RUNNING_SHOWN = 6;
 
 /**
  * The Overview sections a host earns by advertising their capability family
- * (lib/host-offers.ts) — its conversations, its Claude accounts, its boxes —
- * keyed by slot. A slot's view lands here in the same change that adds it to
- * SHIPPED_HOST_OFFERS; none has yet.
+ * (lib/host-offers.ts) — its conversations, its unfinished moves, its Claude
+ * accounts, its boxes — keyed by slot. A slot's view lands here in the same
+ * change that adds it to SHIPPED_HOST_OFFERS; Unfinished moves (M6) is the
+ * first, as on the phone.
  */
-const OVERVIEW_PANELS: Partial<Record<HostOfferSlotId, ComponentType<{ host: Host }>>> = {};
+const OVERVIEW_PANELS: Partial<Record<HostOfferSlotId, ComponentType<{ host: Host }>>> = {
+  moves: UnfinishedMoves,
+};
 
 /**
  * A host at a glance: how hard it is working right now, what the machine is,

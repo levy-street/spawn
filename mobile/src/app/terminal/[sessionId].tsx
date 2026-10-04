@@ -1,11 +1,13 @@
 import { useIsFocused } from "@react-navigation/native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { useRef } from "react";
 import { StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
 import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
+import { MovingWindow } from "@/components/terminal-ui/moving-window";
 import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -48,6 +50,13 @@ export default function TerminalScreen(): React.JSX.Element {
   const restart = useRestartTerminalSession(sessionId);
   const kill = useKillTerminalSession(sessionId);
   const toast = useToast();
+  // A window this screen saw moving comes back as a reconnect: only the
+  // device that moved it takes control of where it runs now.
+  const sawMoving = useRef(false);
+  // Resolved from this screen: this device finished the move and types its
+  // resume, so its terminal opens rather than reconnects.
+  const resolvedHere = useRef(false);
+  if (data.session?.status === "moving") sawMoving.current = true;
 
   /**
    * The kill runs on after the terminal has closed over it, so the answer has
@@ -154,6 +163,36 @@ export default function TerminalScreen(): React.JSX.Element {
     );
   }
 
+  if (data.session.status === "moving") {
+    // Being carried to another host: nothing attaches to the host it leaves.
+    return (
+      <>
+        {screenOptions}
+        <View
+          style={[styles.navClearance, { paddingBottom: bottomNavHeight(insets.bottom) }]}
+          testID="terminal-nav-clearance"
+        >
+          <MovingWindow
+            agents={data.agents}
+            onBack={() => router.back()}
+            // Set before the commit lands: the terminal the window becomes
+            // here opens (takes control) and types this device's resume.
+            onResolving={() => {
+              resolvedHere.current = true;
+            }}
+            onSettled={(outcome) => {
+              // Only a move this device finished or put back is its to type;
+              // anything else is followed as a reconnect.
+              resolvedHere.current = outcome.kind === "finished" || outcome.kind === "restored";
+              if (resolvedHere.current) void data.refetch();
+            }}
+            session={data.session}
+          />
+        </View>
+      </>
+    );
+  }
+
   const host = data.host;
   const sessionName = data.session.name?.trim() || null;
   return (
@@ -170,6 +209,7 @@ export default function TerminalScreen(): React.JSX.Element {
         onKill={() => killSession(sessionName)}
         onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
         onRestart={() => restart.mutateAsync()}
+        reconnect={sawMoving.current && !resolvedHere.current}
         restartDetail={restartDetail(data.session, data.agents)}
         session={data.session}
       />

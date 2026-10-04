@@ -8,6 +8,7 @@ import {
   type PendingLaunchDeliveryResult,
   type PendingLaunchTransport,
   type PendingSessionLife,
+  PROVISIONAL_RECHECK_MS,
   pendingSessionLifeFromStatus,
 } from "@/components/launcher/pending-launch-delivery";
 import type { TransportState } from "@/terminal/transport/types";
@@ -361,5 +362,49 @@ describe("pending launch delivery", () => {
     expect(transport.writes).toHaveLength(0);
     expect(results).toEqual([{ status: "abandoned", reason: "delivery_unconfirmed" }]);
     expect(pending.complete).toHaveBeenCalledWith("session-6");
+  });
+
+  test("waits on a provisional record and types it only once it is confirmed", async () => {
+    jest.useFakeTimers();
+    try {
+      const storage = new MemoryStorage();
+      const pending = createPendingLaunchStore(storage);
+      await pending.persist("session-move", HOST, "claude --resume x", { provisional: true });
+      const transport = new FakeTransport("session-move");
+      const results: PendingLaunchDeliveryResult[] = [];
+      observe(transport, pending, results);
+      transport.emit("ready");
+      await jest.advanceTimersByTimeAsync(PROVISIONAL_RECHECK_MS * 3);
+      expect(transport.writes).toHaveLength(0);
+      expect(results).toEqual([]);
+      await pending.confirm?.("session-move", HOST);
+      await jest.advanceTimersByTimeAsync(PROVISIONAL_RECHECK_MS);
+      expect(transport.writes.map((bytes) => new TextDecoder().decode(bytes))).toEqual([
+        "claude --resume x\r",
+      ]);
+      expect(results).toEqual([{ status: "sent" }]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("a provisional record discarded while it waits is never typed", async () => {
+    jest.useFakeTimers();
+    try {
+      const storage = new MemoryStorage();
+      const pending = createPendingLaunchStore(storage);
+      await pending.persist("session-move", HOST, "claude --resume x", { provisional: true });
+      const transport = new FakeTransport("session-move");
+      const results: PendingLaunchDeliveryResult[] = [];
+      observe(transport, pending, results);
+      transport.emit("ready");
+      await jest.advanceTimersByTimeAsync(PROVISIONAL_RECHECK_MS);
+      await pending.discard?.("session-move", HOST);
+      await jest.advanceTimersByTimeAsync(PROVISIONAL_RECHECK_MS * 2);
+      expect(transport.writes).toHaveLength(0);
+      expect(results).toEqual([{ status: "missing" }]);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

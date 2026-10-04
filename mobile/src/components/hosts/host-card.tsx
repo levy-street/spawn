@@ -22,6 +22,7 @@ import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { groupRunningAgents } from "@/data/selectors/agent";
+import { isLiveSession } from "@/data/selectors/session";
 import { useHostLiveStatus } from "@/data/stores/host-live";
 import { haptics } from "@/lib/haptics";
 import type { TransportState } from "@/terminal/transport/types";
@@ -73,10 +74,7 @@ export function HostCard({
   const [transportState, setTransportState] = useState<TransportState>("idle");
   const [liveError, setLiveError] = useState<string | null>(null);
 
-  const liveSessions = useMemo(
-    () => sessions.filter((session) => session.status !== "exited" && session.status !== "killed"),
-    [sessions],
-  );
+  const liveSessions = useMemo(() => sessions.filter(isLiveSession), [sessions]);
   const running = useMemo(() => groupRunningAgents(liveSessions, agents), [agents, liveSessions]);
 
   useEffect(() => {

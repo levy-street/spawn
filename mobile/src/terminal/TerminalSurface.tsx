@@ -55,9 +55,21 @@ export interface TerminalSurfaceHandle {
   setFollow(follow: boolean): void;
   setFontSize(px: number): void;
   copySelection(): Promise<string | null>;
+  /** The screen as logical lines, or null when the document did not answer:
+   *  read on the device only, for where an agent is after a move. */
+  readScreen(): Promise<TerminalScreen | null>;
   search(q: string, dir: "next" | "prev"): void;
   takeControl(): void;
 }
+
+export interface TerminalScreen {
+  lines: readonly string[];
+  cols: number;
+  alternate: boolean;
+}
+
+/** How long a screen read waits for the terminal document to answer. */
+const SCREEN_READ_TIMEOUT_MS = 1_500;
 
 export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bridge" | "theme"> {
   style?: StyleProp<ViewStyle>;
@@ -84,6 +96,11 @@ export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bri
 
 interface SelectionWaiter {
   resolve(value: string | null): void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface ScreenWaiter {
+  resolve(value: TerminalScreen | null): void;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -132,6 +149,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
     const claimsOnOpen = useRef(claimDisplay);
     const selectionSequence = useRef(0);
     const selectionWaiters = useRef(new Map<string, SelectionWaiter>());
+    const screenWaiters = useRef(new Map<string, ScreenWaiter>());
     const callbacks = useRef({
       onTransport,
       onStateChange,
@@ -334,6 +352,16 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
           clearTimeout(waiter.timer);
           selectionWaiters.current.delete(message.requestId);
           waiter.resolve(message.text.length === 0 ? null : message.text);
+        } else if (message.type === "screen") {
+          const waiter = screenWaiters.current.get(message.requestId);
+          if (!waiter) return;
+          clearTimeout(waiter.timer);
+          screenWaiters.current.delete(message.requestId);
+          waiter.resolve(
+            Array.isArray(message.lines) && message.lines.every((line) => typeof line === "string")
+              ? { lines: message.lines, cols: message.cols, alternate: message.alternate === true }
+              : null,
+          );
         } else if (message.type === "native-selection") {
           callbacks.current.onNativeSelection?.(message.active);
         } else if (message.type === "link") {
@@ -403,6 +431,25 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
             });
           });
         },
+        readScreen: () => {
+          const requestId = `screen-${++selectionSequence.current}`;
+          return new Promise<TerminalScreen | null>((resolve) => {
+            const timer = setTimeout(() => {
+              screenWaiters.current.delete(requestId);
+              resolve(null);
+            }, SCREEN_READ_TIMEOUT_MS);
+            screenWaiters.current.set(requestId, { resolve, timer });
+            try {
+              // Straight to the bridge: a document that is not up yet answers
+              // nothing, which is not a terminal error to report.
+              bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "read-screen", requestId });
+            } catch {
+              clearTimeout(timer);
+              screenWaiters.current.delete(requestId);
+              resolve(null);
+            }
+          });
+        },
         search: (query, direction) =>
           send({
             v: TERMINAL_BRIDGE_VERSION,
@@ -412,7 +459,7 @@ const TerminalSurfaceInstance = forwardRef<TerminalSurfaceHandle, TerminalSurfac
           }),
         takeControl: () => send({ v: TERMINAL_BRIDGE_VERSION, type: "take-control" }),
       }),
-      [send, theme.motion.duration.toastInfo, transport],
+      [bridge, send, theme.motion.duration.toastInfo, transport],
     );
 
     const handleMessage = (event: WebViewMessageEvent): void => {

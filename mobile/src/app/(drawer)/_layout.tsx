@@ -11,6 +11,7 @@ import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-option
 import { useCardAnimation } from "@/components/nav/navigation-reset";
 import { ProfileMenu } from "@/components/nav/profile-menu";
 import { DeviceApprovalPrompt } from "@/components/trust/device-approval-prompt";
+import { MoveRunner } from "@/components/workspace-detail/move-runner";
 import { useMeQuery } from "@/data/queries/auth";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
 import { useTheme } from "@/theme";
@@ -123,6 +124,9 @@ export default function AppStackLayout(): React.JSX.Element | null {
             opened from any host's files. Keyed to the account: a switch forgets them. */}
           <TransfersRunner key={account.accountId ?? "signed-out"} />
           <TransfersSheet />
+          {/* A window moved to another host with its conversation: the move
+            goes on, and its sheet follows, wherever the person goes. */}
+          <MoveRunner key={`move-${account.accountId ?? "signed-out"}`} />
         </BottomChromeProvider>
       </AppHeaderLeadingProvider>
     </AdminRouteBoundary>

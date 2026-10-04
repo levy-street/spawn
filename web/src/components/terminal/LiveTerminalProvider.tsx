@@ -19,6 +19,7 @@ import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { AgentNotice } from "@/lib/agent-notice";
 import { type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
+import type { ClaudeScreenState } from "@/lib/move/screen";
 import type { DisplayControlState } from "@/lib/ws";
 
 // Insert a prompt newline for mobile Return (same as the agent page/panes).
@@ -37,12 +38,15 @@ export type SessionLive = {
   displayState: DisplayControlState | null;
   /** What the agent's own status bar is saying, read off the live screen. */
   agentNotice: AgentNotice | null;
+  /** Claude Code's screen, read while a moved window's note waits. */
+  agentScreen: ClaudeScreenState | null;
 };
 
 const EMPTY_SESSION_LIVE: SessionLive = {
   connInfo: null,
   displayState: null,
   agentNotice: null,
+  agentScreen: null,
 };
 
 /** Stable actions — this context value never changes, so a placeholder's
@@ -165,6 +169,12 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
       [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], agentNotice },
     }));
   }, []);
+  const onAgentScreen = useCallback((sessionId: string, agentScreen: ClaudeScreenState) => {
+    setLive((m) => ({
+      ...m,
+      [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], agentScreen },
+    }));
+  }, []);
   // What an incarnation reported dies with it: an "open" transport, a display
   // lease, an agent's update notice — all facts about a worker that is gone.
   const onIncarnationEnd = useCallback((sessionId: string) => {
@@ -215,6 +225,7 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
               onInfo={onInfo}
               onDisplay={onDisplay}
               onAgentNotice={onAgentNotice}
+              onAgentScreen={onAgentScreen}
               onIncarnationEnd={onIncarnationEnd}
             />
           );
@@ -270,6 +281,7 @@ function PooledTerminal({
   onInfo,
   onDisplay,
   onAgentNotice,
+  onAgentScreen,
   onIncarnationEnd,
 }: {
   sessionId: string;
@@ -279,6 +291,7 @@ function PooledTerminal({
   onInfo: (sessionId: string, info: SessionConnectionInfo) => void;
   onDisplay: (sessionId: string, state: DisplayControlState) => void;
   onAgentNotice: (sessionId: string, notice: AgentNotice | null) => void;
+  onAgentScreen: (sessionId: string, state: ClaudeScreenState) => void;
   onIncarnationEnd: (sessionId: string) => void;
 }) {
   const hostId = useIncarnationHost(sessionId);
@@ -327,6 +340,7 @@ function PooledTerminal({
         onConnectionInfo={(info) => onInfo(sessionId, info)}
         onDisplayControl={(state) => onDisplay(sessionId, state)}
         onAgentNotice={(notice) => onAgentNotice(sessionId, notice)}
+        onAgentScreen={(state) => onAgentScreen(sessionId, state)}
       />
     </div>,
     host,
@@ -396,6 +410,7 @@ export function useLiveTerminal(sessionId: string | null) {
     connInfo: info.connInfo,
     displayState: info.displayState,
     agentNotice: info.agentNotice,
+    agentScreen: info.agentScreen,
   };
 }
 
