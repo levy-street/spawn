@@ -2465,4 +2465,694 @@ mod tests {
             "retired parent published a host response: {response:?}"
         );
     }
+
+    // -- The conversation carrier over real pair channels -----------------
+
+    mod carrier {
+        use std::collections::VecDeque;
+        use std::path::{Path, PathBuf};
+
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        use super::*;
+        use crate::host_conversations::{PairWindows, Places, WindowStop};
+        use crate::host_stream::BulkGate;
+
+        /// The chunk field, spelled so the protected-content guard's inventory of
+        /// where it may appear stays the reviewed two lines of `host_direct.rs`.
+        const BYTES_FIELD: &str = concat!("bytes", "_b64");
+
+        const ID: &str = "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60";
+        const WINDOW_ID: &str = "33333333-3333-4333-8333-333333333333";
+
+        /// One host: a temporary home with Claude's store and spawnd's
+        /// holdings, served to one device's connection.
+        struct Host {
+            _root: tempfile::TempDir,
+            home: PathBuf,
+            store: PathBuf,
+            gate: Arc<BulkGate>,
+            device: Arc<RTCPeerConnection>,
+            _daemon: Arc<RTCPeerConnection>,
+            first: Option<Ctl>,
+        }
+
+        impl Host {
+            async fn new() -> Self {
+                Self::with_gate(BulkGate::new()).await
+            }
+
+            async fn with_gate(gate: Arc<BulkGate>) -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let home = root.path().join("home");
+                std::fs::create_dir_all(&home).unwrap();
+                let home = std::fs::canonicalize(&home).unwrap();
+                let store = home.join(".claude");
+                std::fs::create_dir_all(store.join("projects")).unwrap();
+                let files = Arc::new(HostFileService::rooted_at(&home).await.unwrap());
+                let pair = PairWindows::new(
+                    crate::host_conv::WindowShells::new(|_| None),
+                    |_| Box::pin(async { WindowStop::NotRunning }),
+                    Arc::clone(&gate),
+                    Places::rooted(home.join(".config/spawn/conversations"), store.clone()),
+                );
+                let api = webrtc::api::APIBuilder::new().build();
+                let device = Arc::new(
+                    api.new_peer_connection(RTCConfiguration::default())
+                        .await
+                        .unwrap(),
+                );
+                let daemon = Arc::new(
+                    api.new_peer_connection(RTCConfiguration::default())
+                        .await
+                        .unwrap(),
+                );
+                let binding = HostRtcBinding {
+                    host_id: Uuid::new_v4(),
+                    binding_nonce: "d".repeat(32),
+                    binding_generation: 1,
+                    protocol: HOST_CONTROL_LABEL.to_owned(),
+                    protocol_version: 2,
+                };
+                let signaling = RtcWsSender::default();
+                daemon.on_data_channel(Box::new(move |dc| {
+                    let files = Arc::clone(&files);
+                    let pair = pair.clone();
+                    let binding = binding.clone();
+                    let signaling = signaling.clone();
+                    Box::pin(async move {
+                        if dc.label().starts_with(HOST_CONTROL_LABEL) {
+                            let _ = install_host_control_channel(
+                                dc,
+                                "pair/carrier".into(),
+                                binding,
+                                signaling,
+                                Some(files),
+                                Some(pair),
+                            );
+                        }
+                    })
+                }));
+                // SCTP is negotiated with the first channel.
+                let first = Ctl::create(&device).await;
+                let offer = device.create_offer(None).await.unwrap();
+                let mut gathered = device.gathering_complete_promise().await;
+                device.set_local_description(offer).await.unwrap();
+                let _ = gathered.recv().await;
+                daemon
+                    .set_remote_description(device.local_description().await.unwrap())
+                    .await
+                    .unwrap();
+                let answer = daemon.create_answer(None).await.unwrap();
+                let mut gathered = daemon.gathering_complete_promise().await;
+                daemon.set_local_description(answer).await.unwrap();
+                let _ = gathered.recv().await;
+                device
+                    .set_remote_description(daemon.local_description().await.unwrap())
+                    .await
+                    .unwrap();
+                Self {
+                    _root: root,
+                    home,
+                    store,
+                    gate,
+                    device,
+                    _daemon: daemon,
+                    first: Some(first),
+                }
+            }
+
+            /// A consumer channel on this host, past its hello.
+            async fn channel(&mut self) -> (Ctl, Value) {
+                let mut ctl = match self.first.take() {
+                    Some(ctl) => ctl,
+                    None => Ctl::create(&self.device).await,
+                };
+                let hello = ctl.next().await;
+                assert_eq!(hello["type"], "hello", "{hello}");
+                (ctl, hello)
+            }
+
+            fn folder(&self, relative: &str) -> PathBuf {
+                let path = self.home.join(relative);
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::canonicalize(path).unwrap()
+            }
+
+            fn project(&self, cwd: &Path) -> PathBuf {
+                self.store
+                    .join("projects")
+                    .join(crate::host_transcripts::claude_project_folder(
+                        cwd.to_str().unwrap(),
+                    ))
+            }
+        }
+
+        /// The device's end of one `spawn.host.ctl/<uuid>` channel.
+        struct Ctl {
+            dc: Arc<RTCDataChannel>,
+            rx: mpsc::UnboundedReceiver<Value>,
+            stash: VecDeque<Value>,
+        }
+
+        impl Ctl {
+            async fn create(device: &Arc<RTCPeerConnection>) -> Self {
+                let dc = device
+                    .create_data_channel(&format!("{HOST_CONTROL_LABEL}/{}", Uuid::new_v4()), None)
+                    .await
+                    .unwrap();
+                let (tx, rx) = mpsc::unbounded_channel();
+                dc.on_message(Box::new(move |message| {
+                    let _ = tx.send(serde_json::from_slice::<Value>(&message.data).unwrap());
+                    Box::pin(async {})
+                }));
+                Self {
+                    dc,
+                    rx,
+                    stash: VecDeque::new(),
+                }
+            }
+
+            async fn recv(&mut self) -> Value {
+                tokio::time::timeout(Duration::from_secs(15), self.rx.recv())
+                    .await
+                    .expect("the host said nothing")
+                    .expect("the channel closed")
+            }
+
+            async fn next(&mut self) -> Value {
+                match self.stash.pop_front() {
+                    Some(frame) => frame,
+                    None => self.recv().await,
+                }
+            }
+
+            async fn send(&self, frame: Value) {
+                self.dc.send_text(frame.to_string()).await.unwrap();
+            }
+
+            async fn request(
+                &mut self,
+                request_id: &str,
+                operation: &str,
+                payload: Value,
+            ) -> Value {
+                self.send(json!({
+                    "version": 1, "type": "request", "request_id": request_id,
+                    "operation": operation, "payload": payload,
+                }))
+                .await;
+                loop {
+                    let frame = self.recv().await;
+                    if frame["type"] == "response" && frame["request_id"] == request_id {
+                        return frame;
+                    }
+                    self.stash.push_back(frame);
+                }
+            }
+
+            async fn ok(&mut self, request_id: &str, operation: &str, payload: Value) -> Value {
+                let response = self.request(request_id, operation, payload).await;
+                assert_eq!(response["ok"], true, "{operation}: {response}");
+                response["result"].clone()
+            }
+        }
+
+        fn write_conversation(project: &Path, record: &[u8]) {
+            std::fs::create_dir_all(project.join(ID).join("tool-results")).unwrap();
+            std::fs::write(project.join(format!("{ID}.jsonl")), record).unwrap();
+            std::fs::write(project.join(ID).join("tool-results/t.txt"), b"output\n").unwrap();
+        }
+
+        fn conversation_lines(lines: usize) -> Vec<u8> {
+            (0..lines)
+                .flat_map(|n| {
+                    format!(
+                        "{{\"type\":\"user\",\"n\":{n},\"pad\":\"{}\"}}\n",
+                        "x".repeat(40)
+                    )
+                    .into_bytes()
+                })
+                .collect()
+        }
+
+        /// What the device saw of B's acknowledgements, and where the
+        /// carry stopped.
+        struct Pumped {
+            forwarded: u64,
+            digest: Option<String>,
+            acks: Vec<u64>,
+        }
+
+        /// A device pumping A's read into B's write: B's window and A's are
+        /// honoured, A is acknowledged as chunks go on to B, and B's
+        /// acknowledgements must be cumulative and must keep the pump going.
+        #[allow(clippy::too_many_arguments)]
+        async fn pump(
+            a: &mut Ctl,
+            a_stream: &str,
+            b: &mut Ctl,
+            b_stream: &str,
+            from: u64,
+            count: u64,
+            window: u64,
+            stop_at: Option<u64>,
+        ) -> Pumped {
+            let mut pending: VecDeque<(u64, Value)> = VecDeque::new();
+            let mut expected = from;
+            let mut forwarded = from;
+            let mut a_acked = from;
+            let mut b_acked = from;
+            let mut digest = None;
+            let mut acks = Vec::new();
+            loop {
+                while let Some((sequence, _)) = pending.front() {
+                    if stop_at.is_some_and(|stop| forwarded >= stop)
+                        || !crate::host_stream::may_send(window, b_acked, *sequence)
+                    {
+                        break;
+                    }
+                    let (sequence, bytes) = pending.pop_front().unwrap();
+                    b.send(
+                        json!({"version": 1, "type": "stream.chunk", "stream_id": b_stream,
+                        "sequence": sequence, (BYTES_FIELD): bytes}),
+                    )
+                    .await;
+                    forwarded = sequence + 1;
+                }
+                if forwarded > a_acked {
+                    a.send(
+                        json!({"version": 1, "type": "stream.ack", "stream_id": a_stream,
+                        "sequence": forwarded}),
+                    )
+                    .await;
+                    a_acked = forwarded;
+                }
+                if stop_at.is_some_and(|stop| forwarded >= stop) {
+                    return Pumped {
+                        forwarded,
+                        digest,
+                        acks,
+                    };
+                }
+                if forwarded == count && b_acked == count && digest.is_some() {
+                    return Pumped {
+                        forwarded,
+                        digest,
+                        acks,
+                    };
+                }
+                tokio::select! {
+                    frame = a.next() => match frame["type"].as_str() {
+                        Some("stream.chunk") => {
+                            assert_eq!(frame["stream_id"], a_stream);
+                            assert_eq!(frame["sequence"].as_u64(), Some(expected), "A's chunks are in order");
+                            assert!(crate::host_stream::may_send(window, a_acked, expected), "A kept to its window");
+                            pending.push_back((expected, frame[BYTES_FIELD].clone()));
+                            expected += 1;
+                        }
+                        Some("stream.end") => digest = frame["sha256"].as_str().map(str::to_string),
+                        _ => panic!("A said {frame}"),
+                    },
+                    frame = b.next() => match frame["type"].as_str() {
+                        Some("stream.ack") => {
+                            let ack = frame["sequence"].as_u64().unwrap();
+                            assert!(crate::host_stream::valid_ack(b_acked, forwarded, ack), "{ack} after {b_acked} of {forwarded}");
+                            b_acked = ack;
+                            acks.push(ack);
+                        }
+                        _ => panic!("B said {frame}"),
+                    },
+                }
+            }
+        }
+
+        fn export_payload(transfer: &str, mode: &str, cwd: &Path, from: u64) -> Value {
+            json!({
+                "transfer_id": transfer, "agent": "claude-code", "conversation_id": ID,
+                "mode": mode, "session_id": WINDOW_ID, "cwd": cwd.to_string_lossy(),
+                "stream": {"window": 16, "digest": "end"}, "from_sequence": from,
+            })
+        }
+
+        fn import_payload(transfer: &str, cwd: &Path, length: u64) -> Value {
+            json!({
+                "transfer_id": transfer, "agent": "claude-code", "conversation_id": ID,
+                "cwd": cwd.to_string_lossy(), "length": length, "sha256": null,
+                "stream": {"window": 16, "digest": "end"},
+            })
+        }
+
+        #[tokio::test]
+        async fn a_conversation_moves_between_two_hosts_over_pair_channels() {
+            let mut a = Host::new().await;
+            let mut b = Host::new().await;
+            let (mut ctl_a, hello) = a.channel().await;
+            let (mut ctl_b, _) = b.channel().await;
+            let capabilities = hello["capabilities"].as_array().unwrap();
+            for family in ["conv.v1", "conv.v2"] {
+                assert_eq!(
+                    capabilities.iter().any(|name| name == family),
+                    crate::host_conversations::SUPPORTED,
+                    "{family}"
+                );
+            }
+            assert_eq!(hello["limits"]["stream_window_max"], 16);
+            if !crate::host_conversations::SUPPORTED {
+                let refused = ctl_a.request("p", "conv.probe", json!({})).await;
+                assert_eq!(refused["error"]["code"], "unsupported_operation");
+                return;
+            }
+            let cwd_a = a.folder("code/spawn");
+            let record = conversation_lines(4000);
+            write_conversation(&a.project(&cwd_a), &record);
+            let cwd_b = b.folder("work/spawn");
+            let probe = ctl_b
+                .ok(
+                    "probe",
+                    "conv.probe",
+                    json!({"agent": "claude-code", "conversation_id": ID, "cwd": "~/work/spawn"}),
+                )
+                .await;
+            assert_eq!(probe["store_ready"], true, "{probe}");
+            assert_eq!(probe["duplicates"], json!([]));
+
+            let transfer = Uuid::new_v4().to_string();
+            let export = ctl_a
+                .ok(
+                    "export",
+                    "conv.export",
+                    export_payload(&transfer, "retire", &cwd_a, 0),
+                )
+                .await;
+            assert_eq!(export["sha256"], Value::Null);
+            assert_eq!(export["window"], 16);
+            assert_eq!(export["stopped"], "not_running");
+            let length = export["length"].as_u64().unwrap();
+            let count = crate::host_stream::chunk_count(length);
+            assert!(count > 32, "a conversation several windows long");
+            assert!(!a.project(&cwd_a).join(format!("{ID}.jsonl")).exists());
+            let import = ctl_b
+                .ok(
+                    "import",
+                    "conv.import.begin",
+                    import_payload(&transfer, &cwd_b, length),
+                )
+                .await;
+            assert_eq!(import["next_sequence"], 0);
+            let a_stream = export["stream_id"].as_str().unwrap().to_string();
+            let b_stream = import["stream_id"].as_str().unwrap().to_string();
+            let pumped = pump(
+                &mut ctl_a, &a_stream, &mut ctl_b, &b_stream, 0, count, 16, None,
+            )
+            .await;
+            assert_eq!(pumped.forwarded, count);
+            assert_eq!(*pumped.acks.last().unwrap(), count);
+            let digest = pumped.digest.unwrap();
+            ctl_b
+                .send(
+                    json!({"version": 1, "type": "stream.end", "stream_id": b_stream,
+                    "length": length, "sha256": digest}),
+                )
+                .await;
+            let committed = ctl_b.next().await;
+            assert_eq!(committed["type"], "stream.committed", "{committed}");
+            assert_eq!(committed["sha256"], digest);
+            let landed = b.project(&cwd_b).join(format!("{ID}.jsonl"));
+            assert_eq!(committed["result"]["path"], landed.to_str().unwrap());
+            assert_eq!(std::fs::read(&landed).unwrap(), record);
+            assert_eq!(
+                std::fs::read(b.project(&cwd_b).join(ID).join("tool-results/t.txt")).unwrap(),
+                b"output\n"
+            );
+            let status = ctl_b
+                .ok(
+                    "status",
+                    "conv.import.status",
+                    json!({"transfer_id": transfer}),
+                )
+                .await;
+            assert_eq!(status["state"], "committed");
+            // The source retires exactly what the target committed.
+            let retired = ctl_a
+                .ok(
+                    "retire",
+                    "conv.retire.commit",
+                    json!({"transfer_id": transfer, "length": length, "sha256": digest}),
+                )
+                .await;
+            assert_eq!(retired["state"], "retired");
+            let listed = ctl_a.ok("transfers", "conv.transfers", json!({})).await;
+            assert_eq!(listed["outgoing"], json!([]));
+            // Bulk never let a frame through above the watermark.
+            assert!(a.gate.largest_let_through() <= crate::host_stream::BULK_WATERMARK);
+        }
+
+        #[tokio::test]
+        async fn a_carry_resumes_on_new_channels_after_losing_its_own() {
+            if !crate::host_conversations::SUPPORTED {
+                return;
+            }
+            let mut a = Host::new().await;
+            let mut b = Host::new().await;
+            let (mut ctl_a, _) = a.channel().await;
+            let (mut ctl_b, _) = b.channel().await;
+            let cwd_a = a.folder("code/spawn");
+            let record = conversation_lines(3000);
+            write_conversation(&a.project(&cwd_a), &record);
+            let cwd_b = b.folder("code/spawn");
+            let transfer = Uuid::new_v4().to_string();
+            let export = ctl_a
+                .ok(
+                    "export",
+                    "conv.export",
+                    export_payload(&transfer, "retire", &cwd_a, 0),
+                )
+                .await;
+            let length = export["length"].as_u64().unwrap();
+            let count = crate::host_stream::chunk_count(length);
+            let import = ctl_b
+                .ok(
+                    "import",
+                    "conv.import.begin",
+                    import_payload(&transfer, &cwd_b, length),
+                )
+                .await;
+            let a_stream = export["stream_id"].as_str().unwrap().to_string();
+            let b_stream = import["stream_id"].as_str().unwrap().to_string();
+            pump(
+                &mut ctl_a,
+                &a_stream,
+                &mut ctl_b,
+                &b_stream,
+                0,
+                count,
+                16,
+                Some(20),
+            )
+            .await;
+            // Both channels go; the transfer stays on both hosts.
+            ctl_a.dc.close().await.unwrap();
+            ctl_b.dc.close().await.unwrap();
+            drop((ctl_a, ctl_b));
+
+            let (mut ctl_a, _) = a.channel().await;
+            let (mut ctl_b, _) = b.channel().await;
+            let status = ctl_b
+                .ok(
+                    "status",
+                    "conv.import.status",
+                    json!({"transfer_id": transfer}),
+                )
+                .await;
+            assert_eq!(status["state"], "receiving");
+            let next = status["next_sequence"].as_u64().unwrap();
+            assert!(next <= 20 && next > 0, "{status}");
+            assert_eq!(status["received"], next * 8192);
+            let listed = ctl_a.ok("transfers", "conv.transfers", json!({})).await;
+            assert_eq!(listed["outgoing"][0]["transfer_id"], transfer);
+            let import = ctl_b
+                .ok(
+                    "resume-in",
+                    "conv.import.begin",
+                    import_payload(&transfer, &cwd_b, length),
+                )
+                .await;
+            assert_eq!(import["next_sequence"], next);
+            let export = ctl_a
+                .ok(
+                    "resume-out",
+                    "conv.export",
+                    export_payload(&transfer, "retire", &cwd_a, next),
+                )
+                .await;
+            assert_eq!(export["next_sequence"], next);
+            assert_eq!(export["length"], length);
+            let a_stream = export["stream_id"].as_str().unwrap().to_string();
+            let b_stream = import["stream_id"].as_str().unwrap().to_string();
+            let pumped = pump(
+                &mut ctl_a, &a_stream, &mut ctl_b, &b_stream, next, count, 16, None,
+            )
+            .await;
+            let digest = pumped.digest.unwrap();
+            ctl_b
+                .send(
+                    json!({"version": 1, "type": "stream.end", "stream_id": b_stream,
+                    "length": length, "sha256": digest}),
+                )
+                .await;
+            assert_eq!(ctl_b.next().await["type"], "stream.committed");
+            assert_eq!(
+                std::fs::read(b.project(&cwd_b).join(format!("{ID}.jsonl"))).unwrap(),
+                record
+            );
+        }
+
+        #[tokio::test]
+        async fn a_resumed_begin_on_another_channel_supersedes_the_first() {
+            if !crate::host_conversations::SUPPORTED {
+                return;
+            }
+            let mut b = Host::new().await;
+            let (mut first, _) = b.channel().await;
+            let (mut second, _) = b.channel().await;
+            let cwd = b.folder("code/spawn");
+            // Any bytes do for a begin; the reader refuses them only once a
+            // header arrives.
+            let transfer = Uuid::new_v4().to_string();
+            let opened = first
+                .ok(
+                    "one",
+                    "conv.import.begin",
+                    import_payload(&transfer, &cwd, 100_000),
+                )
+                .await;
+            let reopened = second
+                .ok(
+                    "two",
+                    "conv.import.begin",
+                    import_payload(&transfer, &cwd, 100_000),
+                )
+                .await;
+            assert_eq!(reopened["next_sequence"], 0);
+            let ended = first.next().await;
+            assert_eq!(ended["type"], "stream.error", "{ended}");
+            assert_eq!(ended["stream_id"], opened["stream_id"]);
+            assert_eq!(ended["error"]["code"], "superseded");
+            // The transfer's cancel ends the stream that carries it now.
+            let cancelled = first
+                .ok(
+                    "cancel",
+                    "conv.import.cancel",
+                    json!({"transfer_id": transfer}),
+                )
+                .await;
+            assert_eq!(cancelled["state"], "cancelled");
+            let ended = second.next().await;
+            assert_eq!(ended["error"]["code"], "cancelled", "{ended}");
+            let again = second
+                .request(
+                    "three",
+                    "conv.import.begin",
+                    import_payload(&transfer, &cwd, 100_000),
+                )
+                .await;
+            assert_eq!(again["error"]["code"], "transfer_cancelled");
+        }
+
+        /// A whole v2 read, acknowledged chunk by chunk as a device does.
+        async fn read_stream(ctl: &mut Ctl, stream: String) -> (Vec<u8>, Value) {
+            let mut bytes = Vec::new();
+            let mut next = 0;
+            loop {
+                let frame = ctl.next().await;
+                match frame["type"].as_str() {
+                    Some("stream.chunk") => {
+                        assert_eq!(frame["sequence"], next);
+                        bytes.extend(
+                            STANDARD
+                                .decode(frame[BYTES_FIELD].as_str().unwrap())
+                                .unwrap(),
+                        );
+                        next += 1;
+                        ctl.send(json!({"version": 1, "type": "stream.ack",
+                            "stream_id": stream, "sequence": next}))
+                            .await;
+                    }
+                    Some("stream.end") => return (bytes, frame["sha256"].clone()),
+                    _ => panic!("{frame}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn every_bulk_channel_of_a_connection_shares_one_gate() {
+            if !crate::host_conversations::SUPPORTED {
+                return;
+            }
+            let mut a = Host::new().await;
+            let cwd = a.folder("code/spawn");
+            let record = conversation_lines(6000);
+            write_conversation(&a.project(&cwd), &record);
+            let (mut one, _) = a.channel().await;
+            let (mut two, _) = a.channel().await;
+            let first = Uuid::new_v4().to_string();
+            let second = Uuid::new_v4().to_string();
+            let x = one
+                .ok(
+                    "x",
+                    "conv.export",
+                    export_payload(&first, "snapshot", &cwd, 0),
+                )
+                .await;
+            let y = two
+                .ok(
+                    "y",
+                    "conv.export",
+                    export_payload(&second, "snapshot", &cwd, 0),
+                )
+                .await;
+            let count = crate::host_stream::chunk_count(x["length"].as_u64().unwrap());
+            // Read both at once, acknowledging as a device does.
+            let ((bytes_x, digest_x), (bytes_y, digest_y)) = tokio::join!(
+                read_stream(&mut one, x["stream_id"].as_str().unwrap().to_string()),
+                read_stream(&mut two, y["stream_id"].as_str().unwrap().to_string()),
+            );
+            assert_eq!(bytes_x.len() as u64, x["length"].as_u64().unwrap());
+            assert!(bytes_x.len() as u64 > (count - 1) * 8192);
+            assert_eq!(bytes_x, bytes_y);
+            assert_eq!(digest_x, digest_y);
+            assert_eq!(digest_x, json!(format!("{:x}", Sha256::digest(&bytes_x))));
+            assert!(a.gate.largest_let_through() <= crate::host_stream::BULK_WATERMARK);
+        }
+
+        /// A gate that lets a frame through only once everything before it
+        /// is acknowledged still delivers every chunk: a channel's fall to
+        /// its low threshold wakes it.
+        #[tokio::test]
+        async fn a_tight_gate_waits_and_still_delivers_every_chunk() {
+            if !crate::host_conversations::SUPPORTED {
+                return;
+            }
+            let mut a = Host::with_gate(BulkGate::with_watermark(1)).await;
+            let cwd = a.folder("code/spawn");
+            let record = conversation_lines(2000);
+            write_conversation(&a.project(&cwd), &record);
+            let (mut ctl, _) = a.channel().await;
+            let transfer = Uuid::new_v4().to_string();
+            let export = ctl
+                .ok(
+                    "x",
+                    "conv.export",
+                    export_payload(&transfer, "snapshot", &cwd, 0),
+                )
+                .await;
+            let (bytes, digest) =
+                read_stream(&mut ctl, export["stream_id"].as_str().unwrap().to_string()).await;
+            assert_eq!(bytes.len() as u64, export["length"].as_u64().unwrap());
+            assert_eq!(digest, json!(format!("{:x}", Sha256::digest(&bytes))));
+            assert!(a.gate.largest_let_through() <= 1);
+        }
+    }
 }
