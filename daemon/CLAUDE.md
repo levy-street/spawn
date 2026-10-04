@@ -47,7 +47,11 @@ src/
                  by proto/claude-project-folder.json; reading stays with
                  host_files.rs; host_conv.rs answers `conv.inspect` from a
                  window's process tree and Claude Code's live-session
-                 registry, and executes nothing), codex_home.rs (a skilled
+                 registry, and executes nothing; host_conversations.rs is
+                 the conversation carrier, `conv.v2` — see "Carrying a
+                 conversation" — on host_stream.rs, the stream v2 rules
+                 and each association's bulk gate, and host_bundle.rs, the
+                 conversation bundle v1 format), codex_home.rs (a skilled
                  window's own CODEX_HOME, reconciled against the user's — see
                  "A skilled window's home"), upload.rs, sessions.rs,
                  service.rs + service/ (launchd/systemd dispatch, Windows Task
@@ -103,6 +107,9 @@ vendor/          exact upstream crate sources for narrowly documented patches;
   operation: only a channel admitted through an authenticated device pair
   (`rtc_pair.rs`) answers it, and a legacy protocol-1 host channel, which has
   no device behind it, refuses it with `pair_required` and never advertises it.
+- A bulk transfer on `spawn.host.ctl`: stream v2 (`host_stream.rs`), never a
+  flow-control scheme of its own. Its chunks go out through the pair's
+  `BulkGate` and are published by `host_control.rs` like every other frame.
 - Anything both binaries need: `sessiond/`; anything tests or the browser
   need too: the `lib.rs` surface.
 - Wire changes: daemon frames must stay compatible with
@@ -496,6 +503,61 @@ connection's, since peers keep opening and closing through a server outage
 leak — of slots, or of peers that never finish closing — shows while it is
 one peer. Never write the state file from the RTC path: that write is an
 fsync, and the offer path waits on the locks it would run under.
+
+## Carrying a conversation
+
+`conv.v2` (`host_conversations.rs`) lets a device move one Claude Code
+conversation between two of its hosts: `conv.export` streams a conversation
+bundle (`host_bundle.rs`, `proto/README.md`) out of the source over one host
+channel and `conv.import.begin` writes it into the target over another, on
+stream v2. It is a family of its own because `conv.v1` already names
+`conv.inspect` on deployed daemons, and it is answered only on pair-admitted
+channels of Linux and macOS daemons; Windows does not advertise it until
+spike S5 proves cross-OS resume. Nothing is executed, and the server sees
+none of it.
+
+- **The source is the fence.** `conv.export {mode:"retire"}` refuses with
+  `conversation_live_elsewhere` while a live record or background-roster
+  worker outside the window holds the conversation (`host_conv::holders`),
+  then stops the window through the pair's stop closure (`rtc_pair.rs`,
+  `stop_window`: TERM then KILL through `shutdown_if_current`, the exit
+  forwarder reporting `session.exit` as for any stop), signals every Claude
+  process of the window itself (a pidfd on Linux, so a recycled pid is never
+  signalled) and confirms each gone by pid and start, checks again, and only
+  then moves every copy of the conversation out of Claude's lookup path into
+  `<config>/conversations/outgoing/<transfer>/`. The record is written before
+  any file moves and the bundle is declared once, so a resume after a crash
+  or a lost channel reads the same bytes.
+- **The target chooses every name.** An import stages raw bytes in
+  `incoming/<transfer>/`, checks them as they arrive, verifies every entry
+  and the whole digest again at `stream.end`, extracts 0600/0700 with every
+  file and folder synced, marks the transfer `committing`, sets any other
+  copy of the conversation aside under `superseded/<transfer>/` (never
+  overwritten, never deleted), and renames the sidecar and then the record
+  into Claude's folder for the canonical cwd. From `committing` on it can only
+  commit; a status, begin or cancel that finds it finishes it first.
+- **One lock per transfer** (`Slot`) decides commit against cancel, and a
+  resumed begin or export supersedes the stream that carried the transfer,
+  on whatever channel: a chunk on a superseded stream is refused, and its
+  channel hears `superseded`. Tombstones (`imported/`, `cancelled/`,
+  `aborted/`) make each outcome final across restarts.
+- `conv.retire.commit` moves the holding to `retired/` (kept 30 days) only
+  for the length and digest the target committed; `conv.retire.abort` puts
+  every copy back, sidecar first, never over anything. An unresolved
+  `outgoing/` is never collected; only a device resolves a move
+  (`conv.transfers` lists what is open).
+- **Bulk is paced per association.** `PairContext` owns one `BulkGate`; every
+  v2 stream's chunks go through it, one at a time and in turn, only while the
+  bulk channels together buffer at most 32 KiB, so terminal echo always has
+  most of the 128 KiB SCTP queue. A v2 write is acknowledged when the
+  receiver catches up with its queue, on its last chunk, and never later than
+  half the window.
+
+`scripts/check-no-server-agent-upload.sh` pins the three modules: no
+transport, nothing executed, a gate that never publishes, a format that
+never touches a file, and the carrier reaching only the file capability,
+spawnd's config and private files, the read-only inspector and the two
+format modules.
 
 ## A skilled window's home
 

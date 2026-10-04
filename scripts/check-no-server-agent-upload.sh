@@ -230,8 +230,19 @@ if control.count(expected_control_imports) != 1:
 # registry. It is handed only a pid resolver for the device's windows, never
 # the session registry, and is pinned below to depend on nothing crate-local
 # and to execute nothing.
+# host_conversations, host_stream and host_bundle (2026-10-04) are the
+# conversation carrier (conv.v2): a device carries one conversation's own
+# files between two of its hosts over two host channels, as stream v2 frames
+# host_control publishes through host_direct like every other read or write.
+# The carrier is handed a pid resolver, a stop for one window, the
+# association's bulk gate and its own paths, never the session registry or a
+# transport; it is pinned below to reach only the file capability, spawnd's
+# config and private files, the read-only inspector and the two format
+# modules, and to execute nothing. host_stream only measures and waits (the
+# bulk gate never publishes) and host_bundle is pure byte rules.
 if set(re.findall(r"crate::(\w+)", control)) != {
     "host_conv",
+    "host_conversations",
     "host_desktop",
     "host_direct",
     "host_files",
@@ -239,6 +250,7 @@ if set(re.findall(r"crate::(\w+)", control)) != {
     "host_mime",
     "host_preview",
     "host_signal",
+    "host_stream",
     "host_transcripts",
 }:
     raise SystemExit("no-server-agent-upload: protected host-control gained an unreviewed crate dependency")
@@ -274,6 +286,46 @@ if re.search(
     conv_runtime,
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector may not execute anything")
+carrier_test_modules = {
+    "host_conversations": "#[cfg(all(test, unix))]\nmod tests {",
+    "host_stream": "#[cfg(test)]\nmod tests {",
+    "host_bundle": "#[cfg(test)]\nmod tests {",
+}
+carrier_sources = {}
+for name, marker in carrier_test_modules.items():
+    with open(os.path.join(root, f"daemon/src/{name}.rs"), encoding="utf-8") as source:
+        text = source.read()
+    if text.count(marker) != 1:
+        raise SystemExit(f"no-server-agent-upload: {name} lost its single test-module boundary")
+    carrier_sources[name] = text.split(marker)[0]
+if set(re.findall(r"crate::(\w+)", carrier_sources["host_conversations"])) != {
+    "config",
+    "host_bundle",
+    "host_conv",
+    "host_files",
+    "host_stream",
+    "host_transcripts",
+    "platform",
+}:
+    raise SystemExit("no-server-agent-upload: conversation carrier gained an unreviewed crate dependency")
+for name in ("host_stream", "host_bundle"):
+    if set(re.findall(r"crate::(\w+)", carrier_sources[name])):
+        raise SystemExit(f"no-server-agent-upload: {name} gained a crate dependency")
+for name, runtime in carrier_sources.items():
+    if re.search(
+        r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|tungstenite|TcpStream|UdpSocket|mpsc)\b",
+        runtime,
+    ):
+        raise SystemExit(f"no-server-agent-upload: {name} gained a transport")
+    if re.search(
+        r"process::Command|\bCommand::new\b|\b(?:posix_spawnp?|execv[pe]*|execl[pe]*|fexecve|v?fork|system)\s*\(",
+        runtime,
+    ):
+        raise SystemExit(f"no-server-agent-upload: {name} may not execute anything")
+if re.search(r"\bsend_text\b|\bsend\s*\(\s*&", carrier_sources["host_stream"]):
+    raise SystemExit("no-server-agent-upload: the bulk gate may measure and wait, never publish")
+if re.search(r"\bstd::fs\b|\bcap_std\b|\bFile\b", carrier_sources["host_bundle"]):
+    raise SystemExit("no-server-agent-upload: the bundle format may not touch a file")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
@@ -292,7 +344,7 @@ expected_control_exports = [
     dc: Arc<RTCDataChannel>,
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
-    pair: Option<crate::host_conv::WindowShells>,
+    pair: Option<crate::host_conversations::PairWindows>,
 ) -> Arc<Lifetime> {""",
 ]
 control_exports = list(
@@ -311,9 +363,12 @@ if len(control_exports) != len(expected_control_exports) or any(
 # this or another module, just as it does for HostConnectedSignal. Reviewed
 # 2026-10-03: Context gained `pair`, the pid resolver for a pair-admitted
 # channel's windows (host_conv::WindowShells); it publishes nothing.
+# Reviewed 2026-10-04: `pair` became host_conversations::PairWindows — that
+# resolver, a stop for one window being retired, and the association's bulk
+# gate; it publishes nothing either.
 lifetime_block = control[control.index("struct Context {"):control.index("impl Context {")]
 if hashlib.sha256(lifetime_block.encode()).hexdigest() != (
-    "8d64655df14d5488df14884d0d56c91d1f51f0f6ccbd1e8c3d9ab70e5943a908"
+    "7bd313f444fe8d6672e9e09b87cfeb9d2d22399518ebf05cb4f66745756fdb26"
 ):
     raise SystemExit("no-server-agent-upload: protected host retirement capability changed")
 if control.count("connected_signal: HostConnectedSignal") != 1:
@@ -710,6 +765,9 @@ self_test() {
   cp "$source_root/daemon/src/host_transcripts.rs" "$fixture/daemon/src/host_transcripts.rs"
   cp "$source_root/daemon/src/config.rs" "$fixture/daemon/src/config.rs"
   cp "$source_root/daemon/src/host_conv.rs" "$fixture/daemon/src/host_conv.rs"
+  cp "$source_root/daemon/src/host_conversations.rs" "$fixture/daemon/src/host_conversations.rs"
+  cp "$source_root/daemon/src/host_stream.rs" "$fixture/daemon/src/host_stream.rs"
+  cp "$source_root/daemon/src/host_bundle.rs" "$fixture/daemon/src/host_bundle.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
   printf '%s\n' \
@@ -1006,6 +1064,28 @@ self_test() {
   fi
   printf '%s\n' '    reason="agent uploads belong on spawn.ctl"' \
     >>"$fixture/server/spawn_server/ws/browser.py"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  # The conversation carrier's pins: no execution, no transport, a gate that
+  # never publishes, a format that never touches a file, no new dependency.
+  local carrier_case carrier_file carrier_line carrier_original
+  for carrier_case in \
+    'host_conversations|fn sneaky() { let _ = std::process::Command::new("sh"); }' \
+    'host_conversations|fn sneaky(out_tx: ()) { let _ = out_tx; }' \
+    'host_conversations|fn sneaky() { let _ = crate::ws::anything; }' \
+    'host_stream|async fn sneaky(dc: &RTCDataChannel) { let _ = dc.send_text(String::new()).await; }' \
+    'host_stream|fn sneaky() { let _ = crate::host_files::MAX_FILE_BYTES; }' \
+    'host_bundle|fn sneaky() { let _ = std::fs::read("x"); }'; do
+    carrier_file="$fixture/daemon/src/${carrier_case%%|*}.rs"
+    carrier_line="${carrier_case#*|}"
+    carrier_original="$(<"$carrier_file")"
+    printf '%s\n' "$carrier_line" "$carrier_original" >"$carrier_file"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: carrier pin passed %s\n' "$carrier_case" >&2
+      return 1
+    fi
+    printf '%s\n' "$carrier_original" >"$carrier_file"
+  done
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   mkdir -p "$fixture/bin"

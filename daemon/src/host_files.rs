@@ -516,6 +516,9 @@ pub(crate) enum HostOperationKind {
     WriteCommit,
     ReadRange,
     Preview,
+    /// The conversation carrier's own filesystem work (`host_conversations`),
+    /// which keeps its own durable records rather than this effect fence.
+    Conversation,
     #[cfg(target_os = "macos")]
     Desktop,
 }
@@ -619,8 +622,8 @@ pub(crate) struct WriteLifecycleTestHooks {
     shutdown_started: Notify,
     shutdown_returned: Notify,
     write_delay_entered: Notify,
-    blocking: [BlockingPause; 11],
-    effect_boundary: [BlockingPause; 11],
+    blocking: [BlockingPause; 12],
+    effect_boundary: [BlockingPause; 12],
     temporary_cleanup: BlockingPause,
     read_hashing: BlockingPause,
 }

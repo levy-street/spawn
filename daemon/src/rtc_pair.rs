@@ -19,6 +19,10 @@ pub(super) struct PairContext {
     restart: Mutex<()>,
     retired: AtomicBool,
     host_channels: std::sync::Mutex<Vec<Weak<crate::host_control::Lifetime>>>,
+    /// One per association: every bulk stream on this device's connection
+    /// is paced through it (`host_stream::BulkGate`), whichever channel it
+    /// runs on, so bulk never fills the SCTP queue terminals share.
+    bulk: Arc<crate::host_stream::BulkGate>,
 }
 
 impl PairContext {
@@ -119,6 +123,60 @@ async fn reject_channel(dc: &Arc<RTCDataChannel>) {
     }
 }
 
+/// Stop a window whose conversation a device is retiring, the way a kill
+/// does: the worker signals its shell's process group (TERM, then KILL),
+/// each delivery revalidated against the registry generation under its
+/// transition lock, and the exit forwarder removes the entry and reports
+/// `session.exit` as for any stop. The window's Claude processes, which sit
+/// in a process group of their own, are the carrier's to stop and confirm.
+async fn stop_window(
+    registry: &SessionRegistry,
+    session_id: Uuid,
+) -> crate::host_conversations::WindowStop {
+    use crate::host_conversations::WindowStop;
+    use spawnd::sessiond::wire::LifecycleSignal;
+    let Some(snapshot) = registry.lifecycle_snapshot(session_id) else {
+        return if crate::worker_backend::socket_exists(session_id) {
+            WindowStop::Unavailable
+        } else {
+            WindowStop::NotRunning
+        };
+    };
+    let binding = snapshot.binding();
+    let gone = |deadline: Duration| async move {
+        let deadline = tokio::time::Instant::now() + deadline;
+        loop {
+            if !registry.is_current(binding) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    if let Err(error) = registry
+        .shutdown_if_current(&snapshot, LifecycleSignal::Term)
+        .await
+    {
+        tracing::debug!(%session_id, %error, "retire TERM not delivered");
+    }
+    if gone(Duration::from_millis(1500)).await {
+        return WindowStop::Stopped;
+    }
+    if let Err(error) = registry
+        .shutdown_if_current(&snapshot, LifecycleSignal::Kill)
+        .await
+    {
+        tracing::debug!(%session_id, %error, "retire KILL not delivered");
+    }
+    if gone(Duration::from_secs(5)).await {
+        WindowStop::Stopped
+    } else {
+        WindowStop::Lingering
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct AttachmentLabel {
     session: Uuid,
@@ -183,6 +241,7 @@ impl RtcSessions {
             restart: Mutex::new(()),
             retired: AtomicBool::new(false),
             host_channels: std::sync::Mutex::new(Vec::new()),
+            bulk: crate::host_stream::BulkGate::new(),
         });
         if let Err(error) = self
             .create_host_answer(
@@ -382,11 +441,22 @@ impl RtcSessions {
                     }
                     live.insert(label.to_string(), Arc::downgrade(&dc));
                     // An authenticated device: its channels may ask about
-                    // the windows it can already see, and only that much of
-                    // the registry is handed over.
+                    // the windows it can already see, and stop one whose
+                    // conversation it is moving; only that much of the
+                    // registry is handed over.
                     let registry = pair.registry.clone();
-                    let windows =
+                    let shells =
                         crate::host_conv::WindowShells::new(move |id| registry.shell_pid(id));
+                    let registry = pair.registry.clone();
+                    let windows = crate::host_conversations::PairWindows::new(
+                        shells,
+                        move |id| {
+                            let registry = registry.clone();
+                            Box::pin(async move { stop_window(&registry, id).await })
+                        },
+                        Arc::clone(&pair.bulk),
+                        crate::host_conversations::Places::from_env(crate::run::login_shell_name),
+                    );
                     pair.register_host(install_host_control_channel(
                         dc,
                         signal_id,
@@ -1497,6 +1567,7 @@ mod tests {
             restart: Mutex::new(()),
             retired: AtomicBool::new(false),
             host_channels: std::sync::Mutex::new(Vec::new()),
+            bulk: crate::host_stream::BulkGate::new(),
         });
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),

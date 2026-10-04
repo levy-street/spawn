@@ -3313,6 +3313,18 @@ async fn prime_macos_permissions_once() {
 
 /// The user's login shell: `$SHELL` from the daemon's environment when it
 /// names an executable file, else the platform default.
+/// The login shell this daemon's windows start, by name alone (`bash`,
+/// `zsh`, `pwsh.exe`): what a device needs to quote a line for it.
+pub(crate) fn login_shell_name() -> String {
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let shell = resolve_login_shell(&env);
+    Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&shell)
+        .to_string()
+}
+
 fn resolve_login_shell(env: &BTreeMap<String, String>) -> String {
     #[cfg(unix)]
     if let Some(shell) = env_get_ci(env, "SHELL").map(|value| value.trim()) {
