@@ -505,7 +505,9 @@ pub(crate) fn still_running(holder: &Holder, table: &dyn ProcessTable) -> bool {
 }
 
 /// Whether `holder` is exactly the process seen: alive, and started when it
-/// was first seen. Only such a process is ever signalled.
+/// was first seen. Only such a process is ever signalled (and only where the
+/// carrier signals at all).
+#[cfg(unix)]
 pub(crate) fn is_same_process(holder: &Holder, table: &dyn ProcessTable) -> bool {
     table.alive(holder.pid)
         && holder

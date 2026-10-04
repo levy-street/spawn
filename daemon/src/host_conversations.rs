@@ -922,6 +922,7 @@ fn ensure_dir(parent: &Dir, name: &OsStr) -> FsResult<Dir> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(nofollow(error)),
     }
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = DirBuilder::new();
     #[cfg(unix)]
     {
