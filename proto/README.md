@@ -1823,9 +1823,8 @@ anything holds the conversation, leaving the transfer for an abort. One
 move of a conversation at a time, whatever transfer carries it: a second
 waits for the first to have its record, then fails with
 `transfer_unresolved`, naming it, before anything of its own stops. With
-several copies,
-the one in the window's folder (`cwd`) travels and all leave the lookup path;
-without it, `conversation_ambiguous`. A repeated export with the same
+several copies, the one in the window's folder (`cwd`) travels and all leave
+the lookup path; without it, `conversation_ambiguous`. A repeated export with the same
 `transfer_id` — and `from_sequence` — resumes the same bytes, on any channel,
 superseding the stream that had it.
 
@@ -1836,8 +1835,8 @@ with the same declaration it resumes (`resume_mismatch` otherwise). The
 device forwards the export's `mode` as it forwards its digest, and a target
 imports only what a retire carried: `mode:"snapshot"` is refused with
 `unsupported_operation`, and anything else, or no mode, with
-`invalid_request`. One channel carries at
-most two imports at once (`too_many_streams`): each may have a full window
+`invalid_request`. One channel carries at most two imports at once
+(`too_many_streams`): each may have a full window
 queued, and the channel's 64-frame normal queue keeps room for everything
 else, so a device opens a consumer channel per transfer. The target refuses a
 folder it does not have (`folder_missing`), one outside home
@@ -1854,8 +1853,8 @@ placing the carried record where it writes, would give the conversation two
 writers. A commit refused that way keeps its staging; a resumed begin then
 answers `next_sequence` at the chunk count, and its `stream.end` commits once
 nothing holds the conversation. A transfer already decided (`committing`)
-rolls forward only then. At `stream.end` it verifies every
-entry and the whole digest again, extracts the files 0600 and their folders
+rolls forward only then. At `stream.end` it verifies every entry and the
+whole digest again, extracts the files 0600 and their folders
 0700, syncs each, sets every other copy of the conversation aside (never
 overwriting, never deleting one), renames the sidecar and then the record
 into place, and answers `stream.committed {stream_id, length, sha256,
@@ -1876,9 +1875,9 @@ only once the target has answered `cancelled`. Commit and abort are each
 final; the other then fails with `transfer_committed` or `transfer_aborted`.
 `conv.transfers {}` lists what is unfinished on this host —
 `{outgoing:[{transfer_id, conversation_id, session_id, to_host_id, state
-(moving, held or stranded), created_at, length, sha256}], incoming:[{transfer_id, conversation_id,
-from_host_id, state, received, next_sequence, length, created_at}],
-truncated}` — so any device can resolve a move another one started: it asks
+(moving, held or stranded), created_at, length, sha256}],
+incoming:[{transfer_id, conversation_id, from_host_id, state, received,
+next_sequence, length, created_at}], truncated}` — so any device can resolve a move another one started: it asks
 the outgoing transfer's `to_host_id` — never another host, and never on the
 strength of an answer it could not get — and a committed import there commits
 the retire, while anything else cancels the import there and, once that host
