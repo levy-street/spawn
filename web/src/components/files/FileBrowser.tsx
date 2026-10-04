@@ -1077,6 +1077,9 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
         body: copy.body,
         confirmLabel: copy.confirmLabel,
         destructive: true,
+        // Back to the list either way, even when a row's menu asked and has
+        // gone with its item: Delete and the arrows work again at once.
+        returnFocus: () => listRef.current?.element,
       }).finally(() => {
         deletingRef.current = false;
       });

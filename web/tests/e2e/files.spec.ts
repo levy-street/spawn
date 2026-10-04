@@ -407,6 +407,71 @@ test("several rows are picked with the platform's keys and deleted together", as
     .toEqual(["/Users/tester/a.txt", "/Users/tester/c.txt", "/Users/tester/d.txt"]);
 });
 
+test("the keyboard stays in the list when a delete is cancelled, and when it is confirmed", async ({
+  page,
+}) => {
+  const deletes: string[] = [];
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await mockApp(page, {
+    files: () => home([{ name: "a.txt" }, { name: "b.txt" }, { name: "c.txt" }, { name: "d.txt" }]),
+    fileDelete: async (_h, body, route) => {
+      await held;
+      deletes.push((body as { path: string }).path);
+      await route.fulfill({ status: 200, json: { path: (body as { path: string }).path } });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const grid = page.getByRole("grid", { name: "Files" });
+  await item(page, "a.txt").click();
+  await item(page, "b.txt").click({ modifiers: ["Shift"] });
+  await expect(grid).toBeFocused();
+
+  // Cancel: the keyboard is back where it was, and Delete asks again.
+  await page.keyboard.press("Delete");
+  const dialog = page.getByRole("dialog", { name: "Delete 2 items permanently?" });
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(grid).toBeFocused();
+  await page.keyboard.press("Delete");
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(grid).toBeFocused();
+
+  // From a row's menu, whose item goes with the menu: the list, not the page.
+  await item(page, "c.txt").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Delete permanently…" }).click();
+  await page
+    .getByRole("dialog", { name: "Delete “c.txt” permanently?" })
+    .getByRole("button", { name: "Cancel" })
+    .click();
+  await expect(grid).toBeFocused();
+  await page.keyboard.press("ArrowDown");
+  await expect(item(page, "d.txt")).toHaveAttribute("aria-selected", "true");
+
+  // Confirmed: the list has the keyboard while the host works, and after.
+  await item(page, "a.txt").click();
+  await page.keyboard.press("Delete");
+  await page
+    .getByRole("dialog", { name: "Delete “a.txt” permanently?" })
+    .getByRole("button", { name: "Delete permanently" })
+    .click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Deleting “a.txt” on Mac…" }),
+  ).toBeVisible();
+  await expect(grid).toBeFocused();
+  release();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Deleted “a.txt” on Mac" }),
+  ).toBeVisible();
+  await expect(grid).toBeFocused();
+  expect(deletes).toEqual(["/Users/tester/a.txt"]);
+});
+
 test("in the tree, deleting a folder with things inside it picked asks for the folder alone", async ({
   page,
 }) => {
