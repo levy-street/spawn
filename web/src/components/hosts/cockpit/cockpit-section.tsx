@@ -44,23 +44,36 @@ export function CockpitSection({
   );
 }
 
-/** A labelled fact: a mono caps caption over its value. */
+/**
+ * A labelled fact: a mono caps caption over its value. A value cut short
+ * keeps the whole of it in a tooltip; one that must be read whole wherever it
+ * is — a figure on a phone, which has no tooltip to show — wraps instead.
+ */
 export function Fact({
   label,
   value,
   mono = false,
+  wrap = false,
 }: {
   label: string;
   value: ReactNode;
   mono?: boolean;
+  wrap?: boolean;
 }) {
-  const title = typeof value === "string" ? value : undefined;
+  const title = !wrap && typeof value === "string" ? value : undefined;
   return (
     <div className="min-w-0">
       <dt className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
         {label}
       </dt>
-      <dd className={cn("mt-0.5 truncate", mono && "font-mono text-xs leading-5")} title={title}>
+      <dd
+        className={cn(
+          "mt-0.5",
+          wrap ? "break-words" : "truncate",
+          mono && "font-mono text-xs leading-5",
+        )}
+        title={title}
+      >
         {value}
       </dd>
     </div>

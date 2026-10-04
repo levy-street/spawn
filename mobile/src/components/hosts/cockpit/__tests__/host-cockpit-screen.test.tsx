@@ -400,6 +400,25 @@ describe("host cockpit", () => {
     expect(retry).toHaveBeenCalledTimes(1);
   });
 
+  test("a changed identity says the host is blocked, with nothing to retry", async () => {
+    // Every connection is refused, so the transport keeps trying and failing.
+    useConnectionStore.setState({
+      hostTransports: { [onlineHost.id]: "reconnecting" },
+      hostsSeenReady: { [onlineHost.id]: true },
+      hostRetries: { [onlineHost.id]: jest.fn() },
+    });
+    mockUseHostIdentityConflictQuery.mockReturnValue(mockQuery(true));
+    await renderCockpit();
+
+    expect(screen.getByTestId("host-identity-conflict")).toBeOnTheScreen();
+    expect(screen.getByText("Blocked · identity changed")).toBeOnTheScreen();
+    expect(screen.queryByText("Reconnecting…")).toBeNull();
+    expect(screen.queryByTestId("host-reconnect")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: `Retry connection to ${onlineHost.name}` }),
+    ).toBeNull();
+  });
+
   test("an offline host says when it was last seen", async () => {
     mockUseHostQuery.mockReturnValue(mockQuery({ ...offlineHost, last_seen_at: null }));
     await renderCockpit();

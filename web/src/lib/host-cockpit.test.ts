@@ -4,11 +4,13 @@ import type { Session, Workspace } from "@/lib/api";
 import {
   folderSubtitle,
   groupHostSessions,
+  type HostStatusLine,
   hostFolders,
   hostSessionGroupTitle,
   hostStatusLine,
   hostTabHref,
   hostTabSegment,
+  memoryFigure,
   possessedLabel,
   runningHere,
   serverInstant,
@@ -136,6 +138,21 @@ describe("hostStatusLine", () => {
     });
   });
 
+  test("a changed identity is blocked, not reconnecting, and offers no Retry", () => {
+    const blocked: HostStatusLine = {
+      text: "Blocked · identity changed",
+      tone: "blocked",
+      retry: false,
+      reason: null,
+    };
+    // What the connection says while every attempt is refused.
+    const refused = { state: "error" as const, error: "Can't reach dream from this device." };
+    expect(hostStatusLine(dream, refused, true)).toEqual(blocked);
+    expect(hostStatusLine(dream, { state: "connecting", error: null }, true)).toEqual(blocked);
+    expect(hostStatusLine({ ...dream, status: "offline" }, null, true)).toEqual(blocked);
+    expect(hostStatusLine(dream, refused, false).text).toBe("Reconnecting…");
+  });
+
   test("offline is the server's word, whatever this device holds", () => {
     const offline = { ...dream, status: "offline", last_seen_at: null };
     expect(hostStatusLine(offline, { state: "ready", error: null })).toEqual({
@@ -148,6 +165,15 @@ describe("hostStatusLine", () => {
     expect(hostStatusLine({ ...offline, last_seen_at: seen }, null).text).toBe(
       "Offline · last seen 3h ago",
     );
+  });
+});
+
+describe("memoryFigure", () => {
+  test("keeps each amount on one line, so a narrow Right now wraps between them", () => {
+    const GB = 1024 ** 3;
+    expect(memoryFigure(89 * GB, 125 * GB)).toBe("89\u00a0GB of 125\u00a0GB");
+    expect(memoryFigure(0, 16 * GB)).toBe("0\u00a0B of 16\u00a0GB");
+    expect(memoryFigure(5 * GB, 0)).toBeNull();
   });
 });
 

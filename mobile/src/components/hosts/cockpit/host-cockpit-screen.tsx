@@ -284,7 +284,9 @@ export function HostCockpitScreen({ hostId, tab }: HostCockpitScreenProps): Reac
         },
       ]}
       onBack={router.back}
-      {...(host === undefined ? {} : { subtitle: cockpitStatusLine(host, live.status) })}
+      {...(host === undefined
+        ? {}
+        : { subtitle: cockpitStatusLine(host, live.status, identityConflict) })}
       title={host?.name ?? "Host"}
     />
   );
@@ -354,7 +356,9 @@ export function HostCockpitScreen({ hostId, tab }: HostCockpitScreenProps): Reac
             />
           </View>
         ) : null}
-        {live.status.reconnecting ? (
+        {/* Under a changed identity no retry gets through: the panel above
+            says what does, and nothing here offers one. */}
+        {live.status.reconnecting && !identityConflict ? (
           <View style={styles.reconnect} testID="host-reconnect">
             <Text color="warning" numberOfLines={2} style={styles.reconnectLabel} variant="caption">
               {live.status.label}

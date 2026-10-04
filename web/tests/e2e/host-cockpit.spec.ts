@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import {
+  DEFAULT_HOST_CAPABILITIES,
   fileEntry,
   fileListing,
   HOST_ID,
@@ -62,6 +63,48 @@ test("a host's page is its sections, each at its own address", async ({ page }) 
   await expect(page.getByRole("grid", { name: "Files" })).toBeVisible();
   // The header carried over: one host name, one set of host actions.
   await expect(page.getByRole("button", { name: "Host actions" })).toHaveCount(1);
+});
+
+test("Right now reads whole at phone width: a figure wraps, never cut short", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const GB = 1024 ** 3;
+  await mockApp(page, {
+    hosts: [possessed],
+    capabilities: [...DEFAULT_HOST_CAPABILITIES, "host.metrics"],
+    hostMetrics: () => ({
+      sample: {
+        cpu_percent: 12,
+        memory_used_bytes: 89 * GB,
+        memory_total_bytes: 125 * GB,
+        load_one: 1.25,
+        uptime_seconds: 3 * 86_400 + 4 * 3_600,
+      },
+    }),
+  });
+  await page.goto(`/hosts/${HOST_ID}`);
+
+  const rightNow = page.getByRole("region", { name: "Right now" });
+  const figures = rightNow.locator("dd");
+  await expect(figures).toHaveText(["89 GB of 125 GB", "1.25", "3d 4h"]);
+  // Nothing is cut off: a phone has no tooltip to show the rest in.
+  for (const figure of await figures.all()) {
+    const { cut, title } = await figure.evaluate((element) => ({
+      cut: element.scrollWidth > element.clientWidth,
+      title: element.getAttribute("title"),
+    }));
+    expect(cut).toBe(false);
+    expect(title).toBeNull();
+  }
+  // Wrapped between its two amounts, not inside one.
+  const lines = await figures.first().evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    return new Set([...range.getClientRects()].map((rect) => Math.round(rect.top))).size;
+  });
+  expect(lines).toBeLessThanOrEqual(2);
+  const text = await figures.first().evaluate((element) => element.textContent ?? "");
+  expect(text).toBe("89\u00a0GB of 125\u00a0GB");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 });
 
 test("a folder on Overview opens in Files without going into the address", async ({ page }) => {

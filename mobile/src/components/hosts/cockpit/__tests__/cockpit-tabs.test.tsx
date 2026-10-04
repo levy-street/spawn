@@ -135,6 +135,11 @@ describe("host cockpit tabs", () => {
     expect(screen.getByLabelText("CPU 23%")).toBeOnTheScreen();
     // The browser's figures, each named: Memory, Load and Up.
     expect(screen.getByLabelText("Memory 12 GiB of 32 GiB")).toBeOnTheScreen();
+    // Read whole on a small phone: no line limit to cut it short, and it can
+    // only wrap between its two amounts.
+    const memory = screen.getByTestId("host-figure-memory");
+    expect(memory.props["children"]).toBe("12\u00a0GiB of 32\u00a0GiB");
+    expect(memory.props["numberOfLines"]).toBeUndefined();
     expect(screen.getByLabelText("Load 1.40")).toBeOnTheScreen();
     expect(screen.getByLabelText("Up 6d 0h")).toBeOnTheScreen();
     expect(screen.getByText("live")).toBeOnTheScreen();

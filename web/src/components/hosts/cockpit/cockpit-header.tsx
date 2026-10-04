@@ -72,7 +72,7 @@ export function CockpitHeader({
     () => connection?.getSnapshot() ?? null,
     () => null,
   );
-  const status = host ? hostStatusLine(host, snapshot) : null;
+  const status = host ? hostStatusLine(host, snapshot, identityBlocked) : null;
 
   const startRename = () => {
     if (!host) return;
@@ -203,7 +203,9 @@ export function CockpitHeader({
               className={cn(
                 "truncate font-mono text-[11px]",
                 status.retry && "shrink-0",
-                status.tone === "warning" ? "text-warning" : "text-muted-foreground",
+                status.tone === "warning" || status.tone === "blocked"
+                  ? "text-warning"
+                  : "text-muted-foreground",
               )}
             >
               {status.text}

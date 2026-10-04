@@ -20,10 +20,10 @@ import { cn } from "@/lib/utils";
 /**
  * The hover preview.
  *
- * Fixed width, capped height, and no pointer events — it must not be able to
- * capture the hover that opened it, cover the row's kebab, or swallow a click.
- * The cost is that nothing inside can be scrolled or selected, which is exactly
- * the line between this and the viewer dialog.
+ * Fixed width and capped height. It is placed beside or under its row, never
+ * on it (`previewPlacement`), so it cannot cover the row's kebab or a rename
+ * field's message. Inside, it can be scrolled and opened; anything more is
+ * the viewer dialog's.
  */
 export function FilePreviewCard({
   hostId,

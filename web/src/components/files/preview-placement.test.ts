@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { placeMenu } from "@/components/ui/menu-position";
 import {
   PREVIEW_CARD_WIDTH_PX,
   PREVIEW_TREE_RESERVE_PX,
@@ -34,11 +35,60 @@ describe("previewPlacement", () => {
     // The explorer as a full-width pane: nothing to its right at all, which
     // used to send the card flipping onto the sidebar.
     const panel = panelAt(650, 0, 1160);
-    const { anchor, overlay } = previewPlacement(row, panel, 1160);
+    const { anchor, overlay, side, maxWidth } = previewPlacement(row, panel, 1160);
     expect(overlay).toBe(true);
-    expect(anchor.right).toBe(panel.left + PREVIEW_TREE_RESERVE_PX);
-    // And what is left is still a card worth reading.
-    expect(panel.right - anchor.right).toBeGreaterThan(320);
+    expect(side).toBe("bottom");
+    expect(anchor.left).toBe(panel.left + PREVIEW_TREE_RESERVE_PX);
+    // And what is left is still a card worth reading, inside the panel.
+    expect(maxWidth).toBeGreaterThan(320);
+    expect(anchor.left + (maxWidth ?? 0)).toBeLessThanOrEqual(panel.right);
+  });
+
+  test("a card over its own panel never covers the row it describes", () => {
+    // The Files page at 1440x900: the card used to lie level with the row,
+    // over its ⋯ button (and a rename field's message under it).
+    const viewport = { width: 1440, height: 900 };
+    const panel = { top: 160, bottom: 870, left: 285, right: 1440 };
+    for (const top of [180, 224, 480, 700, 840]) {
+      const hovered = { top, bottom: top + 28, left: panel.left, right: panel.right };
+      const placement = previewPlacement(hovered, panel, viewport.width);
+      expect(placement.overlay).toBe(true);
+      const card = placeMenu({
+        anchor: placement.anchor,
+        menuWidth: Math.min(PREVIEW_CARD_WIDTH_PX, placement.maxWidth ?? Infinity),
+        menuHeight: 520,
+        align: "start",
+        side: placement.side,
+        viewportWidth: viewport.width,
+        viewportHeight: viewport.height,
+      });
+      const height = Math.min(520, card.maxHeight);
+      const clear = card.top >= hovered.bottom || card.top + height <= hovered.top;
+      expect({ top, clear }).toEqual({ top, clear: true });
+      // Edge to edge with it: no other row lies between the row and its card.
+      expect([hovered.bottom, hovered.top]).toContain(
+        card.top >= hovered.bottom ? card.top : card.top + height,
+      );
+      // Right of the strip of tree kept clear.
+      expect(card.left).toBeGreaterThanOrEqual(panel.left + PREVIEW_TREE_RESERVE_PX);
+    }
+  });
+
+  test("beside the panel the card is level with its row, and off it", () => {
+    const panel = panelAt(320, PREVIEW_CARD_WIDTH_PX + 40, 1440);
+    const placement = previewPlacement(row, panel, 1440);
+    expect(placement.side).toBe("right");
+    const card = placeMenu({
+      anchor: placement.anchor,
+      menuWidth: PREVIEW_CARD_WIDTH_PX,
+      menuHeight: 400,
+      align: "start",
+      side: placement.side,
+      viewportWidth: 1440,
+      viewportHeight: 900,
+    });
+    expect(card.left).toBeGreaterThanOrEqual(panel.right);
+    expect(card.top).toBe(row.top);
   });
 
   test("a panel too narrow to host a card goes beside itself instead", () => {

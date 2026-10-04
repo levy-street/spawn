@@ -4,6 +4,7 @@ import {
   cockpitTab,
   groupSessionsByWorkspace,
   hostFolders,
+  memoryFigure,
   runningHere,
   stepCockpitTab,
   windowBlockedReason,
@@ -70,14 +71,35 @@ describe("host cockpit model", () => {
 
   test("the status line says whether this device can reach the host now", () => {
     const now = Date.parse("2026-08-22T03:00:00Z");
-    expect(cockpitStatusLine(onlineHost, { reconnecting: false }, now)).toBe("Online");
-    expect(cockpitStatusLine(onlineHost, { reconnecting: true }, now)).toBe("Reconnecting…");
+    expect(cockpitStatusLine(onlineHost, { reconnecting: false }, false, now)).toBe("Online");
+    expect(cockpitStatusLine(onlineHost, { reconnecting: true }, false, now)).toBe("Reconnecting…");
     expect(
-      cockpitStatusLine({ ...onlineHost, status: "offline" }, { reconnecting: true }, now),
+      cockpitStatusLine({ ...onlineHost, status: "offline" }, { reconnecting: true }, false, now),
     ).toBe("Offline · last seen 3h ago");
     expect(
-      cockpitStatusLine({ status: "offline", last_seen_at: null }, { reconnecting: false }, now),
+      cockpitStatusLine(
+        { status: "offline", last_seen_at: null },
+        { reconnecting: false },
+        false,
+        now,
+      ),
     ).toBe("Offline · never connected");
+  });
+
+  test("the memory figure keeps each amount on one line, so it wraps between them", () => {
+    const GiB = 1024 ** 3;
+    expect(memoryFigure(89 * GiB, 125 * GiB)).toBe("89\u00a0GiB of 125\u00a0GiB");
+    expect(memoryFigure(5 * GiB, 0)).toBeNull();
+  });
+
+  test("a changed identity is blocked, not reconnecting, in the browser's words", () => {
+    const now = Date.parse("2026-08-22T03:00:00Z");
+    expect(cockpitStatusLine(onlineHost, { reconnecting: true }, true, now)).toBe(
+      "Blocked · identity changed",
+    );
+    expect(
+      cockpitStatusLine({ ...onlineHost, status: "offline" }, { reconnecting: false }, true, now),
+    ).toBe("Blocked · identity changed");
   });
 
   test("Running here leads with who needs a person, then what is working, and stops at six", () => {
