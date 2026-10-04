@@ -44,7 +44,7 @@ import {
 import { getPendingDevice } from "@/data/api/endpoints/devices";
 import { patchHost, updateHost } from "@/data/api/endpoints/hosts";
 import { downloadSpawnWorker } from "@/data/api/endpoints/install";
-import { getProfile } from "@/data/api/endpoints/legion";
+import { getProfile } from "@/data/api/endpoints/profile";
 import { getRelease } from "@/data/api/endpoints/release";
 import { createSession, patchSessionAccess } from "@/data/api/endpoints/sessions";
 import { createSkill } from "@/data/api/endpoints/skills";
@@ -210,7 +210,7 @@ it("constructs the required endorsement filter", async () => {
   );
 });
 
-it("calls the sole Legion/profile route", async () => {
+it("calls the sole profile route", async () => {
   await getProfile();
   expect(api).toHaveBeenCalledWith(
     "/api/profile",

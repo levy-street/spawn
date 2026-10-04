@@ -82,6 +82,12 @@ const nextConfig: NextConfig = {
   // The overhaul collapsed five nav destinations into one workspace page plus a
   // settings modal. These keep bookmarks and daemon-printed links from 404ing;
   // an agent id still resolves because agents became sessions one-for-one.
+  //
+  // Config redirects run before filesystem routes, so nothing here may name a
+  // path that is a page again: `/hosts` is the Hosts page (app/hosts/page.tsx),
+  // and a rule for it would shadow the page entirely. Never point a retired
+  // route at "/" when a real page exists — inside the desktop shell the lander
+  // is a dead end.
   async redirects() {
     return [
       // Order matters: the literal /agents/new must precede /agents/:id, or the
@@ -92,7 +98,8 @@ const nextConfig: NextConfig = {
       { source: "/screens", destination: "/", permanent: false },
       { source: "/screens/:id", destination: "/w/:id", permanent: false },
       { source: "/presets", destination: "/", permanent: false },
-      { source: "/hosts", destination: "/", permanent: false },
+      // The fleet page's name before it became Hosts.
+      { source: "/legion", destination: "/hosts", permanent: false },
       { source: "/settings", destination: "/", permanent: false },
       { source: "/trust", destination: "/", permanent: false },
     ];

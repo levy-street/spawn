@@ -88,7 +88,7 @@ export function AppHeader({
   const theme = useTheme();
   // Older route screens still declare Hosts/Settings actions. The global header is the
   // enforcement boundary: primary destinations belong exclusively to persistent tabs,
-  // while contextual actions such as create, connect, Legion, and Admin remain intact.
+  // while contextual actions such as create, connect, and Admin remain intact.
   const visibleActions = actions
     ?.filter((action) => !isPrimaryHeaderDestinationAction(action))
     .slice(0, MAX_ACTIONS);

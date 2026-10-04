@@ -1,9 +1,9 @@
-import type { Host, LegionDay, Session } from "@/lib/api";
+import type { Host, ProfileDay, Session } from "@/lib/api";
 import { isShellCommand } from "@/lib/sessions";
 
 /**
- * Pure derivations for the legion — every machine you own and everything
- * running on it. The sidebar strip, the workspace tile, the full page and the
+ * Pure derivations for your hosts — every computer you have possessed and
+ * everything running on it. The sidebar's Hosts strip, the Hosts page and the
  * profile dialog all read the same rollups from here, so the number in the
  * corner of the sidebar can never disagree with the one on the page it opens.
  *
@@ -17,10 +17,10 @@ export const METER_SEGMENTS = 5;
 /** Host rows the sidebar strip shows before deferring to the full page. */
 export const STRIP_HOST_LIMIT = 4;
 
-export type LegionTone = "active" | "idle" | "offline";
+export type FleetTone = "active" | "idle" | "offline";
 
-/** One host with everything the strip, the tile and the page draw for it. */
-export interface LegionHostRow {
+/** One host with everything the strip, its hover card and the page draw for it. */
+export interface FleetHostRow {
   host: Host;
   /** Sessions on this host that have not exited. */
   live: number;
@@ -33,7 +33,7 @@ export interface LegionHostRow {
   /** The live sessions themselves, most urgent first — the hover card's list. */
   sessions: Session[];
   /** Presence and urgency folded into one dot tone. */
-  tone: LegionTone;
+  tone: FleetTone;
   /** 0..5, or null when this daemon reports no capacity at all. */
   cpuBucket: number | null;
   memBucket: number | null;
@@ -44,7 +44,7 @@ export interface RunningAgent {
   count: number;
 }
 
-export interface LegionSummary {
+export interface FleetSummary {
   hosts: number;
   hostsOnline: number;
   /** Live sessions across every host. */
@@ -56,7 +56,7 @@ export interface LegionSummary {
   memoryBytes: number;
   /** True when at least one online host reports capacity. */
   hasCapacity: boolean;
-  rows: LegionHostRow[];
+  rows: FleetHostRow[];
 }
 
 function isLive(session: Session): boolean {
@@ -82,7 +82,7 @@ export function reportsCapacity(host: Host): boolean {
  * pixels apart, which taught nobody anything. A host is offline, working, or
  * quiet.
  */
-export function hostTone(host: Host, sessions: Session[]): LegionTone {
+export function hostTone(host: Host, sessions: Session[]): FleetTone {
   if (host.status !== "online") return "offline";
   if (sessions.some((session) => session.activity_state === "active")) return "active";
   return "idle";
@@ -132,14 +132,14 @@ export function orderSessions(sessions: Session[]): Session[] {
 }
 
 /**
- * Everything the legion surfaces draw, from the two lists the app already has.
+ * Everything the hosts surfaces draw, from the two lists the app already has.
  *
  * Ordering is deliberately *stable* rather than useful: online before offline,
  * then by name. Busiest-first would be more informative and would also move
  * rows under the cursor every few seconds, which is the wrong trade for
  * something that lives in the periphery and is clicked by muscle memory.
  */
-export function summarizeLegion(hosts: Host[], sessions: Session[]): LegionSummary {
+export function summarizeFleet(hosts: Host[], sessions: Session[]): FleetSummary {
   const byHost = new Map<string, Session[]>();
   for (const session of sessions) {
     const existing = byHost.get(session.host_id);
@@ -152,7 +152,7 @@ export function summarizeLegion(hosts: Host[], sessions: Session[]): LegionSumma
       if (a.status !== b.status) return a.status === "online" ? -1 : 1;
       return a.name.localeCompare(b.name);
     })
-    .map<LegionHostRow>((host) => {
+    .map<FleetHostRow>((host) => {
       const all = byHost.get(host.id) ?? [];
       const live = all.filter(isLive);
       return {
@@ -194,7 +194,7 @@ export function summarizeLegion(hosts: Host[], sessions: Session[]): LegionSumma
  * What the dot on a host row means, in words — the same three states the
  * colour encodes, so hovering never says something the dot did not.
  */
-export function hostToneLabel(row: LegionHostRow): string {
+export function hostToneLabel(row: FleetHostRow): string {
   if (row.host.status !== "online") return `${row.host.name} is offline`;
   if (row.busy > 0) return `${row.busy} ${row.busy === 1 ? "session" : "sessions"} working`;
   if (row.live > 0) return `${row.live} ${row.live === 1 ? "session" : "sessions"}, all quiet`;
@@ -205,7 +205,7 @@ export function hostToneLabel(row: LegionHostRow): string {
  * The strip's one-line reading when it is collapsed. Attention first, because
  * it is the only part worth interrupting for; otherwise the shape of the day.
  */
-export function summaryLine(summary: LegionSummary): string {
+export function summaryLine(summary: FleetSummary): string {
   if (summary.hosts === 0) return "No hosts yet";
   if (summary.attention > 0) return `${summary.attention} need you`;
   if (summary.busy > 0) {
@@ -218,7 +218,7 @@ export function summaryLine(summary: LegionSummary): string {
 }
 
 /** "3 hosts · 7 sessions", the header's count. */
-export function countsLabel(summary: LegionSummary): string {
+export function countsLabel(summary: FleetSummary): string {
   return `${summary.hostsOnline} · ${summary.sessions}`;
 }
 
@@ -333,7 +333,7 @@ export interface CalendarDay {
  * counter was computed against it, and a viewer in UTC+13 must not see a
  * calendar whose last square disagrees with the number beside it.
  */
-export function calendar(days: LegionDay[], today: string, span: number): CalendarDay[] {
+export function calendar(days: ProfileDay[], today: string, span: number): CalendarDay[] {
   const byDay = new Map(days.map((day) => [day.day, day]));
   const end = Date.parse(`${today}T00:00:00Z`);
   if (!Number.isFinite(end) || span <= 0) return [];

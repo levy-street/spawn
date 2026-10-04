@@ -157,7 +157,7 @@ describe("settings panel behavior", () => {
     const screen = await render(<SettingsRoot />, { wrapper });
 
     expect(SETTINGS_PANELS).toHaveLength(8);
-    // Machines belong to the Legion tab, so Settings never lists a Hosts panel.
+    // Hosts belong to the Hosts tab, so Settings never lists a Hosts panel.
     expect(screen.queryByTestId("settings-panel-hosts")).toBeNull();
     for (const panel of SETTINGS_PANELS) {
       expect(screen.getByTestId(`settings-panel-${panel.key}`)).toBeOnTheScreen();

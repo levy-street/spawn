@@ -85,7 +85,7 @@ describe("app navigation shell", () => {
     expect(screen.queryByTestId("root-drawer")).toBeNull();
     expect(screen.getByTestId("root-stack")).toBeTruthy();
     expect(screen.getByTestId("app-screen-(tabs)")).toBeTruthy();
-    for (const pushed of ["workspace/[id]", "host/[id]/index", "legion"]) {
+    for (const pushed of ["workspace/[id]", "host/[id]/index"]) {
       expect(screen.getByTestId(`app-screen-${pushed}`)).toBeTruthy();
     }
   });
@@ -100,9 +100,11 @@ describe("app navigation shell", () => {
 
   it("keeps every public destination reachable", () => {
     const paths = Object.keys(APP_ROUTE_MAP);
-    for (const required of ["/workspaces", "/hosts", "/legion", "/settings", "/admin"]) {
+    for (const required of ["/workspaces", "/hosts", "/settings", "/admin"]) {
       expect(paths).toContain(required);
     }
+    // The fleet's retired address redirects to the Hosts tab; it is not a destination.
+    expect(paths).not.toContain("/legion");
   });
 
   // Edge-only back gestures were the owner's complaint; this must stay full-screen.

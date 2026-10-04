@@ -1,13 +1,13 @@
 "use client";
 
-import { ChevronUp, Server } from "lucide-react";
+import { ChevronRight, ChevronUp, Server } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
+import { CapacityBar, HostDot, RunningIcons } from "@/components/hosts/fleet-parts";
+import { HostHoverCard } from "@/components/hosts/host-hover-card";
 import { useHostLiveStatus } from "@/components/hosts/use-host-live-status";
-import { LegionHostDetail } from "@/components/legion/LegionHostDetail";
-import { CapacityBar, LegionDot, RunningIcons } from "@/components/legion/legion-parts";
 import { SidebarIconSlot, SidebarRowLabel, sidebarRowClass } from "@/components/nav/sidebar-parts";
 import { HostUpdateBadge } from "@/components/release/HostUpdateDialog";
 import { useArmedMotion } from "@/components/ui/armed-motion";
@@ -19,18 +19,23 @@ import { RailTooltip } from "@/components/ui/tooltip";
 import type { Host, Session } from "@/lib/api";
 import {
   bucketFill,
+  type FleetHostRow,
   hostToneLabel,
-  type LegionHostRow,
   STRIP_HOST_LIMIT,
-  summarizeLegion,
-} from "@/lib/legion";
+  summarizeFleet,
+} from "@/lib/fleet";
 import { cn } from "@/lib/utils";
 
 /**
- * The legion — every machine you own — as a disclosure in the sidebar's
- * footer, dressed exactly like the Archived drawer it sits under: same row
- * class, same icon slot, same count and chevron. It is a place you keep
- * machines, not a live ticker, so it gets no chrome of its own.
+ * Your hosts — every computer you have possessed — as a disclosure in the
+ * sidebar's footer, dressed exactly like the Archived drawer it sits under:
+ * same row class, same icon slot, same count and chevron. It is a place you
+ * keep hosts, not a live ticker, so it gets no chrome of its own.
+ *
+ * The label is the way to the Hosts page and the count with its chevron is the
+ * disclosure: two targets on one row, because with four hosts or fewer there
+ * is no "All hosts" row, and a label that only toggled left the page with no
+ * way in from an open sidebar.
  *
  * Closed, it is one row and one number. Open, each host is a name, a presence
  * dot, a session count and a two-bar capacity chart — and resting on a row
@@ -39,10 +44,11 @@ import { cn } from "@/lib/utils";
  *
  * Everything comes from the two queries the sidebar already polls, so the
  * section costs no request and can never disagree with the rows above it.
- * Hovering never opens a WebRTC connection; `/legion` is where exact
- * per-second figures are worth paying for.
+ * Hovering never opens a host-control channel; the Hosts page draws exact
+ * figures for the cards on screen.
  */
 
+/** Kept from before the rename so nobody's strip forgets whether it was open. */
 const OPEN_KEY = "spawn.sidebar.legionOpen";
 
 /**
@@ -56,7 +62,7 @@ const OPEN_KEY = "spawn.sidebar.legionOpen";
  */
 const remembered: { open: boolean | null } = { open: null };
 
-export function LegionStrip({
+export function HostsStrip({
   hosts,
   sessions,
   collapsed,
@@ -68,7 +74,7 @@ export function LegionStrip({
   collapsed: boolean;
   onNavigate?: () => void;
 }) {
-  const router = useRouter();
+  const pathname = usePathname();
   const [open, setOpen] = useState(remembered.open ?? false);
   const armed = useArmedMotion();
   const listRef = useRef<HTMLUListElement | null>(null);
@@ -107,7 +113,7 @@ export function LegionStrip({
       setHoverAnchor(null);
       return;
     }
-    const row = list.querySelector<HTMLElement>(`[data-legion-host="${CSS.escape(hostId)}"]`);
+    const row = list.querySelector<HTMLElement>(`[data-host-row="${CSS.escape(hostId)}"]`);
     if (!row) {
       setHoverAnchor(null);
       return;
@@ -122,7 +128,7 @@ export function LegionStrip({
     });
   }, [hover.value]);
 
-  const summary = summarizeLegion(hosts, sessions);
+  const summary = summarizeFleet(hosts, sessions);
   const hoveredRow = summary.rows.find((row) => row.host.id === hover.value?.hostId) ?? null;
 
   /**
@@ -144,7 +150,7 @@ export function LegionStrip({
     ) => x >= box.left && x <= box.right && y >= box.top && y <= box.bottom;
     const outside = (x: number, y: number) => {
       const panel = listRef.current?.getBoundingClientRect() ?? null;
-      const card = document.getElementById("legion-host-card")?.getBoundingClientRect() ?? null;
+      const card = document.getElementById("host-hover-card")?.getBoundingClientRect() ?? null;
       if (!panel && !card) return true;
       if (panel && within(panel, x, y)) return false;
       if (card) {
@@ -192,35 +198,41 @@ export function LegionStrip({
 
   const shown = summary.rows.slice(0, STRIP_HOST_LIMIT);
   const overflow = summary.rows.length - shown.length;
+  const onHostsPage = pathname === "/hosts";
 
   return (
     <div className="border-t border-border px-2.5 py-2">
       <RailTooltip
-        label={`Legion — ${summary.hostsOnline} of ${summary.hosts} online`}
+        label={`Hosts — ${summary.hostsOnline} of ${summary.hosts} online`}
         disabled={!collapsed}
       >
-        <button
-          type="button"
-          // On the rail there is no room for a list, so the whole legion opens
-          // where it can be read.
-          onClick={
-            collapsed
-              ? () => {
-                  onNavigate?.();
-                  router.push("/legion");
-                }
-              : toggle
-          }
-          aria-label={collapsed ? `Legion (${summary.hosts})` : undefined}
-          aria-expanded={collapsed ? undefined : open}
-          className={cn(sidebarRowClass(false), "group/legion")}
-        >
-          <SidebarIconSlot>
-            <Server className="size-4" aria-hidden />
-          </SidebarIconSlot>
-          <SidebarRowLabel collapsed={collapsed}>Legion</SidebarRowLabel>
+        <div className="flex items-center">
+          <Link
+            href="/hosts"
+            onClick={onNavigate}
+            // On the rail the label is hidden and the count is not drawn, so the
+            // row would otherwise have no name at all.
+            aria-label={collapsed ? `Hosts (${summary.hosts})` : undefined}
+            aria-current={onHostsPage ? "page" : undefined}
+            className={cn(sidebarRowClass(onHostsPage), "min-w-0 flex-1")}
+          >
+            <SidebarIconSlot>
+              <Server className="size-4" aria-hidden />
+            </SidebarIconSlot>
+            <SidebarRowLabel collapsed={collapsed}>Hosts</SidebarRowLabel>
+          </Link>
+          {/* On the rail there is no room for a list, so the icon goes to the
+           * page where every host can be read, and nothing here toggles. */}
           {!collapsed && (
-            <span className="flex shrink-0 items-center gap-1.5 pr-2 text-xs tabular-nums">
+            <button
+              type="button"
+              onClick={toggle}
+              aria-expanded={open}
+              // The name replaces the content it wraps, so it carries the
+              // count a sighted reader sees on the button.
+              aria-label={`${open ? "Hide" : "Show"} the host list (${summary.hosts})`}
+              className="flex h-(--row-h) shrink-0 items-center gap-1.5 rounded-lg px-2 text-xs tabular-nums text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+            >
               {summary.hosts}
               {/* Points up while closed — the list unfolds downward from here. */}
               <ChevronUp
@@ -233,9 +245,9 @@ export function LegionStrip({
                   open && "rotate-180",
                 )}
               />
-            </span>
+            </button>
           )}
-        </button>
+        </div>
       </RailTooltip>
 
       {/* Mounted whether or not it is open: the drawer glides to its own
@@ -265,12 +277,14 @@ export function LegionStrip({
             ))}
           </ul>
           {overflow > 0 && (
-            // Dressed as the row it sits under, pointing the way it leads.
-            <Link href="/legion" onClick={onNavigate} className={sidebarRowClass(false)}>
+            // Dressed as the row it sits under, pointing the way it leads:
+            // sideways, out of the sidebar, onto the Hosts page.
+            <Link href="/hosts" onClick={onNavigate} className={sidebarRowClass(false)}>
               <SidebarIconSlot>
                 <Server className="size-4 opacity-60" aria-hidden />
               </SidebarIconSlot>
-              <SidebarRowLabel collapsed={false}>View all ({summary.hosts})</SidebarRowLabel>
+              <SidebarRowLabel collapsed={false}>All hosts ({summary.hosts})</SidebarRowLabel>
+              <ChevronRight className="mr-3 size-3.5 shrink-0" aria-hidden />
             </Link>
           )}
         </div>
@@ -280,7 +294,7 @@ export function LegionStrip({
        * to be able to land on it. The geometric watcher above keeps it open
        * for exactly that trip and closes it anywhere else. */}
       <Popover
-        id="legion-host-card"
+        id="host-hover-card"
         interactive
         open={hoveredRow !== null && open && !collapsed}
         anchor={hoverAnchor}
@@ -293,7 +307,7 @@ export function LegionStrip({
         ariaLabel={hoveredRow ? `${hoveredRow.host.name} details` : undefined}
       >
         {hoveredRow && (
-          <LegionHostDetail
+          <HostHoverCard
             row={hoveredRow}
             onNavigate={() => {
               // The click is a departure: close the card with it, and let the
@@ -309,12 +323,12 @@ export function LegionStrip({
 }
 
 /**
- * One machine: name, presence, how much is on it — and, underneath, the two
- * bars that make the panel worth looking at.
+ * One host: name, presence, how much is on it — and, underneath, the two bars
+ * that make the panel worth looking at.
  *
  * The chart is the whole reason a host row is taller than a workspace row. A
  * host that reports no capacity draws no chart and collapses back to the nav
- * rhythm, rather than showing two empty tracks — which would claim the machine
+ * rhythm, rather than showing two empty tracks — which would claim the host
  * was idle when the truth is that it never said.
  */
 function HostRow({
@@ -323,7 +337,7 @@ function HostRow({
   onHover,
   onHoverEnd,
 }: {
-  row: LegionHostRow;
+  row: FleetHostRow;
   onNavigate?: () => void;
   onHover?: () => void;
   onHoverEnd?: () => void;
@@ -336,7 +350,7 @@ function HostRow({
   const reconnecting = live?.reconnecting ?? false;
 
   return (
-    <li data-legion-host={row.host.id} className="group/host relative">
+    <li data-host-row={row.host.id} className="group/host relative">
       <Link
         href={`/hosts/${row.host.id}`}
         onClick={onNavigate}
@@ -349,7 +363,7 @@ function HostRow({
         )}
       >
         <span className="flex items-center gap-2">
-          <LegionDot
+          <HostDot
             tone={reconnecting ? "warning" : row.tone}
             label={reconnecting && live ? live.label : hostToneLabel(row)}
             pulse={reconnecting || row.tone === "active"}
@@ -363,7 +377,7 @@ function HostRow({
             {row.host.name}
           </span>
           <HostUpdateBadge host={row.host} />
-          {/* What is on the machine, not how much: "2 Claude, 1 Codex" is the
+          {/* What is on the host, not how much: "2 Claude, 1 Codex" is the
            * thing worth knowing, and a bare 5 was never it. */}
           <RunningIcons running={row.running} fallbackCount={row.live} />
         </span>

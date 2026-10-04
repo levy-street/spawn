@@ -1,13 +1,11 @@
 import { useRouter } from "expo-router";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { RefreshControl, ScrollView, StyleSheet, View } from "react-native";
 import { HostDetailView } from "@/components/hosts/host-detail-view";
 import { errorMessage } from "@/components/hosts/host-model";
+import { REMOVE_HOST_DESCRIPTION } from "@/components/hosts/host-trust-copy";
 import { HostUpdateDialog } from "@/components/hosts/host-update-dialog";
-import {
-  claimHostDetailUpdatePrompt,
-  hostNeedsUpdatePrompt,
-} from "@/components/hosts/host-update-status";
+import { claimHostDetailUpdatePrompt } from "@/components/hosts/host-update-status";
 import { RenameHostDialog } from "@/components/hosts/rename-host-dialog";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
@@ -22,6 +20,7 @@ import { useToast } from "@/components/ui/toast";
 import {
   useAgentsQuery,
   useHostBrowserDevicesQuery,
+  useHostIdentityConflictQuery,
   useHostPinsQuery,
   useHostQuery,
   useHostSessionsQuery,
@@ -46,29 +45,18 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
   const [renameVisible, setRenameVisible] = useState(false);
   const [removeVisible, setRemoveVisible] = useState(false);
   const [updateVisible, setUpdateVisible] = useState(false);
-  const pendingAfterUpdate = useRef<(() => void) | null>(null);
   const host = hostQuery.data;
+  const identityConflict = useHostIdentityConflictQuery(host).data === true;
 
+  // Offered once per host per launch, as the browser's host page does; after
+  // that the update chip under Details opens it. Nothing waits behind it.
   useEffect(() => {
     if (host && claimHostDetailUpdatePrompt(host)) setUpdateVisible(true);
   }, [host]);
 
-  const afterUpdate = () => {
-    const pending = pendingAfterUpdate.current;
-    pendingAfterUpdate.current = null;
-    setUpdateVisible(false);
-    pending?.();
-  };
-
   const openFiles = () => {
-    if (!host) return;
-    const navigate = () => router.push({ pathname: "/host/[id]/files", params: { id: host.id } });
-    if (!hostNeedsUpdatePrompt(host)) {
-      navigate();
-      return;
-    }
-    pendingAfterUpdate.current = navigate;
-    setUpdateVisible(true);
+    if (!host || identityConflict) return;
+    router.push({ pathname: "/host/[id]/files", params: { id: host.id } });
   };
 
   const refresh = () => {
@@ -139,11 +127,15 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
               browserDevices={browserDevicesQuery.data ?? []}
               host={host}
               hostPins={hostPinsQuery.data ?? null}
+              identityConflict={identityConflict}
               onOpenAgents={() =>
                 router.push({ pathname: "/host/[id]/agents", params: { id: host.id } })
               }
               onOpenFiles={openFiles}
               onOpenSession={(session) => router.push(`/terminal/${session.id}`)}
+              onOpenUpdate={() => setUpdateVisible(true)}
+              onRemove={() => setRemoveVisible(true)}
+              removing={remove.isPending}
               sessions={sessionsForHost(sessionsQuery.data ?? [], host.id)}
             />
             {sessionsQuery.isError ? (
@@ -170,7 +162,7 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
                   },
                   {
                     id: "remove",
-                    label: "Remove",
+                    label: "Remove host",
                     destructive: true,
                     icon: <Icon color="destructive" name="Trash2" />,
                     onPress: () => setRemoveVisible(true),
@@ -206,7 +198,7 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
         />
         <Confirm
           confirmLabel={remove.error ? "Retry deletion" : "Remove host"}
-          description="Its daemon token is revoked. SPAWN D stops connecting to that machine."
+          description={REMOVE_HOST_DESCRIPTION}
           destructive
           onCancel={() => setRemoveVisible(false)}
           onConfirm={() => {
@@ -223,16 +215,7 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
           visible={removeVisible && host !== undefined}
         />
         {host && updateVisible ? (
-          <HostUpdateDialog
-            host={host}
-            onDismiss={() => {
-              pendingAfterUpdate.current = null;
-              setUpdateVisible(false);
-            }}
-            onNotNow={afterUpdate}
-            onUpdated={afterUpdate}
-            visible
-          />
+          <HostUpdateDialog host={host} onDismiss={() => setUpdateVisible(false)} visible />
         ) : null}
       </View>
     </Screen>

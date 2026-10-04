@@ -18,7 +18,7 @@ export type DeepLinkRoute =
   | "/(auth)/verify-email"
   | "/onboarding"
   | "/onboarding/device"
-  | "/legion"
+  | "/hosts"
   | "/settings"
   | "/admin"
   | "/host/[id]"
@@ -196,8 +196,10 @@ export function resolveIncomingLink(input: string): ResolvedDeepLink | null {
       requiresAuth: true,
     });
   }
-  if (path === "/legion") {
-    return result("/legion", "/legion", { requiresAuth: true });
+  // The Hosts tab. /legion is the fleet's retired address, kept so links
+  // shared before the rename still land there.
+  if (path === "/hosts" || path === "/legion") {
+    return result("/hosts", "/hosts", { requiresAuth: true });
   }
   if (path === "/admin") return result("/admin", "/admin", { requiresAuth: true });
   if (path === "/download" || path === "/security") {

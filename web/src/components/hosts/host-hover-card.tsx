@@ -1,17 +1,18 @@
 "use client";
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
-import { CapacityBar, LegionDot } from "@/components/legion/legion-parts";
+import { CapacityBar, HostDot } from "@/components/hosts/fleet-parts";
 import { SessionStatusDot } from "@/components/ui/status";
 import { workspaces } from "@/lib/api";
+import type { FleetHostRow } from "@/lib/fleet";
+import { bucketFill, capacityLabel, specLine } from "@/lib/fleet";
 import { hostHealthPanel } from "@/lib/host-health";
 import { formatHostPlatform } from "@/lib/host-platform";
-import type { LegionHostRow } from "@/lib/legion";
-import { bucketFill, capacityLabel, specLine } from "@/lib/legion";
 import { relativeTime, sessionActivityLabel, sessionHref, sessionTitle } from "@/lib/sessions";
 
 /**
- * Everything about one machine, in a card that opens when you rest on its row.
+ * Everything about one host, in a card that opens when you rest on its row in
+ * the sidebar's Hosts strip.
  *
  * This is the other half of the strip's bargain: the row is allowed to be
  * almost nothing — a dot, a name, a count — precisely because the detail is one
@@ -19,9 +20,9 @@ import { relativeTime, sessionActivityLabel, sessionHref, sessionTitle } from "@
  * here, where there is room to lay them out instead of compressing them into a
  * 36px sidebar row.
  *
- * It shows the heartbeat's coarse reading rather than opening a direct channel
- * for exact figures: a hover must not cost a WebRTC connection. `/legion` is
- * where you go to pay for that.
+ * It shows the heartbeat's coarse reading rather than opening a host-control
+ * channel for exact figures: a hover is too brief to be worth one. The Hosts
+ * page draws exact figures for the cards on screen.
  *
  * The sessions are the card's one set of controls: each is the door to where
  * that session lives, because "what is running there" and "take me to it" are
@@ -35,13 +36,7 @@ import { relativeTime, sessionActivityLabel, sessionHref, sessionTitle } from "@
 /** Sessions listed before the card defers to the host page. */
 const SESSION_LIMIT = 6;
 
-export function LegionHostDetail({
-  row,
-  onNavigate,
-}: {
-  row: LegionHostRow;
-  onNavigate?: () => void;
-}) {
+export function HostHoverCard({ row, onNavigate }: { row: FleetHostRow; onNavigate?: () => void }) {
   const host = row.host;
   // The same query the sidebar polls, so the lookup costs no request and can
   // never disagree with the workspace tree the card floats beside.
@@ -59,7 +54,7 @@ export function LegionHostDetail({
   return (
     <div className="w-72 max-w-[min(20rem,calc(100vw-2rem))] p-3 text-sm">
       <header className="flex items-center gap-2">
-        <LegionDot tone={row.tone} label={row.tone} />
+        <HostDot tone={row.tone} label={row.tone} />
         <span className="min-w-0 flex-1 truncate font-medium">{host.name}</span>
         <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
           {online ? "online" : "offline"}
@@ -97,7 +92,7 @@ export function LegionHostDetail({
       <div className="mt-2.5 border-t border-popover-border pt-2.5">
         {row.sessions.length === 0 ? (
           <p className="text-xs text-muted-foreground">
-            {online ? "Nothing running here." : "This machine is offline."}
+            {online ? "Nothing running here." : "This host is offline."}
           </p>
         ) : (
           <>

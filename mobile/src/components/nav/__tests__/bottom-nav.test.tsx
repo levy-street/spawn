@@ -153,7 +153,7 @@ describe("BottomNav", () => {
   it("keeps the current destination selected over a pushed screen", async () => {
     const screen = await renderNav("/host/one");
 
-    expect(screen.getByRole("tab", { name: "Legion" }).props["accessibilityState"]).toEqual({
+    expect(screen.getByRole("tab", { name: "Hosts" }).props["accessibilityState"]).toEqual({
       selected: true,
     });
     expect(screen.getByRole("tab", { name: "Workspaces" }).props["accessibilityState"]).toEqual({
@@ -180,7 +180,7 @@ describe("BottomNav", () => {
     mockRootState = TERMINAL_OVER_HOST;
     const screen = await renderNav("/terminal/one");
 
-    await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
+    await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
 
     await waitFor(() => expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts"));
     expect(mockDispatch).toHaveBeenCalledWith(
@@ -198,7 +198,7 @@ describe("BottomNav", () => {
     mockRootState = TERMINAL_OVER_HOST;
     const screen = await renderNav("/workspaces");
 
-    await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
+    await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
 
     expect(onDismiss).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts"));
@@ -211,7 +211,7 @@ describe("BottomNav", () => {
     // Navigation reports — on every single nav tap.
     const screen = await renderNav("/workspaces");
 
-    await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
+    await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
 
     await waitFor(() => expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts"));
     expect(mockDispatch).not.toHaveBeenCalled();

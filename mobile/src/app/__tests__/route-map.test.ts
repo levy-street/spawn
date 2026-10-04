@@ -12,7 +12,6 @@ const DOCUMENTED_URLS = [
   "/host/[id]",
   "/host/[id]/agents",
   "/host/[id]/files",
-  "/legion",
   "/profile",
   "/device-approval",
   "/settings",
@@ -43,7 +42,9 @@ describe("native stack route map", () => {
   });
 
   it.each([
-    ["/legion", "/legion"],
+    ["/hosts", "/hosts"],
+    // The fleet's retired address is an alias of the Hosts tab, not a screen.
+    ["/legion", "/hosts"],
     ["/admin", "/admin"],
     [`/hosts/${HOST_ID}`, `/host/${HOST_ID}`],
     [`/w/${WORKSPACE_ID}`, `/workspace/${WORKSPACE_ID}`],

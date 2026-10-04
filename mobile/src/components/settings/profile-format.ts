@@ -1,4 +1,4 @@
-import type { ProfileOut } from "@/data/api/schemas/legion";
+import type { ProfileOut } from "@/data/api/schemas/profile";
 
 export function formatProfileMemory(bytes: number): string {
   if (bytes <= 0) return "0 GB";

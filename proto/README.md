@@ -1257,9 +1257,11 @@ request/response on the normal queue rather than a subscription — the browser
 polls at whatever rate it is drawing at, the daemon rate-limits internally to
 sysinfo's minimum sampling interval and returns the previous reading to a
 caller that asks sooner, and a host with telemetry off answers
-`telemetry_disabled` as an ordinary error. Opening this channel costs a real
-WebRTC connection per host, so clients are expected to open it only for a
-surface someone is looking at and close it when they leave.
+`telemetry_disabled` as an ordinary error. The channel rides the one
+connection the device already holds to that host (docs/DEVICE_CONNECTIONS.md),
+so it costs a channel, not a connection; clients still open it only for a
+surface someone is looking at (a host card on screen, in a tab or app in front),
+poll about every 3 s, and close it when that surface leaves.
 
 `desktop.reveal` and `desktop.open` take a path and nothing else. There is no
 field for an application, arguments, or flags — not optional, not ignored,

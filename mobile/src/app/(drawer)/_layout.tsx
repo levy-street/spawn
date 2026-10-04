@@ -28,7 +28,6 @@ export const APP_ROUTE_MAP = {
   "/host/[id]": "host/[id]/index",
   "/host/[id]/agents": "host/[id]/agents",
   "/host/[id]/files": "host/[id]/files",
-  "/legion": "legion",
   "/profile": "profile",
   "/device-approval": "device-approval",
   "/settings": "settings/index",
@@ -104,7 +103,6 @@ export default function AppStackLayout(): React.JSX.Element | null {
             <Stack.Screen name="host/[id]/index" />
             <Stack.Screen name="host/[id]/agents" />
             <Stack.Screen name="host/[id]/files" />
-            <Stack.Screen name="legion" />
             <Stack.Screen name="profile" />
             <Stack.Screen name="device-approval" />
             <Stack.Screen name="admin/index" />

@@ -38,7 +38,11 @@ import {
 } from "@/lib/browser-host-pins";
 import { formatHostPlatform } from "@/lib/host-platform";
 import { relativeTime, sessionActivityDetail, sessionTitle } from "@/lib/sessions";
-import { SIGNED_RTC_REFUSAL_DETAIL, SIGNED_RTC_REFUSAL_NEXT_STEP } from "@/lib/signed-rtc-trust";
+import {
+  HOST_IDENTITY_BLOCKED_REASON,
+  SIGNED_RTC_REFUSAL_DETAIL,
+  SIGNED_RTC_REFUSAL_NEXT_STEP,
+} from "@/lib/signed-rtc-trust";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class HostDeletionFlowError extends Error {
@@ -158,8 +162,8 @@ function HostDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
-      // The machine is gone; the fleet it left is the place to land.
-      router.push("/legion");
+      // The host is gone; the Hosts page it left is the place to land.
+      router.push("/hosts");
     },
     onError: (caught) => {
       if (caught instanceof HostDeletionFlowError && caught.localTombstoneWritten) {
@@ -248,7 +252,7 @@ function HostDetail() {
     if (!host) return;
     const accepted = await confirm({
       title: `Remove ${host.name}?`,
-      body: "Its daemon token will be revoked. Existing session processes on that machine may continue locally, but SPAWN D will no longer connect to them.",
+      body: "Its daemon token is revoked and SPAWN D stops connecting to it. Sessions already running there may keep running on that host.",
       confirmLabel: localDeletionPending ? "Retry deletion" : "Remove host",
       destructive: true,
     });
@@ -257,12 +261,12 @@ function HostDetail() {
 
   /**
    * Back means back — the route you came from. A page opened cold in a fresh
-   * tab has nothing to pop, so it goes to the legion rather than leaving the
-   * arrow dead.
+   * tab has nothing to pop, so it goes to the Hosts page rather than leaving
+   * the arrow dead.
    */
   const goBack = () => {
     if (window.history.length > 1) router.back();
-    else router.push("/legion");
+    else router.push("/hosts");
   };
 
   if (!id) return null;
@@ -323,12 +327,36 @@ function HostDetail() {
               </Badge>
             )}
           </div>
-          <Button asChild variant="outline" size="sm" className="shrink-0">
-            <Link href={`/hosts/${id}/files`}>
+          {identityConflict ? (
+            // The explorer would only meet the same refusal, so while the
+            // panel below is up the way in is shut and says why — as the
+            // phone's Files row does. aria-disabled rather than disabled: it
+            // stays focusable, so a keyboard reaches the reason, and the
+            // pointer still gets the title.
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0 cursor-not-allowed opacity-50 hover:bg-transparent"
+              aria-disabled="true"
+              aria-label="Files"
+              aria-describedby="host-files-blocked-reason"
+              title={HOST_IDENTITY_BLOCKED_REASON}
+            >
               <FolderOpen className="size-4" aria-hidden />
               <span className="hidden sm:inline">Files</span>
-            </Link>
-          </Button>
+              <span id="host-files-blocked-reason" className="sr-only">
+                {HOST_IDENTITY_BLOCKED_REASON}
+              </span>
+            </Button>
+          ) : (
+            <Button asChild variant="outline" size="sm" className="shrink-0">
+              <Link href={`/hosts/${id}/files`} aria-label="Files">
+                <FolderOpen className="size-4" aria-hidden />
+                <span className="hidden sm:inline">Files</span>
+              </Link>
+            </Button>
+          )}
           <DropdownMenu
             renderTrigger={(props) => (
               <Button
@@ -368,7 +396,7 @@ function HostDetail() {
         )}
         {identityConflict && (
           <div
-            className="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/5 p-4"
+            className="mb-4 rounded-xl border border-warning/40 bg-warning-soft p-4"
             data-testid="host-identity-conflict"
             role="alert"
           >

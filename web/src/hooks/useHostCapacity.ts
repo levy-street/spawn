@@ -13,16 +13,21 @@ import type { HostCapacitySample, HostCapacitySpec } from "@/lib/hostControl";
  * heartbeat and nothing finer; these numbers travel browser-to-daemon with no
  * server code path at all (docs/TRUST.md, `daemon/src/host_metrics.rs`).
  *
- * The cost is a real WebRTC connection per host — ICE, DTLS, and something to
- * keep alive — so this must only ever be switched on for a surface somebody is
- * looking at, and switched off when they stop. Callers pass `enabled` and are
- * expected to mean it.
+ * The cost is small but real: a host-control channel on the connection this
+ * device already holds to the host, and a sample every few seconds on the
+ * host itself. So it runs only for a surface somebody is looking at and stops
+ * when they stop — callers pass `enabled` (the Hosts page passes "this card is
+ * on screen and the tab is in front", see `useInView`) and are expected to
+ * mean it.
  */
 
-/** Poll interval. Matches the daemon's own minimum CPU sampling interval. */
-const POLL_MS = 1_000;
+/**
+ * Poll interval. The same cadence the phone samples at, and slow enough that a
+ * page of visible hosts stays a trickle of requests on each of them.
+ */
+const POLL_MS = 3_000;
 /** Give up on a sample well before the next one is due. */
-const REQUEST_TIMEOUT_MS = 4_000;
+const REQUEST_TIMEOUT_MS = 2_500;
 
 export interface HostCapacity {
   sample: HostCapacitySample | null;

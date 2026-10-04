@@ -9,6 +9,7 @@ import TabsLayout from "@/app/(drawer)/(tabs)/_layout";
 import HostsStackLayout from "@/app/(drawer)/(tabs)/hosts/_layout";
 import SettingsStackLayout from "@/app/(drawer)/(tabs)/settings/_layout";
 import WorkspacesStackLayout from "@/app/(drawer)/(tabs)/workspaces/_layout";
+import RetiredFleetRoute from "@/app/(drawer)/legion";
 import { BottomNav } from "@/components/nav/bottom-nav";
 import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
 import { ThemeProvider } from "@/theme";
@@ -60,6 +61,7 @@ const ROUTES = {
   "(drawer)/(tabs)/settings/_layout": SettingsStackLayout,
   "(drawer)/(tabs)/settings/index": screenFor("settings"),
   "(drawer)/workspace/[id]": screenFor("workspace-detail"),
+  "(drawer)/legion": RetiredFleetRoute,
 };
 
 function findState(state: NavigationState | undefined, name: string): NavigationState | undefined {
@@ -79,10 +81,8 @@ async function renderShell() {
 }
 
 describe("primary navigation", () => {
-  // The Legion tab still lives at /hosts: it is the machines it always was, under
-  // the name the product uses for them.
   it.each([
-    ["Legion", "/hosts"],
+    ["Hosts", "/hosts"],
     ["Settings", "/settings"],
   ])("opens %s as a tab, never as a card over the screen you were on", async (label, path) => {
     const { rendered, view } = await renderShell();
@@ -119,6 +119,15 @@ describe("primary navigation", () => {
     await waitFor(() => expect(rendered.getPathname()).toBe("/workspaces"));
     const drawer = findState(rendered.getRouterState() as NavigationState, "(drawer)");
     expect(drawer?.routes.map((route) => route.name)).toEqual(["(tabs)"]);
+  });
+
+  // Kept for one OTA cycle: an install or a restored stack that still asks for
+  // the fleet's retired address lands on the Hosts tab, not on a dead route.
+  it("redirects the retired fleet address to the Hosts tab", async () => {
+    const rendered = renderRouter(ROUTES, { initialUrl: "/legion" });
+    await rendered;
+
+    await waitFor(() => expect(rendered.getPathname()).toBe("/hosts"));
   });
 
   it.each(["workspaces", "hosts", "settings"])("keeps %s inside the tab group on disk", (root) => {

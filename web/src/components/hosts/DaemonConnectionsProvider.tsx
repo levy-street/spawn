@@ -18,8 +18,9 @@ const Connections = createContext<ReadonlyMap<string, DaemonConnection>>(new Map
 /**
  * Connection ownership survives route changes and the last terminal closing.
  * It draws nothing: a host's connection shows where that host already
- * appears — its Legion row, the panes running on it (useHostLiveStatus) — so
- * one that is only asleep never covers the screen you are working in.
+ * appears — its Hosts row and card, the panes running on it
+ * (useHostLiveStatus) — so one that is only asleep never covers the screen you
+ * are working in.
  */
 export function DaemonConnectionsProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth({ probe: "hinted" });

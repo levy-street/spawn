@@ -8,8 +8,9 @@ import { useSyncExternalStore } from "react";
  * doing, and closing it returns them exactly there.
  */
 /**
- * Machines are the Legion's, not a setting: possessing one is `/device` and a
- * host's own page renames and removes it, so there is no Hosts tab to return to.
+ * Hosts are a page, not a setting: possessing one is `/device` (or "Possess a
+ * host" on `/hosts`) and a host's own page renames and removes it, so there is
+ * no Hosts tab to return to.
  */
 export type SettingsTab =
   | "account"

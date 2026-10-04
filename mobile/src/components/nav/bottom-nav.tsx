@@ -19,7 +19,7 @@ import { sizing } from "@/theme/sizing";
 
 const DESTINATIONS = [
   { href: "/workspaces", icon: "Shapes", label: "Workspaces", rootRoute: "workspaces" },
-  { href: "/hosts", icon: "Server", label: "Legion", rootRoute: "hosts" },
+  { href: "/hosts", icon: "Server", label: "Hosts", rootRoute: "hosts" },
   { href: "/settings", icon: "Settings", label: "Settings", rootRoute: "settings" },
 ] as const satisfies readonly {
   href: Href;
@@ -43,7 +43,7 @@ export function bottomNavDestinationForPath(pathname: string): BottomNavRoute | 
   ) {
     return "/workspaces";
   }
-  if (pathname === "/hosts" || pathname.startsWith("/host/") || pathname === "/legion") {
+  if (pathname === "/hosts" || pathname.startsWith("/host/")) {
     return "/hosts";
   }
   if (

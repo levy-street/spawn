@@ -14,7 +14,7 @@ import { spacing } from "@/theme";
  */
 const PANEL_GROUPS = [
   { title: "General", keys: ["account", "appearance", "notifications"] },
-  // Machines are the Legion tab's, not a setting: connecting, renaming and
+  // Hosts are the Hosts tab's, not a setting: possessing, renaming and
   // removing one all happen there, so Settings keeps to what runs on them.
   { title: "Agents", keys: ["agents", "skills", "templates"] },
   { title: "Devices & trust", keys: ["devices", "trust"] },

@@ -278,10 +278,11 @@ export const DESKTOP_SHELL_TOKEN = "SpawnDesktop/";
  *
  * The shell has to tell two arrivals at `/` apart. One is signing out, which
  * should forget the account on the device and reopen the door. The other is a
- * stale link — `next.config.ts` still redirects `/hosts`, `/settings` and the
+ * stale link — `next.config.ts` still redirects `/settings`, `/trust` and the
  * rest of the retired nav there — which should strand nobody and forget
  * nothing. Inferring it from the path alone would sign a person out for
- * clicking an old bookmark.
+ * clicking an old bookmark. (`/hosts` is a real page again, and `/legion`
+ * redirects to it rather than to the lander.)
  *
  * A query parameter rather than a path so that a shell which somehow does not
  * intercept it still lands somewhere real, exactly as a browser does.

@@ -2,12 +2,14 @@ import * as Clipboard from "expo-clipboard";
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { HostFacts } from "@/components/hosts/host-facts";
+import { HostIdentityConflict } from "@/components/hosts/host-identity-conflict";
 import {
   formatHostPlatform,
   hostConnectionLabel,
   relativeSeen,
 } from "@/components/hosts/host-model";
 import { HostSessionList } from "@/components/hosts/host-session-list";
+import { HOST_IDENTITY_BLOCKED_REASON } from "@/components/hosts/host-trust-copy";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -196,10 +198,20 @@ export interface HostDetailViewProps {
   browserDevices?: readonly BrowserDeviceOut[];
   host: HostOut;
   hostPins?: HostPinsOut | null;
+  /**
+   * The server presents a different identity for this host than the one this
+   * device approved. Connections stay closed until it is removed and possessed
+   * again, so the page leads with that and nothing here can open one.
+   */
+  identityConflict?: boolean;
+  /** A removal is in flight, so the conflict panel's exit cannot be pressed twice. */
+  removing?: boolean;
   sessions: readonly SessionOut[];
   onOpenAgents(): void;
   onOpenFiles(): void;
   onOpenSession(session: SessionOut): void;
+  onOpenUpdate?(): void;
+  onRemove?(): void;
 }
 
 export function HostDetailView({
@@ -207,14 +219,21 @@ export function HostDetailView({
   browserDevices = [],
   host,
   hostPins = null,
+  identityConflict = false,
+  removing = false,
   sessions,
   onOpenAgents,
   onOpenFiles,
   onOpenSession,
+  onOpenUpdate,
+  onRemove,
 }: HostDetailViewProps) {
   const online = host.status === "online";
   return (
     <View style={styles.content}>
+      {identityConflict && onRemove ? (
+        <HostIdentityConflict onRemove={onRemove} removing={removing} />
+      ) : null}
       <View style={styles.hero}>
         <View style={styles.statusRow}>
           <StatusDot
@@ -234,8 +253,14 @@ export function HostDetailView({
       {/* No heading over these, so the group opens with its own rule. */}
       <ListGroup openingRule testID="host-destinations">
         <DestinationRow
-          detail={online ? "Browse this machine" : "Unavailable while the daemon is offline"}
-          disabled={!online}
+          detail={
+            identityConflict
+              ? HOST_IDENTITY_BLOCKED_REASON
+              : online
+                ? "Browse this host"
+                : "Unavailable while the daemon is offline"
+          }
+          disabled={!online || identityConflict}
           icon="FolderTree"
           label="Files"
           onPress={onOpenFiles}
@@ -247,7 +272,7 @@ export function HostDetailView({
           onPress={onOpenAgents}
         />
       </ListGroup>
-      <HostFacts host={host} />
+      <HostFacts host={host} {...(onOpenUpdate === undefined ? {} : { onOpenUpdate })} />
       {hostPins ? <HostApprovingDevices devices={browserDevices} hostPins={hostPins} /> : null}
       <HostSessionList agents={agents} onOpen={onOpenSession} sessions={sessions} />
     </View>

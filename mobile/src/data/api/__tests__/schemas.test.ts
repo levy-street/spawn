@@ -8,7 +8,7 @@ import {
   DevicePollResponseSchema,
 } from "@/data/api/schemas/devices";
 import { HostOutSchema } from "@/data/api/schemas/hosts";
-import { ProfileOutSchema } from "@/data/api/schemas/legion";
+import { ProfileOutSchema } from "@/data/api/schemas/profile";
 import { ReleaseSchema } from "@/data/api/schemas/release";
 import { SessionOutSchema } from "@/data/api/schemas/sessions";
 import { SessionAccessOutSchema, SkillOutSchema } from "@/data/api/schemas/skills";
@@ -359,7 +359,7 @@ it("round-trips trust response JSON", () => {
   });
 });
 
-it("round-trips Legion/profile response JSON", () => {
+it("round-trips profile response JSON", () => {
   const fixture = {
     ...user,
     totals: {

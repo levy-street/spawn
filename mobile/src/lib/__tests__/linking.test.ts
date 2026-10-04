@@ -48,7 +48,8 @@ describe("incoming spawn links", () => {
       route: "/host/[id]/files",
       params: { id: HOST_ID, path: "/Users/spawn project" },
     },
-    { input: "/legion", route: "/legion", params: {} },
+    { input: "/hosts", route: "/hosts", params: {} },
+    { input: "/legion", route: "/hosts", params: {} },
     { input: "/admin", route: "/admin", params: {} },
     {
       input: `/w/${WORKSPACE_ID}?tab=${TAB_ID}&focus=${SESSION_ID}`,
@@ -113,7 +114,14 @@ describe("incoming spawn links", () => {
   });
 
   it("keeps drawer destination links public and route-group independent", () => {
-    expect(resolveIncomingLink("/legion")).toMatchObject({ href: "/legion", route: "/legion" });
+    expect(resolveIncomingLink("/hosts")).toMatchObject({ href: "/hosts", route: "/hosts" });
+    // The fleet's retired address still lands on the Hosts tab.
+    expect(resolveIncomingLink("/legion")).toMatchObject({ href: "/hosts", route: "/hosts" });
+    expect(resolveIncomingLink("spawn://legion")).toMatchObject({ href: "/hosts" });
+    expect(resolveIncomingLink(`https://${UNIVERSAL_LINK_HOST}/hosts`)).toMatchObject({
+      href: "/hosts",
+      requiresAuth: true,
+    });
     expect(resolveIncomingLink("/security")).toMatchObject({
       href: "/settings?section=security",
       route: "/settings",

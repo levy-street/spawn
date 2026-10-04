@@ -308,7 +308,7 @@ certificate table, whatever the file is called.
   - **Source:** I-web-frontends.md, R6-frontends.md
 
 - [ ] **Cross-client contract**
-  - **Do:** Edge: onboarding, bare /device, /legion → Add machine. iOS/Android: About, onboarding, Legion/detail/facts/files and Share. Compare release responses without/with daemon.targets.windows-x86_64; copy every target command.
+  - **Do:** Edge: onboarding, bare /device, /hosts → Possess a host. iOS/Android: About, onboarding, Hosts/detail/facts/files and Share. Compare release responses without/with daemon.targets.windows-x86_64; copy every target command.
   - **Expect:** Target count changes two→three only when native Windows is live; one manifest gate everywhere; native command is exact; WSL has no smart quotes/newlines; label is Windows · x64; sorting/icons generic; copy/share advances only intended flow.
   - **Source:** I-web-frontends.md, I-mobile-frontends.md
 

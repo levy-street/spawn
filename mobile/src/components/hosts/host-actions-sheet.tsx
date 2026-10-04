@@ -36,7 +36,7 @@ export function HostActionsSheet({
               },
               {
                 id: "remove",
-                label: "Remove",
+                label: "Remove host",
                 destructive: true,
                 icon: <Icon color="destructive" name="Trash2" />,
                 onPress: () => onRemove(host),

@@ -1,18 +1,18 @@
 import { z } from "zod";
 import { IsoDateSchema, IsoDateTimeSchema, UUIDSchema } from "@/data/api/schemas/common";
 
-export const LegionDayOutSchema = z.object({
+export const ProfileDayOutSchema = z.object({
   day: IsoDateSchema,
   sessions_started: z.number().int().nonnegative(),
   session_seconds: z.number().int().nonnegative(),
   peak_sessions: z.number().int().nonnegative(),
   peak_hosts_online: z.number().int().nonnegative(),
 });
-export const LegionAgentOutSchema = z.object({
+export const ProfileAgentOutSchema = z.object({
   command: z.string(),
   count: z.number().int().nonnegative(),
 });
-export const LegionTotalsOutSchema = z.object({
+export const ProfileTotalsOutSchema = z.object({
   hosts: z.number().int().nonnegative(),
   hosts_online: z.number().int().nonnegative(),
   cores: z.number().int().nonnegative(),
@@ -27,7 +27,7 @@ export const LegionTotalsOutSchema = z.object({
   peak_sessions: z.number().int().nonnegative(),
   first_day: IsoDateSchema.nullable(),
 });
-export const LegionHostOutSchema = z.object({
+export const ProfileHostOutSchema = z.object({
   id: UUIDSchema,
   name: z.string(),
   os: z.string().nullable(),
@@ -45,16 +45,16 @@ export const ProfileOutSchema = z.object({
   created_at: IsoDateTimeSchema,
   email_verified_at: IsoDateTimeSchema.nullable(),
   is_admin: z.boolean(),
-  totals: LegionTotalsOutSchema,
-  agents: z.array(LegionAgentOutSchema),
-  days: z.array(LegionDayOutSchema),
-  hosts: z.array(LegionHostOutSchema),
+  totals: ProfileTotalsOutSchema,
+  agents: z.array(ProfileAgentOutSchema),
+  days: z.array(ProfileDayOutSchema),
+  hosts: z.array(ProfileHostOutSchema),
   history_days: z.number().int().positive(),
   today: IsoDateSchema,
 });
 
-export type LegionDayOut = z.infer<typeof LegionDayOutSchema>;
-export type LegionAgentOut = z.infer<typeof LegionAgentOutSchema>;
-export type LegionTotalsOut = z.infer<typeof LegionTotalsOutSchema>;
-export type LegionHostOut = z.infer<typeof LegionHostOutSchema>;
+export type ProfileDayOut = z.infer<typeof ProfileDayOutSchema>;
+export type ProfileAgentOut = z.infer<typeof ProfileAgentOutSchema>;
+export type ProfileTotalsOut = z.infer<typeof ProfileTotalsOutSchema>;
+export type ProfileHostOut = z.infer<typeof ProfileHostOutSchema>;
 export type ProfileOut = z.infer<typeof ProfileOutSchema>;

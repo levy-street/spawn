@@ -45,11 +45,19 @@ function SegmentedMeter({
   );
 }
 
-function ExactMeter({ label, percent }: { label: string; percent: number }) {
+function ExactMeter({
+  compact = false,
+  label,
+  percent,
+}: {
+  compact?: boolean;
+  label: string;
+  percent: number;
+}) {
   const theme = useTheme();
   const rounded = Math.round(percent);
   return (
-    <View style={styles.meterRow}>
+    <View style={[styles.meterRow, compact && styles.compactMeterRow]}>
       <Text style={styles.meterLabel} variant="micro">
         {label}
       </Text>
@@ -71,7 +79,7 @@ function ExactMeter({ label, percent }: { label: string; percent: number }) {
           ]}
         />
       </View>
-      <Text style={styles.value} variant="caption">
+      <Text style={compact ? undefined : styles.value} variant="caption">
         {rounded}%
       </Text>
     </View>
@@ -81,9 +89,10 @@ function ExactMeter({ label, percent }: { label: string; percent: number }) {
 export interface CapacityMeterProps {
   capacity: CapacityPresentation;
   /**
-   * Both coarse meters on one line, without their word labels — the shape a
-   * list row has room for. The words are still spoken: each meter names its
-   * reading for assistive tech either way.
+   * Both meters on one line, without the coarse word labels or the exact
+   * reading's memory, load and uptime line — the shape a list row has room for,
+   * and the same height whichever resolution it is showing. The readings are
+   * still spoken: each meter names its value for assistive tech either way.
    */
   compact?: boolean;
 }
@@ -101,6 +110,14 @@ export function CapacityMeter({ capacity, compact = false }: CapacityMeterProps)
       <View style={compact ? styles.compactPair : styles.stack} testID="bucketed-capacity">
         <SegmentedMeter compact={compact} label="CPU" segments={capacity.cpuSegments} />
         <SegmentedMeter compact={compact} label="MEM" segments={capacity.memorySegments} />
+      </View>
+    );
+  }
+  if (compact) {
+    return (
+      <View style={styles.compactPair} testID="exact-capacity">
+        <ExactMeter compact label="CPU" percent={capacity.cpuPercent} />
+        <ExactMeter compact label="MEM" percent={capacity.memoryPercent} />
       </View>
     );
   }

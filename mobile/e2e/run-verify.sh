@@ -32,7 +32,7 @@ goto "/server"                "04-server"
 goto "/workspaces"            "05-workspaces" 8
 goto "/workspaces/archived"   "06-archived"
 goto "/hosts"                 "07-hosts"
-goto "/legion"                "08-legion"
+goto "/legion"                "08-legion-redirect"  # retired address: lands on Hosts
 goto "/settings"              "09-settings"
 goto "/settings/appearance"   "10-appearance"
 goto "/settings/notifications" "11-notifications"

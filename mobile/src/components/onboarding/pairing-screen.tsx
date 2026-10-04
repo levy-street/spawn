@@ -15,7 +15,17 @@ import { qk } from "@/data/queryKeys";
 import { useSignOut } from "@/lib/use-sign-out";
 import { chrome, spacing, useTheme } from "@/theme";
 
-export function PairingScreen(): React.JSX.Element {
+export interface PairingScreenProps {
+  /** The header. A host's own link lands on the default; adding one names the action. */
+  title?: string;
+  /** One line before the steps, as the browser's dialog has under its title. */
+  lead?: string;
+}
+
+export function PairingScreen({
+  title = "Connect a computer",
+  lead,
+}: PairingScreenProps = {}): React.JSX.Element {
   const theme = useTheme();
   const router = useRouter();
   const signOut = useSignOut();
@@ -79,13 +89,20 @@ export function PairingScreen(): React.JSX.Element {
               },
             ]}
             onBack={() => leaveOnboarding(router)}
-            title="Connect a computer"
+            title={title}
           />
         }
         padded={false}
         scroll
       >
-        <View style={styles.content}>{content}</View>
+        <View style={styles.content}>
+          {lead === undefined ? null : (
+            <Text color="mutedForeground" style={styles.lead} testID="pairing-lead">
+              {lead}
+            </Text>
+          )}
+          {content}
+        </View>
       </Screen>
     </View>
   );
@@ -98,6 +115,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing[5],
     paddingVertical: spacing[8],
     width: "100%",
+  },
+  lead: {
+    paddingBottom: spacing[6],
   },
   loading: {
     alignItems: "center",
