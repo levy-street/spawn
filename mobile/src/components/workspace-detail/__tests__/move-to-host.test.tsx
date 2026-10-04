@@ -114,6 +114,34 @@ describe("moving a window to another host", () => {
     );
   });
 
+  test("a record holding a flag is not carried: the agent starts there under a new UUID", async () => {
+    const claude = makeAgent({
+      id: "agent-claude",
+      name: "claude-code",
+      kind: "claude-code",
+      command: "claude",
+    });
+
+    await (await actions()).movePaneToHost(
+      makeSession({
+        ...pane,
+        agent_id: claude.id,
+        agent_session_id: "--dangerously-skip-permissions",
+      }),
+      host,
+      "/srv/app",
+      [claude],
+    );
+
+    const body = (moveSession as jest.Mock).mock.calls[0]?.[1];
+    expect(body.agent_session_id).toBe("0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102");
+    expect(pendingLaunches.persist).toHaveBeenCalledWith(
+      "session-1",
+      host.id,
+      "claude --session-id 0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102",
+    );
+  });
+
   test("relaunches an agent that names no conversation as itself", async () => {
     const codex = makeAgent({ command: "codex" });
 

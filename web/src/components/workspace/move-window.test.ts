@@ -165,6 +165,29 @@ describe("moveWindow", () => {
     openIntent.clear(incarnationKey(session.id, MAC));
   });
 
+  test("a record holding a flag is not carried: the agent starts there under a new UUID", async () => {
+    const session = row("99999999-9999-4999-8999-999999999999", DREAM, {
+      agent_id: claude.id,
+      agent_session_id: "--dangerously-skip-permissions",
+    });
+    const bodies: Record<string, unknown>[] = [];
+    await moveWindow({
+      queryClient: seeded(session),
+      session,
+      host: { id: MAC },
+      cwd: "/work",
+      agent: claude,
+      move: async (_id, body) => {
+        bodies.push(body);
+        return row(session.id, MAC, { cwd: "/work", agent_id: claude.id });
+      },
+    });
+    const conversation = String((bodies[0] as { agent_session_id?: unknown }).agent_session_id);
+    assert.match(conversation, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    assert.equal(pendingLaunch.take(session.id, MAC), `claude --session-id ${conversation}`);
+    openIntent.clear(incarnationKey(session.id, MAC));
+  });
+
   test("a shell moves as a shell", async () => {
     const session = row("77777777-7777-4777-8777-777777777777", DREAM, {
       foreground_command: "zsh",

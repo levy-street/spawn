@@ -856,6 +856,9 @@ async def test_session_move_refusals_leave_the_window_where_it_was(client):
         assert (await move(body(cwd=""))).status_code == 422
         assert (await move({"host_id": mac, "cwd": "/work"})).status_code == 422
         assert (await move(body(agent_session_id="rm -rf ~"))).status_code == 422
+        # Nor one the agent would read as a flag after `--session-id`.
+        for flag in ("--dangerously-skip-permissions", "-p", "--settings=x", "-"):
+            assert (await move(body(agent_session_id=flag))).status_code == 422, flag
         assert (await move(body(tile={"x": 0}))).status_code == 422
 
         row = (await client.get(f"/api/sessions/{session_id}", headers=auth)).json()
