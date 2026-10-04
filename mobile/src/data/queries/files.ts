@@ -1,5 +1,11 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
+import {
+  type ChangeProbe,
+  createFolderChecked,
+  type HeldFolder,
+  renameChecked,
+} from "@/components/files/change-check";
 import { fileErrorCode } from "@/components/files/errors";
 import {
   applyFirstPagePoll,
@@ -52,21 +58,78 @@ export function hostCan(transport: HostTransport | null, operation: string): boo
   return transport.hasCapability ? transport.hasCapability(operation) : true;
 }
 
-export function createHostFolder(
+/** What the host says is at `path`, without listing its folder. */
+export function statHostEntry(
+  transport: HostTransport,
+  path: string,
+): Promise<{ path: string; name: string; kind: string }> {
+  return transport.request("fs.stat", { path });
+}
+
+/** How a change the host could not vouch for is looked into (change-check.ts). */
+function changeProbe(transport: HostTransport): ChangeProbe {
+  return {
+    stat: hostCan(transport, "fs.stat") ? (path) => statHostEntry(transport, path) : null,
+    codeOf: fileErrorCode,
+  };
+}
+
+/**
+ * A new folder, never one already there: the host's mkdir would answer that
+ * as made. `held` is the folder's listing on screen, which answers first.
+ */
+export async function createHostFolder(
   transport: HostTransport,
   parentPath: string,
   name: string,
-  pathFlavor: PathFlavor = "posix",
+  pathFlavor: PathFlavor,
+  held: HeldFolder | null,
 ): Promise<{ path: string }> {
-  return transport.request("fs.mkdir", { path: joinDirectory(parentPath, name, pathFlavor) });
+  const path = joinDirectory(parentPath, name, pathFlavor);
+  return {
+    path: await createFolderChecked({
+      path,
+      name,
+      held,
+      mkdir: async () =>
+        (await transport.request<{ path?: string | null }>("fs.mkdir", { path })).path ?? path,
+      probe: changeProbe(transport),
+    }),
+  };
 }
 
-export function renameHostEntry(
+/**
+ * Renames an item in `parentPath` without replacing anything. A name already
+ * taken is said as that, even when the host's own answer was only that it
+ * could not be sure what happened.
+ */
+export async function renameHostEntry(
   transport: HostTransport,
-  path: string,
+  entry: Pick<HostDirEntry, "name" | "path">,
   name: string,
+  parentPath: string,
+  pathFlavor: PathFlavor,
+  held: HeldFolder | null,
 ): Promise<{ path: string }> {
-  return transport.request("fs.rename", { path, name, overwrite: false });
+  const to = joinDirectory(parentPath, name, pathFlavor);
+  return {
+    path: await renameChecked({
+      from: entry.path,
+      fromName: entry.name,
+      to,
+      name,
+      held,
+      rename: async () =>
+        (
+          await transport.request<{ path?: string | null }>("fs.rename", {
+            path: entry.path,
+            name,
+            overwrite: false,
+          })
+        ).path ?? to,
+      probe: changeProbe(transport),
+    }),
+  };
 }
 
 export function removeHostEntry(

@@ -431,6 +431,66 @@ describe("FileBrowserBody", () => {
     ).toBeOnTheScreen();
   });
 
+  test("a name already taken is said as that, though the host's own answer is only 'unknown'", async () => {
+    // As SPAWN D's file service answers: mkdir is mkdir -p, and a rename onto
+    // a name already there fails inside its effect, which it reports as
+    // outcome_unknown.
+    const host = fakeHost({
+      folders: { [HOME]: homeFolder() },
+      capabilities: ["fs.list", "fs.stat", "fs.mkdir", "fs.rename", "fs.remove"],
+      daemonEffects: true,
+    });
+    const asked = (operation: string) =>
+      requestLog(host.request).filter((line) => line.startsWith(operation));
+    mockTransport = host.transport;
+    await renderBody();
+    await screen.findByText("notes2.md");
+
+    // A folder already there is not "made" again.
+    await openFolderActions();
+    await fireEvent.press(screen.getByText("New folder"));
+    await fireEvent.changeText(screen.getByLabelText("Name"), "src");
+    await fireEvent.press(screen.getByText("Create folder"));
+    const dialog = await screen.findByTestId("dialog-content");
+    expect(
+      await within(dialog).findByText("There's already an item named “src” here."),
+    ).toBeOnTheScreen();
+    expect(asked("fs.mkdir")).toEqual([]);
+
+    // Nor is a folder made over a file.
+    await fireEvent.changeText(screen.getByLabelText("Name"), "notes2.md");
+    await fireEvent.press(screen.getByText("Create folder"));
+    expect(
+      await within(dialog).findByText("There's already an item named “notes2.md” here."),
+    ).toBeOnTheScreen();
+    expect(screen.queryByText(/lost touch/u)).toBeNull();
+    await fireEvent.press(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByTestId("dialog-content")).toBeNull());
+
+    // A rename onto a name the listing shows.
+    await fireEvent.press(screen.getByRole("button", { name: "Actions for notes2.md" }));
+    await fireEvent.press(screen.getByText("Rename"));
+    await fireEvent.changeText(screen.getByLabelText("Name"), "notes10.md");
+    const renameDialog = await screen.findByTestId("dialog-content");
+    await fireEvent.press(within(renameDialog).getByRole("button", { name: "Rename" }));
+    expect(
+      await within(renameDialog).findByText("There's already an item named “notes10.md” here."),
+    ).toBeOnTheScreen();
+    expect(asked("fs.rename")).toEqual([]);
+
+    // And onto one made on the host after the folder was read: the host's
+    // "unknown" is looked into, and both names are there.
+    host.tree.get(HOME)?.push(fileEntry(HOME, "late.md"));
+    await fireEvent.changeText(screen.getByLabelText("Name"), "late.md");
+    await fireEvent.press(within(renameDialog).getByRole("button", { name: "Rename" }));
+    expect(
+      await within(renameDialog).findByText("There's already an item named “late.md” here."),
+    ).toBeOnTheScreen();
+    expect(asked("fs.rename")).toEqual([`fs.rename ${HOME}/notes2.md`]);
+    expect(asked("fs.stat")).toEqual([`fs.stat ${HOME}/notes2.md`, `fs.stat ${HOME}/late.md`]);
+    expect(screen.queryByText(/lost touch/u)).toBeNull();
+  });
+
   test("a change whose answer never came says so, not the transport's words", async () => {
     const host = fakeHost({
       folders: { [HOME]: homeFolder() },

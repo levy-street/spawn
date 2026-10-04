@@ -121,6 +121,11 @@ export function changeErrorCopy(
       return `“${name}” is no longer there on ${host}.`;
     case "symlink_rejected":
       return "That path goes through a link SPAWN D doesn't follow.";
+    // The host could not say why, but a look afterwards showed nothing moved
+    // (change-check.ts): this is not the lost-touch case below.
+    case "unchanged":
+      return `SPAWN D couldn't change this on ${host}.`;
+    // Only when not even a look afterwards could settle it.
     case "outcome_unknown":
       return `SPAWN D lost touch with ${host} before it answered, so this may or may not have happened. Check the folder before trying again.`;
     default:

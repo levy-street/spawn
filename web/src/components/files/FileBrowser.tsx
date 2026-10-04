@@ -84,6 +84,12 @@ import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
 import {
+  type ChangeProbe,
+  createFolderChecked,
+  type HeldFolder,
+  renameChecked,
+} from "@/lib/files/change-check";
+import {
   COLUMNS,
   type ColumnKey,
   columnTemplate,
@@ -882,6 +888,29 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
     [hostName],
   );
 
+  // What a New folder or Rename checks against before the host is asked, and
+  // how a host's "outcome unknown" is looked into afterwards (change-check.ts).
+  const heldFolder = useCallback(
+    (dir: string): HeldFolder | null => {
+      const listing = folders.get(dir)?.listing;
+      return listing
+        ? { entries: listing.entries, complete: !listing.truncated && !listing.changedOnHost }
+        : null;
+    },
+    [folders],
+  );
+  const changeProbe = useMemo<ChangeProbe | null>(
+    () =>
+      client
+        ? {
+            stat: capabilities.has("fs.stat") ? (path) => client.stat(path) : null,
+            codeOf: errorCode,
+            refuse: (code) => new HostControlError(code),
+          }
+        : null,
+    [capabilities, client],
+  );
+
   const targetDir = useCallback((): string | null => {
     if (!cwd) return null;
     if (view === "details") return cwd;
@@ -916,9 +945,19 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       name: string;
       kind: "folder" | "file";
     }) => {
-      if (!client) throw new Error("Host is not connected");
+      if (!client || !changeProbe) throw new Error("Host is not connected");
       const path = normalizeAbsolutePath(joinPath(dir, name, flavor), flavor);
-      if (kind === "folder") return (await client.mkdir(path)).path ?? path;
+      if (kind === "folder") {
+        // Never the folder that was already there: the host's mkdir would
+        // answer it as made.
+        return createFolderChecked({
+          path,
+          name,
+          held: heldFolder(dir),
+          mkdir: async () => (await client.mkdir(path)).path ?? path,
+          probe: changeProbe,
+        });
+      }
       // An empty file is a zero-length write that refuses to replace anything.
       return client.writeStream(emptyStream(), {
         dir,
@@ -956,14 +995,34 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   );
 
   const renameM = useMutation({
-    mutationFn: ({ entry, name }: { entry: HostDirEntry; name: string; parentDir: string }) =>
-      client?.rename(entry.path, name) ?? Promise.reject(new Error("Host is not connected")),
+    mutationFn: async ({
+      entry,
+      name,
+      parentDir: dir,
+    }: {
+      entry: HostDirEntry;
+      name: string;
+      parentDir: string;
+    }) => {
+      if (!client || !changeProbe) throw new Error("Host is not connected");
+      const to = normalizeAbsolutePath(joinPath(dir, name, flavor), flavor);
+      // A name already taken is said as that, even when the host's own
+      // answer was only that it could not be sure what happened.
+      return renameChecked({
+        from: entry.path,
+        fromName: entry.name,
+        to,
+        name,
+        held: heldFolder(dir),
+        rename: async () => (await client.rename(entry.path, name)).path ?? to,
+        probe: changeProbe,
+      });
+    },
     onMutate: () => setNameError(null),
-    onSuccess: (result, { entry, parentDir: dir }) => {
+    onSuccess: (to, { entry, parentDir: dir }) => {
       setRenaming(null);
       setStatus(null);
       listRef.current?.element?.focus();
-      const to = result.path;
       if (to) {
         setSelection((current) => renameKey(current, entry.path, to));
         setPendingSelect(to);

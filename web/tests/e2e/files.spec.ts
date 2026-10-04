@@ -783,6 +783,103 @@ test("New folder far down a long folder opens in view, and a refused name is sai
   await expect(item(page, "f000.txt")).toBeVisible();
 });
 
+test("a name already taken is said as that, though the host itself only says it can't be sure", async ({
+  page,
+}) => {
+  // As SPAWN D's file service answers (daemon/src/host_files.rs): mkdir is
+  // mkdir -p, and anything that fails inside a mkdir or a rename comes back
+  // outcome_unknown, a name already taken included.
+  const disk = new Map<string, "file" | "directory">([
+    ["/Users/tester/level1", "directory"],
+    ["/Users/tester/draft.txt", "file"],
+    ["/Users/tester/solo.md", "file"],
+  ]);
+  // What the host lists; a name made later by someone else is not in it.
+  const listed = ["level1", "draft.txt", "solo.md"];
+  const asked: string[] = [];
+  await mockApp(page, {
+    files: () =>
+      home(
+        listed.map((name) => {
+          const folder = disk.get(`/Users/tester/${name}`) === "directory";
+          return { name, is_dir: folder, kind: folder ? "directory" : "file" };
+        }),
+      ),
+    fileStat: (_h, path) => {
+      asked.push(`stat ${path}`);
+      const kind = disk.get(path);
+      if (!kind) throw new Error("host_error:not_found");
+      return { path, name: path.split("/").at(-1), kind, size: null };
+    },
+    fileMkdir: async (_h, body, route) => {
+      const path = (body as { path: string }).path;
+      asked.push(`mkdir ${path}`);
+      const kind = disk.get(path);
+      if (kind === "file") throw new Error("host_error:outcome_unknown");
+      disk.set(path, "directory");
+      await route.fulfill({ status: 200, json: { path } });
+    },
+    fileRename: async (_h, body, route) => {
+      const { path, name } = body as { path: string; name: string };
+      asked.push(`rename ${path}`);
+      const to = `/Users/tester/${name}`;
+      const kind = disk.get(path);
+      if (!kind || disk.has(to)) throw new Error("host_error:outcome_unknown");
+      disk.delete(path);
+      disk.set(to, kind);
+      await route.fulfill({ status: 200, json: { path: to } });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(item(page, "solo.md")).toBeVisible();
+
+  // New folder named like a folder already there: not "made" again.
+  await openNewMenu(page, "New folder");
+  const folderField = page.getByLabel("Folder name");
+  await folderField.fill("level1");
+  await folderField.press("Enter");
+  await expect(folderField).toHaveAccessibleDescription(
+    "There's already an item named “level1” here.",
+  );
+  // Like a file: the same, and never "lost touch".
+  await folderField.fill("draft.txt");
+  await folderField.press("Enter");
+  await expect(folderField).toHaveAccessibleDescription(
+    "There's already an item named “draft.txt” here.",
+  );
+  expect(asked).toEqual([]);
+  await folderField.press("Escape");
+  await expect(item(page, "level1")).toHaveAttribute("aria-selected", "false");
+
+  // Rename onto a name in the folder on screen.
+  await item(page, "solo.md").click();
+  await page.keyboard.press("F2");
+  const renameField = page.getByLabel("Rename entry");
+  await renameField.fill("level1");
+  await renameField.press("Enter");
+  await expect(renameField).toHaveAccessibleDescription(
+    "There's already an item named “level1” here.",
+  );
+  expect(asked).toEqual([]);
+
+  // Onto one made on the host after the folder was read: the host's
+  // "unknown" is looked into, and both names are still there.
+  disk.set("/Users/tester/late.md", "file");
+  await renameField.fill("late.md");
+  await renameField.press("Enter");
+  await expect(renameField).toHaveAccessibleDescription(
+    "There's already an item named “late.md” here.",
+  );
+  expect([...asked].sort()).toEqual([
+    "rename /Users/tester/solo.md",
+    "stat /Users/tester/late.md",
+    "stat /Users/tester/solo.md",
+  ]);
+  await expect(page.getByText(/lost touch/u)).toHaveCount(0);
+  expect(disk.get("/Users/tester/solo.md")).toBe("file");
+});
+
 test("another folder opens at its top, not where the last one was scrolled", async ({ page }) => {
   const homeFiles = [
     fileEntry({ name: "sub", path: "/Users/tester/sub", is_dir: true, size: null }),
