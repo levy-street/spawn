@@ -131,6 +131,11 @@ const IMPORTED: &str = "imported";
 const CANCELLED: &str = "cancelled";
 const SUPERSEDED: &str = "superseded";
 const RECORD: &str = "record.json";
+/// An outgoing record's states: files leaving the store; out and declared;
+/// a move that failed and could not be put back, which only an abort ends.
+const MOVING: &str = "moving";
+const HELD: &str = "held";
+const STRANDED: &str = "stranded";
 const FILES: &str = "files";
 const STAGED: &str = "bundle";
 const TREE: &str = "tree";
@@ -166,7 +171,17 @@ pub(crate) enum WindowStop {
 
 pub(crate) type StopFuture = Pin<Box<dyn Future<Output = WindowStop> + Send>>;
 type StopFn = dyn Fn(Uuid) -> StopFuture + Send + Sync;
+type IncarnationFn = dyn Fn(Uuid) -> Option<u64> + Send + Sync;
 type ShellNameFn = dyn Fn() -> String + Send + Sync;
+
+/// Where a retire is, for a test that acts between its steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MovePoint {
+    /// The record is written; nothing has moved yet.
+    BeforeMove,
+    /// Every file has moved; the holders are about to be checked again.
+    AfterMove,
+}
 
 /// Where the carrier keeps and finds things. Production names nothing and
 /// reads the daemon's own configuration; tests root everything in a
@@ -181,6 +196,8 @@ pub(crate) struct Places {
     /// above, as `conv.inspect` reads them.
     registry_stores: Option<Vec<PathBuf>>,
     login_shell: Arc<ShellNameFn>,
+    #[cfg(test)]
+    move_hook: Option<Arc<dyn Fn(MovePoint) + Send + Sync>>,
 }
 
 impl Places {
@@ -192,6 +209,8 @@ impl Places {
             claude_store: None,
             registry_stores: None,
             login_shell: Arc::new(login_shell),
+            #[cfg(test)]
+            move_hook: None,
         }
     }
 
@@ -202,7 +221,16 @@ impl Places {
             registry_stores: Some(vec![claude_store.clone()]),
             claude_store: Some(claude_store),
             login_shell: Arc::new(|| "bash".to_string()),
+            move_hook: None,
         }
+    }
+
+    fn reached(&self, point: MovePoint) {
+        #[cfg(test)]
+        if let Some(hook) = &self.move_hook {
+            hook(point);
+        }
+        let _ = point;
     }
 
     fn holdings_path(&self) -> FsResult<PathBuf> {
@@ -245,6 +273,7 @@ fn error_unavailable(detail: &str) -> FsError {
 pub(crate) struct PairWindows {
     shells: WindowShells,
     stop: Arc<StopFn>,
+    incarnation: Arc<IncarnationFn>,
     bulk: Arc<BulkGate>,
     places: Places,
 }
@@ -253,12 +282,14 @@ impl PairWindows {
     pub(crate) fn new(
         shells: WindowShells,
         stop: impl Fn(Uuid) -> StopFuture + Send + Sync + 'static,
+        incarnation: impl Fn(Uuid) -> Option<u64> + Send + Sync + 'static,
         bulk: Arc<BulkGate>,
         places: Places,
     ) -> Self {
         Self {
             shells,
             stop: Arc::new(stop),
+            incarnation: Arc::new(incarnation),
             bulk,
             places,
         }
@@ -266,6 +297,12 @@ impl PairWindows {
 
     pub(crate) fn shell_pid(&self, session_id: Uuid) -> Option<u32> {
         self.shells.shell_pid(session_id)
+    }
+
+    /// Which run of the window this daemon has now, if any: a window started
+    /// again is another one.
+    fn incarnation(&self, session_id: Uuid) -> Option<u64> {
+        (self.incarnation)(session_id)
     }
 
     pub(crate) fn bulk(&self) -> &Arc<BulkGate> {
@@ -769,6 +806,29 @@ fn slot(role: Role, transfer: Uuid) -> Arc<Mutex<Slot>> {
     let slot = Arc::new(Mutex::new(Slot::default()));
     slots.insert((role, transfer), Arc::downgrade(&slot));
     slot
+}
+
+type MoveLocks = StdMutex<HashMap<String, Weak<Mutex<()>>>>;
+
+/// One move of a conversation at a time, whatever transfer carries it: held
+/// from the look for an unfinished move of the conversation, through the
+/// holder checks and the window's stop, until its own record is written and
+/// its files are out. A second move of the same conversation — a double tap,
+/// another device — waits here, then finds the first's record and is refused
+/// with `transfer_unresolved` before anything of its own stops.
+fn move_lock(conversation_id: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<MoveLocks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(conversation_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(conversation_id.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 /// The context every operation runs in: the home capability, this channel's
@@ -1659,6 +1719,8 @@ pub(crate) fn collect_held() {
         claude_store: None,
         registry_stores: None,
         login_shell: Arc::new(String::new),
+        #[cfg(test)]
+        move_hook: None,
     };
     if let Ok(holdings) = Holdings::open(&places) {
         collect_garbage(&holdings, now_ms(), false);
@@ -2383,6 +2445,8 @@ impl Carrier {
         &self,
         request: &ExportRequest,
     ) -> FsResult<(BundleSource, BundleRecord, usize, Option<&'static str>)> {
+        let moving = move_lock(&request.conversation_id);
+        let _moving = moving.lock().await;
         let transfer = request.transfer_id;
         let from_sequence = request.from_sequence;
         let check = request.clone();
@@ -2453,21 +2517,31 @@ impl Carrier {
                 .await?
             }
         };
-        // Finish what a crash or a channel loss interrupted: files still in
-        // the store move out; the bundle is declared once.
+        // Finish what a crash or a channel loss interrupted; the bundle is
+        // declared once.
         let transfer = request.transfer_id;
         let (source, bundle, entries) = self
             .blocking(move |files, places, operations| {
                 let holdings = Holdings::open(places)?;
                 let mut record = record;
+                match record.state.as_str() {
+                    // Files may still be in the store: the fence again, as
+                    // for a move that has not begun. Whatever holds the
+                    // conversation now refuses the resume, and the record
+                    // stays for an abort to put back what did move.
+                    MOVING => {
+                        let now = holders_now(places, None, &record.conversation_id);
+                        if !now.elsewhere.is_empty() {
+                            return Err(live_elsewhere_error(&now));
+                        }
+                        move_fenced(files, places, &holdings, transfer, &mut record, &|| false)?;
+                    }
+                    STRANDED => return Err(stranded_error()),
+                    _ => {}
+                }
                 let held = holdings
                     .sub(OUTGOING)?
                     .open_dir_nofollow(transfer.to_string())?;
-                if record.state == "moving" {
-                    let store =
-                        Store::at(files, record.store.iter().map(OsString::from).collect())?;
-                    move_out(&holdings, &store, transfer, &record)?;
-                }
                 let held_files =
                     crate::platform::open_or_create_private_dir_at(&held, Path::new(FILES))?;
                 let root = crate::platform::open_or_create_private_dir_at(
@@ -2485,7 +2559,7 @@ impl Carrier {
                     None => {
                         let bundle = declare(&root, &located, &record.conversation_id, skipped)?;
                         record.bundle = Some(bundle.clone());
-                        record.state = "held".to_string();
+                        record.state = HELD.to_string();
                         write_record(&held, RECORD, &record)?;
                         bundle
                     }
@@ -2524,8 +2598,10 @@ impl Carrier {
 
     /// The fence, for a transfer that has not begun: refuse while anything
     /// outside the window holds the conversation; stop the window and its
-    /// Claude processes and confirm each gone; check again; then move every
-    /// copy out of the lookup path into the holding.
+    /// Claude processes and confirm each gone; check again — and that the
+    /// window has not been started again meanwhile; then write the record
+    /// and move every copy out of the lookup path into the holding
+    /// (`move_fenced`).
     async fn retire_fresh(&self, request: &ExportRequest) -> FsResult<&'static str> {
         let session = request.session_id;
         let conversation_id = request.conversation_id.clone();
@@ -2609,7 +2685,10 @@ impl Carrier {
             }
         }
 
-        // (b) Stop the window, then its own Claude processes, by pid.
+        // (b) Stop the window, then its own Claude processes, by pid. The run
+        // of the window that is stopped is remembered: one started again
+        // before the files are out of the lookup path could resume them.
+        let incarnation = self.pair.incarnation(session);
         let stopped = match self.pair.stop_window(session).await {
             WindowStop::Unavailable => {
                 return Err(error(
@@ -2625,16 +2704,20 @@ impl Carrier {
 
         // (c) Nothing holds it now, anywhere; then out of the lookup path.
         let transfer = request.transfer_id;
-        let conversation_id = request.conversation_id.clone();
+        let pair = self.pair.clone();
+        let restarted = move || {
+            pair.incarnation(session)
+                .is_some_and(|now| Some(now) != incarnation)
+        };
         let record = OutgoingRecord {
             version: 1,
             transfer_id: transfer.to_string(),
             agent: CLAUDE_CODE.to_string(),
-            conversation_id: conversation_id.clone(),
+            conversation_id: request.conversation_id.clone(),
             session_id: Some(session.to_string()),
             to_host_id: Some(request.to_host_id.to_string()),
             created_at: now_ms(),
-            state: "moving".to_string(),
+            state: MOVING.to_string(),
             include: request
                 .include
                 .names()
@@ -2648,9 +2731,12 @@ impl Carrier {
             retired_at: None,
         };
         self.blocking(move |files, places, _| {
-            let now = holders_now(places, None, &conversation_id);
+            let now = holders_now(places, None, &record.conversation_id);
             if !now.elsewhere.is_empty() {
                 return Err(live_elsewhere_error(&now));
+            }
+            if restarted() {
+                return Err(window_restarted_error());
             }
             let holdings = Holdings::open(places)?;
             let outgoing = holdings.sub(OUTGOING)?;
@@ -2661,21 +2747,75 @@ impl Carrier {
             // The record lands before any file moves.
             write_record(&held, RECORD, &record)?;
             crate::platform::fsync_dir(&outgoing)?;
-            let store = Store::at(files, record.store.iter().map(OsString::from).collect())?;
-            move_out(&holdings, &store, transfer, &record)?;
-            // Something that resumed it between the check and the move holds
-            // a file now outside the lookup path: put everything back.
-            let after = holders_now(places, None, &conversation_id);
-            if !after.elsewhere.is_empty() {
-                move_back(&holdings, files, transfer, &record)?;
-                remove_tree(&outgoing, &transfer.to_string())?;
-                return Err(live_elsewhere_error(&after));
-            }
-            Ok(())
+            let mut record = record;
+            move_fenced(files, places, &holdings, transfer, &mut record, &restarted)
         })
         .await?;
         Ok(stopped)
     }
+}
+
+/// Every copy out of the lookup path, then checked again: a Claude that
+/// resumed the conversation while its files moved holds one that is now
+/// outside the lookup path, and a window started again could resume it.
+/// When either happens, or the move fails part-way, every file goes back
+/// and the transfer is forgotten — nothing was carried. A restore that fails
+/// too leaves the record `stranded`: no resume or commit goes on from there,
+/// and only an abort, which puts back what it can, finishes it.
+fn move_fenced(
+    files: &HostFileService,
+    places: &Places,
+    holdings: &Holdings,
+    transfer: Uuid,
+    record: &mut OutgoingRecord,
+    restarted: &dyn Fn() -> bool,
+) -> FsResult<()> {
+    places.reached(MovePoint::BeforeMove);
+    let moved = Store::at(files, record.store.iter().map(OsString::from).collect())
+        .and_then(|store| move_out(holdings, &store, transfer, record));
+    let failure = match moved {
+        Err(failure) => failure,
+        Ok(()) => {
+            places.reached(MovePoint::AfterMove);
+            let after = holders_now(places, None, &record.conversation_id);
+            if !after.elsewhere.is_empty() {
+                live_elsewhere_error(&after)
+            } else if restarted() {
+                window_restarted_error()
+            } else {
+                return Ok(());
+            }
+        }
+    };
+    match move_back(holdings, files, transfer, record) {
+        Ok(_) => remove_tree(&holdings.sub(OUTGOING)?, &transfer.to_string())?,
+        Err(restore) => {
+            tracing::warn!(
+                code = restore.code,
+                "a retire that failed could not be undone; only an abort finishes it"
+            );
+            record.state = STRANDED.to_string();
+            let held = holdings
+                .sub(OUTGOING)?
+                .open_dir_nofollow(transfer.to_string())?;
+            write_record(&held, RECORD, record)?;
+        }
+    }
+    Err(failure)
+}
+
+fn window_restarted_error() -> FsError {
+    error(
+        "window_restarted",
+        "the window was started again while its conversation was moving; nothing has moved",
+    )
+}
+
+fn stranded_error() -> FsError {
+    error(
+        "transfer_incomplete",
+        "this move failed and could not be undone; abort it to put back what can be",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3637,7 +3777,11 @@ mod tests {
         holdings: PathBuf,
         carrier: Carrier,
         stops: Arc<AtomicUsize>,
+        /// Which run of the window the daemon has: `None` once stopped.
+        incarnation: Arc<StdMutex<Option<u64>>>,
     }
+
+    type MoveHook = Arc<dyn Fn(MovePoint) + Send + Sync>;
 
     impl Host {
         async fn new() -> Self {
@@ -3645,6 +3789,14 @@ mod tests {
         }
 
         async fn with_window(shell: Option<u32>, stop: Stop) -> Self {
+            Self::build(shell, stop, None).await
+        }
+
+        async fn with_hook(hook: MoveHook) -> Self {
+            Self::build(None, Arc::new(|| WindowStop::NotRunning), Some(hook)).await
+        }
+
+        async fn build(shell: Option<u32>, stop: Stop, hook: Option<MoveHook>) -> Self {
             let root = tempfile::tempdir().unwrap();
             let home = root.path().join("home");
             std::fs::create_dir_all(&home).unwrap();
@@ -3656,15 +3808,24 @@ mod tests {
             let operations = HostFileOperations::new(Arc::new(AtomicBool::new(false)));
             let stops = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&stops);
+            let incarnation = Arc::new(StdMutex::new(None));
+            let stopped_run = Arc::clone(&incarnation);
+            let current_run = Arc::clone(&incarnation);
+            let mut places = Places::rooted(holdings.clone(), store.clone());
+            places.move_hook = hook;
             let pair = PairWindows::new(
                 WindowShells::new(move |id| (id.to_string() == WINDOW).then_some(shell).flatten()),
                 move |_| {
                     counted.fetch_add(1, Ordering::SeqCst);
                     let stopped = stop();
+                    if stopped != WindowStop::Lingering {
+                        *stopped_run.lock().unwrap() = None;
+                    }
                     Box::pin(async move { stopped })
                 },
+                move |_| *current_run.lock().unwrap(),
                 BulkGate::new(),
-                Places::rooted(holdings.clone(), store.clone()),
+                places,
             );
             Self {
                 _root: root,
@@ -3673,6 +3834,7 @@ mod tests {
                 store,
                 holdings,
                 stops,
+                incarnation,
             }
         }
 
@@ -5215,6 +5377,303 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prepared.stopped, Some("not_running"));
+    }
+
+    /// A live stand-in for a Claude holding `conversation` on `store`.
+    #[cfg(target_os = "linux")]
+    fn live_holder(store: &Path, conversation: &str) -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        record_for(store, child.id(), conversation);
+        child
+    }
+
+    #[cfg(target_os = "linux")]
+    fn end(mut child: std::process::Child) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    fn outgoing_record(host: &Host, transfer: Uuid) -> Option<Value> {
+        let path = host
+            .holdings
+            .join(OUTGOING)
+            .join(transfer.to_string())
+            .join(RECORD);
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// A move interrupted with its record written and its files still in
+    /// the store, resumed after the window was started again and Claude
+    /// resumed the conversation there: the resume runs the fence again,
+    /// refuses, and leaves the record for an abort.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_resumed_move_runs_the_fence_again() {
+        let host = Host::new().await;
+        let cwd = host.folder("code/spawn");
+        let record_path = host.project(&cwd).join(format!("{ID}.jsonl"));
+        write_conversation(&host.project(&cwd), ID, RECORD_BYTES, &[]);
+        let transfer = Uuid::new_v4();
+        host.carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "first")
+            .await
+            .unwrap();
+        // As if the daemon had stopped after the record and before the move.
+        let held = host.holdings.join(OUTGOING).join(transfer.to_string());
+        std::fs::rename(held.join("files/0").join(CONVERSATION), &record_path).unwrap();
+        let mut record = outgoing_record(&host, transfer).unwrap();
+        record["state"] = json!(MOVING);
+        record["bundle"] = Value::Null;
+        std::fs::write(held.join(RECORD), record.to_string()).unwrap();
+        let live = live_holder(&host.store, ID);
+        let resumed = host
+            .carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "second")
+            .await;
+        assert_eq!(resumed.err().unwrap().code, "conversation_live_elsewhere");
+        assert!(record_path.exists(), "moved out from under a live holder");
+        assert_eq!(outgoing_record(&host, transfer).unwrap()["state"], MOVING);
+        end(live);
+        // Once nothing holds it, the resume finishes the move.
+        let resumed = host
+            .carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "third")
+            .await
+            .unwrap();
+        assert!(!record_path.exists());
+        assert_eq!(
+            entries(&drain(resumed.source)).last().unwrap().1,
+            RECORD_BYTES
+        );
+        assert_eq!(outgoing_record(&host, transfer).unwrap()["state"], HELD);
+    }
+
+    /// Two moves of one conversation at once — a double tap, two devices —
+    /// never both stop the window or both hold its files: the second waits
+    /// for the first's record and is refused before anything of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_conversation_moves_once_at_a_time() {
+        for round in 0..8 {
+            let host = Host::with_window(
+                None,
+                Arc::new(|| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    WindowStop::NotRunning
+                }),
+            )
+            .await;
+            let cwd = host.folder("code/spawn");
+            write_conversation(&host.project(&cwd), ID, RECORD_BYTES, SIDECAR_FILES);
+            let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+            let (first, second) = (host.carrier.clone(), host.carrier.clone());
+            let (a, b) = (export(one, Some(&cwd), 0), export(two, Some(&cwd), 0));
+            let (a, b) = tokio::join!(
+                tokio::spawn(
+                    async move { first.prepare_export(a, "one").await.map(|p| p.entries) }
+                ),
+                tokio::spawn(
+                    async move { second.prepare_export(b, "two").await.map(|p| p.entries) }
+                ),
+            );
+            let outcomes = [a.unwrap(), b.unwrap()];
+            let carried: Vec<usize> = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().ok().copied())
+                .collect();
+            let refused: Vec<&str> = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().err().map(|failure| failure.code))
+                .collect();
+            assert_eq!(carried, vec![7], "round {round}: {refused:?}");
+            assert_eq!(refused, vec!["transfer_unresolved"], "round {round}");
+            assert_eq!(host.stops.load(Ordering::SeqCst), 1, "round {round}");
+            assert_eq!(
+                std::fs::read_dir(host.holdings.join(OUTGOING))
+                    .unwrap()
+                    .count(),
+                1,
+                "round {round}"
+            );
+        }
+    }
+
+    /// A Claude that resumed the conversation while its files moved holds
+    /// one now outside the lookup path: everything goes back, and the move
+    /// is forgotten.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_holder_that_appears_during_the_move_puts_everything_back() {
+        let started: Arc<StdMutex<Vec<std::process::Child>>> = Arc::default();
+        let store: Arc<OnceLock<PathBuf>> = Arc::default();
+        let (holders, at) = (Arc::clone(&started), Arc::clone(&store));
+        let once = AtomicBool::new(false);
+        let host = Host::with_hook(Arc::new(move |point| {
+            if point == MovePoint::AfterMove && !once.swap(true, Ordering::SeqCst) {
+                holders
+                    .lock()
+                    .unwrap()
+                    .push(live_holder(at.get().unwrap(), ID));
+            }
+        }))
+        .await;
+        store.set(host.store.clone()).unwrap();
+        let cwd = host.folder("code/spawn");
+        let other = host.folder("code/old");
+        write_conversation(&host.project(&cwd), ID, RECORD_BYTES, SIDECAR_FILES);
+        write_conversation(&host.project(&other), ID, b"{\"old\":1}\n", &[]);
+        let transfer = Uuid::new_v4();
+        let refused = host
+            .carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
+            .await;
+        for child in started.lock().unwrap().drain(..) {
+            end(child);
+        }
+        assert_eq!(refused.err().unwrap().code, "conversation_live_elsewhere");
+        for folder in [&cwd, &other] {
+            assert!(host.project(folder).join(format!("{ID}.jsonl")).exists());
+        }
+        assert!(host.project(&cwd).join(ID).join("notes.md").exists());
+        assert!(outgoing_record(&host, transfer).is_none());
+        // Nothing is left to resolve: the next move starts afresh.
+        host.carrier
+            .prepare_export(export(Uuid::new_v4(), Some(&cwd), 0), "again")
+            .await
+            .unwrap();
+    }
+
+    /// The same, when the Claude that resumed it has already written its
+    /// record anew where the old one was: the restore cannot put it back
+    /// over that, so the move is stranded. No resume or commit goes on from
+    /// there, and an abort puts back what it can once the place is free.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_move_that_cannot_be_put_back_is_stranded() {
+        let started: Arc<StdMutex<Vec<std::process::Child>>> = Arc::default();
+        let project: Arc<OnceLock<(PathBuf, PathBuf)>> = Arc::default();
+        let (holders, at) = (Arc::clone(&started), Arc::clone(&project));
+        let host = Host::with_hook(Arc::new(move |point| {
+            if point == MovePoint::AfterMove {
+                let (store, project) = at.get().unwrap();
+                holders.lock().unwrap().push(live_holder(store, ID));
+                std::fs::write(project.join(format!("{ID}.jsonl")), b"{\"new\":1}\n").unwrap();
+            }
+        }))
+        .await;
+        let cwd = host.folder("code/spawn");
+        project
+            .set((host.store.clone(), host.project(&cwd)))
+            .unwrap();
+        write_conversation(&host.project(&cwd), ID, RECORD_BYTES, &[]);
+        let transfer = Uuid::new_v4();
+        let refused = host
+            .carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
+            .await;
+        for child in started.lock().unwrap().drain(..) {
+            end(child);
+        }
+        assert_eq!(refused.err().unwrap().code, "conversation_live_elsewhere");
+        assert_eq!(outgoing_record(&host, transfer).unwrap()["state"], STRANDED);
+        let resumed = host
+            .carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "again")
+            .await;
+        assert_eq!(resumed.err().unwrap().code, "transfer_incomplete");
+        let commit = RetireCommit::parse(
+            json!({"transfer_id": transfer.to_string(), "length": 1, "sha256": "a".repeat(64)})
+                .as_object(),
+        )
+        .unwrap();
+        assert_eq!(
+            host.carrier.retire_commit(commit).await.unwrap_err().code,
+            "transfer_incomplete"
+        );
+        // Never over what is there now.
+        let record_path = host.project(&cwd).join(format!("{ID}.jsonl"));
+        assert_eq!(
+            host.carrier.retire_abort(transfer).await.unwrap_err().code,
+            "already_exists"
+        );
+        assert_eq!(std::fs::read(&record_path).unwrap(), b"{\"new\":1}\n");
+        std::fs::remove_file(&record_path).unwrap();
+        host.carrier.retire_abort(transfer).await.unwrap();
+        assert_eq!(std::fs::read(&record_path).unwrap(), RECORD_BYTES);
+    }
+
+    /// A move that fails part-way puts back what it moved, and is forgotten.
+    #[tokio::test]
+    async fn a_move_that_fails_part_way_is_put_back() {
+        let holding: Arc<OnceLock<PathBuf>> = Arc::default();
+        let at = Arc::clone(&holding);
+        let host = Host::with_hook(Arc::new(move |point| {
+            if point == MovePoint::BeforeMove {
+                // The second copy's slot cannot be made: the first has moved
+                // by the time the move fails.
+                let files = at.get().unwrap().join(FILES);
+                std::fs::create_dir_all(&files).unwrap();
+                std::fs::write(files.join("1"), b"in the way").unwrap();
+            }
+        }))
+        .await;
+        let cwd = host.folder("code/spawn");
+        let other = host.folder("code/zzz");
+        write_conversation(&host.project(&cwd), ID, RECORD_BYTES, SIDECAR_FILES);
+        write_conversation(&host.project(&other), ID, b"{\"old\":1}\n", &[]);
+        let transfer = Uuid::new_v4();
+        holding
+            .set(host.holdings.join(OUTGOING).join(transfer.to_string()))
+            .unwrap();
+        let failed = host
+            .carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
+            .await;
+        assert!(failed.is_err());
+        assert!(host
+            .holdings
+            .join(OUTGOING)
+            .join(transfer.to_string())
+            .join("files/0")
+            .read_dir()
+            .is_err());
+        for folder in [&cwd, &other] {
+            assert!(
+                host.project(folder).join(format!("{ID}.jsonl")).exists(),
+                "{folder:?}"
+            );
+        }
+        assert!(host.project(&cwd).join(ID).join("notes.md").exists());
+        assert!(outgoing_record(&host, transfer).is_none());
+    }
+
+    /// A window started again before the files are out of the lookup path
+    /// could resume them: the move is refused and everything goes back.
+    #[tokio::test]
+    async fn a_window_started_again_while_its_conversation_moves_refuses_the_move() {
+        let run: Arc<OnceLock<Arc<StdMutex<Option<u64>>>>> = Arc::default();
+        let at = Arc::clone(&run);
+        let host = Host::with_hook(Arc::new(move |point| {
+            if point == MovePoint::AfterMove {
+                *at.get().unwrap().lock().unwrap() = Some(2);
+            }
+        }))
+        .await;
+        run.set(Arc::clone(&host.incarnation)).unwrap();
+        let cwd = host.folder("code/spawn");
+        write_conversation(&host.project(&cwd), ID, RECORD_BYTES, &[]);
+        let transfer = Uuid::new_v4();
+        let refused = host
+            .carrier
+            .prepare_export(export(transfer, Some(&cwd), 0), "s")
+            .await;
+        assert_eq!(refused.err().unwrap().code, "window_restarted");
+        assert!(host.project(&cwd).join(format!("{ID}.jsonl")).exists());
+        assert!(outgoing_record(&host, transfer).is_none());
     }
 
     #[cfg(target_os = "linux")]

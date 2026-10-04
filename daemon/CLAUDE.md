@@ -532,7 +532,12 @@ none of it.
   then moves every copy of the conversation out of Claude's lookup path into
   `<config>/conversations/outgoing/<transfer>/`. The record is written before
   any file moves and the bundle is declared once, so a resume after a crash
-  or a lost channel reads the same bytes.
+  or a lost channel reads the same bytes. `move_lock` makes it one move of a
+  conversation at a time, from the look for an unresolved move to the files
+  being out; `move_fenced` checks the holders (and that the window was not
+  started again) once the files are out and puts everything back otherwise
+  — a restore that fails leaves the record `stranded`, which only an abort
+  ends — and a resume of a `moving` record runs the fence again.
 - **It fails closed.** `host_conv::holders` counts a registry record or
   roster worker as a holder unless its process is shown gone (not running,
   or its start differs from the recorded one): a start it cannot compare

@@ -1781,8 +1781,21 @@ daemon does not reproduce), or a record written in another pid namespace or
 on another machine sharing the home, is a holder; the refusal says so, and
 names removing a stale record as the way out. Only a process whose start the
 daemon read is ever signalled, and one that cannot be told from it counts as
-still running. One move of a conversation at a time:
-`transfer_unresolved` names an earlier one still open. With several copies,
+still running. A window started again after its stop and before the files
+are out of the lookup path refuses the move with `window_restarted`. The
+files move only once the record of the move is on disk, and the holders are
+checked again after the move: when something holds the conversation then,
+or the move fails part-way, every file goes back and the transfer is
+forgotten. A restore that fails as well leaves the transfer `stranded`
+(`conv.transfers`): no resume or commit goes on from there
+(`transfer_incomplete`), and only `conv.retire.abort` — which puts back what
+it can, never over anything — finishes it. A resumed export of a transfer
+whose files may still be in the store runs the fence again and refuses while
+anything holds the conversation, leaving the transfer for an abort. One
+move of a conversation at a time, whatever transfer carries it: a second
+waits for the first to have its record, then fails with
+`transfer_unresolved`, naming it, before anything of its own stops. With
+several copies,
 the one in the window's folder (`cwd`) travels and all leave the lookup path;
 without it, `conversation_ambiguous`. A repeated export with the same
 `transfer_id` — and `from_sequence` — resumes the same bytes, on any channel,
@@ -1824,8 +1837,8 @@ its holding to `retired`, kept 30 days and never in the lookup path:
 only once the target has answered `cancelled`. Commit and abort are each
 final; the other then fails with `transfer_committed` or `transfer_aborted`.
 `conv.transfers {}` lists what is unfinished on this host —
-`{outgoing:[{transfer_id, conversation_id, session_id, to_host_id, state,
-created_at, length, sha256}], incoming:[{transfer_id, conversation_id,
+`{outgoing:[{transfer_id, conversation_id, session_id, to_host_id, state
+(moving, held or stranded), created_at, length, sha256}], incoming:[{transfer_id, conversation_id,
 from_host_id, state, received, next_sequence, length, created_at}],
 truncated}` — so any device can resolve a move another one started: it asks
 the outgoing transfer's `to_host_id` — never another host, and never on the
@@ -1835,8 +1848,9 @@ has answered `cancelled`, aborts the retire. A device that cannot reach the
 target leaves the move unresolved.
 
 Other errors: `window_unavailable` (a worker the daemon has not adopted yet;
-nothing was stopped), `transfer_not_found`, `transfer_incomplete` (a retire
-commit for a transfer that never declared a bundle: abort it),
+nothing was stopped), `window_restarted` (above), `transfer_not_found`,
+`transfer_incomplete` (a resume or retire commit of a transfer that never
+declared a bundle, or is stranded: abort it),
 `store_too_large` (more project folders than a scan reads), `too_large` (an
 entry over 512 MiB, more than 4,096 entries, or a bundle over 2 GiB — refused
 before anything stops), and `file_changed` (a held file no longer matches

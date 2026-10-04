@@ -448,11 +448,17 @@ impl RtcSessions {
                     let shells =
                         crate::host_conv::WindowShells::new(move |id| registry.shell_pid(id));
                     let registry = pair.registry.clone();
+                    let incarnations = pair.registry.clone();
                     let windows = crate::host_conversations::PairWindows::new(
                         shells,
                         move |id| {
                             let registry = registry.clone();
                             Box::pin(async move { stop_window(&registry, id).await })
+                        },
+                        move |id| {
+                            incarnations
+                                .binding_for(id)
+                                .map(|binding| binding.generation())
                         },
                         Arc::clone(&pair.bulk),
                         crate::host_conversations::Places::from_env(crate::run::login_shell_name),
@@ -2516,6 +2522,7 @@ mod tests {
                 let pair = PairWindows::new(
                     crate::host_conv::WindowShells::new(|_| None),
                     |_| Box::pin(async { WindowStop::NotRunning }),
+                    |_| None,
                     Arc::clone(&gate),
                     Places::rooted(home.join(".config/spawn/conversations"), store.clone()),
                 );
