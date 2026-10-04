@@ -1222,10 +1222,13 @@ Unadvertised operations answer `unsupported_operation` as an ordinary error
 response rather than closing the channel.
 
 From `conv.*` on, an operation family is advertised as one versioned
-capability, never a name per operation: `conv.v1` covers every `conv.*`
-operation, and an incompatible revision of a family is a new name
-(`conv.v2`). Clients cap the number of names they accept, and a family keeps a
-hello far from that cap. A family that carries a device's intent for the host
+capability, never a name per operation, and a revision that adds operations
+a client cannot assume from the old name is a new name: `conv.v1` is
+`conv.inspect`, and `conv.v2` is everything `conv.v1` is plus the carrier
+(`conv.probe`, `conv.export`, `conv.import.begin|status|cancel`,
+`conv.retire.commit|abort`, `conv.transfers`; "The conversation carrier"
+below). A daemon that carries advertises both. Clients cap the number of
+names they accept, and a family keeps a hello far from that cap. A family that carries a device's intent for the host
 — `conv.*` now, with `session.launch.*`, `agent.accounts.*`, `screen.*` and
 `box.*` reserved for it — is advertised and answered only on a
 `spawn.host.ctl` channel admitted through an authenticated device pair (the
@@ -1487,13 +1490,15 @@ streams and awaits cleanup before returning. The former REST
 Browser downloads stream to a native file destination when supported; the
 object-URL fallback is hard-capped at 32 MiB so memory remains bounded.
 
-### Stream v2 (specified; not implemented)
+### Stream v2
 
 Every bulk transfer on `spawn.host.ctl` — a conversation a device carries
-between hosts first (`conv.v1`, daemon release D2), file reads and writes
-later (`fs.v2`, D4) — uses one stream primitive, specified here before any
-runtime builds it so that the daemon, the browser and the phone build one
-flow-control mechanism rather than three.
+between hosts first (`conv.v2`, daemon release D2, `daemon/src/host_stream.rs`),
+file reads and writes later (`fs.v2`, D4) — uses one stream primitive,
+specified here before any runtime built it so that the daemon, the browser
+and the phone build one flow-control mechanism rather than three. The daemon
+implements it for `conv.v2` (D2); the clients' carrier comes with milestone
+M6.
 [`stream-v2-vectors.json`](stream-v2-vectors.json) holds its chunking,
 window, acknowledgement, status and pacing cases and two complete frame
 transcripts (a write and a read, each resumed after its channel closed).
@@ -1541,7 +1546,11 @@ v2 write the daemon acknowledges too, once it has written the chunks to its
 staging file (not once it has synced them); that is the whole of write flow
 control, and there is no separate credit frame. A receiver may batch
 acknowledgements but never holds back more than half the window (rounded up)
-of the chunks it has taken, and acknowledges the last chunk at once. An
+of the chunks it has taken, and acknowledges the last chunk at once. The
+daemon acknowledges a write whenever it has caught up with what arrived (no
+frame waiting behind the chunk it just wrote), so a sender that is slower
+than the disk hears about every chunk; the write transcript in the vectors
+is that rule. An
 acknowledgement below an earlier one, or above what was sent, closes the
 channel, as any malformed frame does.
 
@@ -1575,14 +1584,20 @@ under the transfer's lock the daemon ends the old stream with `stream.error`
 `superseded`, refuses any later frame on it as it refuses a frame for an
 unknown stream, and only then reads `next_sequence` for its answer. At most
 one stream writes a transfer at a time, and no stale one writes past the
-point the new one starts from. A `stream.cancel` ends a stream, not its
-transfer: the staged bytes stay `receiving`. Only the family's own
-cancel (`conv.import.cancel`) makes a transfer `cancelled`, and the daemon
-decides commit and cancel under one lock, so a transfer reports exactly one
-of them from then on. Staged bytes outlive the channel that carried them by at
-least ten minutes, bounded in count and bytes as uploads are; a family may
-keep them longer (`conv.v1` keeps a transfer's record until a device resolves
-the move).
+point the new one starts from. The superseded stream's channel hears
+`stream.error {code:"superseded"}`; a chunk that arrives for it afterwards is
+refused as one for an unknown stream would be (the channel closes). A
+`stream.cancel` ends a stream, not its transfer: the staged bytes stay
+`receiving`, and a chunk the device sent before its cancel is dropped. Only
+the family's own cancel (`conv.import.cancel`) makes a transfer `cancelled` —
+the stream carrying it hears `stream.error {code:"cancelled"}` and its chunks
+already on their way are dropped — and the daemon decides commit and cancel
+under one lock, so a transfer reports exactly one of them from then on. Staged
+bytes outlive the channel that carried them by at least ten minutes, bounded
+in count and bytes as uploads are; a family may keep them longer (`conv.v2`
+keeps a transfer's staging until a device resolves the move, at most 16
+transfers at a time). A v2 write stream with nothing for 60 seconds ends with
+`stream.error {code:"stream_timeout"}`; its transfer stays `receiving`.
 
 **Commit.** `stream.committed` follows the receiver's fsync of the file and
 of its directory. A write whose bytes fail the digest at commit
@@ -1615,11 +1630,12 @@ against that. A device paces its own writes the same way, with one gate per
 connection over the sum of `RTCDataChannel.bufferedAmount` across its bulk
 channels.
 
-### Conversation bundle v1 (specified; not implemented)
+### Conversation bundle v1
 
 What `conv.export` streams out of one host and `conv.import.begin` takes in on
 another: one conversation's own files, carried by a device over its two host
-channels. [`conversation-bundle-v1-vectors.json`](conversation-bundle-v1-vectors.json)
+channels. The daemon writes and reads it (`daemon/src/host_bundle.rs`, D2),
+byte for byte as the vectors' bundles. [`conversation-bundle-v1-vectors.json`](conversation-bundle-v1-vectors.json)
 holds three complete bundles (one three stream chunks long, which the stream
 v2 transcripts carry), the path allowlist cases, the requests a target must
 refuse before any stream opens, and the manifests, headers and lengths a
@@ -1694,6 +1710,110 @@ bundle's — the stream's digest — before it commits. Its errors are
 `invalid_bundle`, `unsupported_version`, `invalid_manifest`, `invalid_path`,
 `path_not_allowed`, `entry_order`, `too_large` and `integrity_mismatch`; the
 begin's own are `invalid_request` and the stream's.
+
+A writer carries a log (`.jsonl`) up to and including its last newline: a
+Claude Code killed mid-write leaves a torn last line, and the next append
+glues onto it, so a carried record ends at its last complete line. Files the
+allowlist does not know — or that a request's `include` leaves out, or that
+are links — stay where they are and are counted, never carried.
+
+### The conversation carrier (`conv.v2`)
+
+Implemented by daemon D2 (`daemon/src/host_conversations.rs`), for Claude
+Code; pair channels of Linux and macOS daemons only (Windows waits for spike
+S5). A device moves a conversation by carrying it: it reads the bundle out of
+the source with `conv.export` and writes it into the target with
+`conv.import.begin`, forwarding the source's digest, then settles both ends.
+Neither host hears of the other, and the server sees none of it. Every id is a
+canonical lower-case UUID; a `transfer_id` is a UUIDv4 the device chose, and
+the same one names the transfer on both hosts.
+
+`conv.probe {agent:"claude-code", conversation_id?, cwd}` — the target's facts
+before a move: `{agent, home, cwd, folder_exists, project_folder, store,
+store_ready, store_problem, destination, memory, repository_root, duplicates,
+duplicates_truncated, login_shell, cli_version}`. `cwd` is the folder with
+every link resolved (what Claude Code files it under, inside home); `store`
+is `CLAUDE_CONFIG_DIR` or `~/.claude`; `destination` is
+`<store>/projects/<folder>` by Claude Code's own folder rule; `memory` is the
+memory folder of the folder's repository root (a linked worktree's main
+working tree, read from `.git` and `commondir`, never by running git), or of
+the folder itself outside a repository; `duplicates` names every copy of the
+conversation already on the host (`{folder, path, size, modified_at}`, at most
+16); `login_shell` is the shell the host's windows start, by name; and
+`cli_version` is Claude Code's version, read from where it is installed and
+never by running it, or null. `store_ready` is false — with the reason — when
+the store is missing, outside home, behind a link, or on another filesystem
+from spawnd's holdings.
+
+`conv.export {transfer_id, agent, conversation_id, mode, session_id?, cwd?,
+to_host_id?, include?, stream?, from_sequence?}` opens a v2 read and answers
+`{stream_id, transfer_id, length, sha256, window, next_sequence, entries,
+skipped, stopped}`. `include` lists `conversation` (required), `subagents`,
+`tool_results` and `workflows`, all by default. `mode:"snapshot"` reads a
+bounded prefix where it lies and stops nothing. `mode:"retire"` — which names
+the window it leaves (`session_id`) — is the single-writer fence, in this
+order: it refuses with `conversation_live_elsewhere` while a live Claude
+registry record or background-roster worker outside the window holds the
+conversation (a background session, the job an attach client or agent view
+shows, another window), and with `conversation_changed` when the window is
+now in another conversation; it stops the window's worker (TERM, then KILL,
+through the session registry), then every Claude process of the window
+itself, and confirms each is gone by its pid and start — never by a pid file
+or the session's exit — or fails with `agent_still_running`; it checks again
+that nothing holds the conversation; and it moves every copy of the
+conversation out of Claude's lookup path into the daemon's holding before it
+reads a byte (`stopped` says how the window went: `stopped`,
+`not_running`, `lingering`). One move of a conversation at a time:
+`transfer_unresolved` names an earlier one still open. With several copies,
+the one in the window's folder (`cwd`) travels and all leave the lookup path;
+without it, `conversation_ambiguous`. A repeated export with the same
+`transfer_id` — and `from_sequence` — resumes the same bytes, on any channel,
+superseding the stream that had it.
+
+`conv.import.begin {transfer_id, agent, conversation_id, cwd, length, sha256,
+stream?, from_host_id?}` opens a v2 write into the target's staging and
+answers `{stream_id, window, next_sequence, received}`; repeated with the same
+declaration it resumes (`resume_mismatch` otherwise). The target refuses a
+folder it does not have (`folder_missing`), one outside home
+(`outside_root`), a store that does not exist yet (`store_missing`) or that it
+cannot rename into (`store_unavailable`), more than 16 transfers staged at
+once (`too_many_transfers`), and a transfer already settled
+(`transfer_committed`, `transfer_cancelled`). At `stream.end` it verifies every
+entry and the whole digest again, extracts the files 0600 and their folders
+0700, syncs each, sets every other copy of the conversation aside (never
+overwriting, never deleting one), renames the sidecar and then the record
+into place, and answers `stream.committed {stream_id, length, sha256,
+result:{transfer_id, conversation_id, cwd, project_folder, path, memory,
+set_aside}}` — `path` is the record Claude Code resumes from `cwd`. Bytes
+that fail their checks are discarded and the transfer forgotten.
+
+`conv.import.status {transfer_id}` answers the stream v2 status;
+`conv.import.cancel {transfer_id}` answers it as `cancelled` from then on, or
+fails with `transfer_committed`. `conv.retire.commit {transfer_id, length,
+sha256}` on the source takes the length and digest the target committed —
+`declaration_mismatch` unless they are what the source declared — and moves
+its holding to `retired`, kept 30 days and never in the lookup path:
+`{state:"retired", retired_at, kept_until}`. `conv.retire.abort
+{transfer_id}` puts every copy back where it came from, never over anything
+(`already_exists` otherwise): `{state:"aborted", restored}`. A device sends it
+only once the target has answered `cancelled`. Commit and abort are each
+final; the other then fails with `transfer_committed` or `transfer_aborted`.
+`conv.transfers {}` lists what is unfinished on this host —
+`{outgoing:[{transfer_id, conversation_id, session_id, to_host_id, state,
+created_at, length, sha256}], incoming:[{transfer_id, conversation_id,
+from_host_id, state, received, next_sequence, length, created_at}],
+truncated}` — so any device can resolve a move another one started: a
+committed import commits the retire, anything else cancels the import and
+then aborts the retire.
+
+Other errors: `window_unavailable` (a worker the daemon has not adopted yet;
+nothing was stopped), `transfer_not_found`, `transfer_incomplete` (a retire
+commit for a transfer that never declared a bundle: abort it),
+`store_too_large` (more project folders than a scan reads), `too_large` (an
+entry over 512 MiB, more than 4,096 entries, or a bundle over 2 GiB — refused
+before anything stops), and `file_changed` (a snapshot's file changed while
+it was read). The hello's `limits` carry `stream_window_max`, 16 until spike
+S4 measures.
 
 ### Proposed P2-DATA-02 store contract (review pending; not implemented)
 
