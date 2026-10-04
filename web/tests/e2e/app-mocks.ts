@@ -105,6 +105,30 @@ export async function pinKeyboard(page: Page, keyboard: "apple" | "pc") {
   }, pinned);
 }
 
+/**
+ * Keeps other workers' compiles out of this page's navigations.
+ *
+ * Every worker shares one `next dev`. A compile for any route — one another
+ * worker opens for the first time, or brings back after the dev server let it
+ * go — can make the dev server tell every open page to refetch its server
+ * components ("serverComponentChanges"). The router folds that refetch into a
+ * link navigation still in flight: the click does not land, and the address
+ * does not change, until the dev server answers the refetch, which mid-compile
+ * on a busy runner can take longer than an expectation waits. A production
+ * build never sends it, and no spec edits source, so the broadcast only ever
+ * carries someone else's compile into this test. It is dropped here; the rest
+ * of the dev socket (Fast Refresh, the page's pings) passes through as is.
+ */
+async function dropServerComponentRefreshes(page: Page) {
+  await page.routeWebSocket(/\/_next\/webpack-hmr/, (socket) => {
+    const server = socket.connectToServer();
+    server.onMessage((message) => {
+      if (typeof message === "string" && message.includes('"serverComponentChanges"')) return;
+      socket.send(message);
+    });
+  });
+}
+
 export function session(overrides: Record<string, unknown> = {}) {
   return {
     id: SESSION_ID,
@@ -467,6 +491,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     return result ?? fallback;
   };
 
+  await dropServerComponentRefreshes(page);
   await page.exposeFunction(
     "__spawnHostControlRequest",
     async (hostId: string, operation: string, payload: Record<string, unknown>) => {
