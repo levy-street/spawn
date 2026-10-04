@@ -973,6 +973,11 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     uploadFinalAction: "hold",
   });
+  // The fake clock goes in before the first upload status is shown. A status
+  // timer armed natively is out of the faked clearTimeout's reach: it fires
+  // on its own and blanks whichever status has replaced it by then — on a
+  // slow runner, the oversized-file notice below, before the first look.
+  await page.clock.install();
   await page.getByLabel("Session terminal").evaluate((terminal) => {
     const transfer = new DataTransfer();
     transfer.items.add(new File(["published"], "maybe.png", { type: "image/png" }));
@@ -985,19 +990,22 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   await expect(page.getByTestId("upload-reconciliation")).toContainText(
     "Check the endpoint destination before retrying",
   );
-  await page.clock.install();
   expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
     1,
   );
   expect(uploads).toHaveLength(1);
 
   await page.clock.fastForward(3_500);
+  await expect(page.getByText("Uploading image...")).toHaveCount(0);
   await expect(page.getByTestId("upload-reconciliation")).toContainText(
     "Check the endpoint destination before retrying",
   );
 
   // A later ordinary status may come and go without replacing the durable
-  // reconciliation record.
+  // reconciliation record. Time stands still while it is up, so it leaves
+  // when the test moves the clock, not while the page is still busy taking
+  // in a 20 MB file.
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1_000);
   await page.locator('input[type="file"]').setInputFiles({
     name: "too-large.bin",
     mimeType: "application/octet-stream",
@@ -1007,6 +1015,7 @@ test("a held final acknowledgement surfaces outcome_unknown and never retries", 
   await page.clock.fastForward(3_500);
   await expect(page.getByText(/larger than 20 MB/i)).toHaveCount(0);
   await expect(page.getByTestId("upload-reconciliation")).toContainText("maybe.png");
+  await page.clock.resume();
 
   // Navigation fully unmounts this terminal; the session-scoped record
   // restores on the next component instance.
