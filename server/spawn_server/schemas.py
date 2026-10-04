@@ -1323,10 +1323,27 @@ class SessionMove(BaseModel):
     # caller's agents, never anything the server runs. Omitted or null leaves
     # the type as it is.
     agent_id: str | None = None
-    # The conversation the client is starting the agent with on the new host
-    # (a fresh one: nothing of the old conversation travels). Omitted or null
-    # clears it, so a restart there never resumes a thread the host lacks.
+    # The conversation the client is starting the agent with on the new host:
+    # a fresh one, or — on a carried move — the one the device has just
+    # carried there. Omitted or null clears it, so a restart there never
+    # resumes a thread the host lacks.
     agent_session_id: str | None = Field(default=None, pattern=AGENT_SESSION_ID_PATTERN)
+    # True commits a carried move: the window must be "moving" from
+    # `expected_host_id`, as `/move/begin` left it and no abort has undone.
+    # False (the default) is a fresh move, refused while a carry is under way.
+    carried: bool = False
+
+
+class SessionMoveFence(BaseModel):
+    """`/move/begin` and `/move/abort`: the host the client saw the window on.
+
+    Begin marks the window as moving and abort ends that, each only while the
+    window is still where the client saw it. Neither names where the window is
+    going, carries anything of the conversation, or reaches a host's launch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_host_id: str
 
 
 class SessionPatch(BaseModel):

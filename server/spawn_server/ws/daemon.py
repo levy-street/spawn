@@ -14,7 +14,7 @@ from typing import Any
 
 import jwt
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy import select, text, update
+from sqlalchemy import case, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -25,7 +25,14 @@ from ..config import get_settings
 from ..data_events import publish_data_changed
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
-from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Session
+from ..models import (
+    SESSION_MOVING,
+    BrowserDevice,
+    Host,
+    HostBrowserPin,
+    RevokedBrowserKey,
+    Session,
+)
 from ..pin_liveness import live_browser_device_id_set
 from ..push import send_alert_push
 from ..redis import get_backend, session_event_channel, user_alert_channel
@@ -1934,6 +1941,12 @@ async def _sort_existing_sessions(
     - adopt: rows bound to this host. Routing reattaches them.
     - stop: adopted rows the server already stopped ("killed"), and rows that
       now name another of the owner's hosts — that window runs there now.
+      A row that is "moving" and names this host is adopted and never
+      stopped: this host is the one the move is leaving, and its worker is
+      the move's own retire to end (or, if the move is aborted, the abort's
+      kill). Stopping it here would be the server acting as the move's fence,
+      which it is not. A row "moving" from another host is stopped like any
+      row that names another host.
     - unclaimed: ids with no row in this account. They are left running, and
       their count and first ids go to the server log only; no device is told.
       After a database restore a missing row may be a window created since
@@ -1953,6 +1966,7 @@ async def _sort_existing_sessions(
         session_row = await session.get(Session, sid)
         if session_row is not None and session_row.host_id == host.id:
             adopt.append(sid)
+            # Only a stop the server wrote; never "moving" (see above).
             if session_row.status == "killed":
                 stop.append(sid)
         elif session_row is not None and session_row.owner_user_id == host.owner_user_id:
@@ -2508,6 +2522,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         durable_owner = False
                         started = False
                         rejected_owner = False
+                        still_moving = False
                         started_owner_id: str | None = None
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
@@ -2521,10 +2536,26 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                         Session.host_id == host.id,
                                         _session_owner_exists(conn),
                                     )
-                                    .values(status="running")
+                                    # A window that is moving stays so: a
+                                    # worker that starts on the host it is
+                                    # leaving (a launch sent before the move
+                                    # began) is the source's retire to stop,
+                                    # and the row reads "moving" until the
+                                    # move commits or is aborted. Decided in
+                                    # the statement, so a begin that commits
+                                    # after the read above is never undone.
+                                    .values(
+                                        status=case(
+                                            (Session.status == SESSION_MOVING, SESSION_MOVING),
+                                            else_="running",
+                                        )
+                                    )
+                                    .returning(Session.status)
                                     .execution_options(synchronize_session=False)
                                 )
-                                started = result.rowcount == 1
+                                written = result.scalar_one_or_none()
+                                started = written is not None
+                                still_moving = written == SESSION_MOVING
                                 rejected_owner = not started
                                 if started:
                                     await session.commit()
@@ -2538,7 +2569,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if rejected_owner:
                             await _close_daemon_consistency_failure(conn)
                             break
-                        if started:
+                        if started and not still_moving:
                             attached = await broker.attach_session_to_daemon(
                                 sid,
                                 conn,
@@ -2739,6 +2770,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     if sid is not None and exit_shape_valid:
                         durable_owner = False
                         exited = False
+                        still_moving = False
                         rejected_owner = False
                         died_alert: dict[str, object] | None = None
                         ran_seconds = 0
@@ -2760,6 +2792,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 # stays "killed" however the shell went. A
                                 # crash reaches here from "running".
                                 stopped_by_server = session_row.status == "killed"
+                                # A window that is moving is a device carrying
+                                # its conversation away from here: the source's
+                                # retire stops the shell and the agent, or the
+                                # shell went anyway. Either way the exit is
+                                # recorded and is not news — the row stays
+                                # "moving", the owner is not paged, and no pane
+                                # is told the shell exited — until the move
+                                # commits or is aborted.
+                                moving_at_read = session_row.status == SESSION_MOVING
+                                exit_status = "killed" if sig or stopped_by_server else "exited"
                                 # How long this circle stayed open. Read here
                                 # for the same reason: after the update the row
                                 # is still present, but this is the one place
@@ -2778,14 +2820,25 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                         _session_owner_exists(conn),
                                     )
                                     .values(
-                                        status="killed" if sig or stopped_by_server else "exited",
+                                        # Decided in the statement: a move
+                                        # begun, or a stop or an abort
+                                        # committed, after the read above is
+                                        # kept, never overwritten.
+                                        status=case(
+                                            (Session.status == SESSION_MOVING, SESSION_MOVING),
+                                            (Session.status == "killed", "killed"),
+                                            else_=exit_status,
+                                        ),
                                         exit_code=code,
                                         exited_at=_utcnow(),
                                         foreground_command=None,
                                     )
+                                    .returning(Session.status)
                                     .execution_options(synchronize_session=False)
                                 )
-                                exited = result.rowcount == 1
+                                written = result.scalar_one_or_none()
+                                exited = written is not None
+                                still_moving = written == SESSION_MOVING
                                 rejected_owner = not exited
                                 if exited:
                                     await session.commit()
@@ -2793,7 +2846,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     # the same update nulls foreground_command,
                                     # so `is_agent_finish` sees a status that
                                     # has left "running" and stays silent.
-                                    if not stopped_by_server:
+                                    if not (stopped_by_server or moving_at_read or still_moving):
                                         died_alert = session_died_payload(
                                             sid,
                                             dying_command,
@@ -2810,14 +2863,18 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if rejected_owner:
                             await _close_daemon_consistency_failure(conn)
                             break
-                        published = not exited or await _publish_session_event_if_owner(
-                            conn,
-                            sid,
-                            {
-                                "type": "session.exit",
-                                "exit_code": code,
-                                "signal": sig,
-                            },
+                        published = (
+                            not exited
+                            or still_moving
+                            or await _publish_session_event_if_owner(
+                                conn,
+                                sid,
+                                {
+                                    "type": "session.exit",
+                                    "exit_code": code,
+                                    "signal": sig,
+                                },
+                            )
                         )
                         if exited:
                             await legion.record_session_seconds(alert_owner_id, ran_seconds)
@@ -2827,7 +2884,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if exited:
                             # The alert above is a courtesy some accounts mute;
                             # the data frame is what removes the pane from
-                            # every other open client either way.
+                            # every other open client either way. A moving
+                            # window's frame changes no status; it carries the
+                            # recorded exit to every client's copy of the row.
                             await publish_data_changed(alert_owner_id, "sessions", sid)
                         detached = await broker.detach_session(
                             sid,

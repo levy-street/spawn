@@ -6,12 +6,22 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import desc, select, update
+from sqlalchemy import delete, desc, func, select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, grid, legion, schemas
-from ..db import get_session
-from ..models import Agent, Host, RecentDir, Session, User, Workspace
+from ..db import get_session, get_sessionmaker
+from ..models import (
+    SESSION_MOVABLE_STATUSES,
+    SESSION_MOVING,
+    Agent,
+    Host,
+    RecentDir,
+    Session,
+    User,
+    Workspace,
+)
 from ..ws.broker import get_broker
 from . import capabilities
 
@@ -51,6 +61,8 @@ def _activity(session_row: Session, now: datetime | None = None) -> tuple[str, s
         return "exited", "Exited"
     if session_row.status == "killed":
         return "killed", "Killed"
+    if session_row.status == SESSION_MOVING:
+        return SESSION_MOVING, "Moving"
     if session_row.status != "running":
         return session_row.status, session_row.status.replace("_", " ").title()
 
@@ -112,6 +124,33 @@ async def upsert_recent_dir(db: AsyncSession, *, user: User, host_id: str, path:
         await db.delete(stale)
 
 
+async def _launch_still_addressed(session_id: str, host_id: str) -> bool:
+    """Whether a launch about to go to `host_id` is still that host's to run.
+
+    Read afresh, under the daemon's lifecycle lock, after the commit that
+    asked for the launch: a move that landed in between names another host,
+    a carried move that began in between is the source's own retire to settle,
+    and a delete leaves nothing to start. Each kill takes the same lock
+    (`send_session_kill`), so a move committed after this read sends its kill
+    to the old host after this launch, never before it, and the daemon, which
+    handles lifecycle frames in order, ends the worker this starts.
+
+    A read that fails sends the launch anyway, as before this check existed:
+    a window left "starting" with nothing started is worse than the race.
+    """
+    try:
+        async with get_sessionmaker()() as fresh:
+            row = (
+                await fresh.execute(
+                    select(Session.host_id, Session.status).where(Session.id == session_id)
+                )
+            ).one_or_none()
+    except SQLAlchemyError as e:
+        log.warning("could not re-read session=%s before its launch: %s", session_id, e)
+        return True
+    return row is not None and row.host_id == host_id and row.status != SESSION_MOVING
+
+
 async def dispatch_session_launch(
     *,
     frame_type: str,
@@ -130,6 +169,15 @@ async def dispatch_session_launch(
     # and sends those kills (`DaemonConn.lifecycle_lock`): a launch committed
     # after that decision goes out after the kills, never before them.
     async with daemon.lifecycle_lock:
+        if not await _launch_still_addressed(session_row.id, host.id):
+            log.info(
+                "%s: session=%s moved, began moving or went before its launch reached "
+                "host=%s; not sent",
+                frame_type,
+                session_row.id,
+                host.id,
+            )
+            return
         await broker.attach_session_to_daemon(session_row.id, daemon)
         try:
             await daemon.send_text(
@@ -361,15 +409,69 @@ async def create_session(
     return _to_out(session_row, host.name)
 
 
+async def _after_missed_write(
+    db: AsyncSession, *, user: User, session_id: str
+) -> tuple[str, str] | None:
+    """Roll back a conditional write that matched no row, and say why from the
+    row as committed now: (status, host_id), or None when the caller has no
+    such window. The window is gone, a carried move is under way, or it is no
+    longer where the request saw it.
+
+    The owner's id is read before the rollback, which expires every object
+    this request loaded, the user included."""
+    owner_user_id = user.id
+    await db.rollback()
+    row = (
+        await db.execute(
+            select(Session.status, Session.host_id).where(
+                Session.id == session_id, Session.owner_user_id == owner_user_id
+            )
+        )
+    ).one_or_none()
+    return None if row is None else (row.status, row.host_id)
+
+
+def _session_not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail="session not found")
+
+
+def _move_in_progress() -> HTTPException:
+    """A carried move is under way: it ends with its commit or its abort, and
+    nothing else may start, stop or delete the window meanwhile — the source
+    host holds the window's conversation set aside, and only the device that
+    settles the move there can put it back."""
+    return HTTPException(status_code=409, detail="move_in_progress")
+
+
+def _move_conflict() -> HTTPException:
+    return HTTPException(status_code=409, detail="move_conflict")
+
+
+async def _owned_session(db: AsyncSession, *, user: User, session_id: str) -> Session:
+    session_row = await db.get(Session, session_id)
+    if session_row is None or session_row.owner_user_id != user.id:
+        raise _session_not_found()
+    return session_row
+
+
 @router.post("/{session_id}/restart", response_model=schemas.SessionOut)
 async def restart_session(
     session_id: str,
     db: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.SessionOut:
-    session_row = await db.get(Session, session_id)
-    if session_row is None or session_row.owner_user_id != user.id:
-        raise HTTPException(status_code=404, detail="session not found")
+    """Start the window's shell again on the host it runs on.
+
+    Written as a compare-and-set on the host it read, so a move from another
+    device that lands in between refuses this (`409 move_conflict`) instead of
+    sending the restart to the host the window has left; the move has started
+    the window afresh over there already. A window that is moving is refused
+    with `409 move_in_progress`: its move ends with a commit or an abort, and
+    "Resume" after an abort is this route.
+    """
+    session_row = await _owned_session(db, user=user, session_id=session_id)
+    if session_row.status == SESSION_MOVING:
+        raise _move_in_progress()
 
     host = await db.get(Host, session_row.host_id)
     if host is None or host.owner_user_id != user.id:
@@ -379,14 +481,30 @@ async def restart_session(
     if daemon is None:
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
-    now = _utcnow()
-    session_row.status = "starting"
-    session_row.started_at = now
-    session_row.exited_at = None
-    session_row.exit_code = None
-    session_row.last_output_at = None
-    session_row.last_input_at = None
-    session_row.foreground_command = None
+    result = await db.execute(
+        update(Session)
+        .where(
+            Session.id == session_row.id,
+            Session.owner_user_id == user.id,
+            Session.host_id == host.id,
+            Session.status != SESSION_MOVING,
+        )
+        .values(
+            status="starting",
+            started_at=_utcnow(),
+            exited_at=None,
+            exit_code=None,
+            last_output_at=None,
+            last_input_at=None,
+            foreground_command=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        state = await _after_missed_write(db, user=user, session_id=session_id)
+        if state is None:
+            raise _session_not_found()
+        raise _move_in_progress() if state[0] == SESSION_MOVING else _move_conflict()
     await db.commit()
     await db.refresh(session_row)
     skills = await capabilities.get_session_launch_capabilities(
@@ -403,6 +521,122 @@ async def restart_session(
     return _to_out(session_row, host.name)
 
 
+@router.post("/{session_id}/move/begin", response_model=schemas.SessionOut)
+async def begin_move(
+    session_id: str,
+    body: schemas.SessionMoveFence,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.SessionOut:
+    """Mark a window as moving: a device is about to carry its conversation to
+    another host.
+
+    Lifecycle metadata, nothing more. The row keeps its host, folder and
+    conversation id, and the server is not told where the window is going —
+    the commit (`/move` with `carried`) says that. No frame reaches any host:
+    the source's own retire (`conv.export`, over the device's host channel)
+    stops the worker and the agent, in the order that makes it the single
+    writer's fence; the server is not that fence. Whatever exit the source
+    reports meanwhile is recorded (`exited_at`, `exit_code`) and the status
+    stays "moving", with no session.died alert or push (`ws/daemon.py`).
+
+    A compare-and-set on the host the client saw the window on and on a
+    status a move may begin from (`SESSION_MOVABLE_STATUSES`; a stopped window
+    moves too). Refused: `409 move_in_progress` when a move is already under
+    way, `409 move_conflict` when the window runs somewhere else than the
+    client saw, `409 source_offline` when the host it would leave is not
+    connected — its conversation cannot come along, and a fresh `/move` is
+    the way to start it elsewhere.
+
+    While it is moving, restart, archive, delete, a fresh move and a second
+    begin are refused with `409 move_in_progress`; only the commit or
+    `/move/abort` ends it.
+    """
+    session_row = await _owned_session(db, user=user, session_id=session_id)
+    if session_row.status == SESSION_MOVING:
+        raise _move_in_progress()
+    if session_row.host_id != body.expected_host_id:
+        raise _move_conflict()
+    if get_broker().get_daemon_for_host(session_row.host_id) is None:
+        raise HTTPException(status_code=409, detail="source_offline")
+
+    result = await db.execute(
+        update(Session)
+        .where(
+            Session.id == session_row.id,
+            Session.owner_user_id == user.id,
+            Session.host_id == body.expected_host_id,
+            Session.status.in_(SESSION_MOVABLE_STATUSES),
+        )
+        .values(status=SESSION_MOVING)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        # Another device began a move, moved the window, or deleted it between
+        # the read above and this write.
+        state = await _after_missed_write(db, user=user, session_id=session_id)
+        if state is None:
+            raise _session_not_found()
+        raise _move_in_progress() if state[0] == SESSION_MOVING else _move_conflict()
+    await db.commit()
+    await db.refresh(session_row)
+    host = await db.get(Host, session_row.host_id)
+    return _to_out(session_row, host.name if host is not None else None)
+
+
+@router.post("/{session_id}/move/abort", response_model=schemas.SessionOut)
+async def abort_move(
+    session_id: str,
+    body: schemas.SessionMoveFence,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.SessionOut:
+    """End a carried move that will not commit: the window stays where it was,
+    stopped.
+
+    Any device may send it — the mover after a failed carry, or another device
+    resolving a move that did not finish — and only after the target has
+    confirmed it cannot commit: the source host still holds the window's
+    conversation set aside until the device aborts the retire there, and the
+    server neither knows nor decides that part.
+
+    A compare-and-set on the host the client saw and on "moving": a move that
+    has committed, or was aborted already, is `409 move_conflict`. The row
+    reads "killed" — stopped by the owner, so the exit that confirms it raises
+    no alert — keeping any exit the source already reported, and a
+    best-effort `session.kill` goes to the host it names, to end whatever the
+    retire did not reach (a host that is offline is told when it registers
+    again). Restart then brings the window back there, resuming its
+    conversation once the source has put it back.
+    """
+    session_row = await _owned_session(db, user=user, session_id=session_id)
+    result = await db.execute(
+        update(Session)
+        .where(
+            Session.id == session_row.id,
+            Session.owner_user_id == user.id,
+            Session.host_id == body.expected_host_id,
+            Session.status == SESSION_MOVING,
+        )
+        .values(
+            status="killed",
+            exited_at=func.coalesce(Session.exited_at, _utcnow()),
+            foreground_command=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        if await _after_missed_write(db, user=user, session_id=session_id) is None:
+            raise _session_not_found()
+        raise _move_conflict()
+    await db.commit()
+    await db.refresh(session_row)
+
+    await send_session_kill(session_row.id, session_row.host_id)
+    host = await db.get(Host, session_row.host_id)
+    return _to_out(session_row, host.name if host is not None else None)
+
+
 @router.post("/{session_id}/move", response_model=schemas.SessionOut)
 async def move_session(
     session_id: str,
@@ -415,10 +649,18 @@ async def move_session(
     The row is the window, so it stays: its id, name, agent, skill grants, and
     everything clients key by its id — the tile, mutes, notification settings.
     Only the incarnation changes, one worker and PTY on one host for another.
-    Nothing of the old incarnation travels; an agent window starts a new
-    conversation over there, named by `agent_session_id`. A shell whose agent
-    was started by hand is typed by the move (`agent_id`), as a create would
-    type it, so that conversation is remembered too.
+
+    Two kinds of move end here. A fresh move carries nothing: an agent window
+    starts a new conversation over there, named by `agent_session_id`. A
+    carried move's commit (`carried: true`) comes after `/move/begin` and the
+    device's carry of the conversation to the target; `agent_session_id` then
+    names the conversation the target has just taken in. Its compare-and-set
+    also requires the row to be "moving" — begun and not aborted — so a commit
+    after an abort is `409 move_conflict`. A fresh move of a window that is
+    moving is `409 move_in_progress`: the carry ends with its own commit or
+    abort. Either kind types a shell whose agent was started by hand
+    (`agent_id`), as a create would type it, so its conversation is
+    remembered too.
 
     The order is the point. The row is rebound first, so the old host's late
     frames — the exit the kill below provokes above all — fail the
@@ -426,19 +668,18 @@ async def move_session(
     session.died alert for a window that only moved. The kill to the old host
     is best effort; one that is offline is told to stop the worker when it
     registers again, because the row then names another host
-    (`send_session_kill`). The target gets `session.restart`, the same frame
-    and fields a restart
-    sends, because a restart first ends any worker of this id already there —
-    left by an earlier move away and back. The data-changed frame is published
-    by `DataEventMiddleware` for this path, after the response, like every
-    other session mutation.
+    (`send_session_kill`). After a carry there is usually nothing left to
+    kill: the retire stopped it. The target gets `session.restart`, the same
+    frame and fields a restart sends, because a restart first ends any worker
+    of this id already there — left by an earlier move away and back. The
+    data-changed frame is published by `DataEventMiddleware` for this path,
+    after the response, like every other session mutation.
 
     Authority is unchanged: a restart-class lifecycle request whose folder the
-    operator chose, as on create. No new execution parameter reaches the host.
+    operator chose, as on create. No new execution parameter reaches the host,
+    and nothing of the conversation passes through here.
     """
-    session_row = await db.get(Session, session_id)
-    if session_row is None or session_row.owner_user_id != user.id:
-        raise HTTPException(status_code=404, detail="session not found")
+    session_row = await _owned_session(db, user=user, session_id=session_id)
     target = await db.get(Host, body.host_id)
     if target is None or target.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
@@ -455,11 +696,19 @@ async def move_session(
     # is acting on a stale picture, even when it happens to name the host the
     # window has since moved to.
     if session_row.host_id != body.expected_host_id:
-        raise HTTPException(status_code=409, detail="move_conflict")
+        raise _move_conflict()
+    moving = session_row.status == SESSION_MOVING
+    if body.carried and not moving:
+        # Nothing to commit: never begun, or aborted since.
+        raise _move_conflict()
+    if not body.carried and moving:
+        raise _move_in_progress()
     if target.id == session_row.host_id:
         raise HTTPException(status_code=400, detail="same_host")
     broker = get_broker()
     if broker.get_daemon_for_host(target.id) is None:
+        # A carried move stays moving: the device may try the commit again,
+        # or abort.
         raise HTTPException(status_code=409, detail="target_offline")
 
     source_host_id = session_row.host_id
@@ -471,6 +720,7 @@ async def move_session(
             Session.id == session_row.id,
             Session.owner_user_id == user.id,
             Session.host_id == body.expected_host_id,
+            Session.status == SESSION_MOVING if body.carried else Session.status != SESSION_MOVING,
         )
         .values(
             host_id=target.id,
@@ -488,9 +738,14 @@ async def move_session(
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
-        # Another device moved it between the read above and this write.
-        await db.rollback()
-        raise HTTPException(status_code=409, detail="move_conflict")
+        # Another device moved it, began or aborted a move, or deleted it
+        # between the read above and this write.
+        state = await _after_missed_write(db, user=user, session_id=session_id)
+        if state is None:
+            raise _session_not_found()
+        if not body.carried and state[0] == SESSION_MOVING:
+            raise _move_in_progress()
+        raise _move_conflict()
     await upsert_recent_dir(db, user=user, host_id=target.id, path=body.cwd)
     await db.commit()
     await db.refresh(session_row)
@@ -528,36 +783,74 @@ async def send_session_kill(session_id: str, host_id: str) -> None:
     the session may already be routed to its new host (a launch there
     attaches it), and that worker and its routing are left alone whichever
     order the two are sent in.
+
+    Sent under the daemon's lifecycle lock, as every launch is: a launch that
+    re-read the row before this kill's commit reaches the daemon first, so the
+    kill ends the worker it starts (`_launch_still_addressed`).
     """
     broker = get_broker()
     daemon = broker.get_daemon_for_session(session_id)
     if daemon is None or daemon.host_id != host_id:
         daemon = broker.get_daemon_for_host(host_id)
     if daemon is not None:
-        try:
-            await daemon.send_text(
-                {"type": "session.kill", "session_id": session_id, "signal": "TERM"}
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("session.kill dispatch failed: %s", e)
+        async with daemon.lifecycle_lock:
+            try:
+                await daemon.send_text(
+                    {"type": "session.kill", "session_id": session_id, "signal": "TERM"}
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("session.kill dispatch failed: %s", e)
     await broker.detach_session_from_host(session_id, host_id)
 
 
-def mark_session_stopped(session_row: Session) -> None:
+async def stop_session_row(db: AsyncSession, *, user: User, session_id: str) -> str | None:
     """Write a session's stopped state and keep the row: the window stays.
+    Returns the host it was stopped on, or None when there is no such window
+    of this user's or it is moving.
 
-    What archiving does to each window; commit it, then `send_session_kill`.
-    The process tree, the PTY and the worker holding them go away — nothing of
-    this session runs on the host any more — while the row it is addressed by
-    survives, so the tile still points somewhere and `session.restart` can
-    bring the same session back in the same folder.
+    What archiving does to each window; commit it, then `send_session_kill`
+    to the host returned. The process tree, the PTY and the worker holding
+    them go away — nothing of this session runs on the host any more — while
+    the row it is addressed by survives, so the tile still points somewhere
+    and `session.restart` can bring the same session back in the same folder.
+
+    One statement decides and reports where: a move that lands before it is
+    stopped on its new host, and one that lands after it finds the window
+    stopped where this kill is sent. A moving window is left alone; the
+    caller refuses with `409 move_in_progress`.
     """
     # Written here rather than waited for: the daemon confirms the exit with a
     # status frame, but an offline host never will, and a stopped workspace
     # must not read as still running because its host was unreachable.
-    session_row.status = "killed"
-    session_row.exited_at = _utcnow()
-    session_row.foreground_command = None
+    result = await db.execute(
+        update(Session)
+        .where(
+            Session.id == session_id,
+            Session.owner_user_id == user.id,
+            Session.status != SESSION_MOVING,
+        )
+        .values(status="killed", exited_at=_utcnow(), foreground_command=None)
+        .returning(Session.host_id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none()
+
+
+async def delete_session_row(db: AsyncSession, *, user: User, session_id: str) -> str | None:
+    """Delete a window that is not moving, wherever it runs now, and return
+    the host it ran on; None when there is no such window of this user's or
+    it is moving. Commit, then `send_session_kill` to the host returned."""
+    result = await db.execute(
+        delete(Session)
+        .where(
+            Session.id == session_id,
+            Session.owner_user_id == user.id,
+            Session.status != SESSION_MOVING,
+        )
+        .returning(Session.host_id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none()
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -566,10 +859,15 @@ async def delete_session(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> None:
-    session_row = await db.get(Session, session_id)
-    if session_row is None or session_row.owner_user_id != user.id:
-        raise HTTPException(status_code=404, detail="session not found")
-    host_id = session_row.host_id
-    await db.delete(session_row)
+    """Close a window: the row goes, then its worker, on the host the row
+    named when it went — a move that lands first is followed there. A window
+    that is moving is `409 move_in_progress`: abort the move first, or the
+    conversation the source holds set aside would have no window to return
+    to."""
+    host_id = await delete_session_row(db, user=user, session_id=session_id)
+    if host_id is None:
+        if await _after_missed_write(db, user=user, session_id=session_id) is None:
+            raise _session_not_found()
+        raise _move_in_progress()
     await db.commit()
     await send_session_kill(session_id, host_id)

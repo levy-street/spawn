@@ -670,6 +670,203 @@ async def test_stop_and_delete_kill_only_after_the_commit(file_sqlite_client):
     await get_broker().unregister_daemon(daemon)
 
 
+async def _workspace_with(client, auth, session_ids: list[str], name: str) -> str:
+    created = await client.post("/api/workspaces", json={"name": name}, headers=auth)
+    workspace_id = created.json()["workspace"]["id"]
+    tiles = [_tile(sid, 12 * index, 0, 12, 24) for index, sid in enumerate(session_ids)]
+    patched = await client.patch(
+        f"/api/workspaces/{workspace_id}", json={"layout": _envelope(tiles)}, headers=auth
+    )
+    assert patched.status_code == 200, patched.text
+    return workspace_id
+
+
+async def _begin_move(client, auth, session_id: str, host_id: str) -> None:
+    r = await client.post(
+        f"/api/sessions/{session_id}/move/begin",
+        json={"expected_host_id": host_id},
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+
+
+async def test_archive_and_delete_refuse_a_workspace_with_a_moving_window(client):
+    """Archiving stops, and deleting deletes, every window in the workspace.
+    A window that is moving ends only with its move's commit or abort, so
+    either is refused before anything changes, the other windows included;
+    after the abort both work."""
+    email = "ws-moving@example.com"
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host(email)
+    moving = await _create_session_row(email, host_id)
+    still = await _create_session_row(email, host_id)
+    fake_ws, daemon = await _register_daemon(host_id)
+    try:
+        workspace_id = await _workspace_with(client, auth, [still, moving], "carrying")
+        await _begin_move(client, auth, moving, host_id)
+
+        r = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=auth)
+        assert r.status_code == 409 and r.json()["detail"] == "move_in_progress"
+        r = await client.delete(f"/api/workspaces/{workspace_id}", headers=auth)
+        assert r.status_code == 409 and r.json()["detail"] == "move_in_progress"
+
+        assert fake_ws.sent_text == []
+        workspace = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()
+        assert workspace["archived_at"] is None
+        assert (await client.get(f"/api/sessions/{still}", headers=auth)).json()[
+            "status"
+        ] == "running"
+        assert (await client.get(f"/api/sessions/{moving}", headers=auth)).json()[
+            "status"
+        ] == "moving"
+
+        r = await client.post(
+            f"/api/sessions/{moving}/move/abort",
+            json={"expected_host_id": host_id},
+            headers=auth,
+        )
+        assert r.status_code == 200, r.text
+        r = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=auth)
+        assert r.status_code == 200, r.text
+        r = await client.delete(f"/api/workspaces/{workspace_id}", headers=auth)
+        assert r.status_code == 204, r.text
+    finally:
+        await _unregister_daemon(daemon)
+
+
+async def test_archive_raced_by_a_begin_stops_nothing(client, monkeypatch):
+    """A begin that lands after archive checked for moving windows and before
+    it stopped anything: archive stops the first window, finds the second
+    moving, and is refused and rolled back whole — the first window was never
+    stopped as far as anyone can see, and no kill went out."""
+    email = "ws-moving-race@example.com"
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host(email)
+    first = await _create_session_row(email, host_id)
+    second = await _create_session_row(email, host_id)
+    fake_ws, daemon = await _register_daemon(host_id)
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.dml import Update
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Session
+
+    real_execute = AsyncSession.execute
+    updates = 0
+
+    async def execute(self, statement, *args, **kwargs):
+        nonlocal updates
+        if isinstance(statement, Update) and statement.table.name == "sessions":
+            updates += 1
+            if updates == 1:
+                async with get_sessionmaker()() as other:
+                    row = await other.get(Session, second)
+                    assert row is not None
+                    row.status = "moving"
+                    await other.commit()
+        return await real_execute(self, statement, *args, **kwargs)
+
+    try:
+        workspace_id = await _workspace_with(client, auth, [first, second], "raced")
+        monkeypatch.setattr(AsyncSession, "execute", execute)
+        try:
+            r = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=auth)
+        finally:
+            monkeypatch.setattr(AsyncSession, "execute", real_execute)
+        assert updates == 2
+        assert r.status_code == 409 and r.json()["detail"] == "move_in_progress"
+        assert fake_ws.sent_text == []
+        workspace = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()
+        assert workspace["archived_at"] is None
+        assert (await client.get(f"/api/sessions/{first}", headers=auth)).json()[
+            "status"
+        ] == "running"
+    finally:
+        await _unregister_daemon(daemon)
+
+
+async def test_archive_raced_by_a_move_stops_the_window_where_it_went(client, monkeypatch):
+    """A move that lands between archive's read and its stop is followed: the
+    window is stopped on the host it now names, and the kill goes there, not
+    to the host it left."""
+    email = "ws-move-race@example.com"
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host(email, name="left")
+    new_host_id = await _create_host(email, name="new")
+    session_id = await _create_session_row(email, host_id)
+    left_ws, left = await _register_daemon(host_id)
+    new_ws, new = await _register_daemon(new_host_id)
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.dml import Update
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Session
+
+    real_execute = AsyncSession.execute
+    raced = False
+
+    async def execute(self, statement, *args, **kwargs):
+        nonlocal raced
+        if not raced and isinstance(statement, Update) and statement.table.name == "sessions":
+            raced = True
+            async with get_sessionmaker()() as other:
+                row = await other.get(Session, session_id)
+                assert row is not None
+                row.host_id = new_host_id
+                row.status = "starting"
+                await other.commit()
+        return await real_execute(self, statement, *args, **kwargs)
+
+    try:
+        workspace_id = await _workspace_with(client, auth, [session_id], "followed")
+        monkeypatch.setattr(AsyncSession, "execute", execute)
+        try:
+            r = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=auth)
+        finally:
+            monkeypatch.setattr(AsyncSession, "execute", real_execute)
+        assert raced
+        assert r.status_code == 200, r.text
+        assert [k["session_id"] for k in _frames(new_ws, "session.kill")] == [session_id]
+        assert left_ws.sent_text == []
+        row = (await client.get(f"/api/sessions/{session_id}", headers=auth)).json()
+        assert (row["host_id"], row["status"]) == (new_host_id, "killed")
+    finally:
+        await _unregister_daemon(left)
+        await _unregister_daemon(new)
+
+
+async def test_restore_leaves_a_moving_window_to_its_move(client):
+    """A stopped window moves too, so an archived workspace can hold one that
+    is moving. Restoring the workspace restarts the others and leaves that
+    one to its move's commit or abort."""
+    email = "ws-restore-moving@example.com"
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host(email)
+    moving = await _create_session_row(email, host_id)
+    still = await _create_session_row(email, host_id)
+    fake_ws, daemon = await _register_daemon(host_id)
+    try:
+        workspace_id = await _workspace_with(client, auth, [still, moving], "put away")
+        r = await client.post(f"/api/workspaces/{workspace_id}/archive", headers=auth)
+        assert r.status_code == 200, r.text
+        await _begin_move(client, auth, moving, host_id)
+
+        restored = await client.post(f"/api/workspaces/{workspace_id}/unarchive", headers=auth)
+        assert restored.status_code == 200, restored.text
+        assert [f["session_id"] for f in _frames(fake_ws, "session.restart")] == [still]
+        assert (await client.get(f"/api/sessions/{moving}", headers=auth)).json()[
+            "status"
+        ] == "moving"
+    finally:
+        await _unregister_daemon(daemon)
+
+
 async def test_archive_reindexes_the_rest_and_restore_reclaims_the_slot(client):
     """Positions are contiguous from 0, and a restored row comes back to its
     own place rather than to the end of the list."""
