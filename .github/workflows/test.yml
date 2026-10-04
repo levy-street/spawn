@@ -110,8 +110,11 @@ jobs:
         run: python3 scripts/ci/smoke-systemd-vm.py
       - name: Run repeatable test matrix
         run: bash scripts/ci/with-test-databases.sh scripts/test-all.sh
+      # Always: a test that fails once and passes on its retry leaves the job
+      # green, and the failed attempt's error context and the retry's trace
+      # are the only evidence of what held it up.
       - name: Preserve browser failure evidence
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-browser-test-results

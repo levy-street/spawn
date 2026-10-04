@@ -794,8 +794,12 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   }, [hover.value, rowByKey]);
 
   // Where the card hangs from, and whether it is lying over the panel to get
-  // there — `previewPlacement` owns both, from the row's box and the panel's.
+  // there — `previewPlacement` owns both, from the row's box and the panel's,
+  // and from where the pointer is across the list, whose column it keeps out
+  // of. Read as the card opens, not followed: a card that dodged the pointer
+  // could never be reached.
   const [hoverPlacement, setHoverPlacement] = useState<PreviewPlacement | null>(null);
+  const pointerXRef = useRef<number | null>(null);
   useLayoutEffect(() => {
     const path = hover.value?.path;
     const container = listRef.current?.element;
@@ -813,6 +817,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
         row.getBoundingClientRect(),
         container.getBoundingClientRect(),
         window.innerWidth,
+        pointerXRef.current,
       ),
     );
   }, [hover.value]);
@@ -2372,12 +2377,14 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
             // on something that is not one. A pinned card stays — Space asked
             // for it, and only Escape answers that.
             onPointerMove={(event) => {
+              pointerXRef.current = event.clientX;
               if (hover.value === null || hover.pinned) return;
               if (!(event.target as Element).closest("[data-path]")) hover.cancel();
             }}
             // A preview still waiting on its delay is for a row the pointer
             // has now left; one already open is closed by geometry instead.
             onPointerLeave={() => {
+              pointerXRef.current = null;
               if (hover.value === null) hover.cancel();
             }}
             onClick={(event) => {
@@ -2458,7 +2465,8 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       {/* Hover preview. Anchored to the panel's edges but the row's vertical
           extent, so it tracks the row without sliding sideways: beside the
           panel, or lying over it under the row (over the row when the room
-          is there), never on the row itself. */}
+          is there), never on the row itself, and never across the pointer's
+          way to the next row up or down. */}
       <Popover
         open={hoverEntry !== null}
         anchor={hoverPlacement?.anchor ?? null}

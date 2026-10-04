@@ -36,8 +36,10 @@ if [[ -f "$count_file" ]]; then
   count="$(cat "$count_file")"
 fi
 count=$((count + 1))
-printf '%s\n' "$count" >"$count_file"
+# The pid goes down before the count: wait_count returns on the count, and
+# kill_worker reads the pid straight after.
 printf '%s\n' "$$" >"$pid_file"
+printf '%s\n' "$count" >"$count_file"
 while :; do
   sleep 60
 done
