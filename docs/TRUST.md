@@ -93,7 +93,7 @@ design, not part of these guarantees):
 | **TURN operator** | observe ciphertext volume/timing and peer IPs | decrypt anything |
 | **Malicious co-tenant** | attack the API surface | reach another user's daemons or sessions (all REST + WS paths filter by `owner_user_id`; daemon tokens are host-scoped) |
 | **Attacker with the user's browser device** | full access as that user | — out of scope; this is device security |
-| **Compromised host daemon** | everything on that host | other hosts' sessions (per-host tokens and keys) |
+| **Compromised host daemon** | everything on that host, including any conversation the Operator moves to it, and influence over an agent the Operator later moves away from it, through that conversation's record | other hosts' live sessions and keys (per-host tokens and keys); conversations never placed on it |
 
 Past-session confidentiality is not based on ciphertext being absent. A control
 plane, TURN operator, or network observer can record ephemeral-session DTLS
@@ -287,6 +287,74 @@ to give it one is to hard-link the already-validated inode under a name the
 daemon chose and then verify the link points at that same inode; reconstructing
 a path from components would hand another process a string the kernel never
 resolved through our handles.
+
+### Moving a window between hosts (2026-10-04)
+
+A window keeps its identity when it moves: the server rebinds its row to the
+new host, and the tile, name and skills stay. From daemon release D2 a move
+can also bring the window's Claude Code conversation, and this is what that
+means for what each party learns and can do.
+
+- **Only at the Operator's request, each time.** A device carries a
+  conversation only when the person asks to move that window, and both hosts
+  must have admitted that device through an authenticated pair: the
+  operations (`conv.v2`) do not exist on a legacy host channel, and the server
+  has no frame that reaches them. SPAWN D never copies, mirrors or continues a
+  conversation on another host by itself.
+- **A move, never a copy.** A conversation leaves a host only by being
+  retired out of it, so it is never resumable on two hosts at once. A
+  snapshot — a copy that would leave the source running — is reserved for a
+  later copies feature the owner has not approved, and both ends refuse it:
+  the source never makes one, and the destination imports only what a retire
+  carried.
+- **What crosses.** One conversation's own files: Claude Code's record and
+  the sidecar beside it that the bundle's allowlist names (helpers' records,
+  workflows, spilled tool output). Never `memory/`, `file-history/`,
+  settings, sessions or a credential; never the working folder's files. They
+  are carried by the device over its two `spawn.host.ctl` channels, end to
+  end: never through the server, and never host to host — each host sees only
+  the device.
+- **The source is the fence.** Before a byte leaves, the source refuses while
+  anything outside the window holds the conversation (a background session,
+  an attached client, another window), stops the window and every Claude
+  process in it, confirms each gone by its process id and start time, and
+  moves the conversation's files out of Claude's lookup path. From then on no
+  Claude on the source can resume it. The fence fails closed: a process
+  Claude's own session registry names is counted as holding the conversation
+  unless the daemon can show it has gone, so an unreadable start, a Claude
+  running under another executable name, or a record from another machine or
+  container sharing the home refuses the move rather than slipping past it;
+  and only a process the daemon identified exactly is ever signalled. What it
+  cannot see is a Claude that keeps no session record (versions before the
+  registry), launched under another executable name.
+- **The destination chooses every path.** It computes where the record lands
+  from Claude Code's own folder rule, writes files 0600 and folders 0700,
+  verifies every byte against the source's digests before anything lands,
+  and sets an existing copy of the conversation aside rather than overwrite
+  it. It refuses the conversation while a Claude there holds it, by the same
+  fail-closed reading the source uses, when the move begins and again right
+  before it commits.
+- **Set-aside copies.** Once a move commits, the source keeps what it moved
+  out for 30 days in spawnd's own configuration folder, outside the agent's
+  lookup path, then deletes it — including files of the conversation the
+  bundle does not carry. A move that does not finish stays held out of the
+  lookup path until a device resolves it: the device asks the destination
+  the move named, and only once that host has cancelled the transfer does
+  the source's abort put the files back. Nothing resolves a move on its own,
+  since only the destination knows whether it committed; a destination drops
+  staging nothing has written for 30 days, cancelled first. A copy the
+  destination set aside is kept 30 days too. These are files on the hosts
+  that held them, readable by anyone who can read that user's files there.
+- **What the server and TURN learn.** The conversation, its file names, sizes,
+  digests and paths travel only inside the encrypted host channels. The
+  server learns that the window stopped on the source (the stop reports the
+  session's exit, as any stop does) and that it moved — its host changes, as
+  for any move — and the signaling timing of the device's two connections.
+  TURN, when the device's connections are relayed, learns the volume and
+  timing of two correlated flows.
+
+A carried conversation is text written on one host that an agent on another
+reads and acts on: see residual risk 6.
 
 Workspace, session, agent-definition, and skill names remain server-visible;
 users must not place secrets in labels. A default session name includes the
@@ -552,8 +620,10 @@ What moves where, and the regressions we accept:
   exists independently of any session, so files work with no terminal open.
   Legacy clients can still use the host-v1 connection. The server authorizes the browser for the host and relays only
   signaling/ICE; paths, entry names/sizes/mtimes, file bytes, and operation
-  errors stay on the DataChannel. Cross-host transfer is browser-mediated
-  between two such channels, so the control plane never buffers the file.
+  errors stay on the DataChannel. Cross-host transfer — a file or a
+  conversation move — is browser-mediated between two such channels, so the
+  control plane never buffers it; for conversations the destination daemon
+  chooses every path it writes.
 - **Agent-definition checks** → use REST plus `host.agents.check`; targets,
   versions, and detailed errors can reach the control plane. **Installation**
   is refused by the daemon, and server-driven agent auto-update is disabled.
@@ -615,6 +685,16 @@ worthless:
 5. **Endpoint compromise** is out of scope and undiminished: a CLI agent
    with your credentials running inside a session shell is exactly as dangerous
    as it is without spawn.
+6. **A carried conversation.** A conversation carried between hosts is text
+   written on one host that an agent on another reads and acts on. A
+   compromised source host can try to steer the destination's agent through
+   it. The daemons carry a conversation only at a device's request and never
+   continue one elsewhere on their own; they cannot see what the agent is
+   told. The clients that carry conversations (milestone M6, not yet
+   shipped) are what must tell the agent where the record came from and
+   start it in the permission mode the Operator chose — the relaunch module
+   both clients carry can already compose that line, and no client resumes
+   a carried conversation until it does.
 
 ## Open source
 

@@ -1915,6 +1915,9 @@ async fn dispatch_loop(
                     // waiting on a person, and the dispatch loop is how every
                     // other frame on this socket gets handled.
                     tokio::spawn(prime_macos_permissions_once());
+                    // Conversations set aside by a move are kept 30 days,
+                    // then go, on a host that may never carry another.
+                    tokio::task::spawn_blocking(crate::host_conversations::collect_held);
                     if let Some(access_token) = access_token {
                         let persisted = run_isolated_credential_blocking(move || {
                             creds::replace_access_token(&access_token)
@@ -3309,6 +3312,18 @@ async fn prime_macos_permissions_once() {
         tracing::warn!(error = %error, "could not record the macOS consent answers");
     }
     spawnd::permissions::clear_gate(&shared);
+}
+
+/// The login shell this daemon's windows start, by name alone (`bash`,
+/// `zsh`, `pwsh.exe`): what a device needs to quote a line for it.
+pub(crate) fn login_shell_name() -> String {
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let shell = resolve_login_shell(&env);
+    Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&shell)
+        .to_string()
 }
 
 /// The user's login shell: `$SHELL` from the daemon's environment when it

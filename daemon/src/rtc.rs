@@ -5163,7 +5163,7 @@ fn install_host_control_channel(
     binding: HostRtcBinding,
     signaling: RtcWsSender,
     files_override: Option<Arc<HostFileService>>,
-    pair: Option<crate::host_conv::WindowShells>,
+    pair: Option<crate::host_conversations::PairWindows>,
 ) -> Arc<crate::host_control::Lifetime> {
     let connected_signal = HostConnectedSignal::new(signaling, signal_id, binding);
     crate::host_control::install(dc, connected_signal, files_override, pair)
@@ -10228,7 +10228,14 @@ mod tests {
             .any(|name| name.as_str().is_some_and(|name| name.starts_with("conv."))));
         for (index, operation) in [
             "conv.inspect",
+            "conv.probe",
             "conv.export",
+            "conv.import.begin",
+            "conv.import.status",
+            "conv.import.cancel",
+            "conv.retire.commit",
+            "conv.retire.abort",
+            "conv.transfers",
             "session.launch.set",
             "agent.accounts.list",
             "screen.view",
