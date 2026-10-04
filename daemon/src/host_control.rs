@@ -1,6 +1,6 @@
 //! End-to-end host file protocol carried by `spawn.host.ctl`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -27,7 +27,15 @@ const PROTOCOL: &str = "spawn.host.ctl";
 const VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_ID_BYTES: usize = 128;
-const MAX_SEEN_REQUESTS: usize = 4096;
+/// Finished request ids a channel still refuses to see again (see
+/// `RequestWindow`).
+const RECENT_REQUESTS: usize = 4096;
+/// Request ids one channel may hold in flight at once. Only a client that
+/// never waits for its answers gets near it; reaching it closes the channel.
+const MAX_IN_FLIGHT_REQUESTS: usize = 4096;
+/// Cancels kept for a request that has not arrived yet, oldest forgotten
+/// first.
+const MAX_EARLY_CANCELS: usize = 4096;
 const MAX_NORMAL_QUEUE: usize = 64;
 const MAX_FAST_QUEUE: usize = 64;
 const MAX_LONG_TASKS: usize = 8;
@@ -87,6 +95,136 @@ impl ArrivalArbiter {
     }
 }
 
+/// A bounded set of ids that forgets its oldest member first.
+struct RecencySet {
+    capacity: usize,
+    next_stamp: u64,
+    members: HashMap<String, u64>,
+    /// Insertion order. An entry whose stamp no longer matches `members` was
+    /// removed or re-inserted since, and is skipped when it reaches the front.
+    order: VecDeque<(u64, String)>,
+}
+
+impl RecencySet {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            next_stamp: 0,
+            members: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.members.contains_key(id)
+    }
+
+    fn insert(&mut self, id: &str) {
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.wrapping_add(1);
+        self.members.insert(id.to_string(), stamp);
+        self.order.push_back((stamp, id.to_string()));
+        while self.members.len() > self.capacity {
+            let Some((stamp, id)) = self.order.pop_front() else {
+                break;
+            };
+            if self.members.get(&id) == Some(&stamp) {
+                self.members.remove(&id);
+            }
+        }
+        // Removals leave stale entries behind; never let them outgrow the
+        // live ones.
+        if self.order.len() > self.capacity.saturating_mul(2) {
+            let members = &self.members;
+            self.order
+                .retain(|(stamp, id)| members.get(id) == Some(stamp));
+        }
+    }
+
+    fn remove(&mut self, id: &str) -> bool {
+        self.members.remove(id).is_some()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.members.len()
+    }
+}
+
+/// The request ids a channel refuses to see again: every request still in
+/// flight, plus the `RECENT_REQUESTS` most recently finished. A duplicate
+/// inside that window closes the channel, as any reuse always has; an id
+/// older than the window is forgotten, so a host view that stays open for
+/// days is not closed at its 4,097th request (daemons before this one were).
+struct RequestWindow {
+    in_flight: HashSet<String>,
+    finished: RecencySet,
+    /// A `cancel` rides the fast queue and can overtake its request; it is
+    /// kept here until the request arrives, finishes, or is forgotten.
+    early_cancels: RecencySet,
+}
+
+impl Default for RequestWindow {
+    fn default() -> Self {
+        Self {
+            in_flight: HashSet::new(),
+            finished: RecencySet::new(RECENT_REQUESTS),
+            early_cancels: RecencySet::new(MAX_EARLY_CANCELS),
+        }
+    }
+}
+
+impl RequestWindow {
+    /// False for a duplicate, or when too many requests are already in
+    /// flight; either closes the channel.
+    fn admit(&mut self, id: &str) -> bool {
+        if self.in_flight.contains(id)
+            || self.finished.contains(id)
+            || self.in_flight.len() >= MAX_IN_FLIGHT_REQUESTS
+        {
+            return false;
+        }
+        self.in_flight.insert(id.to_string())
+    }
+
+    fn finish(&mut self, id: &str) {
+        if self.in_flight.remove(id) {
+            self.finished.insert(id);
+        }
+        self.early_cancels.remove(id);
+    }
+
+    /// A cancel that found no read or write under its id: either its request
+    /// has not reached the operation yet, or it already finished. Only the
+    /// first is worth remembering.
+    fn note_cancel(&mut self, id: &str) {
+        if !self.finished.contains(id) {
+            self.early_cancels.insert(id);
+        }
+    }
+
+    fn take_cancel(&mut self, id: &str) -> bool {
+        self.early_cancels.remove(id)
+    }
+}
+
+/// One admitted request id. Dropping it — when the response is sent, or when
+/// the read, write, or preview the request started is over — moves the id
+/// from in flight into the window's recent history.
+struct RequestTicket {
+    id: String,
+    window: Arc<StdMutex<RequestWindow>>,
+}
+
+impl Drop for RequestTicket {
+    fn drop(&mut self) {
+        self.window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish(&self.id);
+    }
+}
+
 struct QueuedFrame {
     arrival_order: u64,
     value: Value,
@@ -95,6 +233,8 @@ struct QueuedFrame {
 struct ActiveWrite {
     pending: Mutex<Option<PendingWrite>>,
     cancelled: CancellationToken,
+    /// The write's `fs.write.begin` stays in flight until the stream is over.
+    _request: RequestTicket,
 }
 
 struct WriteCleanup {
@@ -144,8 +284,11 @@ struct State {
     reads: HashMap<String, mpsc::Sender<ReadSignal>>,
     finished_read_ids: HashMap<String, Instant>,
     read_requests: HashMap<String, Arc<AtomicBool>>,
-    cancelled_request_ids: HashSet<String>,
-    seen_request_ids: HashSet<String>,
+    /// Locked on its own, briefly, and never across an await: a request's
+    /// ticket finishes from `Drop`. Where it must agree with the maps above
+    /// (an early cancel against a read or write starting), this state is
+    /// held around it.
+    requests: Arc<StdMutex<RequestWindow>>,
 }
 
 enum ReadSignal {
@@ -260,6 +403,11 @@ struct Context {
     publications: Arc<PublicationFence>,
     closed: Arc<AtomicBool>,
     shutdown: CancellationToken,
+    /// Present only on a channel admitted through an authenticated device
+    /// pair (`rtc_pair.rs`): which shell each window's processes hang from,
+    /// and nothing else of the session registry. Device-intent operations
+    /// are refused without it (`requires_pair`).
+    pair: Option<crate::host_conv::WindowShells>,
 }
 
 /// Effect permission is retired synchronously, before asynchronous channel
@@ -426,14 +574,27 @@ impl Context {
         .await
     }
 
-    async fn mark_request(&self, request_id: &str) -> bool {
-        let mut state = self.state.lock().await;
-        if state.seen_request_ids.contains(request_id)
-            || state.seen_request_ids.len() >= MAX_SEEN_REQUESTS
-        {
-            return false;
-        }
-        state.seen_request_ids.insert(request_id.to_string())
+    async fn admit_request(&self, request_id: &str) -> Option<RequestTicket> {
+        let window = Arc::clone(&self.state.lock().await.requests);
+        let admitted = window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(request_id);
+        admitted.then(|| RequestTicket {
+            id: request_id.to_string(),
+            window,
+        })
+    }
+
+    /// Whether a cancel already arrived for this request. Taken under the
+    /// held `state`, so it cannot pass a cancel that is looking for this
+    /// request's read or write.
+    fn take_early_cancel(state: &State, request_id: &str) -> bool {
+        state
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_cancel(request_id)
     }
 
     async fn finish_read(&self, stream_id: &str) -> bool {
@@ -490,13 +651,24 @@ impl Context {
         let Some(request_id) = valid_id(object.get("request_id")) else {
             return false;
         };
-        if !self.mark_request(request_id).await {
+        // Held to the end of this arm; an operation that outlives its
+        // response takes it along.
+        let Some(ticket) = self.admit_request(request_id).await else {
             return false;
-        }
+        };
         let Some(operation) = object.get("operation").and_then(Value::as_str) else {
             return false;
         };
         let payload = object.get("payload").and_then(Value::as_object);
+        if requires_pair(operation) && self.pair.is_none() {
+            return self
+                .error(
+                    request_id,
+                    "pair_required",
+                    "this operation needs an authenticated device connection",
+                )
+                .await;
+        }
         match operation {
             "ping" => self.response(request_id, json!({"pong": true})).await,
             "fs.home" => {
@@ -634,9 +806,9 @@ impl Context {
                     Err(error) => self.error(request_id, error.code, &error.detail).await,
                 }
             }
-            "fs.read" => self.begin_read(request_id, payload).await,
-            "fs.read.range" => self.begin_range_read(request_id, payload).await,
-            "fs.preview" => self.begin_preview(request_id, payload).await,
+            "fs.read" => self.begin_read(request_id, payload, ticket).await,
+            "fs.read.range" => self.begin_range_read(request_id, payload, ticket).await,
+            "fs.preview" => self.begin_preview(request_id, payload, ticket).await,
             // Exact capacity, straight down the DataChannel. This is the
             // whole point of putting it here rather than on the heartbeat:
             // the browser gets real numbers and the control plane gets a
@@ -666,7 +838,7 @@ impl Context {
                 self.desktop_action(request_id, payload, DesktopAction::Open)
                     .await
             }
-            "fs.write.begin" => self.begin_write(request_id, payload).await,
+            "fs.write.begin" => self.begin_write(request_id, payload, ticket).await,
             // Where an agent left its own record of this window's
             // conversation (`host_transcripts`). Locate only: the device
             // reads what it names with `fs.read`, under the same root and
@@ -720,6 +892,9 @@ impl Context {
                     Err(error) => self.error(request_id, error.code, &error.detail).await,
                 }
             }
+            crate::host_conv::INSPECT_OP if crate::host_conv::SUPPORTED => {
+                self.inspect_conversation(request_id, payload).await
+            }
             _ => {
                 self.error(
                     request_id,
@@ -731,7 +906,68 @@ impl Context {
         }
     }
 
-    async fn begin_read(&self, request_id: &str, payload: Option<&Map<String, Value>>) -> bool {
+    /// Which conversation a window is in, read from its own processes and
+    /// the agent's live-session registry (`host_conv`). Read-only; the walk
+    /// runs off the control loop, under this channel's operation accounting.
+    async fn inspect_conversation(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+    ) -> bool {
+        let Some(windows) = self.pair.clone() else {
+            return self
+                .error(
+                    request_id,
+                    "pair_required",
+                    "this operation needs an authenticated device connection",
+                )
+                .await;
+        };
+        let Some(session_id) = payload_string(payload, "session_id").and_then(|id| {
+            Uuid::parse_str(id)
+                .ok()
+                .filter(|uuid| uuid.to_string() == id)
+        }) else {
+            return self
+                .error(
+                    request_id,
+                    "invalid_request",
+                    "session_id must be a session UUID",
+                )
+                .await;
+        };
+        let Some(shell_pid) = windows.shell_pid(session_id) else {
+            return self
+                .error(
+                    request_id,
+                    "session_not_found",
+                    "no window with this id is running on this host",
+                )
+                .await;
+        };
+        let inspected = self
+            .files
+            .run_blocking(
+                Arc::clone(&self.file_operations),
+                crate::host_files::HostOperationKind::List,
+                move |_| Ok(crate::host_conv::inspect_window(shell_pid)),
+            )
+            .await;
+        match inspected {
+            Ok(inspection) => match serde_json::to_value(&inspection) {
+                Ok(result) => self.response(request_id, result).await,
+                Err(_) => false,
+            },
+            Err(error) => self.error(request_id, error.code, &error.detail).await,
+        }
+    }
+
+    async fn begin_read(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+        ticket: RequestTicket,
+    ) -> bool {
         let Some(path) = payload_string(payload, "path") else {
             return self
                 .error(request_id, "invalid_request", "path is required")
@@ -749,7 +985,7 @@ impl Context {
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut state = self.state.lock().await;
-            if state.cancelled_request_ids.remove(request_id) {
+            if Self::take_early_cancel(&state, request_id) {
                 drop(state);
                 return self
                     .error(request_id, "cancelled", "file read was cancelled")
@@ -765,6 +1001,7 @@ impl Context {
         let path = path.to_string();
         let task = async move {
             let _permit = permit;
+            let _ticket = ticket;
             let sent = context.send_read(&request_id, &path, cancelled).await;
             context.state.lock().await.read_requests.remove(&request_id);
             if !sent && !context.closed.load(Ordering::Acquire) {
@@ -787,6 +1024,7 @@ impl Context {
         &self,
         request_id: &str,
         payload: Option<&Map<String, Value>>,
+        ticket: RequestTicket,
     ) -> bool {
         let Some(path) = payload_string(payload, "path") else {
             return self
@@ -821,7 +1059,7 @@ impl Context {
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut state = self.state.lock().await;
-            if state.cancelled_request_ids.remove(request_id) {
+            if Self::take_early_cancel(&state, request_id) {
                 drop(state);
                 return self
                     .error(request_id, "cancelled", "file read was cancelled")
@@ -837,6 +1075,7 @@ impl Context {
         let path = path.to_string();
         let task = async move {
             let _permit = permit;
+            let _ticket = ticket;
             let sent = context
                 .send_range_read(&request_id, &path, offset, length, if_version, cancelled)
                 .await;
@@ -935,7 +1174,12 @@ impl Context {
         .await
     }
 
-    async fn begin_preview(&self, request_id: &str, payload: Option<&Map<String, Value>>) -> bool {
+    async fn begin_preview(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+        ticket: RequestTicket,
+    ) -> bool {
         let Some(path) = payload_string(payload, "path") else {
             return self
                 .error(request_id, "invalid_request", "path is required")
@@ -971,6 +1215,7 @@ impl Context {
             // filesystem operation — taking a long-task permit around the slow
             // part is exactly the inversion that would let queued previews
             // starve reads and writes.
+            let _ticket = ticket;
             let sent = context
                 .send_preview(&request_id, &preview, &path, max_pixels, if_version)
                 .await;
@@ -1094,7 +1339,12 @@ impl Context {
         }
     }
 
-    async fn begin_write(&self, request_id: &str, payload: Option<&Map<String, Value>>) -> bool {
+    async fn begin_write(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+        ticket: RequestTicket,
+    ) -> bool {
         let (Some(dir), Some(name), Some(length), Some(sha256)) = (
             payload_string(payload, "dir"),
             payload_string(payload, "name"),
@@ -1111,8 +1361,8 @@ impl Context {
         };
         let overwrite = payload_bool(payload, "overwrite").unwrap_or(false);
         {
-            let mut state = self.state.lock().await;
-            if state.cancelled_request_ids.remove(request_id) {
+            let state = self.state.lock().await;
+            if Self::take_early_cancel(&state, request_id) {
                 drop(state);
                 return self
                     .error(request_id, "cancelled", "file write was cancelled")
@@ -1148,6 +1398,7 @@ impl Context {
                 let slot = Arc::new(ActiveWrite {
                     pending: Mutex::new(Some(write)),
                     cancelled: CancellationToken::new(),
+                    _request: ticket,
                 });
                 let mut state = self.state.lock().await;
                 if self.closed.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
@@ -1157,7 +1408,7 @@ impl Context {
                     }
                     return true;
                 }
-                if state.cancelled_request_ids.remove(request_id) {
+                if Self::take_early_cancel(&state, request_id) {
                     drop(state);
                     if let Some(write) = slot.pending.lock().await.take() {
                         self.file_operations.cleanup_write(write).await;
@@ -1433,7 +1684,7 @@ impl Context {
     }
 
     async fn send_read(&self, request_id: &str, path: &str, cancelled: Arc<AtomicBool>) -> bool {
-        let mut stream = match self
+        let stream = match self
             .files
             .open_read_in_session(
                 path,
@@ -1474,12 +1725,16 @@ impl Context {
             let _ = self.finish_read(&stream_id).await;
             return false;
         }
-
+        // Bounded at the reader, as the range path is: a file that grows
+        // after it was hashed streams the bytes the declaration names and
+        // no more, rather than everything appended until the pump notices.
+        let length = stream.stat.size;
+        let mut reader = stream.file.take(length);
         self.pump_stream(
             &stream_id,
-            &mut stream.file,
+            &mut reader,
             &mut signal_rx,
-            stream.stat.size,
+            length,
             &stream.sha256,
             &cancelled,
         )
@@ -1835,10 +2090,11 @@ impl Context {
                 .remove(request_id)
                 .and_then(|stream_id| state.writes.remove(&stream_id));
             if read.is_none() && write.is_none() {
-                if state.cancelled_request_ids.len() >= MAX_SEEN_REQUESTS {
-                    return false;
-                }
-                state.cancelled_request_ids.insert(request_id.to_string());
+                state
+                    .requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .note_cancel(request_id);
             }
             (read, write)
         };
@@ -1966,10 +2222,31 @@ fn payload_bool(payload: Option<&Map<String, Value>>, key: &str) -> Option<bool>
     payload?.get(key)?.as_bool()
 }
 
+/// Operation families that carry a device's intent for this host: its
+/// conversations now; launch contexts, agent accounts, screens and boxes as
+/// they arrive. A legacy (protocol 1) host channel is admitted on the
+/// server's binding alone, with no authenticated device behind it
+/// (`rtc.rs`, `pair: None`), so every family here is refused on it whatever
+/// a client sends. A new family is added here before its first operation.
+const DEVICE_INTENT_FAMILIES: [&str; 5] = [
+    "conv.",
+    "session.launch.",
+    "agent.accounts.",
+    "screen.",
+    "box.",
+];
+
+fn requires_pair(operation: &str) -> bool {
+    DEVICE_INTENT_FAMILIES
+        .iter()
+        .any(|family| operation.starts_with(family))
+}
+
 pub(crate) fn install(
     dc: Arc<RTCDataChannel>,
     connected_signal: HostConnectedSignal,
     files_override: Option<Arc<HostFileService>>,
+    pair: Option<crate::host_conv::WindowShells>,
 ) -> Arc<Lifetime> {
     // Stored handlers must not own their channel: close does not clear them.
     let message_dc = Arc::downgrade(&dc);
@@ -2051,6 +2328,7 @@ pub(crate) fn install(
     let open_closed = Arc::clone(&closed);
     let open_normal_rx = Arc::clone(&normal_rx);
     let open_fast_rx = Arc::clone(&fast_rx);
+    let open_pair = pair;
     dc.on_open(Box::new(move || {
         let dc = open_dc.upgrade();
         let context_slot = Arc::clone(&open_context);
@@ -2063,6 +2341,7 @@ pub(crate) fn install(
         let closed = Arc::clone(&open_closed);
         let normal_rx = Arc::clone(&open_normal_rx);
         let fast_rx = Arc::clone(&open_fast_rx);
+        let pair = open_pair.clone();
         Box::pin(async move {
             let Some(dc) = dc else { return };
             let files = match files {
@@ -2106,6 +2385,7 @@ pub(crate) fn install(
                 publications,
                 closed,
                 shutdown,
+                pair,
             };
             let mut context_slot = context_slot.lock().await;
             if context.closed.load(Ordering::Acquire) || context.shutdown.is_cancelled() {
@@ -2216,6 +2496,14 @@ pub(crate) fn install(
             if crate::host_desktop::DESKTOP_SUPPORTED {
                 capabilities.push("desktop.reveal");
                 capabilities.push("desktop.open");
+            }
+            // New operation families are advertised as one versioned family
+            // capability (`conv.v1`), not a name per operation: clients cap
+            // the list they accept, and a family stays far from that cap.
+            // Device-intent families appear only where they are answered —
+            // on a pair-admitted channel, on a platform that supports them.
+            if publication_context.pair.is_some() && crate::host_conv::SUPPORTED {
+                capabilities.push(crate::host_conv::CAPABILITY);
             }
             let hello = json!({
                 "version": VERSION,
@@ -2337,6 +2625,110 @@ fn tombstone_deadline() -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ticket(window: &Arc<StdMutex<RequestWindow>>, id: &str) -> Option<RequestTicket> {
+        window.lock().unwrap().admit(id).then(|| RequestTicket {
+            id: id.to_string(),
+            window: Arc::clone(window),
+        })
+    }
+
+    #[test]
+    fn a_long_open_channel_admits_every_new_request_id() {
+        let window = Arc::new(StdMutex::new(RequestWindow::default()));
+        // Well past the 4,096 a daemon used to remember before closing.
+        for index in 0..(RECENT_REQUESTS * 3) {
+            let admitted = ticket(&window, &format!("request-{index}"));
+            assert!(admitted.is_some(), "request {index} was refused");
+        }
+        let window = window.lock().unwrap();
+        assert!(window.in_flight.is_empty());
+        assert_eq!(window.finished.len(), RECENT_REQUESTS);
+    }
+
+    #[test]
+    fn a_duplicate_inside_the_window_is_refused() {
+        let window = Arc::new(StdMutex::new(RequestWindow::default()));
+        let held = ticket(&window, "held").unwrap();
+        assert!(ticket(&window, "held").is_none(), "in flight");
+        drop(held);
+        assert!(ticket(&window, "held").is_none(), "just finished");
+        for index in 0..(RECENT_REQUESTS - 1) {
+            drop(ticket(&window, &format!("filler-{index}")).unwrap());
+        }
+        assert!(ticket(&window, "held").is_none(), "still among the recent");
+        drop(ticket(&window, "one-more").unwrap());
+        assert!(
+            ticket(&window, "held").is_some(),
+            "an id older than the window is forgotten"
+        );
+    }
+
+    #[test]
+    fn a_request_in_flight_is_never_forgotten() {
+        let window = Arc::new(StdMutex::new(RequestWindow::default()));
+        let long_read = ticket(&window, "long-read").unwrap();
+        for index in 0..(RECENT_REQUESTS * 2) {
+            drop(ticket(&window, &format!("short-{index}")).unwrap());
+        }
+        assert!(ticket(&window, "long-read").is_none());
+        drop(long_read);
+        assert!(ticket(&window, "long-read").is_none());
+    }
+
+    #[test]
+    fn requests_in_flight_are_bounded() {
+        let window = Arc::new(StdMutex::new(RequestWindow::default()));
+        let held: Vec<_> = (0..MAX_IN_FLIGHT_REQUESTS)
+            .map(|index| ticket(&window, &format!("held-{index}")).unwrap())
+            .collect();
+        assert!(ticket(&window, "one-too-many").is_none());
+        drop(held);
+        assert!(ticket(&window, "one-too-many").is_some());
+    }
+
+    #[test]
+    fn early_cancels_wait_for_their_request_and_are_bounded() {
+        let mut window = RequestWindow::default();
+        // Overtaken: remembered until its request takes it.
+        window.note_cancel("early");
+        assert!(window.admit("early"));
+        assert!(window.take_cancel("early"));
+        assert!(!window.take_cancel("early"));
+        window.finish("early");
+        // Late: its request already finished, so there is nothing to keep.
+        window.note_cancel("early");
+        assert!(!window.take_cancel("early"));
+        // A request that never takes its cancel (a ping) clears it when it
+        // finishes.
+        assert!(window.admit("ping"));
+        window.note_cancel("ping");
+        window.finish("ping");
+        assert_eq!(window.early_cancels.len(), 0);
+        // Cancels for requests that never come are forgotten oldest first
+        // instead of closing the channel.
+        for index in 0..(MAX_EARLY_CANCELS * 3) {
+            window.note_cancel(&format!("orphan-{index}"));
+        }
+        assert_eq!(window.early_cancels.len(), MAX_EARLY_CANCELS);
+        assert!(window.early_cancels.order.len() <= MAX_EARLY_CANCELS * 2);
+        assert!(!window.take_cancel("orphan-0"));
+        assert!(window.take_cancel(&format!("orphan-{}", MAX_EARLY_CANCELS * 3 - 1)));
+    }
+
+    #[test]
+    fn a_reinserted_id_is_not_evicted_by_its_stale_entry() {
+        let mut set = RecencySet::new(2);
+        set.insert("a");
+        assert!(set.remove("a"));
+        set.insert("b");
+        set.insert("a");
+        // The stale first "a" reaches the front first; the live one stays.
+        set.insert("c");
+        assert!(set.contains("a"));
+        assert!(set.contains("c"));
+        assert!(!set.contains("b"));
+    }
 
     #[tokio::test]
     async fn detached_close_invoker_has_a_hard_lifetime_bound() {

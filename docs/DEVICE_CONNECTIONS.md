@@ -118,11 +118,15 @@ Channel proxies bound individual frames to 64 KiB, queued sends to 256 KiB and
 1,024 messages per channel, and outstanding receive credit to 2 MiB and 1,024
 messages. Scheduling visits channels independently with a small native send
 buffer. The daemon caps a pair at 128 terminal attachments and 32 additional
-host-control consumers, and closes a consumer channel at its 4,097th request id.
-Both clients swap a consumer's channel for a fresh one while it is idle past
-3,500 requests, hold new requests during the swap, and never send more than
-4,000 on one channel. A consumer refused twice in a row before its hello says
-that too many views are open (web keeps retrying slowly; mobile offers Retry).
+host-control consumers. A request id reused while its request is in flight, or
+among the channel's 4,096 most recently finished, still closes the channel;
+older ids are forgotten, so only daemons older than this release close a
+consumer channel at its 4,097th request id. The hello does not say which kind
+a host runs, so both clients keep swapping a consumer's channel for a fresh
+one while it is idle past 3,500 requests, hold new requests during the swap,
+and never send more than 4,000 on one channel. A consumer refused twice in a
+row before its hello says that too many views are open (web keeps retrying
+slowly; mobile offers Retry).
 Existing session replay and host-file streaming limits
 continue to apply. SCTP still shares congestion across the peer, so bandwidth
 contention must be measured with concurrent terminal and file traffic.

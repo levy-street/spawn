@@ -157,10 +157,11 @@ describe("conversation grammar", () => {
     );
   });
 
-  test("Codex names its own sessions, so only the latest one can be reopened", () => {
+  test("Codex names its own sessions: resumed by an id the host named, else the latest one", () => {
     expect(newAgentConversationId("codex")).toBeNull();
     expect(agentLaunchCommand(codex, id)).toBe("codex");
-    expect(agentResumeCommand(codex, id)).toBe("codex resume --last");
+    expect(agentResumeCommand(codex, id)).toBe(`codex resume ${id}`);
+    expect(agentResumeCommand(codex, null)).toBe("codex resume --last");
     expect(
       agentResumeCommand(
         { ...codex, yolo: true, yolo_args: "--dangerously-bypass-approvals-and-sandbox" },
@@ -176,6 +177,37 @@ describe("conversation grammar", () => {
     expect(agentCanResume("hermes")).toBe(false);
     expect(agentCanResume("claude-code")).toBe(true);
     expect(agentCanResume("Codex")).toBe(true);
+  });
+
+  test("an id that is not a UUID never reaches the command line", () => {
+    // The recorded id is the server's to hand back: one shaped like a flag
+    // would be read as one after `--resume`, which takes its value optionally.
+    const yolo = { ...claude, yolo: false, yolo_args: "--dangerously-skip-permissions" };
+    for (const bad of [
+      "--dangerously-skip-permissions",
+      "-p",
+      "--settings=x",
+      "-",
+      "a b",
+      "conv-2",
+      "",
+      `${id} --dangerously-skip-permissions`,
+      `-${id}`,
+    ]) {
+      expect(agentLaunchCommand(yolo, bad)).toBe("claude");
+      expect(agentResumeCommand(yolo, bad)).toBe("claude --continue");
+      expect(agentResumeCommand(codex, bad)).toBe("codex resume --last");
+      expect(agentInstallAndRunCommand({ ...claude, install: "npm i -g x" }, bad)).toBe(
+        "npm i -g x && claude",
+      );
+    }
+  });
+
+  test("an id in upper case is typed lower-case", () => {
+    const upper = id.toUpperCase();
+    expect(agentLaunchCommand(claude, upper)).toBe(`claude --session-id ${id}`);
+    expect(agentResumeCommand(claude, upper)).toBe(`claude --resume ${id}`);
+    expect(agentResumeCommand(codex, upper)).toBe(`codex resume ${id}`);
   });
 
   test("a fresh conversation id is a UUID, only for a CLI that takes one", () => {

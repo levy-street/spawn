@@ -20,6 +20,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { useAgentTranscripts } from "@/data/queries/files";
 import {
+  TRANSCRIPTS_TRUNCATED_NOTE,
   type TranscriptNotice,
   transcriptEmptyState,
   transcriptQueryFor,
@@ -212,7 +213,7 @@ export function TranscriptsSheet({
           )}
           {report.data?.truncated && !notice && !busy ? (
             <Text color="mutedForeground" style={{ paddingTop: theme.space(2) }} variant="caption">
-              Only the newest are listed; older conversations stay on the host.
+              {TRANSCRIPTS_TRUNCATED_NOTE}
             </Text>
           ) : null}
           {transfer ? (

@@ -1,3 +1,9 @@
+import {
+  CONVERSATION_INSPECT_OP,
+  type ConversationInspection,
+  canonicalConversationId,
+  parseConversationInspection,
+} from "@/lib/conversation";
 import { parseCapabilities } from "@/lib/preview/capabilities";
 import { hashStream, Sha256 } from "@/lib/sha256";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
@@ -1239,16 +1245,20 @@ export class HostControlClient {
    * then read with `readFile`, so a transcript is a host file like any
    * other and never crosses the server. Gated on `agent.transcripts`; an
    * older daemon answers `unsupported_operation` as an ordinary error.
+   * Conversation ids travel only as UUIDs (`canonicalConversationId`), both
+   * ways: one that is anything else is not asked about, and a file named
+   * with one is named with none.
    */
   async agentTranscripts(
     query: AgentTranscriptQuery,
     options?: HostControlRequestOptions,
   ): Promise<AgentTranscriptReport> {
+    const conversationId = canonicalConversationId(query.conversationId);
     const result = await this.request<AgentTranscriptReport>(
       AGENT_TRANSCRIPTS_OP,
       {
         agent_kind: query.agentKind,
-        ...(query.conversationId ? { conversation_id: query.conversationId } : {}),
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         ...(query.cwd ? { cwd: query.cwd } : {}),
       },
       options,
@@ -1271,7 +1281,41 @@ export class HostControlClient {
       this.failRtc();
       throw new HostControlError("invalid_response", "Host returned an invalid transcript report");
     }
-    return result;
+    return {
+      ...result,
+      transcripts: result.transcripts.map((file) => ({
+        ...file,
+        conversation_id: canonicalConversationId(file.conversation_id),
+      })),
+    };
+  }
+
+  /**
+   * Which conversation a window is actually in, read by its daemon from the
+   * window's own processes and the agent's live-session registry — the id
+   * `/clear`, `/branch`, `/resume` or agent view moved it to, and whether a
+   * process outside the window holds it. Gated on `conv.v1`; a daemon without
+   * it answers `unsupported_operation`, and a legacy host channel
+   * `pair_required`.
+   */
+  async inspectConversation(
+    sessionId: string,
+    options?: HostControlRequestOptions,
+  ): Promise<ConversationInspection> {
+    const result = await this.request<unknown>(
+      CONVERSATION_INSPECT_OP,
+      { session_id: sessionId },
+      options,
+    );
+    const inspection = parseConversationInspection(result);
+    if (!inspection) {
+      this.failRtc();
+      throw new HostControlError(
+        "invalid_response",
+        "Host returned an invalid conversation report",
+      );
+    }
+    return inspection;
   }
 
   /**

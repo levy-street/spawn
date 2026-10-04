@@ -381,12 +381,19 @@ impl RtcSessions {
                         return;
                     }
                     live.insert(label.to_string(), Arc::downgrade(&dc));
+                    // An authenticated device: its channels may ask about
+                    // the windows it can already see, and only that much of
+                    // the registry is handed over.
+                    let registry = pair.registry.clone();
+                    let windows =
+                        crate::host_conv::WindowShells::new(move |id| registry.shell_pid(id));
                     pair.register_host(install_host_control_channel(
                         dc,
                         signal_id,
                         binding,
                         sessions.signaling.clone(),
                         None,
+                        Some(windows),
                     ));
                     return;
                 }
@@ -2134,6 +2141,155 @@ mod tests {
             let _ = pc.close().await;
         }
         worker.abort();
+    }
+
+    /// A device's host channel may ask which conversation one of this
+    /// daemon's windows is in (`host_conv`), and learns nothing about a
+    /// window this daemon is not running.
+    #[tokio::test]
+    async fn pair_host_channels_inspect_this_daemons_windows_only() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        // A window whose shell is a real process with nothing under it. A
+        // daemon that cannot walk a window (Windows) neither advertises nor
+        // answers `conv.*`, whatever the pid, so this test's own stands in.
+        #[cfg(unix)]
+        let mut shell = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        let shell_pid = shell.id();
+        #[cfg(not(unix))]
+        let shell_pid = std::process::id();
+        let window = Uuid::new_v4();
+        let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        registry.insert(
+            crate::pty::SessionHandle::new_worker(crate::pty::WorkerHandleParts {
+                session_id: window,
+                cwd: "/".into(),
+                cmd_tx,
+                lifecycle: crate::pty::SessionLifecycle::new(
+                    std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
+                    Uuid::new_v4(),
+                ),
+                alive: Arc::new(AtomicBool::new(true)),
+                cols: 80,
+                rows: 24,
+                outbox_tx,
+                control: crate::pty::ForwarderControl::new(),
+            })
+            .with_shell_pid(shell_pid),
+        );
+        // A worker that never reported its shell.
+        let unreported = Uuid::new_v4();
+        let (_binding, _commands) = crate::rtc::tests::insert_test_worker(&registry, unreported);
+        let pc = connect_pair(&sessions, &registry, [42; 32]).await;
+        // connect_pair's signaling receiver has gone away; install a live sink.
+        let (signal_tx, mut signal_rx) = mpsc::channel(128);
+        sessions.signaling.install(signal_tx);
+        sessions.deferred_pruned.store(true, Ordering::Release);
+        let signal_sink = tokio::spawn(async move { while signal_rx.recv().await.is_some() {} });
+        let host = pc
+            .create_data_channel(&format!("spawn.host.ctl/{}", Uuid::new_v4()), None)
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        host.on_message(Box::new(move |message| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx
+                    .send(serde_json::from_slice::<Value>(&message.data).unwrap())
+                    .await;
+            })
+        }));
+        let hello = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello["type"], "hello");
+        let advertised = hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == crate::host_conv::CAPABILITY);
+        assert_eq!(advertised, crate::host_conv::SUPPORTED);
+        let ask = |request_id: &'static str, session_id: String| {
+            let host = Arc::clone(&host);
+            async move {
+                host.send_text(
+                    json!({
+                        "version": 1, "type": "request", "request_id": request_id,
+                        "operation": "conv.inspect", "payload": {"session_id": session_id}
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        ask("inspect-window", window.to_string()).await;
+        let answer = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer["request_id"], "inspect-window");
+        if crate::host_conv::SUPPORTED {
+            assert_eq!(answer["ok"], true, "{answer}");
+            assert_eq!(
+                answer["result"],
+                json!({
+                    "agent": null,
+                    "conversation_id": null,
+                    "state": "unknown",
+                    "cli_version": null,
+                    "live_elsewhere": false,
+                    "source": "none",
+                })
+            );
+            for (request_id, session_id, code) in [
+                (
+                    "inspect-unknown",
+                    Uuid::new_v4().to_string(),
+                    "session_not_found",
+                ),
+                (
+                    "inspect-unreported",
+                    unreported.to_string(),
+                    "session_not_found",
+                ),
+                (
+                    "inspect-garbage",
+                    "not-a-session".to_string(),
+                    "invalid_request",
+                ),
+                (
+                    "inspect-uppercase",
+                    window.to_string().to_uppercase(),
+                    "invalid_request",
+                ),
+            ] {
+                ask(request_id, session_id).await;
+                let answer = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(answer["request_id"], request_id);
+                assert_eq!(answer["error"]["code"], code, "{answer}");
+            }
+        } else {
+            assert_eq!(answer["error"]["code"], "unsupported_operation");
+        }
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        signal_sink.abort();
+        #[cfg(unix)]
+        {
+            shell.kill().unwrap();
+            shell.wait().unwrap();
+        }
     }
 
     #[tokio::test]

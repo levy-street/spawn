@@ -622,6 +622,7 @@ pub(crate) struct WriteLifecycleTestHooks {
     blocking: [BlockingPause; 11],
     effect_boundary: [BlockingPause; 11],
     temporary_cleanup: BlockingPause,
+    read_hashing: BlockingPause,
 }
 
 #[cfg(test)]
@@ -664,6 +665,19 @@ impl WriteLifecycleTestHooks {
 
     pub(crate) fn release_begin_after_create(&self) {
         self.begin_after_create.release();
+    }
+
+    /// Hold an `fs.read` after it has hashed its first chunk.
+    pub(crate) fn arm_read_hashing(&self) {
+        self.read_hashing.arm();
+    }
+
+    pub(crate) async fn wait_read_hashing_entered(&self) {
+        self.read_hashing.entered.notified().await;
+    }
+
+    pub(crate) fn release_read_hashing(&self) {
+        self.read_hashing.release();
     }
 
     pub(crate) fn arm_temporary_cleanup(&self) {
@@ -1183,24 +1197,31 @@ impl HostFileService {
                 "file exceeds the stream limit",
             ));
         }
+        // Exactly the size the read declares, as the stream that follows
+        // sends: a file that grows meanwhile — a transcript its agent is
+        // still writing — is hashed and sent as that prefix. One that comes
+        // up short has changed.
         let mut buffer = vec![0_u8; 64 * 1024];
         let mut hasher = Sha256::new();
         let mut length = 0_u64;
-        loop {
-            if cancelled.load(Ordering::Acquire) || operations.cancelled() {
-                return Err(FsError::new("cancelled", "file read was cancelled"));
+        {
+            let mut declared = Read::by_ref(&mut file).take(metadata.len());
+            loop {
+                if cancelled.load(Ordering::Acquire) || operations.cancelled() {
+                    return Err(FsError::new("cancelled", "file read was cancelled"));
+                }
+                let read = declared.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                length = length.saturating_add(read as u64);
+                hasher.update(&buffer[..read]);
+                #[cfg(test)]
+                {
+                    std::thread::yield_now();
+                    self.write_lifecycle_hooks.read_hashing.pause_if_armed();
+                }
             }
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            length = length.saturating_add(read as u64);
-            if length > metadata.len() || length > MAX_FILE_BYTES {
-                return Err(FsError::new("file_changed", "file changed while hashing"));
-            }
-            hasher.update(&buffer[..read]);
-            #[cfg(test)]
-            std::thread::yield_now();
         }
         if length != metadata.len() {
             return Err(FsError::new("file_changed", "file changed while hashing"));
@@ -1977,7 +1998,7 @@ impl HostFileService {
 }
 
 #[cfg(windows)]
-fn windows_wire_path(path: &Path) -> PathBuf {
+pub(crate) fn windows_wire_path(path: &Path) -> PathBuf {
     use std::path::Prefix;
 
     let mut components = path.components();
@@ -2907,6 +2928,67 @@ mod tests {
             service.remove("~", true).await.unwrap_err().code,
             "root_protected"
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_grows_while_it_is_hashed_reads_as_its_declared_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("growing.jsonl");
+        let original: Vec<u8> = (0..(3 * 64 * 1024 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&path, &original).unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+        let hooks = service.write_lifecycle_test_hooks();
+
+        // An agent appends after the first chunk is hashed.
+        hooks.arm_read_hashing();
+        let reading = {
+            let service = service.clone();
+            tokio::spawn(async move { service.open_read("growing.jsonl").await })
+        };
+        hooks.wait_read_hashing_entered().await;
+        {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&[b'+'; 100 * 1024])
+                .unwrap();
+        }
+        hooks.release_read_hashing();
+        let mut read = reading.await.unwrap().expect("a growing file is readable");
+        assert_eq!(read.stat.size, original.len() as u64);
+        assert_eq!(read.sha256, format!("{:x}", Sha256::digest(&original)));
+        let mut bytes = Vec::new();
+        (&mut read.file)
+            .take(read.stat.size)
+            .read_to_end(&mut bytes)
+            .await
+            .unwrap();
+        assert_eq!(bytes, original);
+
+        // One that shrinks meanwhile has changed.
+        hooks.arm_read_hashing();
+        let reading = {
+            let service = service.clone();
+            tokio::spawn(async move { service.open_read("growing.jsonl").await })
+        };
+        hooks.wait_read_hashing_entered().await;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024)
+            .unwrap();
+        hooks.release_read_hashing();
+        let error = reading
+            .await
+            .unwrap()
+            .err()
+            .expect("a shrunk file is refused");
+        assert_eq!(error.code, "file_changed");
     }
 
     #[cfg(unix)]

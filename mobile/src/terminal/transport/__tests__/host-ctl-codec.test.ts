@@ -115,7 +115,7 @@ describe("agent transcript reports", () => {
           size: 4096,
           modified_at: 1_700_000_000,
           role: "conversation",
-          conversation_id: "abc",
+          conversation_id: "45171E5A-5951-4D38-81E5-E1C0F9639D80",
         },
         { path: "/home/me/x/agent-1.jsonl", name: "agent-1.jsonl", size: 12, role: "subagent" },
       ],
@@ -129,7 +129,7 @@ describe("agent transcript reports", () => {
         size: 4096,
         modified_at: 1_700_000_000,
         role: "conversation",
-        conversation_id: "abc",
+        conversation_id: "45171e5a-5951-4d38-81e5-e1c0f9639d80",
       },
       {
         path: "/home/me/x/agent-1.jsonl",
@@ -142,6 +142,21 @@ describe("agent transcript reports", () => {
     ]);
     expect(report.searched).toEqual(["/home/me/.claude/projects"]);
     expect(report.truncated).toBe(false);
+  });
+
+  test("a file named with an id that is not a UUID is named with none", () => {
+    for (const bad of ["abc", "--dangerously-skip-permissions", "-p", "a b", 7]) {
+      const report = parseAgentTranscriptReport({
+        agent_kind: "claude-code",
+        supported: true,
+        transcripts: [
+          { path: "/x", name: "x", size: 1, role: "conversation", conversation_id: bad },
+        ],
+        searched: [],
+        truncated: false,
+      });
+      expect(report.transcripts[0]?.conversation_id).toBeNull();
+    }
   });
 
   test("refuses a file with a role it does not know", () => {

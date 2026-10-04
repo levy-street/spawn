@@ -1,4 +1,5 @@
 import type { Agent, Session } from "@/lib/api";
+import { canonicalConversationId } from "@/lib/conversation";
 import type {
   AgentTranscriptFile,
   AgentTranscriptQuery,
@@ -15,7 +16,8 @@ import { sessionAgent } from "@/lib/sessions";
  * what to ask for, and what to say about the answer.
  */
 
-/** What to ask the daemon for, or null when the window runs no agent. */
+/** What to ask the daemon for, or null when the window runs no agent. A
+ *  recorded id that is not a UUID is not asked about: the folder is. */
 export function transcriptQueryFor(
   session: Pick<Session, "foreground_command" | "agent_id" | "agent_session_id" | "cwd">,
   agents: readonly Agent[],
@@ -26,7 +28,7 @@ export function transcriptQueryFor(
     agent,
     query: {
       agentKind: agent.kind,
-      conversationId: session.agent_session_id ?? null,
+      conversationId: canonicalConversationId(session.agent_session_id),
       cwd: session.cwd,
     },
   };
@@ -61,9 +63,15 @@ export function transcriptEmptyState(
   hostName: string,
 ): TranscriptNotice | null {
   if (!report.supported) {
+    // A store configured outside the host's home folder (or as a relative
+    // path) is named in `searched`; SPAWN D reads only inside home. An empty
+    // `searched` is a harness the daemon cannot place at all.
     return {
       title: `No transcript for ${agentName}`,
-      body: `SPAWN D doesn't know where ${agentName} keeps its conversations on ${hostName}.`,
+      body:
+        report.searched.length > 0
+          ? `${agentName} keeps its conversations in ${report.searched.join(", ")} on ${hostName}, outside the home folder SPAWN D can read.`
+          : `SPAWN D doesn't know where ${agentName} keeps its conversations on ${hostName}.`,
     };
   }
   if (report.transcripts.length > 0) return null;
@@ -73,6 +81,14 @@ export function transcriptEmptyState(
     body: `${agentName} hasn't written a conversation for this window on ${hostName}.${where}`,
   };
 }
+
+/**
+ * Shown under a list the daemon cut short. The cap mostly cuts a long
+ * conversation's helper files (subagent records, workflows, spilled tool
+ * output), not only older conversations.
+ */
+export const TRANSCRIPTS_TRUNCATED_NOTE =
+  "Not every file is listed. The rest, which can include this conversation's helper files, stay on the host.";
 
 /** The daemon on this host predates transcripts. */
 export function transcriptsUnavailable(hostName: string): TranscriptNotice {

@@ -57,6 +57,13 @@ pub fn credentials_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("credentials.json"))
 }
 
+/// Where spawnd keeps what it generates for each skilled window:
+/// `<config dir>/sessions/<session id>/`, its skills and its Codex home
+/// (`run.rs`, `materialize_session_capabilities`).
+pub fn window_homes_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("sessions"))
+}
+
 /// Build the websocket URL for `/ws/daemon` from the server URL.
 pub fn ws_url(server: &Url) -> Result<Url> {
     let mut ws = server.clone();

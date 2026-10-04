@@ -5095,7 +5095,9 @@ fn install_host_data_channel_handler(
                 let _ = dc.close().await;
                 return;
             }
-            install_host_control_channel(dc, signal_id, binding, signaling, files);
+            // Protocol 1: admitted on the server's binding, no device behind
+            // it, so no device-intent operations (`host_control::requires_pair`).
+            install_host_control_channel(dc, signal_id, binding, signaling, files, None);
         })
     }));
 }
@@ -5161,9 +5163,10 @@ fn install_host_control_channel(
     binding: HostRtcBinding,
     signaling: RtcWsSender,
     files_override: Option<Arc<HostFileService>>,
+    pair: Option<crate::host_conv::WindowShells>,
 ) -> Arc<crate::host_control::Lifetime> {
     let connected_signal = HostConnectedSignal::new(signaling, signal_id, binding);
-    crate::host_control::install(dc, connected_signal, files_override)
+    crate::host_control::install(dc, connected_signal, files_override, pair)
 }
 
 pub(crate) async fn send_host_status(
@@ -10200,6 +10203,60 @@ mod tests {
         assert!(sessions.host_peers.lock().await.is_empty());
     }
 
+    /// A protocol 1 host channel is admitted on the server's binding alone,
+    /// with no authenticated device behind it: device-intent families are
+    /// neither advertised nor answered there, whatever a client sends.
+    #[tokio::test]
+    async fn a_legacy_host_channel_refuses_device_intent_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let binding = HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "c".repeat(32),
+            binding_generation: 1,
+            protocol: HOST_CONTROL_LABEL.to_owned(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        };
+        let (browser_pc, daemon_pc, channel, mut messages, _out_rx) =
+            start_paired_host_endpoint(files, binding, "legacy-device-intent").await;
+        let (_, hello) = receive_host_control(&mut messages).await;
+        assert_eq!(hello["type"], "hello");
+        let capabilities = hello["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|name| name == "fs.home"));
+        assert!(!capabilities
+            .iter()
+            .any(|name| name.as_str().is_some_and(|name| name.starts_with("conv."))));
+        for (index, operation) in [
+            "conv.inspect",
+            "conv.export",
+            "session.launch.set",
+            "agent.accounts.list",
+            "screen.view",
+            "box.list",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = request_host_control(
+                &channel,
+                &mut messages,
+                &format!("legacy-intent-{index}"),
+                operation,
+                json!({"session_id": Uuid::new_v4().to_string()}),
+            )
+            .await;
+            assert_eq!(response["ok"], false, "{operation}");
+            assert_eq!(response["error"]["code"], "pair_required", "{operation}");
+        }
+        // Everything it served before, it still serves.
+        let home =
+            request_host_control(&channel, &mut messages, "legacy-home", "fs.home", json!({}))
+                .await;
+        assert_eq!(home["ok"], true);
+        browser_pc.close().await.unwrap();
+        close_test_peer(&daemon_pc).await;
+    }
+
     #[tokio::test]
     async fn two_real_host_channels_keep_source_and_destination_capabilities_isolated() {
         let source_root = tempfile::tempdir().unwrap();
@@ -10423,6 +10480,7 @@ mod tests {
                 protocol_version: RTC_PROTOCOL_VERSION,
             },
             RtcWsSender::default(),
+            None,
             None,
         );
         let weak_lifetime = Arc::downgrade(&lifetime);
@@ -11439,6 +11497,141 @@ mod tests {
         .expect("cancelled write cleanup did not drain promptly");
         assert!(!root.path().join("stalled-write.bin").exists());
 
+        browser_pc.close().await.unwrap();
+        daemon_pc.close().await.unwrap();
+    }
+
+    fn host_control_test_binding() -> HostRtcBinding {
+        HostRtcBinding {
+            host_id: Uuid::new_v4(),
+            binding_nonce: "d".repeat(32),
+            binding_generation: 1,
+            protocol: HOST_CONTROL_LABEL.to_string(),
+            protocol_version: RTC_PROTOCOL_VERSION,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_control_outlives_its_request_window_and_still_refuses_a_duplicate() {
+        let root = tempfile::tempdir().unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, host_control_test_binding(), "request-window").await;
+        // Daemons before the recency window closed the channel on the
+        // 4,097th id. Batches stay well inside the 64-frame normal queue.
+        const REQUESTS: usize = 4_200;
+        const BATCH: usize = 32;
+        for batch in (0..REQUESTS).step_by(BATCH) {
+            let ids: Vec<String> = (batch..(batch + BATCH).min(REQUESTS))
+                .map(|index| format!("window-{index}"))
+                .collect();
+            for id in &ids {
+                channel
+                    .send_text(
+                        json!({
+                            "version": RTC_PROTOCOL_VERSION,
+                            "type": "request",
+                            "request_id": id,
+                            "operation": "ping",
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            for id in &ids {
+                let (_, response) = receive_host_control(&mut messages).await;
+                assert_eq!(response["request_id"], id.as_str());
+                assert_eq!(response["result"]["pong"], true);
+            }
+        }
+        // A recent id reused is still a protocol violation.
+        channel
+            .send_text(
+                json!({
+                    "version": RTC_PROTOCOL_VERSION,
+                    "type": "request",
+                    "request_id": format!("window-{}", REQUESTS - 1),
+                    "operation": "ping",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        wait_for_host_channel_close(&channel).await;
+        browser_pc.close().await.unwrap();
+        daemon_pc.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_that_grows_mid_read_streams_only_what_was_declared() {
+        let root = tempfile::tempdir().unwrap();
+        let original = (0..(STREAM_CHUNK_BYTES * 8 + 100))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let path = root.path().join("growing.log");
+        tokio::fs::write(&path, &original).await.unwrap();
+        let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let (browser_pc, daemon_pc, channel, mut messages) =
+            paired_host_endpoint(files, host_control_test_binding(), "growing-read").await;
+        let started = request_host_control(
+            &channel,
+            &mut messages,
+            "growing-read",
+            "fs.read",
+            json!({"path": "growing.log"}),
+        )
+        .await;
+        assert_eq!(started["result"]["length"], original.len());
+        let stream_id = started["result"]["stream_id"].as_str().unwrap().to_string();
+        // A full window unacknowledged holds the pump between reads; the file
+        // grows while it waits, as a transcript an agent is writing does.
+        let mut received = Vec::new();
+        for sequence in 0..8 {
+            let (_, chunk) = receive_host_control(&mut messages).await;
+            assert_eq!(chunk["sequence"], sequence);
+            received.extend(
+                STANDARD
+                    .decode(chunk[DIRECT_ENDPOINT_BYTES_FIELD].as_str().unwrap())
+                    .unwrap(),
+            );
+        }
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&vec![b'+'; STREAM_CHUNK_BYTES * 4]).unwrap();
+        }
+        let ack = |sequence: u64| {
+            json!({
+                "version": RTC_PROTOCOL_VERSION,
+                "type": "stream.ack",
+                "stream_id": stream_id,
+                "sequence": sequence,
+            })
+            .to_string()
+        };
+        channel.send_text(ack(8)).await.unwrap();
+        let ended = loop {
+            let (_, message) = receive_host_control(&mut messages).await;
+            if message["type"] != "stream.chunk" {
+                break message;
+            }
+            received.extend(
+                STANDARD
+                    .decode(message[DIRECT_ENDPOINT_BYTES_FIELD].as_str().unwrap())
+                    .unwrap(),
+            );
+            channel
+                .send_text(ack(message["sequence"].as_u64().unwrap() + 1))
+                .await
+                .unwrap();
+        };
+        assert_eq!(ended["type"], "stream.end", "{ended}");
+        assert_eq!(ended["length"], original.len());
+        assert_eq!(received, original);
         browser_pc.close().await.unwrap();
         daemon_pc.close().await.unwrap();
     }

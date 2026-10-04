@@ -121,13 +121,22 @@ Honest inventory, from the current wire protocol:
 password hashes; host names/OS/arch/version/last-seen; workspace names,
 positions, and layouts; session names, host relationships, working directories,
 lifecycle state, exit codes, foreground executable basenames, activity
-timestamps, the agent definition a window was opened as, and the opaque
-conversation id the client handed that agent at launch (`agent_session_id`,
-what a restart resumes — an identifier the client chose, never read by the
-server; the agent's own transcript files that id names are located and read
-only over the device's host channel, `agent.transcripts` then `fs.read`, and
-never reach the server); agent-definition names, kinds, commands, environment prefixes, and
-install commands; skill names, descriptions, bodies, defaults, and session
+timestamps, the agent definition a window was opened as, and an opaque
+conversation id for that agent (`agent_session_id`, what a restart resumes,
+never read by the server). It starts as the id the client handed the agent at
+launch. A device types it only when it is a canonical UUID, so a server that
+rewrites it cannot make a restart type a flag (`claude --resume
+--dangerously-skip-permissions`); a record that is anything else is replaced
+by a fresh id the device chose. On a restart a device may replace it with the Claude Code id the
+window's host named when asked which conversation the window is actually in
+(`conv.inspect`, over the device's host channel): an id the agent chose
+itself after `/clear`, `/branch` or `/resume`, or a background job's. Only
+that id is written back, with `PATCH /api/sessions/{id}`; the rest of the
+answer, and the process tree and live-session registry the host reads for
+it, never reach the server, and neither do the agent's own transcript files
+the id names, which are located and read only over the device's host channel
+(`agent.transcripts` then `fs.read`). Also kept: agent-definition names,
+kinds, commands, environment prefixes, and install commands; skill names, descriptions, bodies, defaults, and session
 grants; public trust material; connection/signaling timing; and IP addresses.
 Host-agent availability flows expose the definition target, installed
 path/version data, and errors. Historical install output/errors, policy, and

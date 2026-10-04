@@ -1258,9 +1258,14 @@ class SkillLaunchConfig(BaseModel):
 
 
 # A conversation id is typed into a shell after the agent's command, so it is
-# held to the characters that never need quoting there. Agent CLIs use UUIDs;
-# the pattern leaves room for any other token an agent might spell.
-AGENT_SESSION_ID_PATTERN = r"^[A-Za-z0-9._:-]{1,64}$"
+# held to the characters that never need quoting there, and it starts with a
+# letter or digit: a leading dash would be read as a flag (`claude --resume
+# --dangerously-skip-permissions`, since `--resume` takes its value
+# optionally). Agent CLIs use UUIDs; the pattern leaves room for any other
+# token an agent might spell. The clients do not lean on this: they type an id
+# only when it is a UUID, since the server is not trusted with what a device
+# types (docs/TRUST.md).
+AGENT_SESSION_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
 
 
 class TilePlacement(BaseModel):

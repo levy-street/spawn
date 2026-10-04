@@ -16,6 +16,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
+import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
 import { agentDisplayName } from "@/components/icons/AgentIcon";
 import { SessionTranscriptsDialog } from "@/components/session/session-transcripts-dialog";
 import { ConnectionChip } from "@/components/terminal/ConnectionChip";
@@ -43,6 +44,7 @@ import {
   workspaces,
 } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
+import { askWindowHost } from "@/lib/conversation-inspect";
 import { remove as removeTile } from "@/lib/grid";
 import { sessionAtShell, sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
@@ -94,6 +96,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     [sessionId, workspacesQ.data],
   );
   const session = sessionQ.data;
+  const daemonConnection = useDaemonConnection(session?.host_id ?? null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -129,6 +132,13 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       return restartSessionAgent({
         session,
         agents: definitions,
+        // The conversation the window is actually in, and whether it has a
+        // record yet, from its host.
+        ...askWindowHost(session.host_id, daemonConnection, sessionId),
+        recordConversation: async (conversationId) => {
+          const saved = await sessions.update(sessionId, { agent_session_id: conversationId });
+          updateSessionCaches(queryClient, saved);
+        },
         restart: async () => {
           const saved = await sessions.restart(sessionId);
           updateSessionCaches(queryClient, saved);

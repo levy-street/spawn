@@ -1,4 +1,5 @@
 import type { Agent } from "@/lib/api";
+import { canonicalConversationId } from "@/lib/conversation";
 
 /**
  * Pure command construction for the agent switcher (§5.5). Everything the
@@ -96,13 +97,14 @@ export function agentInstallAndRunCommand(
  * an id up front is what lets a later restart come back to the same thread.
  */
 export type AgentConversationGrammar = {
-  /** Flags that start a fresh conversation under an id SPAWN D chose. Null when
-   *  the CLI names its own conversations. */
+  /** Flags that start a fresh conversation under an id SPAWN D chose: at
+   *  launch, and on a restart whose conversation the host has no record of
+   *  yet. Null when the CLI names its own conversations. */
   launch: ((conversationId: string) => string) | null;
   /** Flags that reopen a known conversation. Null when the CLI cannot. */
   resume: ((conversationId: string) => string) | null;
   /** Flags that reopen the most recent conversation in this folder, for a
-   *  window whose conversation id was never recorded. Null when the CLI cannot. */
+   *  window whose conversation cannot be named. Null when the CLI cannot. */
   continueLatest: string | null;
 };
 
@@ -112,11 +114,14 @@ const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> 
     resume: (id) => `--resume ${id}`,
     continueLatest: "--continue",
   },
-  // Codex names its own sessions and takes `resume` as a subcommand after the
-  // global flags, so only "the latest one here" can be asked for.
+  // Codex names its own sessions, so it cannot be launched under an id, and a
+  // restart never trusts a recorded one; it takes `resume` as a subcommand
+  // after the global flags. A conversation the host names for the window
+  // (`conv.inspect`) is resumed by that id, and "the latest one here" stands
+  // in wherever the host names none.
   codex: {
     launch: null,
-    resume: null,
+    resume: (id) => `resume ${id}`,
     continueLatest: "resume --last",
   },
 };
@@ -147,7 +152,9 @@ export function newAgentConversationId(kind: string | null | undefined): string 
 /**
  * What starting an agent types when the window is to remember its
  * conversation: the run command with the id the CLI is told to use. Without a
- * grammar for the kind, or without an id, exactly the run command.
+ * grammar for the kind, or without an id, exactly the run command. Only a
+ * UUID is an id here (`canonicalConversationId`): anything else is typed as
+ * no id at all, never as a word after the agent's flags.
  */
 export function agentLaunchCommand(
   agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
@@ -155,14 +162,16 @@ export function agentLaunchCommand(
 ): string {
   const run = agentRunCommand(agent);
   const launch = agentConversationGrammar(agent.kind)?.launch;
-  return launch && conversationId ? `${run} ${launch(conversationId)}` : run;
+  const id = canonicalConversationId(conversationId);
+  return launch && id ? `${run} ${launch(id)}` : run;
 }
 
 /**
  * What a restart types to bring the agent back where it was: resume the
- * recorded conversation, or the latest one in this folder when none was
- * recorded. Null when this kind of agent cannot be resumed at all, so the
- * caller falls back to a plain relaunch and says so.
+ * conversation it names (`restartConversation` decides which), or the latest
+ * one in this folder when there is none to name. Null when this kind of agent
+ * cannot be resumed at all, so the caller falls back to a plain relaunch and
+ * says so. An id that is not a UUID names nothing (`canonicalConversationId`).
  */
 export function agentResumeCommand(
   agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
@@ -171,7 +180,8 @@ export function agentResumeCommand(
   const grammar = agentConversationGrammar(agent.kind);
   if (!grammar) return null;
   const run = agentRunCommand(agent);
-  if (conversationId && grammar.resume) return `${run} ${grammar.resume(conversationId)}`;
+  const id = canonicalConversationId(conversationId);
+  if (id && grammar.resume) return `${run} ${grammar.resume(id)}`;
   if (grammar.continueLatest) return `${run} ${grammar.continueLatest}`;
   return null;
 }

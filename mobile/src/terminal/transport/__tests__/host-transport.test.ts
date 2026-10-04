@@ -866,6 +866,37 @@ describe("HostTransport capabilities", () => {
   });
 });
 
+describe("HostTransport conversation inspection", () => {
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+
+  test("asks about one window where the host offers conv.v1", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["fs.list", "conv.v1"] });
+    const pending = transport.inspectConversation(sessionId);
+    const request = await waitForRequest(bridge, "conv.inspect");
+    expect(request.payload).toEqual({ session_id: sessionId });
+    const result = {
+      agent: "claude-code",
+      conversation_id: "4e0b4642-0972-40ac-9a18-61d542276b76",
+      state: "running",
+      cli_version: "2.1.288",
+      live_elsewhere: false,
+      source: "registry",
+    };
+    respond(bridge, request, result);
+    await expect(pending).resolves.toEqual(result);
+    transport.close();
+  });
+
+  test("a host without conv.v1 is not asked", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["fs.list"] });
+    await expect(transport.inspectConversation(sessionId)).rejects.toMatchObject({
+      code: "unsupported_operation",
+    });
+    expect(hostRequests(bridge, "conv.inspect")).toHaveLength(0);
+    transport.close();
+  });
+});
+
 describe("HostTransport verified reads", () => {
   test("delivers exact 8 KiB chunks, verifies SHA-256, and acknowledges pulls", async () => {
     const bytes = Uint8Array.from({ length: HOST_STREAM_CHUNK_BYTES + 1 }, (_, index) => index);

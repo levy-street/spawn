@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  TRANSCRIPTS_TRUNCATED_NOTE,
   transcriptEmptyState,
   transcriptQueryFor,
   transcriptRoleLabel,
@@ -60,6 +61,26 @@ describe("transcriptQueryFor", () => {
     });
   });
 
+  test("a recorded id that is not a UUID is not asked about: the folder is", () => {
+    for (const bad of ["--dangerously-skip-permissions", "-p", "a b", "conv-2", "../x"]) {
+      const target = transcriptQueryFor(
+        { foreground_command: "claude", agent_id: claude.id, agent_session_id: bad, cwd: "/w" },
+        [claude, codex],
+      );
+      expect(target?.query).toEqual({ agentKind: "claude-code", conversationId: null, cwd: "/w" });
+    }
+    const upper = transcriptQueryFor(
+      {
+        foreground_command: "claude",
+        agent_id: claude.id,
+        agent_session_id: "45171E5A-5951-4D38-81E5-E1C0F9639D80",
+        cwd: "/w",
+      },
+      [claude, codex],
+    );
+    expect(upper?.query.conversationId).toBe("45171e5a-5951-4d38-81e5-e1c0f9639d80");
+  });
+
   test("a codex window has no id recorded and asks by folder alone", () => {
     const target = transcriptQueryFor(
       { foreground_command: "codex", agent_id: codex.id, agent_session_id: null, cwd: "/w" },
@@ -93,6 +114,24 @@ describe("transcript copy", () => {
     );
     expect(notice?.title).toBe("No transcript for opencode");
     expect(notice?.body).toContain("SPAWN D doesn't know where opencode keeps");
+  });
+
+  test("a store outside the home folder is named, not called unknown", () => {
+    const notice = transcriptEmptyState(
+      report({ agent_kind: "codex", supported: false, searched: ["/srv/codex"] }),
+      "codex",
+      "dream",
+    );
+    expect(notice?.title).toBe("No transcript for codex");
+    expect(notice?.body).toBe(
+      "codex keeps its conversations in /srv/codex on dream, outside the home folder SPAWN D can read.",
+    );
+  });
+
+  test("a cut-short list does not claim only older conversations were left out", () => {
+    expect(TRANSCRIPTS_TRUNCATED_NOTE).toBe(
+      "Not every file is listed. The rest, which can include this conversation's helper files, stay on the host.",
+    );
   });
 
   test("an empty search says where it looked", () => {

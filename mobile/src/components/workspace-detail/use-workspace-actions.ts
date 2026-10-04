@@ -22,6 +22,7 @@ import {
   reorderTab,
 } from "@/data/layout/tabs";
 import { addTile } from "@/data/layout/tiles";
+import { restartConversationHooks } from "@/data/queries/conversation";
 import { killSession } from "@/data/queries/session-teardown";
 import {
   normalizeWorkspace,
@@ -138,6 +139,9 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
           return saved;
         },
         pending: pendingLaunches,
+        // The conversation the window is actually in, and whether it has a
+        // record yet, from its host.
+        ...restartConversationHooks(client, session),
       });
       await invalidateSessions();
       return result;

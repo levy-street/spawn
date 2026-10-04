@@ -1,0 +1,118 @@
+{
+  "description": "The folder Claude Code files a working directory's conversations under, below <CLAUDE_CONFIG_DIR or ~/.claude>/projects/. Every UTF-16 code unit of the cwd that is not an ASCII letter or digit becomes '-'; a result longer than 200 units is cut to 200 and given '-' plus the base-36 absolute value of the cwd's Java-style String.hashCode (32-bit, over UTF-16 units). Asserted by the daemon's agent.transcripts locator; a client that computes the folder asserts the same file. The cwd is Claude Code's working directory with every symbolic link resolved (it takes realpathSync(process.cwd())), so a window opened through a link is filed under its target's folder; a '~' is expanded against the host's home before that, never by this rule. The cases below are the rule itself, applied to an already-resolved cwd.",
+  "source": "Claude Code 2.1.288, bundled JS: k(e)=e.replace(/[^a-zA-Z0-9]/g,\"-\"); iP(e){let n=k(e);if(n.length<=200)return n;return `${n.slice(0,200)}-${Math.abs(xee(e)).toString(36)}`}; xee(t){let e=0;for(let n=0;n<t.length;n++)e=(e<<5)-e+t.charCodeAt(n)|0;return e}. The cwd it is given: import{realpathSync as r}from\"fs\"; function jso(){...n=o(r(e))...} var qes=jso(), the default originalCwd that projects/<folder> is computed from. The expected values were produced by running those functions verbatim.",
+  "max_units": 200,
+  "cases": [
+    {
+      "name": "an ASCII Unix path",
+      "cwd": "/home/oem/projects/spawn",
+      "folder": "-home-oem-projects-spawn"
+    },
+    {
+      "name": "dots and underscores become dashes too",
+      "cwd": "/home/me/Server.Company_Insights",
+      "folder": "-home-me-Server-Company-Insights"
+    },
+    {
+      "name": "spaces",
+      "cwd": "/Users/me/My Projects/app v2",
+      "folder": "-Users-me-My-Projects-app-v2"
+    },
+    {
+      "name": "a home directory itself",
+      "cwd": "/home/oem",
+      "folder": "-home-oem"
+    },
+    {
+      "name": "the filesystem root",
+      "cwd": "/",
+      "folder": "-"
+    },
+    {
+      "name": "a trailing slash is a character like any other",
+      "cwd": "/home/me/proj/",
+      "folder": "-home-me-proj-"
+    },
+    {
+      "name": "a tilde is a character too: expanding it is the caller's job",
+      "cwd": "~/proj",
+      "folder": "--proj"
+    },
+    {
+      "name": "a Windows drive path",
+      "cwd": "C:\\Users\\me\\proj",
+      "folder": "C--Users-me-proj"
+    },
+    {
+      "name": "a Windows drive path with spaces and dots",
+      "cwd": "D:\\Work Area\\client.site\\web",
+      "folder": "D--Work-Area-client-site-web"
+    },
+    {
+      "name": "a Windows UNC path",
+      "cwd": "\\\\server\\share\\repo",
+      "folder": "--server-share-repo"
+    },
+    {
+      "name": "a precomposed accent is one UTF-16 unit, so one dash",
+      "cwd": "/home/me/caf\u00e9",
+      "folder": "-home-me-caf-"
+    },
+    {
+      "name": "a decomposed accent keeps its letter and dashes the combining mark",
+      "cwd": "/home/me/cafe\u0301",
+      "folder": "-home-me-cafe-"
+    },
+    {
+      "name": "CJK characters, one unit each",
+      "cwd": "/home/me/\u9805\u76ee",
+      "folder": "-home-me---"
+    },
+    {
+      "name": "an emoji outside the BMP is two UTF-16 units, so two dashes",
+      "cwd": "/home/me/\ud83d\ude80rocket",
+      "folder": "-home-me---rocket"
+    },
+    {
+      "name": "exactly 200 units is kept whole",
+      "cwd": "/home/me/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "folder": "-home-me-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "name": "201 units is truncated to 200 and given the hash",
+      "cwd": "/home/me/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "folder": "-home-me-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-9aaahi",
+      "java_hash": 561471894
+    },
+    {
+      "name": "a deep Unix path past 200 units",
+      "cwd": "/home/oem/segment00/segment01/segment02/segment03/segment04/segment05/segment06/segment07/segment08/segment09/segment10/segment11/segment12/segment13/segment14/segment15/segment16/segment17/segment18/segment19/segment20/segment21/segment22/segment23",
+      "folder": "-home-oem-segment00-segment01-segment02-segment03-segment04-segment05-segment06-segment07-segment08-segment09-segment10-segment11-segment12-segment13-segment14-segment15-segment16-segment17-segment18--y8wav8",
+      "java_hash": 2070793988
+    },
+    {
+      "name": "a deep Windows path past 200 units",
+      "cwd": "C:\\Users\\me\\segment00\\segment01\\segment02\\segment03\\segment04\\segment05\\segment06\\segment07\\segment08\\segment09\\segment10\\segment11\\segment12\\segment13\\segment14\\segment15\\segment16\\segment17\\segment18\\segment19\\segment20\\segment21\\segment22\\segment23",
+      "folder": "C--Users-me-segment00-segment01-segment02-segment03-segment04-segment05-segment06-segment07-segment08-segment09-segment10-segment11-segment12-segment13-segment14-segment15-segment16-segment17-segment1-d0e8ih",
+      "java_hash": -786724505
+    },
+    {
+      "name": "astral characters count twice toward the 200",
+      "cwd": "/home/me/\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00/tail",
+      "folder": "-home-me-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------spr2pv",
+      "java_hash": -1736306563
+    },
+    {
+      "name": "a negative hash is made positive",
+      "cwd": "/home/me/negative/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "folder": "-home-me-negative-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-rz03ss",
+      "java_hash": -1691378236
+    },
+    {
+      "name": "the hash is Integer.MIN_VALUE, whose absolute value overflows 32 bits",
+      "cwd": "f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608polygenelubricants",
+      "folder": "f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608f5a5a608-zik0zk",
+      "java_hash": -2147483648
+    }
+  ]
+}

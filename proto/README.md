@@ -350,10 +350,13 @@ When a session is created, granted skills are included in the daemon
 `session.create` frame. The daemon writes per-session files and exports
 `SPAWN_AGENT_CONFIG_DIR`, `SPAWN_SKILLS_FILE`, and `SPAWN_SKILLS_DIR` into the
 shell's environment (the variables configure agent CLIs launched from the
-shell). It also always writes a per-session `CODEX_HOME` projection containing
-a `config.toml`, the managed skills, and links to existing Codex auth state
-when present — shell-first sessions cannot know in advance whether Codex will
-be launched, so every skilled session gets the projection.
+shell). It also always gives the session a `CODEX_HOME` of its own, reconciled
+at every start and restart and never wiped: the user's own `config.toml`
+merged with the managed skills (its relative paths rewritten to name the
+user's files), the user's Codex conversation stores linked, and their sign-in
+mirrored as a link, never a copy — "A skilled window's home" in
+`daemon/CLAUDE.md` has the rules. Shell-first sessions cannot know in advance
+whether Codex will be launched, so every skilled session gets one.
 
 ### Workspaces
 
@@ -1143,8 +1146,14 @@ Control messages are UTF-8 JSON text limited to 16 KiB, request IDs are
 limited to 128 bytes, and malformed, binary, wrong-version, or oversized
 messages close the channel. The browser limits concurrent requests, applies a
 timeout, sends cancellation on timeout/abort, and binds responses to the
-outstanding request ID. Request IDs may not be reused within a host session;
-the daemon closes rather than evicting its bounded replay set.
+outstanding request ID. A request ID may not be reused while its request is in
+flight (a read, write stream, or preview it started still running) or among
+the daemon's 4,096 most recently finished; a duplicate there closes the
+channel, and an older ID is forgotten rather than counted. Daemons before
+this window remembered every ID and closed the channel at its 4,097th, so a
+client that keeps one consumer open that long must reopen it for them. A
+`cancel` that arrives before its request is held, within the same bound,
+until the request arrives.
 
 `spawn.host.ctl` requires one ordered, fully reliable DataChannel. An unordered
 channel, or one configured with `maxPacketLifeTime`/`maxRetransmits`, is rejected
@@ -1188,6 +1197,21 @@ nothing new and a future Linux daemon lights them up with no client change.
 Unadvertised operations answer `unsupported_operation` as an ordinary error
 response rather than closing the channel.
 
+From `conv.*` on, an operation family is advertised as one versioned
+capability, never a name per operation: `conv.v1` covers every `conv.*`
+operation, and an incompatible revision of a family is a new name
+(`conv.v2`). Clients cap the number of names they accept, and a family keeps a
+hello far from that cap. A family that carries a device's intent for the host
+— `conv.*` now, with `session.launch.*`, `agent.accounts.*`, `screen.*` and
+`box.*` reserved for it — is advertised and answered only on a
+`spawn.host.ctl` channel admitted through an authenticated device pair (the
+shared device connection of `docs/DEVICE_CONNECTIONS.md`). A legacy protocol-1
+host channel is admitted on the server's binding alone, with no device behind
+it: it never advertises those families, and answers any operation in them
+with the ordinary error `pair_required`, whatever the client sends. A daemon
+that cannot perform a family on its platform does not advertise it there
+either, and answers `unsupported_operation`.
+
 `fs.read.range` accepts `{path, offset?, length, if_version?}` and streams a
 bounded slice: `length` is capped at 16 MiB and clamped down to what remains,
 and the declared `sha256` covers **exactly the returned slice**, not the whole
@@ -1200,22 +1224,93 @@ and keeps its end-to-end whole-file guarantee for downloads and transfers. The
 response also carries `file_size`, `eof`, a sniffed `content_type` with its
 `content_type_source`, a `preview_kind`, and `open_allowed`.
 
+`fs.read` streams exactly the `length` it declared, whose `sha256` was taken as
+the read began: a file that grows meanwhile (an agent's transcript) arrives as
+that consistent prefix, and one that shrinks or changes ends in `file_changed`.
+
 `agent.transcripts` accepts `{agent_kind, conversation_id?, cwd?}` and answers
 `{agent_kind, supported, transcripts, searched, truncated}`: where the agent
 harness running in a window left its own record of the conversation, so a
 device can view or download it. `transcripts` entries carry `path`, `name`,
 `size`, optional `modified_at`, a `role` (`conversation`, `subagent`, or
 `input`) and an optional `conversation_id`; `searched` names the directories
-looked in, for an empty answer to say so. Claude Code is found by its id under
-`~/.claude/projects/<folder>/<id>.jsonl` (the launch folder first, subagent
-records beside it), or by the launch folder's conversations when no id was
-recorded; Codex by the id at the end of a `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
-name, or by the `cwd` its first line names; aider by `.aider.chat.history.md`
-in the folder. A harness the daemon cannot place answers `supported:false`.
+looked in, for an empty answer to say so. Each store is where the daemon's
+environment puts it: `CLAUDE_CONFIG_DIR` (else `~/.claude`) and `CODEX_HOME`
+(else `~/.codex`, also when it names one of spawnd's per-window homes, which
+a daemon started from a skilled window inherits); a store outside home answers
+`supported:false` rather than widening the read root, and a `~` cwd is the
+host's home. Both agents name their working directory with its symbolic links
+resolved, so a cwd reached through a link is matched under that name first,
+then as given; a resolved Claude Code folder that does not exist is not listed
+in `searched`. Claude Code is found by its id under
+`<store>/projects/<folder>/<id>.jsonl`, the launch folder first, every record
+of the id before the sidecar beside each (`<id>/subagents/` records and their
+`.meta.json`, `subagents/workflows/<run>/`, `workflows/` and
+`workflows/scripts/` as `subagent`; spilled `tool-results/` as
+`conversation`), or by the launch folder's conversations when no id was
+recorded. The folder is Claude Code's own rule — every UTF-16 unit that is not
+an ASCII letter or digit becomes `-`, and a name over 200 units is cut there
+and suffixed with `-` and the base-36 absolute value of the cwd's Java-style
+`hashCode` — pinned by [`claude-project-folder.json`](claude-project-folder.json);
+a long name also matches another hash of the same cut whose records name the
+cwd, as Claude Code itself does. Codex is found by the id at the end of a
+`<store>/sessions/YYYY/MM/DD/rollout-*.jsonl` (or compressed `.jsonl.zst`)
+name, or by the `cwd` an uncompressed rollout's first line names, then in the
+`codex-home/sessions` a skilled window kept before its Codex home linked the
+store; aider by `.aider.chat.history.md` and `.aider.input.history` in the
+folder and at its git root. Roles stay those three because deployed clients
+refuse a report with any other. A harness the daemon cannot place answers
+`supported:false`.
 The operation only *locates*: every file it names is then read with the
 ordinary `fs.read`, under the same home root and no-follow rule, and the
 search itself is bounded (at most 24 answers, 512 directories, 2000 files).
 The server never sees the request or a byte of a transcript.
+
+`conv.inspect` (family `conv.v1`, pair channels of Linux and macOS daemons
+only) accepts `{session_id}` — the id of a window this daemon runs, as a
+canonical lower-case UUID — and answers which agent conversation that window
+is actually in:
+
+```json
+{"version":1,"type":"request","request_id":"unguessable-id","operation":"conv.inspect","payload":{"session_id":"33333333-3333-4333-8333-333333333333"}}
+{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"agent":"claude-code","conversation_id":"064c9faa-9990-4b0c-9d35-f06ae2dd0d05","state":"idle","cli_version":"2.1.288","live_elsewhere":false,"source":"registry"}}
+```
+
+`agent` is the agent kind as agent definitions spell it (`claude-code`,
+`codex`), or null for a window running no agent. `conversation_id` is the
+conversation's id, or null when the host cannot name one with certainty: a
+window parked in Claude's agent view whose background job has gone, a
+`claude attach` client, a Codex holding several rollouts open. `state` is
+`running`, `blocked` (a permission prompt or question), `idle` or `unknown`,
+and a client reads a value it does not know as `unknown`. `cli_version` is the
+agent's own version, or null. `live_elsewhere` is true when a process the
+window's stop would not stop holds the conversation — a Claude background
+session (including the one a window in agent view shows), an attach target,
+another window. `source` says what the answer rests on (`registry`, `parked`,
+`attach`, `open_file`, `process`, `none`); it is a hint for diagnostics, and
+clients never gate on it. A `session_id` that is not a canonical UUID answers
+`invalid_request`; a window this daemon is not running, or whose worker never
+reported its shell, answers `session_not_found`.
+
+The daemon walks the window's own processes from the shell its worker
+reported — `/proc` on Linux, libproc on macOS; a process that left the shell's
+terminal session is not the window's — and matches Claude Code's live-session
+registry (`<config>/sessions/<pid>.json`), believing a record only while that
+exact process runs (pid, `pidDomain`, and `procStart` where it can be
+compared; where it cannot, the process must at least be Claude). A Codex
+window is named by the one rollout file its process holds open. Nothing is
+executed, no process's arguments or environment are read, every registry file
+is read bounded and without following links, and the answer carries no paths
+and fits one control frame.
+
+A restart asks first where `conv.v1` is advertised. When the answer is about
+the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
+`codex resume <id>`), and a null one resumes "the latest one here"
+(`--continue`, `resume --last`) rather than an id recorded earlier;
+`live_elsewhere` does not stop a restart, since resuming a running background
+session attaches to it. The server never sees the request or the answer; a
+device writes a Claude Code id the host named back to the window's
+`agent_session_id`, and nothing else.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit

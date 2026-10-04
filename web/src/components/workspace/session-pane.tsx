@@ -24,6 +24,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { useDaemonConnection } from "@/components/hosts/DaemonConnectionsProvider";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { SessionTranscriptsDialog } from "@/components/session/session-transcripts-dialog";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
@@ -37,6 +38,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { SessionStatusDot } from "@/components/ui/status";
 import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@/lib/api";
+import { askWindowHost } from "@/lib/conversation-inspect";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
 import { sessionAtShell, sessionOwnName, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
@@ -138,6 +140,7 @@ export function SessionPane({
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
   const { attach, connInfo, getHandle, agentNotice } = useLiveTerminal(session ? sessionId : null);
+  const daemonConnection = useDaemonConnection(session?.host_id ?? null);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);
@@ -210,6 +213,13 @@ export function SessionPane({
       return restartSessionAgent({
         session,
         agents: definitions,
+        // The conversation the window is actually in, and whether it has a
+        // record yet, from its host.
+        ...askWindowHost(session.host_id, daemonConnection, sessionId),
+        recordConversation: async (conversationId) => {
+          const saved = await sessions.update(sessionId, { agent_session_id: conversationId });
+          writeSessionToCache(queryClient, saved);
+        },
         restart: async () => {
           const saved = await sessions.restart(sessionId);
           writeSessionToCache(queryClient, saved);

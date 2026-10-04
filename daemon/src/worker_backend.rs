@@ -493,7 +493,8 @@ fn assemble(session_id: Uuid, pid: u32, connection: WorkerConnection) -> pty::La
         rows,
         outbox_tx,
         control,
-    });
+    })
+    .with_shell_pid(pid);
     pty::Launched {
         handle,
         pid,

@@ -16,6 +16,13 @@ import {
   TERMINAL_BRIDGE_VERSION,
   type WorkerToNativeMessage,
 } from "@/terminal/transport/bridge";
+import {
+  CONVERSATION_CAPABILITY,
+  CONVERSATION_INSPECT_OP,
+  type ConversationInspection,
+  parseConversationInspection,
+} from "@/terminal/transport/conversation-codec";
+import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 import { verifyDaemonHost } from "@/terminal/transport/daemon-trust";
 import {
   AGENT_TRANSCRIPTS_OP,
@@ -630,16 +637,37 @@ class WebViewHostTransport implements StreamingHostTransport {
     options?: HostRequestOptions,
   ): Promise<AgentTranscriptReport> {
     this.#requireCapability(AGENT_TRANSCRIPTS_OP);
+    // A recorded id that is not a UUID is not asked about: the folder is.
+    const conversationId = canonicalConversationId(query.conversationId);
     const response = await this.request<unknown>(
       AGENT_TRANSCRIPTS_OP,
       {
         agent_kind: query.agentKind,
-        ...(query.conversationId ? { conversation_id: query.conversationId } : {}),
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         ...(query.cwd ? { cwd: query.cwd } : {}),
       },
       options,
     );
     return parseAgentTranscriptReport(response);
+  }
+
+  /**
+   * Which conversation a window is actually in, read by its daemon from the
+   * window's own processes and the agent's live-session registry — the id
+   * `/clear`, `/branch`, `/resume` or agent view moved it to, and whether a
+   * process outside the window holds it. Gated on `conv.v1`.
+   */
+  async inspectConversation(
+    sessionId: string,
+    options?: HostRequestOptions,
+  ): Promise<ConversationInspection> {
+    this.#requireCapability(CONVERSATION_CAPABILITY);
+    const response = await this.request<unknown>(
+      CONVERSATION_INSPECT_OP,
+      { session_id: sessionId },
+      options,
+    );
+    return parseConversationInspection(response);
   }
 
   async readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile> {
