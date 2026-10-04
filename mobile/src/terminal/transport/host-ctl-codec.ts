@@ -1,6 +1,7 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { encodeHex } from "@/lib/crypto/bytes";
 import { decodeBridgeBytes, encodeBridgeBytes } from "@/terminal/transport/bridge";
+import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 import type {
   AgentTranscriptFile,
   AgentTranscriptReport,
@@ -266,7 +267,8 @@ export function parseAgentTranscriptReport(value: unknown): AgentTranscriptRepor
       size: size as number,
       modified_at: Number.isSafeInteger(modified) ? (modified as number) : null,
       role: role as AgentTranscriptFile["role"],
-      conversation_id: typeof conversation === "string" ? conversation : null,
+      // Only a UUID names a conversation (`canonicalConversationId`).
+      conversation_id: canonicalConversationId(conversation),
     });
   });
   return Object.freeze({

@@ -1,13 +1,17 @@
+import { randomUUID } from "expo-crypto";
+
 import type { PendingLaunchStore } from "@/components/launcher/pending-launch";
 import {
   agentConversationGrammar,
   agentLaunchCommand,
   agentResumeCommand,
   agentRunCommand,
+  newAgentConversationId,
   sessionAgent,
 } from "@/data/selectors/agent";
 import type { AgentDef, Session } from "@/data/types/domain";
 import type { ConversationInspection } from "@/terminal/transport/conversation-codec";
+import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/terminal/transport/types";
 
 /**
@@ -40,6 +44,12 @@ import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/terminal/tra
  * conversation found". Where the host can look (`agent.transcripts`) and
  * finds no record of the id, the agent starts afresh under that same id
  * instead (`--session-id`); where it cannot say, the restart resumes.
+ *
+ * What goes on the command line: only a UUID (`canonicalConversationId`).
+ * The recorded id is the server's to hand back, and the server is not
+ * trusted with what a device types; a record that is anything else is
+ * neither resumed nor guessed at — the agent starts a new conversation under
+ * a new id, written back in its place (`recordRefused`).
  */
 
 export type AgentRestartPlan =
@@ -67,14 +77,47 @@ export type AgentRestartResult = { plan: AgentRestartPlan };
  * A conversation that something outside the window also holds is resumed all
  * the same: on the same host `claude --resume <id>` of a running background
  * session attaches to it rather than becoming a second writer.
+ *
+ * Either way the id is a UUID, lower-case, or there is none: whatever else a
+ * record or an answer holds is never handed on to a command line.
  */
 export function restartConversation(
   agent: Pick<AgentDef, "kind">,
   session: Pick<Session, "agent_session_id">,
   live: ConversationInspection | null,
 ): string | null {
-  if (live && live.agent === agent.kind.trim().toLowerCase()) return live.conversation_id;
-  return launchesUnderId(agent) ? (session.agent_session_id ?? null) : null;
+  if (answersFor(agent, live)) return canonicalConversationId(live.conversation_id);
+  return launchesUnderId(agent) ? canonicalConversationId(session.agent_session_id) : null;
+}
+
+/**
+ * Whether the window's record names a conversation no command line may
+ * carry — anything but a UUID — where a restart would otherwise read it: an
+ * agent SPAWN D launches under an id, with no answer from the host about it.
+ * The server wrote that record, and a value like `--dangerously-skip-permissions`
+ * typed after `--resume` would be read as a flag. Such a record is not
+ * guessed at either (`--continue` would pick whichever conversation was last
+ * touched here): the agent starts a new conversation.
+ */
+export function recordRefused(
+  agent: Pick<AgentDef, "kind">,
+  session: Pick<Session, "agent_session_id">,
+  live: ConversationInspection | null,
+): boolean {
+  return (
+    !answersFor(agent, live) &&
+    launchesUnderId(agent) &&
+    session.agent_session_id != null &&
+    canonicalConversationId(session.agent_session_id) === null
+  );
+}
+
+/** Whether the host's answer is about this window's agent, and so decides. */
+function answersFor(
+  agent: Pick<AgentDef, "kind">,
+  live: ConversationInspection | null,
+): live is ConversationInspection {
+  return live !== null && live.agent === agent.kind.trim().toLowerCase();
 }
 
 /** Whether SPAWN D hands this kind of agent its conversation id at launch: the
@@ -110,7 +153,10 @@ export function conversationOnRecord(
  * one (`restartConversation`); `onRecord` is whether the host keeps a record
  * of that conversation (`conversationOnRecord`). Only a definite "no" changes
  * anything: an agent SPAWN D launches under an id then starts a fresh
- * conversation under the same one, since there is nothing to resume.
+ * conversation under the same one, since there is nothing to resume. A record
+ * that is not a UUID (`recordRefused`) starts a fresh conversation too; the
+ * restart itself replaces it with a new id first, so the planner sees it here
+ * only when called alone, and then launches with no id at all.
  */
 export function planAgentRestart(
   session: Pick<Session, "foreground_command" | "agent_id" | "agent_session_id">,
@@ -120,6 +166,9 @@ export function planAgentRestart(
 ): AgentRestartPlan {
   const agent = sessionAgent(session, agents);
   if (!agent) return { kind: "shell" };
+  if (recordRefused(agent, session, live)) {
+    return { kind: "agent", agent, command: agentLaunchCommand(agent, null), resumes: false };
+  }
   const conversationId = restartConversation(agent, session, live);
   if (conversationId && onRecord === false && launchesUnderId(agent)) {
     return {
@@ -144,6 +193,7 @@ export async function restartSessionAgent({
   transcripts,
   doneAsking,
   recordConversation,
+  newConversationId = randomUUID,
 }: {
   session: Session;
   agents: readonly AgentDef[];
@@ -166,18 +216,34 @@ export async function restartSessionAgent({
    *  the other devices agree. Best effort, and only for an agent SPAWN D
    *  launches under an id. */
   recordConversation?: (conversationId: string) => Promise<unknown>;
+  /** Where the id comes from when a refused record (`recordRefused`) is
+   *  replaced by a new conversation. */
+  newConversationId?: () => string;
 }): Promise<AgentRestartResult> {
   const agent = sessionAgent(session, agents);
   let live: ConversationInspection | null = null;
   let onRecord: boolean | null = null;
   let conversationId: string | null = null;
+  // The window as the restart reads it: as recorded, unless the record is
+  // refused (`recordRefused`) and stands replaced by a new id.
+  let record: Session = session;
   try {
     live = agent && inspect ? await inspect().catch(() => null) : null;
-    conversationId = agent ? restartConversation(agent, session, live) : null;
+    // A record no command line may carry is not resumed: the agent starts a
+    // new conversation under an id this device chose, written back in the
+    // record's place — the road of a conversation the host has no record of.
+    if (agent && recordRefused(agent, session, live)) {
+      record = {
+        ...session,
+        agent_session_id: newAgentConversationId(agent.kind, newConversationId),
+      };
+      onRecord = false;
+    }
+    conversationId = agent ? restartConversation(agent, record, live) : null;
     // A conversation with no transcript yet cannot be resumed. Only the id
     // about to be resumed is looked for, and only where the agent can be
     // started afresh under it.
-    if (agent && conversationId && transcripts && launchesUnderId(agent)) {
+    if (agent && conversationId && onRecord === null && transcripts && launchesUnderId(agent)) {
       const report = await transcripts({
         agentKind: agent.kind,
         conversationId,
@@ -188,9 +254,10 @@ export async function restartSessionAgent({
   } finally {
     doneAsking?.();
   }
-  // Only an id the host just named is written back, and only where a later
-  // restart reads the record: never the recorded id it replaced, never one
-  // for a CLI that names its own conversations.
+  // Only an id the host just named, or the new one standing in for a refused
+  // record, is written back, and only where a later restart reads the record:
+  // never the recorded id it replaced, never one for a CLI that names its own
+  // conversations.
   if (
     agent &&
     launchesUnderId(agent) &&
@@ -199,7 +266,7 @@ export async function restartSessionAgent({
   ) {
     await recordConversation?.(conversationId).catch(() => undefined);
   }
-  const plan = planAgentRestart(session, agents, live, onRecord);
+  const plan = planAgentRestart(record, agents, live, onRecord);
   // Queued before the restart so the new shell's first keystrokes are the
   // command — for the window as it runs here, so a move that lands first
   // drops it rather than resuming the conversation over there; forgotten

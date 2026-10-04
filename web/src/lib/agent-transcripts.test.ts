@@ -61,6 +61,26 @@ describe("transcriptQueryFor", () => {
     });
   });
 
+  test("a recorded id that is not a UUID is not asked about: the folder is", () => {
+    for (const bad of ["--dangerously-skip-permissions", "-p", "a b", "conv-2", "../x"]) {
+      const target = transcriptQueryFor(
+        { foreground_command: "claude", agent_id: claude.id, agent_session_id: bad, cwd: "/w" },
+        [claude, codex],
+      );
+      expect(target?.query).toEqual({ agentKind: "claude-code", conversationId: null, cwd: "/w" });
+    }
+    const upper = transcriptQueryFor(
+      {
+        foreground_command: "claude",
+        agent_id: claude.id,
+        agent_session_id: "45171E5A-5951-4D38-81E5-E1C0F9639D80",
+        cwd: "/w",
+      },
+      [claude, codex],
+    );
+    expect(upper?.query.conversationId).toBe("45171e5a-5951-4d38-81e5-e1c0f9639d80");
+  });
+
   test("a codex window has no id recorded and asks by folder alone", () => {
     const target = transcriptQueryFor(
       { foreground_command: "codex", agent_id: codex.id, agent_session_id: null, cwd: "/w" },

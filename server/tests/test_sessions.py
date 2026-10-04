@@ -557,7 +557,8 @@ async def test_session_cross_user_scoping(client):
 async def test_session_remembers_the_conversation_its_agent_started(client):
     """The conversation id the client typed after `--session-id` is kept with
     the window, survives a restart (that is what a restart resumes), travels
-    with a retype, and is refused in any spelling a shell would need to quote."""
+    with a retype, and is refused in any spelling a shell would need to quote or
+    the agent would read as a flag."""
     token = await _signup(client, "session-conversation@example.com")
     auth = {"Authorization": f"Bearer {token}"}
     host_id = await _create_host("session-conversation@example.com")
@@ -630,6 +631,29 @@ async def test_session_remembers_the_conversation_its_agent_started(client):
             headers=auth,
         )
         assert r.status_code == 422, r.text
+
+        # Nor anything the agent would read as a flag after `--resume`.
+        for flag in ("--dangerously-skip-permissions", "-p", "--settings=x", "-"):
+            r = await client.patch(
+                f"/api/sessions/{session_id}",
+                json={"agent_id": claude, "agent_session_id": flag},
+                headers=auth,
+            )
+            assert r.status_code == 422, (flag, r.text)
+            r = await client.post(
+                "/api/sessions",
+                json={
+                    "host_id": host_id,
+                    "cwd": "/repo",
+                    "agent_id": claude,
+                    "agent_session_id": flag,
+                },
+                headers=auth,
+            )
+            assert r.status_code == 422, (flag, r.text)
+        r = await client.get(f"/api/sessions/{session_id}", headers=auth)
+        assert r.json()["agent_id"] is None
+        assert r.json()["agent_session_id"] is None
 
         # A plain shell window has no conversation to remember.
         r = await client.post(

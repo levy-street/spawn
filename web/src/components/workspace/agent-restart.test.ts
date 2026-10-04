@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 import {
   conversationOnRecord,
   planAgentRestart,
+  recordRefused,
   restartConversation,
   restartSessionAgent,
 } from "@/components/workspace/agent-restart";
@@ -595,5 +596,164 @@ describe("restartSessionAgent with the host's records", () => {
       "done asking",
       "restart",
     ]);
+  });
+});
+
+/** What a server could put in `agent_session_id`: none of it is a UUID. */
+const REFUSED = [
+  "--dangerously-skip-permissions",
+  "-p",
+  "--settings=x",
+  "-",
+  "a b",
+  "conv-2",
+  "not-a-uuid",
+  `${recorded} --dangerously-skip-permissions`,
+  `-${recorded}`,
+];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+describe("a recorded id that is not a UUID", () => {
+  test("is refused for an agent launched under an id, unless the host answers", () => {
+    for (const bad of REFUSED) {
+      expect(recordRefused(claude, session({ agent_session_id: bad }), null)).toBe(true);
+      expect(restartConversation(claude, session({ agent_session_id: bad }), null)).toBeNull();
+      expect(recordRefused(claude, session({ agent_session_id: bad }), live())).toBe(false);
+      expect(recordRefused(codex, codexSession({ agent_session_id: bad }), null)).toBe(false);
+    }
+    expect(recordRefused(claude, session(), null)).toBe(false);
+    expect(recordRefused(claude, session({ agent_session_id: null }), null)).toBe(false);
+  });
+
+  test("planned alone, starts the agent afresh with no id on the line", () => {
+    for (const bad of REFUSED) {
+      expect(planAgentRestart(session({ agent_session_id: bad }), [claude])).toEqual({
+        kind: "agent",
+        agent: claude,
+        command: "claude",
+        resumes: false,
+      });
+      expect(planAgentRestart(session({ agent_session_id: bad }), [claude], null, true)).toEqual({
+        kind: "agent",
+        agent: claude,
+        command: "claude",
+        resumes: false,
+      });
+      const codexPlan = planAgentRestart(codexSession({ agent_session_id: bad }), [codex]);
+      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume --last");
+    }
+  });
+
+  test("restarts into a new conversation under a new id, written back in its place", async () => {
+    for (const bad of REFUSED) {
+      const transcripts = mock(async () => records([]));
+      const recordConversation = mock(async (_id: string) => undefined);
+      const result = await restartSessionAgent({
+        session: session({ agent_session_id: bad }),
+        agents: [claude],
+        restart: async () => session({ status: "starting" }),
+        inspect: async () => null,
+        transcripts,
+        recordConversation,
+      });
+      expect(recordConversation).toHaveBeenCalledTimes(1);
+      const fresh = recordConversation.mock.calls[0][0];
+      expect(fresh).toMatch(UUID);
+      expect(fresh).not.toBe(recorded);
+      expect(result.plan).toEqual({
+        kind: "agent",
+        agent: claude,
+        command: `claude --session-id ${fresh}`,
+        resumes: false,
+      });
+      // A new id has no record to look for.
+      expect(transcripts).not.toHaveBeenCalled();
+      expect(pendingLaunch.take(session().id, session().host_id)).toBe(
+        `claude --session-id ${fresh}`,
+      );
+    }
+  });
+
+  test("a yolo agent's own flags still come only from its definition", async () => {
+    const yolo = { ...claude, yolo: false };
+    await restartSessionAgent({
+      session: session({ agent_session_id: "--dangerously-skip-permissions" }),
+      agents: [yolo],
+      restart: async () => session({ status: "starting" }),
+    });
+    const typed = pendingLaunch.take(session().id, session().host_id) ?? "";
+    expect(typed).toMatch(/^claude --session-id [0-9a-f-]{36}$/);
+    expect(typed).not.toContain("--dangerously-skip-permissions");
+    expect(typed).not.toContain("--resume");
+  });
+
+  test("the host's answer still decides, and the refused record is replaced by it", async () => {
+    const recordConversation = mock(async (_id: string) => undefined);
+    await restartSessionAgent({
+      session: session({ agent_session_id: "--dangerously-skip-permissions" }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      inspect: async () => live(),
+      transcripts: async () => records([moved]),
+      recordConversation,
+    });
+    expect(recordConversation).toHaveBeenCalledWith(moved);
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`claude --resume ${moved}`);
+
+    await restartSessionAgent({
+      session: session({ agent_session_id: "--dangerously-skip-permissions" }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      inspect: async () => live({ conversation_id: null, source: "attach" }),
+      recordConversation,
+    });
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe("claude --continue");
+    expect(recordConversation).toHaveBeenCalledTimes(1);
+  });
+
+  test("a Codex window falls back to the latest conversation and writes nothing", async () => {
+    const recordConversation = mock(async (_id: string) => undefined);
+    for (const bad of REFUSED) {
+      await restartSessionAgent({
+        session: codexSession({ agent_session_id: bad }),
+        agents: [codex],
+        restart: async () => codexSession({ status: "starting" }),
+        inspect: async () => null,
+        recordConversation,
+      });
+      expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex resume --last");
+    }
+    expect(recordConversation).not.toHaveBeenCalled();
+  });
+
+  test("an id the host names that is not a UUID is no id either", () => {
+    // `parseConversationInspection` refuses such an answer outright; the
+    // planner holds the line on its own all the same.
+    for (const bad of REFUSED) {
+      expect(restartConversation(claude, session(), live({ conversation_id: bad }))).toBeNull();
+      const plan = planAgentRestart(session(), [claude], live({ conversation_id: bad }));
+      expect(plan.kind === "agent" ? plan.command : null).toBe("claude --continue");
+      const codexPlan = planAgentRestart(
+        codexSession(),
+        [codex],
+        live({ agent: "codex", conversation_id: bad, source: "open_file" }),
+      );
+      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume --last");
+    }
+  });
+
+  test("a recorded UUID in upper case is resumed lower-case, and the record set right", async () => {
+    const upper = recorded.toUpperCase();
+    expect(restartConversation(claude, session({ agent_session_id: upper }), null)).toBe(recorded);
+    const recordConversation = mock(async (_id: string) => undefined);
+    await restartSessionAgent({
+      session: session({ agent_session_id: upper }),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      inspect: async () => null,
+      recordConversation,
+    });
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`claude --resume ${recorded}`);
+    expect(recordConversation).toHaveBeenCalledWith(recorded);
   });
 });

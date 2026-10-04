@@ -34,25 +34,50 @@ export interface ConversationInspection {
 }
 
 const STATES: ReadonlySet<string> = new Set(["running", "blocked", "idle", "unknown"]);
-/** The server's own rule for a conversation id (`AGENT_SESSION_ID_PATTERN`). */
-const CONVERSATION_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 const SHORT_TEXT = /^[\x21-\x7e]{1,64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * A conversation id as SPAWN D will put it on a command line, or null when
+ * the value is not one.
+ *
+ * Every agent that takes an id names its conversations with UUIDs (Claude
+ * Code's `--session-id` and `--resume`, Codex's `resume`), and the id is typed
+ * into the window's shell after the agent's own flags. So only a canonical
+ * UUID, 8-4-4-4-12 hex digits written lower-case, is ever an id; anything
+ * else is no id at all. That keeps the id from ever being read as a flag. The
+ * server holds `agent_session_id`, and the server is not trusted with what a
+ * device types (docs/TRUST.md): `claude --resume --dangerously-skip-permissions`
+ * would read the second word as a flag, since `--resume` takes its value
+ * optionally. The phone holds the same rule.
+ */
+export function canonicalConversationId(value: unknown): string | null {
+  return typeof value === "string" && UUID.test(value) ? value.toLowerCase() : null;
+}
 
 function nullableText(value: unknown, pattern: RegExp): string | null | undefined {
   if (value === null) return null;
   return typeof value === "string" && pattern.test(value) ? value : undefined;
 }
 
+/** A conversation id from the host: null, a UUID (`canonicalConversationId`),
+ *  or undefined when it is something else and the answer is malformed. */
+function nullableConversationId(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  return canonicalConversationId(value) ?? undefined;
+}
+
 /**
  * A daemon's answer, checked field by field; null when it is not one. A state
  * this client does not know yet reads as `unknown` rather than as malformed,
- * so a newer daemon never breaks an older tab.
+ * so a newer daemon never breaks an older tab. A conversation id that is not
+ * a UUID makes the answer malformed; one in upper case is read lower-case.
  */
 export function parseConversationInspection(value: unknown): ConversationInspection | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const agent = nullableText(record.agent, SHORT_TEXT);
-  const conversationId = nullableText(record.conversation_id, CONVERSATION_ID);
+  const conversationId = nullableConversationId(record.conversation_id);
   const cliVersion = nullableText(record.cli_version, SHORT_TEXT);
   if (agent === undefined || conversationId === undefined || cliVersion === undefined) return null;
   if (typeof record.live_elsewhere !== "boolean" || typeof record.source !== "string") return null;
