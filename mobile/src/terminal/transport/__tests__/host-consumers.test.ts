@@ -1,6 +1,16 @@
 import { WorkerBridge } from "@/terminal/transport/bridge";
+import {
+  HOST_CONSUMER_LIMIT_CODE,
+  HOST_CONSUMER_LIMIT_MESSAGE,
+  HOST_CONTROL_REQUEST_BUDGET,
+  HOST_CONTROL_ROTATE_AFTER_REQUESTS,
+} from "@/terminal/transport/host-ctl-codec";
 import { createHostConsumerTransport } from "@/terminal/transport/host-transport";
-import type { HostTransport, TransportState } from "@/terminal/transport/types";
+import {
+  CONNECT_TIMEOUT_MS,
+  type HostTransport,
+  type TransportState,
+} from "@/terminal/transport/types";
 import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
 
 class Channel extends EventTarget {
@@ -25,15 +35,34 @@ class Channel extends EventTarget {
   receive(text: string) {
     this.onmessage?.({ data: text });
   }
-  open() {
+  open(capabilities = ["fs.home", "session.transport.v1"]) {
     this.readyState = "open";
     this.onopen?.();
     this.receive(
+      JSON.stringify({ version: 1, type: "hello", protocol: "spawn.host.ctl", capabilities }),
+    );
+  }
+  /** What a daemon at its tool limit does: accept the channel, then close it. */
+  refuse() {
+    this.readyState = "open";
+    this.onopen?.();
+    this.close();
+  }
+  requests() {
+    return this.sent
+      .map((frame) => JSON.parse(frame) as { type: string; request_id: string; operation: string })
+      .filter((frame) => frame.type === "request");
+  }
+  answerLast(result: unknown = { pong: true }) {
+    const request = this.requests().at(-1);
+    if (!request) throw new Error(`No request on ${this.label}`);
+    this.receive(
       JSON.stringify({
         version: 1,
-        type: "hello",
-        protocol: "spawn.host.ctl",
-        capabilities: ["fs.home", "session.transport.v1"],
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result,
       }),
     );
   }
@@ -289,5 +318,494 @@ test("parent outage does not consume a fresh tool attachment budget", async () =
     expect(consumer.state).toBe("ready");
   } finally {
     consumer.close();
+  }
+});
+
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/**
+ * Send and answer `count` requests, a batch at a time under the 32-pending cap
+ * (the worker sends one frame per 4 ms turn, so one at a time would be slow).
+ * A replacement channel that is still opening is admitted before each batch.
+ */
+async function requestRepeatedly(
+  h: ReturnType<typeof harness>,
+  consumer: HostTransport,
+  count: number,
+  batch = 25,
+): Promise<void> {
+  for (let done = 0; done < count; done += batch) {
+    const channel = h.channels.at(-1);
+    if (!channel) throw new Error("No tool channel");
+    if (channel.readyState === "connecting") channel.open(["fs.read", "host.metrics"]);
+    const before = channel.requests().length;
+    const size = Math.min(batch, count - done);
+    const requests = Array.from({ length: size }, () => consumer.request("host.metrics", {}));
+    await jest.advanceTimersByTimeAsync(4 * size + 4);
+    const sent = channel.requests().slice(before);
+    expect(sent).toHaveLength(size);
+    for (const frame of sent)
+      channel.receive(
+        JSON.stringify({ version: 1, type: "response", request_id: frame.request_id, ok: true }),
+      );
+    await Promise.all(requests);
+  }
+}
+
+// Thousands of real worker round trips each.
+const LONG_TEST_MS = 30_000;
+// Jest's fake timers also fake queueMicrotask, which would defer every swap
+// past the response continuations that register a stream; these tests need
+// the real ordering, where the swap check runs first.
+const REAL_MICROTASKS = { doNotFake: ["queueMicrotask" as const] };
+
+test(
+  "a long-lived tool swaps its channel before the daemon's 4,096-id limit, unnoticed",
+  async () => {
+    jest.useFakeTimers();
+    const h = harness();
+    const consumer = h.create();
+    const states: TransportState[] = [];
+    consumer.on("state", (state) => states.push(state));
+    try {
+      const opening = consumer.open();
+      h.channel(0).open(["fs.read", "host.metrics"]);
+      await opening;
+      await requestRepeatedly(h, consumer, HOST_CONTROL_ROTATE_AFTER_REQUESTS);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(h.channels).toHaveLength(2);
+      expect(h.channel(0).readyState).toBe("closed");
+      expect(h.channel(0).requests()).toHaveLength(HOST_CONTROL_ROTATE_AFTER_REQUESTS);
+      expect(h.channel(1).label).not.toBe(h.channel(0).label);
+
+      // A request made while the replacement opens waits for it.
+      const waiting = consumer.request("host.metrics", {});
+      await jest.advanceTimersByTimeAsync(5);
+      expect(h.channel(1).sent).toHaveLength(0);
+      h.channel(1).open(["fs.read", "host.metrics"]);
+      await jest.advanceTimersByTimeAsync(5);
+      expect(
+        h
+          .channel(1)
+          .requests()
+          .map((frame) => frame.operation),
+      ).toEqual(["host.metrics"]);
+      h.channel(1).answerLast({ sample: { cpu_percent: 2 } });
+      await expect(waiting).resolves.toEqual({ sample: { cpu_percent: 2 } });
+
+      // Past what one channel may carry, and the tool never left ready. (Jest's
+      // fake timers also fake queueMicrotask, which defers the swap.)
+      await requestRepeatedly(h, consumer, HOST_CONTROL_ROTATE_AFTER_REQUESTS);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(h.channels).toHaveLength(3);
+      for (const channel of h.channels)
+        expect(channel.requests().length).toBeLessThanOrEqual(HOST_CONTROL_REQUEST_BUDGET);
+      expect(states).toEqual(["connecting", "ready"]);
+      expect(consumer.hasCapability("host.metrics")).toBe(true);
+      expect(h.openSignal).not.toHaveBeenCalled();
+    } finally {
+      consumer.close();
+    }
+  },
+  LONG_TEST_MS,
+);
+
+test(
+  "the swap waits for a read in flight, and past the budget requests wait for it",
+  async () => {
+    jest.useFakeTimers(REAL_MICROTASKS);
+    const h = harness();
+    const consumer = h.create();
+    try {
+      const opening = consumer.open();
+      h.channel(0).open(["fs.read", "host.metrics"]);
+      await opening;
+      await requestRepeatedly(h, consumer, HOST_CONTROL_ROTATE_AFTER_REQUESTS - 1);
+
+      // A read that stays open across the mark: its frames belong to this channel.
+      const reading = consumer.readFile("/private/slow.log");
+      await jest.advanceTimersByTimeAsync(0);
+      h.channel(0).answerLast({
+        stream_id: "slow-read",
+        path: "/private/slow.log",
+        name: "slow.log",
+        length: 0,
+        sha256: EMPTY_SHA256,
+      });
+      const read = await reading;
+      await jest.advanceTimersByTimeAsync(0);
+      expect(h.channels).toHaveLength(1);
+
+      // Under the budget the busy channel keeps carrying requests.
+      await requestRepeatedly(
+        h,
+        consumer,
+        HOST_CONTROL_REQUEST_BUDGET - HOST_CONTROL_ROTATE_AFTER_REQUESTS,
+      );
+      expect(h.channel(0).requests()).toHaveLength(HOST_CONTROL_REQUEST_BUDGET);
+      expect(h.channels).toHaveLength(1);
+
+      // At the budget the next request is held, not sent.
+      const held = consumer.request("host.metrics", {});
+      await jest.advanceTimersByTimeAsync(5);
+      expect(h.channel(0).requests()).toHaveLength(HOST_CONTROL_REQUEST_BUDGET);
+      expect(h.channels).toHaveLength(1);
+
+      // The read ends; only now is the channel idle and swapped.
+      h.channel(0).receive(
+        JSON.stringify({
+          version: 1,
+          type: "stream.end",
+          stream_id: "slow-read",
+          length: 0,
+          sha256: EMPTY_SHA256,
+        }),
+      );
+      const reader = read.stream.getReader();
+      await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+      await jest.advanceTimersByTimeAsync(5);
+      expect(h.channel(0).readyState).toBe("closed");
+      expect(h.channels).toHaveLength(2);
+      h.channel(1).open(["fs.read", "host.metrics"]);
+      await jest.advanceTimersByTimeAsync(5);
+      expect(
+        h
+          .channel(1)
+          .requests()
+          .map((frame) => frame.operation),
+      ).toEqual(["host.metrics"]);
+      h.channel(1).answerLast({ ok: 1 });
+      await expect(held).resolves.toEqual({ ok: 1 });
+      expect(consumer.state).toBe("ready");
+    } finally {
+      consumer.close();
+    }
+  },
+  LONG_TEST_MS,
+);
+
+const BUDGET_CAPABILITIES = ["fs.read", "fs.write.begin", "host.metrics"];
+
+/** A ready tool whose channel is at its budget, with a read still open across the mark. */
+async function toolAtBudget() {
+  jest.useFakeTimers(REAL_MICROTASKS);
+  const h = harness();
+  const consumer = h.create();
+  const opening = consumer.open();
+  h.channel(0).open(BUDGET_CAPABILITIES);
+  await opening;
+  await requestRepeatedly(h, consumer, HOST_CONTROL_ROTATE_AFTER_REQUESTS - 1);
+  const reading = consumer.readFile("/private/slow.log");
+  await jest.advanceTimersByTimeAsync(0);
+  h.channel(0).answerLast({
+    stream_id: "slow-read",
+    path: "/private/slow.log",
+    name: "slow.log",
+    length: 0,
+    sha256: EMPTY_SHA256,
+  });
+  const read = await reading;
+  await requestRepeatedly(
+    h,
+    consumer,
+    HOST_CONTROL_REQUEST_BUDGET - HOST_CONTROL_ROTATE_AFTER_REQUESTS,
+  );
+  expect(h.channel(0).requests()).toHaveLength(HOST_CONTROL_REQUEST_BUDGET);
+  expect(h.channels).toHaveLength(1);
+  const finishRead = async () => {
+    h.channel(0).receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.end",
+        stream_id: "slow-read",
+        length: 0,
+        sha256: EMPTY_SHA256,
+      }),
+    );
+    const reader = read.stream.getReader();
+    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+    await jest.advanceTimersByTimeAsync(5);
+  };
+  return { h, consumer, finishRead };
+}
+
+test(
+  "a stream opened at the budget waits for the swap instead of blocking it",
+  async () => {
+    const { h, consumer, finishRead } = await toolAtBudget();
+    try {
+      // Held, not sent: it has no claim on the spent channel.
+      const next = consumer.readFile("/private/next.log");
+      void next.catch(() => undefined);
+      await jest.advanceTimersByTimeAsync(5);
+      expect(h.channel(0).requests()).toHaveLength(HOST_CONTROL_REQUEST_BUDGET);
+
+      // The read on the spent channel ends: nothing is in flight there, so the
+      // swap starts now rather than when the held open times out.
+      await finishRead();
+      expect(h.channel(0).readyState).toBe("closed");
+      expect(h.channels).toHaveLength(2);
+      h.channel(1).open(BUDGET_CAPABILITIES);
+      await jest.advanceTimersByTimeAsync(5);
+      expect(
+        h
+          .channel(1)
+          .requests()
+          .map((frame) => frame.operation),
+      ).toEqual(["fs.read"]);
+      h.channel(1).answerLast({
+        stream_id: "next-read",
+        path: "/private/next.log",
+        name: "next.log",
+        length: 0,
+        sha256: EMPTY_SHA256,
+      });
+      const opened = await next;
+      expect(opened.streamId).toBe("next-read");
+      h.channel(1).receive(
+        JSON.stringify({
+          version: 1,
+          type: "stream.end",
+          stream_id: "next-read",
+          length: 0,
+          sha256: EMPTY_SHA256,
+        }),
+      );
+      await expect(opened.stream.getReader().read()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      await jest.advanceTimersByTimeAsync(5);
+      expect(consumer.state).toBe("ready");
+      expect(h.channels).toHaveLength(2);
+    } finally {
+      consumer.close();
+    }
+  },
+  LONG_TEST_MS,
+);
+
+test(
+  "a write begun at the budget waits for the swap instead of blocking it",
+  async () => {
+    const { h, consumer, finishRead } = await toolAtBudget();
+    try {
+      const writing = consumer.writeStream?.(
+        new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        { dir: "/private", name: "empty.txt", length: 0, sha256: EMPTY_SHA256 },
+      );
+      if (!writing) throw new Error("Tool transport cannot write");
+      void writing.catch(() => undefined);
+      await jest.advanceTimersByTimeAsync(5);
+      expect(h.channel(0).requests()).toHaveLength(HOST_CONTROL_REQUEST_BUDGET);
+
+      await finishRead();
+      expect(h.channel(0).readyState).toBe("closed");
+      expect(h.channels).toHaveLength(2);
+      h.channel(1).open(BUDGET_CAPABILITIES);
+      await jest.advanceTimersByTimeAsync(5);
+      expect(
+        h
+          .channel(1)
+          .requests()
+          .map((frame) => frame.operation),
+      ).toEqual(["fs.write.begin"]);
+      h.channel(1).answerLast({ stream_id: "empty-write" });
+      await jest.advanceTimersByTimeAsync(10);
+      expect(h.channel(1).sent.map((frame) => JSON.parse(frame).type)).toContain("stream.end");
+      h.channel(1).receive(
+        JSON.stringify({
+          version: 1,
+          type: "stream.committed",
+          stream_id: "empty-write",
+          path: "/private/empty.txt",
+        }),
+      );
+      await expect(writing).resolves.toMatchObject({ path: "/private/empty.txt" });
+      expect(consumer.state).toBe("ready");
+    } finally {
+      consumer.close();
+    }
+  },
+  LONG_TEST_MS,
+);
+
+test(
+  "a held stream open that gives up leaves the channel free to swap",
+  async () => {
+    const { h, consumer, finishRead } = await toolAtBudget();
+    try {
+      const abandoned = consumer
+        .readFile("/private/next.log", { timeoutMs: 1 })
+        .catch((error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(5);
+      expect(await abandoned).toMatchObject({ code: "request_timeout" });
+      await finishRead();
+      expect(h.channel(0).readyState).toBe("closed");
+      expect(h.channels).toHaveLength(2);
+      h.channel(1).open(BUDGET_CAPABILITIES);
+      await jest.advanceTimersByTimeAsync(5);
+      // It was never sent, so nothing reaches either channel for it.
+      expect(h.channel(1).sent).toHaveLength(0);
+      for (const channel of h.channels)
+        expect(channel.sent.map((frame) => JSON.parse(frame).type)).not.toContain("cancel");
+      expect(consumer.state).toBe("ready");
+    } finally {
+      consumer.close();
+    }
+  },
+  LONG_TEST_MS,
+);
+
+test(
+  "a replacement channel that is never ready is retired, not left holding requests",
+  async () => {
+    jest.useFakeTimers();
+    const h = harness();
+    const consumer = h.create();
+    try {
+      const opening = consumer.open();
+      h.channel(0).open(["fs.read", "host.metrics"]);
+      await opening;
+      await requestRepeatedly(h, consumer, HOST_CONTROL_ROTATE_AFTER_REQUESTS);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(h.channels).toHaveLength(2);
+      // The held request keeps its own deadline and was never sent, so nothing
+      // is cancelled on any channel.
+      const held = consumer.request("host.metrics", {}).catch((error: unknown) => error);
+      await jest.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS);
+      expect(await held).toMatchObject({ code: "request_timeout" });
+      expect(h.channel(1).sent).toHaveLength(0);
+      for (const channel of h.channels)
+        expect(channel.sent.map((frame) => JSON.parse(frame).type)).not.toContain("cancel");
+      // The replacement's own deadline retires it and the tool reconnects.
+      expect(consumer.state).toBe("reconnecting");
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(h.channels).toHaveLength(3);
+      h.channel(2).open(["fs.read", "host.metrics"]);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(consumer.state).toBe("ready");
+    } finally {
+      consumer.close();
+    }
+  },
+  LONG_TEST_MS,
+);
+
+test("a tool the daemon refuses twice in a row fails with the tool-limit reason", async () => {
+  jest.useFakeTimers();
+  const h = harness();
+  const consumer = h.create();
+  try {
+    const opening = consumer.open().catch((error: unknown) => error);
+    // One refusal can race a channel that is still closing: retry quietly.
+    h.channel(0).refuse();
+    expect(consumer.state).toBe("reconnecting");
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(h.channels).toHaveLength(2);
+    h.channel(1).refuse();
+    expect(consumer.state).toBe("failed");
+    expect(consumer.lastError).toMatchObject({
+      code: HOST_CONSUMER_LIMIT_CODE,
+      message: HOST_CONSUMER_LIMIT_MESSAGE,
+    });
+    expect(HOST_CONSUMER_LIMIT_MESSAGE).toContain("SPAWN D");
+    expect(await opening).toMatchObject({ code: HOST_CONSUMER_LIMIT_CODE });
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(h.channels).toHaveLength(2);
+    expect(h.parent.state).toBe("ready");
+  } finally {
+    consumer.close();
+  }
+});
+
+test("a tool channel that dies before it opens is an ordinary reconnect, never the tool limit", async () => {
+  jest.useFakeTimers();
+  const h = harness();
+  const consumer = h.create();
+  try {
+    void consumer.open().catch(() => undefined);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      h.channels.at(-1)?.close();
+      expect(consumer.state).toBe("reconnecting");
+      expect(consumer.lastError?.code).not.toBe(HOST_CONSUMER_LIMIT_CODE);
+      await jest.advanceTimersByTimeAsync(5_000);
+    }
+    h.channels.at(-1)?.open();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(consumer.state).toBe("ready");
+  } finally {
+    consumer.close();
+  }
+});
+
+test("refusals count only in a row: a channel lost for another reason breaks the row", async () => {
+  jest.useFakeTimers();
+  const h = harness();
+  const consumer = h.create();
+  try {
+    void consumer.open().catch(() => undefined);
+    h.channel(0).refuse();
+    await jest.advanceTimersByTimeAsync(1_000);
+    // Lost before it opened: not the tool limit, and not part of the row.
+    h.channel(1).close();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.channels).toHaveLength(3);
+    h.channel(2).refuse();
+    expect(consumer.state).toBe("reconnecting");
+    expect(consumer.lastError?.code).not.toBe(HOST_CONSUMER_LIMIT_CODE);
+    await jest.advanceTimersByTimeAsync(5_000);
+    h.channels.at(-1)?.open();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(consumer.state).toBe("ready");
+  } finally {
+    consumer.close();
+  }
+});
+
+test("a tool channel that times out unopened breaks a row of refusals too", async () => {
+  jest.useFakeTimers();
+  const h = harness();
+  const consumer = h.create();
+  try {
+    const opening = consumer.open();
+    h.channel(0).open();
+    await opening;
+    h.channel(0).close();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.channels).toHaveLength(2);
+    h.channel(1).refuse();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.channels).toHaveLength(3);
+    // Never opened: the tool's own deadline ends the attempt, not a refusal.
+    await jest.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 5_000);
+    expect(h.channels).toHaveLength(4);
+    h.channel(3).refuse();
+    expect(consumer.state).toBe("reconnecting");
+    expect(consumer.lastError?.code).not.toBe(HOST_CONSUMER_LIMIT_CODE);
+  } finally {
+    consumer.close();
+  }
+});
+
+test("the worker's own tool limit gives the same reason", async () => {
+  const h = harness();
+  const consumers = Array.from({ length: 33 }, () => h.create());
+  try {
+    const openings = consumers.map((consumer) => consumer.open().catch((error: unknown) => error));
+    expect(h.channels).toHaveLength(32);
+    const last = consumers.at(-1);
+    expect(last?.state).toBe("failed");
+    expect(last?.lastError).toMatchObject({
+      code: HOST_CONSUMER_LIMIT_CODE,
+      message: HOST_CONSUMER_LIMIT_MESSAGE,
+    });
+    expect(await openings.at(-1)).toMatchObject({ code: HOST_CONSUMER_LIMIT_CODE });
+  } finally {
+    for (const consumer of consumers) consumer.close();
   }
 });

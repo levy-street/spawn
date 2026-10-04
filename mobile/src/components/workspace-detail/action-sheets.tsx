@@ -1,6 +1,7 @@
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
+import { UNSUPPORTED_PANE_TITLE } from "@/components/workspace-detail/pane-list";
 import { canMovePaneToTab, canRemoveTab } from "@/data/layout/tabs";
 import { canAddTile, orderedTiles } from "@/data/layout/tiles";
 import { restartDetail } from "@/data/selectors/agent";
@@ -52,6 +53,7 @@ export function PaneActionsSheet({
   const tab = workspace.layout.tabs.find((candidate) => candidate.id === target?.tabId) ?? null;
   const tile = target?.tile ?? null;
   const session = tile && !tile.widget ? (sessionsById.get(tile.session_id) ?? null) : null;
+  const unsupported = Boolean(tile?.widget) && !isFilesWidget(tile?.widget);
   const index =
     tab && tile
       ? orderedTiles(tab.layout.tiles).findIndex((item) => item.session_id === tile.session_id)
@@ -81,14 +83,24 @@ export function PaneActionsSheet({
         ...(canMove ? {} : { detail: "No other tab has room" }),
         onPress: () => onMove(tile),
       },
-      {
-        id: "duplicate",
-        label: "Duplicate",
-        icon: <Icon name="Copy" />,
-        disabled: tab ? !canAddTile(tab.layout) : true,
-        ...(tab && !canAddTile(tab.layout) ? { detail: "This tab is full" } : {}),
-        onPress: () => onDuplicate(tile, session),
-      },
+      unsupported
+        ? {
+            // A pane from a newer SPAWN D is never copied blind.
+            id: "duplicate",
+            label: "Duplicate",
+            icon: <Icon name="Copy" />,
+            disabled: true,
+            detail: "Needs a newer SPAWN D",
+            onPress: () => undefined,
+          }
+        : {
+            id: "duplicate",
+            label: "Duplicate",
+            icon: <Icon name="Copy" />,
+            disabled: tab ? !canAddTile(tab.layout) : true,
+            ...(tab && !canAddTile(tab.layout) ? { detail: "This tab is full" } : {}),
+            onPress: () => onDuplicate(tile, session),
+          },
       {
         id: "move-up",
         label: "Move up",
@@ -152,7 +164,9 @@ export function PaneActionsSheet({
     ? sessionTitle(session, agents)
     : tile && isFilesWidget(tile.widget)
       ? "Files"
-      : "Pane actions";
+      : unsupported
+        ? UNSUPPORTED_PANE_TITLE
+        : "Pane actions";
   return (
     <ActionSheet
       actions={actions}

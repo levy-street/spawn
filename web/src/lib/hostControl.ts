@@ -37,6 +37,28 @@ const STREAM_TIMEOUT_MS = 60_000;
 const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
 const MAX_STREAM_TOMBSTONES = 256;
 const STREAM_TOMBSTONE_TTL_MS = 120_000;
+/**
+ * A daemon admits 4,096 request ids on one host-control channel, remembers
+ * every one, and closes the channel at the next (daemon/src/host_control.rs,
+ * MAX_SEEN_REQUESTS). A consumer that lives for hours — live metrics at one
+ * request a second, a file explorer left open — dies there, and daemons
+ * already installed will never forget an id. So a consumer swaps its channel
+ * for a fresh one once it has sent the first number and nothing is in flight,
+ * and never sends more than the second on one channel: past it, requests wait
+ * for the swap. Keep this for as long as such daemons can be reached.
+ */
+export const CHANNEL_ROTATE_AFTER_REQUESTS = 3_500;
+export const CHANNEL_REQUEST_BUDGET = 4_000;
+/**
+ * A daemon accepts 32 consumer channels per device and host, across every tab
+ * of this browser (daemon/src/rtc_pair.rs, MAX_PAIR_CONTROLS), and closes any
+ * channel past that before its hello. One such close can be a race with a
+ * channel that is closing; a second in a row is the limit.
+ */
+const CONSUMER_REFUSALS_BEFORE_ERROR = 2;
+const CONSUMER_REFUSED_RETRY_CAP_MS = 30_000;
+export const CONSUMER_REFUSED_MESSAGE =
+  "Too many SPAWN D views are open on this host. Close a few windows or tabs and this one reconnects on its own.";
 // A request whose acknowledgement is lost may or may not have taken effect, so
 // it must never be transparently retried. Launching an application is exactly
 // that: a lost ack could still have opened a window on someone's desktop.
@@ -226,7 +248,19 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   mutation: boolean;
   dispatched: boolean;
+  /** Set when this request opens a stream; see `StreamOpening`. */
+  opening?: StreamOpening;
   removeAbort?: () => void;
+}
+
+/**
+ * A stream-opening request's claim on its channel, counted in
+ * `openingStreams` only while the request is actually on a channel: from its
+ * dispatch until its stream is registered or it fails. One held for a swap
+ * has no channel yet, so it must not keep the spent one from being swapped.
+ */
+interface StreamOpening {
+  onChannel: boolean;
 }
 
 interface IncomingStream {
@@ -394,6 +428,19 @@ export class HostControlClient {
   // must never be surfaced as one. The release watcher owns its recovery UI.
   private terminalReason: HostControlTerminalReason | null = null;
   private stopped = true;
+  // Consumer channel accounting against the daemon's per-channel id budget
+  // (CHANNEL_REQUEST_BUDGET). `rotating` is a replacement channel opening:
+  // requests made meanwhile wait in `held` and go out after its hello, so the
+  // swap is invisible to callers and the client never leaves `ready` for it.
+  private channelRequests = 0;
+  private rotating = false;
+  private held: Array<{ requestId: string; frame: string }> = [];
+  // Stream-opening requests sent on the channel whose stream is not
+  // registered yet: their first frames are already on the way, so the channel
+  // is not idle. A held one is not counted (see `StreamOpening`).
+  private openingStreams = 0;
+  private consumerRefusals = 0;
+  private refusalTimer: ReturnType<typeof setTimeout> | null = null;
   private pending = new Map<string, PendingRequest>();
   private incomingStreams = new Map<string, IncomingStream>();
   private cancelledIncomingStreams = new Map<string, CancelledIncomingStream>();
@@ -490,6 +537,8 @@ export class HostControlClient {
     const snapshot = connection.getSnapshot();
     this.signedRtcRefusal = snapshot.refusal;
     if (snapshot.state !== "ready") {
+      // A new peer is a new budget of consumer channels at the daemon.
+      this.clearConsumerRefusal();
       this.setState(snapshot.state);
       return;
     }
@@ -498,22 +547,192 @@ export class HostControlClient {
       return;
     }
     if (this.channel?.readyState === "connecting" || this.channel?.readyState === "open") return;
-    const id = crypto.randomUUID();
+    // Refused for too many views: the backoff reopens, not every snapshot.
+    if (this.refusalTimer) return;
     try {
-      const channel = connection.createChannel(`spawn.host.ctl/${id}`);
-      this.sessionId = id;
-      this.channel = channel;
-      this.setState("connecting");
-      channel.onmessage = ({ data }) => this.handleControlMessage(data, id);
-      channel.onclose = () => {
-        if (this.sessionId === id) this.failRtc(id);
-      };
-      channel.onerror = () => {
-        if (this.sessionId === id) this.failRtc(id);
-      };
+      this.openConsumerChannel(connection);
+      // A refused consumer keeps saying why while it tries again.
+      if (this.consumerRefusals < CONSUMER_REFUSALS_BEFORE_ERROR) this.setState("connecting");
     } catch {
+      // Not a refusal: whatever is wrong, it is no longer the view limit.
+      this.clearConsumerRefusal();
       this.setState("error");
       this.scheduleReconnect();
+    }
+  }
+
+  /** Open this consumer's own channel on the shared connection. Throws when the
+   *  connection cannot take another. */
+  private openConsumerChannel(connection: DaemonConnection): void {
+    const id = crypto.randomUUID();
+    const channel = connection.createChannel(`spawn.host.ctl/${id}`);
+    this.sessionId = id;
+    this.channel = channel;
+    this.helloReceived = false;
+    this.channelRequests = 0;
+    let opened = false;
+    channel.onopen = () => {
+      opened = true;
+    };
+    channel.onmessage = ({ data }) => this.handleControlMessage(data, id);
+    channel.onclose = () => this.consumerChannelLost(id, opened);
+    channel.onerror = () => this.consumerChannelLost(id, opened);
+    // A channel the owner tab never opens, or a daemon that never says hello,
+    // must not leave this consumer (or the requests a swap is holding) waiting
+    // for ever.
+    this.clearConnectDeadline();
+    this.connectTimer = setTimeout(
+      () => {
+        this.connectTimer = null;
+        if (this.sessionId === id && !this.helloReceived) this.consumerChannelLost(id, false);
+      },
+      Math.max(1, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS),
+    );
+  }
+
+  /**
+   * This consumer's channel ended. One the daemon opened and closed before its
+   * hello, while the connection itself is fine, was refused; refused twice in
+   * a row, the consumer says why and retries on a slow backoff instead of
+   * reopening every half second for as long as the view is open. Any other
+   * ending breaks the row: the consumer stops blaming the limit and tries
+   * again as it would after any lost channel.
+   */
+  private consumerChannelLost(id: string, opened: boolean): void {
+    if (this.sessionId !== id) return;
+    this.clearConnectDeadline();
+    this.rotating = false;
+    const refused =
+      opened &&
+      !this.helloReceived &&
+      this.options.sharedConnection?.getSnapshot().state === "ready";
+    if (!refused) {
+      if (this.consumerRefusals >= CONSUMER_REFUSALS_BEFORE_ERROR) this.setState("connecting");
+      this.clearConsumerRefusal();
+      this.failRtc(id);
+      return;
+    }
+    this.consumerRefusals += 1;
+    if (this.consumerRefusals < CONSUMER_REFUSALS_BEFORE_ERROR) {
+      this.failRtc(id);
+      return;
+    }
+    this.cleanupRtc(true);
+    this.connectionError = CONSUMER_REFUSED_MESSAGE;
+    this.setState("error");
+    if (this.refusalTimer) clearTimeout(this.refusalTimer);
+    this.refusalTimer = setTimeout(
+      () => {
+        this.refusalTimer = null;
+        this.syncShared();
+      },
+      backoffDelay(
+        this.consumerRefusals - CONSUMER_REFUSALS_BEFORE_ERROR,
+        {
+          base: 4 * this.sharedReconnectDelayMs(),
+          cap: CONSUMER_REFUSED_RETRY_CAP_MS,
+        },
+        this.options.reconnectRandom,
+      ),
+    );
+  }
+
+  private clearConsumerRefusal(): void {
+    if (this.refusalTimer) clearTimeout(this.refusalTimer);
+    this.refusalTimer = null;
+    if (this.consumerRefusals >= CONSUMER_REFUSALS_BEFORE_ERROR) this.connectionError = null;
+    this.consumerRefusals = 0;
+  }
+
+  private sharedReconnectDelayMs(): number {
+    return Math.max(1, this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS);
+  }
+
+  /** Every place work on the channel settles calls this; cheap when not due. */
+  private noteSettled(): void {
+    if (this.rotating || this.channelRequests < CHANNEL_ROTATE_AFTER_REQUESTS) return;
+    queueMicrotask(() => this.rotateChannelWhenIdle());
+  }
+
+  private channelIdle(): boolean {
+    if (this.openingStreams > 0 || this.incomingStreams.size > 0 || this.outgoingStreams.size > 0)
+      return false;
+    for (const pending of this.pending.values()) if (pending.dispatched) return false;
+    return true;
+  }
+
+  /**
+   * Close a spent consumer channel and open its replacement, once nothing is
+   * in flight on it: a stream or a request in progress belongs to the channel
+   * it started on, and closing that channel would end it.
+   */
+  private rotateChannelWhenIdle(): void {
+    const connection = this.options.sharedConnection;
+    const previous = this.channel;
+    if (
+      !connection ||
+      !previous ||
+      this.stopped ||
+      this.rotating ||
+      !this.helloReceived ||
+      this.state !== "ready" ||
+      this.channelRequests < CHANNEL_ROTATE_AFTER_REQUESTS ||
+      !this.channelIdle() ||
+      connection.getSnapshot().state !== "ready"
+    )
+      return;
+    this.rotating = true;
+    previous.onopen = null;
+    previous.onmessage = null;
+    previous.onclose = null;
+    previous.onerror = null;
+    previous.close();
+    this.cancelledIncomingStreams.clear();
+    try {
+      this.openConsumerChannel(connection);
+    } catch {
+      this.rotating = false;
+      this.failRtc();
+    }
+  }
+
+  private mustHoldRequests(): boolean {
+    return (
+      this.rotating ||
+      (this.options.sharedConnection !== undefined &&
+        this.channelRequests >= CHANNEL_REQUEST_BUDGET)
+    );
+  }
+
+  private dispatchRequest(requestId: string, frame: string, pending: PendingRequest): void {
+    try {
+      const channel = this.channel;
+      if (channel?.readyState !== "open") throw new Error("Host control channel is not ready");
+      channel.send(frame);
+      pending.dispatched = true;
+      this.channelRequests += 1;
+      if (pending.opening) {
+        pending.opening.onChannel = true;
+        this.openingStreams += 1;
+      }
+    } catch (error) {
+      this.finishPending(requestId);
+      pending.reject(error instanceof Error ? error : new Error("Host control send failed"));
+    }
+  }
+
+  /** A stream-opening request's claim ends: its stream is registered (and
+   *  holds the channel itself) or the request failed. */
+  private leaveChannel(opening: StreamOpening): void {
+    if (!opening.onChannel) return;
+    opening.onChannel = false;
+    this.openingStreams -= 1;
+  }
+
+  private flushHeld(): void {
+    for (const { requestId, frame } of this.held.splice(0)) {
+      const pending = this.pending.get(requestId);
+      if (pending && !pending.dispatched) this.dispatchRequest(requestId, frame, pending);
     }
   }
 
@@ -594,6 +813,7 @@ export class HostControlClient {
     this.connectionAttempt += 1;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.clearConsumerRefusal();
     this.clearConnectDeadline();
     this.clearSignalWatchdog();
     this.clearRtcRecoveryTimers();
@@ -614,8 +834,17 @@ export class HostControlClient {
     payload?: unknown,
     options: HostControlRequestOptions = {},
   ): Promise<T> {
-    const channel = this.channel;
-    if (this.state !== "ready" || channel?.readyState !== "open") {
+    return this.issueRequest<T>(operation, payload, options);
+  }
+
+  private issueRequest<T>(
+    operation: string,
+    payload: unknown,
+    options: HostControlRequestOptions = {},
+    opening?: StreamOpening,
+  ): Promise<T> {
+    // A swap in progress is still ready: the request waits for the new channel.
+    if (this.state !== "ready" || (!this.rotating && this.channel?.readyState !== "open")) {
       return Promise.reject(new Error("Host control channel is not ready"));
     }
     if (this.pending.size >= this.maxPendingRequests()) {
@@ -644,7 +873,8 @@ export class HostControlClient {
       const timer = setTimeout(() => {
         const current = this.finishPending(requestId);
         if (!current) return;
-        this.sendCancel(requestId);
+        // A held request never reached the daemon: there is nothing to cancel.
+        if (current.dispatched) this.sendCancel(requestId);
         current.reject(
           this.requestAcknowledgementLost(current, new Error("Host control request timed out")),
         );
@@ -655,12 +885,13 @@ export class HostControlClient {
         timer,
         mutation: INDETERMINATE_REQUEST_OPERATIONS.has(operation),
         dispatched: false,
+        ...(opening ? { opening } : {}),
       };
       if (options.signal) {
         const onAbort = () => {
           const current = this.finishPending(requestId);
           if (!current) return;
-          this.sendCancel(requestId);
+          if (current.dispatched) this.sendCancel(requestId);
           current.reject(
             this.requestAcknowledgementLost(
               current,
@@ -672,13 +903,12 @@ export class HostControlClient {
         pending.removeAbort = () => options.signal?.removeEventListener("abort", onAbort);
       }
       this.pending.set(requestId, pending);
-      try {
-        channel.send(frame);
-        pending.dispatched = true;
-      } catch (error) {
-        this.finishPending(requestId);
-        reject(error instanceof Error ? error : new Error("Host control send failed"));
+      if (this.mustHoldRequests()) {
+        this.held.push({ requestId, frame });
+        this.rotateChannelWhenIdle();
+        return;
       }
+      this.dispatchRequest(requestId, frame, pending);
     });
   }
 
@@ -763,7 +993,22 @@ export class HostControlClient {
     payload: Record<string, unknown>,
     options?: HostControlRequestOptions,
   ): Promise<{ declaration: T; stream: ReadableStream<Uint8Array> }> {
-    const declaration = await this.request<T>(operation, payload, options);
+    const opening: StreamOpening = { onChannel: false };
+    try {
+      return await this.openIncomingStream<T>(operation, payload, opening, options);
+    } finally {
+      this.leaveChannel(opening);
+      this.noteSettled();
+    }
+  }
+
+  private async openIncomingStream<T extends { stream_id: string; length: number; sha256: string }>(
+    operation: string,
+    payload: Record<string, unknown>,
+    opening: StreamOpening,
+    options?: HostControlRequestOptions,
+  ): Promise<{ declaration: T; stream: ReadableStream<Uint8Array> }> {
+    const declaration = await this.issueRequest<T>(operation, payload, options, opening);
     const { stream_id: streamId, length, sha256 } = declaration ?? ({} as T);
     this.pruneIncomingTombstones();
     if (
@@ -809,6 +1054,7 @@ export class HostControlClient {
           }
           this.incomingStreams.delete(streamId);
           this.cancelStream(streamId);
+          this.noteSettled();
         },
       },
       { highWaterMark: 4 },
@@ -1160,13 +1406,24 @@ export class HostControlClient {
     },
     signal?: AbortSignal,
   ): Promise<string> {
-    const begin = await this.request<{ stream_id: string }>("fs.write.begin", declaration, {
-      signal,
-      timeoutMs: this.streamTimeoutMs(),
-    });
-    const streamId = begin.stream_id;
-    if (typeof streamId !== "string" || this.outgoingStreams.has(streamId)) {
-      throw new HostControlError("invalid_response", "Host returned an invalid write stream");
+    // Holds its channel until the stream is registered below; see `StreamOpening`.
+    const opening: StreamOpening = { onChannel: false };
+    let streamId: string;
+    try {
+      const begin = await this.issueRequest<{ stream_id: string }>(
+        "fs.write.begin",
+        declaration,
+        { signal, timeoutMs: this.streamTimeoutMs() },
+        opening,
+      );
+      streamId = begin.stream_id;
+      if (typeof streamId !== "string" || this.outgoingStreams.has(streamId)) {
+        throw new HostControlError("invalid_response", "Host returned an invalid write stream");
+      }
+    } catch (error) {
+      this.leaveChannel(opening);
+      this.noteSettled();
+      throw error;
     }
     let terminalError: Error | null = null;
     let rejectTerminal!: (error: Error) => void;
@@ -1191,6 +1448,8 @@ export class HostControlClient {
       this.outgoingStreams.set(streamId, outgoing);
       this.resetOutgoingTimeout(streamId, outgoing);
     });
+    // Registered: the stream itself now keeps the channel from being swapped.
+    this.leaveChannel(opening);
     void committed.catch(() => {});
     const reader = stream.getReader();
     let cleanup: Promise<void> | null = null;
@@ -1203,6 +1462,7 @@ export class HostControlClient {
           clearTimeout(pending.timer);
           this.outgoingStreams.delete(streamId);
           pending.reject(this.writeAcknowledgementLost(pending, reason));
+          this.noteSettled();
         }
         await reader.cancel(reason).catch(() => {});
       })();
@@ -1992,6 +2252,12 @@ export class HostControlClient {
         this.requireTransportUpdate("Update SPAWN D on this host to share its connection.");
         return;
       }
+      if (this.options.sharedConnection) {
+        this.clearConsumerRefusal();
+        this.connectionError = null;
+        this.rotating = false;
+        this.flushHeld();
+      }
       this.setState("ready");
       return;
     }
@@ -2052,6 +2318,7 @@ export class HostControlClient {
         }
         this.incomingStreams.delete(message.stream_id);
         clearTimeout(incoming.timer);
+        this.noteSettled();
         const digest = incoming.hash.digestHex();
         if (
           message.length !== incoming.expectedLength ||
@@ -2076,6 +2343,7 @@ export class HostControlClient {
         this.outgoingStreams.delete(message.stream_id);
         clearTimeout(outgoing.timer);
         outgoing.resolve(message.path);
+        this.noteSettled();
         return;
       }
       if (message.type === "stream.error") {
@@ -2088,6 +2356,7 @@ export class HostControlClient {
           this.incomingStreams.delete(message.stream_id);
           clearTimeout(incoming.timer);
           incoming.controller.error(error);
+          this.noteSettled();
           return;
         }
         this.pruneIncomingTombstones();
@@ -2097,6 +2366,7 @@ export class HostControlClient {
           this.outgoingStreams.delete(message.stream_id);
           clearTimeout(outgoing.timer);
           outgoing.reject(error);
+          this.noteSettled();
           return;
         }
         this.failRtc(sessionId);
@@ -2278,6 +2548,7 @@ export class HostControlClient {
       this.incomingStreams.delete(streamId);
       this.cancelStream(streamId);
       incoming.controller.error(new HostControlError("stream_timeout", "File read timed out"));
+      this.noteSettled();
     }, this.streamTimeoutMs());
   }
 
@@ -2293,6 +2564,7 @@ export class HostControlClient {
           new HostControlError("stream_timeout", "File write timed out"),
         ),
       );
+      this.noteSettled();
     }, this.streamTimeoutMs());
   }
 
@@ -2324,6 +2596,7 @@ export class HostControlClient {
     this.pending.delete(requestId);
     clearTimeout(pending.timer);
     pending.removeAbort?.();
+    if (pending.dispatched) this.noteSettled();
     return pending;
   }
 
@@ -2370,6 +2643,10 @@ export class HostControlClient {
     this.signedRtcDecisionForBinding = null;
     this.capabilities = new Set();
     this.helloReceived = false;
+    this.channelRequests = 0;
+    this.rotating = false;
+    // Held requests are still pending, so rejectPending below settles them.
+    this.held = [];
     this.connectionInfo = { kind: null, rttMs: null, protocol: null };
     if (notifyServer && sessionId && !this.options.sharedConnection) {
       this.sendSignal({
@@ -2419,7 +2696,7 @@ export class HostControlClient {
         this.reconnectTimer = setTimeout(() => {
           this.reconnectTimer = null;
           this.syncShared();
-        }, 500);
+        }, this.sharedReconnectDelayMs());
       return;
     }
     if (

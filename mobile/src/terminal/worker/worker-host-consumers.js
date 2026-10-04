@@ -76,9 +76,19 @@
 
   function open(id) {
     if (consumers.has(id)) return;
+    // The daemon's own limit per device and host (rtc_pair.rs MAX_PAIR_CONTROLS);
+    // the copy matches HOST_CONSUMER_LIMIT_MESSAGE in host-ctl-codec.ts.
+    if (uuid.test(id) && consumers.size >= 32) {
+      post(id, {
+        type: "error",
+        code: "host_consumer_limit",
+        message: "Too many SPAWN D views are open on this host. Close one and try again.",
+        retryable: false,
+      });
+      return;
+    }
     if (
       !uuid.test(id) ||
-      consumers.size >= 32 ||
       api.state.mode !== "host" ||
       api.state.pc?.connectionState !== "connected" ||
       api.state.ctl?.readyState !== "open"
@@ -103,6 +113,8 @@
       unreceived: 0,
       receipts: new Map(),
       onBuffered: null,
+      opened: false,
+      hello: false,
     };
     const channel = new EventTarget();
     Object.defineProperties(channel, {
@@ -136,7 +148,10 @@
       state: { ctl: channel },
       decodeBase64: api.decodeBase64,
       post: (message) => {
-        if (consumers.get(id) === entry) post(id, message);
+        if (consumers.get(id) !== entry) return;
+        if (message.type === "host-response" && message.requestId === "$host.hello")
+          entry.hello = true;
+        post(id, message);
       },
       error: (code, message) => {
         if (consumers.get(id) !== entry) return;
@@ -149,12 +164,27 @@
     consumers.set(id, entry);
     protocol.hostBindingAccepted();
     dc.onopen = () => {
-      if (consumers.get(id) === entry) protocol.hostChannelOpened();
+      if (consumers.get(id) !== entry) return;
+      entry.opened = true;
+      protocol.hostChannelOpened();
     };
     dc.onmessage = ({ data }) => {
       if (consumers.get(id) === entry) protocol.receiveHostCtl(data);
     };
-    dc.onclose = dc.onerror = () => close(id);
+    dc.onclose = dc.onerror = () => {
+      // Opened and closed by the daemon before its hello: refused, which is
+      // what the daemon does past its tool limit. Native decides what that
+      // means; one can be a race with a channel that is still closing.
+      if (consumers.get(id) === entry && entry.opened && !entry.hello) {
+        post(id, {
+          type: "error",
+          code: "host_consumer_refused",
+          message: "The host closed this tool's channel before it was ready.",
+          retryable: true,
+        });
+      }
+      close(id);
+    };
     entry.onBuffered = () => channel.dispatchEvent(new Event("bufferedamountlow"));
     dc.addEventListener("bufferedamountlow", entry.onBuffered);
   }

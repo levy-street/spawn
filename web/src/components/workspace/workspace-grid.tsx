@@ -31,6 +31,7 @@ import {
 import {
   autoPlace,
   GRID_SIZE,
+  isFilesWidget,
   MAX_TILES,
   MIN_TILE_SIZE,
   type Rect,
@@ -496,7 +497,8 @@ export function WorkspaceGrid({
   const canDuplicate = useCallback(
     (tileId: string) =>
       tiles.length < MAX_TILES &&
-      (Boolean(tiles.find((tile) => tile.session_id === tileId)?.widget) ||
+      // A pane from a newer SPAWN D is never copied blind.
+      (isFilesWidget(tiles.find((tile) => tile.session_id === tileId)?.widget) ||
         sessionsById.has(tileId)),
     [sessionsById, tiles],
   );

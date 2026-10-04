@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { deriveFileCapabilities, FILE_OPS, parseCapabilities } from "./capabilities";
+import {
+  deriveFileCapabilities,
+  FILE_OPS,
+  MAX_CAPABILITIES,
+  parseCapabilities,
+} from "./capabilities";
 
 const ALL = new Set(Object.values(FILE_OPS) as string[]);
 const LEGACY = new Set(["ping", "fs.home", "fs.list", "fs.stat", "fs.read"]);
@@ -75,16 +80,32 @@ describe("parseCapabilities", () => {
     expect(parseCapabilities({ a: 1 }).size).toBe(0);
   });
 
-  test("rejects malformed entries wholesale", () => {
-    expect(parseCapabilities(["fs.list", 42]).size).toBe(0);
-    expect(parseCapabilities(["fs.list", "Fs.Upper"]).size).toBe(0);
-    expect(parseCapabilities(["fs.list", "has space"]).size).toBe(0);
-    expect(parseCapabilities(["fs.list", "-leading"]).size).toBe(0);
+  test("skips a malformed entry and keeps every name it can read", () => {
+    // A newer daemon's odd entry must not cost the names this client knows.
+    for (const odd of [42, null, { op: "x" }, "Fs.Upper", "has space", "-leading"]) {
+      expect([...parseCapabilities(["fs.list", odd, "session.transport.v1"])]).toEqual([
+        "fs.list",
+        "session.transport.v1",
+      ]);
+    }
+    expect([...parseCapabilities([`fs.${"x".repeat(80)}`, "ping"])]).toEqual(["ping"]);
   });
 
-  test("rejects absurd lists rather than storing them", () => {
-    expect(parseCapabilities(Array.from({ length: 65 }, () => "fs.list")).size).toBe(0);
-    expect(parseCapabilities([`fs.${"x".repeat(80)}`]).size).toBe(0);
+  test("a list longer than 64 names keeps them all: there is no cliff", () => {
+    // The old parser emptied the set past 64 names, which made a host look like
+    // a daemon without session transport and refused a working connection.
+    const names = Array.from({ length: 80 }, (_, index) => `family${index}.v1`);
+    const parsed = parseCapabilities([...names, "session.transport.v1"]);
+    expect(parsed.size).toBe(81);
+    expect(parsed.has("session.transport.v1")).toBe(true);
+  });
+
+  test("reads at most MAX_CAPABILITIES names and ignores the rest", () => {
+    const names = Array.from({ length: MAX_CAPABILITIES + 50 }, (_, index) => `op${index}`);
+    const parsed = parseCapabilities(names);
+    expect(parsed.size).toBe(MAX_CAPABILITIES);
+    expect(parsed.has("op0")).toBe(true);
+    expect(parsed.has(`op${MAX_CAPABILITIES}`)).toBe(false);
   });
 
   test("an empty list is valid and empty", () => {

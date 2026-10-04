@@ -23,6 +23,7 @@ import {
   runningAgent,
   sessionAgent,
 } from "@/data/selectors/agent";
+import { isFilesWidget } from "@/data/types/layout";
 
 export interface WorkspaceOperationResult {
   workspace: WorkspaceOut;
@@ -208,8 +209,12 @@ function initialDuplicateLayout(
     cwd: tab.cwd,
     layout: {
       version: 3 as const,
+      // Sessions are recreated below. A pane from a newer SPAWN D is left out,
+      // as a template leaves it out: this app cannot know what copying it means.
       tiles: tab.layout.tiles.flatMap((tile): WorkspaceTile[] =>
-        tile.widget ? [{ ...tile, session_id: randomId(), widget: { ...tile.widget } }] : [],
+        isFilesWidget(tile.widget)
+          ? [{ ...tile, session_id: randomId(), widget: { ...tile.widget } }]
+          : [],
       ),
     },
   }));

@@ -8,6 +8,8 @@ const APPROVAL_NONCE = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const HOST_PUBLIC_KEY = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000003";
 const OTHER_HOST_PUBLIC_KEY = "11qYAYdk9Jt0uvL7Tp_5eQK8heP0LOEYVVt4dSK3M3A";
+// A key no seeded pin holds, so nothing can ever bind to the host that serves it.
+const THIRD_HOST_PUBLIC_KEY = "nr4kqaG6yM0KHIIazkJMygbXOHdwTveWuLnz2Od4-ik";
 
 function fingerprint(publicKey: string): string {
   const digest = createHash("sha256").update(Buffer.from(publicKey, "base64url")).digest();
@@ -151,6 +153,7 @@ async function installRoutes(
     deleteCalls: number;
     hostVisible: boolean;
     hostResponse?: typeof host;
+    listedHost?: typeof host;
     onDelete: (route: Route) => Promise<void>;
   },
 ): Promise<void> {
@@ -219,7 +222,10 @@ async function installRoutes(
       return;
     }
     if (path === "/api/hosts" && request.method() === "GET") {
-      await route.fulfill({ status: 200, json: state.hostVisible ? [host] : [] });
+      await route.fulfill({
+        status: 200,
+        json: state.hostVisible ? [state.listedHost ?? host] : [],
+      });
       return;
     }
     if (path === `/api/hosts/${HOST_ID}` && request.method() === "GET") {
@@ -266,6 +272,9 @@ test("response-ID substitution blocks local mutation and the route-target DELETE
   };
   await installRoutes(page, state);
   await approveExactHost(page);
+  // The app binds the listed host ID to its pin in the background; take the
+  // snapshot only once that has landed, or the binding reads as a mutation.
+  await expectExactHostBinding(page);
   const before = JSON.stringify(await readHostPins(page));
 
   await page.goto(`/hosts/${HOST_ID}`);
@@ -338,9 +347,14 @@ test("deletion never revokes among multiple active unbound host pins", async ({ 
   // stronger form: with no exact Host-ID-to-key binding there is nothing to
   // select, so NO local pin is revoked — deletion can never guess and
   // tombstone the wrong key. Both pins must survive untouched and active.
+  // The host serves a key neither pin holds: a pin whose key matched would be
+  // bound to the host in the background, legitimately, and then revoked.
+  const unbindable = { ...host, host_public_key: THIRD_HOST_PUBLIC_KEY };
   const state = {
     deleteCalls: 0,
     hostVisible: true,
+    hostResponse: unbindable,
+    listedHost: unbindable,
     onDelete: async (route: Route) => route.fulfill({ status: 204 }),
   };
   await installRoutes(page, state);

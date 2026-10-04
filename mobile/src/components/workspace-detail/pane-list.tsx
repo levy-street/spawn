@@ -77,6 +77,8 @@ export const PaneList = memo(function PaneList({
           paneId={tile.session_id}
           path={widget.path}
         />
+      ) : widget ? (
+        <UnsupportedPaneRow onActions={() => onPaneActions(tile)} paneId={tile.session_id} />
       ) : session ? (
         <TerminalRow
           agents={agents}
@@ -97,7 +99,11 @@ export const PaneList = memo(function PaneList({
             identity: identifyAgent(session.foreground_command, agents),
           }
         : {
-            title: isFilesWidget(widget) ? "Files" : "Session unavailable",
+            title: isFilesWidget(widget)
+              ? "Files"
+              : widget
+                ? UNSUPPORTED_PANE_TITLE
+                : "Session unavailable",
             identity: identifyAgent(null, agents),
           };
       return (
@@ -191,6 +197,33 @@ function AddPaneControl({ canAddPane, onAddPane }: { canAddPane: boolean; onAddP
           This tab is full. A tab can contain up to 16 panes.
         </Text>
       ) : null}
+    </View>
+  );
+}
+
+/** Header name of a pane whose kind came from a newer SPAWN D. */
+export const UNSUPPORTED_PANE_TITLE = "Unsupported pane";
+
+/**
+ * A pane a newer SPAWN D added: nothing here can open it, and nothing here
+ * changes it. The layout keeps it untouched; the row only says so, and its
+ * actions still move or remove it like any other pane.
+ */
+function UnsupportedPaneRow({ paneId, onActions }: { paneId: string; onActions: () => void }) {
+  return (
+    <View testID={`unsupported-row-${paneId}`}>
+      <ListRow
+        leading={<Icon color="mutedForeground" name="Shapes" />}
+        onLongPress={() => {
+          haptics.impact("medium");
+          onActions();
+        }}
+        onPress={onActions}
+        shape="fullBleed"
+        subtitle="A newer version added it. You can still move or remove it here."
+        title="This pane needs a newer SPAWN D"
+        trailing={<Icon color="mutedForeground" name="Ellipsis" />}
+      />
     </View>
   );
 }

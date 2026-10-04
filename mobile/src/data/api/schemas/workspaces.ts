@@ -11,11 +11,20 @@ export const WorkspaceIconPatchSchema = z.object({
   icon: z.string().nullable().optional(),
   icon_source: WorkspaceIconSourceSchema.nullable().optional(),
 });
-export const TileWidgetSchema = z.object({
-  kind: z.literal("files"),
-  host_id: UUIDSchema,
-  path: z.string(),
-});
+/**
+ * A pane's non-session content. One kind this app does not know must not fail
+ * the whole workspace: it parses as an inert widget, kept verbatim (fields
+ * included) so a layout saved from here carries it back unchanged. A files
+ * widget keeps fields it does not name for the same reason.
+ */
+export const TileWidgetSchema = z.union([
+  z.looseObject({
+    kind: z.literal("files"),
+    host_id: UUIDSchema,
+    path: z.string(),
+  }),
+  z.looseObject({ kind: z.string().refine((kind) => kind !== "files") }),
+]);
 export const WorkspaceTileSchema = z.object({
   session_id: z.string(),
   x: z.number().int(),

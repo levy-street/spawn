@@ -66,19 +66,29 @@ export function deriveFileCapabilities(
   };
 }
 
+/** How many advertised names are read. A hello is one 16 KiB frame, and new
+ *  op families are advertised as one versioned name each (`conv.v1`), so a
+ *  real daemon stays far below this. */
+export const MAX_CAPABILITIES = 256;
+const MAX_CAPABILITY_LENGTH = 64;
+const CAPABILITY_NAME = /^[a-z][a-z0-9._]*$/;
+
 /**
- * Capabilities as announced by a daemon, validated.
+ * Capabilities as announced by a daemon, validated name by name.
  *
- * A hello from a newer daemon carrying something unexpected must degrade to
- * "no extra capabilities", never tear the channel down — the connection itself
- * is fine, we simply do not know what it offers.
+ * A hello from a newer daemon carrying something unexpected must never cost
+ * the names this client does know: an unreadable entry is skipped, and so is
+ * anything past MAX_CAPABILITIES. Emptying the whole set instead would make a
+ * longer list look like a daemon with no session transport at all, and the
+ * connection would refuse a host that is fine. Only a hello whose list is not
+ * a list at all offers nothing — the connection itself is still fine.
  */
 export function parseCapabilities(value: unknown): ReadonlySet<string> {
-  if (!Array.isArray(value) || value.length > 64) return new Set();
   const parsed = new Set<string>();
-  for (const entry of value) {
-    if (typeof entry !== "string" || entry.length > 64) return new Set();
-    if (!/^[a-z][a-z0-9._]*$/.test(entry)) return new Set();
+  if (!Array.isArray(value)) return parsed;
+  for (const entry of value.slice(0, MAX_CAPABILITIES)) {
+    if (typeof entry !== "string" || entry.length > MAX_CAPABILITY_LENGTH) continue;
+    if (!CAPABILITY_NAME.test(entry)) continue;
     parsed.add(entry);
   }
   return parsed;

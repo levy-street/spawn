@@ -60,5 +60,7 @@ export function useHostControl(hostId: string | null, enabled = true) {
     /** Host platform, for wording only — never for gating a capability. */
     os: hostQuery.data?.os ?? null,
     signedRtcRefusal,
+    /** Why this view's channel is down, when it can say (too many views open). */
+    connectionError: state === "error" ? (client?.getConnectionError() ?? null) : null,
   };
 }

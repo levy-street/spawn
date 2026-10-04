@@ -214,6 +214,37 @@ describe("duplicateTab", () => {
     expect(next?.tabs.at(-1)?.layout.tiles).toEqual([tile("n2", 12, 0, 12, 24)]);
   });
 
+  test("leaves a pane from a newer SPAWN D out of the copy, never copied blind", () => {
+    const withWidgets = envelope([
+      {
+        id: "t1",
+        tiles: [
+          { ...tile("w1", 0, 0, 8, 24), widget: { kind: "files", host_id: "h1", path: "/src" } },
+          { ...tile("w2", 8, 0, 8, 24), widget: { kind: "desktop", display: "seat-1" } },
+          tile("s1", 16, 0, 8, 24),
+        ],
+      },
+    ]);
+    // Even handed an id for it, the unknown pane is not copied.
+    const next = duplicateTab(
+      withWidgets,
+      "t1",
+      "copy",
+      "c",
+      new Map([
+        ["w1", "n1"],
+        ["w2", "n2"],
+        ["s1", "n3"],
+      ]),
+    );
+    expect(next?.tabs.at(-1)?.layout.tiles).toEqual([
+      { ...tile("n1", 0, 0, 8, 24), widget: { kind: "files", host_id: "h1", path: "/src" } },
+      tile("n3", 16, 0, 8, 24),
+    ]);
+    // The original keeps it.
+    expect(next?.tabs[0]).toEqual(withWidgets.tabs[0]);
+  });
+
   test("refuses an unknown tab, a used id, and a full envelope", () => {
     expect(duplicateTab(layout, "ghost", "copy", "c", new Map())).toBeNull();
     expect(duplicateTab(layout, "t1", "t2", "c", new Map())).toBeNull();

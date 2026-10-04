@@ -21,7 +21,13 @@ import {
   AGENT_TRANSCRIPTS_OP,
   assertHostFileSize,
   collectHostStream,
+  HOST_CONSUMER_LIMIT_CODE,
+  HOST_CONSUMER_LIMIT_MESSAGE,
+  HOST_CONSUMER_REFUSALS_BEFORE_FAILURE,
+  HOST_CONSUMER_REFUSED_CODE,
   HOST_CONTROL_PROTOCOL,
+  HOST_CONTROL_REQUEST_BUDGET,
+  HOST_CONTROL_ROTATE_AFTER_REQUESTS,
   HOST_FILE_MAX_BYTES,
   HOST_RANGE_MAX_BYTES,
   HOST_STREAM_CHUNK_BYTES,
@@ -104,7 +110,19 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   dispatched: boolean;
   indeterminate: boolean;
+  /** Set when this request opens a stream; see `StreamOpening`. */
+  opening?: StreamOpening;
   removeAbort?: () => void;
+}
+
+/**
+ * A stream-opening request's claim on its channel, counted in
+ * `#openingStreams` only while the request is actually on a channel: from its
+ * dispatch until its stream is registered or it fails. One held for a swap
+ * has no channel yet, so it must not keep the spent one from being swapped.
+ */
+interface StreamOpening {
+  onChannel: boolean;
 }
 
 interface PendingCommand {
@@ -185,6 +203,20 @@ class WebViewHostTransport implements StreamingHostTransport {
   readonly #diagnosticListeners = new Set<(diagnostic: WorkerDiagnostic) => void>();
   #consumerId: string | null = null;
   #parentUnsubscribe: (() => void) | null = null;
+  // Tool channel accounting against the daemon's per-channel id budget
+  // (HOST_CONTROL_REQUEST_BUDGET). `#rotating` is a replacement channel
+  // opening: requests made meanwhile wait in `#held` and go out once it is
+  // ready, so the swap is invisible to callers and the state stays `ready`.
+  #channelRequests = 0;
+  #rotating = false;
+  #rotationTimer: ReturnType<typeof setTimeout> | null = null;
+  #held: Array<{ requestId: string; message: NativeToWorkerMessage }> = [];
+  // Stream-opening requests sent on the channel whose stream is not
+  // registered yet: their first frames are already on the way, so the channel
+  // is not idle. A held one is not counted (see `StreamOpening`).
+  #openingStreams = 0;
+  #consumerRefused = false;
+  #consumerRefusals = 0;
 
   constructor(
     private readonly options: HostTransportOptions,
@@ -198,6 +230,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#streams = new HostStreamRuntime({
       send: (type, payload) => this.#sendStreamCommand(type, payload),
       fatal: (error) => this.#fail("host_stream_protocol", error.message),
+      settled: () => this.#settled(),
       timeoutMs: this.#streamTimeout,
     });
   }
@@ -396,6 +429,15 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   request<T>(operation: string, payload?: unknown, options: HostRequestOptions = {}): Promise<T> {
+    return this.#request<T>(operation, payload, options);
+  }
+
+  #request<T>(
+    operation: string,
+    payload: unknown,
+    options: HostRequestOptions = {},
+    opening?: StreamOpening,
+  ): Promise<T> {
     if (this.#state !== "ready") {
       return Promise.reject(
         new HostControlTransportError("not_ready", "Host transport is not ready."),
@@ -412,12 +454,20 @@ class WebViewHostTransport implements StreamingHostTransport {
       );
     }
     const requestId = newUuid();
+    const message: NativeToWorkerMessage = {
+      v: TERMINAL_BRIDGE_VERSION,
+      type: "host-request",
+      requestId,
+      operation,
+      ...(payload === undefined ? {} : { payload }),
+    };
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(
         () => {
           const pending = this.#finishPending(requestId);
           if (!pending) return;
-          this.cancel(requestId);
+          // A held request never reached the daemon: there is nothing to cancel.
+          if (pending.dispatched) this.cancel(requestId);
           pending.reject(
             this.#requestFailure(
               pending,
@@ -433,12 +483,13 @@ class WebViewHostTransport implements StreamingHostTransport {
         timer,
         dispatched: false,
         indeterminate: INDETERMINATE_OPERATIONS.has(operation),
+        ...(opening ? { opening } : {}),
       };
       if (options.signal) {
         const onAbort = () => {
           const current = this.#finishPending(requestId);
           if (!current) return;
-          this.cancel(requestId);
+          if (current.dispatched) this.cancel(requestId);
           current.reject(
             this.#requestFailure(
               current,
@@ -450,20 +501,115 @@ class WebViewHostTransport implements StreamingHostTransport {
         pending.removeAbort = () => options.signal?.removeEventListener("abort", onAbort);
       }
       this.#pending.set(requestId, pending);
-      try {
-        this.#send({
-          v: TERMINAL_BRIDGE_VERSION,
-          type: "host-request",
-          requestId,
-          operation,
-          ...(payload === undefined ? {} : { payload }),
-        });
-        pending.dispatched = true;
-      } catch (error) {
-        this.#finishPending(requestId);
-        reject(error instanceof Error ? error : new Error("Host-control send failed."));
+      if (this.#mustHoldRequests()) {
+        this.#held.push({ requestId, message });
+        this.#rotateWhenIdle();
+        return;
       }
+      this.#dispatch(requestId, message, pending);
     });
+  }
+
+  #dispatch(requestId: string, message: NativeToWorkerMessage, pending: PendingRequest): void {
+    try {
+      this.#send(message);
+      pending.dispatched = true;
+      this.#channelRequests += 1;
+      if (pending.opening) {
+        pending.opening.onChannel = true;
+        this.#openingStreams += 1;
+      }
+    } catch (error) {
+      this.#finishPending(requestId);
+      pending.reject(error instanceof Error ? error : new Error("Host-control send failed."));
+    }
+  }
+
+  #mustHoldRequests(): boolean {
+    return (
+      this.#rotating ||
+      (this.parent !== undefined && this.#channelRequests >= HOST_CONTROL_REQUEST_BUDGET)
+    );
+  }
+
+  /** Every place work on the channel settles calls this; cheap when not due. */
+  #settled(): void {
+    if (this.#rotating || this.#channelRequests < HOST_CONTROL_ROTATE_AFTER_REQUESTS) return;
+    // Deferred: whatever settled may still send its last frame (a stream
+    // cancel) on the channel it belongs to.
+    queueMicrotask(() => this.#rotateWhenIdle());
+  }
+
+  #channelIdle(): boolean {
+    if (this.#openingStreams > 0 || this.#streams.active > 0 || this.#commands.size > 0)
+      return false;
+    for (const pending of this.#pending.values()) if (pending.dispatched) return false;
+    return true;
+  }
+
+  /**
+   * Close a spent tool channel and open its replacement, once nothing is in
+   * flight on it: a stream or request in progress belongs to the channel it
+   * started on, and closing that channel would end it.
+   */
+  #rotateWhenIdle(): void {
+    if (
+      !this.parent ||
+      this.#rotating ||
+      this.#state !== "ready" ||
+      !this.#consumerId ||
+      this.#channelRequests < HOST_CONTROL_ROTATE_AFTER_REQUESTS ||
+      this.parent.state !== "ready" ||
+      !this.#channelIdle()
+    )
+      return;
+    this.#rotating = true;
+    this.#detachConsumer();
+    if (!this.#openConsumer()) return;
+    // A replacement that is never ready must not hold requests for ever.
+    this.#rotationTimer = setTimeout(() => {
+      this.#rotationTimer = null;
+      if (this.#rotating) this.#scheduleReconnect();
+    }, this.options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS);
+  }
+
+  #finishRotation(): void {
+    this.#rotating = false;
+    this.#clearRotationTimer();
+    for (const { requestId, message } of this.#held.splice(0)) {
+      const pending = this.#pending.get(requestId);
+      if (pending && !pending.dispatched) this.#dispatch(requestId, message, pending);
+    }
+  }
+
+  #clearRotationTimer(): void {
+    if (this.#rotationTimer === null) return;
+    clearTimeout(this.#rotationTimer);
+    this.#rotationTimer = null;
+  }
+
+  /**
+   * The worker lost this tool's channel. One the daemon opened and closed
+   * before its hello, while the host connection is fine, was refused for the
+   * tool limit; twice in a row, the tool fails with that reason rather than
+   * retrying until its reconnect budget runs out and blaming the connection.
+   * Any other loss breaks the row.
+   */
+  #consumerChannelLost(): void {
+    if (this.#state === "closed" || this.#state === "failed") return;
+    const refused = this.#consumerRefused && this.parent?.state === "ready";
+    this.#consumerRefused = false;
+    this.#rotating = false;
+    this.#clearRotationTimer();
+    if (!refused) this.#consumerRefusals = 0;
+    else {
+      this.#consumerRefusals += 1;
+      if (this.#consumerRefusals >= HOST_CONSUMER_REFUSALS_BEFORE_FAILURE) {
+        this.#fail(HOST_CONSUMER_LIMIT_CODE, HOST_CONSUMER_LIMIT_MESSAGE);
+        return;
+      }
+    }
+    this.#scheduleReconnect();
   }
 
   cancel(requestId: string): void {
@@ -497,11 +643,30 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   async readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile> {
-    const declaration = await this.#beginIncoming("fs.read", { path }, options);
-    return {
-      ...exposedDeclaration(declaration),
-      stream: this.#streams.beginIncoming(declaration, options),
-    };
+    const opening: StreamOpening = { onChannel: false };
+    try {
+      const declaration = await this.#beginIncoming("fs.read", { path }, opening, options);
+      return {
+        ...exposedDeclaration(declaration),
+        stream: this.#streams.beginIncoming(declaration, options),
+      };
+    } finally {
+      this.#releaseOpening(opening);
+    }
+  }
+
+  /**
+   * A stream-opening request keeps its channel from being swapped from its
+   * dispatch until its stream is registered, in the same continuation as the
+   * response: the stream's first frames are already on their way. Released
+   * once registered (the stream then holds the channel) or failed.
+   */
+  #releaseOpening(opening: StreamOpening): void {
+    if (opening.onChannel) {
+      opening.onChannel = false;
+      this.#openingStreams -= 1;
+    }
+    this.#settled();
   }
 
   async readRange(
@@ -521,13 +686,21 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (!Number.isSafeInteger(length) || length <= 0 || length > rangeLimit) {
       throw new HostControlTransportError("invalid_request", "Range length is invalid.");
     }
-    const declaration = await this.#beginIncoming(
-      "fs.read.range",
-      { path, offset, length },
-      options,
-      rangeLimit,
-    );
-    const stream = this.#streams.beginIncoming(declaration, options);
+    const opening: StreamOpening = { onChannel: false };
+    let declaration: HostReadDeclarationWire;
+    let stream: ReadableStream<Uint8Array>;
+    try {
+      declaration = await this.#beginIncoming(
+        "fs.read.range",
+        { path, offset, length },
+        opening,
+        options,
+        rangeLimit,
+      );
+      stream = this.#streams.beginIncoming(declaration, options);
+    } finally {
+      this.#releaseOpening(opening);
+    }
     const raw = declaration.raw;
     if (declaration.length > length || !Number.isSafeInteger(raw["file_size"])) {
       await stream.cancel("Invalid range declaration.");
@@ -583,21 +756,27 @@ class WebViewHostTransport implements StreamingHostTransport {
       ...options,
       timeoutMs: options.timeoutMs ?? PREVIEW_REQUEST_TIMEOUT_MS,
     };
-    const declaration = await this.#beginIncoming(
-      "fs.preview",
-      { path, max_pixels: maxPixels },
-      requestOptions,
-      this.#capabilities.limits.previewBytes,
-    );
-    const raw = declaration.raw;
-    return {
-      ...exposedDeclaration(declaration),
-      mime: typeof raw["content_type"] === "string" ? raw["content_type"] : "image/png",
-      width: Number.isSafeInteger(raw["width"]) ? (raw["width"] as number) : 0,
-      height: Number.isSafeInteger(raw["height"]) ? (raw["height"] as number) : 0,
-      version: typeof raw["version"] === "string" ? raw["version"] : null,
-      stream: this.#streams.beginIncoming(declaration, requestOptions),
-    };
+    const opening: StreamOpening = { onChannel: false };
+    try {
+      const declaration = await this.#beginIncoming(
+        "fs.preview",
+        { path, max_pixels: maxPixels },
+        opening,
+        requestOptions,
+        this.#capabilities.limits.previewBytes,
+      );
+      const raw = declaration.raw;
+      return {
+        ...exposedDeclaration(declaration),
+        mime: typeof raw["content_type"] === "string" ? raw["content_type"] : "image/png",
+        width: Number.isSafeInteger(raw["width"]) ? (raw["width"] as number) : 0,
+        height: Number.isSafeInteger(raw["height"]) ? (raw["height"] as number) : 0,
+        version: typeof raw["version"] === "string" ? raw["version"] : null,
+        stream: this.#streams.beginIncoming(declaration, requestOptions),
+      };
+    } finally {
+      this.#releaseOpening(opening);
+    }
   }
 
   async writeStream(
@@ -611,11 +790,25 @@ class WebViewHostTransport implements StreamingHostTransport {
       throw new HostControlTransportError("invalid_digest", "Host write digest is invalid.");
     }
     options.onProgress?.({ phase: "declaring", transferred: 0, total: declaration.length });
-    const begin = await this.request<unknown>("fs.write.begin", declaration, {
-      timeoutMs: this.#streamTimeout,
-      ...(options.signal ? { signal: options.signal } : {}),
-    });
-    return this.#streams.write(parseHostWriteStreamId(begin), stream, declaration, options);
+    const opening: StreamOpening = { onChannel: false };
+    let writing: Promise<HostWriteResult>;
+    try {
+      const begin = await this.#request<unknown>(
+        "fs.write.begin",
+        declaration,
+        {
+          timeoutMs: this.#streamTimeout,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+        opening,
+      );
+      // `write` registers its stream before its first await, so the stream
+      // already holds the channel when this claim is released.
+      writing = this.#streams.write(parseHostWriteStreamId(begin), stream, declaration, options);
+    } finally {
+      this.#releaseOpening(opening);
+    }
+    return writing;
   }
 
   async writeFile(
@@ -723,14 +916,17 @@ class WebViewHostTransport implements StreamingHostTransport {
   async #beginIncoming(
     operation: "fs.read" | "fs.read.range" | "fs.preview",
     payload: Record<string, unknown>,
+    opening: StreamOpening,
     options: HostRequestOptions = {},
     declarationLimit?: number,
   ): Promise<HostReadDeclarationWire> {
     this.#requireCapability(operation);
-    const response = await this.request<unknown>(operation, payload, {
-      ...options,
-      timeoutMs: options.timeoutMs ?? this.#streamTimeout,
-    });
+    const response = await this.#request<unknown>(
+      operation,
+      payload,
+      { ...options, timeoutMs: options.timeoutMs ?? this.#streamTimeout },
+      opening,
+    );
     return parseHostReadDeclaration(
       response,
       declarationLimit ?? this.#capabilities?.limits.fileBytes,
@@ -838,6 +1034,8 @@ class WebViewHostTransport implements StreamingHostTransport {
       this.#clearConnectWatchdog();
       this.#connectDeadline = null;
       this.#capabilities = null;
+      // A new peer is a new budget of tool channels at the daemon.
+      this.#consumerRefusals = 0;
       const parentError = this.parent.state === "failed" ? this.parent.lastError : null;
       const error = new HostControlTransportError(
         parentError?.code ?? "connection_lost",
@@ -854,21 +1052,30 @@ class WebViewHostTransport implements StreamingHostTransport {
     }
     if (this.#consumerId) return;
     this.#clearReconnectTimer();
-    this.#consumerId = newUuid();
     this.#capabilities = null;
     this.#setState("connecting");
     this.#armConnectWatchdog();
+    this.#openConsumer();
+  }
+
+  /** Ask the worker for a fresh tool channel. False when it could not. */
+  #openConsumer(): boolean {
+    this.#consumerId = newUuid();
+    this.#consumerRefused = false;
+    this.#channelRequests = 0;
     try {
       this.options.bridge.send({
         v: TERMINAL_BRIDGE_VERSION,
         type: "host-consumer-open",
         consumerId: this.#consumerId,
       });
+      return true;
     } catch (error) {
       this.#fail(
         "host_consumer_open",
         error instanceof Error ? error.message : "Host tool channel could not open.",
       );
+      return false;
     }
   }
 
@@ -1081,7 +1288,10 @@ class WebViewHostTransport implements StreamingHostTransport {
         // may reach a later open() on the same bridge, so it cannot close that
         // replacement or stop its signing and signalling messages.
         if (message.state === "closed") break;
-        if (message.state === "reconnecting") this.#scheduleReconnect();
+        if (message.state === "reconnecting") {
+          if (this.parent) this.#consumerChannelLost();
+          else this.#scheduleReconnect();
+        } else if (message.state === "ready" && this.#rotating) this.#finishRotation();
         else this.#setState(message.state);
         break;
       case "signal-frame":
@@ -1136,6 +1346,12 @@ class WebViewHostTransport implements StreamingHostTransport {
         }
         break;
       case "error":
+        // Not news for anyone listening: one refusal can be a race. The loss
+        // that follows decides (see #consumerChannelLost).
+        if (this.parent && message.code === HOST_CONSUMER_REFUSED_CODE) {
+          this.#consumerRefused = true;
+          break;
+        }
         if (!message.retryable) {
           this.#fail(message.code, message.message);
           break;
@@ -1156,6 +1372,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (message.requestId === HOST_HELLO_BRIDGE_ID) {
       try {
         this.#capabilities = parseHostHello(message.result);
+        this.#consumerRefusals = 0;
         if (!this.parent && !this.hasCapability("session.transport.v1")) {
           this.#fail(
             "daemon_update_required",
@@ -1178,6 +1395,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (command) {
       clearTimeout(command.timer);
       this.#commands.delete(message.requestId);
+      this.#settled();
       if (message.ok) command.resolve();
       else {
         command.reject(
@@ -1208,6 +1426,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#pending.delete(requestId);
     clearTimeout(pending.timer);
     pending.removeAbort?.();
+    if (pending.dispatched) this.#settled();
     return pending;
   }
 
@@ -1249,6 +1468,8 @@ class WebViewHostTransport implements StreamingHostTransport {
       () => {
         this.#connectTimer = null;
         if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
+        // An attempt that timed out was not refused; it breaks a row of refusals.
+        this.#consumerRefusals = 0;
         if (this.#hasEverReady && this.#remainingConnectTime() > 0) {
           this.#scheduleReconnect();
           return;
@@ -1377,6 +1598,11 @@ class WebViewHostTransport implements StreamingHostTransport {
   }
 
   #rejectActive(error: Error): void {
+    // Held requests are still pending, so the loop below settles them.
+    this.#held = [];
+    this.#rotating = false;
+    this.#clearRotationTimer();
+    this.#channelRequests = 0;
     for (const requestId of [...this.#pending.keys()]) {
       const pending = this.#finishPending(requestId);
       if (pending) {

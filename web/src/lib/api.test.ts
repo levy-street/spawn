@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { auth, trust } from "./api";
+import { auth, SESSION_STATUSES, SessionSchema, trust, WorkspaceSchema } from "./api";
+import { isFilesWidget } from "./grid";
 
 const originalFetch = globalThis.fetch;
 
@@ -116,5 +117,83 @@ describe("authenticated API requests", () => {
       credentials: "include",
       body: "{}",
     });
+  });
+});
+
+describe("parsing what a newer server sends", () => {
+  const HOST = "11111111-2222-4333-8444-555555555555";
+  const session = (status: string, activity_state = "active") => ({
+    id: "00000000-0000-4000-8000-000000000009",
+    name: null,
+    host_id: HOST,
+    host_name: "dream",
+    cwd: "/home/me",
+    status,
+    started_at: "2026-10-03T00:00:00Z",
+    exited_at: null,
+    exit_code: null,
+    activity_state,
+    activity_label: "Active",
+  });
+
+  test("an unknown session status reads as starting instead of failing the list", () => {
+    const list = SessionSchema.array().parse([session("running"), session("moving", "moving")]);
+    expect(list.map((item) => item.status)).toEqual(["running", "starting"]);
+    expect(list[1]?.activity_state).toBe("unknown");
+    for (const status of SESSION_STATUSES)
+      expect(SessionSchema.parse(session(status)).status).toBe(status);
+  });
+
+  test("a session status that is not text is still refused", () => {
+    expect(() => SessionSchema.parse(session(7 as unknown as string))).toThrow();
+  });
+
+  const workspace = (widgets: unknown[]) => ({
+    id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    name: "Workspace 1",
+    layout: {
+      version: 3,
+      active_tab: "t1",
+      tabs: [
+        {
+          id: "t1",
+          name: "Tab 1",
+          layout: {
+            version: 3,
+            tiles: widgets.map((widget, index) => ({
+              session_id: `00000000-0000-4000-8000-00000000000${index}`,
+              x: index * 12,
+              y: 0,
+              w: 12,
+              h: 24,
+              widget,
+            })),
+          },
+        },
+      ],
+    },
+    created_at: "2026-10-03T00:00:00Z",
+    updated_at: "2026-10-03T00:00:00Z",
+  });
+
+  test("a widget kind this client does not know parses as an inert pane, kept verbatim", () => {
+    const desktop = { kind: "desktop", host_id: HOST, desktop_id: "d1", fallback: { w: 1280 } };
+    const files = { kind: "files", host_id: HOST, path: "/srv", show_hidden: true };
+    const parsed = WorkspaceSchema.parse(workspace([desktop, files]));
+    const [first, second] = parsed.layout.tabs[0]?.layout.tiles ?? [];
+    expect(isFilesWidget(first?.widget)).toBe(false);
+    expect(first?.widget).toEqual(desktop);
+    expect(isFilesWidget(second?.widget)).toBe(true);
+    // Saving the layout from here sends both back exactly as they came.
+    expect(
+      JSON.parse(JSON.stringify(parsed.layout)).tabs[0].layout.tiles.map(
+        (tile: { widget: unknown }) => tile.widget,
+      ),
+    ).toEqual([desktop, files]);
+  });
+
+  test("a files widget that is not well formed is still refused", () => {
+    expect(() => WorkspaceSchema.parse(workspace([{ kind: "files", host_id: HOST }]))).toThrow();
+    expect(() => WorkspaceSchema.parse(workspace([{ host_id: HOST, path: "/" }]))).toThrow();
   });
 });

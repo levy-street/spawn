@@ -1,4 +1,11 @@
-import { autoPlace, type GridLayout, readingOrder, remove, type Tile } from "@/lib/grid";
+import {
+  autoPlace,
+  type GridLayout,
+  isFilesWidget,
+  readingOrder,
+  remove,
+  type Tile,
+} from "@/lib/grid";
 
 /**
  * Layout schema v3 — the tab envelope. Contract: proto/README.md,
@@ -127,7 +134,8 @@ export function copyTabName(layout: LayoutV3, name: string): string {
  * `session_id` to the id its copy should carry — a freshly created session for
  * a pane, a fresh uuid for a widget. Tiles missing from the map are dropped,
  * which is how a caller refuses to copy a pane whose session it could not
- * recreate.
+ * recreate. A pane from a newer SPAWN D is always dropped, as a template drops
+ * it: this client cannot know what copying it means.
  *
  * `atIndex` is the slot the copy takes, counted in the strip as it stands and
  * clamped to it; left out, the copy goes on the end. The source keeps its own
@@ -148,6 +156,7 @@ export function duplicateTab(
   if (!source) return null;
   const tiles = source.layout.tiles.flatMap((tile) => {
     const copyId = sessionIds.get(tile.session_id);
+    if (tile.widget && !isFilesWidget(tile.widget)) return [];
     return copyId ? [{ ...tile, session_id: copyId }] : [];
   });
   const tabs = [...layout.tabs];

@@ -36,11 +36,36 @@ export const MAX_TILES = 16;
  * Non-session pane content. A widget tile's `session_id` is its own id — the
  * algebra only requires a unique non-empty string, and the server keeps
  * widget tiles instead of pruning them against the session table.
+ *
+ * Fields this client does not know are kept as they arrived, so saving the
+ * layout from here never strips what a newer SPAWN D wrote.
  */
-export interface TileWidget {
+export interface FilesTileWidget {
   kind: "files";
   host_id: string;
   path: string;
+  [field: string]: unknown;
+}
+
+/**
+ * A pane kind from a newer SPAWN D. It is kept exactly as the server sent it,
+ * so moving the pane or saving the layout here never destroys it, and it is
+ * drawn as an inert pane that says it needs a newer version.
+ */
+export interface UnsupportedTileWidget {
+  kind: string;
+  [field: string]: unknown;
+}
+
+export type TileWidget = FilesTileWidget | UnsupportedTileWidget;
+
+/** The only widget kind this client can draw. Everything else is inert. */
+export function isFilesWidget(widget: TileWidget | null | undefined): widget is FilesTileWidget {
+  return (
+    widget?.kind === "files" &&
+    typeof widget.host_id === "string" &&
+    typeof widget.path === "string"
+  );
 }
 
 export interface Tile {
