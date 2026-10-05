@@ -85,7 +85,7 @@ export const MOVE_SWITCHED_CONVERSATION =
 export const MOVE_UNCONFIRMED_CONVERSATION =
   "SPAWN D couldn't confirm which conversation this window is in now. It will bring back the one it started with.";
 
-/** The permission-mode picker: every resumed conversation names its mode. */
+/** The permission-mode picker: every conversation carried to another host names its mode. */
 export const MOVE_MODE_PICKER_TITLE = "Starts in";
 export const moveStartsIn = (mode: string) => `${MOVE_MODE_PICKER_TITLE} ${mode}`;
 export const moveModePickerMessage = (to: string) =>

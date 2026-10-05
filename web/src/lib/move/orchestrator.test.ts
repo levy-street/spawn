@@ -87,7 +87,7 @@ describe("a move that goes through", () => {
       cwd: "/Users/me/code/spawn",
     });
     expect(server.calls).toEqual(["begin", "commit"]);
-    // Every resume carries an explicit mode, and a running agent's note
+    // The arrival carries an explicit mode, and a running agent's note
     // rides the line as its first prompt in a POSIX shell on macOS.
     expect(launcher.prepared?.line).toStartWith(
       `claude --resume ${CONVERSATION} --permission-mode default '[SPAWN D] This conversation just moved from dream (Linux) to mac (macOS)`,

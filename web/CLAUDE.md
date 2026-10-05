@@ -188,13 +188,15 @@ from the catalogue. Every claim about spawnd survives a diff against
   Web Lock claim one tab takes for good, never a timeout that lets a second
   tab do it too. Whoever settles a move — the mover, or any device that
   resolves it — leaves the window running its agent: the resume (put back,
-  the line from `lib/move/put-back.ts`, mode explicit) is queued with
-  `pendingLaunch.claim`, and that device's view of the window takes the
-  display to type it (`usePendingLaunchDrain`) rather than waiting for Take
-  control; with no view of it (a host's page), the outcome says so and
-  offers to open the window. A card saying the window stays "Moving" goes
-  once its row stops reading moving (`useDismissWhenResolved`). The
-  orchestrator, carrier and resolver in `lib/move/` are framework-free and
+  the line from `lib/move/put-back.ts` — the Restart line, naming no mode,
+  so Claude Code comes back in the mode its record carries on the source;
+  only a line that carries the conversation to the target names one) is
+  queued with `pendingLaunch.claim`, and that device's view of the window
+  takes the display to type it (`usePendingLaunchDrain`) rather than
+  waiting for Take control; with no view of it (a host's page), the outcome
+  says so and offers to open the window. A card saying the window stays
+  "Moving" goes once its row stops reading moving (`useDismissWhenResolved`).
+  The orchestrator, carrier and resolver in `lib/move/` are framework-free and
   tested against `lib/move/fakes.ts`; once the target has
   committed, a move only finishes, and a refusal from the server is read
   again rather than believed (`lib/move/server.ts`). Every string a move says

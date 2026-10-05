@@ -113,12 +113,15 @@ scripts/, docs/   build helpers and app-specific notes
   `MoveResolveSheet`) from the moving window, the pane's ⋯ sheet and the host
   page. Whoever settles a move leaves the window running its agent: a
   put-back restarts it with the line from `putBackLine`
-  (`data/selectors/move-facts.ts`, the browser's line, mode explicit) queued
-  for this device, and the device that settled it opens the window (the
-  opening takes control and types it) — from the host page, a toast says the
-  agent resumes when the window is opened and offers Open window. A move
-  held "moving" here that another device settles meanwhile is let go once
-  its row stops reading moving (`resolvedUnderneath`). Every word is in `move-copy.ts`, which the browser mirrors string for
+  (`data/selectors/move-facts.ts`, the browser's line: the Restart line,
+  naming no mode, so Claude Code comes back in the mode its record carries
+  on the source; only a line that carries the conversation to the target
+  names one) queued for this device, and the device that settled it opens
+  the window (the opening takes control and types it) — from the host
+  page, a toast says the agent resumes when the window is opened and offers
+  Open window. A move held "moving" here that another device settles
+  meanwhile is let go once its row stops reading moving
+  (`resolvedUnderneath`). Every word is in `move-copy.ts`, which the browser mirrors string for
   string: `__tests__/move-copy.test.ts` and the browser's
   `lib/move/copy.test.ts` pin the same names to the same sentences, so a
   change to one is a change to both; no daemon or server code and no agent

@@ -2276,8 +2276,10 @@ strings or every one of its `all` strings, or when one line's core matches
 one of its `line_regex`.
 
 1. Find the last line holding any string in
-   `read_below_last_line_containing` (`--permission-mode`: every resume line a
-   move types names its mode, so that line is the shell's echo of it). Only
+   `read_below_last_line_containing` (`--permission-mode`: every line that
+   carries a conversation onto a host names its mode, so that line is the
+   shell's echo of it; a move put back names none, and has no note to wait
+   on, so its screen is never read). Only
    the lines after it are read; with none, all of them are. The echo carries
    the note's server-chosen host names, and whatever was on the screen above
    it — an earlier attempt's error — is not this attempt's.

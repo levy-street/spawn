@@ -1,9 +1,11 @@
 /**
- * The permission mode Claude Code starts in after a move. Every resume line
- * SPAWN D types after a move names one (`--permission-mode`): `claude
- * --resume` otherwise restores the mode its record carries — auto or accept
- * edits — and a carried record must never bring back a mode the person did
- * not choose on the receiving host.
+ * The permission mode Claude Code starts in after a move. Every line that
+ * carries a conversation onto another host names one (`--permission-mode`):
+ * `claude --resume` otherwise restores the mode its record carries — auto or
+ * accept edits — and a carried record must never bring back a mode the
+ * person did not choose on the receiving host. A move put back names none:
+ * it is a Restart on the host the window never left, whose record is that
+ * host's own (`put-back.ts`).
  *
  * Names are Claude Code's own indicators ("manual mode", "plan mode", …),
  * the words its footer shows, read out of its binary; `default` is written
