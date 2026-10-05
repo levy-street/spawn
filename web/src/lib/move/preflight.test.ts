@@ -18,6 +18,7 @@ function probe(overrides: Partial<ConversationProbe> = {}): ConversationProbe {
     duplicates: [],
     live: false,
     loginShell: "/bin/zsh",
+    cliPath: "/Users/me/.local/bin/claude",
     cliVersion: "2.1.289",
     ...overrides,
   };
@@ -133,6 +134,7 @@ describe("moveDialogModel", () => {
     const model = moveDialogModel(
       facts({
         probe: probe({
+          cliPath: null,
           cliVersion: null,
           duplicates: [{ folder: "x", path: "y", size: 1, live: false }],
         }),
@@ -141,6 +143,28 @@ describe("moveDialogModel", () => {
     );
     expect(model.notes).toEqual(["An older copy of this conversation on mac will be set aside."]);
     expect(model.warnings).toEqual(["SPAWN D couldn't find Claude Code on mac."]);
+    expect(model.blocks).toEqual([]);
+  });
+
+  test("Claude Code found there with no version to read is not missing, and is not compared", () => {
+    // The source's Claude is newer than anything: only a version could be older.
+    const newerSource = (cliVersion: string | null) =>
+      moveDialogModel(
+        facts({
+          inspection: inspection({ cli_version: "9.9.999" }),
+          probe: probe({ cliPath: "/opt/spawn/claude", cliVersion }),
+        }),
+        NAMES,
+      );
+    const model = newerSource(null);
+    expect(model.warnings).toEqual([]);
+    expect(model.blocks).toEqual([]);
+    const words = [model.title, model.body, model.stateLine, model.folderLine, ...model.notes];
+    expect(words.join(" ")).not.toContain("/opt/spawn/claude");
+    // Found with a version: compared as before.
+    expect(newerSource("2.1.289").warnings).toEqual([
+      "Claude Code on mac (2.1.289) is older than on dream (9.9.999).",
+    ]);
   });
 
   test("a window that switched conversations says which one goes; one the host cannot name warns", () => {

@@ -145,12 +145,34 @@ describe("preview: what the dialog says before anything changes", () => {
 
   it("a repository here and none there is said; Claude Code not found there is a warning", async () => {
     const w = world();
-    w.target.probe = { ...w.target.probe, cliVersion: null };
+    w.target.probe = { ...w.target.probe, cliPath: null, cliVersion: null };
     w.source.files.set("/home/me/code/spawn/.git/HEAD", `${"c".repeat(40)}\n`);
     const preview = await ready(w);
     expect(preview.dialog.warnings).toEqual([
       "~/code/spawn on mac isn't a git repository, so SPAWN D can't compare it with the one here.",
       "SPAWN D couldn't find Claude Code on mac.",
+    ]);
+  });
+
+  it("Claude Code found there with no version to read is not missing, and is not compared", async () => {
+    // The source's Claude is newer than anything: only a version could be older.
+    const newerSource = (cliVersion: string | null) => {
+      const w = world();
+      w.source.inspection = {
+        ...(w.source.inspection as NonNullable<typeof w.source.inspection>),
+        cli_version: "9.9.999",
+      };
+      w.target.probe = { ...w.target.probe, cliPath: "/opt/spawn/claude", cliVersion };
+      return w;
+    };
+    const preview = await ready(newerSource(null));
+    expect(preview.dialog.warnings).toEqual([]);
+    const words = [preview.dialog.body, preview.dialog.stateLine, ...preview.dialog.info].join(" ");
+    expect(words).not.toContain("/opt/spawn/claude");
+
+    // Found with a version: compared as before.
+    expect((await ready(newerSource("2.1.289"))).dialog.warnings).toEqual([
+      "Claude Code on mac (2.1.289) is older than on dream (9.9.999).",
     ]);
   });
 

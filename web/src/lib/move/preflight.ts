@@ -221,7 +221,11 @@ export function moveDialogModel(
   if (facts.seconds !== null && facts.seconds > SHOW_ESTIMATE_SECONDS)
     warnings.push(durationWarning(formatDuration(facts.seconds)));
   const sourceVersion = facts.inspection?.cli_version ?? null;
-  if (probe && probe.cliVersion === null) warnings.push(claudeNotFoundWarning(target));
+  // Missing only when nothing was found: a `cliPath` with no version is a
+  // Claude Code whose version is unknown, with nothing to compare. A daemon
+  // that predates `cli_path` leaves it null, so its null version reads as before.
+  if (probe && probe.cliVersion === null && probe.cliPath === null)
+    warnings.push(claudeNotFoundWarning(target));
   else if (probe?.cliVersion && sourceVersion && olderVersion(probe.cliVersion, sourceVersion))
     warnings.push(olderClaudeWarning(target, probe.cliVersion, source, sourceVersion));
   if (probe && probe.duplicates.length > 0 && !probe.live) notes.push(duplicateNote(target));

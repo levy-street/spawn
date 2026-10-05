@@ -135,6 +135,10 @@ function optionalString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 function requiredString(value: unknown, what: string): string {
   if (typeof value !== "string" || value.length === 0) throw invalid(what);
   return value;
@@ -177,6 +181,11 @@ export interface ConversationProbe {
   readonly live: boolean | null;
   /** The shell the host's windows start, by name. */
   readonly loginShell: string | null;
+  /** The file `claude` resolves to on the target, or null; a daemon that
+   *  predates the field omits it, read as null. */
+  readonly cliPath: string | null;
+  /** Claude Code's version there, read from where it is installed, or null.
+   *  With a `cliPath` it is found but its version unknown, not missing. */
   readonly cliVersion: string | null;
 }
 
@@ -215,6 +224,7 @@ export function parseConversationProbe(value: unknown): ConversationProbe {
     ),
     live: typeof live === "boolean" ? live : null,
     loginShell: optionalString(record["login_shell"]),
+    cliPath: nonEmptyString(record["cli_path"]),
     cliVersion: optionalString(record["cli_version"]),
   });
 }

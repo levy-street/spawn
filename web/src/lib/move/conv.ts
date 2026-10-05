@@ -89,6 +89,10 @@ function text(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function nonEmptyText(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 function count(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -135,6 +139,11 @@ export interface ConversationProbe {
   /** A Claude on the target holds the conversation now; null when not asked. */
   live: boolean | null;
   loginShell: string | null;
+  /** The file `claude` resolves to on the target, or null; a daemon that
+   *  predates the field omits it, read as null. */
+  cliPath: string | null;
+  /** Claude Code's version there, read from where it is installed, or null.
+   *  With a `cliPath` it is found but its version unknown, not missing. */
   cliVersion: string | null;
 }
 
@@ -171,6 +180,7 @@ export function parseProbe(value: unknown): ConversationProbe {
     duplicates,
     live: typeof answer.live === "boolean" ? answer.live : null,
     loginShell: text(answer.login_shell),
+    cliPath: nonEmptyText(answer.cli_path),
     cliVersion: text(answer.cli_version),
   };
 }

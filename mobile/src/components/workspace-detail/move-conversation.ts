@@ -468,8 +468,12 @@ export async function previewMove(
     }
   }
   // Not a block: a login shell's PATH can find what the daemon's cannot.
-  if (probe.cliVersion === null) warnings.push(copy.moveAgentNotFound(to.name));
-  else if (olderVersion(probe.cliVersion, about?.cli_version ?? null)) {
+  // Missing only when nothing was found: a `cliPath` with no version is a
+  // Claude Code whose version is unknown, with nothing to compare. A daemon
+  // that predates `cli_path` leaves it null, so its null version reads as before.
+  if (probe.cliVersion === null) {
+    if (probe.cliPath === null) warnings.push(copy.moveAgentNotFound(to.name));
+  } else if (olderVersion(probe.cliVersion, about?.cli_version ?? null)) {
     warnings.push(
       copy.moveOlderAgent(to.name, probe.cliVersion, from.name, about?.cli_version ?? ""),
     );

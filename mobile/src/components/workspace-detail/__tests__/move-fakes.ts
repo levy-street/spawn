@@ -117,6 +117,7 @@ export class FakeDaemon implements MoveChannel {
     duplicates: [],
     live: false,
     loginShell: "zsh",
+    cliPath: "/Users/me/.local/bin/claude",
     cliVersion: "2.1.289",
   };
   files = new Map<string, string>();
