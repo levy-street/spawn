@@ -175,6 +175,7 @@ export const SendToHost = forwardRef<SendToHostHandle, SendToHostProps>(function
   }, [locating, sameFolderThere, state, target]);
 
   const names = items.map((item) => item.name);
+  const sendLabel = target ? sendTitle(names, target.name) : "";
   const destLabel =
     destination && targetHome && pathsEqual(destination, targetHome, targetFlavor)
       ? "Home"
@@ -258,8 +259,8 @@ export const SendToHost = forwardRef<SendToHostHandle, SendToHostProps>(function
           {target && destination && (
             <>
               <DialogHeader>
-                <DialogTitle>{sendTitle(names, target.name)}</DialogTitle>
-                <DialogDescription className="text-xs">
+                <DialogTitle className="break-words">{sendLabel}</DialogTitle>
+                <DialogDescription className="break-words text-xs">
                   <span title={displayPath(destination)}>
                     {sendDestinationLine(destLabel, target.name)}
                   </span>{" "}
@@ -293,10 +294,14 @@ export const SendToHost = forwardRef<SendToHostHandle, SendToHostProps>(function
                 </p>
                 <p className="text-xs text-muted-foreground">{PERMISSIONS_NOT_COPIED}</p>
               </div>
+              {/* The send button says the whole sentence, which a long name or
+                host can make wider than the dialog. It gives way, cut short
+                with the title above saying it in full, and Cancel never does. */}
               <DialogFooter>
                 <Button
                   variant="ghost"
                   size="sm"
+                  className="shrink-0"
                   onClick={() => {
                     setTarget(null);
                     setDestination(null);
@@ -304,8 +309,14 @@ export const SendToHost = forwardRef<SendToHostHandle, SendToHostProps>(function
                 >
                   Cancel
                 </Button>
-                <Button size="sm" onClick={send} disabled={!transfers}>
-                  {sendTitle(names, target.name)}
+                <Button
+                  size="sm"
+                  className="min-w-0"
+                  title={sendLabel}
+                  onClick={send}
+                  disabled={!transfers}
+                >
+                  <span className="truncate">{sendLabel}</span>
                 </Button>
               </DialogFooter>
             </>

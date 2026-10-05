@@ -1840,9 +1840,9 @@ operations answers another with `too_many_tasks`.
 `conv.probe {agent:"claude-code", conversation_id?, cwd}` — the target's facts
 before a move: `{agent, home, cwd, folder_exists, project_folder, store,
 store_ready, store_problem, destination, memory, repository_root, duplicates,
-duplicates_truncated, live, login_shell, cli_version}`. `cwd` is the folder with
-every link resolved (what Claude Code files it under, inside home); `store`
-is `CLAUDE_CONFIG_DIR` or `~/.claude`; `destination` is
+duplicates_truncated, live, login_shell, cli_path, cli_version}`. `cwd` is
+the folder with every link resolved (what Claude Code files it under, inside
+home); `store` is `CLAUDE_CONFIG_DIR` or `~/.claude`; `destination` is
 `<store>/projects/<folder>` by Claude Code's own folder rule; `memory` is the
 memory folder of the folder's repository root (a linked worktree's main
 working tree, read from `.git` and `commondir`, never by running git), or of
@@ -1852,11 +1852,18 @@ at most 16); `live` (null without a `conversation_id`) says whether a process
 on the target holds the conversation now, by the same fail-closed reading the
 source's fence uses — which copy it holds is not said, so every duplicate
 carries the same value — and an import is refused while it does;
-`login_shell` is the shell the host's windows start, by name; and
-`cli_version` is Claude Code's version, read from where it is installed and
-never by running it, or null. `store_ready` is false — with the reason — when
-the store is missing, outside home, behind a link, or on another filesystem
-from spawnd's holdings.
+`login_shell` is the shell the host's windows start, by name; `cli_path` is
+the file `claude` resolves to — the first on the PATH the host's windows are
+given (the one its latest window was given, else the daemon's own behind the
+common user bin folders; the probe never asks a shell), then Claude Code's
+native link in `~/.local/bin` — or null when there is none; and
+`cli_version` is that one's version, read from where it is installed and
+never by running it, or null. A `cli_path` with a null `cli_version` is a
+Claude Code found whose version is unknown (copied onto the PATH, behind a
+wrapper script), not a missing one; a daemon that predates `cli_path` omits
+it, and a client then reads a null `cli_version` as it always did.
+`store_ready` is false — with the reason — when the store is missing, outside
+home, behind a link, or on another filesystem from spawnd's holdings.
 
 `conv.export {transfer_id, agent, conversation_id, mode:"retire", session_id,
 to_host_id, cwd?, include?, stream?, from_sequence?}` opens a v2 read and

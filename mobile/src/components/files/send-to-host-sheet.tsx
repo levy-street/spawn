@@ -44,7 +44,7 @@ import type { HostDirEntry } from "@/components/files/types";
 import { type ConflictAsked, ConflictQuestion } from "@/components/files/upload-conflict-sheet";
 import { FolderPicker } from "@/components/launcher/folder-picker";
 import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
-import { Button } from "@/components/ui/button";
+import { Button, buttonContentColor } from "@/components/ui/button";
 import { DrawerRow } from "@/components/ui/drawer-row";
 import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
@@ -418,6 +418,7 @@ export function SendToHostSheet({
   );
 
   const counting = plan === null && planError === null;
+  const confirmLabel = warnRelay ? proceedAnywayLabel("send") : sendLabel;
   const confirm = (
     <SheetScrollView contentContainerStyle={styles.confirm}>
       <View style={styles.section}>
@@ -490,16 +491,29 @@ export function SendToHostSheet({
             </Text>
           </View>
         ) : null}
+        {/* The send button says the whole sentence, which a long name or host
+          can make wider than the phone. It gives way, cut in the middle so
+          the host it goes to still shows (the bar above already cuts the same
+          sentence at its end), and Cancel never does. */}
         <View style={styles.actions}>
-          <Button onPress={onDismiss} variant="outline">
+          <Button onPress={onDismiss} style={styles.cancel} variant="outline">
             Cancel
           </Button>
           <Button
+            accessibilityLabel={confirmLabel}
             disabled={!plan || plan.tooMany !== null || plan.items.length === 0 || checking}
             onPress={() => void send()}
+            style={styles.confirmButton}
             testID="send-confirm"
           >
-            {warnRelay ? proceedAnywayLabel("send") : sendLabel}
+            <Text
+              color={buttonContentColor("default")}
+              ellipsizeMode="middle"
+              numberOfLines={1}
+              variant="label"
+            >
+              {confirmLabel}
+            </Text>
           </Button>
         </View>
       </View>
@@ -592,6 +606,7 @@ export function SendToHostSheet({
 const styles = StyleSheet.create({
   actions: { flexDirection: "row", gap: spacing[2], justifyContent: "flex-end" },
   backPlaceholder: { height: spacing[9], width: spacing[9] },
+  cancel: { flexShrink: 0 },
   centered: {
     alignItems: "center",
     flex: 1,
@@ -600,6 +615,7 @@ const styles = StyleSheet.create({
     padding: spacing[6],
   },
   confirm: { gap: spacing[3], paddingVertical: spacing[4] },
+  confirmButton: { flexShrink: 1 },
   error: { margin: spacing[4], padding: spacing[3] },
   flex: { flex: 1 },
   inline: { alignItems: "center", flexDirection: "row", gap: spacing[2] },

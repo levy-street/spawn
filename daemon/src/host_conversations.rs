@@ -38,7 +38,9 @@
 //! Nothing is executed. Every file read is hostile input: bounded, reached
 //! without following a link, through the home capability or spawnd's own
 //! private holdings. Stopping processes is signalling them, through a pidfd
-//! on Linux so a recycled pid is never signalled.
+//! on Linux so a recycled pid is never signalled. A probe looks for Claude
+//! Code on the PATH the daemon's windows are given (`run::window_path`),
+//! and never asks the user's shell for it: only a window's launch does.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -121,6 +123,8 @@ const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SMALL_FILE_BYTES: u64 = 64 * 1024;
 /// Copies of a conversation a probe names.
 const MAX_REPORTED_DUPLICATES: usize = 16;
+/// Folders of the windows' PATH a probe looks through for Claude Code.
+const MAX_PATH_ENTRIES: usize = 64;
 /// How long a window's processes have to go after TERM, then after KILL.
 const AGENT_TERM_GRACE: Duration = Duration::from_secs(3);
 const AGENT_KILL_GRACE: Duration = Duration::from_secs(2);
@@ -178,6 +182,7 @@ pub(crate) type StopFuture = Pin<Box<dyn Future<Output = WindowStop> + Send>>;
 type StopFn = dyn Fn(Uuid) -> StopFuture + Send + Sync;
 type IncarnationFn = dyn Fn(Uuid) -> Option<u64> + Send + Sync;
 type ShellNameFn = dyn Fn() -> String + Send + Sync;
+type WindowPathFn = dyn Fn() -> Option<String> + Send + Sync;
 
 /// Where a retire is, for a test that acts between its steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +206,9 @@ pub(crate) struct Places {
     /// above, as `conv.inspect` reads them.
     registry_stores: Option<Vec<PathBuf>>,
     login_shell: Arc<ShellNameFn>,
+    /// The PATH the daemon's windows are given (`run::window_path`), where
+    /// the probe looks for Claude Code.
+    window_path: Arc<WindowPathFn>,
     #[cfg(test)]
     move_hook: Option<Arc<dyn Fn(MovePoint) + Send + Sync>>,
     /// The free space a test's filesystem reports.
@@ -210,13 +218,17 @@ pub(crate) struct Places {
 
 impl Places {
     /// The daemon's own: its config dir, the store its environment names,
-    /// and the login shell its windows start.
-    pub(crate) fn from_env(login_shell: fn() -> String) -> Self {
+    /// and the login shell its windows start and the PATH they are given.
+    pub(crate) fn from_env(
+        login_shell: fn() -> String,
+        window_path: fn() -> Option<String>,
+    ) -> Self {
         Self {
             holdings: None,
             claude_store: None,
             registry_stores: None,
             login_shell: Arc::new(login_shell),
+            window_path: Arc::new(window_path),
             #[cfg(test)]
             move_hook: None,
             #[cfg(test)]
@@ -231,6 +243,7 @@ impl Places {
             registry_stores: Some(vec![claude_store.clone()]),
             claude_store: Some(claude_store),
             login_shell: Arc::new(|| "bash".to_string()),
+            window_path: Arc::new(|| None),
             move_hook: None,
             free_space: None,
         }
@@ -1395,31 +1408,41 @@ fn worktree_main(files: &HostFileService, dir: &Dir, here: &Path) -> Option<Stri
     main.to_str().map(str::to_string)
 }
 
-/// Claude Code's version, read from where it is installed and never by
-/// running it: a native install's `versions/<version>`, a Homebrew cask's
-/// `claude-code/<version>/`, or the `package.json` beside an npm install's
-/// entry point inside home.
-fn claude_version(files: &HostFileService) -> Option<String> {
-    let mut candidates = vec![Path::new(&files.home_dir()).join(".local/bin/claude")];
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(
+/// The Claude Code a window of this host runs when `claude` is typed in it.
+struct ClaudeCli {
+    /// The file `claude` resolves to, every link resolved.
+    path: PathBuf,
+    /// Its version, when where it is installed says.
+    version: Option<String>,
+}
+
+/// The `claude` a window of this host would run: the first on the PATH its
+/// windows are given (`run::window_path`, at most `MAX_PATH_ENTRIES`
+/// absolute folders of it), else Claude Code's native link in
+/// `~/.local/bin`, resolved by the daemon's own rule for agents
+/// (`run::resolve_on_path`). Its version is read from where it is installed
+/// and never by running it: a native install's `versions/<version>`, a
+/// Homebrew cask's `claude-code/<version>/`, or the `package.json` beside an
+/// npm install's entry point inside home. A `claude` installed any other way
+/// — copied onto the PATH, behind a wrapper script — is found with its
+/// version unknown.
+fn claude_cli(files: &HostFileService, places: &Places) -> Option<ClaudeCli> {
+    let native = Path::new(&files.home_dir()).join(".local/bin");
+    let mut folders: Vec<PathBuf> = (places.window_path)()
+        .map(|path| {
             std::env::split_paths(&path)
-                .take(64)
-                .map(|dir| dir.join("claude")),
-        );
+                .filter(|folder| folder.is_absolute())
+                .take(MAX_PATH_ENTRIES)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !folders.contains(&native) {
+        folders.push(native);
     }
-    for candidate in candidates {
-        let Ok(target) = std::fs::canonicalize(&candidate) else {
-            continue;
-        };
-        if let Some(version) = version_from_install_path(&target) {
-            return Some(version);
-        }
-        if let Some(version) = npm_package_version(files, &target) {
-            return Some(version);
-        }
-    }
-    None
+    let search = std::env::join_paths(folders).ok()?.into_string().ok()?;
+    let path = crate::run::resolve_on_path("claude", search)?;
+    let version = version_from_install_path(&path).or_else(|| npm_package_version(files, &path));
+    Some(ClaudeCli { path, version })
 }
 
 fn plausible_version(text: &str) -> bool {
@@ -1470,7 +1493,9 @@ impl Carrier {
     /// What a device needs from a target before it moves a conversation
     /// there: the folder as Claude Code will see it, where the record would
     /// land, where its memory lives, whether any copy of the conversation is
-    /// already here, the login shell, and Claude Code's version.
+    /// already here, the login shell, and the Claude Code its windows would
+    /// run and that one's version — a Claude Code found whose version is
+    /// unknown is still found.
     pub(crate) async fn probe(&self, request: ProbeRequest) -> FsResult<Value> {
         self.blocking(move |files, places, operations| {
             probe_sync(files, places, operations, &request)
@@ -1560,6 +1585,7 @@ fn probe_sync(
         }
         Err(failure) => (None, Some(failure.code), None, None),
     };
+    let cli = claude_cli(files, places);
     Ok(json!({
         "agent": CLAUDE_CODE,
         "home": files.home_dir(),
@@ -1576,7 +1602,8 @@ fn probe_sync(
         "duplicates_truncated": duplicates_truncated,
         "live": live,
         "login_shell": (places.login_shell)(),
-        "cli_version": claude_version(files),
+        "cli_path": cli.as_ref().map(|cli| cli.path.to_string_lossy().into_owned()),
+        "cli_version": cli.and_then(|cli| cli.version),
     }))
 }
 
@@ -1828,6 +1855,7 @@ pub(crate) fn collect_held() {
         claude_store: None,
         registry_stores: None,
         login_shell: Arc::new(String::new),
+        window_path: Arc::new(|| None),
         #[cfg(test)]
         move_hook: None,
         #[cfg(test)]
@@ -4284,6 +4312,11 @@ mod tests {
         assert_eq!(answer["live"], false);
         #[cfg(unix)]
         assert_eq!(answer["cli_version"], "2.1.288");
+        #[cfg(unix)]
+        assert_eq!(
+            answer["cli_path"],
+            versions.join("2.1.288").to_str().unwrap()
+        );
         let duplicates = answer["duplicates"].as_array().unwrap();
         assert_eq!(duplicates.len(), 1);
         assert_eq!(
@@ -4315,6 +4348,94 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// An executable `claude` at `path` that leaves `ran` behind if anything
+    /// runs it.
+    fn write_claude(path: &Path, ran: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_probe_finds_the_claude_a_window_would_run_without_running_it() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside = std::fs::canonicalize(outside.path()).unwrap();
+        let ran = outside.join("ran");
+        let window_path: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let given = Arc::clone(&window_path);
+        let host = Host::build(None, Arc::new(|| WindowStop::NotRunning), move |places| {
+            places.window_path = Arc::new(move || given.lock().unwrap().clone());
+        })
+        .await;
+        let set_path = |folders: &[&Path]| {
+            *window_path.lock().unwrap() = Some(
+                std::env::join_paths(folders)
+                    .unwrap()
+                    .into_string()
+                    .unwrap(),
+            );
+        };
+        let probe = || {
+            let carrier = host.carrier.clone();
+            async move {
+                carrier
+                    .probe(
+                        ProbeRequest::parse(
+                            json!({"agent": "claude-code", "cwd": "~"}).as_object(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Nowhere: not on the windows' PATH, no native link.
+        set_path(&[&outside.join("empty")]);
+        let answer = probe().await;
+        assert_eq!(answer["cli_path"], Value::Null);
+        assert_eq!(answer["cli_version"], Value::Null);
+
+        // Claude Code installed natively, and a `claude` copied onto the
+        // windows' PATH ahead of it, outside every install layout: a window
+        // runs the copy, so the copy is what is found, its version unknown —
+        // found, not missing.
+        let versions = host.home.join(".local/share/claude/versions");
+        write_claude(&versions.join("2.1.288"), &ran);
+        std::fs::create_dir_all(host.home.join(".local/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            versions.join("2.1.288"),
+            host.home.join(".local/bin/claude"),
+        )
+        .unwrap();
+        let copied = outside.join("opt/spawn/claude");
+        write_claude(&copied, &ran);
+        set_path(&[copied.parent().unwrap(), &host.home.join(".local/bin")]);
+        let answer = probe().await;
+        assert_eq!(answer["cli_path"], copied.to_str().unwrap());
+        assert_eq!(answer["cli_version"], Value::Null);
+
+        // A Homebrew cask's on the windows' PATH says its version by where it is.
+        let cask = outside.join("Caskroom/claude-code/2.1.290/claude");
+        write_claude(&cask, &ran);
+        set_path(&[cask.parent().unwrap(), copied.parent().unwrap()]);
+        let answer = probe().await;
+        assert_eq!(answer["cli_path"], cask.to_str().unwrap());
+        assert_eq!(answer["cli_version"], "2.1.290");
+
+        // A PATH without the native link still finds it, after the PATH.
+        set_path(&[&outside.join("empty")]);
+        let answer = probe().await;
+        assert_eq!(
+            answer["cli_path"],
+            versions.join("2.1.288").to_str().unwrap()
+        );
+        assert_eq!(answer["cli_version"], "2.1.288");
+
+        assert!(!ran.exists(), "the probe ran a claude");
     }
 
     #[tokio::test]
