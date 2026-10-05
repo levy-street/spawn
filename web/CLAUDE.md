@@ -231,8 +231,11 @@ generated type paths never rewrite the tracked `tsconfig.json`.
 In CI the suite compiles every page and route handler under `src/app` before
 its first test (`tests/e2e/global-setup.ts`), and the dev server Playwright
 starts keeps them compiled for the run (`SPAWN_E2E_KEEP_ROUTES`, read in
-`next.config.ts`), so nothing compiles or rebuilds under a test. A new route
-needs nothing more: the setup finds it.
+`next.config.ts`), so nothing compiles or rebuilds under a test. A new page
+or route handler (`page` or `route`, as `.tsx`, `.ts`, `.jsx` or `.js`)
+needs nothing more: the setup finds it. Metadata routes such as `robots.ts`
+and `sitemap.ts` are not warmed; a test that visits one pays its first
+compile.
 
 ## Keeping this file true
 

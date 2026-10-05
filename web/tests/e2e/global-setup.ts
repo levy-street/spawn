@@ -1,5 +1,5 @@
 import { readdirSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import type { FullConfig } from "@playwright/test";
 
 /**
@@ -31,8 +31,12 @@ export default async function warmEveryRoute(config: FullConfig) {
   if (!process.env.CI || process.env.SPAWN_E2E_BASE_URL) return;
   const baseURL = config.projects[0]?.use.baseURL;
   if (!baseURL) return;
+  // The app beside the config, as the dev server Playwright starts runs
+  // there, not where Playwright itself was started (`-c web/...` from the
+  // repository's root).
+  const webDir = config.configFile ? dirname(config.configFile) : process.cwd();
   // The first proxied request that fails compiles the error page.
-  const paths = ["/api/e2e-warm", ...appRoutes(join(process.cwd(), "src", "app"))];
+  const paths = ["/api/e2e-warm", ...appRoutes(join(webDir, "src", "app"))];
   for (const path of paths) {
     const started = Date.now();
     const response = await fetch(new URL(path, baseURL), {
@@ -44,15 +48,18 @@ export default async function warmEveryRoute(config: FullConfig) {
   }
 }
 
-/** Every page and route handler under `src/app`, a dynamic segment filled
- *  with a placeholder: any value compiles the route, which is all this is for. */
+/** Every page and route handler under `src/app` (`page` or `route` with any
+ *  of Next's default extensions, `.tsx`, `.ts`, `.jsx`, `.js`), a dynamic
+ *  segment filled with a placeholder: any value compiles the route, which is
+ *  all this is for. Metadata routes (`robots.ts`, `sitemap.ts`) are left
+ *  cold: no test visits one. */
 function appRoutes(appDir: string): string[] {
   const routes: string[] = [];
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) walk(path);
-      else if (entry.name === "page.tsx" || entry.name === "route.ts") {
+      else if (/^(page|route)\.[jt]sx?$/.test(entry.name)) {
         const segments = relative(appDir, dir)
           .split(sep)
           .filter((segment) => segment && !/^\(.*\)$/.test(segment))
