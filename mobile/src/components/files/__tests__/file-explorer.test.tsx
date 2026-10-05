@@ -3,30 +3,18 @@ import { fireEvent, render, screen } from "@testing-library/react-native";
 import type { ReactNode } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { fakeHost, fileEntry, folderEntry } from "@/components/files/__tests__/fixtures";
 import { FileExplorer } from "@/components/files/file-explorer";
-import type { HostDirEntry } from "@/components/files/types";
+import { resetExplorerPrefs } from "@/data/stores/explorer-prefs";
 import {
   HOST_CONSUMER_LIMIT_CODE,
   HOST_CONSUMER_LIMIT_MESSAGE,
 } from "@/terminal/transport/host-ctl-codec";
+import type { HostTransport } from "@/terminal/transport/types";
 import { ThemeProvider } from "@/theme";
 
-const mockTransport = {
-  hostId: "host-1",
-  state: "ready",
-  open: jest.fn(async () => undefined),
-  close: jest.fn(),
-  request: jest.fn(),
-  stream: jest.fn(),
-  on: jest.fn(() => () => undefined),
-};
-
-const mockEntries: HostDirEntry[] = [
-  { is_dir: true, kind: "directory", name: "dev", path: "/Users/charlie/dev" },
-  { is_dir: false, kind: "file", name: ".zshrc", path: "/Users/charlie/.zshrc", size: 23 },
-  { is_dir: false, kind: "file", name: "notes.md", path: "/Users/charlie/notes.md", size: 40 },
-];
-
+const HOME = "/Users/charlie";
+let mockTransport: HostTransport | null = null;
 let mockSurfaceFailure: { code: string; message: string } | null = null;
 
 jest.mock("@/terminal/HostTransportSurface", () => {
@@ -55,23 +43,7 @@ jest.mock("@/terminal/HostTransportSurface", () => {
   };
 });
 
-jest.mock("@/data/queries/files", () => ({
-  createHostFolder: jest.fn(),
-  removeHostEntry: jest.fn(),
-  renameHostEntry: jest.fn(),
-  useHostDirectory: () => ({
-    data: { pages: [{ entries: mockEntries, home_dir: "/Users/charlie", path: "/Users/charlie" }] },
-    error: null,
-    fetchNextPage: jest.fn(),
-    hasNextPage: false,
-    isError: false,
-    isFetchingNextPage: false,
-    isLoading: false,
-    isRefetching: false,
-    refetch: jest.fn(),
-  }),
-  useHostHome: () => ({ data: { home_dir: "/Users/charlie" }, isLoading: false }),
-}));
+jest.mock("@react-navigation/native", () => ({ useIsFocused: () => true }));
 
 interface MockListProps<T> {
   data: readonly T[];
@@ -100,18 +72,21 @@ jest.mock("@shopify/flash-list", () => {
 
 jest.mock("expo-clipboard", () => ({ setStringAsync: jest.fn(async () => undefined) }));
 
-// The viewer's web view has no native module here, and nothing below opens it.
-jest.mock("react-native-webview", () => ({ __esModule: true, default: () => null }));
-
 const METRICS = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
   insets: { top: 47, right: 0, bottom: 34, left: 0 },
 };
 
+const clients: QueryClient[] = [];
+
 function renderExplorer(onBack = jest.fn()) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: Number.POSITIVE_INFINITY } },
+  });
+  clients.push(client);
   return render(
     <SafeAreaProvider initialMetrics={METRICS}>
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={client}>
         <ThemeProvider>
           <FileExplorer
             hostId="host-1"
@@ -125,20 +100,35 @@ function renderExplorer(onBack = jest.fn()) {
   );
 }
 
+beforeEach(() => {
+  resetExplorerPrefs();
+  mockTransport = fakeHost({
+    home: HOME,
+    folders: {
+      [HOME]: [
+        folderEntry(HOME, "dev"),
+        fileEntry(HOME, ".zshrc", { size: 23 }),
+        fileEntry(HOME, "notes.md", { size: 40 }),
+      ],
+      [`${HOME}/dev`]: [fileEntry(`${HOME}/dev`, "main.rs")],
+    },
+  }).transport;
+});
+
 afterEach(() => {
   mockSurfaceFailure = null;
+  for (const client of clients.splice(0)) client.clear();
 });
 
 describe("FileExplorer", () => {
-  test("wears one header, naming the machine under the screen's name", async () => {
+  test("wears one header, naming the machine and the folder under the screen's name", async () => {
     const onBack = jest.fn();
     await renderExplorer(onBack);
 
     expect(screen.getByRole("header", { name: "Files" })).toBeOnTheScreen();
-    expect(screen.getByText("Charlies-MacBook-Pro.local")).toBeOnTheScreen();
+    expect(await screen.findByText("Charlies-MacBook-Pro.local · ~")).toBeOnTheScreen();
     // No second bar with a second arrow: the breadcrumbs are the way up.
     expect(screen.queryByRole("button", { name: "Go to parent folder" })).toBeNull();
-    expect(screen.queryByText("Connected")).toBeNull();
     expect(screen.getAllByRole("button", { name: "Go back" })).toHaveLength(1);
     expect(screen.getByTestId("file-breadcrumbs")).toBeOnTheScreen();
 
@@ -146,18 +136,24 @@ describe("FileExplorer", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  test("keeps the folder's controls behind the header's overflow", async () => {
+  test("keeps the folder's controls behind one overflow, beside the filter", async () => {
     await renderExplorer();
-    expect(screen.getByText(".zshrc")).toBeOnTheScreen();
+    expect(await screen.findByText("notes.md")).toBeOnTheScreen();
+    expect(screen.getByLabelText("Filter this folder")).toBeOnTheScreen();
 
     await fireEvent.press(screen.getByRole("button", { name: "Folder actions" }));
     expect(screen.getByText("New folder")).toBeOnTheScreen();
-    await fireEvent.press(screen.getByText("Hide dotfiles"));
+    expect(screen.getByText("New file")).toBeOnTheScreen();
+    expect(screen.getByText("Go to folder…")).toBeOnTheScreen();
+    expect(screen.getByText("Select")).toBeOnTheScreen();
+    expect(screen.getByText("View options…")).toBeOnTheScreen();
+  });
 
-    expect(screen.queryByText(".zshrc")).toBeNull();
-    expect(screen.getByText("notes.md")).toBeOnTheScreen();
-    await fireEvent.press(screen.getByRole("button", { name: "Folder actions" }));
-    expect(screen.getByText("Show dotfiles")).toBeOnTheScreen();
+  test("without a route to push, a folder opens in place", async () => {
+    await renderExplorer();
+    await fireEvent.press(await screen.findByTestId("file-row-dev"));
+    expect(await screen.findByText("main.rs")).toBeOnTheScreen();
+    expect(screen.getByText("Charlies-MacBook-Pro.local · ~/dev")).toBeOnTheScreen();
   });
 
   test("a refused tool channel says too many views are open, and offers Retry", async () => {

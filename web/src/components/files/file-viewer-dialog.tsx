@@ -11,7 +11,6 @@ import {
   MoreHorizontal,
 } from "lucide-react";
 import { type KeyboardEvent, useEffect, useState } from "react";
-import { formatSize } from "@/components/files/FileExplorer";
 import { FileIcon } from "@/components/files/file-icon";
 import {
   CodeLines,
@@ -28,6 +27,7 @@ import { usePreview } from "@/components/files/use-preview";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { formatSize } from "@/lib/files/format";
 import type { HostControlClient, HostDirEntry } from "@/lib/hostControl";
 import type { FileActionCapabilities } from "@/lib/preview/capabilities";
 import { isTextKind } from "@/lib/preview/file-kinds";

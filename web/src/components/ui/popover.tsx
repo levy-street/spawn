@@ -33,6 +33,7 @@ export function Popover({
   align = "start",
   flip = true,
   interactive = false,
+  layer = "page",
   id,
   ariaLabel,
   className,
@@ -47,6 +48,15 @@ export function Popover({
   /** False pins the box to `side`, narrowing it rather than crossing over. */
   flip?: boolean;
   interactive?: boolean;
+  /**
+   * "page": over the page's own floating chrome (z-40) but under every modal
+   * (z-50) and menu (z-100) — a card about something on the page has no
+   * business above a dialog that has since taken the window, so it can never
+   * sit on that dialog's buttons. "drawer": above modals, for a card whose
+   * owner itself lives in a drawer or sheet and has to clear it (the
+   * sidebar's host card; the sidebar is a drawer on a phone).
+   */
+  layer?: "page" | "drawer";
   id?: string;
   ariaLabel?: string;
   className?: string;
@@ -115,10 +125,16 @@ export function Popover({
       // Hidden until measured, so it never paints at the wrong place first.
       style={coords ?? { position: "fixed", visibility: "hidden" }}
       className={cn(
-        // Below DropdownMenu's z-[100] so a context menu opened over a preview
-        // still wins, and above Dialog's z-50.
-        "z-[90] overflow-hidden rounded-lg border border-popover-border bg-popover text-popover-foreground shadow-xl shadow-black/50",
-        "animate-in fade-in-0 zoom-in-95 duration-100",
+        // Both below DropdownMenu's z-[100], so a context menu opened over a
+        // card still wins; only a drawer's card clears Dialog's z-50.
+        layer === "page" ? "z-[45]" : "z-[90]",
+        "overflow-hidden rounded-lg border border-popover-border bg-popover text-popover-foreground shadow-xl shadow-black/50",
+        // `duration-100` times the opening animation, but it is a transition
+        // duration too, and with no property named every property takes it:
+        // a card moving to its next row glided there from the last one's
+        // place, a tenth of a second over rows it is not about and across
+        // the pointer's way to them. It moves at once, like it opens.
+        "animate-in fade-in-0 zoom-in-95 duration-100 transition-none",
         // pointer-events-auto also un-inherits the `pointer-events: none` a
         // modal Radix dialog puts on <body>, which this portal would take on.
         interactive ? "pointer-events-auto" : "pointer-events-none",

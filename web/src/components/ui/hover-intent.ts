@@ -34,6 +34,11 @@ export type HoverIntent<T> = {
   /** Open now and stay open — the keyboard path. Hover cannot dismiss it. */
   pin: (value: T) => void;
   unpin: () => void;
+  /**
+   * The pointer has reached what is open: abandon a pending swap to another
+   * target, picked up on the way there, and keep what is showing.
+   */
+  hold: () => void;
   /** Close immediately, cancelling any pending open. */
   cancel: () => void;
   dispose: () => void;
@@ -43,9 +48,18 @@ export function createHoverIntent<T>(
   io: HoverIntentTimers & {
     onChange: (value: T | null, pinned: boolean) => void;
     openDelayMs?: number;
+    /**
+     * Something else has the pointer's attention — a menu, a dialog — and a
+     * card must not open over it. Asked again when the delay runs out, not
+     * only when it starts: the pointer can settle on a row in the instant a
+     * dialog takes the window, and the card would otherwise land on top of
+     * that dialog a quarter-second later.
+     */
+    blocked?: () => boolean;
   },
 ): HoverIntent<T> {
   const openDelay = io.openDelayMs ?? HOVER_OPEN_DELAY_MS;
+  const blocked = () => io.blocked?.() === true;
 
   let timer: number | null = null;
   let current: T | null = null;
@@ -64,19 +78,34 @@ export function createHoverIntent<T>(
     io.onChange(value, nextPinned);
   };
 
+  /** Blocked: nothing opens, and whatever is up goes. */
+  const close = () => {
+    clear();
+    if (current !== null || pinned) set(null, false);
+  };
+
   return {
     enter(value) {
       if (pinned) return;
       clear();
+      if (blocked()) {
+        close();
+        return;
+      }
       // Already showing this one: a pending close is simply abandoned, and
       // nothing refetches.
       if (current !== null && sameTarget(current, value)) return;
       timer = io.setTimer(() => {
         timer = null;
-        set(value, false);
+        if (blocked()) close();
+        else set(value, false);
       }, openDelay);
     },
     pin(value) {
+      if (blocked()) {
+        close();
+        return;
+      }
       clear();
       set(value, true);
     },
@@ -84,10 +113,10 @@ export function createHoverIntent<T>(
       clear();
       set(null, false);
     },
-    cancel() {
-      clear();
-      if (current !== null || pinned) set(null, false);
+    hold() {
+      if (current !== null) clear();
     },
+    cancel: close,
     dispose() {
       clear();
     },
@@ -105,8 +134,11 @@ function sameTarget<T>(a: T, b: T): boolean {
   return keys.every((key) => left[key] === right[key]);
 }
 
-export function useHoverIntent<T>(options: { enabled?: boolean } = {}) {
+export function useHoverIntent<T>(options: { enabled?: boolean; blocked?: () => boolean } = {}) {
   const enabled = options.enabled !== false;
+  // The latest answer, read through a ref: the intent is made once.
+  const blockedRef = useRef(options.blocked);
+  blockedRef.current = options.blocked;
   const [state, setState] = useState<{ value: T | null; pinned: boolean }>({
     value: null,
     pinned: false,
@@ -120,6 +152,7 @@ export function useHoverIntent<T>(options: { enabled?: boolean } = {}) {
         setTimer: (fn, ms) => window.setTimeout(fn, ms),
         clearTimer: (id) => window.clearTimeout(id),
         onChange: (value, pinned) => setState({ value, pinned }),
+        blocked: () => blockedRef.current?.() === true,
       }),
     [],
   );
@@ -140,7 +173,8 @@ export function useHoverIntent<T>(options: { enabled?: boolean } = {}) {
     },
     [intent],
   );
+  const hold = useCallback(() => intent.hold(), [intent]);
   const cancel = useCallback(() => intent.cancel(), [intent]);
 
-  return { value: state.value, pinned: state.pinned, enter, pin, cancel };
+  return { value: state.value, pinned: state.pinned, enter, pin, hold, cancel };
 }

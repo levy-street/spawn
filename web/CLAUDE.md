@@ -31,7 +31,10 @@ src/
                   cards and the shared host connection provider)
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
-                  alerts — with colocated *.test.ts files
+                  alerts — with colocated *.test.ts files (lib/files/ is
+                  the file browser's pure core: sort, filter, selection,
+                  type-ahead, listing sources; components/files/FileBrowser
+                  draws it in its page, pane and aside layouts)
   middleware.ts   request middleware (+ its test beside it)
 tests/e2e/        Playwright end-to-end specs
 scripts/          build wrappers (next-with-proxy-target.mjs) and helpers
@@ -124,6 +127,14 @@ from the catalogue. Every claim about spawnd survives a diff against
   always-fast cadence they were most of the server's request volume
   (2026-09-22). Prefer a `refetchInterval` function or a ref read at
   schedule time over remounting the query.
+- A host path never goes into a URL — not a `?path=`, not a fragment. A URL
+  reaches the server's request logs, every prefetch and RSC request, the
+  browser's history and the next site's Referer, and a host path is protected
+  content (`docs/TRUST.md`). To open a host's Files at a folder, call
+  `useOpenHostFolder()` (`components/files/`), which hands the folder over in
+  memory; the Files page keeps the folder on screen in the tab's
+  `history.state` (`lib/files/folder-handoff.ts`). An inbound `?path=` (a
+  phone's universal link) is still read once and dropped from the address.
 - Device transport: `DaemonConnectionsProvider` owns one signed host connection
   per registered device and host. Identity replacement retires its connections.
   `lib/daemon-connection.ts` shares it across tabs with

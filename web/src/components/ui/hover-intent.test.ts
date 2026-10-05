@@ -31,12 +31,15 @@ function clock() {
 function harness() {
   const time = clock();
   const changes: Array<{ value: { path: string } | null; pinned: boolean }> = [];
+  /** Whether a menu or dialog is up, as the caller would answer it. */
+  const overlay = { up: false };
   const intent = createHoverIntent<{ path: string }>({
     setTimer: time.setTimer,
     clearTimer: time.clearTimer,
     onChange: (value, pinned) => changes.push({ value, pinned }),
+    blocked: () => overlay.up,
   });
-  return { time, changes, intent, last: () => changes.at(-1) };
+  return { time, changes, intent, overlay, last: () => changes.at(-1) };
 }
 
 describe("createHoverIntent", () => {
@@ -89,6 +92,28 @@ describe("createHoverIntent", () => {
     expect(last()).toEqual({ value: { path: "/b" }, pinned: false });
   });
 
+  test("reaching the open card keeps it, though a row crossed on the way asked to swap", () => {
+    // A card below its row is reached across the next row, which asks for
+    // its own card; arriving on this one abandons that.
+    const { time, intent, last } = harness();
+    intent.enter({ path: "/a" });
+    time.advance(HOVER_OPEN_DELAY_MS);
+    intent.enter({ path: "/b" });
+    time.advance(100);
+    intent.hold();
+    time.advance(HOVER_OPEN_DELAY_MS * 4);
+    expect(last()).toEqual({ value: { path: "/a" }, pinned: false });
+    expect(time.pendingCount()).toBe(0);
+  });
+
+  test("hold with nothing open leaves a pending open alone", () => {
+    const { time, intent, last } = harness();
+    intent.enter({ path: "/a" });
+    intent.hold();
+    time.advance(HOVER_OPEN_DELAY_MS);
+    expect(last()).toEqual({ value: { path: "/a" }, pinned: false });
+  });
+
   test("cancel closes at once, whenever the caller decides", () => {
     const { time, intent, last } = harness();
     intent.enter({ path: "/a" });
@@ -135,6 +160,64 @@ describe("createHoverIntent", () => {
     intent.cancel();
     time.advance(10_000);
     expect(changes).toHaveLength(0);
+  });
+
+  test("a card still waiting on its delay stays shut once a dialog has taken the window", () => {
+    // The live bug: a menu item clicked over a row closes the menu, the
+    // pointer is suddenly resting on that row, and the dialog the item opened
+    // is up before the delay runs out. The card must not land on the dialog.
+    const { time, intent, overlay, changes } = harness();
+    intent.enter({ path: "/readme.md" });
+    time.advance(50);
+    overlay.up = true;
+    time.advance(HOVER_OPEN_DELAY_MS * 4);
+    expect(changes).toHaveLength(0);
+  });
+
+  test("nothing opens, or is even scheduled, while a menu or dialog is up", () => {
+    const { time, intent, overlay, changes } = harness();
+    overlay.up = true;
+    intent.enter({ path: "/a" });
+    expect(time.pendingCount()).toBe(0);
+    time.advance(10_000);
+    expect(changes).toHaveLength(0);
+  });
+
+  test("a hover while blocked takes down the card that is up", () => {
+    const { time, intent, overlay, last } = harness();
+    intent.enter({ path: "/a" });
+    time.advance(HOVER_OPEN_DELAY_MS);
+    expect(last()?.value).toEqual({ path: "/a" });
+    overlay.up = true;
+    intent.enter({ path: "/a" });
+    expect(last()).toEqual({ value: null, pinned: false });
+  });
+
+  test("a swap that comes due while blocked closes the card instead", () => {
+    const { time, intent, overlay, last } = harness();
+    intent.enter({ path: "/a" });
+    time.advance(HOVER_OPEN_DELAY_MS);
+    intent.enter({ path: "/b" });
+    overlay.up = true;
+    time.advance(HOVER_OPEN_DELAY_MS);
+    expect(last()).toEqual({ value: null, pinned: false });
+  });
+
+  test("Space cannot pin a card over a menu or dialog either", () => {
+    const { intent, overlay, changes } = harness();
+    overlay.up = true;
+    intent.pin({ path: "/a" });
+    expect(changes).toHaveLength(0);
+  });
+
+  test("once the menu or dialog has gone, hovering opens as usual", () => {
+    const { time, intent, overlay, last } = harness();
+    overlay.up = true;
+    intent.enter({ path: "/a" });
+    overlay.up = false;
+    intent.enter({ path: "/a" });
+    time.advance(HOVER_OPEN_DELAY_MS);
+    expect(last()).toEqual({ value: { path: "/a" }, pinned: false });
   });
 
   test("dispose leaves no timer behind", () => {

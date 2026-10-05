@@ -26,6 +26,8 @@
 const MARGIN = 8;
 /** Gap between the anchor and the box. */
 const OFFSET = 4;
+/** `OFFSET`, for a caller that wants its box edge to edge with what it anchors to. */
+export const MENU_ANCHOR_GAP_PX = OFFSET;
 
 export type MenuAlign = "start" | "end";
 export type MenuSide = "top" | "bottom" | "left" | "right";

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   appleArrowBytes,
   type Chord,
+  explorerShortcut,
   gridShortcut,
   keystrokeBelongsToText,
   usesAppleModifiers,
@@ -166,5 +167,156 @@ describe("the Mac arrows the terminal states for itself", () => {
 describe("which targets are typing", () => {
   test("nothing outside the document is", () => {
     expect(keystrokeBelongsToText(null)).toBe(false);
+  });
+});
+
+describe("the file browser's keys", () => {
+  const mac = { apple: true, textHasKey: false };
+  const pc = { apple: false, textHasKey: false };
+
+  test("never while a rename box or the filter is typing", () => {
+    expect(explorerShortcut(chord({ key: "ArrowDown" }), { ...mac, textHasKey: true })).toBeNull();
+    expect(explorerShortcut(chord({ key: "a" }), { ...pc, textHasKey: true })).toBeNull();
+  });
+
+  test("never ⌥/Alt+Arrow — that is the grid's", () => {
+    for (const key of ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]) {
+      expect(explorerShortcut(chord({ key, altKey: true }), mac)).toBeNull();
+      expect(explorerShortcut(chord({ key, altKey: true }), pc)).toBeNull();
+    }
+  });
+
+  test("never an AltGr character, even one that spells a chord", () => {
+    // German AltGr+8 is "[": Ctrl+Alt on Windows, never "Back".
+    expect(explorerShortcut(chord({ key: "[", ctrlKey: true, altKey: true }), pc)).toBeNull();
+    expect(explorerShortcut(chord({ key: "@", ctrlKey: true, altKey: true }), pc)).toBeNull();
+  });
+
+  test("arrows move, Shift extends, Home and End jump", () => {
+    expect(explorerShortcut(chord({ key: "ArrowDown" }), pc)).toEqual({
+      kind: "move",
+      to: "next",
+      extend: false,
+      keep: false,
+    });
+    expect(explorerShortcut(chord({ key: "ArrowUp", shiftKey: true }), mac)).toEqual({
+      kind: "move",
+      to: "prev",
+      extend: true,
+      keep: false,
+    });
+    expect(explorerShortcut(chord({ key: "End", shiftKey: true }), pc)).toMatchObject({
+      to: "last",
+      extend: true,
+    });
+    expect(explorerShortcut(chord({ key: "PageDown" }), mac)).toMatchObject({ to: "pageDown" });
+  });
+
+  test("Ctrl+Arrow moves only the focus on Windows and Linux; Ctrl+Space toggles", () => {
+    expect(explorerShortcut(chord({ key: "ArrowDown", ctrlKey: true }), pc)).toEqual({
+      kind: "move",
+      to: "next",
+      extend: false,
+      keep: true,
+    });
+    expect(explorerShortcut(chord({ key: " ", ctrlKey: true }), pc)).toEqual({
+      kind: "toggleSelected",
+    });
+    expect(explorerShortcut(chord({ key: " ", ctrlKey: true }), mac)).toBeNull();
+  });
+
+  test("← and → fold and unfold the tree", () => {
+    expect(explorerShortcut(chord({ key: "ArrowLeft" }), mac)).toEqual({ kind: "collapse" });
+    expect(explorerShortcut(chord({ key: "ArrowRight" }), pc)).toEqual({ kind: "expand" });
+  });
+
+  test("Return renames on a Mac; Enter opens elsewhere; F2 renames on both", () => {
+    expect(explorerShortcut(chord({ key: "Enter" }), mac)).toEqual({ kind: "rename" });
+    expect(explorerShortcut(chord({ key: "Enter" }), pc)).toEqual({ kind: "open" });
+    expect(explorerShortcut(chord({ key: "F2" }), mac)).toEqual({ kind: "rename" });
+    expect(explorerShortcut(chord({ key: "F2" }), pc)).toEqual({ kind: "rename" });
+  });
+
+  test("a Mac opens with ⌘↓ or ⌘O and goes up with ⌘↑", () => {
+    expect(explorerShortcut(chord({ key: "ArrowDown", metaKey: true }), mac)).toEqual({
+      kind: "open",
+    });
+    expect(explorerShortcut(chord({ key: "o", metaKey: true }), mac)).toEqual({ kind: "open" });
+    expect(explorerShortcut(chord({ key: "ArrowUp", metaKey: true }), mac)).toEqual({ kind: "up" });
+  });
+
+  test("Backspace goes up on Windows and Linux, and deletes with ⌘ on a Mac", () => {
+    expect(explorerShortcut(chord({ key: "Backspace" }), pc)).toEqual({ kind: "up" });
+    expect(explorerShortcut(chord({ key: "Backspace" }), mac)).toBeNull();
+    expect(explorerShortcut(chord({ key: "Backspace", metaKey: true }), mac)).toEqual({
+      kind: "delete",
+    });
+    expect(explorerShortcut(chord({ key: "Backspace", metaKey: true, altKey: true }), mac)).toEqual(
+      { kind: "delete" },
+    );
+    expect(explorerShortcut(chord({ key: "Delete" }), pc)).toEqual({ kind: "delete" });
+    expect(explorerShortcut(chord({ key: "Delete", shiftKey: true }), pc)).toEqual({
+      kind: "delete",
+    });
+  });
+
+  test("Back and Forward are ⌘[ ⌘] and Ctrl+[ Ctrl+]", () => {
+    expect(explorerShortcut(chord({ key: "[", metaKey: true }), mac)).toEqual({ kind: "back" });
+    expect(explorerShortcut(chord({ key: "]", ctrlKey: true }), pc)).toEqual({ kind: "forward" });
+    expect(explorerShortcut(chord({ key: "[", ctrlKey: true }), mac)).toBeNull();
+  });
+
+  test("the command chords use each platform's command key, and only it", () => {
+    expect(explorerShortcut(chord({ key: "a", metaKey: true }), mac)).toEqual({
+      kind: "selectAll",
+    });
+    expect(explorerShortcut(chord({ key: "a", ctrlKey: true }), pc)).toEqual({
+      kind: "selectAll",
+    });
+    expect(explorerShortcut(chord({ key: "a", ctrlKey: true }), mac)).toBeNull();
+    expect(explorerShortcut(chord({ key: "f", metaKey: true }), mac)).toEqual({ kind: "filter" });
+    expect(explorerShortcut(chord({ key: "G", ctrlKey: true, shiftKey: true }), pc)).toEqual({
+      kind: "goToFolder",
+    });
+    expect(explorerShortcut(chord({ key: "i", metaKey: true }), mac)).toEqual({ kind: "details" });
+  });
+
+  test("hidden files: ⇧⌘. on a Mac, Ctrl+H elsewhere", () => {
+    expect(explorerShortcut(chord({ key: ">", metaKey: true, shiftKey: true }), mac)).toEqual({
+      kind: "toggleHidden",
+    });
+    expect(explorerShortcut(chord({ key: ".", metaKey: true, shiftKey: true }), mac)).toEqual({
+      kind: "toggleHidden",
+    });
+    expect(explorerShortcut(chord({ key: "h", ctrlKey: true }), pc)).toEqual({
+      kind: "toggleHidden",
+    });
+  });
+
+  test("New folder is bound only in the desktop app; a browser tab keeps ⇧⌘N", () => {
+    const newFolder = chord({ key: "N", metaKey: true, shiftKey: true });
+    expect(explorerShortcut(newFolder, mac)).toBeNull();
+    expect(explorerShortcut(newFolder, { ...mac, desktopShell: true })).toEqual({
+      kind: "newFolder",
+    });
+    expect(explorerShortcut(chord({ key: "n", metaKey: true }), mac)).toBeNull();
+    expect(explorerShortcut(chord({ key: "t", ctrlKey: true }), pc)).toBeNull();
+    expect(explorerShortcut(chord({ key: "w", ctrlKey: true }), pc)).toBeNull();
+  });
+
+  test("Space peeks and Escape clears", () => {
+    expect(explorerShortcut(chord({ key: " " }), mac)).toEqual({ kind: "peek" });
+    expect(explorerShortcut(chord({ key: "Escape" }), pc)).toEqual({ kind: "escape" });
+  });
+
+  test("typing letters is type-ahead, capitals included", () => {
+    expect(explorerShortcut(chord({ key: "r" }), mac)).toEqual({ kind: "typeAhead", text: "r" });
+    expect(explorerShortcut(chord({ key: "R", shiftKey: true }), pc)).toEqual({
+      kind: "typeAhead",
+      text: "R",
+    });
+    expect(explorerShortcut(chord({ key: "é" }), pc)).toEqual({ kind: "typeAhead", text: "é" });
+    expect(explorerShortcut(chord({ key: "Tab" }), pc)).toBeNull();
+    expect(explorerShortcut(chord({ key: "Shift", shiftKey: true }), pc)).toBeNull();
   });
 });

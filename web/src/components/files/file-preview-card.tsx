@@ -1,7 +1,6 @@
 "use client";
 
 import { Loader2, Maximize2 } from "lucide-react";
-import { formatSize } from "@/components/files/FileExplorer";
 import { FileIcon } from "@/components/files/file-icon";
 import { PREVIEW_CARD_WIDTH_PX } from "@/components/files/preview-placement";
 import {
@@ -12,6 +11,7 @@ import {
   previewErrorNote,
 } from "@/components/files/preview-renderers";
 import { usePreview } from "@/components/files/use-preview";
+import { formatSize } from "@/lib/files/format";
 import type { HostControlClient, HostDirEntry } from "@/lib/hostControl";
 import type { FileActionCapabilities } from "@/lib/preview/capabilities";
 import { isTextKind } from "@/lib/preview/file-kinds";
@@ -20,10 +20,11 @@ import { cn } from "@/lib/utils";
 /**
  * The hover preview.
  *
- * Fixed width, capped height, and no pointer events — it must not be able to
- * capture the hover that opened it, cover the row's kebab, or swallow a click.
- * The cost is that nothing inside can be scrolled or selected, which is exactly
- * the line between this and the viewer dialog.
+ * Fixed width and capped height. It is placed beside or under its row, never
+ * on it and never in the pointer's column (`previewPlacement`), so it cannot
+ * cover the row's kebab or a rename field's message, or take the click meant
+ * for the next row. Inside, it can be scrolled and opened; anything more is
+ * the viewer dialog's.
  */
 export function FilePreviewCard({
   hostId,

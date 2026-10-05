@@ -1,4 +1,4 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Locator, type Page, test } from "@playwright/test";
 import { fileEntry, fileListing, HOST_ID, host, mockApp, session, windowsHost } from "./app-mocks";
 
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000009";
@@ -36,14 +36,167 @@ function treeFiles(_hostId: string, path: string | null) {
   return fileListing();
 }
 
-function row(page: import("@playwright/test").Page, name: string) {
+/** What the host says a path in `treeFiles` is: a file has an extension. */
+function treeStat(_hostId: string, path: string) {
+  const name = path.split("/").at(-1) ?? path;
+  const file = name.includes(".");
+  return { path, name, kind: file ? "file" : "directory", size: file ? 2 : null };
+}
+
+function home(entries: Array<Record<string, unknown>>) {
+  return fileListing({
+    entries: entries.map((entry) =>
+      fileEntry({ path: `/Users/tester/${String(entry.name)}`, ...entry }),
+    ),
+  });
+}
+
+/** A Details row by its name. */
+function item(page: Page, name: string) {
+  return page
+    .getByRole("grid", { name: "Files" })
+    .getByRole("row")
+    .filter({ hasText: name })
+    .first();
+}
+
+/** A tree item by its name. */
+function row(page: Page, name: string) {
   return page.getByRole("treeitem").filter({ hasText: name }).first();
 }
 
-test("file tree lazily expands directories in place", async ({ page }) => {
+/** The names in the Details view, top to bottom (header excluded). */
+async function names(page: Page) {
+  return page
+    .getByRole("grid", { name: "Files" })
+    .locator("[role='row'][data-path]")
+    .evaluateAll((rows) =>
+      rows
+        .sort(
+          (a, b) =>
+            Number(a.getAttribute("aria-rowindex")) - Number(b.getAttribute("aria-rowindex")),
+        )
+        .map((row) => row.querySelector("[role='gridcell'] span")?.textContent ?? ""),
+    );
+}
+
+/** The names in a tree, top to bottom. */
+async function treeNames(scope: Locator) {
+  return scope
+    .getByRole("treeitem")
+    .evaluateAll((rows) =>
+      rows
+        .sort(
+          (a, b) =>
+            Number.parseFloat((a as HTMLElement).style.top) -
+            Number.parseFloat((b as HTMLElement).style.top),
+        )
+        .map((row) => row.getAttribute("data-path")?.split("/").at(-1) ?? ""),
+    );
+}
+
+/** A Details column header, by the label on its sort button. */
+function header(page: Page, label: string) {
+  return page
+    .getByRole("columnheader")
+    .filter({ has: page.getByRole("button", { name: label, exact: true }) });
+}
+
+async function openNewMenu(page: Page, item: "New folder" | "New file" | "Upload files…") {
+  await page.getByRole("button", { name: "New", exact: true }).click();
+  await page.getByRole("menuitem", { name: item }).click();
+}
+
+test("a host's files open in Details: folders first, natural order, hidden files hidden", async ({
+  page,
+}) => {
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "file10.txt", size: 300, modified_at: 1_700_000_300 },
+        { name: "src", is_dir: true, size: null },
+        { name: "file2.txt", size: 100, modified_at: 1_700_000_500 },
+        { name: "Docs", is_dir: true, size: null },
+        { name: ".env", size: 10 },
+      ]),
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(item(page, "file10.txt")).toBeVisible();
+  await expect.poll(() => names(page)).toEqual(["Docs", "src", "file2.txt", "file10.txt"]);
+  // What is shown, and what the hidden toggle keeps back — as the phone counts.
+  await expect(page.getByRole("status").filter({ hasText: "4 items · 1 hidden" })).toBeVisible();
+
+  // A column header sorts, and says so; sizes lead with the largest.
+  await header(page, "Size").getByRole("button").click();
+  await expect(header(page, "Size")).toHaveAttribute("aria-sort", "descending");
+  await expect.poll(() => names(page)).toEqual(["Docs", "src", "file10.txt", "file2.txt"]);
+
+  // Name again, twice: reversed, folders still on top.
+  await header(page, "Name").getByRole("button").click();
+  await header(page, "Name").getByRole("button").click();
+  await expect(header(page, "Name")).toHaveAttribute("aria-sort", "descending");
+  await expect.poll(() => names(page)).toEqual(["src", "Docs", "file10.txt", "file2.txt"]);
+
+  // Hidden files show on request, and the choice outlives a reload.
+  await page.getByRole("button", { name: "Show hidden files" }).click();
+  await expect(item(page, ".env")).toBeVisible();
+  await page.reload();
+  await expect(item(page, ".env")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hide hidden files" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+});
+
+test("Details fits its panel: Kind goes first, then each row folds to the phone's two lines", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "src", is_dir: true, size: null },
+        { name: "a-long-name-for-a-narrow-panel-report.final.pdf", size: 3_400_000 },
+        { name: "notes.txt", size: 2048 },
+      ]),
+  });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const grid = page.getByRole("grid", { name: "Files" });
+  /** How far the grid could be scrolled sideways: never at all. */
+  const sideways = () => grid.evaluate((element) => element.scrollWidth - element.clientWidth);
+  const headers = () => grid.getByRole("columnheader").allInnerTexts();
+
+  // A phone: Name alone, and under each name what the phone's row says — a
+  // file's size and date, a folder's date.
+  await expect(item(page, "notes.txt")).toBeVisible();
+  await expect.poll(headers).toEqual(["Name"]);
+  await expect
+    .poll(() => names(page))
+    .toEqual(["src", "a-long-name-for-a-narrow-panel-report.final.pdf", "notes.txt"]);
+  await expect(item(page, "notes.txt")).toContainText(/2\.0 KB · .*2025/);
+  await expect(item(page, "a-long-name")).toContainText("3.2 MB · ");
+  await expect(item(page, "src")).toContainText("2025");
+  await expect(item(page, "src")).not.toContainText("·");
+  expect(await sideways()).toBe(0);
+  // Folded, Name still sorts.
+  await header(page, "Name").getByRole("button").click();
+  await expect(header(page, "Name")).toHaveAttribute("aria-sort", "descending");
+
+  // Wider: the columns come back, all but Kind until there is room for it.
+  await page.setViewportSize({ width: 900, height: 844 });
+  await expect.poll(headers).toEqual(["Name", "Date modified", "Size"]);
+  expect(await sideways()).toBe(0);
+  await page.setViewportSize({ width: 1400, height: 844 });
+  await expect.poll(headers).toEqual(["Name", "Date modified", "Size", "Kind"]);
+  expect(await sideways()).toBe(0);
+});
+
+test("Tree view lazily expands directories in place", async ({ page }) => {
   await mockApp(page, { files: treeFiles });
 
   await page.goto(`/hosts/${HOST_ID}/files`);
+  await page.getByRole("button", { name: "Tree view" }).click();
   const tree = page.getByRole("tree", { name: "Files" });
   await expect(tree.getByRole("treeitem")).toHaveCount(2);
 
@@ -63,20 +216,65 @@ test("file tree lazily expands directories in place", async ({ page }) => {
   await expect(tree.getByRole("treeitem")).toHaveCount(2);
 });
 
-test("?path deep link expands ancestors and selects the target", async ({ page }) => {
-  await mockApp(page, { files: treeFiles });
+test("?path deep link to a file opens its folder with it selected", async ({ page }) => {
+  await mockApp(page, { files: treeFiles, fileStat: treeStat });
 
   await page.goto(
     `/hosts/${HOST_ID}/files?path=${encodeURIComponent("/Users/tester/projects/spawn/main.rs")}`,
   );
 
-  const target = page.getByRole("treeitem").filter({ hasText: "main.rs" });
-  await expect(target).toBeVisible();
-  await expect(target).toHaveAttribute("aria-selected", "true");
-  await expect(row(page, "projects")).toHaveAttribute("aria-expanded", "true");
+  await expect(item(page, "main.rs")).toHaveAttribute("aria-selected", "true");
+  const crumbs = page.getByRole("navigation", { name: "Folder path" });
+  await expect(crumbs.getByRole("button", { name: "spawn" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(crumbs.getByRole("button", { name: "projects" })).toBeVisible();
+
+  // The link is read once and dropped from the address; the tab keeps the
+  // folder, so a reload still comes back to it.
+  await expect(page).toHaveURL(new RegExp(`/hosts/${HOST_ID}/files$`));
+  await page.reload();
+  await expect(crumbs.getByRole("button", { name: "spawn" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(item(page, "main.rs")).toBeVisible();
 });
 
-test("header upload posts multipart into the tree root", async ({ page }) => {
+test("the folder on screen never goes into the address or a request", async ({ page }) => {
+  await mockApp(page, { files: treeFiles, fileStat: treeStat });
+  const requested: string[] = [];
+  page.on("request", (request) => requested.push(decodeURIComponent(request.url())));
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await item(page, "projects").dblclick();
+  await expect(item(page, "readme.md")).toBeVisible();
+  await item(page, "spawn").dblclick();
+  await expect(item(page, "main.rs")).toBeVisible();
+
+  // A host path is protected content: not in the URL, so not in a server log,
+  // an RSC request, a prefetch, the browser's history or a Referer.
+  await expect(page).toHaveURL(new RegExp(`/hosts/${HOST_ID}/files$`));
+  expect(requested.filter((url) => url.includes("/Users/tester"))).toEqual([]);
+  expect(await page.evaluate(() => window.location.hash)).toBe("");
+
+  // Kept with the tab instead: a reload, or Back to the page, returns to it.
+  await page.reload();
+  await expect(item(page, "main.rs")).toBeVisible();
+  // Even when the router has since rewritten the entry's state without it
+  // (it does on some of its own updates), as a dev refresh would.
+  await page.evaluate(() => {
+    const { __NA, __PRIVATE_NEXTJS_INTERNALS_TREE } = window.history.state ?? {};
+    window.history.replaceState({ __NA, __PRIVATE_NEXTJS_INTERNALS_TREE }, "");
+  });
+  await page.goto(`/hosts/${HOST_ID}`);
+  await page.goBack();
+  await expect(item(page, "main.rs")).toBeVisible();
+  expect(requested.filter((url) => url.includes("/Users/tester"))).toEqual([]);
+});
+
+test("upload goes into the folder on screen", async ({ page }) => {
   let uploadedDir: string | null = null;
   await mockApp(page, {
     files: treeFiles,
@@ -92,10 +290,10 @@ test("header upload posts multipart into the tree root", async ({ page }) => {
   });
 
   await page.goto(`/hosts/${HOST_ID}/files`);
-  await expect(row(page, "notes.txt")).toBeVisible();
+  await expect(item(page, "notes.txt")).toBeVisible();
 
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("button", { name: "Upload files" }).click();
+  await openNewMenu(page, "Upload files…");
   await (await chooser).setFiles({
     name: "report.txt",
     mimeType: "text/plain",
@@ -106,8 +304,9 @@ test("header upload posts multipart into the tree root", async ({ page }) => {
   await expect(page.getByText("Uploaded /Users/tester/report.txt")).toBeVisible();
 });
 
-test("inline new folder, rename, and delete round-trip", async ({ page }) => {
+test("new folder, new file, rename and delete round-trip", async ({ page }) => {
   const mkdirs: unknown[] = [];
+  const writes: unknown[] = [];
   const renames: unknown[] = [];
   const deletes: unknown[] = [];
   await mockApp(page, {
@@ -118,6 +317,15 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
         status: 200,
         contentType: "application/json",
         json: { path: (body as { path: string }).path },
+      });
+    },
+    fileUpload: async (_h, route) => {
+      const declaration = route.request().postDataJSON() as Record<string, unknown>;
+      writes.push(declaration);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: { path: `${String(declaration.dir)}/${String(declaration.name)}` },
       });
     },
     fileRename: async (_h, body, route) => {
@@ -139,16 +347,24 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
   });
 
   await page.goto(`/hosts/${HOST_ID}/files`);
-  await expect(row(page, "notes.txt")).toBeVisible();
+  await expect(item(page, "notes.txt")).toBeVisible();
 
-  // New folder: inline input at the root.
-  await page.getByRole("button", { name: "New folder" }).click();
+  // New folder: an inline name field in the folder on screen.
+  await openNewMenu(page, "New folder");
   await page.getByLabel("Folder name").fill("scratch");
   await page.getByLabel("Folder name").press("Enter");
   await expect.poll(() => mkdirs.at(-1)).toMatchObject({ path: "/Users/tester/scratch" });
 
-  // Rename via the row menu → inline input.
-  const notes = row(page, "notes.txt");
+  // New file: an empty write that refuses to replace anything.
+  await openNewMenu(page, "New file");
+  await page.getByLabel("File name").fill("todo.md");
+  await page.getByLabel("File name").press("Enter");
+  await expect
+    .poll(() => writes.at(-1))
+    .toMatchObject({ dir: "/Users/tester", name: "todo.md", length: 0, overwrite: false });
+
+  // Rename from the row's menu, inline.
+  const notes = item(page, "notes.txt");
   await notes.hover();
   await notes.getByRole("button", { name: "notes.txt actions" }).click();
   await page.getByRole("menuitem", { name: "Rename" }).click();
@@ -159,17 +375,149 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
     .poll(() => renames.at(-1))
     .toMatchObject({ path: "/Users/tester/notes.txt", name: "renamed.txt" });
 
-  // Delete with confirm.
-  page.on("dialog", (d) => d.accept());
-  const readme = row(page, "projects");
-  await readme.click(); // expand
-  const target = row(page, "readme.md");
-  await target.hover();
-  await target.getByRole("button", { name: "readme.md actions" }).click();
-  await page.getByRole("menuitem", { name: "Delete" }).click();
+  // Delete asks first, naming what goes and that it is permanent.
+  await item(page, "projects").dblclick();
+  const target = item(page, "readme.md");
+  await target.click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Delete permanently…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Delete “readme.md” permanently?" });
+  await expect(dialog).toContainText("It won't go to the Trash on Mac. This can't be undone.");
+  await dialog.getByRole("button", { name: "Delete permanently" }).click();
   await expect
     .poll(() => deletes.at(-1))
     .toMatchObject({ path: "/Users/tester/projects/readme.md", recursive: false });
+  await expect(
+    page.getByRole("status").filter({ hasText: "Deleted “readme.md” on Mac" }),
+  ).toBeVisible();
+});
+
+test("several rows are picked with the platform's keys and deleted together", async ({ page }) => {
+  const deletes: string[] = [];
+  await mockApp(page, {
+    files: () => home([{ name: "a.txt" }, { name: "b.txt" }, { name: "c.txt" }, { name: "d.txt" }]),
+    fileDelete: async (_h, body, route) => {
+      deletes.push((body as { path: string }).path);
+      await route.fulfill({ status: 200, json: { path: (body as { path: string }).path } });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await item(page, "a.txt").click();
+  await item(page, "c.txt").click({ modifiers: ["Shift"] });
+  for (const name of ["a.txt", "b.txt", "c.txt"]) {
+    await expect(item(page, name)).toHaveAttribute("aria-selected", "true");
+  }
+  // Ctrl-click (this is not a Mac) toggles one out and another in.
+  await item(page, "b.txt").click({ modifiers: ["Control"] });
+  await item(page, "d.txt").click({ modifiers: ["Control"] });
+  await expect(item(page, "b.txt")).toHaveAttribute("aria-selected", "false");
+  await expect(page.getByRole("status").filter({ hasText: "3 selected" })).toBeVisible();
+
+  await page.keyboard.press("Delete");
+  const dialog = page.getByRole("dialog", { name: "Delete 3 items permanently?" });
+  await expect(dialog).toContainText("They won't go to the Trash on Mac.");
+  await dialog.getByRole("button", { name: "Delete permanently" }).click();
+  await expect
+    .poll(() => [...deletes].sort())
+    .toEqual(["/Users/tester/a.txt", "/Users/tester/c.txt", "/Users/tester/d.txt"]);
+});
+
+test("the keyboard stays in the list when a delete is cancelled, and when it is confirmed", async ({
+  page,
+}) => {
+  const deletes: string[] = [];
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await mockApp(page, {
+    files: () => home([{ name: "a.txt" }, { name: "b.txt" }, { name: "c.txt" }, { name: "d.txt" }]),
+    fileDelete: async (_h, body, route) => {
+      await held;
+      deletes.push((body as { path: string }).path);
+      await route.fulfill({ status: 200, json: { path: (body as { path: string }).path } });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const grid = page.getByRole("grid", { name: "Files" });
+  await item(page, "a.txt").click();
+  await item(page, "b.txt").click({ modifiers: ["Shift"] });
+  await expect(grid).toBeFocused();
+
+  // Cancel: the keyboard is back where it was, and Delete asks again.
+  await page.keyboard.press("Delete");
+  const dialog = page.getByRole("dialog", { name: "Delete 2 items permanently?" });
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(grid).toBeFocused();
+  await page.keyboard.press("Delete");
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(grid).toBeFocused();
+
+  // From a row's menu, whose item goes with the menu: the list, not the page.
+  await item(page, "c.txt").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Delete permanently…" }).click();
+  await page
+    .getByRole("dialog", { name: "Delete “c.txt” permanently?" })
+    .getByRole("button", { name: "Cancel" })
+    .click();
+  await expect(grid).toBeFocused();
+  await page.keyboard.press("ArrowDown");
+  await expect(item(page, "d.txt")).toHaveAttribute("aria-selected", "true");
+
+  // Confirmed: the list has the keyboard while the host works, and after.
+  await item(page, "a.txt").click();
+  await page.keyboard.press("Delete");
+  await page
+    .getByRole("dialog", { name: "Delete “a.txt” permanently?" })
+    .getByRole("button", { name: "Delete permanently" })
+    .click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Deleting “a.txt” on Mac…" }),
+  ).toBeVisible();
+  await expect(grid).toBeFocused();
+  release();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Deleted “a.txt” on Mac" }),
+  ).toBeVisible();
+  await expect(grid).toBeFocused();
+  expect(deletes).toEqual(["/Users/tester/a.txt"]);
+});
+
+test("in the tree, deleting a folder with things inside it picked asks for the folder alone", async ({
+  page,
+}) => {
+  const deletes: string[] = [];
+  await mockApp(page, {
+    files: treeFiles,
+    fileDelete: async (_h, body, route) => {
+      deletes.push((body as { path: string }).path);
+      await route.fulfill({ status: 200, json: { path: (body as { path: string }).path } });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await page.getByRole("button", { name: "Tree view" }).click();
+  await row(page, "projects").click();
+  await expect(row(page, "readme.md")).toBeVisible();
+  await row(page, "readme.md").click({ modifiers: ["Control"] });
+  await row(page, "notes.txt").click({ modifiers: ["Control"] });
+  await expect(page.getByRole("status").filter({ hasText: "3 selected" })).toBeVisible();
+
+  await page.keyboard.press("Delete");
+  // readme.md goes with projects: two things are removed, not three.
+  const dialog = page.getByRole("dialog", { name: "Delete 2 items permanently?" });
+  await expect(dialog).toContainText(
+    "They won't go to the Trash on Mac. Folders go with everything inside them. This can't be undone.",
+  );
+  await dialog.getByRole("button", { name: "Delete permanently" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Deleted 2 items on Mac" }),
+  ).toBeVisible();
+  expect([...deletes].sort()).toEqual(["/Users/tester/notes.txt", "/Users/tester/projects"]);
 });
 
 test("Windows file operations preserve native drive paths", async ({ page }) => {
@@ -220,32 +568,30 @@ test("Windows file operations preserve native drive paths", async ({ page }) => 
 
   const deepPath = "C:\\Users\\tester\\Work\\readme.md";
   await page.goto(`/hosts/${HOST_ID}/files?path=${encodeURIComponent(deepPath)}`);
-  await expect(row(page, "readme.md")).toHaveAttribute("aria-selected", "true");
+  await expect(item(page, "readme.md")).toHaveAttribute("aria-selected", "true");
 
-  await page.getByRole("button", { name: "New folder" }).click();
+  await openNewMenu(page, "New folder");
   await page.getByLabel("Folder name").fill("scratch");
   await page.getByLabel("Folder name").press("Enter");
-  await expect.poll(() => mkdirs.at(-1)).toMatchObject({ path: "C:\\Users\\tester\\scratch" });
+  await expect
+    .poll(() => mkdirs.at(-1))
+    .toMatchObject({ path: "C:\\Users\\tester\\Work\\scratch" });
 
-  const notes = row(page, "notes.txt");
-  await notes.hover();
-  await notes.getByRole("button", { name: "notes.txt actions" }).click();
-  await page.getByRole("menuitem", { name: "Rename" }).click();
+  await item(page, "readme.md").click();
+  await page.keyboard.press("Delete");
+  await page.getByRole("dialog").getByRole("button", { name: "Delete permanently" }).click();
+  await expect.poll(() => deletes.at(-1)).toMatchObject({ path: deepPath, recursive: false });
+
+  // Up lands in home with the folder it came out of selected.
+  await page.getByRole("button", { name: "Enclosing folder" }).click();
+  await expect(item(page, "Work")).toHaveAttribute("aria-selected", "true");
+  await item(page, "notes.txt").click();
+  await page.keyboard.press("F2");
   await page.getByLabel("Rename entry").fill("renamed.txt");
   await page.getByLabel("Rename entry").press("Enter");
   await expect
     .poll(() => renames.at(-1))
-    .toMatchObject({
-      path: "C:\\Users\\tester\\notes.txt",
-      name: "renamed.txt",
-    });
-
-  page.on("dialog", (dialog) => dialog.accept());
-  const readme = row(page, "readme.md");
-  await readme.hover();
-  await readme.getByRole("button", { name: "readme.md actions" }).click();
-  await page.getByRole("menuitem", { name: "Delete" }).click();
-  await expect.poll(() => deletes.at(-1)).toMatchObject({ path: deepPath, recursive: false });
+    .toMatchObject({ path: "C:\\Users\\tester\\notes.txt", name: "renamed.txt" });
 
   expect(listed).toContain("C:\\Users\\tester\\Work");
   expect(listed.some((path) => path?.startsWith("/C:"))).toBe(false);
@@ -276,7 +622,7 @@ test("right-click opens a context menu with download and send to host", async ({
   });
 
   await page.goto(`/hosts/${HOST_ID}/files`);
-  const notes = row(page, "notes.txt");
+  const notes = item(page, "notes.txt");
   await notes.click({ button: "right" });
 
   const downloadEvent = page.waitForEvent("download");
@@ -294,7 +640,7 @@ test("right-click opens a context menu with download and send to host", async ({
   await expect.poll(() => uploads.at(-1)).toEqual({ hostId: OTHER_HOST_ID, dir: "/home/tester" });
 });
 
-test("keyboard navigation: arrows move selection, F2 renames", async ({ page }) => {
+test("keyboard: arrows move, Enter opens, Backspace goes back up, F2 renames", async ({ page }) => {
   const renames: unknown[] = [];
   await mockApp(page, {
     files: treeFiles,
@@ -309,31 +655,559 @@ test("keyboard navigation: arrows move selection, F2 renames", async ({ page }) 
   });
 
   await page.goto(`/hosts/${HOST_ID}/files`);
-  await row(page, "projects").click(); // select + expand
-  await expect(page.getByRole("treeitem").filter({ hasText: "readme.md" })).toBeVisible();
-  const tree = page.getByRole("tree", { name: "Files" });
-  await tree.focus();
+  await item(page, "projects").click();
+  await page.keyboard.press("ArrowDown");
+  await expect(item(page, "notes.txt")).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("ArrowUp");
 
-  await page.keyboard.press("ArrowDown"); // spawn
-  await page.keyboard.press("ArrowDown"); // readme.md
-  await expect(page.getByRole("treeitem").filter({ hasText: "readme.md" })).toHaveAttribute(
-    "aria-selected",
-    "true",
-  );
+  // Enter opens the folder (this is not a Mac); the address stays the page's.
+  await page.keyboard.press("Enter");
+  await expect(item(page, "readme.md")).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/hosts/${HOST_ID}/files$`));
+  await page.keyboard.press("Backspace");
+  await expect(item(page, "projects")).toHaveAttribute("aria-selected", "true");
 
+  // Back and Forward walk the trail.
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(item(page, "readme.md")).toBeVisible();
+  await page.getByRole("button", { name: "Forward" }).click();
+  await expect(item(page, "notes.txt")).toBeVisible();
+
+  // Type-ahead jumps to a name; F2 renames it.
+  await item(page, "projects").click();
+  await page.keyboard.type("no");
+  await expect(item(page, "notes.txt")).toHaveAttribute("aria-selected", "true");
   await page.keyboard.press("F2");
   const renameInput = page.getByLabel("Rename entry");
   await renameInput.fill("kb.txt");
   await renameInput.press("Enter");
   await expect
     .poll(() => renames.at(-1))
-    .toMatchObject({ path: "/Users/tester/projects/readme.md", name: "kb.txt" });
+    .toMatchObject({ path: "/Users/tester/notes.txt", name: "kb.txt" });
+});
+
+test("filter as you type narrows the folder and Escape clears it", async ({ page }) => {
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "README.md" },
+        { name: "notes-readme.txt" },
+        { name: "src", is_dir: true },
+        { name: ".readme-old" },
+        { name: ".zshrc" },
+      ]),
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(page.getByRole("status").filter({ hasText: "3 items · 2 hidden" })).toBeVisible();
+  const filter = page.getByRole("searchbox", { name: "Filter this folder" });
+  await filter.fill("readme");
+  await expect.poll(() => names(page)).toEqual(["notes-readme.txt", "README.md"]);
+  // The count is of the matches, and of the hidden files that match.
+  await expect(page.getByRole("status").filter({ hasText: "2 items · 1 hidden" })).toBeVisible();
+  await filter.fill("nothing-like-it");
+  await expect(page.getByText("Nothing in this folder matches “nothing-like-it”.")).toBeVisible();
+  await filter.fill("zsh");
+  await expect(
+    page.getByText("Nothing in this folder matches “zsh”. 1 hidden file matches."),
+  ).toBeVisible();
+  await filter.press("Escape");
+  await expect(item(page, "src")).toBeVisible();
+});
+
+test("a folder of only hidden files says so, with the way to show them", async ({ page }) => {
+  await mockApp(page, { files: () => home([{ name: ".env" }, { name: ".git", is_dir: true }]) });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(page.getByText("This folder has only hidden files (2).")).toBeVisible();
+  await page.getByRole("button", { name: "Show hidden files" }).first().click();
+  await expect(item(page, ".env")).toBeVisible();
+});
+
+test("a folder's details call it a Folder, never the host's guess at a file type", async ({
+  page,
+}) => {
+  const statted: string[] = [];
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "src", is_dir: true, size: null, modified_at: 1_700_000_000 },
+        { name: "notes.txt", size: 10, modified_at: 1_700_000_000 },
+      ]),
+    // What a daemon's fs.stat says: a type guessed from the name alone, which
+    // for a folder is "application/octet-stream". Its dates are newer than
+    // the listing's, so the pane can be seen to have the host's answer.
+    fileStat: (_hostId, path) => {
+      statted.push(path);
+      const folder = path.endsWith("/src");
+      return {
+        path,
+        name: path.split("/").at(-1),
+        kind: folder ? "directory" : "file",
+        size: folder ? 4096 : 10,
+        modified_at: 1_800_000_000,
+        content_type: folder ? "application/octet-stream" : "text/plain",
+      };
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await page.getByRole("button", { name: "Details pane" }).click();
+  const details = page.getByRole("complementary", { name: "Details" });
+  const value = (term: string) =>
+    details
+      .locator("dl > div")
+      .filter({ has: page.locator("dt", { hasText: new RegExp(`^${term}$`) }) })
+      .locator("dd");
+
+  // A file's type is what the host says it is.
+  await item(page, "notes.txt").click();
+  await expect(value("Modified")).toContainText("2027");
+  await expect(value("Type")).toHaveText("text/plain");
+
+  // A folder is a Folder, as its Kind says, once the host has answered too.
+  await item(page, "src").click();
+  await expect.poll(() => statted).toContain("/Users/tester/src");
+  await expect(value("Modified")).toContainText("2027");
+  await expect(value("Kind")).toHaveText("Folder");
+  await expect(value("Type")).toHaveText("Folder");
+  await expect(details.getByText("application/octet-stream")).toHaveCount(0);
+});
+
+test("Go to folder takes ~ paths and says why it cannot go somewhere", async ({ page }) => {
+  await mockApp(page, {
+    files: (_hostId, path) => {
+      if (path === "/Users/tester/missing") throw new Error("host_error:not_found");
+      return treeFiles(_hostId, path);
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(item(page, "notes.txt")).toBeVisible();
+
+  await page.getByRole("button", { name: "Go to folder" }).click();
+  const field = page.getByRole("textbox", { name: "Go to folder" });
+  await expect(field).toHaveValue("~");
+  await field.fill("~/projects");
+  await field.press("Enter");
+  await expect(item(page, "readme.md")).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/hosts/${HOST_ID}/files$`));
+
+  // A relative path is from the folder on screen, as in a shell.
+  await page.getByRole("button", { name: "Go to folder" }).click();
+  await field.fill("spawn");
+  await field.press("Enter");
+  await expect(item(page, "main.rs")).toBeVisible();
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(item(page, "readme.md")).toBeVisible();
+
+  await page.getByRole("button", { name: "Go to folder" }).click();
+  await field.fill("/etc");
+  await field.press("Enter");
+  await expect(field).toHaveAccessibleDescription(
+    "SPAWN D only opens folders inside your home folder on Mac.",
+  );
+  await field.fill("~/missing");
+  await field.press("Enter");
+  await expect(field).toHaveAccessibleDescription("There's no folder at that path on Mac.");
+  await field.press("Escape");
+  await expect(item(page, "readme.md")).toBeVisible();
+});
+
+test("a folder past the host's 1,024 cap is drained, virtualized, and honest about it", async ({
+  page,
+}) => {
+  const cursors: number[] = [];
+  const all = Array.from({ length: 1_500 }, (_, i) =>
+    fileEntry({ name: `f${String(i).padStart(4, "0")}.txt`, path: `/Users/tester/big/f${i}` }),
+  );
+  await mockApp(page, {
+    fileStat: (_hostId, path) => ({ path, name: "big", kind: "directory", size: null }),
+    files: (_hostId, path, cursor) => {
+      if (path !== "/Users/tester/big") {
+        return home([{ name: "big", is_dir: true, size: null }]);
+      }
+      cursors.push(cursor);
+      const end = Math.min(cursor + 96, 1_024);
+      return fileListing({
+        path,
+        entries: all.slice(cursor, end),
+        next_cursor: end < 1_024 ? end : null,
+        truncated: end === 1_024,
+      });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files?path=${encodeURIComponent("/Users/tester/big")}`);
+  await expect(page.getByRole("note")).toHaveText(
+    "This folder has more than 1,024 items. SPAWN D on Mac can only list the first 1,024 it finds, so sorting and filtering cover just those.",
+  );
+  expect(cursors.slice(0, 11)).toEqual([0, 96, 192, 288, 384, 480, 576, 672, 768, 864, 960]);
+  await expect(page.getByRole("status").filter({ hasText: "1,024 items" })).toBeVisible();
+
+  // Only the rows near the viewport are in the page.
+  const grid = page.getByRole("grid", { name: "Files" });
+  const rendered = await grid.locator("[role='row'][data-path]").count();
+  expect(rendered).toBeGreaterThan(5);
+  expect(rendered).toBeLessThan(120);
+
+  // End jumps to the last row, which scrolls into view.
+  await item(page, "f0000.txt").click();
+  await page.keyboard.press("End");
+  await expect(item(page, "f1023.txt")).toBeVisible();
+  await expect(item(page, "f1023.txt")).toHaveAttribute("aria-selected", "true");
+});
+
+/** A 300-entry home, served a page at a time the way a v1 host does. */
+function bigHome(all: Array<Record<string, unknown>>) {
+  return (_hostId: string, path: string | null, cursor: number) => {
+    if (path !== "/Users/tester") return fileListing({ path, entries: [] });
+    const end = Math.min(cursor + 96, all.length);
+    return fileListing({
+      entries: all.slice(cursor, end),
+      next_cursor: end < all.length ? end : null,
+    });
+  };
+}
+
+test("New folder far down a long folder opens in view, and a refused name is said there", async ({
+  page,
+}) => {
+  const mkdirs: string[] = [];
+  const all = Array.from({ length: 300 }, (_, i) =>
+    fileEntry({ name: `f${String(i).padStart(3, "0")}.txt`, path: `/Users/tester/f${i}.txt` }),
+  );
+  await mockApp(page, {
+    files: bigHome(all),
+    fileMkdir: async (_h, body, route) => {
+      const path = (body as { path: string }).path;
+      mkdirs.push(path);
+      if (path.endsWith("/taken")) throw new Error("host_error:already_exists");
+      await route.fulfill({ status: 200, json: { path } });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await item(page, "f000.txt").click();
+  await page.keyboard.press("End");
+  await expect(item(page, "f299.txt")).toBeVisible();
+  await expect(item(page, "f000.txt")).toHaveCount(0);
+
+  await openNewMenu(page, "New folder");
+  const field = page.getByLabel("Folder name");
+  await expect(field).toBeVisible();
+  await expect(field).toBeFocused();
+
+  // The host refuses: the reason is right under the name, which stays to fix.
+  await field.fill("taken");
+  await field.press("Enter");
+  await expect(field).toHaveAccessibleDescription("There's already an item named “taken” here.");
+  await expect(field).toBeFocused();
+  await field.fill("scratch");
+  await expect(page.getByRole("alert").filter({ hasText: "already an item" })).toHaveCount(0);
+  await field.press("Enter");
+  await expect.poll(() => mkdirs).toEqual(["/Users/tester/taken", "/Users/tester/scratch"]);
+  await expect(field).toHaveCount(0);
+
+  // The list still answers the keyboard.
+  await page.keyboard.press("Home");
+  await expect(item(page, "f000.txt")).toBeVisible();
+});
+
+test("a name already taken is said as that, though the host itself only says it can't be sure", async ({
+  page,
+}) => {
+  // As SPAWN D's file service answers (daemon/src/host_files.rs): mkdir is
+  // mkdir -p, and anything that fails inside a mkdir or a rename comes back
+  // outcome_unknown, a name already taken included.
+  const disk = new Map<string, "file" | "directory">([
+    ["/Users/tester/level1", "directory"],
+    ["/Users/tester/draft.txt", "file"],
+    ["/Users/tester/solo.md", "file"],
+  ]);
+  // What the host lists; a name made later by someone else is not in it.
+  const listed = ["level1", "draft.txt", "solo.md"];
+  const asked: string[] = [];
+  await mockApp(page, {
+    files: () =>
+      home(
+        listed.map((name) => {
+          const folder = disk.get(`/Users/tester/${name}`) === "directory";
+          return { name, is_dir: folder, kind: folder ? "directory" : "file" };
+        }),
+      ),
+    fileStat: (_h, path) => {
+      asked.push(`stat ${path}`);
+      const kind = disk.get(path);
+      if (!kind) throw new Error("host_error:not_found");
+      return { path, name: path.split("/").at(-1), kind, size: null };
+    },
+    fileMkdir: async (_h, body, route) => {
+      const path = (body as { path: string }).path;
+      asked.push(`mkdir ${path}`);
+      const kind = disk.get(path);
+      if (kind === "file") throw new Error("host_error:outcome_unknown");
+      disk.set(path, "directory");
+      await route.fulfill({ status: 200, json: { path } });
+    },
+    fileRename: async (_h, body, route) => {
+      const { path, name } = body as { path: string; name: string };
+      asked.push(`rename ${path}`);
+      const to = `/Users/tester/${name}`;
+      const kind = disk.get(path);
+      if (!kind || disk.has(to)) throw new Error("host_error:outcome_unknown");
+      disk.delete(path);
+      disk.set(to, kind);
+      await route.fulfill({ status: 200, json: { path: to } });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(item(page, "solo.md")).toBeVisible();
+
+  // New folder named like a folder already there: not "made" again.
+  await openNewMenu(page, "New folder");
+  const folderField = page.getByLabel("Folder name");
+  await folderField.fill("level1");
+  await folderField.press("Enter");
+  await expect(folderField).toHaveAccessibleDescription(
+    "There's already an item named “level1” here.",
+  );
+  // Like a file: the same, and never "lost touch".
+  await folderField.fill("draft.txt");
+  await folderField.press("Enter");
+  await expect(folderField).toHaveAccessibleDescription(
+    "There's already an item named “draft.txt” here.",
+  );
+  expect(asked).toEqual([]);
+  await folderField.press("Escape");
+  await expect(item(page, "level1")).toHaveAttribute("aria-selected", "false");
+
+  // Rename onto a name in the folder on screen.
+  await item(page, "solo.md").click();
+  await page.keyboard.press("F2");
+  const renameField = page.getByLabel("Rename entry");
+  await renameField.fill("level1");
+  await renameField.press("Enter");
+  await expect(renameField).toHaveAccessibleDescription(
+    "There's already an item named “level1” here.",
+  );
+  expect(asked).toEqual([]);
+
+  // Onto one made on the host after the folder was read: the host's
+  // "unknown" is looked into, and both names are still there.
+  disk.set("/Users/tester/late.md", "file");
+  await renameField.fill("late.md");
+  await renameField.press("Enter");
+  await expect(renameField).toHaveAccessibleDescription(
+    "There's already an item named “late.md” here.",
+  );
+  expect([...asked].sort()).toEqual([
+    "rename /Users/tester/solo.md",
+    "stat /Users/tester/late.md",
+    "stat /Users/tester/solo.md",
+  ]);
+  await expect(page.getByText(/lost touch/u)).toHaveCount(0);
+  expect(disk.get("/Users/tester/solo.md")).toBe("file");
+});
+
+test("a file's preview never covers its own row: its ⋯ stays in reach, and reaching for it puts the card away", async ({
+  page,
+}) => {
+  // The Files page filling a wide window: the card lies over the list.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "notes.txt", size: 20 },
+        { name: "solo-zx1.md", size: 40 },
+        { name: "zeta.txt", size: 30 },
+        { name: "zeta2.txt", size: 30 },
+        { name: "zeta3.txt", size: 30 },
+      ]),
+    fileRead: () => "# Notes\n\nA line.\n",
+  });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const row = item(page, "solo-zx1.md");
+  await expect(row).toBeVisible();
+
+  // Rest on the name, as a person does.
+  await row.getByText("solo-zx1.md", { exact: true }).hover();
+  const card = page.locator("#file-preview-card");
+  await expect(card).toBeVisible();
+  await expect(card.getByText("solo-zx1.md", { exact: true })).toBeVisible();
+  const rowBox = await row.boundingBox();
+  const cardBox = await card.boundingBox();
+  if (!rowBox || !cardBox) throw new Error("no boxes");
+  const clearOfRow =
+    cardBox.y >= rowBox.y + rowBox.height - 0.5 || cardBox.y + cardBox.height <= rowBox.y + 0.5;
+  expect(clearOfRow).toBe(true);
+
+  // On the way down onto the card the pointer crosses the next file's row;
+  // arriving keeps this card rather than swapping to that one.
+  const name = await row.getByText("solo-zx1.md", { exact: true }).boundingBox();
+  if (!name) throw new Error("no name");
+  await page.mouse.move(cardBox.x - 20, rowBox.y + rowBox.height + 10, { steps: 6 });
+  await page.mouse.move(cardBox.x + 80, cardBox.y + 60, { steps: 6 });
+  await page.waitForTimeout(700);
+  await expect(card.getByText("solo-zx1.md", { exact: true })).toBeVisible();
+  await page.mouse.move(name.x + name.width / 2, name.y + name.height / 2, { steps: 10 });
+  await expect(card.getByText("solo-zx1.md", { exact: true })).toBeVisible();
+
+  // The row's ⋯ is the row's, not the card's.
+  const kebab = row.getByRole("button", { name: "solo-zx1.md actions" });
+  const kebabBox = await kebab.boundingBox();
+  if (!kebabBox) throw new Error("no kebab");
+  const at = { x: kebabBox.x + kebabBox.width / 2, y: kebabBox.y + kebabBox.height / 2 };
+  const hit = await page.evaluate(
+    ({ x, y }) =>
+      document.elementFromPoint(x, y)?.closest("[data-path]")?.getAttribute("data-path"),
+    at,
+  );
+  expect(hit).toBe("/Users/tester/solo-zx1.md");
+
+  // Moving along the row to it puts the card away, and it opens the row's menu.
+  await page.mouse.move(at.x, at.y, { steps: 12 });
+  await expect(card).toBeHidden();
+  await page.mouse.click(at.x, at.y);
+  await expect(page.getByRole("menuitem", { name: "Rename" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menuitem", { name: "Rename" })).toHaveCount(0);
+
+  // A rename field's message lies under its row: no card stays over it.
+  await item(page, "notes.txt").getByText("notes.txt", { exact: true }).click();
+  await expect(card).toBeVisible();
+  await page.keyboard.press("F2");
+  await expect(page.getByLabel("Rename entry")).toBeFocused();
+  await expect(card).toBeHidden();
+});
+
+test("a file's preview never lies in the pointer's way: the next row takes its click, and the card is still reached by going to it", async ({
+  page,
+}) => {
+  // The Files page filling the window, so the card lies over the list. It
+  // used to hang from the strip of names whatever the pointer did, under the
+  // middle of every row below: a click, a pause long enough for the card,
+  // then a Shift-click on the next file landed on the card instead.
+  await mockApp(page, {
+    files: () => home([{ name: "a.txt" }, { name: "b.txt" }, { name: "c.txt" }, { name: "d.txt" }]),
+    fileRead: () => "A line.\n",
+  });
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  const card = page.locator("#file-preview-card");
+
+  // Clicked in the middle of a row, and waited on until its card is up.
+  await item(page, "a.txt").click();
+  await expect(card).toHaveAttribute("aria-label", "a.txt preview");
+  await item(page, "b.txt").click({ modifiers: ["Shift"], timeout: 2_000 });
+  for (const name of ["a.txt", "b.txt"]) {
+    await expect(item(page, name)).toHaveAttribute("aria-selected", "true");
+  }
+
+  // Resting without a click is the same: the card opens beside the pointer's
+  // column, never across it, and the row straight below is a click away.
+  const c = await item(page, "c.txt").boundingBox();
+  if (!c) throw new Error("no row");
+  const x = c.x + c.width / 2;
+  await page.mouse.move(x, c.y + c.height / 2);
+  await expect(card).toHaveAttribute("aria-label", "c.txt preview");
+  const cardBox = await card.boundingBox();
+  if (!cardBox) throw new Error("no card");
+  expect(cardBox.x > x || cardBox.x + cardBox.width < x).toBe(true);
+  await page.mouse.move(x, c.y + c.height * 1.5, { steps: 4 });
+  await item(page, "d.txt").click({ timeout: 2_000 });
+  await expect(item(page, "d.txt")).toHaveAttribute("aria-selected", "true");
+  await expect(item(page, "a.txt")).toHaveAttribute("aria-selected", "false");
+
+  // And the card is still the pointer's to reach: going to it keeps it.
+  await item(page, "b.txt").hover();
+  await expect(card).toHaveAttribute("aria-label", "b.txt preview");
+  const reach = await card.boundingBox();
+  if (!reach) throw new Error("no card");
+  await page.mouse.move(reach.x + reach.width / 2, reach.y + 40, { steps: 8 });
+  await page.waitForTimeout(700);
+  await expect(card).toHaveAttribute("aria-label", "b.txt preview");
+});
+
+test("another folder opens at its top, not where the last one was scrolled", async ({ page }) => {
+  const homeFiles = [
+    fileEntry({ name: "sub", path: "/Users/tester/sub", is_dir: true, size: null }),
+    ...Array.from({ length: 300 }, (_, i) =>
+      fileEntry({ name: `f${String(i).padStart(3, "0")}.txt`, path: `/Users/tester/f${i}.txt` }),
+    ),
+  ];
+  const subFiles = Array.from({ length: 300 }, (_, i) =>
+    fileEntry({ name: `g${String(i).padStart(3, "0")}.txt`, path: `/Users/tester/sub/g${i}.txt` }),
+  );
+  await mockApp(page, {
+    files: (_hostId, path, cursor) => {
+      const sub = path === "/Users/tester/sub";
+      const all = sub ? subFiles : homeFiles;
+      const end = Math.min(cursor + 96, all.length);
+      return fileListing({
+        path: sub ? path : "/Users/tester",
+        entries: all.slice(cursor, end),
+        next_cursor: end < all.length ? end : null,
+      });
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await item(page, "sub").click();
+  await page.keyboard.press("End");
+  await expect(item(page, "f299.txt")).toBeVisible();
+
+  await page.getByRole("button", { name: "Go to folder" }).click();
+  await page.getByRole("textbox", { name: "Go to folder" }).fill("sub");
+  await page.getByRole("textbox", { name: "Go to folder" }).press("Enter");
+  await expect(item(page, "g000.txt")).toBeInViewport();
+});
+
+test("a folder bigger than a page that changed on the host says so instead of keeping ghosts", async ({
+  page,
+}) => {
+  const all = Array.from({ length: 200 }, (_, i) =>
+    fileEntry({ name: `f${String(i).padStart(3, "0")}.txt`, path: `/Users/tester/f${i}.txt` }),
+  );
+  await page.clock.install();
+  await mockApp(page, { files: bigHome(all) });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(item(page, "f000.txt")).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "200 items" })).toBeVisible();
+  // Not kept current on a timer, so it does not claim to be.
+  await expect(page.getByText("Refreshes every few seconds")).toHaveCount(0);
+
+  // f000 is deleted on the host; the next look at page one notices.
+  all.splice(0, 1);
+  await page.clock.fastForward(11_000);
+  const notice = page.getByRole("status").filter({ hasText: "This folder changed on Mac." });
+  await expect(notice).toBeVisible();
+
+  await notice.getByRole("button", { name: "Refresh" }).click();
+  await expect(notice).toHaveCount(0);
+  await expect(item(page, "f000.txt")).toHaveCount(0);
+  await expect(page.getByRole("status").filter({ hasText: "199 items" })).toBeVisible();
+});
+
+test("a folder that fits on one page is kept current, and says so", async ({ page }) => {
+  const entries = [{ name: "a.txt" }, { name: "b.txt" }];
+  await page.clock.install();
+  await mockApp(page, { files: () => home(entries) });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(item(page, "b.txt")).toBeVisible();
+  await expect(page.getByText("Refreshes every few seconds")).toBeVisible();
+  entries.splice(1, 1);
+  await page.clock.fastForward(11_000);
+  await expect(item(page, "b.txt")).toHaveCount(0);
+  await expect(page.getByText("This folder changed on Mac.")).toHaveCount(0);
 });
 
 test("session page toggles an inline files panel rooted at the cwd", async ({ page }) => {
   let requestedPath: string | null = null;
   await mockApp(page, {
     sessions: [session()],
+    fileStat: treeStat,
     files: (_hostId, path) => {
       requestedPath = path;
       return fileListing({
@@ -354,6 +1228,20 @@ test("session page toggles an inline files panel rooted at the cwd", async ({ pa
 
   await page.getByRole("button", { name: "Toggle files", exact: true }).click();
   await expect(panel).toHaveCount(0);
+  await page.getByRole("button", { name: "Toggle files", exact: true }).click();
+  await expect(panel).toBeVisible();
+
+  // Its menu reaches the full browser at the same folder — handed over in
+  // memory, so the folder is in no link, prefetch or address.
+  await panel.getByRole("button", { name: "File actions" }).click();
+  const open = page.getByRole("menuitem", { name: "Open in full browser" });
+  await expect(open).not.toHaveAttribute("href", /.*/);
+  await open.click();
+  await expect(page).toHaveURL(new RegExp(`/hosts/${HOST_ID}/files$`));
+  await expect(
+    page.getByRole("navigation", { name: "Folder path" }).getByRole("button", { name: "spawn" }),
+  ).toHaveAttribute("aria-current", "page");
+  await expect(item(page, "main.rs")).toBeVisible();
 });
 
 test("a file explorer is added to the workspace as its own pane", async ({ page }) => {
@@ -391,6 +1279,92 @@ test("a file explorer is added to the workspace as its own pane", async ({ page 
   await expect(pane).toBeVisible();
   await expect(pane.getByRole("tree", { name: "Files" })).toBeVisible();
   await expect.poll(() => requested.length).toBeGreaterThan(0);
+
+  // Its own ground offers what the pane's header does not.
+  await pane
+    .getByRole("tree", { name: "Files" })
+    .click({ button: "right", position: { x: 40, y: 200 } });
+  await expect(page.getByRole("menuitemcheckbox", { name: "Show hidden files" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "New file" })).toBeVisible();
+});
+
+test("a workspace's file pane filters and sorts from its own header, as the Files page does", async ({
+  page,
+}) => {
+  const { WORKSPACE_ID, workspace } = await import("./app-mocks");
+  await mockApp(page, {
+    sessions: [session({ cwd: "/Users/tester/spawn" })],
+    workspaces: [workspace()],
+    files: (_hostId, path) => {
+      const dir = path ?? "/Users/tester/spawn";
+      return fileListing({
+        path: dir,
+        entries: [
+          fileEntry({ name: "src", path: `${dir}/src`, is_dir: true, size: null }),
+          fileEntry({ name: "b.txt", path: `${dir}/b.txt`, size: 300 }),
+          fileEntry({ name: "a.txt", path: `${dir}/a.txt`, size: 100 }),
+          fileEntry({ name: "c.md", path: `${dir}/c.md`, size: 200 }),
+        ],
+      });
+    },
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page.getByRole("button", { name: "Add a window" }).hover();
+  await page.getByRole("button", { name: "New file explorer window" }).click();
+  await page.getByRole("menu", { name: "Where?" }).getByRole("menuitem").first().click();
+  const pane = page.getByRole("region", { name: /^Files — / });
+  const tree = pane.getByRole("tree", { name: "Files" });
+  await expect(tree).toBeVisible();
+  await expect.poll(() => treeNames(tree)).toEqual(["src", "a.txt", "b.txt", "c.md"]);
+
+  // The tree has no column headers to click: the header's Sort offers the
+  // same fields, directions and folders-on-top as the page's View options.
+  const sortBy = async (choice: string) => {
+    await pane.getByRole("button", { name: "Sort", exact: true }).click();
+    await page.getByRole("menuitemcheckbox", { name: choice, exact: true }).click();
+  };
+  await sortBy("Size");
+  await expect.poll(() => treeNames(tree)).toEqual(["src", "b.txt", "c.md", "a.txt"]);
+  await sortBy("Folders on top");
+  // A folder has no size, and no size sinks whichever way the list runs.
+  await expect.poll(() => treeNames(tree)).toEqual(["b.txt", "c.md", "a.txt", "src"]);
+  await sortBy("Smallest first");
+  await expect.poll(() => treeNames(tree)).toEqual(["a.txt", "c.md", "b.txt", "src"]);
+  await pane.getByRole("button", { name: "Sort", exact: true }).click();
+  await expect(page.getByRole("menuitemcheckbox", { name: "Size", exact: true })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
+  await expect(page.getByRole("menuitemcheckbox", { name: "Folders on top" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
+  await page.keyboard.press("Escape");
+
+  // Search is in sight, not only behind Ctrl/⌘+F: it opens the filter and
+  // puts the keyboard in it.
+  await pane.getByRole("button", { name: "Filter this folder" }).click();
+  const filter = pane.getByRole("searchbox", { name: "Filter this folder" });
+  await expect(filter).toBeFocused();
+  await page.keyboard.type("a");
+  await expect.poll(() => treeNames(tree)).toEqual(["a.txt"]);
+  await filter.press("Escape");
+  await expect(filter).toHaveCount(0);
+  await expect.poll(() => treeNames(tree)).toEqual(["a.txt", "c.md", "b.txt", "src"]);
+
+  // One sort for the device: the host's Files page opens in the order the
+  // pane was given, and its View options say so.
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(header(page, "Size")).toHaveAttribute("aria-sort", "ascending");
+  await page.getByRole("button", { name: "View options" }).click();
+  await expect(page.getByRole("menuitemcheckbox", { name: "Smallest first" })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
+  await expect(page.getByRole("menuitemcheckbox", { name: "Folders on top" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
 });
 
 /** Enough shapes that a rendered view is unmistakably not the source. */
