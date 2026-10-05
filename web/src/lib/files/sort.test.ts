@@ -7,6 +7,7 @@ import {
   type SortableEntry,
   sortEntries,
   toggleSort,
+  typeLabel,
 } from "./sort";
 
 function file(name: string, extra: Partial<SortableEntry> = {}): SortableEntry {
@@ -94,6 +95,31 @@ describe("sorting a folder", () => {
     expect(names(kinds)).toEqual(["z", "a.md", "c.md", "b.png"]);
     expect(kindLabel(folder("z"))).toBe("Folder");
     expect(kindLabel(file("a.md"))).toBe("Markdown");
+  });
+
+  test("a folder's type is Folder, never the host's name-based guess", () => {
+    // What fs.stat says of a folder: a type guessed from its name.
+    expect(
+      typeLabel(folder("src"), { kind: "directory", content_type: "application/octet-stream" }),
+    ).toBe("Folder");
+    expect(typeLabel(folder("photos.png"), { kind: "directory", content_type: "image/png" })).toBe(
+      "Folder",
+    );
+    // Before the host answers, or on a host without fs.stat, the listing says so.
+    expect(typeLabel(folder("src"), null)).toBe("Folder");
+    // A file is what the host says, and nothing until it says it.
+    expect(typeLabel(file("a.md"), { kind: "file", content_type: "text/markdown" })).toBe(
+      "text/markdown",
+    );
+    expect(
+      typeLabel(file("blob"), { kind: "file", content_type: "application/octet-stream" }),
+    ).toBe("application/octet-stream");
+    expect(typeLabel(file("a.md"), null)).toBeNull();
+    expect(typeLabel(file("a.md"), { kind: "file", content_type: null })).toBeNull();
+    // The host's answer is the newer one: a row listed as a file that is a folder now.
+    expect(
+      typeLabel(file("build"), { kind: "directory", content_type: "application/octet-stream" }),
+    ).toBe("Folder");
   });
 
   test("does not reorder the array it was given", () => {

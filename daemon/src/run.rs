@@ -3186,12 +3186,9 @@ async fn handle_session_create(
         return;
     }
 
-    // Build the env for the session's login shell: the daemon's process env
-    // (so HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally and agent
-    // CLIs launched from the shell find their own credentials), normalized
-    // and PATH-enriched. spawn does not inject credentials.
-    let mut env: BTreeMap<String, String> = std::env::vars().collect();
-    normalize_session_env(&mut env).await;
+    // The env for the session's login shell (`resolved_command_env`). spawn
+    // does not inject credentials.
+    let mut env = resolved_command_env().await;
     if let Err(error) = materialize_session_capabilities(&create, &mut env) {
         tracing::warn!(%session_id, %error, "session capability setup failed");
         send_spawn_failed_exit(session_id, out_tx, "capability setup failed").await;
@@ -3399,10 +3396,53 @@ fn login_shell_argv(shell: String) -> Vec<String> {
     }
 }
 
+/// The PATH `resolved_command_env` last made, for the daemon's latest window
+/// or agent check — the only places the user's shell is asked for it.
+static WINDOW_PATH: StdMutex<Option<String>> = StdMutex::new(None);
+
+/// The environment a window's login shell starts with, and an agent check
+/// resolves commands in: the daemon's process env (so HOME, XDG_CONFIG_HOME,
+/// PATH, etc. flow through naturally and agent CLIs launched from the shell
+/// find their own credentials), normalized and PATH-enriched. Its PATH is
+/// kept for `window_path`.
 async fn resolved_command_env() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     normalize_session_env(&mut env).await;
+    if let Some(path) = env_get_ci(&env, "PATH") {
+        *WINDOW_PATH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
+    }
     env
+}
+
+/// The PATH a window of this daemon finds its commands on, for a reader that
+/// executes nothing (`conv.probe`): the one the latest window or agent check
+/// was given, else — before either, since this daemon started — the same
+/// enrichment short of asking the user's shell: the common user bin folders
+/// ahead of the daemon's own PATH.
+pub(crate) fn window_path() -> Option<String> {
+    let remembered = WINDOW_PATH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    remembered.or_else(|| path_without_shell(std::env::vars().collect()))
+}
+
+/// `normalize_session_env`'s PATH without the entries only the user's shell
+/// can name.
+fn path_without_shell(mut env: BTreeMap<String, String>) -> Option<String> {
+    let preferred = common_user_bin_entries(&env);
+    prepend_path_entries(&mut env, preferred);
+    env_get_ci(&env, "PATH").cloned()
+}
+
+/// Where `program` resolves on `path` by the daemon's own rule for agents
+/// (`resolve_program_in_env`): the file, every link resolved. Nothing is
+/// executed.
+pub(crate) fn resolve_on_path(program: &str, path: String) -> Option<PathBuf> {
+    let env = BTreeMap::from([("PATH".to_string(), path)]);
+    resolve_program_in_env(Path::new(program), &env).map(|resolved| resolved.path)
 }
 
 async fn normalize_session_env(env: &mut BTreeMap<String, String>) {
@@ -6443,6 +6483,66 @@ mod tests {
         assert_eq!(entries[1], home.join(".local/bin"));
         assert!(entries.iter().any(|entry| entry == &service_bin));
         assert!(entries.iter().any(|entry| entry == &fallback_bin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn window_path_before_any_launch_is_the_enrichment_short_of_the_shell() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let mut env = BTreeMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert("PATH".to_string(), "/opt/spawn:/usr/bin".to_string());
+
+        let path = path_without_shell(env).expect("path");
+        let entries = std::env::split_paths(&path).collect::<Vec<_>>();
+        assert_eq!(entries[0], home.join(".local/bin"));
+        assert_eq!(
+            entries[entries.len() - 2..],
+            [PathBuf::from("/opt/spawn"), PathBuf::from("/usr/bin")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolving_on_a_path_takes_the_first_and_runs_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(temp.path()).expect("root");
+        let ran = root.join("ran");
+        let (first, second) = (root.join("first"), root.join("second"));
+        for folder in [&first, &second] {
+            fs::create_dir_all(folder).expect("folder");
+            let program = folder.join("agent");
+            fs::write(&program, format!("#!/bin/sh\ntouch '{}'\n", ran.display()))
+                .expect("program");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("mode");
+        }
+        let missing = root.join("missing");
+        let path = std::env::join_paths([&missing, &first, &second])
+            .expect("join")
+            .into_string()
+            .expect("utf-8");
+
+        assert_eq!(
+            resolve_on_path("agent", path.clone()),
+            Some(first.join("agent"))
+        );
+        // A link is followed to the file it names.
+        let linked = root.join("linked");
+        fs::create_dir_all(&linked).expect("linked");
+        std::os::unix::fs::symlink(second.join("agent"), linked.join("agent")).expect("link");
+        let path = std::env::join_paths([&linked, &first])
+            .expect("join")
+            .into_string()
+            .expect("utf-8");
+        assert_eq!(resolve_on_path("agent", path), Some(second.join("agent")));
+        assert_eq!(
+            resolve_on_path("absent", missing.display().to_string()),
+            None
+        );
+        assert!(!ran.exists(), "resolving ran the program");
     }
 
     #[cfg(unix)]

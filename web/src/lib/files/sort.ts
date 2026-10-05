@@ -57,10 +57,29 @@ export function isFolder(entry: Pick<HostDirEntry, "is_dir">): boolean {
   return entry.is_dir === true;
 }
 
+/** What a folder is called wherever the browser names a kind. */
+export const FOLDER_LABEL = "Folder";
+
 /** The Kind column's words: "Folder", "Markdown", "PNG image", "File". */
 export function kindLabel(entry: Pick<HostDirEntry, "name" | "kind" | "is_dir" | "size">): string {
-  if (isFolder(entry)) return "Folder";
+  if (isFolder(entry)) return FOLDER_LABEL;
   return classifyFile(entry).label;
+}
+
+/**
+ * The details pane's Type: a file's content type as the host gives it, and a
+ * folder is a Folder. `fs.stat` guesses a type from the name alone, so a
+ * folder comes back as "application/octet-stream" — or, named like a file
+ * ("photos.png"), as that file's type — and neither is about the folder.
+ * The host's answer, when there is one, says whether it is a folder now.
+ */
+export function typeLabel(
+  entry: Pick<HostDirEntry, "is_dir">,
+  stat: { kind?: string | null; content_type?: string | null } | null,
+): string | null {
+  const folder = stat?.kind ? stat.kind === "directory" : isFolder(entry);
+  if (folder) return FOLDER_LABEL;
+  return stat?.content_type || null;
 }
 
 /** Clicking a column: the same column reverses, another starts at its first order. */

@@ -7,7 +7,7 @@ import { FileIcon } from "@/components/files/file-icon";
 import { itemCount } from "@/lib/files/copy";
 import { formatSize, formatTimestamp } from "@/lib/files/format";
 import { displayPath } from "@/lib/files/navigation";
-import { kindLabel } from "@/lib/files/sort";
+import { kindLabel, typeLabel } from "@/lib/files/sort";
 import type { HostControlClient, HostDirEntry } from "@/lib/hostControl";
 import type { PathFlavor } from "@/lib/paths";
 import { cn } from "@/lib/utils";
@@ -91,7 +91,8 @@ export function DetailsPane({
     }
     const modified = stat?.modified_at ?? only.modified_at;
     if (modified != null) rows.push(["Modified", formatTimestamp(modified)]);
-    if (stat?.content_type) rows.push(["Type", stat.content_type]);
+    const type = typeLabel(only, stat);
+    if (type) rows.push(["Type", type]);
     rows.push(["Where", displayPath(only.path, homeDir, flavor)]);
   } else if (entries.length > 1) {
     title = `${itemCount(entries.length)} selected`;
