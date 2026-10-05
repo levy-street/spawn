@@ -1,4 +1,4 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Locator, type Page, test } from "@playwright/test";
 import { fileEntry, fileListing, HOST_ID, host, mockApp, session, windowsHost } from "./app-mocks";
 
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000009";
@@ -77,6 +77,21 @@ async function names(page: Page) {
             Number(a.getAttribute("aria-rowindex")) - Number(b.getAttribute("aria-rowindex")),
         )
         .map((row) => row.querySelector("[role='gridcell'] span")?.textContent ?? ""),
+    );
+}
+
+/** The names in a tree, top to bottom. */
+async function treeNames(scope: Locator) {
+  return scope
+    .getByRole("treeitem")
+    .evaluateAll((rows) =>
+      rows
+        .sort(
+          (a, b) =>
+            Number.parseFloat((a as HTMLElement).style.top) -
+            Number.parseFloat((b as HTMLElement).style.top),
+        )
+        .map((row) => row.getAttribute("data-path")?.split("/").at(-1) ?? ""),
     );
 }
 
@@ -710,6 +725,56 @@ test("a folder of only hidden files says so, with the way to show them", async (
   await expect(item(page, ".env")).toBeVisible();
 });
 
+test("a folder's details call it a Folder, never the host's guess at a file type", async ({
+  page,
+}) => {
+  const statted: string[] = [];
+  await mockApp(page, {
+    files: () =>
+      home([
+        { name: "src", is_dir: true, size: null, modified_at: 1_700_000_000 },
+        { name: "notes.txt", size: 10, modified_at: 1_700_000_000 },
+      ]),
+    // What a daemon's fs.stat says: a type guessed from the name alone, which
+    // for a folder is "application/octet-stream". Its dates are newer than
+    // the listing's, so the pane can be seen to have the host's answer.
+    fileStat: (_hostId, path) => {
+      statted.push(path);
+      const folder = path.endsWith("/src");
+      return {
+        path,
+        name: path.split("/").at(-1),
+        kind: folder ? "directory" : "file",
+        size: folder ? 4096 : 10,
+        modified_at: 1_800_000_000,
+        content_type: folder ? "application/octet-stream" : "text/plain",
+      };
+    },
+  });
+
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await page.getByRole("button", { name: "Details pane" }).click();
+  const details = page.getByRole("complementary", { name: "Details" });
+  const value = (term: string) =>
+    details
+      .locator("dl > div")
+      .filter({ has: page.locator("dt", { hasText: new RegExp(`^${term}$`) }) })
+      .locator("dd");
+
+  // A file's type is what the host says it is.
+  await item(page, "notes.txt").click();
+  await expect(value("Modified")).toContainText("2027");
+  await expect(value("Type")).toHaveText("text/plain");
+
+  // A folder is a Folder, as its Kind says, once the host has answered too.
+  await item(page, "src").click();
+  await expect.poll(() => statted).toContain("/Users/tester/src");
+  await expect(value("Modified")).toContainText("2027");
+  await expect(value("Kind")).toHaveText("Folder");
+  await expect(value("Type")).toHaveText("Folder");
+  await expect(details.getByText("application/octet-stream")).toHaveCount(0);
+});
+
 test("Go to folder takes ~ paths and says why it cannot go somewhere", async ({ page }) => {
   await mockApp(page, {
     files: (_hostId, path) => {
@@ -1223,6 +1288,85 @@ test("a file explorer is added to the workspace as its own pane", async ({ page 
     .click({ button: "right", position: { x: 40, y: 200 } });
   await expect(page.getByRole("menuitemcheckbox", { name: "Show hidden files" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "New file" })).toBeVisible();
+});
+
+test("a workspace's file pane filters and sorts from its own header, as the Files page does", async ({
+  page,
+}) => {
+  const { WORKSPACE_ID, workspace } = await import("./app-mocks");
+  await mockApp(page, {
+    sessions: [session({ cwd: "/Users/tester/spawn" })],
+    workspaces: [workspace()],
+    files: (_hostId, path) => {
+      const dir = path ?? "/Users/tester/spawn";
+      return fileListing({
+        path: dir,
+        entries: [
+          fileEntry({ name: "src", path: `${dir}/src`, is_dir: true, size: null }),
+          fileEntry({ name: "b.txt", path: `${dir}/b.txt`, size: 300 }),
+          fileEntry({ name: "a.txt", path: `${dir}/a.txt`, size: 100 }),
+          fileEntry({ name: "c.md", path: `${dir}/c.md`, size: 200 }),
+        ],
+      });
+    },
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page.getByRole("button", { name: "Add a window" }).hover();
+  await page.getByRole("button", { name: "New file explorer window" }).click();
+  await page.getByRole("menu", { name: "Where?" }).getByRole("menuitem").first().click();
+  const pane = page.getByRole("region", { name: /^Files — / });
+  const tree = pane.getByRole("tree", { name: "Files" });
+  await expect(tree).toBeVisible();
+  await expect.poll(() => treeNames(tree)).toEqual(["src", "a.txt", "b.txt", "c.md"]);
+
+  // The tree has no column headers to click: the header's Sort offers the
+  // same fields, directions and folders-on-top as the page's View options.
+  const sortBy = async (choice: string) => {
+    await pane.getByRole("button", { name: "Sort", exact: true }).click();
+    await page.getByRole("menuitemcheckbox", { name: choice, exact: true }).click();
+  };
+  await sortBy("Size");
+  await expect.poll(() => treeNames(tree)).toEqual(["src", "b.txt", "c.md", "a.txt"]);
+  await sortBy("Folders on top");
+  // A folder has no size, and no size sinks whichever way the list runs.
+  await expect.poll(() => treeNames(tree)).toEqual(["b.txt", "c.md", "a.txt", "src"]);
+  await sortBy("Smallest first");
+  await expect.poll(() => treeNames(tree)).toEqual(["a.txt", "c.md", "b.txt", "src"]);
+  await pane.getByRole("button", { name: "Sort", exact: true }).click();
+  await expect(page.getByRole("menuitemcheckbox", { name: "Size", exact: true })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
+  await expect(page.getByRole("menuitemcheckbox", { name: "Folders on top" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
+  await page.keyboard.press("Escape");
+
+  // Search is in sight, not only behind Ctrl/⌘+F: it opens the filter and
+  // puts the keyboard in it.
+  await pane.getByRole("button", { name: "Filter this folder" }).click();
+  const filter = pane.getByRole("searchbox", { name: "Filter this folder" });
+  await expect(filter).toBeFocused();
+  await page.keyboard.type("a");
+  await expect.poll(() => treeNames(tree)).toEqual(["a.txt"]);
+  await filter.press("Escape");
+  await expect(filter).toHaveCount(0);
+  await expect.poll(() => treeNames(tree)).toEqual(["a.txt", "c.md", "b.txt", "src"]);
+
+  // One sort for the device: the host's Files page opens in the order the
+  // pane was given, and its View options say so.
+  await page.goto(`/hosts/${HOST_ID}/files`);
+  await expect(header(page, "Size")).toHaveAttribute("aria-sort", "ascending");
+  await page.getByRole("button", { name: "View options" }).click();
+  await expect(page.getByRole("menuitemcheckbox", { name: "Smallest first" })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
+  await expect(page.getByRole("menuitemcheckbox", { name: "Folders on top" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
 });
 
 /** Enough shapes that a rendered view is unmistakably not the source. */
