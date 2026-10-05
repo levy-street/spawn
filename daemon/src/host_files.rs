@@ -516,6 +516,9 @@ pub(crate) enum HostOperationKind {
     WriteCommit,
     ReadRange,
     Preview,
+    /// The conversation carrier's own filesystem work (`host_conversations`),
+    /// which keeps its own durable records rather than this effect fence.
+    Conversation,
     #[cfg(target_os = "macos")]
     Desktop,
 }
@@ -619,10 +622,13 @@ pub(crate) struct WriteLifecycleTestHooks {
     shutdown_started: Notify,
     shutdown_returned: Notify,
     write_delay_entered: Notify,
-    blocking: [BlockingPause; 11],
-    effect_boundary: [BlockingPause; 11],
+    blocking: [BlockingPause; 12],
+    effect_boundary: [BlockingPause; 12],
     temporary_cleanup: BlockingPause,
     read_hashing: BlockingPause,
+    /// A full stream window waits for its device as long as a deployed
+    /// daemon's does, not the half second tests otherwise allow.
+    deployed_ack_deadline: AtomicBool,
 }
 
 #[cfg(test)]
@@ -678,6 +684,18 @@ impl WriteLifecycleTestHooks {
 
     pub(crate) fn release_read_hashing(&self) {
         self.read_hashing.release();
+    }
+
+    /// For a test that holds a stream's window full across round trips of
+    /// its own and is not about the acknowledgement deadline: on a slow
+    /// runner those round trips outlast the test deadline, and the stream
+    /// would time out from under the test.
+    pub(crate) fn keep_deployed_ack_deadline(&self) {
+        self.deployed_ack_deadline.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn keeps_deployed_ack_deadline(&self) -> bool {
+        self.deployed_ack_deadline.load(Ordering::Acquire)
     }
 
     pub(crate) fn arm_temporary_cleanup(&self) {

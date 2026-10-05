@@ -1,14 +1,14 @@
 {
-  "description": "Stream v2 on spawn.host.ctl: base64 JSON chunks of exactly chunk_bytes (8192) but the last, a negotiated window of unacknowledged chunks starting at 16 or fewer, cumulative stream.ack in both directions (the daemon acknowledges what it wrote), resumable by a device-chosen id with one status shape {id} -> {state, received, next_sequence}, a digest at the start or the end, and one bulk gate per association: a bulk frame of any stream is sent only while the sum of buffered_amount over the association's bulk channels is at or below the watermark. proto/README.md, 'Stream v2', is the specification; conv.v1 (daemon D2) is its first user and fs.v2 (D4) adopts it. Nothing implements it yet. The transcripts carry the bytes of the three-chunk bundle in conversation-bundle-v1-vectors.json; their conv.* payload fields beyond the stream's own and conv.import.begin's agent and conversation_id (which the bundle specification constrains) are illustrative until D2 specifies them.",
+  "description": "Stream v2 on spawn.host.ctl: base64 JSON chunks of exactly chunk_bytes (8192) but the last, a negotiated window of unacknowledged chunks of at most 16 (spike S4), cumulative stream.ack in both directions (the daemon acknowledges what it wrote), resumable by a device-chosen id with one status shape {id} -> {state, received, next_sequence}, a digest at the start or the end, and one bulk gate per association: a bulk frame of any stream is sent only while the sum of buffered_amount over the association's bulk channels is at or below the watermark, 64 KiB (spike S4). proto/README.md, 'Stream v2', is the specification; conv.v2 (daemon D2, daemon/src/host_stream.rs) is its first user and fs.v2 (D4) adopts it. The transcripts carry the bytes of the three-chunk bundle in conversation-bundle-v1-vectors.json; their conv.* payload fields beyond the stream's own and conv.import.begin's agent and conversation_id (which the bundle specification constrains) are specified in proto/README.md, 'The conversation carrier (conv.v2)'.",
   "limits": {
     "chunk_bytes": 8192,
     "frame_bytes_max": 16384,
     "full_chunk_frame_bytes": 11006,
-    "window_max_until_measured": 16,
+    "window_max": 16,
     "window_wire_bytes_at_max": 176096,
     "association_pending_queue_bytes": 131072,
-    "bulk_low_watermark_bytes": 32768,
-    "association_bulk_bytes_max": 49152,
+    "bulk_low_watermark_bytes": 65536,
+    "association_bulk_bytes_max": 81920,
     "resume_retention_seconds_min": 600
   },
   "chunking": [
@@ -281,47 +281,47 @@
         0
       ],
       "other_buffered_amounts": [],
-      "watermark": 32768,
+      "watermark": 65536,
       "may_send": true
     },
     {
       "name": "one bulk channel at the watermark",
       "bulk_buffered_amounts": [
-        32768
+        65536
       ],
       "other_buffered_amounts": [],
-      "watermark": 32768,
+      "watermark": 65536,
       "may_send": true
     },
     {
       "name": "one bulk channel a byte over",
       "bulk_buffered_amounts": [
-        32769
+        65537
       ],
       "other_buffered_amounts": [],
-      "watermark": 32768,
+      "watermark": 65536,
       "may_send": false
     },
     {
       "name": "three bulk channels, each under the watermark, together over it",
       "bulk_buffered_amounts": [
-        32767,
-        32767,
-        32767
+        65535,
+        65535,
+        65535
       ],
       "other_buffered_amounts": [],
-      "watermark": 32768,
+      "watermark": 65536,
       "may_send": false
     },
     {
       "name": "three bulk channels that together sit at the watermark",
       "bulk_buffered_amounts": [
+        32768,
         16384,
-        8192,
-        8192
+        16384
       ],
       "other_buffered_amounts": [],
-      "watermark": 32768,
+      "watermark": 65536,
       "may_send": true
     },
     {
@@ -333,7 +333,7 @@
         65536,
         4096
       ],
-      "watermark": 32768,
+      "watermark": 65536,
       "may_send": true
     }
   ],
@@ -354,6 +354,7 @@
               "transfer_id": "9b2f5c1e-7a40-4d3b-8e61-0c4f2a7d9e15",
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+              "mode": "retire",
               "cwd": "~/code/spawn",
               "length": 16753,
               "sha256": "cc08614a77b5663da499ec4ebe6b165c1c03b80b63ae5c31b078021ef0dcf265",
@@ -448,6 +449,7 @@
               "transfer_id": "9b2f5c1e-7a40-4d3b-8e61-0c4f2a7d9e15",
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
+              "mode": "retire",
               "cwd": "~/code/spawn",
               "length": 16753,
               "sha256": "cc08614a77b5663da499ec4ebe6b165c1c03b80b63ae5c31b078021ef0dcf265",
@@ -559,6 +561,8 @@
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
               "mode": "retire",
+              "session_id": "33333333-3333-4333-8333-333333333333",
+              "to_host_id": "44444444-4444-4444-8444-444444444444",
               "stream": {
                 "window": 16,
                 "digest": "end"
@@ -628,6 +632,8 @@
               "agent": "claude-code",
               "conversation_id": "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60",
               "mode": "retire",
+              "session_id": "33333333-3333-4333-8333-333333333333",
+              "to_host_id": "44444444-4444-4444-8444-444444444444",
               "stream": {
                 "window": 16,
                 "digest": "end"
