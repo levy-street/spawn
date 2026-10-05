@@ -6,21 +6,22 @@ import re
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, grid, schemas
 from ..db import get_session
-from ..models import Host, Session, User, Workspace
+from ..models import SESSION_MOVING, Host, Session, User, Workspace
 from . import capabilities
 from .sessions import (
     _to_out as session_to_out,
 )
 from .sessions import (
     create_session_row,
+    delete_session_row,
     dispatch_session_launch,
-    mark_session_stopped,
     send_session_kill,
+    stop_session_row,
 )
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
@@ -114,6 +115,73 @@ def active_tab(layout: dict) -> dict:
 def layout_tiles(layout: dict) -> list[dict]:
     """Every tile across the envelope, tabs in order."""
     return [tile for tab in layout["tabs"] for tile in tab["layout"]["tiles"]]
+
+
+def _layout_session_ids(layout: dict) -> list[str]:
+    """The windows a layout's session tiles name, once each, in layout order."""
+    ids: list[str] = []
+    for tile in layout_tiles(layout):
+        session_id = tile.get("session_id")
+        if isinstance(session_id, str) and tile.get("widget") is None and session_id not in ids:
+            ids.append(session_id)
+    return ids
+
+
+async def archived_workspace_holds(db: AsyncSession, owner_user_id: str, session_id: str) -> bool:
+    """Whether one of the owner's archived workspaces has a tile for this
+    window.
+
+    Nothing runs in an archived workspace — archive stopped every window in
+    it, and restore is what starts them again — so a move into one would
+    quietly undo the archive, as a new window would (`create_session`'s
+    `409 workspace_archived`). Read in the caller's transaction after its own
+    write to the window, so an archive that stopped the window first is seen,
+    and one that comes after finds the window already changed."""
+    layouts = (
+        await db.execute(
+            select(Workspace.layout).where(
+                Workspace.owner_user_id == owner_user_id,
+                Workspace.archived_at.is_not(None),
+            )
+        )
+    ).scalars()
+    return any(
+        session_id in _layout_session_ids(parse_workspace_layout(layout)) for layout in layouts
+    )
+
+
+async def _refuse_while_moving(db: AsyncSession, user: User, session_ids: list[str]) -> None:
+    """`409 move_in_progress` when any of these windows is moving.
+
+    Asked before anything changes: archiving or deleting a workspace stops or
+    deletes every window in it, and a window that is moving ends only with
+    its move's commit or abort — the host it is leaving holds its
+    conversation set aside meanwhile."""
+    if not session_ids:
+        return
+    moving = await db.scalar(
+        select(Session.id)
+        .where(
+            Session.owner_user_id == user.id,
+            Session.id.in_(session_ids),
+            Session.status == SESSION_MOVING,
+        )
+        .limit(1)
+    )
+    if moving is not None:
+        raise HTTPException(status_code=409, detail="move_in_progress")
+
+
+async def _refuse_moved_since(db: AsyncSession, user: User, session_id: str) -> None:
+    """After a conditional stop or delete matched nothing: a window that began
+    moving since `_refuse_while_moving` refuses the whole request, rolled
+    back; one that is gone needs nothing."""
+    still_there = await db.scalar(
+        select(Session.status).where(Session.id == session_id, Session.owner_user_id == user.id)
+    )
+    if still_there is not None:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="move_in_progress")
 
 
 async def prune_workspace_tiles(db: AsyncSession, user: User, layout: dict) -> dict:
@@ -392,6 +460,7 @@ async def create_workspace(
             session_row=session_row,
             host=host,
             create_cwd=True,
+            stopped_since=_utcnow(),
             skills=skills,
         )
         session_out = session_to_out(session_row, host.name)
@@ -469,20 +538,26 @@ async def archive_workspace(
     to take: the workspace *is* its own snapshot. `position` is left where it
     was so a restore can slot the row back in; the active rows renumber
     around it.
+
+    A workspace with a window that is moving is not archived (`409
+    move_in_progress`): that move ends with its own commit or abort. Each
+    window is stopped on the host it names as it is stopped, so a move that
+    lands first is followed there (`stop_session_row`).
     """
     workspace = await _get_owned_workspace(db, workspace_id, user)
     if workspace.archived_at is not None:
         raise HTTPException(status_code=409, detail="workspace_archived")
 
     layout = parse_workspace_layout(workspace.layout)
+    session_ids = _layout_session_ids(layout)
+    await _refuse_while_moving(db, user, session_ids)
     stopped: list[tuple[str, str]] = []
-    for tile in layout_tiles(layout):
-        if not isinstance(tile.get("session_id"), str) or tile.get("widget") is not None:
+    for session_id in session_ids:
+        host_id = await stop_session_row(db, user=user, session_id=session_id)
+        if host_id is None:
+            await _refuse_moved_since(db, user, session_id)
             continue
-        session_row = await db.get(Session, tile["session_id"])
-        if session_row is not None and session_row.owner_user_id == user.id:
-            mark_session_stopped(session_row)
-            stopped.append((session_row.id, session_row.host_id))
+        stopped.append((session_id, host_id))
 
     workspace.archived_at = _utcnow()
     workspace.updated_at = workspace.archived_at
@@ -529,31 +604,54 @@ async def unarchive_workspace(
     for index, row in enumerate(rows):
         row.position = index
 
-    launches: list[tuple[Session, Host]] = []
-    for tile in layout_tiles(parse_workspace_layout(workspace.layout)):
-        if not isinstance(tile.get("session_id"), str) or tile.get("widget") is not None:
-            continue
-        session_row = await db.get(Session, tile["session_id"])
+    launches: list[tuple[Session, Host, datetime | None]] = []
+    for session_id in _layout_session_ids(parse_workspace_layout(workspace.layout)):
+        session_row = await db.get(Session, session_id)
         if session_row is None or session_row.owner_user_id != user.id:
+            continue
+        # A window that is moving is left to its move, which ends with a
+        # commit or an abort. (A move cannot begin in an archived workspace,
+        # but a moving window's tile can be placed in one.)
+        if session_row.status == SESSION_MOVING:
             continue
         host = await db.get(Host, session_row.host_id)
         if host is None or host.owner_user_id != user.id or host.status != "online":
             continue
-        session_row.status = "starting"
-        session_row.started_at = _utcnow()
-        session_row.exited_at = None
-        session_row.exit_code = None
-        session_row.last_output_at = None
-        session_row.last_input_at = None
-        session_row.foreground_command = None
-        launches.append((session_row, host))
+        # Conditional on the host read above and on no move under way, so a
+        # window another device moved, or began moving, since then is left as
+        # that device left it rather than restarted where it no longer runs.
+        result = await db.execute(
+            update(Session)
+            .where(
+                Session.id == session_row.id,
+                Session.owner_user_id == user.id,
+                Session.host_id == host.id,
+                Session.status != SESSION_MOVING,
+            )
+            .values(
+                status="starting",
+                started_at=_utcnow(),
+                exited_at=None,
+                exit_code=None,
+                last_output_at=None,
+                last_input_at=None,
+                foreground_command=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 1:
+            # When the window stopped, for a launch a move withholds; the
+            # object keeps the values it was read with until refreshed.
+            launches.append((session_row, host, session_row.exited_at))
 
     await db.commit()
     await db.refresh(workspace)
 
     # Dispatched after the commit, exactly as workspace creation does: the
     # rows are in their restarting state before any daemon can call back.
-    for session_row, host in launches:
+    # A launch a move or a close overtakes is withheld and leaves that window
+    # as the other device left it; the restore itself still stands.
+    for session_row, host, stopped_since in launches:
         await db.refresh(session_row)
         skills = await capabilities.get_session_launch_capabilities(
             db, user=user, session_id=session_row.id
@@ -563,6 +661,7 @@ async def unarchive_workspace(
             session_row=session_row,
             host=host,
             create_cwd=True,
+            stopped_since=stopped_since,
             skills=skills,
         )
     return _to_out(workspace)
@@ -574,18 +673,17 @@ async def delete_workspace(
     user: User = Depends(auth.current_user),
 ) -> None:
     workspace = await _get_owned_workspace(db, workspace_id, user)
-    layout = parse_workspace_layout(workspace.layout)
-    referenced = [
-        tile["session_id"]
-        for tile in layout_tiles(layout)
-        if isinstance(tile.get("session_id"), str) and tile.get("widget") is None
-    ]
+    referenced = _layout_session_ids(parse_workspace_layout(workspace.layout))
+    # A window that is moving is not deleted with its workspace, nor is the
+    # workspace deleted around it: abort the move first.
+    await _refuse_while_moving(db, user, referenced)
     deleted: list[tuple[str, str]] = []
     for session_id in referenced:
-        session_row = await db.get(Session, session_id)
-        if session_row is not None and session_row.owner_user_id == user.id:
-            deleted.append((session_row.id, session_row.host_id))
-            await db.delete(session_row)
+        host_id = await delete_session_row(db, user=user, session_id=session_id)
+        if host_id is None:
+            await _refuse_moved_since(db, user, session_id)
+            continue
+        deleted.append((session_id, host_id))
     await db.delete(workspace)
     await db.commit()
     # After the commit, so an exit the daemon confirms finds no row to

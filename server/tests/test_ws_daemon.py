@@ -1253,6 +1253,131 @@ def _frames_for(ws: FakeDaemonWebSocket, session_id: str) -> list[str]:
     ]
 
 
+async def test_register_spares_a_moving_window_on_the_host_it_is_leaving(client, monkeypatch):
+    """A window that is moving still names the host it is leaving, which holds
+    its worker until the move's retire stops it. That host registering again
+    mid-move adopts the worker and is not told to stop it: the server is not
+    the move's fence. A move that was aborted reads "killed" and is stopped
+    like any other; a window moving from another host is that host's."""
+    user_id, _ = await _signup(client, "ws-daemon-reaper-moving@example.com")
+    host_id = await _create_host(user_id, name="leaving")
+    other_host_id = await _create_host(user_id, name="elsewhere")
+    moving_here = await _create_session_row(user_id, host_id, name="moving-here")
+    await _set_session_status(moving_here, "moving")
+    aborted = await _create_session_row(user_id, host_id, name="aborted")
+    await _set_session_status(aborted, "killed")
+    moving_elsewhere = await _create_session_row(user_id, other_host_id, name="moving-elsewhere")
+    await _set_session_status(moving_elsewhere, "moving")
+    done = _signal_when_registration_done(monkeypatch)
+
+    token = auth.issue_daemon_token(host_id, user_id)
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    ws.queue_text(
+        {
+            "type": "register",
+            "version": "0.2.0",
+            "existing_sessions": [moving_here, aborted, moving_elsewhere],
+        }
+    )
+    await asyncio.wait_for(done.wait(), timeout=2)
+
+    kills = [item["session_id"] for item in _sent_json(ws) if item.get("type") == "session.kill"]
+    assert kills == [aborted, moving_elsewhere]
+    daemon = get_broker().get_daemon_for_host(host_id)
+    assert daemon is not None
+    assert get_broker().get_daemon_for_session(moving_here) is daemon
+    async with get_sessionmaker()() as session:
+        row = await session.get(Session, moving_here)
+        assert row is not None and row.status == "moving"
+    assert ws.close_calls == []
+
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_a_worker_that_starts_mid_move_leaves_the_window_moving(client, monkeypatch):
+    """A launch sent before the move began can report `session.started` after
+    it: the row stays "moving" — the source's retire stops that worker — and
+    no pane is told the window is running. Decided in the statement, so a
+    begin that lands between the handler's read and its write holds too."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.dml import Update
+
+    from spawn_server.redis import session_event_channel
+
+    user_id, _ = await _signup(client, "ws-daemon-started-moving@example.com")
+    host_id = await _create_host(user_id, name="leaving")
+    moving = await _create_session_row(user_id, host_id, name="moving")
+    await _set_session_status(moving, "moving")
+    raced = await _create_session_row(user_id, host_id, name="raced")
+    await _set_session_status(raced, "starting")
+    control = await _create_session_row(user_id, host_id, name="control")
+    await _set_session_status(control, "starting")
+
+    real_execute = AsyncSession.execute
+    armed = False
+    landed = False
+
+    async def execute(self, statement, *args, **kwargs):
+        nonlocal landed
+        if (
+            armed
+            and not landed
+            and isinstance(statement, Update)
+            and statement.table.name == "sessions"
+        ):
+            landed = True
+            await _set_session_status(raced, "moving")
+        return await real_execute(self, statement, *args, **kwargs)
+
+    events: dict[str, list[dict[str, Any]]] = {moving: [], raced: [], control: []}
+
+    async def tap(sid: str, ready: asyncio.Event) -> None:
+        async with get_backend().subscribe_channel(session_event_channel(sid)) as stream:
+            ready.set()
+            async for raw in stream:
+                events[sid].append(json.loads(raw))
+
+    readies = {sid: asyncio.Event() for sid in events}
+    taps = [asyncio.create_task(tap(sid, readies[sid])) for sid in events]
+    for ready in readies.values():
+        await asyncio.wait_for(ready.wait(), timeout=1)
+
+    done = _signal_when_registration_done(monkeypatch)
+    monkeypatch.setattr(AsyncSession, "execute", execute)
+    token = auth.issue_daemon_token(host_id, user_id)
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(daemon_ws(ws, token=None))  # type: ignore[arg-type]
+    try:
+        ws.queue_text({"type": "register", "version": "0.2.0"})
+        await asyncio.wait_for(done.wait(), timeout=2)
+        ws.queue_text({"type": "session.started", "session_id": moving})
+        ws.queue_text({"type": "session.started", "session_id": control})
+        await _wait_until(lambda: bool(events[control]))
+        armed = True
+        ws.queue_text({"type": "session.started", "session_id": raced})
+        await _wait_until(lambda: landed)
+        await asyncio.sleep(0.05)
+    finally:
+        monkeypatch.setattr(AsyncSession, "execute", real_execute)
+        ws.queue_disconnect()
+        await asyncio.wait_for(task, timeout=1)
+        for running in taps:
+            running.cancel()
+        await asyncio.gather(*taps, return_exceptions=True)
+
+    assert ws.close_calls == []
+    assert events[moving] == [] and events[raced] == []
+    assert events[control] == [{"type": "session.status", "status": "running"}]
+    async with get_sessionmaker()() as session:
+        statuses = {
+            sid: (await session.get(Session, sid)).status  # type: ignore[union-attr]
+            for sid in (moving, raced, control)
+        }
+    assert statuses == {moving: "moving", raced: "moving", control: "running"}
+
+
 async def test_register_spares_a_window_restarted_while_its_host_registers(client, monkeypatch):
     """The owner presses Restart on a window stopped while its host was away,
     the moment the host shows online. The registration that read the row as

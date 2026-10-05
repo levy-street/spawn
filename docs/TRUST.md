@@ -135,7 +135,14 @@ that id is written back, with `PATCH /api/sessions/{id}`; the rest of the
 answer, and the process tree and live-session registry the host reads for
 it, never reach the server, and neither do the agent's own transcript files
 the id names, which are located and read only over the device's host channel
-(`agent.transcripts` then `fs.read`). Also kept: agent-definition names,
+(`agent.transcripts` then `fs.read`). Lifecycle state includes a transient
+`moving`, held while a device carries a window's conversation to another host
+(`POST /api/sessions/{id}/move/begin`, then the commit or `/move/abort`): the
+server learns that a window is moving and, at the commit, which host it runs
+on and when that changed — not where it is going before then, nor anything of
+the conversation, which travels end to end over the device's two host
+channels. Moving is metadata: the server is not what keeps two hosts from
+writing one conversation; the source host's own retire is. Also kept: agent-definition names,
 kinds, commands, environment prefixes, and install commands; skill names, descriptions, bodies, defaults, and session
 grants; public trust material; connection/signaling timing; and IP addresses.
 Host-agent availability flows expose the definition target, installed
@@ -347,9 +354,11 @@ means for what each party learns and can do.
   that held them, readable by anyone who can read that user's files there.
 - **What the server and TURN learn.** The conversation, its file names, sizes,
   digests and paths travel only inside the encrypted host channels. The
-  server learns that the window stopped on the source (the stop reports the
-  session's exit, as any stop does) and that it moved — its host changes, as
-  for any move — and the signaling timing of the device's two connections.
+  server learns that the window is moving, from the device's
+  `move/begin` until its commit or abort (never where it is going before the
+  commit), that it stopped on the source (the stop reports the session's
+  exit, as any stop does) and that it moved — its host changes, as for any
+  move — and the signaling timing of the device's two connections.
   TURN, when the device's connections are relayed, learns the volume and
   timing of two correlated flows.
 
