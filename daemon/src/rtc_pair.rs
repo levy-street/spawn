@@ -464,6 +464,7 @@ impl RtcSessions {
                         crate::host_conversations::Places::from_env(
                             crate::run::login_shell_name,
                             crate::run::window_path,
+                            crate::run::resolve_on_path,
                         ),
                     );
                     pair.register_host(install_host_control_channel(

@@ -183,6 +183,7 @@ type StopFn = dyn Fn(Uuid) -> StopFuture + Send + Sync;
 type IncarnationFn = dyn Fn(Uuid) -> Option<u64> + Send + Sync;
 type ShellNameFn = dyn Fn() -> String + Send + Sync;
 type WindowPathFn = dyn Fn() -> Option<String> + Send + Sync;
+type ResolveProgramFn = dyn Fn(&str, String) -> Option<PathBuf> + Send + Sync;
 
 /// Where a retire is, for a test that acts between its steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +210,11 @@ pub(crate) struct Places {
     /// The PATH the daemon's windows are given (`run::window_path`), where
     /// the probe looks for Claude Code.
     window_path: Arc<WindowPathFn>,
+    /// Where a program name resolves on a PATH by the daemon's own rule for
+    /// agents (`run::resolve_on_path`): a canonicalize and a stat per
+    /// folder, nothing executed. Handed in like `window_path`, so the carrier
+    /// itself depends on nothing that launches.
+    resolve_program: Arc<ResolveProgramFn>,
     #[cfg(test)]
     move_hook: Option<Arc<dyn Fn(MovePoint) + Send + Sync>>,
     /// The free space a test's filesystem reports.
@@ -222,6 +228,7 @@ impl Places {
     pub(crate) fn from_env(
         login_shell: fn() -> String,
         window_path: fn() -> Option<String>,
+        resolve_program: fn(&str, String) -> Option<PathBuf>,
     ) -> Self {
         Self {
             holdings: None,
@@ -229,6 +236,7 @@ impl Places {
             registry_stores: None,
             login_shell: Arc::new(login_shell),
             window_path: Arc::new(window_path),
+            resolve_program: Arc::new(resolve_program),
             #[cfg(test)]
             move_hook: None,
             #[cfg(test)]
@@ -244,6 +252,7 @@ impl Places {
             claude_store: Some(claude_store),
             login_shell: Arc::new(|| "bash".to_string()),
             window_path: Arc::new(|| None),
+            resolve_program: Arc::new(|_, _| None),
             move_hook: None,
             free_space: None,
         }
@@ -1440,7 +1449,7 @@ fn claude_cli(files: &HostFileService, places: &Places) -> Option<ClaudeCli> {
         folders.push(native);
     }
     let search = std::env::join_paths(folders).ok()?.into_string().ok()?;
-    let path = crate::run::resolve_on_path("claude", search)?;
+    let path = (places.resolve_program)("claude", search)?;
     let version = version_from_install_path(&path).or_else(|| npm_package_version(files, &path));
     Some(ClaudeCli { path, version })
 }
@@ -1856,6 +1865,7 @@ pub(crate) fn collect_held() {
         registry_stores: None,
         login_shell: Arc::new(String::new),
         window_path: Arc::new(|| None),
+        resolve_program: Arc::new(|_, _| None),
         #[cfg(test)]
         move_hook: None,
         #[cfg(test)]
@@ -4051,6 +4061,7 @@ mod tests {
             let stopped_run = Arc::clone(&incarnation);
             let current_run = Arc::clone(&incarnation);
             let mut places = Places::rooted(holdings.clone(), store.clone());
+            places.resolve_program = Arc::new(crate::run::resolve_on_path);
             configure(&mut places);
             let pair = PairWindows::new(
                 WindowShells::new(move |id| (id.to_string() == WINDOW).then_some(shell).flatten()),
