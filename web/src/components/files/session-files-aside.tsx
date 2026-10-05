@@ -6,6 +6,7 @@ import {
   ExternalLink,
   FilePlus,
   FolderPlus,
+  FolderUp,
   RefreshCw,
   Search,
   Upload,
@@ -27,6 +28,7 @@ import {
   NEW_FOLDER_LABEL,
   SHOW_HIDDEN_LABEL,
   UPLOAD_FILES_LABEL,
+  UPLOAD_FOLDER_LABEL,
 } from "@/lib/files/copy";
 import { sessionTitle } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
@@ -75,6 +77,10 @@ export function SessionFilesPanel({
           <DropdownMenuItem onSelect={() => browserRef.current?.upload()}>
             <Upload className="size-4" aria-hidden />
             {UPLOAD_FILES_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => browserRef.current?.uploadFolder()}>
+            <FolderUp className="size-4" aria-hidden />
+            {UPLOAD_FOLDER_LABEL}
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => browserRef.current?.focusFilter()}>

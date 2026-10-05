@@ -167,10 +167,15 @@ export class RemoteDaemonChannel extends EventTarget implements DaemonChannel {
   }
 }
 
+/** A native queue above this waits for the channel to drain before it gets more. */
+const NATIVE_HIGH_WATER = 32 * 1024;
+
 /** Round-robin sends keep one producer from filling every shared SCTP queue. */
 export class DaemonSendScheduler {
   private queues = new Map<RTCDataChannel, Array<{ data: ChannelBytes; done: () => void }>>();
   private bytes = new Map<RTCDataChannel, number>();
+  /** Congested channels whose low-water event will wake the drain. */
+  private readonly waking = new WeakSet<RTCDataChannel>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private scheduled = false;
@@ -228,7 +233,10 @@ export class DaemonSendScheduler {
         this.remove(channel);
         continue;
       }
-      if (channel.bufferedAmount > 32 * 1024) continue;
+      if (channel.bufferedAmount > NATIVE_HIGH_WATER) {
+        this.wakeWhenDrained(channel);
+        continue;
+      }
       const item = queue.shift();
       if (!item) {
         this.remove(channel);
@@ -254,5 +262,24 @@ export class DaemonSendScheduler {
         this.timer = null;
         this.drain();
       }, 4);
+  }
+
+  /**
+   * A congested channel resumes on its own low-water event, not only on the
+   * timer: the owner tab may be hidden, where timers wait a second or more,
+   * and a transfer it runs would crawl at a queue's worth per wake.
+   */
+  private wakeWhenDrained(channel: RTCDataChannel): void {
+    if (this.waking.has(channel) || typeof channel.addEventListener !== "function") return;
+    this.waking.add(channel);
+    channel.bufferedAmountLowThreshold = NATIVE_HIGH_WATER;
+    channel.addEventListener(
+      "bufferedamountlow",
+      () => {
+        this.waking.delete(channel);
+        this.schedule();
+      },
+      { once: true },
+    );
   }
 }

@@ -248,7 +248,7 @@ test("a folder opens a window right there, in the workspace you pick", async ({ 
   });
   await page.goto(`/hosts/${HOST_ID}`);
   await page.getByRole("button", { name: "Open a window in ~/projects/spawn" }).click();
-  await page.getByRole("menuitem", { name: /^Open a shell here/ }).click();
+  await page.getByRole("menuitem", { name: /^Open terminal here/ }).click();
   await page
     .getByRole("menu", { name: "Open in which workspace?" })
     .getByRole("menuitem", { name: /^daily drive/ })

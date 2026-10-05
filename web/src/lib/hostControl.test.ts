@@ -1664,6 +1664,197 @@ describe("HostControlClient", () => {
     destination.client.close();
   });
 
+  test("a relayed file can land under another name, saying what the source declared and how far it got", async () => {
+    const source = await readyClient();
+    const destination = await readyClient({}, destinationHostId);
+    const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const declared: unknown[] = [];
+    const progress: number[] = [];
+    const transferring = source.client.transferFileTo(
+      destination.client,
+      "/source/notes.txt",
+      "/destination",
+      false,
+      undefined,
+      {
+        name: "notes (2).txt",
+        onDeclared: (value) => declared.push(value),
+        onProgress: (bytes) => progress.push(bytes),
+      },
+    );
+    const readRequest = JSON.parse(source.pc.channel.sent.at(-1));
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: readRequest.request_id,
+        ok: true,
+        result: {
+          stream_id: "source-stream",
+          path: "/source/notes.txt",
+          name: "notes.txt",
+          length: 5,
+          sha256,
+        },
+      }),
+    );
+    await Bun.sleep(1);
+    expect(declared).toEqual([{ name: "notes.txt", length: 5, sha256 }]);
+    const writeRequest = destination.pc.channel.sent
+      .map((frame) => JSON.parse(frame))
+      .find((frame) => frame.operation === "fs.write.begin");
+    expect(writeRequest.payload).toMatchObject({
+      dir: "/destination",
+      name: "notes (2).txt",
+      sha256,
+    });
+    destination.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: writeRequest.request_id,
+        ok: true,
+        result: { stream_id: "destination-stream" },
+      }),
+    );
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.chunk",
+        stream_id: "source-stream",
+        sequence: 0,
+        bytes_b64: btoa("hello"),
+      }),
+    );
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.end",
+        stream_id: "source-stream",
+        length: 5,
+        sha256,
+      }),
+    );
+    await Bun.sleep(2);
+    destination.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "stream.committed",
+        stream_id: "destination-stream",
+        path: "/destination/notes (2).txt",
+      }),
+    );
+    await expect(transferring).resolves.toEqual({ path: "/destination/notes (2).txt" });
+    expect(progress).toEqual([5]);
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("a refused destination cancels the source read even when progress is counted", async () => {
+    const source = await readyClient();
+    const destination = await readyClient({}, destinationHostId);
+    const transferring = source.client.transferFileTo(
+      destination.client,
+      "/source/notes.txt",
+      "/destination",
+      false,
+      undefined,
+      { onProgress: () => {} },
+    );
+    const readRequest = JSON.parse(source.pc.channel.sent.at(-1));
+    source.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: readRequest.request_id,
+        ok: true,
+        result: {
+          stream_id: "source-stream",
+          path: "/source/notes.txt",
+          name: "notes.txt",
+          length: 5,
+          sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        },
+      }),
+    );
+    await Bun.sleep(1);
+    const writeRequest = destination.pc.channel.sent
+      .map((frame) => JSON.parse(frame))
+      .find((frame) => frame.operation === "fs.write.begin");
+    destination.pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: writeRequest.request_id,
+        ok: false,
+        error: { code: "already_exists", detail: "destination already exists" },
+      }),
+    );
+    await expect(transferring).rejects.toMatchObject({ code: "already_exists" });
+    await Bun.sleep(2);
+    expect(framesOf(source.pc.channel, "stream.cancel")).toContainEqual(
+      expect.objectContaining({ stream_id: "source-stream" }),
+    );
+    source.client.close();
+    destination.client.close();
+  });
+
+  test("a write held back by a full channel resumes on its low-water event, not only on a timer", async () => {
+    const endpoint = await readyClient();
+    const channel = endpoint.pc.channel;
+    const events = new EventTarget();
+    Object.assign(channel, {
+      bufferedAmountLowThreshold: 0,
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+    });
+    const realSetTimeout = globalThis.setTimeout;
+    // Timers that never come, as in a background tab: only the event can wake it.
+    globalThis.setTimeout = (() => 0) as unknown as typeof setTimeout;
+    try {
+      channel.bufferedAmount = 512 * 1024;
+      const writing = endpoint.client.writeStream(new Blob(["hello"]).stream(), {
+        dir: "/private",
+        name: "a.txt",
+        length: 5,
+        sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      });
+      void writing.catch(() => {});
+      const begin = channel.sent
+        .map((frame) => JSON.parse(frame))
+        .find((frame) => frame.operation === "fs.write.begin");
+      channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "response",
+          request_id: begin.request_id,
+          ok: true,
+          result: { stream_id: "held-write" },
+        }),
+      );
+      await Bun.sleep(5);
+      expect(framesOf(channel, "stream.chunk")).toHaveLength(0);
+      expect(channel.bufferedAmountLowThreshold).toBe(128 * 1024);
+      channel.bufferedAmount = 0;
+      events.dispatchEvent(new Event("bufferedamountlow"));
+      await Bun.sleep(1);
+      expect(framesOf(channel, "stream.chunk")).toHaveLength(1);
+      expect(framesOf(channel, "stream.end")).toHaveLength(1);
+      channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "stream.committed",
+          stream_id: "held-write",
+          path: "/private/a.txt",
+        }),
+      );
+      await expect(writing).resolves.toBe("/private/a.txt");
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      endpoint.client.close();
+    }
+  });
+
   test("rejects cross-host signaling and cannot settle a request on the other host channel", async () => {
     const source = await readyClient();
     const destination = await readyClient({}, destinationHostId);

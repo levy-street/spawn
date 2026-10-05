@@ -36,15 +36,19 @@ src/
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files (lib/files/ is
                   the file browser's pure core: sort, filter, selection,
-                  type-ahead, listing sources; components/files/FileBrowser
-                  draws it in its page, pane and aside layouts)
+                  type-ahead, listing sources, and transfers — the engine,
+                  the hub that hands jobs between tabs, the zip writer,
+                  download sinks; components/files/FileBrowser draws it in
+                  its page, pane and aside layouts)
   middleware.ts   request middleware (+ its test beside it)
 tests/e2e/        Playwright end-to-end specs
 scripts/          build wrappers (next-with-proxy-target.mjs) and helpers
                   (og-shots.mjs renders SEO pages' OG images from a dev server;
                   measure-session-opening.mjs records first/repeat terminal
                   navigation timings in the isolated live browser smoke)
-public/           static assets (og/ holds the per-page OG images)
+public/           static assets (og/ holds the per-page OG images; sw.js is
+                  the service worker — the offline shell, notification
+                  clicks, and the streamed-download route)
 ```
 
 The retired production mockup paths `src/trust-ux/` and
@@ -154,6 +158,17 @@ from the catalogue. Every claim about spawnd survives a diff against
   memory; the Files page keeps the folder on screen in the tab's
   `history.state` (`lib/files/folder-handoff.ts`). An inbound `?path=` (a
   phone's universal link) is still read once and dropped from the address.
+- Uploads, downloads and sends between hosts are jobs in the Transfers tray
+  (`components/files/transfers-provider.tsx` over `lib/files/transfer-engine.ts`),
+  never work a view does itself: they outlive the folder and the page they
+  were started from, and each host is reached through a transfer consumer of
+  its own. An upload or a send runs in the tab that holds the host's
+  connection (`lib/files/transfer-hub.ts`); a download runs where it is saved,
+  and its save target is chosen in the click itself (a save picker needs the
+  gesture). `public/sw.js` matches its stream route before anything else and
+  never caches it, and a new version of it waits to take over while the one in
+  control is still answering a streamed download (the stream lives only in
+  that worker's memory).
 - Device transport: `DaemonConnectionsProvider` owns one signed host connection
   per registered device and host. Identity replacement retires its connections.
   `lib/daemon-connection.ts` shares it across tabs with

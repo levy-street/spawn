@@ -46,7 +46,13 @@ its freeze event) loses it: a visible tab that hears nothing for ten seconds
 steals the lock, and the silent owner stands down and follows when it resumes.
 A tab whose own timers were suspended does not count that gap as the owner's
 silence. A connection that retires itself is rebuilt by the provider rather
-than left closed until a reload. Unsupported
+than left closed until a reload. Every announcement names the owner's page —
+one id for all of a tab's host connections — and an owner letting go (closing,
+freezing, standing down) says so before followers retire their channels, as
+does a follower that takes over from a silent owner; file transfers use both
+to run in the owner and to say "interrupted because another SPAWN D tab closed
+or went to sleep" when a transfer elsewhere breaks with it (see "File
+transfers" below). Unsupported
 coordination APIs produce an explicit error. Each account, registered device key,
 and host has its own lock and connection. Registration finishes before
 connection admission; replacing a
@@ -135,6 +141,42 @@ fifteen minutes lapses. A device that missed the
 move's data frame converges when its polled session list names the new host,
 which refetches the window's row; the list alone never moves a terminal, since a
 list response that left the server before the move can arrive after it.
+
+## File transfers
+
+Uploads, downloads and sends between hosts run as jobs in the Transfers tray
+(`web/src/components/files/transfers-provider.tsx`, `web/src/lib/files/`), each
+host reached through a transfer consumer of its own, so a transfer fault never
+takes a file list down. A v1 host writes on one serial queue and closes the
+channel when it overflows, so a host takes part in one running transfer at a
+time and files go one after another.
+
+Because every tab reaches a host through the owner's connection, a transfer
+in any other tab breaks when the owner closes or sleeps. So an upload or a
+send is handed to the tab holding the connection to the host it writes to
+(`transfer-hub.ts`, a BroadcastChannel scoped to the account); the asking tab
+mirrors its progress and answers its questions, and the transfer survives
+that tab closing. The running tab sends its plan to the asking tab before its
+first write, and again whenever a name in it changes, so the asking tab always
+holds the plan the writes follow. A download stays in the tab that saves it. When the tab
+running a transfer goes, the tab that asked shows it interrupted with Resume,
+and Resume hands the plan and how far it got to whichever tab holds the
+connection now. Reads resume at the byte reached (`fs.read.range`, pinned to
+the file's version); a v1 write starts its file again, and a write whose
+commit may have landed is checked by the host's own digest before anything is
+written twice.
+
+On the phone, uploads and sends go through one queue for the app
+(`mobile/src/data/stores/transfers.ts`, memory only), run one item at a time by
+`mobile/src/components/files/transfer-engine.ts`. Its runner is mounted once
+beside the navigator, so a transfer outlives the screen it was started from,
+and it holds a channel of its own to each host the queue needs, only while
+there is something to move. The phone closes its host connections a few
+seconds after SPAWN D leaves the screen, so an item cut off then, or by a
+connection lost while on screen, is interrupted rather than failed: the queue
+pauses until Resume, which starts a cut-off file again from the beginning,
+and a write whose commit may have landed is checked by its digest before it is
+sent again.
 
 ## Bounds and verification
 

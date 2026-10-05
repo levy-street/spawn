@@ -4,7 +4,7 @@ import { Slot } from "@radix-ui/react-slot";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bot, LayoutGrid, Plus, SquareTerminal } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { type ReactElement, useId, useRef, useState } from "react";
+import { forwardRef, type ReactElement, useId, useImperativeHandle, useRef, useState } from "react";
 import { AgentIcon } from "@/components/icons/AgentIcon";
 import { HostUpdateDialog, useHostUpdate } from "@/components/release/HostUpdateDialog";
 import {
@@ -22,6 +22,7 @@ import {
 import { isWorkspaceFullError } from "@/components/workspace/new-session-menu-helpers";
 import { useWherePanel } from "@/components/workspace/where-picker";
 import { type Agent, agents, type Host, type Workspace, workspaces } from "@/lib/api";
+import { OPEN_TERMINAL_HERE_LABEL, START_AGENT_HERE_LABEL } from "@/lib/files/copy";
 import { displayPath } from "@/lib/places";
 import { cn } from "@/lib/utils";
 import { isArchived } from "@/lib/workspaces";
@@ -56,41 +57,14 @@ function workspaceChoices(list: readonly Workspace[], last: string | null): Work
 }
 
 /**
- * "New window here…" — a window on this host, opened from its page.
- *
- * Three questions, each a step of one cascade: what it runs, where on this
- * host — the step a folder row answers already, so from one it is skipped —
- * and which workspace it opens in (the one used last first). The phone asks
- * them in the same order. Then the window opens there through the same
- * `createWindow` every other "+" uses, and this tab goes to it.
- *
- * `disabledReason` shuts it and says why, for a host whose connections are
- * blocked or that is not online.
+ * What opening a window "here" takes, once a host is known: the agents to
+ * offer, the "Open in which workspace?" step, and the open itself — through
+ * the same `createWindow` every other "+" uses, then this tab goes to it.
+ * Shared by the host page's menus and the file browser's.
  */
-export function OpenHereMenu({
-  host,
-  cwd,
-  trigger,
-  disabledReason,
-  className,
-}: {
-  host: Host;
-  /** The folder, when the menu is opened from one; asked for otherwise. */
-  cwd?: string;
-  trigger: ReactElement;
-  disabledReason?: string | null;
-  className?: string;
-}) {
+export function useOpenHere(host: Host | null) {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const anchorRef = useRef<HTMLSpanElement>(null);
-  const menuRef = useRef<CascadeMenuHandle>(null);
-  const reasonId = useId();
-  /**
-   * A folder browsed to with "Choose a folder…". The cascade closed for the
-   * browser, so it opens again with the one question left as its first step.
-   */
-  const [browsed, setBrowsed] = useState<{ choice: Choice; folder: string } | null>(null);
   const hostUpdate = useHostUpdate(null);
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
   const workspacesQ = useQuery({
@@ -98,7 +72,6 @@ export function OpenHereMenu({
     queryFn: () => workspaces.list(),
     staleTime: 30_000,
   });
-  const where = useWherePanel({ hostId: host.id, anchorRef });
 
   const createM = useMutation({
     mutationFn: ({
@@ -109,13 +82,15 @@ export function OpenHereMenu({
       choice: Choice;
       folder: string;
       workspace: WindowWorkspace;
-    }) =>
-      createWindow({
+    }) => {
+      if (!host) throw new Error("The host is not known yet");
+      return createWindow({
         host,
         cwd: folder,
         agent: choice.kind === "agent" ? choice.agent : null,
         workspace,
-      }),
+      });
+    },
     onSuccess: ({ session, workspaceId, tabId }) => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
@@ -137,7 +112,7 @@ export function OpenHereMenu({
   });
 
   const open = (choice: Choice, folder: string, workspace: WindowWorkspace) => {
-    if (host.status !== "online" || createM.isPending) return;
+    if (!host || host.status !== "online" || createM.isPending) return;
     hostUpdate.promptHostUpdate(host, () => createM.mutate({ choice, folder, workspace }));
   };
 
@@ -171,10 +146,103 @@ export function OpenHereMenu({
     };
   };
 
+  /** "Which agent?", each agent leading to `next`. */
+  const agentPanel = (
+    id: string,
+    next: (choice: Choice) => Pick<CascadeItem, "panel" | "onSelect">,
+  ): CascadePanel => ({
+    id,
+    title: "Which agent?",
+    loading: agentsQ.isLoading,
+    emptyLabel: "No agents are defined. Add one in Settings → Agents.",
+    items: (agentsQ.data ?? []).map((agent) => ({
+      key: agent.id,
+      icon: <AgentIcon kind={agent.kind} size={18} className="rounded" />,
+      label: agent.name,
+      detail: agent.command,
+      ...next({ kind: "agent", agent }),
+    })),
+  });
+
+  return {
+    open,
+    workspaceStep,
+    agentPanel,
+    agents: agentsQ.data ?? [],
+    agentsLoading: agentsQ.isLoading,
+    overlays: <HostUpdateDialog {...hostUpdate.dialogProps} />,
+  };
+}
+
+/** The first step from a folder: a terminal there, or an agent. */
+function folderPanel(
+  folder: string,
+  next: (choice: Choice) => Pick<CascadeItem, "panel" | "onSelect">,
+  agentPanel: ReturnType<typeof useOpenHere>["agentPanel"],
+): CascadePanel {
+  return {
+    id: "open-here",
+    title: displayPath(folder),
+    items: [
+      {
+        key: "shell",
+        icon: <SquareTerminal />,
+        label: OPEN_TERMINAL_HERE_LABEL,
+        detail: "A plain login shell",
+        ...next({ kind: "shell" }),
+      },
+      {
+        key: "agent",
+        icon: <Bot />,
+        // The ellipsis: more questions follow, as "New window here…" says.
+        label: START_AGENT_HERE_LABEL,
+        panel: agentPanel("open-here-agents", next),
+      },
+    ],
+  };
+}
+
+/**
+ * "New window here…" — a window on this host, opened from its page.
+ *
+ * Three questions, each a step of one cascade: what it runs, where on this
+ * host — the step a folder row answers already, so from one it is skipped —
+ * and which workspace it opens in (the one used last first). The phone asks
+ * them in the same order. Then the window opens there through the same
+ * `createWindow` every other "+" uses, and this tab goes to it.
+ *
+ * `disabledReason` shuts it and says why, for a host whose connections are
+ * blocked or that is not online.
+ */
+export function OpenHereMenu({
+  host,
+  cwd,
+  trigger,
+  disabledReason,
+  className,
+}: {
+  host: Host;
+  /** The folder, when the menu is opened from one; asked for otherwise. */
+  cwd?: string;
+  trigger: ReactElement;
+  disabledReason?: string | null;
+  className?: string;
+}) {
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const menuRef = useRef<CascadeMenuHandle>(null);
+  const reasonId = useId();
+  /**
+   * A folder browsed to with "Choose a folder…". The cascade closed for the
+   * browser, so it opens again with the one question left as its first step.
+   */
+  const [browsed, setBrowsed] = useState<{ choice: Choice; folder: string } | null>(null);
+  const here = useOpenHere(host);
+  const where = useWherePanel({ hostId: host.id, anchorRef });
+
   /** What it runs is settled: next, where on this host — unless a folder said. */
   const afterWhat = (choice: Choice): CascadePanel =>
     cwd !== undefined
-      ? workspaceStep(choice, cwd)
+      ? here.workspaceStep(choice, cwd)
       : where.panel(
           `where-${choiceKey(choice)}`,
           (_host, folder) => {
@@ -182,7 +250,7 @@ export function OpenHereMenu({
             menuRef.current?.open();
           },
           `Where on ${host.name}?`,
-          (_host, folder) => workspaceStep(choice, folder),
+          (_host, folder) => here.workspaceStep(choice, folder),
         );
 
   const agentItem = (agent: Agent): CascadeItem => ({
@@ -192,41 +260,15 @@ export function OpenHereMenu({
     detail: agent.command,
     panel: afterWhat({ kind: "agent", agent }),
   });
-  const agentList = agentsQ.data ?? [];
 
   const root: CascadePanel = browsed
-    ? workspaceStep(browsed.choice, browsed.folder)
+    ? here.workspaceStep(browsed.choice, browsed.folder)
     : cwd !== undefined
-      ? {
-          id: "open-here",
-          title: displayPath(cwd),
-          items: [
-            {
-              key: "shell",
-              icon: <SquareTerminal />,
-              label: "Open a shell here",
-              detail: "A plain login shell",
-              panel: afterWhat({ kind: "shell" }),
-            },
-            {
-              key: "agent",
-              icon: <Bot />,
-              // The ellipsis: more questions follow, as "New window here…" says.
-              label: "Start an agent here…",
-              panel: {
-                id: "open-here-agents",
-                title: "Which agent?",
-                loading: agentsQ.isLoading,
-                emptyLabel: "No agents are defined. Add one in Settings → Agents.",
-                items: agentList.map(agentItem),
-              },
-            },
-          ],
-        }
+      ? folderPanel(cwd, (choice) => ({ panel: afterWhat(choice) }), here.agentPanel)
       : {
           id: "new-window-here",
           title: `New window on ${host.name}`,
-          loading: agentsQ.isLoading,
+          loading: here.agentsLoading,
           items: [
             {
               key: "shell",
@@ -235,7 +277,7 @@ export function OpenHereMenu({
               detail: "A plain login shell",
               panel: afterWhat({ kind: "shell" }),
             },
-            ...agentList.map(agentItem),
+            ...here.agents.map(agentItem),
           ],
         };
 
@@ -272,7 +314,77 @@ export function OpenHereMenu({
         />
       )}
       {where.overlays}
-      <HostUpdateDialog {...hostUpdate.dialogProps} />
+      {here.overlays}
     </span>
   );
 }
+
+export interface OpenHereLauncherHandle {
+  /**
+   * "Open terminal here" or "Start agent here…" for `folder`, the menu hanging
+   * off a point (the menu it was chosen from). A window opened from inside a
+   * workspace lands in it; anywhere else it asks which workspace.
+   */
+  open(folder: string, what: "terminal" | "agent", at: { x: number; y: number }): void;
+}
+
+/** The open-here questions, started from someone else's menu: the file browser's. */
+export const OpenHereLauncher = forwardRef<
+  OpenHereLauncherHandle,
+  { host: Host | null; workspaceId?: string | null }
+>(function OpenHereLauncher({ host, workspaceId }, ref) {
+  const menuRef = useRef<CascadeMenuHandle>(null);
+  const [request, setRequest] = useState<{ folder: string; what: "terminal" | "agent" } | null>(
+    null,
+  );
+  const here = useOpenHere(host);
+  const hereRef = useRef(here);
+  hereRef.current = here;
+
+  /** A choice made: into this workspace when there is one, else ask which. */
+  const next =
+    (folder: string) =>
+    (choice: Choice): Pick<CascadeItem, "panel" | "onSelect"> =>
+      workspaceId
+        ? { onSelect: () => here.open(choice, folder, { id: workspaceId }) }
+        : { panel: here.workspaceStep(choice, folder) };
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      open: (folder, what, at) => {
+        if (what === "terminal" && workspaceId) {
+          hereRef.current.open({ kind: "shell" }, folder, { id: workspaceId });
+          return;
+        }
+        setRequest({ folder, what });
+        menuRef.current?.openAt(at.x, at.y);
+      },
+    }),
+    [workspaceId],
+  );
+
+  const root: CascadePanel = !request
+    ? { id: "open-here-idle", items: [] }
+    : request.what === "agent"
+      ? here.agentPanel("open-here-agents", next(request.folder))
+      : here.workspaceStep({ kind: "shell" }, request.folder);
+
+  return (
+    <>
+      <CascadeMenu
+        ref={menuRef}
+        root={root}
+        sheetTitle={root.title}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setRequest(null);
+        }}
+        // Opened at a point from another menu: no trigger of its own.
+        renderTrigger={() => (
+          <span aria-hidden className="pointer-events-none absolute size-0 overflow-hidden" />
+        )}
+      />
+      {here.overlays}
+    </>
+  );
+});

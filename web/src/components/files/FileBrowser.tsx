@@ -6,6 +6,7 @@ import {
   ArrowRight,
   ArrowRightLeft,
   ArrowUp,
+  Bot,
   ChevronsDownUp,
   Copy,
   CornerUpLeft,
@@ -19,6 +20,7 @@ import {
   FolderOpen,
   FolderPlus,
   FolderSearch,
+  FolderUp,
   List,
   ListTree,
   Loader2,
@@ -29,6 +31,7 @@ import {
   RefreshCw,
   Search,
   SlidersHorizontal,
+  SquareTerminal,
   Trash2,
   TriangleAlert,
   Upload,
@@ -58,12 +61,17 @@ import { FilePreviewCard } from "@/components/files/file-preview-card";
 import { FileViewerDialog } from "@/components/files/file-viewer-dialog";
 import { PathBar, type PathBarHandle } from "@/components/files/PathBar";
 import { type PreviewPlacement, previewPlacement } from "@/components/files/preview-placement";
+import { SendToHost, type SendToHostHandle } from "@/components/files/send-to-host";
 import { SortMenuItems } from "@/components/files/sort-menu";
 import { TREE_INDENT_PX, TreeEntryRow, TreeStatusRow } from "@/components/files/TreeView";
+import { useTransfers } from "@/components/files/transfers-provider";
 import { isFinalListError, useDirectoryListings } from "@/components/files/use-directory-listings";
 import { type FileBrowserView, useFilePrefs } from "@/components/files/use-file-prefs";
 import { useOpenHostFolder } from "@/components/files/use-open-host-folder";
-import { useDaemonConnections } from "@/components/hosts/DaemonConnectionsProvider";
+import {
+  OpenHereLauncher,
+  type OpenHereLauncherHandle,
+} from "@/components/hosts/cockpit/open-here-menu";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import {
@@ -98,12 +106,16 @@ import {
   resizeColumn,
 } from "@/lib/files/columns";
 import {
+  archiveName,
   changedOnHostNotice,
   changeErrorCopy,
   DELETE_PERMANENTLY_LABEL,
+  DOWNLOAD_LABEL,
+  DOWNLOAD_ZIP_LABEL,
   deleteConfirmCopy,
   deletedNotice,
   deletingNotice,
+  downloadItemsLabel,
   EMPTY_FOLDER,
   FILTER_PLACEHOLDER,
   HIDE_HIDDEN_LABEL,
@@ -111,16 +123,21 @@ import {
   NEW_FILE_LABEL,
   NEW_FOLDER_LABEL,
   noFilterMatches,
+  OPEN_TERMINAL_HERE_LABEL,
   onlyHiddenFiles,
   POLLED_REFRESH_NOTE,
   partialDeleteNotice,
+  SEND_TO_HOST_LABEL,
   SHOW_HIDDEN_LABEL,
+  START_AGENT_HERE_LABEL,
   statusSummary,
   TRUNCATED_ROW_LABEL,
   truncationNotice,
   UNNAMED_HOST,
   UPLOAD_FILES_LABEL,
+  UPLOAD_FOLDER_LABEL,
 } from "@/lib/files/copy";
+import { droppedEntries, type LocalPick, pickedFolder, walkDropped } from "@/lib/files/drop-walk";
 import { filterEntries } from "@/lib/files/filter";
 import { formatSize } from "@/lib/files/format";
 import {
@@ -150,9 +167,10 @@ import {
   toggleKey,
 } from "@/lib/files/selection";
 import { sortEntries, toggleSort } from "@/lib/files/sort";
+import { entryKind, walkSourceOf } from "@/lib/files/transfer-plan";
 import { flattenTree, outermostItems, type TreeRow } from "@/lib/files/tree";
 import { pushTypeAhead, type TypeAheadState, typeAheadMatch } from "@/lib/files/type-ahead";
-import { HostControlClient, HostControlError, type HostDirEntry } from "@/lib/hostControl";
+import { HostControlError, type HostDirEntry } from "@/lib/hostControl";
 import {
   detectAppleModifiers,
   type ExplorerShortcut,
@@ -202,6 +220,7 @@ export type FileBrowserHandle = {
   newFolder: () => void;
   newFile: () => void;
   upload: () => void;
+  uploadFolder: () => void;
   refresh: () => void;
   collapseAll: () => void;
   toggleHidden: () => void;
@@ -223,6 +242,11 @@ export interface FileBrowserProps {
    * keeps it with the tab, never in the URL: a host path is protected content.
    */
   onPathChange?: (path: string) => void;
+  /**
+   * The workspace the browser sits in (a workspace's files pane): a window
+   * opened "here" lands in it. Elsewhere "Open in which workspace?" is asked.
+   */
+  workspaceId?: string | null;
 }
 
 /** sha256 of nothing: a new, empty file. */
@@ -281,7 +305,7 @@ function useCoarsePointer(): boolean {
 }
 
 export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(function FileBrowser(
-  { hostId, layout, rootPath, rootLabel, initialPath, className, onPathChange },
+  { hostId, layout, rootPath, rootLabel, initialPath, className, onPathChange, workspaceId },
   handleRef,
 ) {
   const listId = useId();
@@ -289,10 +313,13 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   const pathBarRef = useRef<PathBarHandle>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const uploadDirRef = useRef<string | null>(null);
+  const sendRef = useRef<SendToHostHandle>(null);
+  const openHereRef = useRef<OpenHereLauncherHandle>(null);
   const typeAheadRef = useRef<TypeAheadState | null>(null);
 
-  const daemonConnections = useDaemonConnections();
+  const transfers = useTransfers();
   const desktopShell = useDesktopShell();
   const coarse = useCoarsePointer();
   const {
@@ -382,7 +409,6 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   const deletingRef = useRef(false);
   const [viewing, setViewing] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const [uploadingCount, setUploadingCount] = useState(0);
   const [dropDir, setDropDir] = useState<string | null>(null);
   const [listFocused, setListFocused] = useState(false);
   const [pollPaths, setPollPaths] = useState<string[]>([]);
@@ -1151,60 +1177,81 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
     [can.remove, client, failure, flavor, hostName, refresh],
   );
 
-  const uploadFiles = useCallback(
-    async (dir: string, files: globalThis.File[]) => {
-      if (files.length === 0) return;
+  /** A folder as transfers name it: "Home", or its own name. */
+  const folderLabel = useCallback(
+    (dir: string) =>
+      homeDir && pathsEqual(dir, homeDir, flavor) ? "Home" : pathBasename(dir, flavor) || dir,
+    [flavor, homeDir],
+  );
+
+  // Uploads, downloads and sends run in the Transfers tray, which outlives
+  // this folder and this page; the browser only hands them over.
+  const uploadPick = useCallback(
+    (dir: string, pick: LocalPick) => {
+      if (!transfers || !can.write) return;
       setStatus(null);
-      setUploadingCount((n) => n + files.length);
-      for (const file of files) {
-        try {
-          if (!client) throw new Error("Host control channel is not ready");
-          const result = await client.uploadFile(file, { dir });
-          setStatus(`Uploaded ${result.path ?? file.name}`);
-        } catch (err) {
-          setStatus(`${file.name || "File"}: ${errorMessage(err)}`);
-        } finally {
-          setUploadingCount((n) => n - 1);
-        }
-      }
-      void refresh(dir);
+      transfers.upload({ hostId, dir, dirLabel: folderLabel(dir), pick });
     },
-    [client, refresh],
+    [can.write, folderLabel, hostId, transfers],
   );
 
-  const transferM = useMutation({
-    mutationFn: ({ entry, destHostId }: { entry: HostDirEntry; destHostId: string }) => {
-      if (!client) throw new Error("Source host is not connected");
-      const sharedConnection = daemonConnections.get(destHostId);
-      if (!sharedConnection) throw new Error("Destination host is not connected");
-      return (async () => {
-        const destination = new HostControlClient(destHostId, { sharedConnection });
-        try {
-          await destination.waitUntilReady();
-          const home = await destination.home();
-          return await client.transferFileTo(destination, entry.path, home.home_dir);
-        } finally {
-          destination.close();
-        }
-      })();
-    },
-    onSuccess: (result) => setStatus(`Sent to ${result.path ?? "destination host"}`),
-    onError: (err) => setStatus(errorMessage(err)),
-  });
-
-  const download = useCallback(
-    async (entry: HostDirEntry) => {
-      setStatus(`Downloading ${entry.name}...`);
-      try {
-        if (!client) throw new Error("Host control channel is not ready");
-        await client.saveFileToBrowser(entry.path, entry.name);
-        setStatus(null);
-      } catch (err) {
-        setStatus(`${entry.name}: ${errorMessage(err)}`);
-      }
-    },
-    [client],
+  const uploadFiles = useCallback(
+    (dir: string, files: globalThis.File[]) =>
+      uploadPick(dir, { items: files.map((file) => ({ rel: file.name, file })), emptyDirs: [] }),
+    [uploadPick],
   );
+
+  // What arrives here shows up at once, not at the next poll.
+  useEffect(
+    () =>
+      transfers?.onFinished((view) => {
+        const into =
+          view.verb === "upload" ? view.hostIds[0] : view.verb === "send" ? view.hostIds[1] : null;
+        if (into === hostId) void refreshAll();
+      }),
+    [hostId, refreshAll, transfers],
+  );
+
+  /** One file as itself; a folder, or several items, as one zip. Call from the click. */
+  const downloadEntries = (entries: HostDirEntry[]) => {
+    setMenu(null);
+    if (!transfers || entries.length === 0) return;
+    const sources = entries.map(walkSourceOf);
+    const only = sources.length === 1 ? sources[0] : undefined;
+    void transfers.download({
+      hostId,
+      sources,
+      archive:
+        only && !only.isDir
+          ? null
+          : archiveName(
+              sources.map((source) => source.name),
+              cwd ? folderLabel(cwd) : null,
+            ),
+    });
+  };
+
+  /** Where a follow-on menu hangs: the context menu's point, or the row's corner. */
+  const pointFor = (path: string | null): { x: number; y: number } => {
+    if (menu) return { x: menu.x, y: menu.y };
+    const row = path
+      ? listRef.current?.element?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`)
+      : null;
+    const box = row?.getBoundingClientRect() ?? listRef.current?.element?.getBoundingClientRect();
+    return box ? { x: box.right - 24, y: box.top + Math.min(box.height, 28) } : { x: 0, y: 0 };
+  };
+
+  const sendEntries = (entries: HostDirEntry[]) => {
+    const at = pointFor(entries[0]?.path ?? null);
+    setMenu(null);
+    sendRef.current?.open(entries.map(walkSourceOf), at);
+  };
+
+  const openHere = (folder: string, what: "terminal" | "agent") => {
+    const at = pointFor(pathsEqual(folder, cwd ?? "", flavor) ? null : folder);
+    setMenu(null);
+    openHereRef.current?.open(folder, what, at);
+  };
 
   const revealM = useMutation({
     mutationFn: (entry: HostDirEntry) => client!.reveal(entry.path),
@@ -1252,12 +1299,12 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   }, []);
 
   const pickUpload = useCallback(
-    (dir: string | null) => {
-      if (!can.write) return;
+    (dir: string | null, folder = false) => {
+      if (!can.write || (folder && !can.mkdir)) return;
       uploadDirRef.current = dir;
-      fileInputRef.current?.click();
+      (folder ? folderInputRef : fileInputRef).current?.click();
     },
-    [can.write],
+    [can.mkdir, can.write],
   );
 
   useImperativeHandle(
@@ -1266,6 +1313,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       newFolder: () => startCreate("folder"),
       newFile: () => startCreate("file"),
       upload: () => pickUpload(targetDir()),
+      uploadFolder: () => pickUpload(targetDir(), true),
       refresh: refreshEverything,
       collapseAll: () => setExpanded([]),
       toggleHidden: () => setShowHidden(!showHidden),
@@ -1465,7 +1513,12 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
       event.preventDefault();
       event.stopPropagation();
       setDropDir(null);
-      void uploadFiles(dir, Array.from(event.dataTransfer.files));
+      // Taken now: a drop's items are gone once this handler returns. Folders
+      // in it are walked afterwards and arrive whole.
+      const dropped = droppedEntries(event.dataTransfer);
+      void walkDropped(dropped)
+        .then((pick) => uploadPick(dir, pick))
+        .catch((error) => setStatus(errorMessage(error)));
     },
   });
 
@@ -1521,6 +1574,9 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   // ---- Menus ------------------------------------------------------------------
   const entryActions = (row: EntryFlatRow): ReactNode => {
     const { entry } = row;
+    // A link (or a socket, a device) is never followed or copied: it has no
+    // bytes of its own to download or send.
+    const movable = entryKind(entry) === "dir" || entryKind(entry) === "file";
     return (
       <>
         {entry.is_dir ? (
@@ -1557,11 +1613,17 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
           <CornerUpLeft className="size-4" aria-hidden />
           Copy relative path
         </DropdownMenuItem>
-        {(can.read || can.rename) && <DropdownMenuSeparator />}
-        {!entry.is_dir && can.read && (
-          <DropdownMenuItem onSelect={() => void download(entry)}>
+        {((can.read && transfers && movable) || can.rename) && <DropdownMenuSeparator />}
+        {can.read && transfers && movable && (
+          <DropdownMenuItem onSelect={() => downloadEntries([entry])}>
             <Download className="size-4" aria-hidden />
-            Download
+            {entry.is_dir ? DOWNLOAD_ZIP_LABEL : DOWNLOAD_LABEL}
+          </DropdownMenuItem>
+        )}
+        {can.read && transfers && movable && otherHosts.length > 0 && (
+          <DropdownMenuItem onSelect={() => sendEntries([entry])}>
+            <ArrowRightLeft className="size-4" aria-hidden />
+            {SEND_TO_HOST_LABEL}
           </DropdownMenuItem>
         )}
         {can.rename && (
@@ -1570,22 +1632,7 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
             Rename
           </DropdownMenuItem>
         )}
-        {!entry.is_dir && can.read && otherHosts.length > 0 && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>Send to host</DropdownMenuLabel>
-            {otherHosts.map((other) => (
-              <DropdownMenuItem
-                key={other.id}
-                disabled={other.status !== "online"}
-                onSelect={() => transferM.mutate({ entry, destHostId: other.id })}
-              >
-                <ArrowRightLeft className="size-4" aria-hidden />
-                {other.name}
-              </DropdownMenuItem>
-            ))}
-          </>
-        )}
+        {entry.is_dir && openHereActions(entry.path)}
         {can.remove && (
           <>
             <DropdownMenuSeparator />
@@ -1610,6 +1657,21 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
         <Copy className="size-4" aria-hidden />
         Copy paths
       </DropdownMenuItem>
+      {can.read && transfers && (
+        <>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => downloadEntries(targets.map((row) => row.entry))}>
+            <Download className="size-4" aria-hidden />
+            {downloadItemsLabel(targets.length)}
+          </DropdownMenuItem>
+          {otherHosts.length > 0 && (
+            <DropdownMenuItem onSelect={() => sendEntries(targets.map((row) => row.entry))}>
+              <ArrowRightLeft className="size-4" aria-hidden />
+              {SEND_TO_HOST_LABEL}
+            </DropdownMenuItem>
+          )}
+        </>
+      )}
       {can.remove && (
         <>
           <DropdownMenuSeparator />
@@ -1626,6 +1688,22 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
   // in a URL reaches the server's logs, a prefetch and the browser's history.
   const openHostFolder = useOpenHostFolder();
   const offerFullBrowser = Boolean(cwd) && layout !== "page";
+
+  /** "Open terminal here" and "Start agent here…", for a folder on an online host. */
+  const openHereActions = (folder: string): ReactNode =>
+    hostQ.data?.status === "online" ? (
+      <>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => openHere(folder, "terminal")}>
+          <SquareTerminal className="size-4" aria-hidden />
+          {OPEN_TERMINAL_HERE_LABEL}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => openHere(folder, "agent")}>
+          <Bot className="size-4" aria-hidden />
+          {START_AGENT_HERE_LABEL}
+        </DropdownMenuItem>
+      </>
+    ) : null;
 
   const backgroundActions = (): ReactNode => (
     <>
@@ -1647,6 +1725,13 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
           {UPLOAD_FILES_LABEL}
         </DropdownMenuItem>
       )}
+      {can.write && can.mkdir && (
+        <DropdownMenuItem onSelect={() => pickUpload(targetDir(), true)}>
+          <FolderUp className="size-4" aria-hidden />
+          {UPLOAD_FOLDER_LABEL}
+        </DropdownMenuItem>
+      )}
+      {cwd && openHereActions(cwd)}
       {(can.mkdir || can.write) && <DropdownMenuSeparator />}
       <DropdownMenuItem checked={showHidden} onSelect={() => prefs.setShowHidden(!showHidden)}>
         {SHOW_HIDDEN_LABEL}
@@ -2139,6 +2224,12 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
                       {UPLOAD_FILES_LABEL}
                     </DropdownMenuItem>
                   )}
+                  {can.write && can.mkdir && (
+                    <DropdownMenuItem onSelect={() => pickUpload(targetDir(), true)}>
+                      <FolderUp className="size-4" aria-hidden />
+                      {UPLOAD_FOLDER_LABEL}
+                    </DropdownMenuItem>
+                  )}
                 </DropdownMenu>
               )}
               <DropdownMenu
@@ -2220,7 +2311,22 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
           const files = Array.from(event.target.files ?? []);
           event.target.value = "";
           const dir = uploadDirRef.current ?? cwd;
-          if (dir) void uploadFiles(dir, files);
+          if (dir) uploadFiles(dir, files);
+        }}
+      />
+      <input
+        ref={folderInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        aria-label="Upload folder input"
+        // A folder, its files each carrying their path under it.
+        {...({ webkitdirectory: "" } as Record<string, string>)}
+        onChange={(event) => {
+          const files = Array.from(event.target.files ?? []);
+          event.target.value = "";
+          const dir = uploadDirRef.current ?? cwd;
+          if (dir) uploadPick(dir, pickedFolder(files));
         }}
       />
 
@@ -2395,37 +2501,30 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
           role="status"
         >
           <span className="min-w-0 flex-1 truncate">
-            {uploadingCount > 0
-              ? `Uploading ${uploadingCount} file(s)...`
-              : (status ??
-                (cwdListing
-                  ? statusSummary({
-                      shown,
-                      hidden,
-                      selected: selectedRows.length,
-                      selectedBytes,
-                      formatBytes: formatSize,
-                    })
-                  : ""))}
+            {status ??
+              (cwdListing
+                ? statusSummary({
+                    shown,
+                    hidden,
+                    selected: selectedRows.length,
+                    selectedBytes,
+                    formatBytes: formatSize,
+                  })
+                : "")}
           </span>
           <span className="flex shrink-0 items-center gap-1">
-            {(fetching || uploadingCount > 0) && (
-              <Loader2 className="size-3 animate-spin" aria-hidden />
-            )}
+            {fetching && <Loader2 className="size-3 animate-spin" aria-hidden />}
             {/* Only a folder that fits on one page is kept current on a timer. */}
             {controlReady && cwdListing && !cwdListing.multiPage && POLLED_REFRESH_NOTE}
           </span>
         </div>
       ) : (
-        (status || uploadingCount > 0) && (
+        status && (
           <div
             className="flex shrink-0 items-center gap-2 border-t border-border px-2 py-1 text-[11px] text-muted-foreground"
             role="status"
           >
-            {uploadingCount > 0 && <Loader2 className="size-3 animate-spin" aria-hidden />}
-            <span className="truncate">
-              {uploadingCount > 0 ? `Uploading ${uploadingCount} file(s)...` : status}
-            </span>
+            <span className="truncate">{status}</span>
           </div>
         )
       )}
@@ -2480,11 +2579,20 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
           }
         }}
         onClose={() => setViewing(null)}
-        onDownload={() => viewingEntry && void download(viewingEntry)}
+        onDownload={() => viewingEntry && downloadEntries([viewingEntry])}
         onReveal={() => viewingEntry && revealM.mutate(viewingEntry)}
         onOpenExternal={() => viewingEntry && openExternalM.mutate(viewingEntry)}
         onCopyPath={() => viewingEntry && void copyText(viewingEntry.path, "path")}
       />
+
+      <SendToHost
+        ref={sendRef}
+        sourceHostId={hostId}
+        sourceHome={homeDir}
+        sourceDir={cwd}
+        sourceOs={hostOs}
+      />
+      <OpenHereLauncher ref={openHereRef} host={hostQ.data ?? null} workspaceId={workspaceId} />
 
       {menu && (
         <div

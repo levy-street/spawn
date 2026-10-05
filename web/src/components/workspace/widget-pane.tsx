@@ -9,6 +9,7 @@ import {
   Ellipsis,
   Folder,
   FolderPlus,
+  FolderUp,
   RefreshCw,
   Search,
   Shapes,
@@ -26,7 +27,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { hosts } from "@/lib/api";
-import { FILTER_PLACEHOLDER } from "@/lib/files/copy";
+import { FILTER_PLACEHOLDER, UPLOAD_FILES_LABEL, UPLOAD_FOLDER_LABEL } from "@/lib/files/copy";
 import { type FilesTileWidget, isFilesWidget, type Tile, type TileWidget } from "@/lib/grid";
 import { basename } from "@/lib/paths";
 import { cn } from "@/lib/utils";
@@ -43,6 +44,8 @@ export function widgetTitle(widget: TileWidget): string {
 interface WidgetPaneProps {
   tile: Tile;
   widget: TileWidget;
+  /** The workspace it is in: a window opened from its folders lands there. */
+  workspaceId?: string;
   focused: boolean;
   paneCount: number;
   canDrag: boolean;
@@ -77,6 +80,7 @@ export function WidgetPane(props: WidgetPaneProps) {
 function FilesWidgetPane({
   tile,
   widget,
+  workspaceId,
   focused,
   paneCount,
   canDrag,
@@ -199,7 +203,11 @@ function FilesWidgetPane({
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => explorerRef.current?.upload()}>
             <Upload className="size-4" aria-hidden />
-            Upload files
+            {UPLOAD_FILES_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => explorerRef.current?.uploadFolder()}>
+            <FolderUp className="size-4" aria-hidden />
+            {UPLOAD_FOLDER_LABEL}
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => explorerRef.current?.refresh()}>
             <RefreshCw className="size-4" aria-hidden />
@@ -261,6 +269,7 @@ function FilesWidgetPane({
         key={`${widget.host_id}:${widget.path}`}
         hostId={widget.host_id}
         rootPath={widget.path}
+        workspaceId={workspaceId}
         dense
         hideHeader
         className="min-h-0 flex-1"

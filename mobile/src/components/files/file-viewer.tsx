@@ -17,11 +17,25 @@ import {
 } from "@/components/files/stream-adapter";
 import { decodeText, looksBinary } from "@/components/files/text-decode";
 import { receiveVerifiedHostFile } from "@/components/files/transfer";
+import {
+  DOWNLOAD_AND_SHARE,
+  proceedAnywayLabel,
+  relayWarning,
+} from "@/components/files/transfer-copy";
+import {
+  estimateSeconds,
+  expectedRate,
+  needsRelayWarning,
+  relayedHosts,
+  worthEstimating,
+} from "@/components/files/transfer-plan";
 import type { HostDirEntry } from "@/components/files/types";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
+import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { Text } from "@/components/ui/text";
+import { useTransfersStore } from "@/data/stores/transfers";
 import type { HostTransport } from "@/terminal/transport/types";
 import { borderWidth, spacing, useTheme } from "@/theme";
 
@@ -30,14 +44,25 @@ const TRANSFER_KEEP_AWAKE_TAG = "spawn-host-file-transfer";
 export interface FileViewerProps {
   entry: HostDirEntry | null;
   transport: HostTransport | null;
+  /** The host the file is on, as a person reads it: named when its download is relayed. */
+  hostName: string;
   onDismiss: () => void;
   onPrevious?: () => void;
   onNext?: () => void;
 }
 
-export function FileViewer({ entry, transport, onDismiss, onPrevious, onNext }: FileViewerProps) {
+export function FileViewer({
+  entry,
+  transport,
+  hostName,
+  onDismiss,
+  onPrevious,
+  onNext,
+}: FileViewerProps) {
   const theme = useTheme();
   const [state, setState] = useState<ViewerState>({ status: "idle" });
+  /** The relay warning a big download is waiting on (OD3), for the file it was said for. */
+  const [relayAsk, setRelayAsk] = useState<{ path: string; warning: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const type = useMemo(() => (entry ? classifyFile(entry) : null), [entry]);
 
@@ -161,7 +186,33 @@ export function FileViewer({ entry, transport, onDismiss, onPrevious, onNext }: 
     }
   };
 
+  /**
+   * A relayed download over the warning size says so first, as an upload or
+   * a send does, with about how long it will take (OD3).
+   */
+  const askThenDownload = () => {
+    if (!entry || !transport) return;
+    const size = entry.size ?? 0;
+    const relayed = relayedHosts([{ name: hostName, info: transport.connectionInfo }]);
+    if (!needsRelayWarning(size, relayed)) {
+      void downloadAndShare();
+      return;
+    }
+    const seconds = estimateSeconds(
+      size,
+      expectedRate(
+        [{ hostId: transport.hostId, info: transport.connectionInfo }],
+        useTransfersStore.getState().routeRates,
+      ),
+    );
+    setRelayAsk({
+      path: entry.path,
+      warning: relayWarning(relayed, size, worthEstimating(seconds) ? seconds : null),
+    });
+  };
+
   if (!entry || !type) return null;
+  const asking = relayAsk?.path === entry.path ? relayAsk.warning : null;
   return (
     <Dialog
       closeAccessibilityLabel="Close file viewer"
@@ -209,6 +260,36 @@ export function FileViewer({ entry, transport, onDismiss, onPrevious, onNext }: 
           type={type}
         />
       </View>
+      {asking ? (
+        <View
+          style={[
+            styles.relay,
+            { backgroundColor: theme.colors.warningSoft, borderTopColor: theme.colors.border },
+          ]}
+          testID="file-viewer-relay-warning"
+        >
+          <View style={styles.relayLine}>
+            <Icon color="warning" name="AlertTriangle" />
+            <Text color="warning" style={styles.footerCopy}>
+              {asking}
+            </Text>
+          </View>
+          <View style={styles.relayActions}>
+            <Button onPress={() => setRelayAsk(null)} size="sm" variant="ghost">
+              Cancel
+            </Button>
+            <Button
+              onPress={() => {
+                setRelayAsk(null);
+                void downloadAndShare();
+              }}
+              size="sm"
+            >
+              {proceedAnywayLabel("download")}
+            </Button>
+          </View>
+        </View>
+      ) : null}
       <View style={[styles.footer, { borderTopColor: theme.colors.border }]}>
         <View style={styles.footerCopy}>
           <Text color="mutedForeground" numberOfLines={1} variant="caption">
@@ -219,12 +300,12 @@ export function FileViewer({ entry, transport, onDismiss, onPrevious, onNext }: 
           </Text>
         </View>
         <Button
-          disabled={!hasHostFileStreams(transport) || entry.kind !== "file"}
-          onPress={() => void downloadAndShare()}
+          disabled={!hasHostFileStreams(transport) || entry.kind !== "file" || asking !== null}
+          onPress={askThenDownload}
           size="sm"
           variant="outline"
         >
-          Download & Share…
+          {DOWNLOAD_AND_SHARE}
         </Button>
       </View>
     </Dialog>
@@ -252,4 +333,7 @@ const styles = StyleSheet.create({
     paddingTop: spacing[12],
   },
   headerCopy: { flex: 1, minWidth: 0 },
+  relay: { borderTopWidth: borderWidth.hairline, gap: spacing[2], padding: spacing[3] },
+  relayActions: { flexDirection: "row", gap: spacing[2], justifyContent: "flex-end" },
+  relayLine: { alignItems: "flex-start", flexDirection: "row", gap: spacing[2] },
 });

@@ -238,6 +238,7 @@ export function TranscriptsSheet({
           {...(selectedIndex > 0
             ? { onPrevious: () => setSelected(entryOf(transcripts[selectedIndex - 1]) ?? null) }
             : {})}
+          hostName={hostName}
           transport={transport}
         />
       ) : null}

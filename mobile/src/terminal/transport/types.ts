@@ -295,6 +295,13 @@ export interface HostWriteOptions extends HostRequestOptions {
   onProgress?(progress: HostWriteProgress): void;
 }
 
+/** A file carried from one host to another through this device. */
+export interface HostTransferOptions extends HostWriteOptions {
+  overwrite?: boolean;
+  /** The name it takes in the destination folder; the source's own when omitted. */
+  name?: string;
+}
+
 export interface HostWriteResult {
   readonly path: string;
   readonly length: number;
@@ -331,6 +338,12 @@ export interface HostTransport {
   readonly state: TransportState;
   /** Null until this RTC generation's hello frame is decoded. */
   readonly capabilities?: HostCapabilities | null;
+  /**
+   * How the device-host connection under this channel is carried — direct or
+   * through the relay — as its WebRTC stats last said; null until they have.
+   * A tool channel reports its host connection's.
+   */
+  readonly connectionInfo?: ConnectionInfo | null;
   prepare?(): void;
   networkChanged?(): void;
   open(): Promise<void>;
@@ -381,7 +394,7 @@ export interface HostTransport {
     destination: HostTransport,
     path: string,
     destinationDirectory: string,
-    options?: HostWriteOptions & { overwrite?: boolean },
+    options?: HostTransferOptions,
   ): Promise<HostWriteResult>;
   on(ev: "state", fn: (state: TransportState) => void): () => void;
   on(ev: "error", fn: (error: TransportError) => void): () => void;
@@ -427,7 +440,7 @@ export interface StreamingHostTransport extends HostTransport {
     destination: HostTransport,
     path: string,
     destinationDirectory: string,
-    options?: HostWriteOptions & { overwrite?: boolean },
+    options?: HostTransferOptions,
   ): Promise<HostWriteResult>;
 }
 

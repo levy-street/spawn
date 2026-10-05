@@ -31,6 +31,7 @@ import {
 } from "@/components/files/errors";
 import { FileRow } from "@/components/files/file-row";
 import { FileViewer } from "@/components/files/file-viewer";
+import { FilesOpenHere, type OpenedWindow } from "@/components/files/files-open-here";
 import { countHiddenMatches, filterEntries } from "@/components/files/filter";
 import { GoToFolderDialog } from "@/components/files/go-to-folder-dialog";
 import { NameDialog } from "@/components/files/name-dialog";
@@ -54,10 +55,38 @@ import {
   toggleSelected,
 } from "@/components/files/selection";
 import { SelectionBar } from "@/components/files/selection-bar";
+import { SendToHostSheet } from "@/components/files/send-to-host-sheet";
 import { sortEntries } from "@/components/files/sort";
 import { hasHostFileStreams } from "@/components/files/stream-adapter";
+import { HOST_TRANSFER_MAX_BYTES } from "@/components/files/transfer";
+import {
+  DOWNLOAD_AND_SHARE,
+  FOLDER_DOWNLOAD_UNAVAILABLE,
+  KEEP_OPEN,
+  OPEN_TERMINAL_HERE,
+  proceedAnywayLabel,
+  relayWarning,
+  SEND_TO_ANOTHER_HOST,
+  START_AGENT_HERE,
+  tooLargeFile,
+  UPLOAD_FROM_FILES,
+  UPLOAD_FROM_PHOTOS,
+} from "@/components/files/transfer-copy";
+import {
+  type ConflictDecision,
+  estimateSeconds,
+  expectedRate,
+  needsRelayWarning,
+  relayedHosts,
+  worthEstimating,
+} from "@/components/files/transfer-plan";
+import { TransfersBanner } from "@/components/files/transfers-banner";
 import type { HostDirEntry } from "@/components/files/types";
+import { UploadConflictSheet } from "@/components/files/upload-conflict-sheet";
+import { releaseLocalCopy } from "@/components/files/upload-source";
 import { ViewOptionsSheet } from "@/components/files/view-options-sheet";
+import type { OpenHereRequest } from "@/components/launcher/open-here-sheet";
+import { type PickedOriginal, pickOriginalFiles } from "@/components/media/image-source";
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/confirm";
@@ -82,6 +111,7 @@ import {
 } from "@/data/queries/files";
 import { qk } from "@/data/queryKeys";
 import { useFileViewOptions } from "@/data/stores/explorer-prefs";
+import { type NewTransferItem, useTransfersStore } from "@/data/stores/transfers";
 import { useAppActive } from "@/lib/app-active";
 import { haptics } from "@/lib/haptics";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
@@ -118,6 +148,11 @@ export interface FileBrowserBodyProps {
    * it is in, so whatever titles the body can name that folder.
    */
   onShowFolder?(folder: string): void;
+  /**
+   * Shows a window opened from a folder ("Open terminal here", "Start agent
+   * here…"). Without it the browser does not offer to open one.
+   */
+  onWindowOpened?(opened: OpenedWindow): void;
 }
 
 type NameMode =
@@ -134,6 +169,25 @@ interface LinkedFile {
   path: string;
   /** Opened over its folder already, so closing it stays closed. */
   opened: boolean;
+}
+
+/**
+ * Files picked to upload into the folder, on their way to the queue: first a
+ * relay warning if the upload is big and relayed (OD3), then one question for
+ * each picked file whose name the folder already holds.
+ */
+interface UploadFlow {
+  picked: PickedOriginal[];
+  /** The host's name when this device reaches it through the relay. */
+  relayed: string[];
+  /** About how long it will take, when that is worth saying (OD3). */
+  estimate: number | null;
+  total: number;
+  step: "relay" | "conflicts";
+  /** Picked files whose names are taken here, still to be answered. */
+  clashes: (PickedOriginal & { clashIsDir: boolean })[];
+  /** The answers so far, by the picked file's local address. */
+  decisions: ReadonlyMap<string, ConflictDecision>;
 }
 
 /** A line about the folder as a whole: what a change did, or what one is doing. */
@@ -161,6 +215,7 @@ export function FileBrowserBody({
   active = true,
   onOpenFolder,
   onShowFolder,
+  onWindowOpened,
 }: FileBrowserBodyProps) {
   const theme = useTheme();
   const queryClient = useQueryClient();
@@ -196,6 +251,13 @@ export function FileBrowserBody({
   const [manualRefresh, setManualRefresh] = useState(false);
   /** A linked path the host said is a file: its folder is shown, with it open. */
   const [linkedFileState, setLinkedFile] = useState<LinkedFile | null>(null);
+  const [sendTargets, setSendTargets] = useState<readonly HostDirEntry[] | null>(null);
+  const [openHere, setOpenHere] = useState<OpenHereRequest | null>(null);
+  // The sheets that read the server are mounted once first asked for, not per folder screen.
+  const [sendUsed, setSendUsed] = useState(false);
+  const [openHereUsed, setOpenHereUsed] = useState(false);
+  const [upload, setUpload] = useState<UploadFlow | null>(null);
+  const enqueueTransfer = useTransfersStore((state) => state.enqueue);
   // Only for the link it was found on: a body shown another path starts afresh.
   const linkedFile = linkedFileState?.link === path ? linkedFileState : null;
   // Set before the first await, so a second tap cannot start the same delete twice.
@@ -454,9 +516,129 @@ export function FileBrowserBody({
   const canRename = ready && hostCan(transport, "fs.rename");
   const canDelete = ready && hostCan(transport, "fs.remove");
   const canStream = hasHostFileStreams(transport);
+  const canUpload = canCreateFile;
+  // A send reads its files from here; the host it goes to is chosen, and asked, in its sheet.
+  const canSend =
+    ready && hostCan(transport, "fs.read") && typeof transport?.transferFileTo === "function";
 
   const folderLabel =
     homeDir && folder ? breadcrumbParts(folder, homeDir, pathFlavor).at(-1)?.label : undefined;
+  const thisHost = {
+    id: hostId,
+    name: hostName,
+    publicKey: hostIdentityPublicKey,
+    os: hostOS ?? null,
+  };
+
+  /** Into the Transfers queue: every picked file, its answer to a taken name, or "ask" if none was needed. */
+  const queueUpload = (flow: UploadFlow) => {
+    setUpload(null);
+    const items: NewTransferItem[] = [];
+    const refused: { item: NewTransferItem; reason: string }[] = [];
+    for (const file of flow.picked) {
+      const item: NewTransferItem = {
+        name: file.name,
+        size: file.size,
+        source: { kind: "local", uri: file.uri, mimeType: file.mimeType },
+        policy: flow.decisions.get(file.uri) ?? "ask",
+      };
+      if (file.size !== null && file.size > HOST_TRANSFER_MAX_BYTES) {
+        refused.push({ item, reason: tooLargeFile(file.name) });
+      } else {
+        items.push(item);
+      }
+    }
+    enqueueTransfer({
+      kind: "upload",
+      source: null,
+      destination: thisHost,
+      destDir: folder,
+      destLabel: folderLabel ?? hostName,
+      items,
+      refused,
+    });
+  };
+
+  const continueUpload = (flow: UploadFlow) => {
+    if (flow.step === "conflicts" && flow.clashes.length === 0) queueUpload(flow);
+    else setUpload(flow);
+  };
+
+  /** Backing out uploads nothing, and the picker's copies go. */
+  const abandonUpload = () => {
+    for (const file of upload?.picked ?? []) releaseLocalCopy(file.uri);
+    setUpload(null);
+  };
+
+  const startUpload = async (from: "files" | "photos") => {
+    if (!transport || !folder) return;
+    clearStatus();
+    let picked: PickedOriginal[];
+    try {
+      picked = await pickOriginalFiles(from);
+    } catch (error) {
+      haptics.error();
+      setStatus({
+        message:
+          error instanceof Error && error.message.trim()
+            ? error.message
+            : "SPAWN D couldn't open the picker.",
+        tone: "destructive",
+      });
+      return;
+    }
+    if (picked.length === 0) return;
+    const total = picked.reduce((sum, file) => sum + (file.size ?? 0), 0);
+    const relayed = relayedHosts([{ name: hostName, info: transport.connectionInfo }]);
+    const seconds = estimateSeconds(
+      total,
+      expectedRate(
+        [{ hostId, info: transport.connectionInfo }],
+        useTransfersStore.getState().routeRates,
+      ),
+    );
+    const fold = (name: string) => (pathFlavor === "windows" ? name.toLocaleLowerCase() : name);
+    const here = new Map(
+      (listing.data?.entries ?? []).map((entry) => [fold(entry.name), entry.is_dir === true]),
+    );
+    continueUpload({
+      picked,
+      relayed,
+      estimate: worthEstimating(seconds) ? seconds : null,
+      total,
+      step: needsRelayWarning(total, relayed) ? "relay" : "conflicts",
+      clashes: picked.flatMap((file) => {
+        const clashIsDir = here.get(fold(file.name));
+        return clashIsDir === undefined ? [] : [{ ...file, clashIsDir }];
+      }),
+      decisions: new Map(),
+    });
+  };
+
+  const answerConflict = (policy: ConflictDecision, applyToRest: boolean) => {
+    if (!upload) return;
+    const [current, ...rest] = upload.clashes;
+    if (!current) return;
+    const decisions = new Map(upload.decisions);
+    for (const file of applyToRest ? upload.clashes : [current]) decisions.set(file.uri, policy);
+    continueUpload({ ...upload, clashes: applyToRest ? [] : rest, decisions });
+  };
+
+  const firstClash = upload?.step === "conflicts" ? upload.clashes[0] : undefined;
+  const uploadAsked = firstClash
+    ? { name: firstClash.name, isDir: false, clashIsDir: firstClash.clashIsDir }
+    : null;
+
+  const openHereAt = (cwd: string, run: "shell" | "agent") => {
+    setOpenHereUsed(true);
+    setOpenHere({ cwd, run });
+  };
+
+  const sendEntries = (targets: readonly HostDirEntry[]) => {
+    if (targets.length === 0) return;
+    setSendUsed(true);
+    setSendTargets(targets);
+  };
   const folderActions: ActionSheetAction[] = [
     {
       id: "new-folder",
@@ -472,6 +654,38 @@ export function FileBrowserBody({
       disabled: !canCreateFile,
       onPress: () => setNameMode({ kind: "file" }),
     },
+    {
+      id: "upload-files",
+      label: UPLOAD_FROM_FILES,
+      icon: <Icon color="mutedForeground" name="Upload" />,
+      disabled: !canUpload || !folder,
+      onPress: () => void startUpload("files"),
+    },
+    {
+      id: "upload-photos",
+      label: UPLOAD_FROM_PHOTOS,
+      icon: <Icon color="mutedForeground" name="ImagePlus" />,
+      disabled: !canUpload || !folder,
+      onPress: () => void startUpload("photos"),
+    },
+    ...(onWindowOpened
+      ? [
+          {
+            id: "open-shell",
+            label: OPEN_TERMINAL_HERE,
+            icon: <Icon color="mutedForeground" name="SquareTerminal" />,
+            disabled: !folder,
+            onPress: () => openHereAt(folder, "shell"),
+          },
+          {
+            id: "start-agent",
+            label: START_AGENT_HERE,
+            icon: <Icon color="mutedForeground" name="Bot" />,
+            disabled: !folder,
+            onPress: () => openHereAt(folder, "agent"),
+          },
+        ]
+      : []),
     {
       id: "go-to-folder",
       label: "Go to folder…",
@@ -523,16 +737,38 @@ export function FileBrowserBody({
           disabled: !canRename,
           onPress: () => setNameMode({ kind: "rename", entry: actionEntry }),
         },
-        ...(!actionEntry.is_dir
+        actionEntry.is_dir
+          ? {
+              id: "download",
+              label: DOWNLOAD_AND_SHARE,
+              disabled: true,
+              detail: FOLDER_DOWNLOAD_UNAVAILABLE,
+              onPress: () => undefined,
+            }
+          : {
+              id: "download",
+              label: DOWNLOAD_AND_SHARE,
+              disabled: !canStream,
+              detail: canStream ? KEEP_OPEN : "Requires the verified host stream bridge.",
+              onPress: () => setPreview(actionEntry),
+            },
+        {
+          id: "send",
+          label: SEND_TO_ANOTHER_HOST,
+          disabled: !canSend || actionEntry.kind === "symlink",
+          onPress: () => sendEntries([actionEntry]),
+        },
+        ...(actionEntry.is_dir && onWindowOpened
           ? [
               {
-                id: "download",
-                label: "Download & Share…",
-                disabled: !canStream,
-                detail: canStream
-                  ? "Keep SPAWN D open until transfer finishes."
-                  : "Requires the verified host stream bridge.",
-                onPress: () => setPreview(actionEntry),
+                id: "open-shell",
+                label: OPEN_TERMINAL_HERE,
+                onPress: () => openHereAt(actionEntry.path, "shell"),
+              },
+              {
+                id: "start-agent",
+                label: START_AGENT_HERE,
+                onPress: () => openHereAt(actionEntry.path, "agent"),
               },
             ]
           : []),
@@ -784,14 +1020,17 @@ export function FileBrowserBody({
         // Above the list whatever it shows, so an empty filter says what it searched.
         <FolderNotice icon="AlertCircle" message={truncatedFolderNotice(hostName)} />
       ) : null}
+      <TransfersBanner />
       <View style={styles.content}>{content}</View>
       {selecting ? (
         <SelectionBar
           canDelete={canDelete}
+          canSend={canSend}
           count={chosen.length}
           onDelete={() => {
             if (!operationPending) setDeleteTargets(chosen);
           }}
+          onSend={() => sendEntries(chosen.filter((entry) => entry.kind !== "symlink"))}
           pending={operationPending}
         />
       ) : null}
@@ -893,6 +1132,44 @@ export function FileBrowserBody({
         title={deleteConfirmTitle(deleteTargets ?? [])}
         visible={deleteTargets !== null}
       />
+      {sendUsed && homeDir && folder ? (
+        <SendToHostSheet
+          entries={sendTargets ?? NO_ENTRIES}
+          onDismiss={() => setSendTargets(null)}
+          source={thisHost}
+          sourceFolder={folder}
+          sourceHomeDir={homeDir}
+          sourceTransport={ready ? transport : null}
+          visible={sendTargets !== null}
+        />
+      ) : null}
+      {openHereUsed && onWindowOpened ? (
+        <FilesOpenHere
+          hostId={hostId}
+          onDismiss={() => setOpenHere(null)}
+          onOpened={onWindowOpened}
+          request={openHere}
+        />
+      ) : null}
+      <Confirm
+        cancelLabel="Cancel"
+        confirmLabel={proceedAnywayLabel("upload")}
+        description={upload ? relayWarning(upload.relayed, upload.total, upload.estimate) : ""}
+        onCancel={abandonUpload}
+        onConfirm={() => {
+          if (upload) continueUpload({ ...upload, step: "conflicts" });
+        }}
+        title="Upload through the SPAWN D relay?"
+        visible={upload?.step === "relay"}
+      />
+      <UploadConflictSheet
+        folderLabel={folderLabel ?? hostName}
+        hostName={hostName}
+        asked={uploadAsked}
+        onCancel={abandonUpload}
+        onChoose={answerConflict}
+        others={Math.max(0, (upload?.clashes.length ?? 0) - 1)}
+      />
       <FileViewer
         entry={preview}
         onDismiss={() => setPreview(null)}
@@ -902,6 +1179,7 @@ export function FileBrowserBody({
         {...(preview && files.indexOf(preview) > 0
           ? { onPrevious: () => setPreview(files[files.indexOf(preview) - 1] ?? null) }
           : {})}
+        hostName={hostName}
         transport={transport}
       />
     </View>

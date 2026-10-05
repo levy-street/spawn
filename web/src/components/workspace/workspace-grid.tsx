@@ -1735,6 +1735,7 @@ export function WorkspaceGrid({
                   <WidgetPane
                     tile={tile}
                     widget={tile.widget}
+                    workspaceId={workspace.id}
                     focused={focusedId === tile.session_id}
                     paneCount={tiles.length}
                     canDrag={canGesture}
@@ -1900,6 +1901,7 @@ export function WorkspaceGrid({
                 <WidgetPane
                   tile={{ session_id: sessionId, x: 0, y: 0, w: GRID_SIZE, h: GRID_SIZE }}
                   widget={widget}
+                  workspaceId={workspace.id}
                   focused={focusedId === sessionId}
                   paneCount={tiles.length}
                   canDrag={false}

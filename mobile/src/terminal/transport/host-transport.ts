@@ -57,6 +57,7 @@ import { reconnectDelay } from "@/terminal/transport/state-machine";
 import type {
   AgentTranscriptQuery,
   AgentTranscriptReport,
+  ConnectionInfo,
   HostCapabilities,
   HostFileSource,
   HostPreviewFile,
@@ -64,6 +65,7 @@ import type {
   HostReadableFile,
   HostReadHead,
   HostRequestOptions,
+  HostTransferOptions,
   HostTransport,
   HostTransportOptions,
   HostWriteDeclaration,
@@ -156,6 +158,21 @@ function newUuid(): string {
   return bytesToUuid(bytes);
 }
 
+const CONNECTION_KINDS: ReadonlySet<string> = new Set(["direct", "stun", "relay", "unknown"]);
+
+/** What the worker's stats said about the selected candidate pair, or null if unreadable. */
+function readConnectionInfo(value: unknown): ConnectionInfo | null {
+  const info = record(value);
+  if (!info || typeof info["kind"] !== "string" || !CONNECTION_KINDS.has(info["kind"])) {
+    return null;
+  }
+  const rtt = info["rttMs"];
+  return {
+    kind: info["kind"] as ConnectionInfo["kind"],
+    rttMs: typeof rtt === "number" && Number.isFinite(rtt) ? rtt : null,
+  };
+}
+
 function exposedDeclaration(declaration: HostReadDeclarationWire) {
   return {
     streamId: declaration.streamId,
@@ -173,6 +190,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   #state: TransportState = "idle";
   #lastError: TransportError | null = null;
   #capabilities: HostCapabilities | null = null;
+  #connectionInfo: ConnectionInfo | null = null;
   #browserKey: string | null = null;
   #signal: SignalChannelLike | null = null;
   #signalUnsubscribe: (() => void) | null = null;
@@ -252,6 +270,11 @@ class WebViewHostTransport implements StreamingHostTransport {
 
   get capabilities(): HostCapabilities | null {
     return this.#capabilities;
+  }
+
+  /** A tool channel rides its host connection, so it reports that connection's. */
+  get connectionInfo(): ConnectionInfo | null {
+    return this.parent ? (this.parent.connectionInfo ?? null) : this.#connectionInfo;
   }
 
   prepare(): void {
@@ -419,6 +442,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     clearTimeout(this.#resumeTimer ?? undefined);
     this.#resumeTimer = null;
     this.#workerStarted = false;
+    this.#connectionInfo = null;
     this.#prepareEpoch++;
     this.#bridgeUnsubscribe?.();
     this.#bridgeUnsubscribe = null;
@@ -889,7 +913,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     destination: HostTransport,
     path: string,
     destinationDirectory: string,
-    options: HostWriteOptions & { overwrite?: boolean } = {},
+    options: HostTransferOptions = {},
   ): Promise<HostWriteResult> {
     if (!destination.writeStream) {
       throw new HostControlTransportError(
@@ -903,7 +927,7 @@ class WebViewHostTransport implements StreamingHostTransport {
         read.stream,
         {
           dir: destinationDirectory,
-          name: read.name,
+          name: options.name ?? read.name,
           length: read.length,
           sha256: read.sha256,
           overwrite: options.overwrite ?? false,
@@ -1358,6 +1382,10 @@ class WebViewHostTransport implements StreamingHostTransport {
       }
       case "host-response":
         this.#handleHostResponse(message);
+        break;
+      case "connection-info":
+        // The root's own peer reports these every few seconds once connected.
+        if (!this.parent) this.#connectionInfo = readConnectionInfo(message.info);
         break;
       case "diagnostic":
         for (const listener of this.#diagnosticListeners) listener(message.diagnostic);

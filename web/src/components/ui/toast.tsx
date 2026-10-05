@@ -2,6 +2,7 @@
 
 import { AlertCircle, CheckCircle2, X } from "lucide-react";
 import { type ReactNode, useEffect, useSyncExternalStore } from "react";
+import { ProgressBar } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 
 /**
@@ -347,26 +348,7 @@ export function ToastProgressBar({ progress }: { progress: ToastProgress }) {
   const percent = determinate ? Math.max(0, Math.min(100, Math.round(progress))) : undefined;
   return (
     <div className="mt-2 flex items-center gap-2">
-      <div
-        role="progressbar"
-        aria-valuemin={determinate ? 0 : undefined}
-        aria-valuemax={determinate ? 100 : undefined}
-        aria-valuenow={percent}
-        aria-valuetext={determinate ? `${percent}%` : "in progress"}
-        className="relative h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted"
-      >
-        {determinate ? (
-          <div
-            className="h-full rounded-full bg-primary transition-[width] duration-300 ease-swift"
-            style={{ width: `${percent}%` }}
-          />
-        ) : (
-          // Reduced motion keeps a still, part-filled track: the notice's own
-          // text is what carries the meaning, and a frozen stripe reads as
-          // stalled (DESIGN.md rule 6 — nothing depends on the animation).
-          <div className="h-full w-1/3 rounded-full bg-primary motion-safe:animate-toast-progress motion-reduce:w-1/2" />
-        )}
-      </div>
+      <ProgressBar value={determinate ? progress : "indeterminate"} />
       {determinate ? (
         <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{percent}%</span>
       ) : null}
