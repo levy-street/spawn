@@ -19,7 +19,8 @@ docs/     design docs; docs/RELEASE.md — the release process,
           docs/WINDOWS_VALIDATION.md — the Windows evidence gate, and
           docs/AZURE_SIGNING_SETUP.md — the Windows signing identity, for
           whoever holds Azure
-tools/    development utilities
+tools/    development utilities; relaunch-vectors/ writes proto/agent-note-vectors.json
+          from a reference implementation kept apart from the clients' module
 .github/  CI workflows: tests, native connection acceptance and its promotion
           gate, the rolling daemon prebuilts, the Windows check
           and its unsigned packaging rehearsal, and the signed desktop
@@ -68,7 +69,17 @@ So any user-facing change ships in both, in the same commit:
 Both have their own idiom and neither should be a transliteration of the other.
 Match the surrounding code — `web/` uses Tailwind and server components,
 `mobile/` uses the `@/theme` tokens and the shared `ui/` primitives. Shared
-*meaning* stays identical; shared *markup* is not a goal.
+*meaning* stays identical; shared *markup* is not a goal. One file is the
+deliberate exception: the agent relaunch module, which composes what a device
+types into a host's shell, is the same file byte for byte in both
+(`web/src/lib/agent-relaunch.ts`, `mobile/src/data/selectors/agent-relaunch.ts`).
+Change both copies together; web's unit test fails when they differ. Its
+`canonicalConversationId` is each client's one rule for a conversation id
+(`web/src/lib/conversation.ts` and `mobile/src/terminal/transport/conversation-id.ts`
+re-export it); never write a second one. A rule the module follows changes in
+`tools/relaunch-vectors/relaunch_ref.py` too: `generate.py` there rewrites
+`proto/agent-note-vectors.json`, and `scripts/test-all.sh` fails when the
+committed vectors are not what it writes.
 
 When something genuinely belongs to one platform — Face ID unlock, a
 `WebAuthn` ceremony that needs a browser — say so in the commit message. An
