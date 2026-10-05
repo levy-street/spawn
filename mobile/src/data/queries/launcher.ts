@@ -2,6 +2,11 @@ import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
 import { randomUUID } from "expo-crypto";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  type CreateWindowRequest,
+  type CreateWindowResult,
+  createWindow,
+} from "@/components/launcher/create-window";
+import {
   createLaunchOrchestrator,
   type LaunchRequest,
   type WidgetRequest,
@@ -22,7 +27,7 @@ import {
   getSession,
   listSessions,
 } from "@/data/api/endpoints/sessions";
-import { getWorkspace, patchWorkspace } from "@/data/api/endpoints/workspaces";
+import { createWorkspace, getWorkspace, patchWorkspace } from "@/data/api/endpoints/workspaces";
 import type { RecentDirOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
@@ -130,6 +135,40 @@ export function useLaunchSession() {
       ]);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: qk.workspace(request.workspaceId) }),
+        queryClient.invalidateQueries({ queryKey: qk.workspaces() }),
+        queryClient.invalidateQueries({ queryKey: qk.sessions() }),
+      ]);
+    },
+  });
+}
+
+/**
+ * Opens a window wherever `request.workspace` says — a workspace's tab, or a
+ * new workspace that starts with it — through the one window maker
+ * (`create-window.ts`), then refreshes what the new window changes.
+ */
+export function useCreateWindow() {
+  const queryClient = useQueryClient();
+  return useMutation<CreateWindowResult, Error, CreateWindowRequest>({
+    mutationFn: (request) =>
+      createWindow(request, {
+        createSession,
+        createWorkspace,
+        getWorkspace,
+        patchWorkspace: (workspaceId, patch) => patchWorkspace(workspaceId, patch),
+        newId: randomUUID,
+        pending: pendingLaunches,
+      }),
+    onSuccess: async (result) => {
+      queryClient.setQueryData<SessionOut>(qk.session(result.session.id), result.session);
+      queryClient.setQueryData<SessionOut[]>(qk.sessions(), (sessions) => [
+        ...(sessions ?? []).filter((session) => session.id !== result.session.id),
+        result.session,
+      ]);
+      await Promise.all([
+        ...(result.workspaceId
+          ? [queryClient.invalidateQueries({ queryKey: qk.workspace(result.workspaceId) })]
+          : []),
         queryClient.invalidateQueries({ queryKey: qk.workspaces() }),
         queryClient.invalidateQueries({ queryKey: qk.sessions() }),
       ]);

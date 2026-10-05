@@ -58,6 +58,9 @@ export const HostOutSchema = z.object({
   cpu_bucket: z.number().int().min(0).max(5).nullable(),
   mem_bucket: z.number().int().min(0).max(5).nullable(),
   capacity_at: IsoDateTimeSchema.nullable(),
+  // When the host was possessed. Newer servers send it; an older one omits it
+  // and the host's page simply leaves the date out.
+  created_at: IsoDateTimeSchema.nullable().optional(),
 });
 export const HostPatchSchema = z.object({ name: z.string().max(128).nullable().optional() });
 export const HostAgentTargetSchema = z.object({

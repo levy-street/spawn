@@ -1,16 +1,8 @@
 import { commandBasename } from "@/lib/agent-identity";
-import {
-  type Agent,
-  agents,
-  type Host,
-  sessions,
-  type WorkspaceTemplate,
-  workspaces,
-} from "@/lib/api";
+import { type Agent, agents, type Host, type WorkspaceTemplate, workspaces } from "@/lib/api";
 import { basename } from "@/lib/paths";
 import { activeTab, type LayoutV3, withActiveTab } from "@/lib/tabs";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
-import { pendingLaunch } from "./pending-launch";
+import { createWindow } from "./create-window";
 
 /** See the call in `instantiateTemplate`. */
 function iconForInstance(
@@ -84,21 +76,14 @@ export async function instantiateTemplate(
     }
     for (const tile of sessionTiles) {
       const agent = tile.run.kind === "agent" ? matchAgent(tile.run.command, definitions) : null;
-      const conversation = agent ? newAgentConversationId(agent.kind) : null;
-      const session = await sessions.create({
-        host_id: host.id,
+      const { session } = await createWindow({
+        host,
         cwd,
-        ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
-        workspace_id: workspace.id,
-        tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
+        agent,
+        // A definition since deleted still leaves a command worth typing.
+        command: tile.run.kind === "agent" ? tile.run.command : null,
+        workspace: { id: workspace.id, tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h } },
       });
-      if (tile.run.kind === "agent") {
-        pendingLaunch.set(
-          session.id,
-          session.host_id,
-          agent ? agentLaunchCommand(agent, conversation) : tile.run.command,
-        );
-      }
       focusSessionId ??= session.id;
     }
     layout = (await workspaces.get(workspace.id)).layout;

@@ -132,6 +132,9 @@ const TONE_DOT: Record<string, string> = {
   active: "bg-tone-active",
   // This device has lost a host the server still sees: reconnecting.
   warning: "bg-warning",
+  // Its identity changed, so nothing connects until it is removed: steady,
+  // since nothing is being tried.
+  blocked: "bg-warning",
   idle: "bg-tone-idle",
   offline: "bg-tone-offline",
 };

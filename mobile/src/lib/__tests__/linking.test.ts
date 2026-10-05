@@ -48,6 +48,16 @@ describe("incoming spawn links", () => {
       route: "/host/[id]/files",
       params: { id: HOST_ID, path: "/Users/spawn project" },
     },
+    {
+      input: `/hosts/${HOST_ID}/sessions`,
+      route: "/host/[id]",
+      params: { id: HOST_ID, tab: "sessions" },
+    },
+    {
+      input: `/hosts/${HOST_ID}/access`,
+      route: "/host/[id]",
+      params: { id: HOST_ID, tab: "access" },
+    },
     { input: "/hosts", route: "/hosts", params: {} },
     { input: "/legion", route: "/hosts", params: {} },
     { input: "/admin", route: "/admin", params: {} },
@@ -134,6 +144,9 @@ describe("incoming spawn links", () => {
     expect(resolveIncomingLink("/onboarding?step=unknown")).toBeNull();
     expect(resolveIncomingLink("/hosts/not-a-uuid")).toBeNull();
     expect(resolveIncomingLink(`/hosts/${HOST_ID}/files?path=`)).toBeNull();
+    // A host page's tabs are the ones the browser addresses; nothing else is.
+    expect(resolveIncomingLink(`/hosts/${HOST_ID}/agents`)).toBeNull();
+    expect(resolveIncomingLink(`/hosts/${HOST_ID}/sessions/extra`)).toBeNull();
     expect(resolveIncomingLink("https://example.net/login")).toBeNull();
   });
 

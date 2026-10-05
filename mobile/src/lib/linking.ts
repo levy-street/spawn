@@ -230,6 +230,15 @@ export function resolveIncomingLink(input: string): ResolvedDeepLink | null {
         requiresAuth: true,
       });
     }
+    // The browser gives each of a host's tabs its own address; here they are
+    // one screen, so the tab rides along as `?tab=`.
+    if (segments.length === 3 && (segments[2] === "sessions" || segments[2] === "access")) {
+      const tab = segments[2];
+      return result("/host/[id]", withQuery(`/host/${id}`, { tab }), {
+        params: { id, tab },
+        requiresAuth: true,
+      });
+    }
     return null;
   }
   if (segments[0] === "w" && segments.length === 2 && validUuid(segments[1])) {

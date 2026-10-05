@@ -180,9 +180,9 @@ import { cn } from "@/lib/utils";
 /**
  * SPAWN D's file browser: one component, three layouts.
  *
- * - `page` — a host's Files: a toolbar (Back, Forward, Up, the path bar,
- *   the filter, the view switch, New, view options, the details pane), the
- *   Details view by default, and a status bar.
+ * - `page` — a host's Files: a toolbar (Previous and Next folder, the
+ *   enclosing folder, the path bar, the filter, the view switch, New, view
+ *   options, the details pane), the Details view by default, and a status bar.
  * - `pane` — a workspace's file explorer window: the dense tree by default,
  *   no toolbar of its own (the pane's header carries its actions, the filter
  *   and the sort), the rest on the background's context menu.
@@ -2034,12 +2034,15 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
           className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border px-2 py-1.5"
         >
           <div className="flex shrink-0 items-center">
+            {/* Named for the folders they walk, not "Back" and "Forward":
+                the page around the browser has a Back of its own, out of
+                the page, and a screen reader would hear two. */}
             <Button
               variant="ghost"
               size="icon"
               className="size-8"
-              aria-label="Back"
-              title="Back"
+              aria-label="Previous folder"
+              title="Previous folder"
               disabled={!history || !canGoBack(history)}
               onClick={() => stepHistory("back")}
             >
@@ -2049,8 +2052,8 @@ export const FileBrowser = forwardRef<FileBrowserHandle, FileBrowserProps>(funct
               variant="ghost"
               size="icon"
               className="size-8"
-              aria-label="Forward"
-              title="Forward"
+              aria-label="Next folder"
+              title="Next folder"
               disabled={!history || !canGoForward(history)}
               onClick={() => stepHistory("forward")}
             >

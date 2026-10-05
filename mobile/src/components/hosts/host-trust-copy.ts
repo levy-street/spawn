@@ -31,6 +31,12 @@ export const HOST_IDENTITY_CONFLICT_TITLE =
 export const HOST_IDENTITY_BLOCKED_REASON =
   "Connections to this host are blocked until it is removed and possessed again.";
 
+/**
+ * The host page's status line while that panel is up: blocked, not
+ * reconnecting, since no retry gets past it. The browser's says the same.
+ */
+export const HOST_IDENTITY_BLOCKED_STATUS = "Blocked · identity changed";
+
 /** What removing a host does, everywhere a host can be removed. */
 export const REMOVE_HOST_DESCRIPTION =
   "Its daemon token is revoked and SPAWN D stops connecting to it. Sessions already running there may keep running on that host.";

@@ -22,15 +22,14 @@ import {
   type CascadeMenuHandle,
   type CascadePanel,
 } from "@/components/ui/cascade-menu";
-import { type Agent, ApiError, agents, type Host, sessions, workspaces } from "@/lib/api";
+import { type Agent, ApiError, agents, type Host, workspaces } from "@/lib/api";
 import { autoPlace, type Rect } from "@/lib/grid";
 import { activeTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { createWindow } from "./create-window";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
-import { pendingLaunch } from "./pending-launch";
 import { useWherePanel } from "./where-picker";
-import { addPaneTiles, PENDING_TILE_ID } from "./workspace-grid-helpers";
+import { addPaneTiles } from "./workspace-grid-helpers";
 
 /** What the menu is about to add: a shell, an agent in a shell, or a widget. */
 type Choice = { kind: "shell" } | { kind: "agent"; agent: Agent } | { kind: "files" };
@@ -127,11 +126,6 @@ function useNewSessionChoices(
 
   const createM = useMutation({
     mutationFn: async ({ host, cwd, choice }: { host: Host; cwd: string; choice: Choice }) => {
-      // The conversation this agent starts under, chosen here so the window
-      // can record it and a restart can resume it; null for a CLI that names
-      // its own.
-      const conversation =
-        choice.kind === "agent" ? newAgentConversationId(choice.agent.kind) : null;
       // Whatever this makes room in is what `activeTab` reads below, so it has
       // to land on the server before anything else is fetched.
       undoRef.current = (await beforeCreate?.()) ?? null;
@@ -159,70 +153,21 @@ function useNewSessionChoices(
         });
         return { workspaceId: saved.id, sessionId: null };
       }
+      const agent = choice.kind === "agent" ? choice.agent : null;
       if (mode === "session") {
         if (!workspaceId) throw new Error("A workspace is required to create this session.");
-        // Without an explicit drop rect, the pane joins an even band rather
-        // than halving the biggest occupant. That reshapes the siblings too,
-        // so the layout has to land before the create — the server refuses a
-        // tile that overlaps what it still thinks is there.
-        let tile = placement;
-        if (!tile) {
-          const current = await workspaces.get(workspaceId);
-          const tab = activeTab(current.layout);
-          const placed = addPaneTiles(tab.layout.tiles, PENDING_TILE_ID);
-          if (!placed) throw new ApiError(409, "workspace_full", "workspace_full");
-          const landed = placed.find((item) => item.session_id === PENDING_TILE_ID);
-          if (landed) {
-            tile = { x: landed.x, y: landed.y, w: landed.w, h: landed.h };
-            await workspaces.update(workspaceId, {
-              layout: withTabTiles(
-                current.layout,
-                tab.id,
-                placed.filter((item) => item.session_id !== PENDING_TILE_ID),
-              ),
-            });
-          }
-        }
-        const session = await sessions.create({
-          host_id: host.id,
+        // Without an explicit drop rect, the window joins the active tab's
+        // band (createWindow makes the room).
+        const created = await createWindow({
+          host,
           cwd,
-          // The window is a shell that an agent is about to be typed into;
-          // recording which one is what makes it that kind of window, so a
-          // duplicate of it opens as one too — and which conversation it is
-          // starting, so a restart can bring it back to it.
-          ...(choice.kind === "agent" && {
-            agent_id: choice.agent.id,
-            agent_session_id: conversation,
-          }),
-          workspace_id: workspaceId,
-          tile,
+          agent,
+          workspace: { id: workspaceId, tile: placement },
         });
-        if (choice.kind === "agent")
-          pendingLaunch.set(
-            session.id,
-            session.host_id,
-            agentLaunchCommand(choice.agent, conversation),
-          );
-        return { workspaceId, sessionId: session.id };
+        return { workspaceId, sessionId: created.session.id };
       }
-      const result = await workspaces.create({
-        first_session: {
-          host_id: host.id,
-          cwd,
-          ...(choice.kind === "agent" && {
-            agent_id: choice.agent.id,
-            agent_session_id: conversation,
-          }),
-        },
-      });
-      if (!result.session) throw new Error("The workspace was created without its first session.");
-      if (choice.kind === "agent")
-        pendingLaunch.set(
-          result.session.id,
-          result.session.host_id,
-          agentLaunchCommand(choice.agent, conversation),
-        );
-      return { workspaceId: result.workspace.id, sessionId: result.session.id };
+      const created = await createWindow({ host, cwd, agent, workspace: { new: true } });
+      return { workspaceId: created.workspaceId as string, sessionId: created.session.id };
     },
     onSuccess: (result) => {
       undoRef.current = null;

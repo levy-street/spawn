@@ -52,6 +52,10 @@ export const WorkspaceLayoutV3Schema = z.object({
 export const WorkspaceFirstSessionSchema = z.object({
   host_id: UUIDSchema,
   cwd: z.string(),
+  /** The agent the first window opens as, and the conversation it starts —
+   *  the same two fields `POST /api/sessions` takes. */
+  agent_id: UUIDSchema.nullable().optional(),
+  agent_session_id: z.string().max(64).nullable().optional(),
   skill_ids: z.array(UUIDSchema).nullable().optional(),
 });
 export const WorkspaceCreateSchema = WorkspaceIconPatchSchema.extend({

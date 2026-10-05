@@ -1,19 +1,26 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { AlertCircle, CheckCircle2, RefreshCw, X } from "lucide-react";
+import { AlertCircle, CheckCircle2, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, type Host, type HostAgentStatus, hosts } from "@/lib/api";
 
+/**
+ * Which agents a host has, when asked. Checking runs `which` on the host
+ * through the server (`host.agents.check`), so it runs when somebody presses
+ * "Check agents" or "Check again" — never every minute a page happens to be
+ * open, and never on its own when the fleet changes — and an answer already
+ * in hand (a pane's agent switcher asked earlier) is shown as is.
+ */
 export function HostAgentsPanel({ host }: { host: Host }) {
   const agentsQ = useQuery({
     queryKey: ["host-agents", host.id],
     queryFn: () => hosts.agents(host.id),
-    enabled: host.status === "online",
+    // Never on its own: only `refetch` below asks.
+    enabled: false,
     staleTime: 30_000,
-    refetchInterval: 60_000,
   });
   if (host.status !== "online") {
     return (
@@ -28,6 +35,7 @@ export function HostAgentsPanel({ host }: { host: Host }) {
   }
 
   const definitions = agentsQ.data?.agents ?? [];
+  const checked = agentsQ.data !== undefined;
 
   return (
     <section
@@ -39,15 +47,13 @@ export function HostAgentsPanel({ host }: { host: Host }) {
           Agent availability
         </h2>
         <Button
-          variant="ghost"
-          size="icon"
-          className="size-7"
-          aria-label={`Refresh agents for ${host.name}`}
-          title="Refresh"
+          variant="outline"
+          size="sm"
+          className="h-7 px-2.5 text-xs"
           onClick={() => agentsQ.refetch()}
           disabled={agentsQ.isFetching}
         >
-          <RefreshCw className={`size-3.5 ${agentsQ.isFetching ? "animate-spin" : ""}`} />
+          {agentsQ.isFetching ? "Checking…" : checked ? "Check again" : "Check agents"}
         </Button>
       </div>
 
@@ -56,7 +62,12 @@ export function HostAgentsPanel({ host }: { host: Host }) {
         trusted terminal on this host.
       </p>
 
-      {agentsQ.isLoading && (
+      {!checked && !agentsQ.isFetching && !agentsQ.error && (
+        <p className="px-4 py-3 text-sm text-muted-foreground">
+          Check to see which agents are installed on {host.name}.
+        </p>
+      )}
+      {!checked && agentsQ.isFetching && (
         <div className="space-y-3 p-4">
           <Skeleton className="h-5 w-2/3" />
           <Skeleton className="h-5 w-1/2" />
@@ -67,8 +78,8 @@ export function HostAgentsPanel({ host }: { host: Host }) {
           {agentsQ.error instanceof ApiError ? agentsQ.error.message : String(agentsQ.error)}
         </div>
       )}
-      {!agentsQ.isLoading && !agentsQ.error && definitions.length === 0 && (
-        <div className="px-4 py-3 text-sm text-muted-foreground">No agents defined.</div>
+      {checked && !agentsQ.error && definitions.length === 0 && (
+        <div className="px-4 py-3 text-sm text-muted-foreground">No agents are defined.</div>
       )}
 
       {definitions.length > 0 && (

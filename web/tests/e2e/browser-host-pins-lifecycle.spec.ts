@@ -322,6 +322,12 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
   await expect(panel).toContainText("identity changed");
   await expect(panel).toContainText("spawnd possess");
   await expect(panel.getByRole("button")).toHaveText(/Remove this host/u);
+  // The line under the host's name agrees with the panel: blocked, not
+  // reconnecting, and with no Retry, which could never get through.
+  const hostPage = page.getByRole("main");
+  await expect(hostPage.getByText("Blocked · identity changed", { exact: true })).toBeVisible();
+  await expect(hostPage.getByText("Reconnecting…")).toHaveCount(0);
+  await expect(hostPage.getByRole("button", { name: /^Retry connection/u })).toHaveCount(0);
   // The explorer would only meet the same refusal, so Files shuts and says
   // why, in the words the phone uses (mobile host-trust-copy.ts).
   await expect(page.getByRole("link", { name: "Files", exact: true })).toHaveCount(0);

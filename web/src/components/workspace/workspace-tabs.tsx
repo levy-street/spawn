@@ -45,7 +45,6 @@ import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialo
 import {
   ApiError,
   agents,
-  sessionAccess,
   sessions,
   type Workspace,
   workspaces,
@@ -53,7 +52,6 @@ import {
 } from "@/lib/api";
 import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE, isFilesWidget } from "@/lib/grid";
-import { sessionAgent } from "@/lib/sessions";
 import {
   addTab,
   allTiles,
@@ -78,10 +76,9 @@ import {
   workspaceFolder,
   workspaceLiveSessionCount,
 } from "@/lib/workspaces";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { duplicateWindow } from "./create-window";
 import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
-import { pendingLaunch } from "./pending-launch";
 import { type SplitChrome, SplitWorkspaceMenu, UnsplitButton } from "./split-chrome";
 import { type MergeDrop, type MergeRefusal, planMerge, WHOLE_CANVAS } from "./tab-merge";
 import { dockZoneAt, freeRects, wantsDuplicate } from "./workspace-grid-helpers";
@@ -960,20 +957,9 @@ export function WorkspaceTabs({
           }
           const source = sessionsById.get(tile.session_id);
           if (!source) continue; // a tile whose session is already gone
-          const access = await sessionAccess.get(source.id).catch(() => null);
-          const skillIds = access?.skills.map((skill) => skill.id) ?? [];
-          const agent = sessionAgent(source, definitions);
-          const conversation = agent ? newAgentConversationId(agent.kind) : null;
-          const copy = await sessions.create({
-            host_id: source.host_id,
-            cwd: source.cwd,
-            ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
-            ...(skillIds.length > 0 && { skill_ids: skillIds }),
-          });
+          const { session: copy } = await duplicateWindow(source, definitions);
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
-          if (agent)
-            pendingLaunch.set(copy.id, copy.host_id, agentLaunchCommand(agent, conversation));
         }
         const next = duplicateTab(
           layout,

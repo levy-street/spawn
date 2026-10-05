@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { randomUUID } from "expo-crypto";
 import { useCallback } from "react";
 import { restartSessionAgent } from "@/components/launcher/agent-restart";
+import { createWindow } from "@/components/launcher/create-window";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
 import { moveWindowError } from "@/components/workspace-detail/move-window";
 
@@ -257,21 +258,27 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       if (!session) throw new Error("Session unavailable.");
       const access = await getSessionAccess(session.id);
       const agent = sessionAgent(session, agents);
-      // A copy is the same kind of window in a conversation of its own.
-      const conversation = agent ? newAgentConversationId(agent.kind, randomUUID) : null;
-      const duplicate = await createSession({
-        host_id: session.host_id,
-        cwd: session.cwd,
-        name: session.name,
-        // The copy is the same kind of window as its source — a Hermes window
-        // duplicates as a Hermes window — whatever process happens to hold the
-        // source's foreground right now.
-        ...(agent ? { agent_id: agent.id, agent_session_id: conversation } : {}),
-        skill_ids: access.skills.map((skill) => skill.id),
-      });
+      // The copy is the same kind of window as its source — a Hermes window
+      // duplicates as a Hermes window — whatever process happens to hold the
+      // source's foreground right now, in a conversation of its own. It is
+      // made on its own and placed beside its source below.
+      const opened = await createWindow(
+        {
+          host: { id: session.host_id },
+          cwd: session.cwd,
+          name: session.name,
+          ...(agent ? { agent } : {}),
+          skillIds: access.skills.map((skill) => skill.id),
+        },
+        { createSession, newId: randomUUID, pending: pendingLaunches },
+      );
+      const duplicate = opened.session;
+      // A copy that never lands in the layout is removed with its queued command.
+      const discard = () =>
+        Promise.allSettled([pendingLaunches.clear(duplicate.id), deleteSession(duplicate.id)]);
       const layout = addTile(sourceTab.layout, { session_id: duplicate.id });
       if (!layout) {
-        await deleteSession(duplicate.id);
+        await discard();
         throw new Error("This tab is full — close a window before duplicating another.");
       }
       let saved: Workspace;
@@ -281,24 +288,15 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
           replaceTabLayout(workspace, sourceTab.id, { ...sourceTab, layout }),
         );
       } catch (error) {
-        await deleteSession(duplicate.id).catch(() => undefined);
+        await discard();
         throw error;
       }
-      if (agent) {
-        try {
-          await pendingLaunches.persist(
-            duplicate.id,
-            duplicate.host_id,
-            agentLaunchCommand(agent, conversation),
-          );
-        } catch {
-          await invalidateSessions();
-          throw new Error(
-            "The session was duplicated as a shell, but the agent command could not be saved.",
-          );
-        }
-      }
       await invalidateSessions();
+      if (opened.status === "created_unqueued") {
+        throw new Error(
+          "The session was duplicated as a shell, but the agent command could not be saved.",
+        );
+      }
       return saved;
     },
     flushReorders: () => reorder.flush(),

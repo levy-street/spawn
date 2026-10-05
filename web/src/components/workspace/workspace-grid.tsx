@@ -23,7 +23,6 @@ import {
   agents as agentsApi,
   type Host,
   type Session,
-  sessionAccess,
   sessions as sessionsApi,
   type Workspace,
   workspaces,
@@ -56,11 +55,10 @@ import {
   withTabTiles,
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { duplicateWindow } from "./create-window";
 import { moveWindow, moveWindowConfirmation, moveWindowError } from "./move-window";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
-import { pendingLaunch } from "./pending-launch";
 import { type PaneSlotTarget, SessionPane } from "./session-pane";
 import { WidgetPane, widgetTitle } from "./widget-pane";
 import {
@@ -651,30 +649,15 @@ export function WorkspaceGrid({
       const session = sessionsById.get(sourceId);
       if (!session) return;
       try {
-        // Skills are read at launch, so they have to travel with the create
-        // call rather than being patched on afterwards.
-        const access = await sessionAccess.get(sourceId).catch(() => null);
-        const skillIds = access?.skills.map((skill) => skill.id) ?? [];
         // Awaited rather than read from the hook: a duplicate fired before
         // the registry query settles would silently copy an agent pane as a
         // bare shell. Failure falls back to the empty list it used to read.
         const definitions = await queryClient
           .ensureQueryData({ queryKey: ["agents"], queryFn: agentsApi.list })
           .catch(() => []);
-        // The copy is created as the same type of window, so it is one even
-        // before its agent has taken the foreground — and stays one if the
-        // agent is later quit.
-        const agent = sessionAgent(session, definitions);
-        // A copy is the same kind of window in a conversation of its own.
-        const conversation = agent ? newAgentConversationId(agent.kind) : null;
-        const created = await sessionsApi.create({
-          host_id: session.host_id,
-          cwd: session.cwd,
-          ...(agent && { agent_id: agent.id, agent_session_id: conversation }),
-          ...(skillIds.length > 0 && { skill_ids: skillIds }),
-        });
-        if (agent)
-          pendingLaunch.set(created.id, created.host_id, agentLaunchCommand(agent, conversation));
+        // The same kind of window with the same skills, in a conversation of
+        // its own, landed by this grid rather than by the server.
+        const { session: created } = await duplicateWindow(session, definitions);
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});
           throw new Error("This tab is full — close a window before duplicating another.");
