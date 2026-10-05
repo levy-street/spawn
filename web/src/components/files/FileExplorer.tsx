@@ -12,6 +12,8 @@ export type FileExplorerHandle = {
   upload: () => void;
   refresh: () => void;
   collapseAll: () => void;
+  /** Opens the filter row (as Ctrl/⌘+F does) and puts the keyboard in it. */
+  focusFilter: () => void;
 };
 
 /**
@@ -49,6 +51,7 @@ export const FileExplorer = forwardRef<
       upload: () => browserRef.current?.upload(),
       refresh: () => browserRef.current?.refresh(),
       collapseAll: () => browserRef.current?.collapseAll(),
+      focusFilter: () => browserRef.current?.focusFilter(),
     }),
     [],
   );

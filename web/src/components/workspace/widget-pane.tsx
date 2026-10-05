@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import {
+  ArrowUpDown,
   ChevronDown,
   ChevronsDownUp,
   Copy,
@@ -9,6 +10,7 @@ import {
   Folder,
   FolderPlus,
   RefreshCw,
+  Search,
   Shapes,
   Trash2,
   Upload,
@@ -16,12 +18,15 @@ import {
 } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, useRef, useState } from "react";
 import { FileExplorer, type FileExplorerHandle } from "@/components/files/FileExplorer";
+import { SortMenuItems } from "@/components/files/sort-menu";
+import { useFilePrefs } from "@/components/files/use-file-prefs";
 import {
   DropdownMenu,
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { hosts } from "@/lib/api";
+import { FILTER_PLACEHOLDER } from "@/lib/files/copy";
 import { type FilesTileWidget, isFilesWidget, type Tile, type TileWidget } from "@/lib/grid";
 import { basename } from "@/lib/paths";
 import { cn } from "@/lib/utils";
@@ -88,6 +93,9 @@ function FilesWidgetPane({
   const explorerRef = useRef<FileExplorerHandle>(null);
   const folderChipRef = useRef<HTMLButtonElement>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // The device's sort, the one every file browser here reads: changed from
+  // this header, the explorer below follows it.
+  const { sort, setSort } = useFilePrefs("pane");
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const paneHost = (hostsQ.data ?? []).find((host) => host.id === widget.host_id) ?? null;
   return (
@@ -141,6 +149,37 @@ function FilesWidgetPane({
           </span>
           {onChangePath && <ChevronDown className="size-3 shrink-0" aria-hidden />}
         </button>
+        {/* Finding and ordering what is in the folder, in sight rather than
+            only behind Ctrl/⌘+F and the Details view's column headers: the
+            same filter and the same sort as the host's Files page. One
+            cluster, apart from the window's own ⋯ and close. */}
+        <div className="flex shrink-0 items-center">
+          <button
+            type="button"
+            aria-label={FILTER_PLACEHOLDER}
+            title={FILTER_PLACEHOLDER}
+            onClick={() => explorerRef.current?.focusFilter()}
+            className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <Search className="size-3.5" aria-hidden />
+          </button>
+          <DropdownMenu
+            align="end"
+            renderTrigger={(props) => (
+              <button
+                {...props}
+                type="button"
+                aria-label="Sort"
+                title="Sort"
+                className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground aria-expanded:bg-accent aria-expanded:text-foreground"
+              >
+                <ArrowUpDown className="size-3.5" aria-hidden />
+              </button>
+            )}
+          >
+            <SortMenuItems sort={sort} onSort={setSort} />
+          </DropdownMenu>
+        </div>
         <DropdownMenu
           align="end"
           renderTrigger={(props) => (
