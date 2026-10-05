@@ -17,10 +17,31 @@ import {
   type WorkerToNativeMessage,
 } from "@/terminal/transport/bridge";
 import {
+  CARRIED_AGENT,
   CONVERSATION_CAPABILITY,
+  CONVERSATION_CARRIER_CAPABILITY,
+  CONVERSATION_EXPORT_OP,
+  CONVERSATION_IMPORT_BEGIN_OP,
+  CONVERSATION_IMPORT_CANCEL_OP,
+  CONVERSATION_IMPORT_STATUS_OP,
   CONVERSATION_INSPECT_OP,
+  CONVERSATION_PROBE_OP,
+  CONVERSATION_RETIRE_ABORT_OP,
+  CONVERSATION_RETIRE_COMMIT_OP,
+  CONVERSATION_STREAM_WINDOW,
+  CONVERSATION_TRANSFERS_OP,
   type ConversationInspection,
+  type ConversationProbe,
+  type ConversationTransferStatus,
+  type ConversationTransfers,
+  parseConversationExport,
+  parseConversationImportOpened,
   parseConversationInspection,
+  parseConversationProbe,
+  parseConversationTransferStatus,
+  parseConversationTransfers,
+  parseRetireAnswer,
+  type RetireAnswer,
 } from "@/terminal/transport/conversation-codec";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 import { verifyDaemonHost } from "@/terminal/transport/daemon-trust";
@@ -58,6 +79,10 @@ import type {
   AgentTranscriptQuery,
   AgentTranscriptReport,
   ConnectionInfo,
+  ConversationExportRequest,
+  ConversationExportStream,
+  ConversationImportRequest,
+  ConversationImportStream,
   HostCapabilities,
   HostFileSource,
   HostPreviewFile,
@@ -90,6 +115,9 @@ import { terminalDark, terminalMetrics } from "@/theme";
 const MAX_PENDING_REQUESTS = 32;
 const REQUEST_TIMEOUT_MS = 15_000;
 const PREVIEW_REQUEST_TIMEOUT_MS = 35_000;
+/** A conversation's control operations may wait on its transfer's lock
+ *  while a commit verifies and extracts. */
+const CONVERSATION_REQUEST_TIMEOUT_MS = 30_000;
 const HOST_HELLO_BRIDGE_ID = "$host.hello";
 const HOST_STREAM_BRIDGE_PREFIX = "$host.stream:";
 const STREAM_COMMAND_PREFIX = "$host.stream.";
@@ -692,6 +720,193 @@ class WebViewHostTransport implements StreamingHostTransport {
       options,
     );
     return parseConversationInspection(response);
+  }
+
+  /** The target's facts before a move (`conv.probe`, gated on `conv.v2`). */
+  async conversationProbe(
+    request: { conversationId?: string | null; cwd: string },
+    options: HostRequestOptions = {},
+  ): Promise<ConversationProbe> {
+    this.#requireCapability(CONVERSATION_CARRIER_CAPABILITY);
+    const conversationId = canonicalConversationId(request.conversationId);
+    const response = await this.request<unknown>(
+      CONVERSATION_PROBE_OP,
+      {
+        agent: CARRIED_AGENT,
+        cwd: request.cwd,
+        ...(conversationId ? { conversation_id: conversationId } : {}),
+      },
+      { ...options, timeoutMs: options.timeoutMs ?? CONVERSATION_REQUEST_TIMEOUT_MS },
+    );
+    return parseConversationProbe(response);
+  }
+
+  /** The window the read asks for: the host's maximum, at most 16 (S4). */
+  #conversationWindow(): number {
+    const max = this.#capabilities?.limits.streamWindowMax ?? CONVERSATION_STREAM_WINDOW;
+    return Math.max(1, Math.min(CONVERSATION_STREAM_WINDOW, max));
+  }
+
+  /**
+   * Retire a conversation out of this host and read its bundle
+   * (`conv.export`). The host stops the window and every Claude of it,
+   * confirms they are gone and takes the files out of Claude Code's lookup
+   * path before it answers; repeated with the same transfer id and a
+   * `fromSequence`, it serves the same bytes from there.
+   */
+  async conversationExport(
+    request: ConversationExportRequest,
+    options: HostRequestOptions = {},
+  ): Promise<ConversationExportStream> {
+    this.#requireCapability(CONVERSATION_CARRIER_CAPABILITY);
+    const opening: StreamOpening = { onChannel: false };
+    this.#streams.openingV2();
+    try {
+      const response = await this.#request<unknown>(
+        CONVERSATION_EXPORT_OP,
+        {
+          transfer_id: request.transferId,
+          agent: CARRIED_AGENT,
+          conversation_id: request.conversationId,
+          mode: "retire",
+          session_id: request.sessionId,
+          to_host_id: request.toHostId,
+          ...(request.cwd ? { cwd: request.cwd } : {}),
+          stream: { window: this.#conversationWindow(), digest: "end" },
+          from_sequence: request.fromSequence,
+        },
+        { ...options, timeoutMs: options.timeoutMs ?? this.#streamTimeout },
+        opening,
+      );
+      const declaration = parseConversationExport(response);
+      if (declaration.transferId !== request.transferId) {
+        throw new HostControlTransportError("invalid_response", "Host answered another transfer.");
+      }
+      // Registered in the response's own continuation: its chunks follow it.
+      const reader = this.#streams.beginReadV2(declaration.streamId, {
+        length: declaration.length,
+        nextSequence: declaration.nextSequence,
+        window: declaration.window,
+      });
+      return { declaration, reader };
+    } finally {
+      // After the replay of early frames the registration queued.
+      queueMicrotask(() => this.#streams.openingV2Settled());
+      this.#releaseOpening(opening);
+    }
+  }
+
+  /** Stage a carried conversation on this host (`conv.import.begin`);
+   *  repeated with the same declaration, it resumes where the staging ends. */
+  async conversationImport(
+    request: ConversationImportRequest,
+    options: HostRequestOptions = {},
+  ): Promise<ConversationImportStream> {
+    this.#requireCapability(CONVERSATION_CARRIER_CAPABILITY);
+    const opening: StreamOpening = { onChannel: false };
+    this.#streams.openingV2();
+    try {
+      const response = await this.#request<unknown>(
+        CONVERSATION_IMPORT_BEGIN_OP,
+        {
+          transfer_id: request.transferId,
+          agent: CARRIED_AGENT,
+          conversation_id: request.conversationId,
+          mode: "retire",
+          cwd: request.cwd,
+          length: request.length,
+          sha256: request.sha256,
+          stream: {
+            window: this.#conversationWindow(),
+            digest: request.sha256 === null ? "end" : "start",
+          },
+          from_host_id: request.fromHostId,
+        },
+        { ...options, timeoutMs: options.timeoutMs ?? this.#streamTimeout },
+        opening,
+      );
+      const opened = parseConversationImportOpened(response);
+      const writer = this.#streams.beginWriteV2(opened.streamId, {
+        window: opened.window,
+        nextSequence: opened.nextSequence,
+      });
+      return { opened, writer };
+    } finally {
+      queueMicrotask(() => this.#streams.openingV2Settled());
+      this.#releaseOpening(opening);
+    }
+  }
+
+  async conversationImportStatus(
+    transferId: string,
+    options: HostRequestOptions = {},
+  ): Promise<ConversationTransferStatus> {
+    return parseConversationTransferStatus(
+      await this.#conversationRequest(
+        CONVERSATION_IMPORT_STATUS_OP,
+        { transfer_id: transferId },
+        options,
+      ),
+    );
+  }
+
+  /** Once it answers, the import can never commit; a committed one says so
+   *  (`transfer_committed`). */
+  async conversationImportCancel(
+    transferId: string,
+    options: HostRequestOptions = {},
+  ): Promise<ConversationTransferStatus> {
+    return parseConversationTransferStatus(
+      await this.#conversationRequest(
+        CONVERSATION_IMPORT_CANCEL_OP,
+        { transfer_id: transferId },
+        options,
+      ),
+    );
+  }
+
+  async conversationRetireCommit(
+    request: { transferId: string; length: number; sha256: string },
+    options: HostRequestOptions = {},
+  ): Promise<RetireAnswer> {
+    return parseRetireAnswer(
+      await this.#conversationRequest(
+        CONVERSATION_RETIRE_COMMIT_OP,
+        { transfer_id: request.transferId, length: request.length, sha256: request.sha256 },
+        options,
+      ),
+    );
+  }
+
+  async conversationRetireAbort(
+    transferId: string,
+    options: HostRequestOptions = {},
+  ): Promise<RetireAnswer> {
+    return parseRetireAnswer(
+      await this.#conversationRequest(
+        CONVERSATION_RETIRE_ABORT_OP,
+        { transfer_id: transferId },
+        options,
+      ),
+    );
+  }
+
+  async conversationTransfers(options: HostRequestOptions = {}): Promise<ConversationTransfers> {
+    return parseConversationTransfers(
+      await this.#conversationRequest(CONVERSATION_TRANSFERS_OP, {}, options),
+    );
+  }
+
+  #conversationRequest(
+    operation: string,
+    payload: Record<string, unknown>,
+    options: HostRequestOptions,
+  ): Promise<unknown> {
+    this.#requireCapability(CONVERSATION_CARRIER_CAPABILITY);
+    return this.request<unknown>(operation, payload, {
+      ...options,
+      timeoutMs: options.timeoutMs ?? CONVERSATION_REQUEST_TIMEOUT_MS,
+    });
   }
 
   async readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile> {

@@ -34,10 +34,25 @@ import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
 import { restartSessionAgent } from "@/components/workspace/agent-restart";
 import { AgentSwitcher } from "@/components/workspace/agent-switcher";
+import {
+  MoveNoteBanner,
+  MoveProgressOverlay,
+  MovingElsewhereOverlay,
+  moveCoversPane,
+  ResumingGuard,
+} from "@/components/workspace/move-overlay";
+import { MoveResolveDialog } from "@/components/workspace/move-resolve-dialog";
+import {
+  useDismissWhenResolved,
+  useMoveFor,
+  useMoves,
+} from "@/components/workspace/moves-provider";
+import { useMoveNoteDelivery } from "@/components/workspace/use-move-note";
 import { usePendingLaunchDrain } from "@/hooks/usePendingLaunchDrain";
 import {
   ApiError,
   agents as agentsApi,
+  hosts,
   type Session,
   sessions,
   type Workspace,
@@ -46,7 +61,7 @@ import {
 import { cachedListItem } from "@/lib/cached-list-item";
 import { askWindowHost } from "@/lib/conversation-inspect";
 import { remove as removeTile } from "@/lib/grid";
-import { sessionAtShell, sessionTitle } from "@/lib/sessions";
+import { sessionAtShell, sessionMoving, sessionTitle } from "@/lib/sessions";
 import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 
@@ -75,7 +90,12 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [draftName, setDraftName] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const { attach, getHandle, connInfo, displayState, agentNotice } = useLiveTerminal(sessionId);
+  const { attach, getHandle, connInfo, displayState, agentNotice, agentScreen } =
+    useLiveTerminal(sessionId);
+  const moves = useMoves();
+  const move = useMoveFor(sessionId);
+  const covering = moveCoversPane(move) ? move : null;
+  const [resolveOpen, setResolveOpen] = useState(false);
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -97,6 +117,11 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   );
   const session = sessionQ.data;
   const daemonConnection = useDaemonConnection(session?.host_id ?? null);
+  const moving = session ? sessionMoving(session) : false;
+  // A card saying the window stays "Moving" goes once it is resolved underneath.
+  useDismissWhenResolved(covering, moving);
+  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
+  const sessionHost = hostsQ.data?.find((host) => host.id === session?.host_id) ?? null;
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -158,6 +183,14 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   // shell's transport opens — the same drain, behind the same gate, the
   // workspace pane runs, so a restart from this page lands the agent back too.
   usePendingLaunchDrain({ sessionId, session, connInfo, displayState, getHandle });
+  const moveNote = useMoveNoteDelivery({
+    sessionId,
+    session,
+    connInfo,
+    displayState,
+    getHandle,
+    agentScreen,
+  });
   const removeFromWorkspaceM = useMutation({
     mutationFn: (workspace: Workspace) =>
       workspaces.update(workspace.id, {
@@ -335,10 +368,12 @@ export function SessionView({ sessionId }: { sessionId: string }) {
             <Pencil className="size-4" aria-hidden />
             Rename
           </DropdownMenuItem>
-          <DropdownMenuItem disabled={restartM.isPending} onSelect={() => restartM.mutate()}>
-            <RotateCcw className="size-4" aria-hidden />
-            Restart
-          </DropdownMenuItem>
+          {!moving && (
+            <DropdownMenuItem disabled={restartM.isPending} onSelect={() => restartM.mutate()}>
+              <RotateCcw className="size-4" aria-hidden />
+              Restart
+            </DropdownMenuItem>
+          )}
           {/* The agent's own record of the conversation, read from the host.
               A shell window has none, so the row waits for an agent. */}
           {(session.agent_id || !sessionAtShell(session)) && (
@@ -356,12 +391,23 @@ export function SessionView({ sessionId }: { sessionId: string }) {
               Remove from workspace
             </DropdownMenuItem>
           )}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem destructive disabled={closeM.isPending} onSelect={closeSession}>
-            <Trash2 className="size-4" aria-hidden />
-            Close session
-          </DropdownMenuItem>
+          {!moving && <DropdownMenuSeparator />}
+          {!moving && (
+            <DropdownMenuItem destructive disabled={closeM.isPending} onSelect={closeSession}>
+              <Trash2 className="size-4" aria-hidden />
+              Close session
+            </DropdownMenuItem>
+          )}
         </DropdownMenu>
+        {sessionHost && (
+          <MoveResolveDialog
+            open={resolveOpen}
+            onOpenChange={setResolveOpen}
+            session={session}
+            source={sessionHost}
+            targetCwd={move?.targetCwd ?? null}
+          />
+        )}
         <SessionTranscriptsDialog
           open={transcriptsOpen}
           session={session}
@@ -381,6 +427,26 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       <div className="flex min-h-0 flex-1">
         <div className="relative min-h-0 min-w-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
+          {covering ? (
+            <MoveProgressOverlay
+              move={covering}
+              onControl={(action) => moves?.control(covering.transferId, action)}
+              onDismiss={() => moves?.dismiss(covering.transferId)}
+              // Starting afresh, or again, is the workspace's to place.
+              onStartFresh={() => moves?.dismiss(covering.transferId)}
+              onTryAgain={() => moves?.dismiss(covering.transferId)}
+              onResolve={() => setResolveOpen(true)}
+            />
+          ) : (
+            moving && (
+              <MovingElsewhereOverlay
+                target={move?.targetName ?? null}
+                onResolve={() => setResolveOpen(true)}
+              />
+            )
+          )}
+          {moveNote.guard && !moving && <ResumingGuard onUseTerminal={moveNote.useTerminalNow} />}
+          {!moving && <MoveNoteBanner state={moveNote} />}
           {agentNotice === "update_installed" &&
             session.status === "running" &&
             !sessionAtShell(session) && (

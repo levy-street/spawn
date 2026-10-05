@@ -3,6 +3,8 @@ import { chunkPtyInput } from "@/terminal/transport/ctl-codec";
 import type { TransportState } from "@/terminal/transport/types";
 
 const COMMAND_TERMINATOR = "\r";
+/** How soon a provisional record is asked about again. */
+export const PROVISIONAL_RECHECK_MS = 500;
 
 export type PendingSessionLife = "alive" | "dead" | "unknown";
 
@@ -49,7 +51,7 @@ export interface PendingLaunchDeliveryOptions {
 }
 
 function resultForRead(
-  read: Exclude<PendingLaunchRead, { status: "ready" }>,
+  read: Exclude<PendingLaunchRead, { status: "ready" } | { status: "provisional" }>,
 ): PendingLaunchDeliveryResult {
   if (read.status === "missing") return { status: "missing" };
   if (read.status === "stale") return { status: "stale" };
@@ -78,6 +80,7 @@ export function observePendingLaunchDelivery({
   let disposed = false;
   let settled = false;
   let operation: Promise<void> | null = null;
+  let recheck: ReturnType<typeof setTimeout> | null = null;
 
   const finish = (result: PendingLaunchDeliveryResult): void => {
     settled = true;
@@ -108,7 +111,7 @@ export function observePendingLaunchDelivery({
   const canType = (): boolean => transport.state === "ready" && transport.displayOwner !== false;
 
   const deliver = (): void => {
-    if (settled || operation || !canType()) return;
+    if (settled || operation || recheck || !canType()) return;
     operation = (async () => {
       let read: PendingLaunchRead;
       try {
@@ -118,6 +121,19 @@ export function observePendingLaunchDelivery({
         return;
       }
 
+      if (read.status === "provisional") {
+        // Queued ahead of the commit that makes this incarnation: typed only
+        // once that commit has answered, so asked again until it is
+        // confirmed, discarded, or lapses.
+        operation = null;
+        if (!disposed) {
+          recheck = setTimeout(() => {
+            recheck = null;
+            deliver();
+          }, PROVISIONAL_RECHECK_MS);
+        }
+        return;
+      }
       if (read.status !== "ready") {
         finish(resultForRead(read));
         return;
@@ -168,6 +184,7 @@ export function observePendingLaunchDelivery({
 
   return () => {
     disposed = true;
+    if (recheck) clearTimeout(recheck);
     unsubscribe();
     unsubscribeDisplay();
   };

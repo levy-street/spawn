@@ -3,8 +3,9 @@
  * that host's daemon advertises — never by its OS, and never by the server.
  *
  * Every later surface of the host page registers here, once: a remote
- * desktop (a tab of its own), and the conversations a host keeps, its Claude
- * accounts and its boxes (sections of Overview).
+ * desktop (a tab of its own), and the conversations a host keeps, the moves
+ * it holds that did not finish, its Claude accounts and its boxes (sections
+ * of Overview).
  * Each waits on one versioned capability family (`screen.v1`, not a list of
  * ops), so a daemon's hello stays a short list however much it learns. A slot
  * is lit only when both halves are true: the host advertises its family, and
@@ -18,13 +19,14 @@
  * tab. A family name fixes its set of operations, so a slot waits on the
  * version that brings what it draws.
  *
- * The phone keeps the same registry: the same slots, waiting on the same
- * families.
+ * The phone keeps the same registry: the same slots, with the same ids and
+ * labels, waiting on the same families
+ * (`mobile/src/data/selectors/host-offers.ts`).
  *
  * Pure and DOM-free.
  */
 
-export type HostOfferSlotId = "desktop" | "conversations" | "claude-accounts" | "boxes";
+export type HostOfferSlotId = "desktop" | "conversations" | "moves" | "claude-accounts" | "boxes";
 
 /**
  * "tab": a destination of its own, entered from the section row (the remote
@@ -64,6 +66,14 @@ export const HOST_OFFER_SLOTS: readonly HostOfferSlot[] = [
     capability: "conv.v2",
     label: "Conversations",
   },
+  // Moves that did not finish, as the host keeps them (`conv.transfers`),
+  // each resolvable from here whoever started it. Draws nothing when none.
+  {
+    id: "moves",
+    placement: "overview",
+    capability: "conv.v2",
+    label: "Unfinished moves",
+  },
   {
     id: "claude-accounts",
     placement: "overview",
@@ -74,10 +84,12 @@ export const HOST_OFFER_SLOTS: readonly HostOfferSlot[] = [
 ];
 
 /**
- * The slots this build can draw. Empty: the registry ships before any of its
- * tenants, and a slot joins this set in the same change that adds its view.
+ * The slots this build can draw. A slot joins this set in the same change
+ * that adds its view; the registry ships before the rest of its tenants.
  */
-export const SHIPPED_HOST_OFFERS: ReadonlySet<HostOfferSlotId> = new Set();
+export const SHIPPED_HOST_OFFERS: ReadonlySet<HostOfferSlotId> = new Set<HostOfferSlotId>([
+  "moves",
+]);
 
 export interface HostOffers {
   /** Extra tabs, in order, between Sessions and Access. */

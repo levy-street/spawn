@@ -72,6 +72,60 @@ describe("workspace action sheets", () => {
     });
   });
 
+  it("offers a window that is moving to another host Resolve, and nothing that acts on it", async () => {
+    const session = makeSession({ status: "moving", activity_state: "moving" });
+    const tile: Tile = { session_id: session.id, x: 0, y: 0, w: 24, h: 24 };
+    const workspace = makeWorkspace([makeTab("main", [tile]), makeTab("tests")]);
+    const onResolve = jest.fn();
+    await render(
+      <PaneActionsSheet
+        agents={[]}
+        onDismiss={jest.fn()}
+        onDuplicate={jest.fn()}
+        onMove={jest.fn()}
+        onMoveToHost={jest.fn()}
+        onRemove={jest.fn()}
+        onRename={jest.fn()}
+        onReorder={jest.fn()}
+        onRestart={jest.fn()}
+        onResolve={onResolve}
+        onTranscripts={jest.fn()}
+        sessionsById={new Map([[session.id, session]])}
+        target={{ tabId: "main", tile }}
+        visible
+        workspace={workspace}
+      />,
+    );
+    const actions = latestActions();
+    const ids = actions.map((action) => action.id);
+    expect(ids[0]).toBe("resolve");
+    for (const forbidden of ["move-host", "restart", "transcripts", "remove"]) {
+      expect(ids).not.toContain(forbidden);
+    }
+    // Its name can still change: the server renames a moving window.
+    expect(ids).toContain("rename");
+    expect(actions.find((action) => action.id === "duplicate")).toMatchObject({ disabled: true });
+    actions.find((action) => action.id === "resolve")?.onPress();
+    expect(onResolve).toHaveBeenCalledWith(session);
+  });
+
+  it("tells a Claude Code window its conversation comes along where it can", async () => {
+    const session = makeSession();
+    await render(
+      <MovePaneHostSheet
+        hosts={[makeHost(), makeHost({ id: "host-2", name: "mac" })]}
+        message="Claude Code's conversation comes with it where it can."
+        onBrowse={jest.fn()}
+        onDismiss={jest.fn()}
+        onSelect={jest.fn()}
+        session={session}
+        sessions={[session]}
+        visible
+      />,
+    );
+    expect(latestActions().length).toBeGreaterThan(0);
+  });
+
   it("lets a pane from a newer SPAWN D move or go, but never copies it blind", async () => {
     const tile: Tile = {
       session_id: "desktop-1",

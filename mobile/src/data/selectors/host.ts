@@ -1,5 +1,5 @@
 import { runningAgent } from "@/data/selectors/agent";
-import { sessionAttention } from "@/data/selectors/session";
+import { isLiveSession, sessionAttention } from "@/data/selectors/session";
 import type {
   AgentDef,
   FleetRollup,
@@ -63,9 +63,7 @@ export function fleetRollup(
 ): FleetRollup {
   const hostIds = new Set(hosts.map((host) => host.id));
   const fleetSessions = sessions.filter((session) => hostIds.has(session.host_id));
-  const liveSessions = fleetSessions.filter(
-    (session) => session.status !== "exited" && session.status !== "killed",
-  );
+  const liveSessions = fleetSessions.filter(isLiveSession);
   return {
     hosts: hosts.length,
     onlineHosts: hosts.filter((host) => host.status === "online").length,

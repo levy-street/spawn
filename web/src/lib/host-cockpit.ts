@@ -112,8 +112,9 @@ export function memoryFigure(usedBytes: number, totalBytes: number): string | nu
   return `${unbroken(formatBytes(usedBytes) ?? "0 B")} of ${unbroken(total)}`;
 }
 
+/** Running here now: not over, and not on its way to another host. */
 function isLive(session: Session): boolean {
-  return session.status !== "exited" && session.status !== "killed";
+  return session.status !== "exited" && session.status !== "killed" && session.status !== "moving";
 }
 
 function lastUsed(session: Session): number {

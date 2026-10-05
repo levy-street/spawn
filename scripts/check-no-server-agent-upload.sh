@@ -94,8 +94,16 @@ allowed_web_endpoint_bytes() {
   local content="${remainder#*:}"
   [[ "$match_line" =~ ^[0-9]+$ ]] || return 1
   [[ "$file" == "web/src/lib/hostControl.ts" ]] || return 1
+  # Reviewed 2026-10-04 (M6, web): stream v2 for the conversation carrier.
+  # A v2 chunk's bytes are encoded in one place (`sendChunkV2`), read in one
+  # place (`handleStreamV2`), and typed once (`StreamV2Frame`), all on the
+  # host-control DataChannel; the carrier above it (`lib/move/carrier.ts`)
+  # handles bytes only, never the field.
   [[ "$content" == '            bytes_b64: bytesToBase64(chunk),' || \
     "$content" == '      bytes_b64?: string;' || \
+    "$content" == '  bytes_b64?: string;' || \
+    "$content" == '        const encoded = message.bytes_b64;' || \
+    "$content" == '      bytes_b64: bytesToBase64(chunk),' || \
     "$content" == '            message.bytes_b64,' || \
     "$content" == '        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {' || \
     "$content" == '          bytes = base64ToBytes(message.bytes_b64);' ]]
@@ -145,6 +153,9 @@ check_privileged_endpoint_structure() {
   local web_late='            message.bytes_b64,'
   local web_check='        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {'
   local web_decode='          bytes = base64ToBytes(message.bytes_b64);'
+  local web_v2_type='  bytes_b64?: string;'
+  local web_v2_read='        const encoded = message.bytes_b64;'
+  local web_v2_encode='      bytes_b64: bytesToBase64(chunk),'
   local line
 
   for line in "$daemon_encode" "$daemon_decode"; do
@@ -426,9 +437,16 @@ if rtc.count("use crate::host_signal::HostConnectedSignal;") != 1 or rtc.count(
     raise SystemExit("no-server-agent-upload: connected signal construction topology changed")
 PY
 
-  for line in "$web_encode" "$web_type" "$web_late" "$web_check" "$web_decode"; do
+  for line in "$web_encode" "$web_type" "$web_late" "$web_check" "$web_decode" \
+    "$web_v2_type" "$web_v2_read" "$web_v2_encode"; do
     required_exact_line_once "$web_file" "$line" || return 1
   done
+  required_line_between "$web_file" "$web_v2_type" \
+    'type StreamV2Frame = {' 'length?: number;' || return 1
+  required_line_between "$web_file" "$web_v2_read" \
+    'private handleStreamV2(' 'case "stream.ack":' || return 1
+  required_line_between "$web_file" "$web_v2_encode" \
+    '  sendChunkV2(' '  cancelStreamV2(' || return 1
   required_line_between "$web_file" "$web_encode" \
     'async writeStream(' 'async transferFileTo(' || return 1
   for line in "$web_type" "$web_late" "$web_check" "$web_decode"; do
@@ -803,6 +821,18 @@ self_test() {
     '        if (message.sequence !== incoming.nextSequence || typeof message.bytes_b64 !== "string") {' \
     '          bytes = base64ToBytes(message.bytes_b64);' \
     '}' \
+    'type StreamV2Frame = {' \
+    '  bytes_b64?: string;' \
+    '  length?: number;' \
+    '};' \
+    'private handleStreamV2() {' \
+    '        const encoded = message.bytes_b64;' \
+    '      case "stream.ack":' \
+    '}' \
+    '  sendChunkV2() {' \
+    '      bytes_b64: bytesToBase64(chunk),' \
+    '  }' \
+    '  cancelStreamV2() {}' \
     'private sendSignal() {' \
     '  ws.send(frame);' \
     '  ws.send(pong);' \

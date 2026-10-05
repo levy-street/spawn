@@ -4,6 +4,19 @@
   const api = globalThis.spawnWorker;
   const consumers = new Map();
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  // One bulk gate per connection (proto/README.md, "Bulk pacing"): a bulk
+  // frame — a stream's chunk or end — goes out only while the bytes buffered
+  // on every tool channel that has carried bulk sum to at most 64 KiB, so
+  // however many streams run, terminal channels keep room in the
+  // association's 128 KiB queue (spike S4).
+  const BULK_WATERMARK = 64 * 1024;
+  const CONTROL_HIGH_WATER = 32 * 1024;
+
+  function bulkBuffered() {
+    let total = 0;
+    for (const entry of consumers.values()) if (entry.bulk) total += entry.dc.bufferedAmount;
+    return total;
+  }
 
   function post(id, message) {
     const entry = consumers.get(id);
@@ -58,9 +71,16 @@
     }
     // A bounded queue and native buffer for this consumer. Service one frame
     // per turn so bulk work yields to terminal channels and sibling tools.
-    if (entry.queue.length && entry.dc.bufferedAmount <= 32 * 1024) {
+    const head = entry.queue[0];
+    const room = head
+      ? head.bulk
+        ? bulkBuffered() + (entry.bulk ? 0 : entry.dc.bufferedAmount) <= BULK_WATERMARK
+        : entry.dc.bufferedAmount <= CONTROL_HIGH_WATER
+      : false;
+    if (room) {
       const item = entry.queue.shift();
       entry.queued -= item.bytes;
+      if (item.bulk) entry.bulk = true;
       try {
         entry.dc.send(item.text);
         item.resolve();
@@ -115,6 +135,7 @@
       onBuffered: null,
       opened: false,
       hello: false,
+      bulk: false,
     };
     const channel = new EventTarget();
     Object.defineProperties(channel, {
@@ -127,7 +148,7 @@
         },
       },
     });
-    channel.send = (text) =>
+    channel.send = (text, bulk) =>
       new Promise((resolve, reject) => {
         const bytes = new TextEncoder().encode(text).byteLength;
         if (
@@ -139,13 +160,14 @@
           reject(new Error("Host consumer send queue is unavailable."));
           return;
         }
-        entry.queue.push({ text, bytes, resolve, reject });
+        entry.queue.push({ text, bytes, bulk: bulk === true, resolve, reject });
         entry.queued += bytes;
         if (entry.timer === null) entry.timer = setTimeout(() => drain(id), 0);
       });
     entry.channel = channel;
     const protocol = {
       state: { ctl: channel },
+      bulkHighWater: BULK_WATERMARK,
       decodeBase64: api.decodeBase64,
       post: (message) => {
         if (consumers.get(id) !== entry) return;

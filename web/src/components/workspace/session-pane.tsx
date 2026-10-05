@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowDown,
+  ArrowRightLeft,
   ArrowUp,
   Bell,
   BellOff,
@@ -41,13 +42,31 @@ import { usePendingLaunchDrain } from "@/hooks/usePendingLaunchDrain";
 import { agents as agentsApi, type Host, hosts, type Session, sessions } from "@/lib/api";
 import { askWindowHost } from "@/lib/conversation-inspect";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
+import { MOVE_TO_ANOTHER_HOST_ITEM } from "@/lib/move/copy";
 import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
-import { sessionAtShell, sessionOwnName, sessionTitle, sessionTitleDetail } from "@/lib/sessions";
+import {
+  sessionAgent,
+  sessionAtShell,
+  sessionMoving,
+  sessionOwnName,
+  sessionTitle,
+  sessionTitleDetail,
+} from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { restartSessionAgent } from "./agent-restart";
 import { AgentSwitcher } from "./agent-switcher";
-import { WhereChip } from "./where-chip";
+import {
+  MoveNoteBanner,
+  MoveProgressOverlay,
+  MovingElsewhereOverlay,
+  moveCoversPane,
+  ResumingGuard,
+} from "./move-overlay";
+import { MoveResolveDialog } from "./move-resolve-dialog";
+import { useDismissWhenResolved, useMoveFor, useMoves } from "./moves-provider";
+import { useMoveNoteDelivery } from "./use-move-note";
+import { WhereChip, type WhereChipHandle } from "./where-chip";
 
 /** Trailing shortcut hint in a menu row — the gesture that does the same thing. */
 function MenuHint({ children }: { children: ReactNode }) {
@@ -91,6 +110,7 @@ export function SessionPane({
   onRemoveFromWorkspace,
   onConvertToFiles,
   onMoveToHost,
+  onMoveFresh,
   workspaceId,
   registerHandle,
   onError,
@@ -120,6 +140,9 @@ export function SessionPane({
   /** Move this pane's window to `cwd` on another host — the same window, run
    *  over there (workspace grid only: the grid confirms and moves it). */
   onMoveToHost?: (sessionId: string, host: Host, cwd: string) => void;
+  /** Move it with a new conversation there, without asking again — the
+   *  answer to "dream is offline, start a new one on mac instead?". */
+  onMoveFresh?: (sessionId: string, host: Host, cwd: string) => void;
   /** Ranks the places the pane can be moved to: beside its tab-mates first. */
   workspaceId?: string;
   registerHandle: (sessionId: string, getHandle: () => TerminalHandle | null) => void;
@@ -133,12 +156,26 @@ export function SessionPane({
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const hostList = hostsQ.data ?? [];
   const paneHost = hostList.find((host) => host.id === session?.host_id) ?? null;
+  const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agentsApi.list, staleTime: 60_000 });
+  const paneAgent = session ? sessionAgent(session, agentsQ.data ?? []) : null;
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const { attach, connInfo, displayState, getHandle, agentNotice } = useLiveTerminal(
+  const { attach, connInfo, displayState, getHandle, agentNotice, agentScreen } = useLiveTerminal(
     session ? sessionId : null,
   );
   const daemonConnection = useDaemonConnection(session?.host_id ?? null);
+  const whereChipRef = useRef<WhereChipHandle>(null);
+  // A move this browser knows of, and the server's word that one is under way.
+  const moves = useMoves();
+  const move = useMoveFor(sessionId);
+  const moving = session ? sessionMoving(session) : false;
+  const covering = moveCoversPane(move) ? move : null;
+  const moveCovers = covering !== null;
+  const [resolveOpen, setResolveOpen] = useState(false);
+  const otherHosts = hostList.some((host) => host.id !== session?.host_id);
+  // A card saying the window stays "Moving" until it is resolved goes once
+  // the move is resolved underneath it, and the where chip with it.
+  useDismissWhenResolved(covering, moving);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);
@@ -162,6 +199,16 @@ export function SessionPane({
   // the shell that replaces this one, is typed into the shell once this pane
   // holds the window as it runs now (`usePendingLaunchDrain`).
   usePendingLaunchDrain({ sessionId, session, connInfo, displayState, getHandle });
+  // After a move, the note finds its place: typed into Claude's ready prompt
+  // or carried by the line, and Claude's dialogs said, never answered.
+  const moveNote = useMoveNoteDelivery({
+    sessionId,
+    session,
+    connInfo,
+    displayState,
+    getHandle,
+    agentScreen,
+  });
 
   const renameM = useMutation({
     mutationFn: (name: string | null) => sessions.update(sessionId, { name }),
@@ -404,9 +451,12 @@ export function SessionPane({
         )}
         {session && (
           <WhereChip
+            ref={whereChipRef}
             session={session}
             host={paneHost}
             workspaceId={workspaceId}
+            disabled={moving || moveCovers}
+            carries={paneAgent?.kind === "claude-code"}
             onPick={(host, cwd) => {
               if (host.id === session.host_id) {
                 // Same machine: the running shell changes directory, keeping
@@ -457,10 +507,16 @@ export function SessionPane({
               Rename
             </DropdownMenuItem>
           )}
-          {session && (
+          {session && !moving && (
             <DropdownMenuItem disabled={restartM.isPending} onSelect={() => restartM.mutate()}>
               <RotateCcw className="size-4" aria-hidden />
               Restart
+            </DropdownMenuItem>
+          )}
+          {session && onMoveToHost && otherHosts && !moving && !moveCovers && (
+            <DropdownMenuItem onSelect={() => whereChipRef.current?.openOtherHosts()}>
+              <ArrowRightLeft className="size-4" aria-hidden />
+              {MOVE_TO_ANOTHER_HOST_ITEM}
             </DropdownMenuItem>
           )}
           {/* The agent's own record of the conversation, read from the host.
@@ -471,7 +527,7 @@ export function SessionPane({
               Transcript
             </DropdownMenuItem>
           )}
-          {session && onDuplicate && (
+          {session && onDuplicate && !moving && (
             <DropdownMenuItem disabled={!canDuplicate} onSelect={() => onDuplicate(sessionId)}>
               <Copy className="size-4" aria-hidden />
               Duplicate
@@ -516,22 +572,51 @@ export function SessionPane({
             accidental clicks, so the X can express its intent directly. A
             pane whose session is gone has no process to kill, so its X skips
             the ceremony and just takes the dead pane out of the layout. */}
-        <button
-          type="button"
-          aria-label={session ? `Close ${title}` : "Remove from workspace"}
-          disabled={closeM.isPending}
-          onClick={session ? closeSession : () => onRemoveFromWorkspace(sessionId)}
-          // Pulled back off the bar's rhythm: the two controls are one
-          // cluster at the end of the header, not two more items in the row.
-          className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive disabled:opacity-50"
-        >
-          <X className="size-3.5" aria-hidden />
-        </button>
+        {!moving && (
+          <button
+            type="button"
+            aria-label={session ? `Close ${title}` : "Remove from workspace"}
+            disabled={closeM.isPending}
+            onClick={session ? closeSession : () => onRemoveFromWorkspace(sessionId)}
+            // Pulled back off the bar's rhythm: the two controls are one
+            // cluster at the end of the header, not two more items in the row.
+            className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive disabled:opacity-50"
+          >
+            <X className="size-3.5" aria-hidden />
+          </button>
+        )}
       </header>
 
       {session ? (
         <div className="relative min-h-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
+          {covering ? (
+            <MoveProgressOverlay
+              move={covering}
+              onControl={(action) => moves?.control(covering.transferId, action)}
+              onDismiss={() => moves?.dismiss(covering.transferId)}
+              onStartFresh={() => {
+                const target = hostList.find((host) => host.id === covering.targetHostId);
+                moves?.dismiss(covering.transferId);
+                if (target) onMoveFresh?.(sessionId, target, covering.targetCwd);
+              }}
+              onTryAgain={() => {
+                const target = hostList.find((host) => host.id === covering.targetHostId);
+                moves?.dismiss(covering.transferId);
+                if (target) onMoveToHost?.(sessionId, target, covering.targetCwd);
+              }}
+              onResolve={() => setResolveOpen(true)}
+            />
+          ) : (
+            moving && (
+              <MovingElsewhereOverlay
+                target={move?.targetName ?? null}
+                onResolve={() => setResolveOpen(true)}
+              />
+            )
+          )}
+          {moveNote.guard && !moving && <ResumingGuard onUseTerminal={moveNote.useTerminalNow} />}
+          {!moving && <MoveNoteBanner state={moveNote} />}
           {agentNotice === "update_installed" &&
             session.status === "running" &&
             !sessionAtShell(session) && (
@@ -615,6 +700,15 @@ export function SessionPane({
         </div>
       )}
 
+      {session && paneHost && (
+        <MoveResolveDialog
+          open={resolveOpen}
+          onOpenChange={setResolveOpen}
+          session={session}
+          source={paneHost}
+          targetCwd={move?.targetCwd ?? null}
+        />
+      )}
       {session && (
         <SessionTranscriptsDialog
           open={transcriptsOpen}

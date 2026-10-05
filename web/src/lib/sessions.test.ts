@@ -86,6 +86,10 @@ describe("activity derivation", () => {
     expect(sessionActivityTone(makeSession({ activity_state: "input_sent" }))).toBe("waiting");
     expect(sessionActivityTone(makeSession({ activity_state: "starting" }))).toBe("waiting");
     expect(sessionActivityTone(makeSession({ activity_state: "quiet" }))).toBe("idle");
+    // A window that is moving asks nothing of anyone: neutral, as on the phone.
+    expect(sessionActivityTone(makeSession({ status: "moving", activity_state: "moving" }))).toBe(
+      "idle",
+    );
     expect(sessionActivityTone(makeSession({ activity_state: "unknown" }))).toBe("idle");
     expect(sessionActivityTone(makeSession({ activity_state: "exited", status: "exited" }))).toBe(
       "offline",

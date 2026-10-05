@@ -33,10 +33,18 @@ describe("host offers", () => {
     }
   });
 
-  test("lights nothing in this build, whatever a host advertises", () => {
-    expect(SHIPPED_HOST_OFFERS.size).toBe(0);
-    expect(deriveHostOffers(EVERY_FAMILY).slots).toEqual([]);
+  test("lights only Unfinished moves in this build, on conv.v2 alone", () => {
+    expect([...SHIPPED_HOST_OFFERS]).toEqual(["moves"]);
+    expect(deriveHostOffers(EVERY_FAMILY).slots.map((slot) => slot.id)).toEqual(["moves"]);
+    expect(deriveHostOffers(EVERY_FAMILY).slots.map((slot) => slot.label)).toEqual([
+      "Unfinished moves",
+    ]);
     expect(deriveHostOffers(EVERY_FAMILY).has("desktop")).toBe(false);
+    // The conversation list is reserved, not drawn yet.
+    expect(deriveHostOffers(EVERY_FAMILY).has("conversations")).toBe(false);
+    // conv.v1 is inspect only: it lists nothing.
+    expect(deriveHostOffers(["conv.v1"]).has("moves")).toBe(false);
+    expect(deriveHostOffers(["conv.v1", "conv.v2"]).has("moves")).toBe(true);
   });
 
   test("a slot needs both its family on the host and a view in this build", () => {
@@ -58,9 +66,11 @@ describe("host offers", () => {
     expect(deriveHostOffers(["screen.v10"], EVERY_SLOT).has("desktop")).toBe(false);
   });
 
-  test("conversations need conv.v2, not conv.v1 alone", () => {
-    expect(deriveHostOffers(["conv.v1"], EVERY_SLOT).has("conversations")).toBe(false);
-    expect(deriveHostOffers(["conv.v1", "conv.v2"], EVERY_SLOT).has("conversations")).toBe(true);
+  test("conversations and unfinished moves need conv.v2, not conv.v1 alone", () => {
+    for (const slot of ["conversations", "moves"] as const) {
+      expect(deriveHostOffers(["conv.v1"], EVERY_SLOT).has(slot)).toBe(false);
+      expect(deriveHostOffers(["conv.v1", "conv.v2"], EVERY_SLOT).has(slot)).toBe(true);
+    }
   });
 
   test("each family lights its own slot, in the registry's order", () => {
@@ -71,13 +81,14 @@ describe("host offers", () => {
     expect(offers.slots.map((slot) => slot.id)).toEqual([
       "desktop",
       "conversations",
+      "moves",
       "claude-accounts",
       "boxes",
     ]);
     expect(offers.slots.find((slot) => slot.id === "desktop")?.placement).toBe("screen");
     expect(
       offers.slots.filter((slot) => slot.placement === "panel").map((slot) => slot.label),
-    ).toEqual(["Conversations", "Claude accounts", "Boxes"]);
+    ).toEqual(["Conversations", "Unfinished moves", "Claude accounts", "Boxes"]);
   });
 
   test("a Mac's hello lights only what a Linux host's would", () => {

@@ -3,6 +3,7 @@ import { canAddTile, orderedTiles } from "@/data/layout/tiles";
 import { identifyAgent } from "@/data/selectors/agent";
 import {
   activityTone,
+  isLiveSession,
   sessionAttention,
   sessionTitle,
   sessionTitleDetail,
@@ -20,7 +21,7 @@ import type {
 import { isFilesWidget, type PaneId, type WorkspaceTab } from "@/data/types/layout";
 
 function live(session: Session): boolean {
-  return session.status !== "exited" && session.status !== "killed";
+  return isLiveSession(session);
 }
 
 function timestamp(value: string | null): number {

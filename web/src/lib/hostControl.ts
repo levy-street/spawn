@@ -256,6 +256,9 @@ interface PendingRequest {
   dispatched: boolean;
   /** Set when this request opens a stream; see `StreamOpening`. */
   opening?: StreamOpening;
+  /** Called with a successful result before anything else runs: a v2
+   *  stream's frames can follow its response in the same task. */
+  onResult?: (result: unknown) => void;
   removeAbort?: () => void;
 }
 
@@ -296,6 +299,66 @@ interface OutgoingStream {
   commitDispatched: boolean;
   cancelSent: boolean;
   timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * One stream v2 (`proto/README.md`, "Stream v2") as its caller sees it: the
+ * client only parses frames and routes them by `stream_id`; flow control,
+ * sequence and digest checks are the caller's (`lib/move/carrier.ts`), which
+ * pumps one host's read into another's write.
+ */
+export interface StreamV2Handlers {
+  /** A read's chunk: its sequence and decoded bytes. */
+  chunk?: (sequence: number, bytes: Uint8Array) => void;
+  /** A write's cumulative acknowledgement. */
+  ack?: (sequence: number) => void;
+  /** A read ended; `sha256` is the end digest, or null where the declaration had it. */
+  end?: (length: number, sha256: string | null) => void;
+  /** A write committed, with the family's result. */
+  committed?: (length: number, sha256: string, result: unknown) => void;
+  /** The daemon ended the stream (`superseded`, `cancelled`, `stream_timeout`, …). */
+  error?: (error: HostControlError) => void;
+  /** The channel carrying the stream is gone: nothing more will arrive on it. */
+  lost?: (error: Error) => void;
+}
+
+/** A stream v2 frame as it arrives, before its fields are checked. */
+type StreamV2Frame = {
+  type?: string;
+  stream_id?: string;
+  sequence?: number;
+  bytes_b64?: string;
+  length?: number;
+  sha256?: string | null;
+  result?: unknown;
+  error?: { code?: string; detail?: string };
+};
+
+/** What the hello's `limits` say about streams, with v1's values where it is silent. */
+export interface HostStreamLimits {
+  chunkBytes: number;
+  streamWindowMax: number;
+}
+
+const DEFAULT_STREAM_LIMITS: HostStreamLimits = {
+  chunkBytes: STREAM_CHUNK_BYTES,
+  streamWindowMax: STREAM_WINDOW_CHUNKS,
+};
+
+function parseStreamLimits(value: unknown): HostStreamLimits {
+  if (!isJsonObject(value)) return DEFAULT_STREAM_LIMITS;
+  const chunk = value.chunk_bytes;
+  const window = value.stream_window_max;
+  return {
+    chunkBytes:
+      typeof chunk === "number" && Number.isSafeInteger(chunk) && chunk > 0 && chunk <= 64 * 1024
+        ? chunk
+        : STREAM_CHUNK_BYTES,
+    streamWindowMax:
+      typeof window === "number" && Number.isSafeInteger(window) && window > 0 && window <= 1024
+        ? window
+        : STREAM_WINDOW_CHUNKS,
+  };
 }
 
 interface SignalMetadata {
@@ -427,6 +490,11 @@ export class HostControlClient {
   // teardown so a reconnect onto a downgraded daemon cannot inherit a stale
   // capability set and keep offering actions that daemon no longer supports.
   private capabilities: ReadonlySet<string> = new Set();
+  private streamLimits: HostStreamLimits = DEFAULT_STREAM_LIMITS;
+  /** A hello that came before its channel's `open` (spike S4 F2): the client
+   *  turns ready, and sends what it holds, only once the channel is open. */
+  private helloAwaitingOpen = false;
+  private v2Streams = new Map<string, StreamV2Handlers>();
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. Terminal: blocks auto-reconnect.
   private signedRtcRefusal: SignedRtcRefusalReason | null = null;
@@ -575,10 +643,12 @@ export class HostControlClient {
     this.sessionId = id;
     this.channel = channel;
     this.helloReceived = false;
+    this.helloAwaitingOpen = false;
     this.channelRequests = 0;
     let opened = false;
     channel.onopen = () => {
       opened = true;
+      if (this.sessionId === id && this.helloAwaitingOpen) this.finishHello();
     };
     channel.onmessage = ({ data }) => this.handleControlMessage(data, id);
     channel.onclose = () => this.consumerChannelLost(id, opened);
@@ -661,7 +731,12 @@ export class HostControlClient {
   }
 
   private channelIdle(): boolean {
-    if (this.openingStreams > 0 || this.incomingStreams.size > 0 || this.outgoingStreams.size > 0)
+    if (
+      this.openingStreams > 0 ||
+      this.incomingStreams.size > 0 ||
+      this.outgoingStreams.size > 0 ||
+      this.v2Streams.size > 0
+    )
       return false;
     for (const pending of this.pending.values()) if (pending.dispatched) return false;
     return true;
@@ -848,6 +923,7 @@ export class HostControlClient {
     payload: unknown,
     options: HostControlRequestOptions = {},
     opening?: StreamOpening,
+    onResult?: (result: unknown) => void,
   ): Promise<T> {
     // A swap in progress is still ready: the request waits for the new channel.
     if (this.state !== "ready" || (!this.rotating && this.channel?.readyState !== "open")) {
@@ -892,6 +968,7 @@ export class HostControlClient {
         mutation: INDETERMINATE_REQUEST_OPERATIONS.has(operation),
         dispatched: false,
         ...(opening ? { opening } : {}),
+        ...(onResult ? { onResult } : {}),
       };
       if (options.signal) {
         const onAbort = () => {
@@ -1978,6 +2055,10 @@ export class HostControlClient {
         this.failRtc(sessionId);
       }
     };
+    channel.onopen = () => {
+      if (this.sessionId !== sessionId || this.channel !== channel) return;
+      if (this.helloAwaitingOpen) this.finishHello();
+    };
     channel.onmessage = (event) => {
       if (this.sessionId !== sessionId || this.channel !== channel) return;
       this.handleControlMessage(event.data, sessionId);
@@ -2321,22 +2402,30 @@ export class HostControlClient {
       // malformed list degrades to "offers nothing extra" rather than failing
       // the channel: the connection is fine, we just cannot read its menu.
       this.capabilities = parseCapabilities(message.capabilities);
+      this.streamLimits = parseStreamLimits((parsed as { limits?: unknown }).limits);
       if (this.options.deviceConnection && !this.capabilities.has("session.transport.v1")) {
         this.requireTransportUpdate("Update SPAWN D on this host to share its connection.");
         return;
       }
-      if (this.options.sharedConnection) {
-        this.clearConsumerRefusal();
-        this.connectionError = null;
-        this.rotating = false;
-        this.flushHeld();
+      // The hello can reach a browser before the channel's own `open` event
+      // (spike S4 F2: Chrome delivered it 0.5 ms early, `readyState` still
+      // "connecting"). Nothing is sent from here until the channel is open:
+      // ready, and the requests a swap held, wait for its `open`.
+      if (this.channel?.readyState !== "open") {
+        this.helloAwaitingOpen = true;
+        return;
       }
-      this.setState("ready");
+      this.finishHello();
       return;
     }
     if (message.type?.startsWith("stream.")) {
       if (typeof message.stream_id !== "string") {
         this.failRtc(sessionId);
+        return;
+      }
+      const v2 = this.v2Streams.get(message.stream_id);
+      if (v2) {
+        this.handleStreamV2(message as StreamV2Frame, message.stream_id, v2, sessionId);
         return;
       }
       if (message.type === "stream.chunk") {
@@ -2451,14 +2540,195 @@ export class HostControlClient {
     if (message.type !== "response" || typeof message.request_id !== "string") return;
     const pending = this.finishPending(message.request_id);
     if (!pending) return;
-    if (message.ok) pending.resolve(message.result);
-    else
+    if (message.ok) {
+      pending.onResult?.(message.result);
+      pending.resolve(message.result);
+    } else
       pending.reject(
         new HostControlError(
           message.error?.code ?? "request_failed",
           message.error?.detail ?? "Host control request failed",
         ),
       );
+  }
+
+  /** The hello's work that may send: only once the channel is open. */
+  private finishHello(): void {
+    this.helloAwaitingOpen = false;
+    if (!this.helloReceived || this.channel?.readyState !== "open") return;
+    if (this.options.sharedConnection) {
+      this.clearConsumerRefusal();
+      this.connectionError = null;
+      this.rotating = false;
+      this.flushHeld();
+    }
+    this.setState("ready");
+  }
+
+  private handleStreamV2(
+    message: StreamV2Frame,
+    streamId: string,
+    handlers: StreamV2Handlers,
+    sessionId: string,
+  ): void {
+    const sequence = message.sequence;
+    const length = message.length;
+    switch (message.type) {
+      case "stream.chunk": {
+        // The one read of a v2 chunk's bytes (scripts/check-no-server-agent-upload.sh).
+        const encoded = message.bytes_b64;
+        let bytes: Uint8Array;
+        try {
+          if (
+            typeof sequence !== "number" ||
+            !Number.isSafeInteger(sequence) ||
+            sequence < 0 ||
+            typeof encoded !== "string"
+          )
+            throw new Error("malformed chunk");
+          bytes = base64ToBytes(encoded);
+        } catch {
+          this.failRtc(sessionId);
+          return;
+        }
+        handlers.chunk?.(sequence, bytes);
+        return;
+      }
+      case "stream.ack":
+        if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0) {
+          this.failRtc(sessionId);
+          return;
+        }
+        handlers.ack?.(sequence);
+        return;
+      case "stream.end":
+        if (
+          typeof length !== "number" ||
+          !Number.isSafeInteger(length) ||
+          length < 0 ||
+          (message.sha256 !== null && typeof message.sha256 !== "string")
+        ) {
+          this.failRtc(sessionId);
+          return;
+        }
+        this.v2Streams.delete(streamId);
+        this.noteSettled();
+        handlers.end?.(length, message.sha256 ?? null);
+        return;
+      case "stream.committed":
+        if (
+          typeof length !== "number" ||
+          !Number.isSafeInteger(length) ||
+          typeof message.sha256 !== "string"
+        ) {
+          this.failRtc(sessionId);
+          return;
+        }
+        this.v2Streams.delete(streamId);
+        this.noteSettled();
+        handlers.committed?.(length, message.sha256, message.result);
+        return;
+      case "stream.error":
+        this.v2Streams.delete(streamId);
+        this.noteSettled();
+        handlers.error?.(
+          new HostControlError(message.error?.code ?? "stream_failed", message.error?.detail),
+        );
+        return;
+      default:
+        this.failRtc(sessionId);
+    }
+  }
+
+  /**
+   * Open a stream v2 — `conv.export` (a read) or `conv.import.begin` (a
+   * write) — and route its frames to `handlers` from the moment its response
+   * arrives: registered before the response resolves, so a chunk that follows
+   * it in the same task finds its stream. Resolves with the declaration.
+   */
+  async openStreamV2<T extends { stream_id: string }>(
+    operation: string,
+    payload: Record<string, unknown>,
+    handlers: StreamV2Handlers,
+    options?: HostControlRequestOptions,
+  ): Promise<T> {
+    const opening: StreamOpening = { onChannel: false };
+    let registered: string | null = null;
+    try {
+      const declaration = await this.issueRequest<T>(
+        operation,
+        payload,
+        { timeoutMs: this.streamTimeoutMs(), ...options },
+        opening,
+        (result) => {
+          const streamId = isJsonObject(result) ? result.stream_id : undefined;
+          if (typeof streamId !== "string" || streamId === "" || this.v2Streams.has(streamId))
+            return;
+          this.v2Streams.set(streamId, handlers);
+          registered = streamId;
+        },
+      );
+      if (!registered || declaration?.stream_id !== registered) {
+        throw new HostControlError("invalid_response", "Host returned an invalid stream");
+      }
+      return declaration;
+    } finally {
+      this.leaveChannel(opening);
+      this.noteSettled();
+    }
+  }
+
+  /** Send an acknowledgement or the end of a stream v2 this client opened.
+   *  Throws when the channel is gone. */
+  sendStreamV2(
+    type: "stream.ack" | "stream.end",
+    streamId: string,
+    values: Record<string, unknown>,
+  ): void {
+    this.sendStreamFrame(type, streamId, values);
+  }
+
+  /** Send one chunk of a stream v2 write this client opened: the one place
+   *  a v2 chunk's bytes are encoded (scripts/check-no-server-agent-upload.sh).
+   *  Throws when the channel is gone. */
+  sendChunkV2(streamId: string, sequence: number, chunk: Uint8Array): void {
+    this.sendStreamFrame("stream.chunk", streamId, {
+      sequence,
+      bytes_b64: bytesToBase64(chunk),
+    });
+  }
+
+  /**
+   * End a stream v2 from this side: `stream.cancel`, best effort. Its
+   * frames already on their way are taken quietly for a while, as v1's
+   * tombstones do, rather than closing the channel as unknown ones would.
+   */
+  cancelStreamV2(streamId: string): void {
+    if (!this.v2Streams.has(streamId)) return;
+    const quiet: StreamV2Handlers = {};
+    this.v2Streams.set(streamId, quiet);
+    this.cancelStream(streamId);
+    setTimeout(() => {
+      if (this.v2Streams.get(streamId) === quiet) {
+        this.v2Streams.delete(streamId);
+        this.noteSettled();
+      }
+    }, STREAM_TOMBSTONE_TTL_MS);
+  }
+
+  /** The hello's stream limits (`chunk_bytes`, `stream_window_max`). */
+  getStreamLimits(): HostStreamLimits {
+    return this.streamLimits;
+  }
+
+  /** What this client's channel has queued and not yet seen acknowledged. */
+  bufferedAmount(): number {
+    return this.channel?.bufferedAmount ?? 0;
+  }
+
+  /** Resolves once this client's channel has `threshold` bytes or fewer queued. */
+  waitForBuffered(threshold: number, signal?: AbortSignal): Promise<void> {
+    return this.waitForWritable(signal, threshold);
   }
 
   private sendSignal(
@@ -2641,13 +2911,16 @@ export class HostControlClient {
     }, this.streamTimeoutMs());
   }
 
-  private async waitForWritable(signal?: AbortSignal): Promise<void> {
+  private async waitForWritable(
+    signal?: AbortSignal,
+    threshold: number = STREAM_BUFFERED_HIGH_WATER,
+  ): Promise<void> {
     for (;;) {
       const channel = this.channel;
       if (channel?.readyState !== "open") {
         throw new HostControlError("connection_closed", "Host control channel is not open");
       }
-      if (channel.bufferedAmount <= STREAM_BUFFERED_HIGH_WATER) return;
+      if (channel.bufferedAmount <= threshold) return;
       if (signal?.aborted) throw new DOMException("Host file write aborted", "AbortError");
       await new Promise<void>((resolve, reject) => {
         // The channel's low-water event wakes this where timers are throttled
@@ -2669,7 +2942,7 @@ export class HostControlClient {
         };
         signal?.addEventListener("abort", onAbort, { once: true });
         if (listens) {
-          channel.bufferedAmountLowThreshold = STREAM_BUFFERED_HIGH_WATER;
+          channel.bufferedAmountLowThreshold = threshold;
           channel.addEventListener("bufferedamountlow", onLow);
         }
       });
@@ -2728,7 +3001,9 @@ export class HostControlClient {
     this.signedRtcRequired = false;
     this.signedRtcDecisionForBinding = null;
     this.capabilities = new Set();
+    this.streamLimits = DEFAULT_STREAM_LIMITS;
     this.helloReceived = false;
+    this.helloAwaitingOpen = false;
     this.channelRequests = 0;
     this.rotating = false;
     // Held requests are still pending, so rejectPending below settles them.
@@ -2773,6 +3048,9 @@ export class HostControlClient {
       clearTimeout(outgoing.timer);
       outgoing.reject(this.writeAcknowledgementLost(outgoing, streamError));
     }
+    const v2 = [...this.v2Streams.values()];
+    this.v2Streams.clear();
+    for (const handlers of v2) handlers.lost?.(streamError);
     if (!this.stopped && this.state === "ready") this.setState("open");
   }
 

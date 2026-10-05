@@ -46,6 +46,26 @@ describe("pendingLaunch", () => {
     assert.equal(pendingLaunch.has("w4", "dream", 1_000), false);
   });
 
+  test("a launch a device queued for itself to type says so, for that incarnation only", () => {
+    // A put-back or a settled move: the device that did it types the resume
+    // and takes the display to do it; an ordinary launch waits for the
+    // display instead.
+    pendingLaunch.claim("w6", "dream", "claude --resume x --permission-mode default", 0);
+    assert.equal(pendingLaunch.claims("w6", "dream", 1), true);
+    assert.equal(pendingLaunch.claims("w6", "mac", 1), false);
+    assert.equal(
+      pendingLaunch.take("w6", "dream", 1),
+      "claude --resume x --permission-mode default",
+    );
+    assert.equal(pendingLaunch.claims("w6", "dream", 2), false);
+
+    pendingLaunch.set("w7", "dream", "claude", 0);
+    assert.equal(pendingLaunch.claims("w7", "dream", 1), false);
+    // A claimed one lapses like any other.
+    pendingLaunch.claim("w7", "dream", "claude --resume y", 0);
+    assert.equal(pendingLaunch.claims("w7", "dream", PENDING_LAUNCH_TTL_MS), false);
+  });
+
   test("a refused launch is forgotten", () => {
     pendingLaunch.set("w5", "dream", "claude", 0);
     pendingLaunch.clear("w5");

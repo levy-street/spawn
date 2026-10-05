@@ -54,6 +54,8 @@ import { type AgentNotice, detectAgentNotice } from "@/lib/agent-notice";
 import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
+import { pendingNote } from "@/lib/move/note-delivery";
+import { type ClaudeScreenState, classifyClaudeScreen, readScreenLines } from "@/lib/move/screen";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import { viewportInset } from "@/lib/viewport";
@@ -218,6 +220,13 @@ export interface TerminalHandle {
   pasteText: (text: string) => void;
   /** Promote this browser to the shared PTY geometry controller. */
   takeControl: () => void;
+  /**
+   * Owe the display the claim an opening makes: taken as soon as this view
+   * can carry it — in the foreground, its tab visible, its transport open —
+   * and on the next open if not before. For a device that has a line of its
+   * own to type into the window (`pendingLaunch.claim`).
+   */
+  claimDisplay: () => void;
   /** Open the native file picker to upload files to this session. */
   openUpload: () => void;
   /** Scroll the viewport back to the live edge (bottom of the buffer). */
@@ -258,6 +267,11 @@ export interface TerminalProps {
    *  read off the rendered screen here, never off the wire. Called with null
    *  when the notice leaves the screen. */
   onAgentNotice?: (notice: AgentNotice | null) => void;
+  /** What Claude Code's screen shows (`lib/move/screen.ts`), read while a
+   *  moved window's note waits for this incarnation, so the note is typed
+   *  only into Claude's ready prompt and its dialogs are surfaced, never
+   *  answered. Read off the rendered screen, never off the wire. */
+  onAgentScreen?: (state: ClaudeScreenState) => void;
 }
 
 /**
@@ -279,6 +293,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     active = true,
     onExit,
     onAgentNotice,
+    onAgentScreen,
   },
   ref,
 ) {
@@ -1117,21 +1132,34 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     agentNoticeRef.current = notice;
     onAgentNoticeRef.current?.(notice);
   }, []);
+  const onAgentScreenRef = useRef(onAgentScreen);
+  onAgentScreenRef.current = onAgentScreen;
+  const agentScreenRef = useRef<ClaudeScreenState | null>(null);
   const scanAgentNotice = useCallback(() => {
     const term = termRef.current;
     if (!term) return;
     const buffer = term.buffer.active;
-    if (buffer.type === "alternate") {
-      reportAgentNotice(null);
-      return;
-    }
     const end = buffer.baseY + term.rows;
     const rows: string[] = [];
     for (let y = buffer.baseY; y < end; y += 1) {
       rows.push(buffer.getLine(y)?.translateToString(true) ?? "");
     }
+    // Claude Code's screen, only while a moved window's note waits here:
+    // the classifier is the move's, and costs nothing otherwise. It reads
+    // logical lines, a row the terminal wrapped joined to the one before it.
+    if (onAgentScreenRef.current && hostId && pendingNote.peek(sessionId, hostId)) {
+      const state = classifyClaudeScreen(readScreenLines(buffer, term.rows));
+      if (state !== agentScreenRef.current) {
+        agentScreenRef.current = state;
+        onAgentScreenRef.current(state);
+      }
+    }
+    if (buffer.type === "alternate") {
+      reportAgentNotice(null);
+      return;
+    }
     reportAgentNotice(detectAgentNotice(rows));
-  }, [reportAgentNotice]);
+  }, [reportAgentNotice, hostId, sessionId]);
   const scheduleAgentNoticeScan = useCallback(() => {
     if (!onAgentNoticeRef.current || agentNoticeTimerRef.current !== null) return;
     agentNoticeTimerRef.current = window.setTimeout(() => {
@@ -1264,7 +1292,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       socketInitialSize !== null &&
       daemonConnection !== null &&
       sessionIdentityQuery.data?.status !== "exited" &&
-      sessionIdentityQuery.data?.status !== "killed",
+      sessionIdentityQuery.data?.status !== "killed" &&
+      // A window that is moving is leaving this host: nothing attaches to it
+      // until the move commits (a new incarnation) or is put back.
+      sessionIdentityQuery.data?.status !== "moving",
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {
@@ -3354,6 +3385,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pasteDataTransfer,
       pasteText,
       takeControl: () => takeControlNowRef.current(),
+      claimDisplay: () => {
+        displayClaimOwedRef.current = true;
+        payDisplayClaimRef.current();
+      },
       openUpload: () => fileInputRef.current?.click(),
       snapToLiveEdge,
     }),

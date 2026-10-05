@@ -2940,3 +2940,181 @@ describe("HostControlClient conversation inspection", () => {
     client.close();
   });
 });
+
+describe("HostControlClient hello before open (spike S4 F2)", () => {
+  test("a hello that beats the channel's open sends nothing and is ready only once open", async () => {
+    const connection = new FakeSharedConnection();
+    const client = new HostControlClient(hostId, {
+      sharedConnection: connection,
+      reconnectBaseDelayMs: 1,
+      reconnectRandom: () => 0,
+    });
+    const states: string[] = [];
+    client.subscribe((state) => {
+      states.push(state);
+      // A subscriber that asks the moment it hears "ready" — the case F2
+      // broke: a send from the hello's own handler on a connecting channel.
+      if (state === "ready") void client.ping().catch(() => {});
+    });
+    client.connect();
+    const channel = connection.latest();
+    expect(channel.readyState).toBe("connecting");
+    channel.hello(["ping", "conv.v1", "conv.v2"]);
+    expect(client.getState()).not.toBe("ready");
+    expect(channel.sent).toHaveLength(0);
+    channel.open();
+    expect(client.getState()).toBe("ready");
+    expect(client.hasCapability("conv.v2")).toBe(true);
+    expect(channel.requests().map((frame) => frame.operation)).toEqual(["ping"]);
+    client.close();
+  });
+
+  test("the hello's stream limits are read, and v1's stand where it says none", async () => {
+    const { client, connection } = await readyConsumer();
+    expect(client.getStreamLimits()).toEqual({ chunkBytes: 8192, streamWindowMax: 8 });
+    connection.latest().close();
+    await waitFor(() => connection.channels.length > 1, 1_000);
+    const next = connection.latest();
+    next.open();
+    next.receive({
+      version: 1,
+      type: "hello",
+      protocol: HOST_CONTROL_PROTOCOL,
+      capabilities: ["ping"],
+      limits: { chunk_bytes: 8192, stream_window_max: 16 },
+    });
+    expect(client.getStreamLimits()).toEqual({ chunkBytes: 8192, streamWindowMax: 16 });
+    client.close();
+  });
+});
+
+describe("HostControlClient stream v2", () => {
+  test("frames that follow the declaration in the same task reach the stream", async () => {
+    const { client, connection } = await readyConsumer();
+    const channel = connection.latest();
+    const seen: unknown[] = [];
+    const opening = client.openStreamV2(
+      "conv.export",
+      { transfer_id: "t" },
+      {
+        chunk: (sequence, bytes) => seen.push(["chunk", sequence, new TextDecoder().decode(bytes)]),
+        end: (length, sha256) => seen.push(["end", length, sha256]),
+      },
+    );
+    const request = channel.requests().at(-1);
+    channel.receive({
+      version: 1,
+      type: "response",
+      request_id: request.request_id,
+      ok: true,
+      result: { stream_id: "s1", length: 2, sha256: null, window: 16, next_sequence: 0 },
+    });
+    // Before the declaration's promise has even settled.
+    channel.receive({
+      version: 1,
+      type: "stream.chunk",
+      stream_id: "s1",
+      sequence: 0,
+      bytes_b64: "aGk=",
+    });
+    channel.receive({
+      version: 1,
+      type: "stream.end",
+      stream_id: "s1",
+      length: 2,
+      sha256: "a".repeat(64),
+    });
+    const declaration = await opening;
+    expect(declaration.stream_id).toBe("s1");
+    expect(seen).toEqual([
+      ["chunk", 0, "hi"],
+      ["end", 2, "a".repeat(64)],
+    ]);
+    client.close();
+  });
+
+  test("a write hears its acknowledgements, its commit and its errors; a lost channel says so", async () => {
+    const { client, connection } = await readyConsumer();
+    const channel = connection.latest();
+    const seen: unknown[] = [];
+    const handlers = {
+      ack: (sequence) => seen.push(["ack", sequence]),
+      committed: (length, sha256, result) => seen.push(["committed", length, sha256, result]),
+      error: (error) => seen.push(["error", error.code]),
+      lost: () => seen.push(["lost"]),
+    };
+    const first = client.openStreamV2("conv.import.begin", {}, handlers);
+    channel.answerLast({ stream_id: "w1", window: 16, next_sequence: 0, received: 0 });
+    await first;
+    client.sendChunkV2("w1", 0, new TextEncoder().encode("hi"));
+    expect(JSON.parse(channel.sent.at(-1))).toMatchObject({
+      type: "stream.chunk",
+      stream_id: "w1",
+    });
+    channel.receive({ version: 1, type: "stream.ack", stream_id: "w1", sequence: 1 });
+    channel.receive({
+      version: 1,
+      type: "stream.committed",
+      stream_id: "w1",
+      length: 2,
+      sha256: "b".repeat(64),
+      result: { transfer_id: "t" },
+    });
+    const second = client.openStreamV2("conv.import.begin", {}, handlers);
+    channel.answerLast({ stream_id: "w2", window: 16, next_sequence: 0, received: 0 });
+    await second;
+    channel.receive({
+      version: 1,
+      type: "stream.error",
+      stream_id: "w2",
+      error: { code: "superseded", detail: "x" },
+    });
+    const third = client.openStreamV2("conv.import.begin", {}, handlers);
+    channel.answerLast({ stream_id: "w3", window: 16, next_sequence: 0, received: 0 });
+    await third;
+    channel.close();
+    expect(seen).toEqual([
+      ["ack", 1],
+      ["committed", 2, "b".repeat(64), { transfer_id: "t" }],
+      ["error", "superseded"],
+      ["lost"],
+    ]);
+    client.close();
+  });
+
+  test("frames for a stream this side cancelled are taken quietly, not as unknown", async () => {
+    const { client, connection } = await readyConsumer();
+    const channel = connection.latest();
+    const chunks: number[] = [];
+    const opening = client.openStreamV2(
+      "conv.export",
+      {},
+      { chunk: (sequence) => chunks.push(sequence) },
+    );
+    channel.answerLast({ stream_id: "r1", length: 9, sha256: null, window: 16, next_sequence: 0 });
+    await opening;
+    client.cancelStreamV2("r1");
+    expect(JSON.parse(channel.sent.at(-1))).toMatchObject({
+      type: "stream.cancel",
+      stream_id: "r1",
+    });
+    channel.receive({
+      version: 1,
+      type: "stream.chunk",
+      stream_id: "r1",
+      sequence: 0,
+      bytes_b64: "aGk=",
+    });
+    expect(chunks).toEqual([]);
+    expect(channel.closed).toBe(false);
+    client.close();
+  });
+
+  test("a declaration without a stream id is refused", async () => {
+    const { client, connection } = await readyConsumer();
+    const opening = client.openStreamV2("conv.export", {}, {});
+    connection.latest().answerLast({ length: 1 });
+    await expect(opening).rejects.toMatchObject({ code: "invalid_response" });
+    client.close();
+  });
+});

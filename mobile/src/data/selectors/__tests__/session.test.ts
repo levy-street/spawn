@@ -4,6 +4,8 @@ import {
   deriveActivity,
   displayStatus,
   durableUnreadCount,
+  isLiveSession,
+  isMovingSession,
   relativeTime,
   sessionAttention,
   sessionOwnName,
@@ -192,19 +194,46 @@ describe("sessionOwnName", () => {
 });
 
 describe("a session status this app has never seen", () => {
-  // A newer server can report a status this build does not know (a window
-  // being moved between hosts reads `moving`). It must still list, read
-  // sensibly and never count as dead.
-  const moving = session({ status: "moving", activity_state: "moving", activity_label: "" });
+  // A newer server can report a status this build does not know. It must
+  // still list, read sensibly and never count as dead.
+  const unknown = session({
+    status: "relocating",
+    activity_state: "relocating",
+    activity_label: "",
+  });
 
   test("reads as its own name, never as dead or running", () => {
-    expect(deriveActivity(moving, NOW)).toMatchObject({ state: "moving", label: "Moving" });
-    expect(sessionAttention(moving)).toBeNull();
-    expect(activityTone(moving)).toBe("offline");
-    expect(displayStatus(moving, null, "idle")).toMatchObject({
-      process: "moving",
-      label: "MOVING",
+    expect(deriveActivity(unknown, NOW)).toMatchObject({
+      state: "relocating",
+      label: "Relocating",
+    });
+    expect(sessionAttention(unknown)).toBeNull();
+    expect(activityTone(unknown)).toBe("offline");
+    expect(displayStatus(unknown, null, "idle")).toMatchObject({
+      process: "relocating",
+      label: "RELOCATING",
       attention: null,
     });
+  });
+});
+
+describe("a window a device is moving to another host", () => {
+  const moving = session({ status: "moving", activity_state: "moving", activity_label: "Moving" });
+
+  test("says so on every device, and is neither live, waiting nor dead", () => {
+    // Lists say the server's word; a pane says where it is going, as far as
+    // any device can before the commit.
+    expect(deriveActivity(moving, NOW)).toMatchObject({ state: "moving", label: "Moving" });
+    expect(displayStatus(moving, null, "idle")).toMatchObject({
+      process: "moving",
+      label: "Moving to another host…",
+      attention: null,
+      tone: "idle",
+    });
+    expect(sessionAttention(moving)).toBeNull();
+    expect(isMovingSession(moving)).toBe(true);
+    expect(isLiveSession(moving)).toBe(false);
+    expect(isLiveSession(session({ status: "running" }))).toBe(true);
+    expect(isLiveSession(session({ status: "killed" }))).toBe(false);
   });
 });

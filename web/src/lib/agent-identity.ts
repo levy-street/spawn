@@ -73,6 +73,20 @@ export function resolveAgentIcon(kind?: string | null, command?: string | null):
 }
 
 /**
+ * What to call an agent definition in prose: its brand ("Codex", "Claude
+ * Code") when it is one SPAWN D knows, else the name the person gave it —
+ * never a built-in definition's slug ("codex", "claude-code").
+ */
+export function agentBrandName(agent: {
+  name: string;
+  kind?: string | null;
+  command?: string | null;
+}): string {
+  const resolved = resolveAgentIcon(agent.kind, agent.command);
+  return resolved.icon === "monogram" || resolved.icon === "shell" ? agent.name : resolved.label;
+}
+
+/**
  * What to call a running command in prose: the brand name when the command is
  * a known agent, else whatever the daemon reported. Keeps version-named
  * executables and bare basenames from showing up in sentences.

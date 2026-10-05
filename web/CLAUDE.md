@@ -39,7 +39,14 @@ src/
                   type-ahead, listing sources, and transfers — the engine,
                   the hub that hands jobs between tabs, the zip writer,
                   download sinks; components/files/FileBrowser draws it in
-                  its page, pane and aside layouts)
+                  its page, pane and aside layouts; lib/move/ is moving a
+                  Claude Code window to another host with its
+                  conversation — the carrier's wire and pump, the
+                  orchestrator and its failure matrix, the resolver for an
+                  unfinished move, the hub that runs a move in the tab
+                  holding the connection, the dialog's checks, the screen
+                  classifier and the move's copy, tested against fakes in
+                  lib/move/fakes.ts)
   middleware.ts   request middleware (+ its test beside it)
 tests/e2e/        Playwright end-to-end specs
 scripts/          build wrappers (next-with-proxy-target.mjs) and helpers
@@ -138,10 +145,13 @@ from the catalogue. Every claim about spawnd survives a diff against
   by their surface.
 - A host's page grows by capability, never by OS: anything beyond Overview,
   Files, Sessions and Access — a Desktop tab, or a section of Overview for
-  its conversations, Claude accounts or boxes — is a slot in
-  `lib/host-offers.ts`, keyed by one versioned capability family the host
-  advertises on this device's own connection, and lit only once this build
-  ships its view. The phone keeps the same slots on the same families.
+  its conversations, its unfinished moves, Claude accounts or boxes — is a
+  slot in `lib/host-offers.ts`, keyed by one versioned capability family the
+  host advertises on this device's own connection, and lit only once this
+  build ships its view. The phone keeps the same slots, with the same ids
+  and labels, on the same families. The first to ship is Unfinished moves
+  (`moves`, `conv.v2`, `components/hosts/cockpit/unfinished-moves.tsx`);
+  `conversations` stays reserved for the list of a host's conversations.
 - Polling idles when nothing is pending. A `refetchInterval` under ten seconds
   is for a state a person is waiting on right now — a live ceremony, a blocked
   session — and gives way to the idle cadence the moment that state clears
@@ -169,6 +179,35 @@ from the catalogue. Every claim about spawnd survives a diff against
   never caches it, and a new version of it waits to take over while the one in
   control is still answering a streamed download (the stream lives only in
   that worker's memory).
+- Moving a window to another host with its conversation is a job too, never
+  work a view does itself: `MovesProvider` (`components/workspace/`) runs it
+  through the hub in `lib/move/move-hub.ts`, in the tab that holds the
+  target's connection, over consumer channels of its own, and the tab that
+  asked queues what is typed after it (`move-launch.ts`). Exactly one tab
+  runs a move, queues its relaunch and restarts a window put back: each is a
+  Web Lock claim one tab takes for good, never a timeout that lets a second
+  tab do it too. Whoever settles a move — the mover, or any device that
+  resolves it — leaves the window running its agent: the resume (put back,
+  the line from `lib/move/put-back.ts` — the Restart line, naming no mode,
+  so Claude Code comes back in the mode its record carries on the source;
+  only a line that carries the conversation to the target names one) is
+  queued with `pendingLaunch.claim`, and that device's view of the window
+  takes the display to type it (`usePendingLaunchDrain`) rather than
+  waiting for Take control; with no view of it (a host's page), the outcome
+  says so and offers to open the window. A card saying the window stays
+  "Moving" goes once its row stops reading moving (`useDismissWhenResolved`).
+  The orchestrator, carrier and resolver in `lib/move/` are framework-free and
+  tested against `lib/move/fakes.ts`; once the target has
+  committed, a move only finishes, and a refusal from the server is read
+  again rather than believed (`lib/move/server.ts`). Every string a move says
+  is in `lib/move/copy.ts`, which the phone mirrors string for string
+  (`lib/move/copy.test.ts` and the phone's `move-copy.test.ts` pin the same
+  names to the same sentences), and none is a daemon or server code. A note
+  is typed into Claude Code only when the shared screen table
+  (`lib/move/screen.ts`, pinned by `proto/claude-screen-vectors.json`) reads
+  its ready prompt; no dialog is ever answered with a key. A v2 chunk's bytes are encoded and read only in
+  `lib/hostControl.ts` (`sendChunkV2`, `handleStreamV2`), which
+  `scripts/check-no-server-agent-upload.sh` pins.
 - Device transport: `DaemonConnectionsProvider` owns one signed host connection
   per registered device and host. Identity replacement retires its connections.
   `lib/daemon-connection.ts` shares it across tabs with
@@ -188,6 +227,15 @@ An end-to-end test that starts another Next server gives it its own disposable
 `SPAWN_NEXT_DIST_DIR`. Sharing `.next` overwrites the running suite's build.
 Use `SPAWN_NEXT_TSCONFIG_PATH` with a disposable config copy as well, so Next's
 generated type paths never rewrite the tracked `tsconfig.json`.
+
+In CI the suite compiles every page and route handler under `src/app` before
+its first test (`tests/e2e/global-setup.ts`), and the dev server Playwright
+starts keeps them compiled for the run (`SPAWN_E2E_KEEP_ROUTES`, read in
+`next.config.ts`), so nothing compiles or rebuilds under a test. A new page
+or route handler (`page` or `route`, as `.tsx`, `.ts`, `.jsx` or `.js`)
+needs nothing more: the setup finds it. Metadata routes such as `robots.ts`
+and `sitemap.ts` are not warmed; a test that visits one pays its first
+compile.
 
 ## Keeping this file true
 

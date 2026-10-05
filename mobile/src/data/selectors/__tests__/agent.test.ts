@@ -1,5 +1,6 @@
 import {
   agentCanResume,
+  agentDisplayName,
   agentInstallAndLaunchCommand,
   agentInstallAndRunCommand,
   agentLaunchCommand,
@@ -102,6 +103,24 @@ describe("agent identity", () => {
       logoKey: "shell",
     });
     expect(runningAgent("pwsh.exe", BUILT_INS)).toBeNull();
+  });
+});
+
+describe("agentDisplayName", () => {
+  it("names a built-in agent as people read it, never by its definition's slug", () => {
+    expect(BUILT_INS.map(agentDisplayName)).toEqual([
+      "Claude Code",
+      "Codex",
+      "OpenCode",
+      "Aider Sonnet",
+      "Hermes Agent",
+    ]);
+  });
+
+  it("names a custom agent by its own name", () => {
+    expect(agentDisplayName(agent({ name: "My Bot", kind: "mybot", command: "mybot" }))).toBe(
+      "My Bot",
+    );
   });
 });
 

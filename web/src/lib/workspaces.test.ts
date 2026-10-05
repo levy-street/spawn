@@ -102,6 +102,9 @@ describe("workspaceAttentionCount", () => {
       // S3 unknown (still loading) — must not count or throw.
     ]);
     expect(workspaceAttentionCount(workspace, sessionsById)).toBe(2);
+    // A window on its way to another host asks nothing of anyone.
+    sessionsById.set(S3, makeSession(S3, { status: "moving", activity_state: "moving" }));
+    expect(workspaceAttentionCount(workspace, sessionsById)).toBe(2);
     expect(workspaceAttentionCount(makeWorkspace([]), sessionsById)).toBe(0);
   });
 });
@@ -210,6 +213,8 @@ describe("workspaceLiveSessionCount", () => {
       [S2, makeSession(S2, { status: "starting" })],
       [S3, makeSession(S3, { status: "exited" })],
     ]);
+    expect(workspaceLiveSessionCount(workspace, sessionsById)).toBe(2);
+    sessionsById.set(S3, makeSession(S3, { status: "moving" }));
     expect(workspaceLiveSessionCount(workspace, sessionsById)).toBe(2);
   });
 

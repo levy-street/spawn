@@ -43,8 +43,20 @@ export const SessionMoveSchema = z.object({
    *  nothing recorded as one — a shell someone typed `claude` into. Omitted
    *  leaves the type be. */
   agent_id: UUIDSchema.nullable().optional(),
-  /** The new conversation the agent starts with over there, or none. */
+  /** The new conversation the agent starts with over there, or none — or,
+   *  on a carried move's commit, the conversation the device carried there. */
   agent_session_id: z.string().max(64).nullable().optional(),
+  /** True commits a carried move: the window must be "moving" from
+   *  `expected_host_id`, as `/move/begin` left it. */
+  carried: z.boolean().optional(),
+});
+/**
+ * `/move/begin` and `/move/abort`: the host the client saw the window on, and
+ * nothing else. Neither names where the window goes nor carries anything of
+ * the conversation.
+ */
+export const SessionMoveFenceSchema = z.object({
+  expected_host_id: UUIDSchema,
 });
 export const SessionOutSchema = z.object({
   id: UUIDSchema,
@@ -80,4 +92,5 @@ export type TilePlacement = z.infer<typeof TilePlacementSchema>;
 export type SessionCreate = z.infer<typeof SessionCreateSchema>;
 export type SessionPatch = z.infer<typeof SessionPatchSchema>;
 export type SessionMove = z.infer<typeof SessionMoveSchema>;
+export type SessionMoveFence = z.infer<typeof SessionMoveFenceSchema>;
 export type SessionOut = z.infer<typeof SessionOutSchema>;

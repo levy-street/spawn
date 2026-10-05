@@ -2129,11 +2129,16 @@ A line that cannot be said as asked — a mode the CLI has no flag, or no such
 mode, for; a note the CLI or the shell cannot take on the command line — is
 not composed at all, never composed with that part left off. Restart asks for
 no mode and no note: the agent comes back on the same host in the mode its
-own conversation recorded, as it always has. A note means the conversation
-was carried, so a relaunch with a note and no explicit mode is not composed
-either: every resume SPAWN D types after a move or an account switch carries
-an explicit mode, and a carried record can never bring back a mode the
-Operator did not choose on the receiving host. Codex has no mode to state
+own conversation recorded, as it always has. A move put back is a Restart
+too — the window comes back on the host it never left, its conversation put
+back where it was by the source's own retire abort, so the record is the one
+that host wrote and its mode is the one the window ran in before the move
+(the browser's `lib/move/put-back.ts`, the phone's `putBackLine`). A note
+means the conversation was carried, so a relaunch with a note and no
+explicit mode is not composed either: every resume SPAWN D types where a
+move or an account switch has carried a conversation carries an explicit
+mode, and a carried record can never bring back a mode the Operator did not
+choose on the receiving host. Codex has no mode to state
 until Codex carry gives it an approval grammar, so until then a Codex
 conversation has no move line at all.
 
@@ -2242,6 +2247,106 @@ follows only the ready prompt, and never an idle note.
 the resume itself), `--append-system-prompt` (a resumed conversation keeps
 its recorded system prompt until it is compacted), or a rewritten or stripped
 transcript (its thinking blocks are bound to it).
+
+### Reading Claude Code's screen after a move
+
+A typed note waits for Claude Code's prompt, and nothing a device types may
+answer a question Claude Code asks the person. So after a move the device
+delivering the note reads the resumed window's screen — on the device, from
+its own terminal; the daemon and the server never see it — and classifies it
+with one table, [`claude-screen-vectors.json`](claude-screen-vectors.json)
+(version 2), which both clients embed (`web/src/lib/move/screen.ts`,
+`mobile/src/data/selectors/claude-screen.ts`). Each client's test
+deep-equals its embedded table with the file — all of it but `description`,
+`source`, `checked_against` and `fixtures` — and classifies every fixture as
+the file expects. The fixtures are screens captured from Claude Code 2.1.289
+in a sandbox against a local stub of the Messages API, and screens laid out
+like them with wording read out of the installed 2.1.288 and 2.1.289 binaries,
+each shell's own messages, or text a person, Claude or a host's name can put
+there; each says which.
+
+**Input.** The visible rows of the terminal's active buffer (Claude Code
+2.1.289 draws on the alternate one), top to bottom, as logical lines: each
+row is read without the empty cells at its end (xterm's
+`translateToString(true)`), a row xterm marks `isWrapped` is appended to the
+line before it, and a line that began above the first visible row is read
+from its start (web `readScreenLines`, the phone's terminal worker
+`readScreen`). Whitespace means JavaScript's `\s` with the `u` flag, which
+includes the no-break space Claude Code draws after `❯`; every pattern in the
+table is a JavaScript regular expression compiled with the `u` flag.
+
+**Classifying.** `core(line)` is the line without `edge_characters` (a
+dialog's box drawing) and whitespace at either end. A rule matches some lines
+when the lines' words — their cores, blank ones left out, joined by single
+spaces, every run of whitespace made one space — contain any of its `any`
+strings or every one of its `all` strings, or when one line's core matches
+one of its `line_regex`.
+
+1. Find the last line holding any string in
+   `read_below_last_line_containing` (`--permission-mode`: every line that
+   carries a conversation onto a host names its mode, so that line is the
+   shell's echo of it; a move put back names none, and has no note to wait
+   on, so its screen is never read). Only
+   the lines after it are read; with none, all of them are. The echo carries
+   the note's server-chosen host names, and whatever was on the screen above
+   it — an earlier attempt's error — is not this attempt's.
+2. Drop trailing blank lines. Nothing left is `unknown`.
+3. Look for Claude Code's input box, walking up from the last line. At each
+   line: if its core matches `input_box.rule`, the core above it matches
+   `input_box.prompt` and the one above that matches `input_box.rule`, those
+   three lines are the box. Otherwise the line, unless it is blank, counts as
+   a footer line; with more than `input_box.footer_lines_max` (2) of them, or
+   at the top of the screen, there is no box. A rule is at least ten `─` or
+   `━`, then optionally a label set off by whitespace (a named
+   conversation's) and one to four more of them.
+4. With a box, the context is the `input_box.context_lines_above` (4) lines
+   above its top rule and the lines under its bottom rule. The first rule of
+   `while_input_shows` that matches the context names the state
+   (`login_required`, then `busy`). Otherwise the state is `agent_ready` when
+   the prompt's core matches `input_box.empty_prompt`, and `unknown` when
+   anything is typed into it.
+5. Without a box, the last `bottom_lines` (14) lines are read, and the first
+   rule of `bottom` that matches them names the state:
+   `conversation_not_found`, `agent_missing`, `trust_prompt`,
+   `bypass_prompt`, `resume_summary_prompt`, `login_required`, `dialog`. None
+   matching is `unknown`.
+
+The conversation is read only in the few lines next to the box, and without
+the box only at the bottom of the screen, where a question replaces it: a
+history that quotes a dialog, a numbered request, or Claude asking "Do you
+want to proceed?" in prose cannot pass for a question, and an input box drawn
+in the conversation cannot pass for the prompt.
+
+**States.** `agent_ready`: the empty prompt, nothing running, nothing asked.
+`busy`: a turn is running — the lines around the box hold "esc to interr"
+(the footer's "esc to interrupt", or what a narrow screen leaves of it) or
+"enter to interrupt", or a spinner line such as "✻ Polishing… (3s · ↓ 14
+tokens)" sits just above the box. `trust_prompt`, `bypass_prompt`, `resume_summary_prompt`, `login_required`:
+the folder trust question, the Bypass Permissions warning, the long
+conversation's resume choice, and signing in (the login method or first-run
+screens, or "Not logged in" by the prompt). `dialog`: any other question —
+a tool's permission ("Do you want to proceed?"), the environment API key, a
+numbered choice. `conversation_not_found`: Claude Code had no such
+conversation. `agent_missing`: the shell has no `claude`. `unknown`: anything
+else. `asks_person` lists the five question states.
+
+**What a device does.** It types into Claude Code only on `agent_ready`: an
+idle note, never sent, or a mid-turn note followed by Enter as a keystroke of
+its own. On a state in `asks_person` it says in a banner what Claude Code is
+asking and leaves the terminal to the person to answer it — nothing guards
+the terminal while a question is up — and it never presses a key into a
+question (the trust and Bypass Permissions warnings select "No, exit" first,
+so a blind Enter would quit). On `busy` or `unknown` it waits; past its wait it leaves
+the terminal alone and offers a note it has not placed to copy. On
+`conversation_not_found` it says so and offers Try again, which types the
+resume line again; until the echo of that line is read the screen still shows
+the error, so a device reads it as `unknown` until the terminal reads another
+state or five seconds pass. On `agent_missing` it says so and stops.
+
+**Changing it.** A rule, a state or a fixture changes in the JSON and in both
+embeds in the same commit, with a fixture that shows why. `version` moves
+whenever a state's meaning or the way a screen is read changes, so an embed
+left behind fails its test.
 
 ## Versioning
 

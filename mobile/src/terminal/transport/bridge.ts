@@ -96,6 +96,7 @@ export type NativeToWorkerMessage =
   | (NativeMessage & { type: "set-follow"; follow: boolean })
   | (NativeMessage & { type: "search"; query: string; direction: "next" | "prev" })
   | (NativeMessage & { type: "copy-selection"; requestId: string })
+  | (NativeMessage & { type: "read-screen"; requestId: string })
   | (NativeMessage & {
       type: "clipboard-response";
       requestId: string;
@@ -170,6 +171,13 @@ export type WorkerToNativeMessage =
   | (WorkerMessage & { type: "agent-notice"; notice: AgentNotice | null })
   | (WorkerMessage & { type: "scroll-state"; scroll: ScrollState })
   | (WorkerMessage & { type: "selection"; text: string; requestId?: string })
+  | (WorkerMessage & {
+      type: "screen";
+      requestId: string;
+      lines: string[];
+      cols: number;
+      alternate: boolean;
+    })
   | (WorkerMessage & { type: "native-selection"; active: boolean })
   | (WorkerMessage & { type: "link"; url: string })
   | (WorkerMessage & { type: "clipboard-read"; requestId: string })
@@ -288,6 +296,7 @@ const NATIVE_MESSAGE_TYPES = new Set([
   "set-follow",
   "search",
   "copy-selection",
+  "read-screen",
   "clipboard-response",
   "focus",
   "blur",
@@ -315,6 +324,7 @@ const WORKER_MESSAGE_TYPES = new Set([
   "agent-notice",
   "scroll-state",
   "selection",
+  "screen",
   "native-selection",
   "link",
   "clipboard-read",

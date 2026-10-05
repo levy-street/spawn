@@ -147,6 +147,7 @@ function respond(bridge: FakeBridge, request: { requestId: string }, result: unk
 
 async function readyTransport(options?: {
   capabilities?: readonly string[];
+  limits?: Record<string, unknown>;
   omitCapabilities?: boolean;
   streamTimeoutMs?: number;
   loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
@@ -195,6 +196,7 @@ async function readyTransport(options?: {
         range_bytes: 16 * 1024 * 1024,
         preview_bytes: 2 * 1024 * 1024,
         preview_pixels: [128, 256, 512, 1024],
+        ...options?.limits,
       },
     },
   });
@@ -896,6 +898,225 @@ describe("HostTransport conversation inspection", () => {
       code: "unsupported_operation",
     });
     expect(hostRequests(bridge, "conv.inspect")).toHaveLength(0);
+    transport.close();
+  });
+});
+
+describe("HostTransport conversation carrier", () => {
+  const transferId = "9b2f5c1e-7a40-4d3b-8e61-0c4f2a7d9e15";
+  const conversationId = "6f1c2a9e-0b7d-4c55-8f3e-2d9a1b7c4e60";
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  const targetId = "44444444-4444-4444-8444-444444444444";
+
+  test("a host without conv.v2 is never asked to carry", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["conv.v1"] });
+    await expect(transport.conversationProbe({ cwd: "~/code/spawn" })).rejects.toMatchObject({
+      code: "unsupported_operation",
+    });
+    await expect(transport.conversationTransfers()).rejects.toMatchObject({
+      code: "unsupported_operation",
+    });
+    expect(hostRequests(bridge, "conv.probe")).toHaveLength(0);
+    transport.close();
+  });
+
+  test("probes the target for the conversation in the folder it goes to", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["conv.v1", "conv.v2"] });
+    const pending = transport.conversationProbe({ conversationId, cwd: "~/code/spawn" });
+    const request = await waitForRequest(bridge, "conv.probe");
+    expect(request.payload).toEqual({
+      agent: "claude-code",
+      cwd: "~/code/spawn",
+      conversation_id: conversationId,
+    });
+    respond(bridge, request, {
+      agent: "claude-code",
+      home: "/Users/me",
+      cwd: "/Users/me/code/spawn",
+      folder_exists: true,
+      project_folder: "-Users-me-code-spawn",
+      store: "~/.claude",
+      store_ready: true,
+      store_problem: null,
+      destination: "~/.claude/projects/-Users-me-code-spawn",
+      memory: "~/.claude/projects/-Users-me-code-spawn/memory",
+      repository_root: "/Users/me/code/spawn",
+      duplicates: [],
+      duplicates_truncated: false,
+      live: false,
+      login_shell: "zsh",
+      cli_version: "2.1.289",
+    });
+    await expect(pending).resolves.toMatchObject({
+      cwd: "/Users/me/code/spawn",
+      folderExists: true,
+      storeReady: true,
+      memory: "~/.claude/projects/-Users-me-code-spawn/memory",
+      live: false,
+      loginShell: "zsh",
+      cliVersion: "2.1.289",
+    });
+    transport.close();
+  });
+
+  test("exports in the window the host allows and acknowledges what it hands on", async () => {
+    const { bridge, transport } = await readyTransport({
+      capabilities: ["conv.v1", "conv.v2"],
+      limits: { stream_window_max: 8 },
+    });
+    const pending = transport.conversationExport({
+      transferId,
+      conversationId,
+      sessionId,
+      toHostId: targetId,
+      cwd: "~/code/spawn",
+      fromSequence: 0,
+    });
+    const request = await waitForRequest(bridge, "conv.export");
+    expect(request.payload).toEqual({
+      transfer_id: transferId,
+      agent: "claude-code",
+      conversation_id: conversationId,
+      mode: "retire",
+      session_id: sessionId,
+      to_host_id: targetId,
+      cwd: "~/code/spawn",
+      stream: { window: 8, digest: "end" },
+      from_sequence: 0,
+    });
+    const bytes = Uint8Array.of(1, 2, 3);
+    respond(bridge, request, {
+      stream_id: "rs-1",
+      transfer_id: transferId,
+      mode: "retire",
+      length: bytes.byteLength,
+      sha256: null,
+      window: 8,
+      next_sequence: 0,
+      entries: 1,
+      skipped: 0,
+      stopped: "stopped",
+    });
+    // The chunk follows the response at once, as the daemon sends them.
+    bridge.stream({
+      version: 1,
+      type: "stream.chunk",
+      stream_id: "rs-1",
+      sequence: 0,
+      bytes_b64: encodeBridgeBytes(bytes),
+    });
+    const { declaration, reader } = await pending;
+    expect(declaration).toMatchObject({ length: 3, sha256: null, stopped: "stopped", window: 8 });
+    await expect(reader.next()).resolves.toEqual({ kind: "chunk", sequence: 0, bytes });
+    reader.acknowledge(1);
+    bridge.stream({
+      version: 1,
+      type: "stream.end",
+      stream_id: "rs-1",
+      length: 3,
+      sha256: digest(bytes),
+    });
+    await expect(reader.next()).resolves.toEqual({ kind: "end", length: 3, sha256: digest(bytes) });
+    expect(hostRequests(bridge, "$host.stream.ack").map((item) => item.payload)).toEqual([
+      { stream_id: "rs-1", sequence: 1 },
+    ]);
+    transport.close();
+  });
+
+  test("imports with the source's digest at the end and returns what the target placed", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["conv.v1", "conv.v2"] });
+    const pending = transport.conversationImport({
+      transferId,
+      conversationId,
+      cwd: "~/code/spawn",
+      length: 3,
+      sha256: null,
+      fromHostId: sessionId,
+    });
+    const request = await waitForRequest(bridge, "conv.import.begin");
+    expect(request.payload).toEqual({
+      transfer_id: transferId,
+      agent: "claude-code",
+      conversation_id: conversationId,
+      mode: "retire",
+      cwd: "~/code/spawn",
+      length: 3,
+      sha256: null,
+      stream: { window: 16, digest: "end" },
+      from_host_id: sessionId,
+    });
+    respond(bridge, request, { stream_id: "ws-1", window: 16, next_sequence: 0, received: 0 });
+    const { opened, writer } = await pending;
+    expect(opened).toEqual({ streamId: "ws-1", window: 16, nextSequence: 0, received: 0 });
+    await writer.write(0, Uint8Array.of(1, 2, 3));
+    bridge.stream({ version: 1, type: "stream.ack", stream_id: "ws-1", sequence: 1 });
+    const committing = writer.end(3, "c".repeat(64));
+    await flush();
+    bridge.stream({
+      version: 1,
+      type: "stream.committed",
+      stream_id: "ws-1",
+      length: 3,
+      sha256: "c".repeat(64),
+      result: {
+        transfer_id: transferId,
+        conversation_id: conversationId,
+        cwd: "/Users/me/code/spawn",
+        project_folder: "-Users-me-code-spawn",
+        path: "~/.claude/projects/-Users-me-code-spawn/x.jsonl",
+        memory: "~/.claude/projects/-Users-me-code-spawn/memory",
+        set_aside: 0,
+      },
+    });
+    await expect(committing).resolves.toMatchObject({ length: 3, sha256: "c".repeat(64) });
+    expect(hostRequests(bridge, "$host.stream.end").map((item) => item.payload)).toEqual([
+      { stream_id: "ws-1", length: 3, sha256: "c".repeat(64) },
+    ]);
+    transport.close();
+  });
+
+  test("settles both ends and lists what is unfinished", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["conv.v1", "conv.v2"] });
+    const status = transport.conversationImportStatus(transferId);
+    respond(bridge, await waitForRequest(bridge, "conv.import.status"), {
+      state: "receiving",
+      received: 16384,
+      next_sequence: 2,
+    });
+    await expect(status).resolves.toEqual({ state: "receiving", received: 16384, nextSequence: 2 });
+    const commit = transport.conversationRetireCommit({
+      transferId,
+      length: 3,
+      sha256: "d".repeat(64),
+    });
+    const commitRequest = await waitForRequest(bridge, "conv.retire.commit");
+    expect(commitRequest.payload).toEqual({
+      transfer_id: transferId,
+      length: 3,
+      sha256: "d".repeat(64),
+    });
+    respond(bridge, commitRequest, { state: "retired", retired_at: 1, kept_until: 2 });
+    await expect(commit).resolves.toEqual({ state: "retired", keptUntil: 2 });
+    const listing = transport.conversationTransfers();
+    respond(bridge, await waitForRequest(bridge, "conv.transfers"), {
+      outgoing: [
+        {
+          transfer_id: transferId,
+          conversation_id: conversationId,
+          session_id: sessionId,
+          to_host_id: targetId,
+          state: "moving",
+          created_at: 5,
+          length: 3,
+          sha256: "d".repeat(64),
+        },
+      ],
+      incoming: [],
+      truncated: false,
+    });
+    await expect(listing).resolves.toMatchObject({
+      outgoing: [{ transferId, sessionId, toHostId: targetId, state: "moving", length: 3 }],
+    });
     transport.close();
   });
 });

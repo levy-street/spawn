@@ -299,7 +299,7 @@ export const RecentDirsSchema = z.object({
 });
 export type RecentDirs = z.infer<typeof RecentDirsSchema>;
 
-export const SESSION_STATUSES = ["starting", "running", "exited", "killed"] as const;
+export const SESSION_STATUSES = ["starting", "running", "exited", "killed", "moving"] as const;
 export type SessionStatus = (typeof SESSION_STATUSES)[number];
 export const SESSION_ACTIVITY_STATES = [
   "starting",
@@ -309,15 +309,17 @@ export const SESSION_ACTIVITY_STATES = [
   "input_sent",
   "exited",
   "killed",
+  "moving",
   "unknown",
 ] as const;
 export type SessionActivityState = (typeof SESSION_ACTIVITY_STATES)[number];
 
 /**
- * The server's status is free text, and a newer server adds values (a window
- * being moved between hosts reads `moving`). One unknown value must not fail
- * the parse of every session list it appears in, so it reads as `starting`:
- * the window exists, and is not running here yet.
+ * The server's status is free text, and a newer server adds values. One
+ * unknown value must not fail the parse of every session list it appears in,
+ * so it reads as `starting`: the window exists, and is not running here yet.
+ * `moving` is known: a device is carrying the window's conversation to
+ * another host (`/move/begin`), and only its commit or its abort ends it.
  */
 export function knownSessionStatus(value: string): SessionStatus {
   return (SESSION_STATUSES as readonly string[]).includes(value)
@@ -1389,11 +1391,38 @@ export const sessions = {
       expected_host_id: string;
       agent_id?: string | null;
       agent_session_id?: string | null;
+      /** Commits a carried move begun with `moveBegin`: `agent_session_id`
+       *  names the conversation the target has just taken in. */
+      carried?: boolean;
     },
   ) =>
     api(`/api/sessions/${id}/move`, {
       method: "POST",
       body: JSON.stringify(body),
+      schema: SessionSchema,
+    }),
+  /**
+   * A device is about to carry the window's conversation to another host:
+   * the row reads "moving" until the carried `move` commits it or
+   * `moveAbort` ends it. Refused `move_in_progress`, `move_conflict`,
+   * `source_offline` (the conversation cannot come along) or
+   * `workspace_archived`.
+   */
+  moveBegin: (id: string, expectedHostId: string) =>
+    api(`/api/sessions/${id}/move/begin`, {
+      method: "POST",
+      body: JSON.stringify({ expected_host_id: expectedHostId }),
+      schema: SessionSchema,
+    }),
+  /**
+   * End a carried move that will not commit: "running" when nothing stopped
+   * the window meanwhile, "killed" when an exit was recorded (restart it to
+   * resume there). `move_conflict` when it committed or ended already.
+   */
+  moveAbort: (id: string, expectedHostId: string) =>
+    api(`/api/sessions/${id}/move/abort`, {
+      method: "POST",
+      body: JSON.stringify({ expected_host_id: expectedHostId }),
       schema: SessionSchema,
     }),
   /** Kill + hard delete. */

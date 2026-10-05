@@ -12,6 +12,24 @@ import type {
 } from "@/data/types/domain";
 
 const ACTIVE_OUTPUT_MS = 3_000;
+
+/** What every device shows on a pane and its terminal while a device moves
+ *  the window to another host: the target cannot be named before the commit. */
+export const MOVING_STATUS_LABEL = "Moving to another host…";
+/** The same window in lists, the host page and the fleet: the server's word. */
+export const MOVING_LIST_LABEL = "Moving";
+
+/** A window being carried to another host (`/move/begin`): not live, not
+ *  waiting, not dead — and never attached on the host it is leaving. */
+export function isMovingSession(session: Pick<Session, "status">): boolean {
+  return session.status === "moving";
+}
+
+/** Whether a window counts as running somewhere: not stopped, and not in
+ *  the middle of a move. */
+export function isLiveSession(session: Pick<Session, "status">): boolean {
+  return session.status !== "exited" && session.status !== "killed" && session.status !== "moving";
+}
 const WAITING_OUTPUT_MS = 8_000;
 
 function timestamp(value: string | null): number | null {
@@ -39,6 +57,7 @@ export function deriveActivity(session: Session, now = Date.now()): ActivityPres
   if (session.status === "starting") return terminal("starting", "Starting");
   if (session.status === "exited") return terminal("exited", "Exited");
   if (session.status === "killed") return terminal("killed", "Killed");
+  if (session.status === "moving") return terminal("moving", MOVING_LIST_LABEL);
   if (session.status !== "running") {
     const label = session.status
       .replaceAll("_", " ")
@@ -69,6 +88,7 @@ export function activityTone(session: Session): ActivityTone {
     case "starting":
       return "waiting";
     case "quiet":
+    case "moving":
       return "idle";
     default:
       return session.status === "running" ? "idle" : "offline";
@@ -104,7 +124,11 @@ export function displayStatus(
     transport,
     transportPresentation: transportPresentation(transport),
     attention: sessionAttention(session),
-    label: session.activity_label || session.status.toUpperCase(),
+    // The server's own label for a moving window is "Moving"; every device
+    // says where to, as far as it can before the commit.
+    label: isMovingSession(session)
+      ? MOVING_STATUS_LABEL
+      : session.activity_label || session.status.toUpperCase(),
     tone: activityTone(session),
     pulse: session.activity_state === "active",
   };

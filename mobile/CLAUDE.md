@@ -69,8 +69,11 @@ scripts/, docs/   build helpers and app-specific notes
   (never on the OS or a shared prefix) and this build ships its view — the
   slot is in `SHIPPED_HOST_OFFERS` and its renderer in
   `cockpit/host-offer-slots.tsx`, added in one change (a test holds the two
-  together). `host/[id]/agents.tsx` is a redirect stub to Overview for one OTA
-  cycle.
+  together). The slots, their ids and labels are the browser's; the first to
+  ship is Unfinished moves (`moves`, `conv.v2`,
+  `cockpit/unfinished-moves-panel.tsx`), and `conversations` stays reserved
+  for the list of a host's conversations. `host/[id]/agents.tsx` is a
+  redirect stub to Overview for one OTA cycle.
 - Uploads and sends between hosts go through one queue,
   `data/stores/transfers.ts` (memory only: it names host paths), run one item
   (a folder to make or a file to copy) at a time by
@@ -87,6 +90,66 @@ scripts/, docs/   build helpers and app-specific notes
   on screen is `interrupted`, not failed: the queue pauses and waits for Resume.
   The file browser body never navigates: it asks its screen to show a folder
   (`onOpenFolder`) or a window opened from one (`onWindowOpened`).
+- A Claude Code window moved to another host carries its conversation
+  (milestone M6, `conv.v2` in both hosts' hellos, never their OS):
+  `components/workspace-detail/move-conversation.ts` is the orchestrator —
+  the dialog's checks (`previewMove`, side-effect free; a target folder that
+  is not there blocks the carry, as does anything the import would refuse),
+  then `/move/begin`, the source's `conv.export` retire, the target's
+  `conv.import.begin`, a pump that never outruns the target's window,
+  `conv.retire.commit` and the carried `/move`; a failure before the target
+  commits is held for Try again or put back in the one safe order (target
+  cancelled — it must answer "cancelled" — then the source's files, then the
+  server abort, then a restart only where the retire stopped Claude), and
+  nothing after it is ever undone: a carried commit refused as settled is
+  checked against the window's row (begun again where a resolver put it back
+  underneath the carry, or "Take the window to <host>"). A host that cannot
+  answer before the commit leaves "Give up the move" — the server's abort
+  alone, neither host touched. `move-resolve.ts` finishes or undoes a move
+  from any device, from the hosts' own `conv.transfers` and
+  `conv.import.status`; it never decides on one empty listing (read again,
+  then the source asked whether anything is moving) and offers Give up where
+  a host cannot answer. Resolve asks first (`use-resolve-move.tsx`,
+  `MoveResolveSheet`) from the moving window, the pane's ⋯ sheet and the host
+  page. Whoever settles a move leaves the window running its agent: a
+  put-back restarts it with the line from `putBackLine`
+  (`data/selectors/move-facts.ts`, the browser's line: the Restart line,
+  naming no mode, so Claude Code comes back in the mode its record carries
+  on the source; only a line that carries the conversation to the target
+  names one) queued for this device, and the device that settled it opens
+  the window (the opening takes control and types it) — from the host
+  page, a toast says the agent resumes when the window is opened and offers
+  Open window. A move held "moving" here that another device settles
+  meanwhile is let go once its row stops reading moving
+  (`resolvedUnderneath`). Every word is in `move-copy.ts`, which the browser mirrors string for
+  string: `__tests__/move-copy.test.ts` and the browser's
+  `lib/move/copy.test.ts` pin the same names to the same sentences, so a
+  change to one is a change to both; no daemon or server code and no agent
+  definition's slug reaches a person. Runs live in
+  `data/stores/moves.ts` (memory only) and are run by `move-runner.tsx`,
+  mounted once in `(drawer)/_layout.tsx` beside the transfer runner:
+  keep-awake while one is under way, stopped where it is past the
+  three-second background deadline, and the moved window opened full screen
+  when this device's commit lands it — the opening takes control, so the
+  resume line (the pending-launch store) and the note (its sibling
+  `launcher/pending-agent-input.ts`, host names and folders, never
+  conversation bytes, for at most 15 minutes) are typed by this device only.
+  Both are written provisional before the commit and typable only once it
+  answers (`confirm`); any other end — a refusal, retries spent, Close, the
+  background, an app that died meanwhile — drops them (`discard`, or a lapse
+  after three minutes), so nothing is typed later into a live Claude.
+  The terminal types a note only at Claude Code's ready prompt, read off its
+  own screen with `data/selectors/claude-screen.ts` (pinned by
+  `proto/claude-screen-vectors.json`), answers no dialog — a question on
+  screen lowers the "Resuming the conversation…" guard and shows its banner —
+  and stops at "No conversation found" until Try again
+  (`terminal-ui/move-arrival.ts`). A window that reads "moving" never
+  attaches a terminal and offers only Resolve and Rename
+  (`terminal-ui/moving-window.tsx`, the pane's ⋯ sheet); a terminal that saw
+  it moving follows it as a reconnect. The host page's Unfinished moves
+  (slot `moves`, `conv.v2`, `hosts/cockpit/unfinished-moves-panel.tsx`)
+  lists the moves a host holds that did not finish and its windows the
+  server has moving, never a move this phone is carrying now.
 - Every window the app opens — launcher, "New window here…"
   (`launcher/open-here-sheet.tsx`), template replay, workspace and pane
   duplicates — goes through `components/launcher/create-window.ts`: it names

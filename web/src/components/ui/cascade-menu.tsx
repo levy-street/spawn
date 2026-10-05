@@ -67,6 +67,8 @@ export type CascadePanel = {
   loading?: boolean;
   /** Muted row shown when `items` is empty and not loading. */
   emptyLabel?: string;
+  /** One muted line under the first panel's title: what choosing here does. */
+  caption?: string;
   items: CascadeItem[];
 };
 
@@ -350,13 +352,17 @@ export const CascadeMenu = forwardRef<
           {panel.title ?? "Back"}
         </button>
       ) : (
-        // A sheet already says the first panel's title above it.
-        panel.title != null &&
-        !asSheet && (
-          <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground">
-            {panel.title}
-          </div>
-        )
+        <>
+          {/* A sheet already says the first panel's title above it. */}
+          {panel.title != null && !asSheet && (
+            <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground">
+              {panel.title}
+            </div>
+          )}
+          {panel.caption && (
+            <div className="px-2 pb-1.5 text-[11px] text-muted-foreground">{panel.caption}</div>
+          )}
+        </>
       )}
       {panel.loading ? (
         <div className="flex items-center justify-center py-6">

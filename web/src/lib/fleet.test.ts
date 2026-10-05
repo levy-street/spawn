@@ -178,6 +178,8 @@ describe("summarizeFleet", () => {
         makeSession("s2", HOST_A, { activity_state: "quiet", foreground_command: "claude" }),
         makeSession("s3", HOST_B, { activity_state: "waiting", foreground_command: "codex" }),
         makeSession("s4", HOST_B, { status: "exited" }),
+        // On its way elsewhere: neither live, waiting nor dead here.
+        makeSession("s5", HOST_B, { status: "moving", activity_state: "moving" }),
       ],
     );
     expect(summary.hosts).toBe(2);

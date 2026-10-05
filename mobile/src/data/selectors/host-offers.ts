@@ -10,10 +10,11 @@
  * host's OS, never on the server's word, and never on a name that merely
  * shares a prefix — and this build can draw it (`SHIPPED_HOST_OFFERS`).
  *
- * None is lit by any host today; each is drawn by the milestone that brings
- * its feature.
+ * Each is drawn by the milestone that brings its feature; Unfinished moves
+ * is the first (M6). The browser keeps the same slots, with the same ids,
+ * labels and families.
  */
-export type HostOfferSlotId = "desktop" | "conversations" | "claude-accounts" | "boxes";
+export type HostOfferSlotId = "desktop" | "conversations" | "moves" | "claude-accounts" | "boxes";
 
 export interface HostOfferSlot {
   id: HostOfferSlotId;
@@ -35,6 +36,9 @@ export const HOST_OFFER_SLOTS: readonly HostOfferSlot[] = [
   // shipped (conv.inspect alone, which Restart uses); the list is the version
   // that adds conv.transfers, so a host that only inspects shows nothing here.
   { id: "conversations", capability: "conv.v2", label: "Conversations", placement: "panel" },
+  // Moves that did not finish, as the host keeps them (`conv.transfers`),
+  // each resolvable from here whoever started it. Draws nothing when none.
+  { id: "moves", capability: "conv.v2", label: "Unfinished moves", placement: "panel" },
   {
     id: "claude-accounts",
     capability: "agent.accounts.v1",
@@ -45,12 +49,13 @@ export const HOST_OFFER_SLOTS: readonly HostOfferSlot[] = [
 ];
 
 /**
- * The slots this build can draw. Empty: the registry ships before any of its
- * tenants, and a slot joins this set in the same change that registers its
- * view in `components/hosts/cockpit/host-offer-slots.tsx` (a test holds the
- * two together).
+ * The slots this build can draw: a slot joins this set in the same change
+ * that registers its view in `components/hosts/cockpit/host-offer-slots.tsx`
+ * (a test holds the two together). Unfinished moves came with M6: the moves
+ * a host holds that did not finish. Conversations stays reserved for the
+ * list of the conversations a host keeps.
  */
-export const SHIPPED_HOST_OFFERS: ReadonlySet<HostOfferSlotId> = new Set();
+export const SHIPPED_HOST_OFFERS: ReadonlySet<HostOfferSlotId> = new Set(["moves"]);
 
 export interface HostOffers {
   /** The slots this host lights, in registry order. */

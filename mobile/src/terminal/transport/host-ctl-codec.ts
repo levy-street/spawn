@@ -2,6 +2,14 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { encodeHex } from "@/lib/crypto/bytes";
 import { decodeBridgeBytes, encodeBridgeBytes } from "@/terminal/transport/bridge";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
+import { HostControlTransportError } from "@/terminal/transport/host-ctl-error";
+import {
+  type StreamV2ReadDeclaration,
+  type StreamV2Reader,
+  StreamV2Runtime,
+  type StreamV2WriteDeclaration,
+  type StreamV2Writer,
+} from "@/terminal/transport/stream-v2";
 import type {
   AgentTranscriptFile,
   AgentTranscriptReport,
@@ -58,15 +66,7 @@ const TRANSCRIPT_ROLES = new Set(["conversation", "subagent", "input"]);
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
-export class HostControlTransportError extends Error {
-  constructor(
-    readonly code: string,
-    readonly detail?: string,
-  ) {
-    super(detail ?? code);
-    this.name = "HostControlTransportError";
-  }
-}
+export { HostControlTransportError } from "@/terminal/transport/host-ctl-error";
 
 interface HostRecord extends Record<string, unknown> {
   version?: unknown;
@@ -112,7 +112,18 @@ export type HostStreamFrame =
       readonly code: string;
       readonly detail?: string;
     }
-  | { readonly type: "stream.committed"; readonly streamId: string; readonly path: string };
+  | {
+      readonly type: "stream.committed";
+      readonly streamId: string;
+      /** v1 writes name the file they published. */
+      readonly path?: string;
+      /** Stream v2: what was committed, and the family's result. */
+      readonly length?: number;
+      readonly sha256?: string;
+      readonly result?: unknown;
+    }
+  /** Stream v2: the receiver of a write has taken every chunk below `sequence`. */
+  | { readonly type: "stream.ack"; readonly streamId: string; readonly sequence: number };
 
 function record(value: unknown): HostRecord | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -161,6 +172,7 @@ function parseLimits(value: unknown): HostControlLimits {
     previewPixels: Object.freeze(pixels),
     normalQueue: optionalPositiveInt(limits?.["normal_queue"]),
     fastQueue: optionalPositiveInt(limits?.["fast_queue"]),
+    streamWindowMax: optionalPositiveInt(limits?.["stream_window_max"]),
   });
 }
 
@@ -341,13 +353,38 @@ export function parseHostStreamFrame(value: unknown): HostStreamFrame {
     };
   }
   if (frame.type === "stream.committed") {
-    if (typeof frame.path !== "string") {
+    const invalidCommit = () =>
+      new HostControlTransportError("invalid_commit", "Host returned an invalid commit frame.");
+    if (frame.path !== undefined && typeof frame.path !== "string") throw invalidCommit();
+    if (
+      frame.length !== undefined &&
+      (!Number.isSafeInteger(frame.length) || (frame.length as number) < 0)
+    ) {
+      throw invalidCommit();
+    }
+    if (
+      frame.sha256 !== undefined &&
+      (typeof frame.sha256 !== "string" || !SHA256_PATTERN.test(frame.sha256))
+    ) {
+      throw invalidCommit();
+    }
+    return {
+      type: frame.type,
+      streamId: frame.stream_id,
+      ...(typeof frame.path === "string" ? { path: frame.path } : {}),
+      ...(typeof frame.length === "number" ? { length: frame.length } : {}),
+      ...(typeof frame.sha256 === "string" ? { sha256: frame.sha256 } : {}),
+      ...(frame["result"] === undefined ? {} : { result: frame["result"] }),
+    };
+  }
+  if (frame.type === "stream.ack") {
+    if (!Number.isSafeInteger(frame.sequence) || (frame.sequence as number) < 0) {
       throw new HostControlTransportError(
-        "invalid_commit",
-        "Host returned an invalid commit frame.",
+        "invalid_ack",
+        "Host returned an invalid acknowledgement.",
       );
     }
-    return { type: frame.type, streamId: frame.stream_id, path: frame.path };
+    return { type: frame.type, streamId: frame.stream_id, sequence: frame.sequence as number };
   }
   if (frame.type === "stream.error") {
     const error = record(frame.error);
@@ -444,12 +481,41 @@ export class HostStreamRuntime {
   readonly #incoming = new Map<string, IncomingStreamState>();
   readonly #tombstones = new Map<string, IncomingTombstone>();
   readonly #outgoing = new Map<string, OutgoingStreamState>();
+  readonly #v2: StreamV2Runtime;
 
-  constructor(private readonly port: HostStreamPort) {}
+  constructor(private readonly port: HostStreamPort) {
+    this.#v2 = new StreamV2Runtime(port);
+  }
 
   /** Streams in progress. Each belongs to the channel it started on. */
   get active(): number {
-    return this.#incoming.size + this.#outgoing.size;
+    return this.#incoming.size + this.#outgoing.size + this.#v2.active;
+  }
+
+  /** A request that opens a v2 stream is on its way (`StreamV2Runtime.opening`). */
+  openingV2(): void {
+    this.#v2.opening();
+  }
+
+  openingV2Settled(): void {
+    this.#v2.openingSettled();
+  }
+
+  /** A stream v2 read the host has declared (`conv.export`), registered in
+   *  the same continuation as its declaration: its chunks are on their way. */
+  beginReadV2(streamId: string, declaration: StreamV2ReadDeclaration): StreamV2Reader {
+    if (this.#incoming.has(streamId) || this.#outgoing.has(streamId)) {
+      throw new HostControlTransportError("invalid_response", "Host reused a live stream ID.");
+    }
+    return this.#v2.beginRead(streamId, declaration);
+  }
+
+  /** A stream v2 write the host has opened (`conv.import.begin`). */
+  beginWriteV2(streamId: string, declaration: StreamV2WriteDeclaration): StreamV2Writer {
+    if (this.#incoming.has(streamId) || this.#outgoing.has(streamId)) {
+      throw new HostControlTransportError("invalid_response", "Host reused a live stream ID.");
+    }
+    return this.#v2.beginWrite(streamId, declaration);
   }
 
   beginIncoming(
@@ -618,13 +684,14 @@ export class HostStreamRuntime {
       );
       return;
     }
+    if (this.#v2.handle(frame)) return;
     const outgoing = this.#outgoing.get(frame.streamId);
     if (outgoing && (frame.type === "stream.committed" || frame.type === "stream.error")) {
       this.#outgoing.delete(frame.streamId);
       if (outgoing.timer) clearTimeout(outgoing.timer);
       this.port.settled?.();
       if (frame.type === "stream.committed") {
-        if (!outgoing.commitDispatched) {
+        if (!outgoing.commitDispatched || frame.path === undefined) {
           this.port.fatal(
             new HostControlTransportError(
               "invalid_commit",
@@ -695,6 +762,7 @@ export class HostStreamRuntime {
   }
 
   close(error: Error): void {
+    this.#v2.close(error);
     for (const [streamId, incoming] of this.#incoming) {
       this.#finishIncoming(streamId, incoming);
       incoming.controller.error(error);

@@ -729,6 +729,16 @@
           text: documentSelection() || (state.term?.getSelection() ?? ""),
         });
         return true;
+      case "read-screen":
+        // The live screen as logical lines, for the device's own reading of
+        // where an agent is after a move (claude-screen.ts). Only on request,
+        // and only from the document that draws it: nothing leaves the device.
+        api.post({
+          type: "screen",
+          requestId: message.requestId,
+          ...(api.readScreen?.() ?? { lines: [], cols: 0, alternate: false }),
+        });
+        return true;
       case "focus":
         api.focusDisplayView?.();
         refocusTerminal();

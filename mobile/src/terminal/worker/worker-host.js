@@ -35,18 +35,25 @@
       return text;
     }
 
-    function sendFrame(frame) {
+    function sendFrame(frame, bulk) {
       if (!state.ctl || state.ctl.readyState !== "open") {
         throw new Error("Host-control channel is not ready.");
       }
-      return state.ctl.send(encodeFrame(frame));
+      // A stream's chunks and end are bulk: a tool channel paces them in its
+      // connection's bulk gate. An RTCDataChannel ignores the flag.
+      return state.ctl.send(encodeFrame(frame), bulk === true);
     }
+
+    // A tool channel's bulk frames wait here per channel, then in its
+    // connection's one bulk gate (worker-host-consumers.js); a channel may
+    // hold up to the gate's watermark, so one stream alone can fill it.
+    const highWater = api.bulkHighWater || BUFFERED_HIGH_WATER;
 
     async function waitForWritable() {
       const channel = state.ctl;
       if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
-      if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
-      channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
+      if (channel.bufferedAmount <= highWater) return;
+      channel.bufferedAmountLowThreshold = highWater / 2;
       await new Promise((resolve, reject) => {
         const cleanup = () => {
           clearTimeout(timer);
@@ -58,7 +65,7 @@
           reject(new Error("Host stream backpressure timed out."));
         }, STREAM_TIMEOUT_MS);
         const onWritable = () => {
-          if (channel.bufferedAmount > BUFFERED_HIGH_WATER) return;
+          if (channel.bufferedAmount > highWater) return;
           cleanup();
           resolve();
         };
@@ -128,8 +135,9 @@
           if (!["ack", "cancel", "chunk", "end"].includes(type)) {
             throw new Error("Unknown host stream command.");
           }
-          if (type === "chunk" || type === "end") await waitForWritable();
-          await sendFrame(streamFrame(type, message.payload));
+          const bulk = type === "chunk" || type === "end";
+          if (bulk) await waitForWritable();
+          await sendFrame(streamFrame(type, message.payload), bulk);
           postResponse(message.requestId, true, { sent: true });
           return;
         }

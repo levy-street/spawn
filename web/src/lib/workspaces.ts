@@ -76,7 +76,12 @@ export function workspaceLiveSessionCount(
 ): number {
   return workspaceSessionIds(workspace).filter((id) => {
     const session = sessionsById.get(id);
-    return session !== undefined && session.status !== "exited" && session.status !== "killed";
+    return (
+      session !== undefined &&
+      session.status !== "exited" &&
+      session.status !== "killed" &&
+      session.status !== "moving"
+    );
   }).length;
 }
 

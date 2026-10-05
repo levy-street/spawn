@@ -164,6 +164,34 @@ describe("TerminalSurface", () => {
     await expect(result).resolves.toBe("selected text");
   });
 
+  test("reads the screen on request, correlated by its id", async () => {
+    const ref = createRef<TerminalSurfaceHandle>();
+    await render(<TerminalSurface ref={ref} {...props()} />);
+    let result: Promise<unknown> | undefined;
+    await act(() => {
+      result = ref.current?.readScreen();
+    });
+    const readCall = mockPostMessage.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as { type: string; requestId?: string })
+      .find((message) => message.type === "read-screen");
+    expect(readCall?.requestId).toBeDefined();
+    await act(() => {
+      mockWebViewProps.onMessage?.({
+        nativeEvent: {
+          data: JSON.stringify({
+            v: 1,
+            type: "screen",
+            requestId: readCall?.requestId,
+            lines: ["❯", "────"],
+            cols: 80,
+            alternate: true,
+          }),
+        },
+      });
+    });
+    await expect(result).resolves.toEqual({ lines: ["❯", "────"], cols: 80, alternate: true });
+  });
+
   test("defers fit throughout the soft-keyboard transition", async () => {
     jest.useFakeTimers();
     const listeners = new Map<KeyboardEventName, () => void>();

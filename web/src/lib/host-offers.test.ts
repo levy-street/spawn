@@ -30,9 +30,17 @@ const TODAY_LINUX = [
 const TODAY_MAC = [...TODAY_LINUX, "fs.preview", "desktop.reveal", "desktop.open"];
 
 describe("deriveHostOffers", () => {
-  test("lights nothing in this build, whatever a host advertises", () => {
-    assert.equal(SHIPPED_HOST_OFFERS.size, 0);
-    assert.deepEqual(deriveHostOffers(EVERY_FAMILY), NO_HOST_OFFERS);
+  test("this build draws only unfinished moves, and only for a host that carries", () => {
+    assert.deepEqual([...SHIPPED_HOST_OFFERS], ["moves"]);
+    assert.deepEqual(
+      deriveHostOffers(EVERY_FAMILY).panels.map((slot) => slot.id),
+      ["moves"],
+    );
+    assert.deepEqual(deriveHostOffers(["conv.v1"]), NO_HOST_OFFERS);
+    assert.deepEqual(
+      deriveHostOffers(["conv.v1", "conv.v2"]).panels.map((slot) => slot.label),
+      ["Unfinished moves"],
+    );
   });
 
   test("no host today lights a slot, even with every view shipped", () => {
@@ -67,14 +75,14 @@ describe("deriveHostOffers", () => {
     const listed = deriveHostOffers(["conv.v1", "conv.v2"], EVERY_SLOT);
     assert.deepEqual(
       listed.panels.map((slot) => slot.id),
-      ["conversations"],
+      ["conversations", "moves"],
     );
   });
 
   test("Desktop is a tab of its own; the rest are Overview sections, in registry order", () => {
     assert.deepEqual(
       HOST_OFFER_SLOTS.map((slot) => slot.id),
-      ["desktop", "conversations", "claude-accounts", "boxes"],
+      ["desktop", "conversations", "moves", "claude-accounts", "boxes"],
     );
     const offers = deriveHostOffers(
       new Set(["box.v1", "agent.accounts.v1", "screen.v1", "conv.v2"]),
@@ -86,7 +94,7 @@ describe("deriveHostOffers", () => {
     );
     assert.deepEqual(
       offers.panels.map((slot) => slot.label),
-      ["Conversations", "Claude accounts", "Boxes"],
+      ["Conversations", "Unfinished moves", "Claude accounts", "Boxes"],
     );
   });
 

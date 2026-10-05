@@ -159,6 +159,11 @@ export async function installSessionRtcMock(
 
       class FakeDataChannel {
         label: string;
+        /** The view's attachment the channel belongs to: its label past the
+         *  protocol, which one view's spawn.pty and spawn.ctl share. */
+        attachment: string;
+        /** On spawn.pty: everything sendPty has delivered on it. */
+        output = "";
         historyIndex: number;
         ordered: boolean;
         maxPacketLifeTime: number | null;
@@ -184,7 +189,9 @@ export async function installSessionRtcMock(
         }
 
         constructor(label: string, init?: RTCDataChannelInit) {
-          this.label = label.split("/")[0];
+          const [protocol = label, ...attachment] = label.split("/");
+          this.label = protocol;
+          this.attachment = attachment.join("/");
           this.historyIndex = state.ptyChannels.length;
           this.ordered = init?.ordered ?? true;
           this.maxPacketLifeTime = init?.maxPacketLifeTime ?? null;
@@ -338,7 +345,19 @@ export async function installSessionRtcMock(
             queueMicrotask(() => replyReplay(this, request, selected));
           } else if (operation === "snapshot") {
             if (state.autoSnapshot) {
-              queueMicrotask(() => replyReplay(this, request, state.history));
+              // A daemon's capture holds every byte its pty_offset counts,
+              // and the reply's offset counts everything sendPty has sent: so
+              // the capture holds this view's output too, not the history
+              // alone. A capture without it would roll the screen back — the
+              // client trusts the offset and replays nothing up to it — as
+              // soon as a snapshot lands after a sendPty: a scrollback refresh
+              // or a width reseed that a slow runner fires late.
+              queueMicrotask(() => {
+                const pty = state.ptyChannels.find(
+                  (channel) => channel.attachment === this.attachment,
+                );
+                replyReplay(this, request, state.history + (pty?.output ?? ""));
+              });
             } else {
               state.pendingReplay.push({ channel: this, request });
             }
@@ -534,6 +553,7 @@ export async function installSessionRtcMock(
             connectionIndex == null ? state.activePtyChannel : state.ptyChannels[connectionIndex];
           if (!channel) return false;
           state.ptyOffset += bytes.length;
+          channel.output += text;
           channel.receive(bytes.buffer);
           return true;
         },
