@@ -1,0 +1,24 @@
+{
+  "manifest_version": 2,
+  "name": "SPAWN D Tab Groups",
+  "version": "1.0.0",
+  "description": "Firefox-style tab groups for SPAWN D workspace tabs: name and colour a group, collapse it to its label, add and remove tabs from the tab's right-click menu.",
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  },
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://spawnd.dev/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "spawn-tab-groups@local",
+      "strict_min_version": "115.0"
+    }
+  }
+}
