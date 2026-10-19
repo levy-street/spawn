@@ -25,13 +25,32 @@ const runtimeFiles = [
   "worker-transport.js",
 ];
 
-const [xtermCss, vendorSources, runtimeSources] = await Promise.all([
+// Plain-JS modules the web terminal imports and this worker shares verbatim.
+// The page runs classic scripts, so each is wrapped in a function scope with
+// its `export` keywords stripped, and its exports land on one global.
+const sharedModules = [
+  { file: "web/src/components/terminal/ritual-spinner.mjs", global: "SpawnRitualSpinner" },
+];
+
+function inlineModule(source, global) {
+  if (/^\s*import\s/m.test(source)) throw new Error(`${global}: shared modules cannot import`);
+  const names = [...source.matchAll(/^export (?:const|function) (\w+)/gm)].map((m) => m[1]);
+  const body = source.replace(/^export (const|function) /gm, "$1 ");
+  return `var ${global} = (function () {\n${body}\nreturn { ${names.join(", ")} };\n})();`;
+}
+
+const [xtermCss, vendorSources, sharedSources, runtimeSources] = await Promise.all([
   readFile(resolve(repoRoot, "web/node_modules/@xterm/xterm/css/xterm.css"), "utf8"),
   Promise.all(vendorFiles.map((file) => readFile(resolve(repoRoot, file), "utf8"))),
+  Promise.all(
+    sharedModules.map(async ({ file, global }) =>
+      inlineModule(await readFile(resolve(repoRoot, file), "utf8"), global),
+    ),
+  ),
   Promise.all(runtimeFiles.map((file) => readFile(resolve(workerDir, file), "utf8"))),
 ]);
 
-const scripts = [...vendorSources, ...runtimeSources]
+const scripts = [...vendorSources, ...sharedSources, ...runtimeSources]
   .join("\n")
   .replaceAll("</script", "<\\/script");
 

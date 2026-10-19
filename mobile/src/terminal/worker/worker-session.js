@@ -248,6 +248,9 @@
   }
 
   function scheduleAgentNoticeScan() {
+    // The ritual spinner reads the same screen at the same settled moments,
+    // on its own shorter timer, as it does on the web.
+    state.ritualSpinner?.schedule();
     if (agentNoticeTimer !== null) return;
     agentNoticeTimer = setTimeout(() => {
       agentNoticeTimer = null;
