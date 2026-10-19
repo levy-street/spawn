@@ -54,10 +54,26 @@ export interface WorkspaceTab {
   [key: string]: unknown;
 }
 
+/**
+ * A named, coloured run of adjacent tabs (`data/layout/tab-groups.ts`). Its
+ * `tab_ids` are listed in strip order and always sit next to each other; a tab
+ * belongs to at most one group. `color` is a preset name or a lowercase
+ * `#rrggbb`, and an empty `name` reads as "Unnamed group".
+ */
+export interface TabGroup {
+  id: string;
+  name: string;
+  color: string;
+  collapsed: boolean;
+  tab_ids: TabId[];
+}
+
 export interface WorkspaceLayoutV3 {
   version: 3;
   active_tab: TabId | null;
   tabs: WorkspaceTab[];
+  /** Listed in strip order. Absent reads as none; the wire always carries it. */
+  groups?: TabGroup[];
   [key: string]: unknown;
 }
 

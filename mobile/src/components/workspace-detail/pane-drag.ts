@@ -44,12 +44,17 @@ export interface TabStripGeometry {
   tabWidth: number;
   tabGap: number;
   tabCount: number;
+  /**
+   * Each visible tab's left edge, when group labels share the row. The answer
+   * is then a visible slot, which the strip maps back to its tab.
+   */
+  slotLefts?: readonly number[];
 }
 
 /**
  * Which tab sits under a window-space point, or -1 for none — outside the
- * strip's band, in a gap between tabs, or past the last one (the "+" button
- * is not a drop target).
+ * strip's band, in a gap between tabs, over a group's label, or past the last
+ * one (the "+" button is not a drop target).
  */
 export function tabIndexAtPoint(x: number, y: number, geometry: TabStripGeometry): number {
   "worklet";
@@ -63,6 +68,7 @@ export function tabIndexAtPoint(x: number, y: number, geometry: TabStripGeometry
     tabWidth,
     tabGap,
     tabCount,
+    slotLefts,
   } = geometry;
   if (stripWidth <= 0 || stripHeight <= 0 || tabCount <= 0) return -1;
   if (x < stripLeft || x > stripLeft + stripWidth) return -1;
@@ -70,6 +76,13 @@ export function tabIndexAtPoint(x: number, y: number, geometry: TabStripGeometry
 
   const withinContent = x - stripLeft + scrollX - contentInset;
   if (withinContent < 0) return -1;
+  if (slotLefts) {
+    for (let slot = 0; slot < Math.min(tabCount, slotLefts.length); slot += 1) {
+      const left = slotLefts[slot] as number;
+      if (withinContent >= left && withinContent <= left + tabWidth) return slot;
+    }
+    return -1;
+  }
   const step = tabWidth + tabGap;
   const index = Math.floor(withinContent / step);
   if (index < 0 || index >= tabCount) return -1;

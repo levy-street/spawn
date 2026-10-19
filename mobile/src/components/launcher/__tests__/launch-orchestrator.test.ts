@@ -142,7 +142,7 @@ describe("two-stage launch orchestration", () => {
   test("blocks a launch into a full tab before creating a session", async () => {
     const createSession = jest.fn(async () => makeSession());
     const workspace = makeWorkspace({
-      layout: { version: 3, active_tab: "tab-1", tabs: [fullTab()] },
+      layout: { version: 3, active_tab: "tab-1", groups: [], tabs: [fullTab()] },
     });
     const orchestrator = createLaunchOrchestrator(
       makeDependencies({ getWorkspace: async () => workspace, createSession }),
@@ -204,7 +204,7 @@ describe("two-stage launch orchestration", () => {
 
   test("refuses a file explorer a full tab has no room for", async () => {
     const workspace = makeWorkspace({
-      layout: { version: 3, active_tab: "tab-1", tabs: [fullTab()] },
+      layout: { version: 3, active_tab: "tab-1", groups: [], tabs: [fullTab()] },
     });
     const patchWorkspace = jest.fn<
       ReturnType<LaunchDependencies["patchWorkspace"]>,

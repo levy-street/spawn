@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { auth, SESSION_STATUSES, SessionSchema, trust, WorkspaceSchema } from "./api";
+import { auth, SESSION_STATUSES, SessionSchema, trust, WorkspaceSchema, workspaces } from "./api";
 import { isFilesWidget } from "./grid";
+import type { LayoutV3 } from "./tabs";
 
 const originalFetch = globalThis.fetch;
 
@@ -195,5 +196,46 @@ describe("parsing what a newer server sends", () => {
   test("a files widget that is not well formed is still refused", () => {
     expect(() => WorkspaceSchema.parse(workspace([{ kind: "files", host_id: HOST }]))).toThrow();
     expect(() => WorkspaceSchema.parse(workspace([{ host_id: HOST, path: "/" }]))).toThrow();
+  });
+
+  test("a workspace saved before tab groups reads as having none", () => {
+    expect(WorkspaceSchema.parse(workspace([])).layout.groups).toEqual([]);
+    const withGroups = workspace([]);
+    const group = { id: "g", name: "Agents", color: "teal", collapsed: true, tab_ids: ["t1"] };
+    (withGroups.layout as Record<string, unknown>).groups = [group];
+    // A colour from a newer client is kept as text; normalizeGroups decides.
+    expect(WorkspaceSchema.parse(withGroups).layout.groups).toEqual([group]);
+  });
+});
+
+describe("workspaces.update", () => {
+  const sent = async (layout: LayoutV3) => {
+    let body: unknown = null;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return new Response("{}", { status: 500 });
+    }) as unknown as typeof fetch;
+    await workspaces.update("w", { layout }).catch(() => undefined);
+    return (body as { layout: LayoutV3 }).layout;
+  };
+  const tabs = [
+    { id: "a", name: "A", layout: { version: 3 as const, tiles: [] } },
+    { id: "b", name: "B", layout: { version: 3 as const, tiles: [] } },
+  ];
+
+  test("always sends groups, empty when there are none", async () => {
+    expect((await sent({ version: 3, active_tab: "a", tabs })).groups).toEqual([]);
+  });
+
+  test("sends them normalised against the tabs it is sending", async () => {
+    const layout: LayoutV3 = {
+      version: 3,
+      active_tab: "a",
+      tabs,
+      groups: [{ id: "g", name: "x", color: "#ABCDEF", collapsed: false, tab_ids: ["b", "gone"] }],
+    };
+    expect((await sent(layout)).groups).toEqual([
+      { id: "g", name: "x", color: "#abcdef", collapsed: false, tab_ids: ["b"] },
+    ]);
   });
 });

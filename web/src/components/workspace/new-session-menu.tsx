@@ -336,11 +336,15 @@ export function NewSessionMenu(
     /** Goes on the dropdown itself — its width, mostly, where the default is
      *  too narrow for the labels a surface carries. */
     menuClassName?: string;
+    /** For a caller that opens the menu from somewhere other than its trigger
+     *  — the tab group panel's "New tab in group", which closes first. */
+    menuRef?: RefObject<CascadeMenuHandle | null>;
   },
 ): JSX.Element {
   const { trigger, mode, heading, anchor = "trigger", className, menuClassName } = props;
   const anchorRef = useRef<HTMLSpanElement>(null);
-  const menuRef = useRef<CascadeMenuHandle>(null);
+  const ownMenuRef = useRef<CascadeMenuHandle>(null);
+  const menuRef = props.menuRef ?? ownMenuRef;
   // The lozenge row has no single cascade to return to, so only this
   // presentation offers a way back.
   const { root, disabled, tooltip, overlays } = useNewSessionChoices(props, anchorRef, () =>

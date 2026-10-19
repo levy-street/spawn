@@ -121,7 +121,7 @@ import {
 } from "lucide-react-native";
 import { View } from "react-native";
 
-import { type Colors, useTheme } from "@/theme";
+import { type ColorToken, useTheme } from "@/theme";
 
 export const iconSet = {
   Activity,
@@ -281,7 +281,7 @@ const chromeSymbolSet: Partial<Record<IconName, SFSymbol>> = {
 
 export interface IconProps {
   accessibilityLabel?: string;
-  color?: keyof Colors;
+  color?: ColorToken;
   name: IconName;
   size?: number;
   /** Apple chrome opts into SF Symbols; Spawn brand/domain imagery remains Lucide by default. */

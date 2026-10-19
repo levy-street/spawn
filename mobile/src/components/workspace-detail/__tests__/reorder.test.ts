@@ -1,5 +1,9 @@
 import { QueryClient } from "@tanstack/react-query";
-import { tabDestinationIndex } from "@/components/workspace-detail/tab-reorder";
+import {
+  siblingShift,
+  tabDestinationIndex,
+  tabInsertionX,
+} from "@/components/workspace-detail/tab-reorder";
 import { reorderPaneLayout } from "@/components/workspace-detail/use-workspace-actions";
 import { patchWorkspace } from "@/data/api/endpoints/workspaces";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
@@ -59,7 +63,10 @@ describe("workspace mobile reorder", () => {
 
     expect(applyMobileOrder).toHaveBeenCalledWith(main, ["files", "one"]);
     expect(patchWorkspaceMock).toHaveBeenCalledTimes(1);
-    expect(patchWorkspaceMock).toHaveBeenCalledWith(workspace.id, { layout });
+    // `groups` always travels, even when the domain layout never had the key.
+    expect(patchWorkspaceMock).toHaveBeenCalledWith(workspace.id, {
+      layout: { ...layout, groups: [] },
+    });
     expect(layout.tabs[1]).toEqual(inactive);
     expect(
       layout.tabs[0]?.layout.tiles.find((tile) => tile.session_id === "files")?.widget,
@@ -86,6 +93,27 @@ describe("workspace mobile reorder", () => {
         expect(reordered.active_tab).toBe(workspace.layout.active_tab);
       }
     }
+  });
+
+  it("crosses tabs at their real positions when a group label shares the row", () => {
+    // Two tabs, a 100pt label, then two more: the gap after slot 1 is wider.
+    const slotLefts = [0, 166, 432, 598];
+    const geometry = { tabWidth: 160, tabGap: 6, slotLefts };
+
+    // Slot 1 must travel past the label before it crosses slot 2's midpoint (512).
+    expect(tabDestinationIndex(1, 185, 4, geometry)).toBe(1);
+    expect(tabDestinationIndex(1, 187, 4, geometry)).toBe(2);
+    expect(tabDestinationIndex(2, -186, 4, geometry)).toBe(2);
+    expect(tabDestinationIndex(2, -187, 4, geometry)).toBe(1);
+    // A sibling slides into its neighbour's place; labels never move.
+    expect(siblingShift(2, 1, 2, geometry)).toBe(-266);
+    expect(siblingShift(1, 2, 1, geometry)).toBe(266);
+    expect(siblingShift(3, 1, 2, geometry)).toBe(0);
+    expect(siblingShift(1, 1, 2, geometry)).toBe(0);
+    expect(siblingShift(1, -1, -1, geometry)).toBe(0);
+    expect(tabInsertionX(1, 2, geometry)).toBe(432 + 160 + 3);
+    expect(tabInsertionX(2, 1, geometry)).toBe(166 - 3);
+    expect(tabInsertionX(2, 2, geometry)).toBe(432);
   });
 
   it("changes destination only after the dragged edge crosses a neighbor midpoint", () => {

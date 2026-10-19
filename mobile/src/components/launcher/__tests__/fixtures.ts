@@ -88,7 +88,7 @@ export function makeWorkspace(overrides: Partial<WorkspaceOut> = {}): WorkspaceO
     name: "spawn",
     host_id: null,
     cwd: null,
-    layout: { version: 3, active_tab: "tab-1", tabs: [makeTab()] },
+    layout: { version: 3, active_tab: "tab-1", groups: [], tabs: [makeTab()] },
     position: 0,
     icon: null,
     icon_source: null,

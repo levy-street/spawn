@@ -5,7 +5,7 @@ import {
   type TextStyle,
 } from "react-native";
 
-import { type Colors, useTheme } from "@/theme";
+import { type ColorToken, useTheme } from "@/theme";
 
 export type TextVariant =
   | "title"
@@ -22,7 +22,7 @@ export type TextVariant =
   | "sigilButton"
   | "grimoireBody"
   | "grimoireBodyLoose";
-export type TextColor = keyof Colors;
+export type TextColor = ColorToken;
 export type TextWeight = "light" | "normal" | "medium" | "semibold";
 
 export interface TextProps extends NativeTextProps {

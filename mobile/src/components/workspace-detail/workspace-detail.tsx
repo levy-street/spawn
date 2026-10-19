@@ -16,6 +16,7 @@ import {
   PaneActionsSheet,
   type PaneActionTarget,
   TabActionsSheet,
+  TabGroupPickerSheet,
   WorkspaceActionsSheet,
 } from "@/components/workspace-detail/action-sheets";
 import { moveWindowConfirmation } from "@/components/workspace-detail/move-window";
@@ -23,7 +24,12 @@ import { type PaneGhost, usePaneDragValues } from "@/components/workspace-detail
 import { PaneDragGhost } from "@/components/workspace-detail/pane-drag-ghost";
 import { PaneList } from "@/components/workspace-detail/pane-list";
 import { RenameDialog } from "@/components/workspace-detail/rename-dialog";
+import {
+  TabGroupSheet,
+  type TabGroupSheetMode,
+} from "@/components/workspace-detail/tab-group-sheet";
 import { TabStrip } from "@/components/workspace-detail/tab-strip";
+import { stepDestination } from "@/components/workspace-detail/tab-strip-model";
 import { useWorkspaceActions } from "@/components/workspace-detail/use-workspace-actions";
 import {
   WorkspaceErrorBanner,
@@ -32,6 +38,7 @@ import {
 } from "@/components/workspace-detail/workspace-detail-states";
 import { WorkspaceHeader } from "@/components/workspace-detail/workspace-header";
 import { WorkspaceFolderSheet } from "@/components/workspaces/workspace-folder-sheet";
+import { layoutGroups } from "@/data/layout/tab-groups";
 import { canAddTab } from "@/data/layout/tabs";
 import { canAddTile } from "@/data/layout/tiles";
 import { useWorkspaceDetail } from "@/data/queries/workspace-detail";
@@ -99,6 +106,13 @@ export function WorkspaceDetail({
   /** A move waiting on a folder picked from any host's browser. */
   const [browseTarget, setBrowseTarget] = useState<{ tile: Tile; session: Session } | null>(null);
   const [tabTarget, setTabTarget] = useState<WorkspaceTab | null>(null);
+  /** The tab whose "…to group…" picker is up. */
+  const [groupPickTab, setGroupPickTab] = useState<WorkspaceTab | null>(null);
+  /** The group whose sheet is up, by id, so the sheet follows the group's live state. */
+  const [groupSheet, setGroupSheet] = useState<{
+    groupId: string;
+    mode: TabGroupSheetMode;
+  } | null>(null);
   const [workspaceActionsVisible, setWorkspaceActionsVisible] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [confirmation, setConfirmation] = useState<ConfirmationState | null>(null);
@@ -130,6 +144,10 @@ export function WorkspaceDetail({
     () => new Map(sessions.map((session) => [session.id, session])),
     [sessions],
   );
+  const groups = useMemo(() => (workspace ? layoutGroups(workspace.layout) : []), [workspace]);
+  const sheetGroup = groupSheet
+    ? (groups.find((group) => group.id === groupSheet.groupId) ?? null)
+    : null;
   const hostsById = useMemo(() => new Map(hosts.map((host) => [host.id, host])), [hosts]);
   // The transcript sheet reads host files, which takes a host consumer channel
   // of its own; it exists only while the sheet is up. The session is kept
@@ -201,6 +219,35 @@ export function WorkspaceDetail({
       }
     },
     [toast],
+  );
+
+  /**
+   * A group edit made while looking at it — a name, a colour, a collapse. It
+   * lands on the workspace as it is now rather than as this render saw it,
+   * since a debounced edit can arrive after others; and it is quiet: the strip
+   * already shows it, so only a failure says anything.
+   */
+  const editGroups = useCallback((operation: (current: Workspace) => Promise<unknown>) => {
+    const current = workspaceRef.current;
+    if (!current) return;
+    void operation(current).catch((error: unknown) => {
+      setOperationError(errorMessage(error));
+      haptics.error();
+    });
+  }, []);
+
+  /** Puts a tab in a group of its own, then opens that group's sheet to name it. */
+  const startNewGroup = useCallback(
+    (tab: WorkspaceTab) => {
+      const current = workspaceRef.current;
+      if (!current) return;
+      void run(async () => {
+        const { groupId, saved } = actions.createGroup(current, tab.id);
+        setGroupSheet({ groupId, mode: "create" });
+        await saved;
+      });
+    },
+    [actions, run],
   );
 
   /**
@@ -426,12 +473,17 @@ export function WorkspaceDetail({
               if (saved.layout.active_tab) setSelectedTabId(saved.layout.active_tab);
             });
           }}
+          groups={groups}
           onClose={closeTab}
+          onManageGroup={(group) => setGroupSheet({ groupId: group.id, mode: "manage" })}
           onReorder={(tabId, toIndex) => actions.reorderTab(workspace, tabId, toIndex)}
           onSelect={(index) => {
             const tab = workspace.layout.tabs[index];
             if (tab) setSelectedTabId(tab.id);
           }}
+          onToggleGroup={(group) =>
+            editGroups((current) => actions.toggleCollapsed(current, group.id))
+          }
           paneDrag={paneDrag}
           sessionsById={sessionsById}
           tabs={workspace.layout.tabs}
@@ -578,15 +630,55 @@ export function WorkspaceDetail({
         <TabActionsSheet
           onDelete={closeTab}
           onDismiss={() => setTabTarget(null)}
+          onNewGroup={startNewGroup}
+          onPickGroup={setGroupPickTab}
+          onRemoveFromGroup={(tab) => {
+            void run(() => actions.removeFromGroup(workspace, tab.id));
+          }}
           onRename={(tab) => setRenameTarget({ kind: "tab", id: tab.id, value: tab.name })}
           onReorder={(tab, offset) => {
-            const index = workspace.layout.tabs.findIndex((candidate) => candidate.id === tab.id);
-            actions.reorderTab(workspace, tab.id, index + offset);
+            // One place as the strip shows it: past a collapsed group, not into it.
+            const toIndex = stepDestination(workspace.layout.tabs, groups, tab.id, offset);
+            actions.reorderTab(workspace, tab.id, toIndex);
             setTabTarget(null);
           }}
           tab={tabTarget}
           visible={tabTarget !== null}
           workspace={workspace}
+        />
+        <TabGroupPickerSheet
+          onDismiss={() => setGroupPickTab(null)}
+          onNewGroup={startNewGroup}
+          onPick={(tab, group) => {
+            void run(() => actions.addToGroup(workspace, tab.id, group.id));
+          }}
+          tab={groupPickTab}
+          visible={groupPickTab !== null}
+          workspace={workspace}
+        />
+        <TabGroupSheet
+          canAddTab={canAddTab(workspace.layout)}
+          group={sheetGroup}
+          mode={groupSheet?.mode ?? "manage"}
+          onCancel={(group) => editGroups((current) => actions.ungroup(current, group.id))}
+          onDismiss={() => setGroupSheet(null)}
+          onNewTab={(group) => {
+            void run(async () => {
+              const saved = await actions.createTabInGroup(
+                workspaceRef.current ?? workspace,
+                group.id,
+              );
+              if (saved.layout.active_tab) setSelectedTabId(saved.layout.active_tab);
+            });
+          }}
+          onToggleCollapsed={(group) =>
+            editGroups((current) => actions.toggleCollapsed(current, group.id))
+          }
+          onUngroup={(group) => editGroups((current) => actions.ungroup(current, group.id))}
+          onUpdate={(groupId, patch) =>
+            editGroups((current) => actions.updateGroup(current, groupId, patch))
+          }
+          visible={sheetGroup !== null}
         />
         <WorkspaceActionsSheet
           canAddTab={canAddTab(workspace.layout)}

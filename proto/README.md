@@ -438,6 +438,47 @@ every stored v2 layout into a single `{"id": "tab-1", "name": "Tab 1"}` tab,
 and `parse_workspace_layout` performs the same upgrade at read time for any
 straggler rows.
 
+Tab groups — the envelope's optional `groups`, named and coloured runs of
+adjacent tabs, as Firefox has them:
+
+```json
+"groups": [{"id": "g-1", "name": "Agents", "color": "orange",
+            "collapsed": false, "tab_ids": ["tab-2", "tab-3"]}]
+```
+
+- `id` is non-empty and unique (≤64 chars). `name` may be empty (≤64), and the
+  clients then show "Unnamed group".
+- `color` is one of Firefox's nine presets, in this order — `blue`, `purple`,
+  `cyan`, `orange`, `yellow`, `pink`, `green`, `gray`, `red` — or a custom
+  colour stored as lowercase `#rrggbb`. The clients draw presets from their
+  theme tokens and a custom colour as chosen.
+- `collapsed` is workspace state, like `active_tab`: every device shows the
+  group folded. A collapsed group still shows the open tab.
+- `tab_ids` is non-empty; every id names a tab, a tab is in at most one group,
+  and a group's tabs sit next to each other in the strip. Reads list them in
+  strip order and list groups by their first tab.
+
+A write that carries `groups` is checked against its tabs and refused with a
+400 (`tab groups: unknown_tab | tab_in_two_groups | split_group |
+duplicate_group_id | empty_group`); a bad shape or colour is a 422. A write
+whose envelope has **no `groups` key** keeps the stored groups, re-fitted to
+the tabs it sent: a tab that is gone leaves its group, a group split by a move
+keeps its longest run, and an emptied group is dropped. Clients from before
+tab groups strip the key they do not know, so this is what keeps a layout
+saved from an older phone update or a browser tab on the old bundle from
+erasing them. Current clients always send the key — `[]` when there are none.
+Reads are lenient the same way as their tabs, and session create carries the
+groups through. Templates do not copy groups.
+
+Moving a tab regroups it: a tab dropped between two tabs of one group joins
+it, a grouped tab still touching its group stays, a group's only tab carries
+the group with it, and any other grouped tab leaves. Adding a tab to a group
+moves it to the group's end; removing one from the middle moves it just past
+the group. `tab-groups-fixtures.json` keeps `spawn_server/tab_groups.py`,
+`web/src/lib/tab-groups.ts` and `mobile/src/data/layout/tab-groups.ts`
+identical (mobile reads a copy at `mobile/tests/fixtures/`); the server runs
+the regroup cases too, though only clients move tabs.
+
 A workspace has no home host. It is a layout of windows, and each window
 runs wherever it was opened: a session tile on its own session row's host, a
 files widget on the `host_id` it names. One workspace can hold windows from

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { IsoDateTimeSchema, UUIDSchema } from "@/data/api/schemas/common";
 import { SessionOutSchema } from "@/data/api/schemas/sessions";
+import { normalizeGroups } from "@/data/layout/tab-groups";
 
 export const WorkspaceIconSourceSchema = z.enum(["auto", "custom", "none"]);
 export const WorkspaceIconFieldsSchema = z.object({
@@ -44,11 +45,29 @@ export const WorkspaceTabSchema = z.object({
   host_id: UUIDSchema.nullable(),
   cwd: z.string().nullable(),
 });
-export const WorkspaceLayoutV3Schema = z.object({
-  version: z.literal(3),
-  active_tab: z.string().nullable(),
-  tabs: z.array(WorkspaceTabSchema).min(1).max(8),
-});
+/**
+ * The envelope's tab groups. Read leniently against the strip they sit in
+ * (`normalizeGroups`): a malformed or stale group must not fail the whole
+ * workspace, it reads as what the server would make of it. Absent reads as
+ * none — and since a PATCH goes through this schema too, every layout this app
+ * sends carries `groups`, canonical for its strip, `[]` when there are none.
+ * The server reads a layout without the key as an older client's and keeps
+ * what it has stored.
+ */
+export const WorkspaceLayoutV3Schema = z
+  .object({
+    version: z.literal(3),
+    active_tab: z.string().nullable(),
+    tabs: z.array(WorkspaceTabSchema).min(1).max(8),
+    groups: z.unknown().optional(),
+  })
+  .transform(({ groups, ...layout }) => ({
+    ...layout,
+    groups: normalizeGroups(
+      layout.tabs.map((tab) => tab.id),
+      groups ?? [],
+    ),
+  }));
 export const WorkspaceFirstSessionSchema = z.object({
   host_id: UUIDSchema,
   cwd: z.string(),

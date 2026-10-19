@@ -2,7 +2,8 @@ import { z } from "zod";
 import { CLIENT_INSTANCE_ID } from "@/lib/client-instance";
 import type { GridLayout, Tile, TileWidget } from "@/lib/grid";
 import { type ReleaseInfo, ReleaseSchema } from "@/lib/release";
-import type { LayoutV3, WorkspaceTab } from "@/lib/tabs";
+import { normalizeGroups } from "@/lib/tab-groups";
+import type { LayoutV3, TabGroup, WorkspaceTab } from "@/lib/tabs";
 
 /**
  * Typed REST helpers. Shapes mirror `/proto/README.md` exactly.
@@ -465,11 +466,44 @@ export const WorkspaceTabSchema: z.ZodType<WorkspaceTab> = z.object({
   layout: GridLayoutSchema,
 });
 
+/**
+ * A tab group (proto/README.md, "Tab groups"). The colour is read as any
+ * string: a preset added by a newer SPAWN D must not fail the whole
+ * workspace, and `normalizeGroups` (lib/tab-groups) is what decides what this
+ * client draws and writes back.
+ */
+export const TabGroupSchema: z.ZodType<TabGroup> = z.object({
+  id: z.string().min(1),
+  name: z.string().default(""),
+  color: z.string(),
+  collapsed: z.boolean().default(false),
+  tab_ids: z.array(z.string()),
+});
+
 export const LayoutV3Schema: z.ZodType<LayoutV3> = z.object({
   version: z.literal(3),
   active_tab: z.string().nullable().default(null),
   tabs: z.array(WorkspaceTabSchema).min(1),
+  /** Absent on a workspace saved before groups, which reads as none. */
+  groups: z.array(TabGroupSchema).default([]),
 });
+
+/**
+ * The envelope as it goes out: `groups` always present — `[]` when there are
+ * none — because a server reads a missing key as a client from before groups
+ * and keeps what it stored. Normalised on the way, so whatever a caller built
+ * is a set the server's strict check accepts rather than a 400 over one stale
+ * id.
+ */
+export function layoutForWrite(layout: LayoutV3): LayoutV3 {
+  return {
+    ...layout,
+    groups: normalizeGroups(
+      layout.tabs.map((tab) => tab.id),
+      layout.groups ?? [],
+    ),
+  };
+}
 
 export const WorkspaceIconSourceSchema = z
   .enum(["auto", "custom", "none"])
@@ -1509,7 +1543,7 @@ export const workspaces = {
   ) =>
     api(`/api/workspaces/${id}`, {
       method: "PATCH",
-      body: JSON.stringify(body),
+      body: JSON.stringify(body.layout ? { ...body, layout: layoutForWrite(body.layout) } : body),
       schema: WorkspaceSchema,
     }),
   /**

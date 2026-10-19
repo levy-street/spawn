@@ -18,6 +18,7 @@ function workspace(id = "workspace-new"): WorkspaceOut {
     layout: {
       version: 3,
       active_tab: "tab-default",
+      groups: [],
       tabs: [
         {
           id: "tab-default",
@@ -334,6 +335,34 @@ describe("workspace lifecycle operations", () => {
       },
     ]);
     expect(harness.createSession).not.toHaveBeenCalled();
+  });
+
+  test("groups a duplicate's tabs as the source's were, under ids of its own", async () => {
+    const harness = dependencyHarness();
+    harness.randomId
+      .mockReturnValueOnce("copy-a")
+      .mockReturnValueOnce("copy-b")
+      .mockReturnValueOnce("group-copy");
+    const source = workspace("source");
+    const empty = { host_id: null, cwd: null, layout: { version: 3 as const, tiles: [] } };
+    source.layout.tabs = [
+      { id: "a", name: "A", ...empty },
+      { id: "b", name: "B", ...empty },
+    ];
+    source.layout.active_tab = "a";
+    source.layout.groups = [
+      { id: "group", name: "Agents", color: "#ff8800", collapsed: true, tab_ids: ["b"] },
+    ];
+
+    const result = await duplicateWorkspaceDeep(
+      { workspace: source, sessions: [], agents: [], existingNames: [] },
+      harness.dependencies,
+    );
+
+    expect(harness.patchWorkspace.mock.calls[0]?.[1].layout?.groups).toEqual([
+      { id: "group-copy", name: "Agents", color: "#ff8800", collapsed: true, tab_ids: ["copy-b"] },
+    ]);
+    expect(result.workspace.layout.groups).toHaveLength(1);
   });
 
   test("deletes a partial duplicate when recreation fails", async () => {

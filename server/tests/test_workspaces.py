@@ -57,6 +57,7 @@ def _envelope(tiles: list[dict], *, extra_tabs: list[dict] | None = None) -> dic
         "version": 3,
         "active_tab": "tab-1",
         "tabs": [{"host_id": None, "cwd": None, **tab} for tab in tabs],
+        "groups": [],
     }
 
 
@@ -318,6 +319,166 @@ async def test_tab_folder_round_trips_and_drops_hosts_that_are_not_yours(client)
     # And it survives a plain read.
     r = await client.get(f"/api/workspaces/{workspace_id}", headers=a_auth)
     assert r.json()["layout"]["tabs"][0]["cwd"] == "/repo"
+
+
+def _tabs(*ids: str) -> list[dict]:
+    """Empty tabs named after their ids, for envelopes about the strip only."""
+    return [{"id": tab_id, "name": tab_id, "layout": {"version": 3, "tiles": []}} for tab_id in ids]
+
+
+def _strip(tab_ids: list[str], groups: list[dict] | None = None) -> dict:
+    """An envelope of empty tabs; `groups` left out unless given, the way a
+    client from before tab groups writes."""
+    layout = _envelope([], extra_tabs=_tabs(*tab_ids))
+    layout["tabs"] = layout["tabs"][1:]
+    layout["active_tab"] = tab_ids[0]
+    del layout["groups"]
+    if groups is not None:
+        layout["groups"] = groups
+    return layout
+
+
+def _group(group_id: str, tab_ids: list[str], **fields) -> dict:
+    return {
+        "id": group_id,
+        "name": "",
+        "color": "blue",
+        "collapsed": False,
+        "tab_ids": tab_ids,
+        **fields,
+    }
+
+
+async def _empty_workspace(client, email: str) -> tuple[dict, str]:
+    auth = {"Authorization": f"Bearer {await _signup(client, email)}"}
+    created = await client.post("/api/workspaces", json={"name": "groups"}, headers=auth)
+    assert created.status_code == 201, created.text
+    return auth, created.json()["workspace"]["id"]
+
+
+async def test_tab_groups_round_trip_in_canonical_form(client):
+    auth, workspace_id = await _empty_workspace(client, "ws-groups-trip@example.com")
+    layout = _strip(
+        ["a", "b", "c", "d"],
+        [
+            _group("late", ["d"], color="#FF8800", collapsed=True),
+            _group("early", ["c", "b"], name="Agents", color="orange"),
+        ],
+    )
+    r = await client.patch(f"/api/workspaces/{workspace_id}", json={"layout": layout}, headers=auth)
+    assert r.status_code == 200, r.text
+    expected = [
+        _group("early", ["b", "c"], name="Agents", color="orange"),
+        _group("late", ["d"], color="#ff8800", collapsed=True),
+    ]
+    assert r.json()["layout"]["groups"] == expected
+    read = await client.get(f"/api/workspaces/{workspace_id}", headers=auth)
+    assert read.json()["layout"]["groups"] == expected
+    listed = await client.get("/api/workspaces", headers=auth)
+    assert listed.json()[0]["layout"]["groups"] == expected
+
+
+async def test_tab_groups_that_do_not_fit_the_strip_are_refused(client):
+    auth, workspace_id = await _empty_workspace(client, "ws-groups-refused@example.com")
+
+    async def patch(groups: list):
+        return await client.patch(
+            f"/api/workspaces/{workspace_id}",
+            json={"layout": _strip(["a", "b", "c"], groups)},
+            headers=auth,
+        )
+
+    for groups, detail in [
+        ([_group("g", ["a", "zz"])], "tab groups: unknown_tab"),
+        ([_group("g", ["a", "c"])], "tab groups: split_group"),
+        ([_group("g", ["a"]), _group("h", ["a", "b"])], "tab groups: tab_in_two_groups"),
+        ([_group("g", ["a"]), _group("g", ["b"])], "tab groups: duplicate_group_id"),
+        ([_group("g", [])], "tab groups: empty_group"),
+    ]:
+        r = await patch(groups)
+        assert r.status_code == 400, groups
+        assert r.json()["detail"] == detail
+
+    # Shapes are the schema's: a colour outside the presets and #rrggbb, an
+    # unknown key, an over-long name.
+    for group in [
+        _group("g", ["a"], color="teal"),
+        _group("g", ["a"], color="#abc"),
+        {**_group("g", ["a"]), "emoji": "x"},
+        _group("g", ["a"], name="n" * 65),
+    ]:
+        assert (await patch([group])).status_code == 422, group
+
+
+async def test_a_layout_without_groups_keeps_the_stored_ones(client):
+    """A phone on an older update, or a browser tab still holding the old
+    bundle, saves layouts that know nothing of groups. Its write keeps them,
+    re-fitted to the strip it sent: a closed tab leaves its group, and a
+    group split by a move keeps its longest run."""
+    auth, workspace_id = await _empty_workspace(client, "ws-groups-carry@example.com")
+    url = f"/api/workspaces/{workspace_id}"
+    grouped = _strip(
+        ["a", "b", "c", "d", "e"],
+        [_group("g", ["b", "c", "d"], name="Agents", color="green"), _group("h", ["e"])],
+    )
+    assert (await client.patch(url, json={"layout": grouped}, headers=auth)).status_code == 200
+
+    # An old client closes "e" and drags "a" in between "b" and "c".
+    r = await client.patch(url, json={"layout": _strip(["b", "a", "c", "d"])}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["layout"]["groups"] == [_group("g", ["c", "d"], name="Agents", color="green")]
+
+    # A rename-only write touches nothing.
+    renamed = await client.patch(url, json={"name": "renamed"}, headers=auth)
+    assert renamed.json()["layout"]["groups"] == r.json()["layout"]["groups"]
+
+
+async def test_an_empty_groups_list_clears_them(client):
+    auth, workspace_id = await _empty_workspace(client, "ws-groups-clear@example.com")
+    url = f"/api/workspaces/{workspace_id}"
+    grouped = _strip(["a", "b"], [_group("g", ["a", "b"])])
+    assert (await client.patch(url, json={"layout": grouped}, headers=auth)).status_code == 200
+    r = await client.patch(url, json={"layout": _strip(["a", "b"], [])}, headers=auth)
+    assert r.json()["layout"]["groups"] == []
+
+
+async def test_a_new_window_keeps_the_workspaces_groups(client):
+    email = "ws-groups-session@example.com"
+    auth, workspace_id = await _empty_workspace(client, email)
+    host_id = await _create_host(email)
+    url = f"/api/workspaces/{workspace_id}"
+    grouped = _strip(["a", "b"], [_group("g", ["a", "b"], name="Agents")])
+    assert (await client.patch(url, json={"layout": grouped}, headers=auth)).status_code == 200
+
+    created = await client.post(
+        "/api/sessions",
+        json={"host_id": host_id, "cwd": "/repo", "workspace_id": workspace_id},
+        headers=auth,
+    )
+    assert created.status_code == 201, created.text
+    layout = (await client.get(url, headers=auth)).json()["layout"]
+    assert [tile["session_id"] for tile in layout["tabs"][0]["layout"]["tiles"]] == [
+        created.json()["id"]
+    ]
+    assert layout["groups"] == [_group("g", ["a", "b"], name="Agents")]
+
+
+async def test_stored_groups_that_no_longer_fit_are_trimmed_on_read(client):
+    """Rows are read leniently, like their tabs: a group naming a tab that is
+    gone, or holding a colour no client can draw, is trimmed rather than
+    failing the read."""
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Workspace
+
+    auth, workspace_id = await _empty_workspace(client, "ws-groups-read@example.com")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        row = await session.get(Workspace, workspace_id)
+        row.layout = _strip(["a", "b"], [_group("g", ["a", "gone"], color="teal"), "junk"])
+        await session.commit()
+    r = await client.get(f"/api/workspaces/{workspace_id}", headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["layout"]["groups"] == [_group("g", ["a"])]
 
 
 async def test_workspace_layout_rejects_grid_invariant_violations(client):

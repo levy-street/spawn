@@ -326,6 +326,30 @@
   --shell: oklch(0.945 0 0);
   --terminal-bg: oklch(0.99 0 0);
 
+  /* Tab group colours: Firefox's nine presets, cut for the strip they sit on.
+     Light values are dark enough that the 2px line over a group's tabs clears
+     3:1 on --shell; each -fg is the label ink with the higher contrast on its
+     pill (labelTextColor in lib/color, which color.test.ts holds these to).
+     Hex rather than oklch so the picker can start a custom colour from them. */
+  --tab-group-blue: #2f6fe4;
+  --tab-group-blue-fg: #ffffff;
+  --tab-group-purple: #8a4fd6;
+  --tab-group-purple-fg: #ffffff;
+  --tab-group-cyan: #087894;
+  --tab-group-cyan-fg: #ffffff;
+  --tab-group-orange: #b8520b;
+  --tab-group-orange-fg: #ffffff;
+  --tab-group-yellow: #a47a06;
+  --tab-group-yellow-fg: #171717;
+  --tab-group-pink: #c8336f;
+  --tab-group-pink-fg: #ffffff;
+  --tab-group-green: #267f3d;
+  --tab-group-green-fg: #ffffff;
+  --tab-group-gray: #6b7079;
+  --tab-group-gray-fg: #ffffff;
+  --tab-group-red: #d93030;
+  --tab-group-red-fg: #ffffff;
+
   --brand-bg: oklch(0.97 0 0);
   --brand-panel: oklch(1 0 0);
   --brand-well: oklch(0.94 0 0);
@@ -402,6 +426,27 @@
   --ring: var(--foreground);
   --shell: oklch(0.2 0 0);
   --terminal-bg: oklch(0.145 0 0);
+
+  /* Lifted for the dark strip, the way the status hues are: every one takes
+     dark ink, and the line reads at 6:1 or better on --shell. */
+  --tab-group-blue: #6aa2ff;
+  --tab-group-blue-fg: #171717;
+  --tab-group-purple: #b68cff;
+  --tab-group-purple-fg: #171717;
+  --tab-group-cyan: #3ccbe3;
+  --tab-group-cyan-fg: #171717;
+  --tab-group-orange: #ff9446;
+  --tab-group-orange-fg: #171717;
+  --tab-group-yellow: #f2cc3f;
+  --tab-group-yellow-fg: #171717;
+  --tab-group-pink: #ff7ab5;
+  --tab-group-pink-fg: #171717;
+  --tab-group-green: #5ccf78;
+  --tab-group-green-fg: #171717;
+  --tab-group-gray: #9ea3ad;
+  --tab-group-gray-fg: #171717;
+  --tab-group-red: #ff6464;
+  --tab-group-red-fg: #171717;
 
   --brand-bg: oklch(0.115 0 0);
   --brand-panel: oklch(0.15 0 0);

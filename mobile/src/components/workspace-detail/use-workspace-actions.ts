@@ -16,6 +16,16 @@ import {
 import { patchWorkspace } from "@/data/api/endpoints/workspaces";
 import { applyMobileOrder, readingOrder } from "@/data/layout/mobile-order";
 import {
+  addTabToGroup,
+  createGroup,
+  layoutGroups,
+  nextGroupColor,
+  removeTabFromGroup,
+  type TabGroupPatch,
+  ungroup,
+  updateGroup,
+} from "@/data/layout/tab-groups";
+import {
   addTab,
   movePaneToTab,
   removePane,
@@ -87,11 +97,53 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
     await client.invalidateQueries({ queryKey: qk.sessions() });
   }, [client]);
 
+  /** A group operation that changed nothing sends nothing. */
+  const commitChange = (workspace: Workspace, layout: WorkspaceLayoutV3) =>
+    layout === workspace.layout ? Promise.resolve(workspace) : commit(workspace, layout);
+
   return {
     createTab: async (workspace: Workspace) => {
       const layout = addTab(workspace.layout, randomUUID());
       if (!layout) throw new Error("A workspace can have up to 8 tabs.");
       return commit(workspace, layout);
+    },
+    /**
+     * Puts a tab in a new, unnamed group wearing the next free preset. The
+     * group is in the cache as this returns, so its sheet can open on it while
+     * the save is still in flight.
+     */
+    createGroup: (workspace: Workspace, tabId: TabId) => {
+      const groupId = randomUUID();
+      const layout = createGroup(workspace.layout, tabId, {
+        id: groupId,
+        name: "",
+        color: nextGroupColor(layoutGroups(workspace.layout)),
+      });
+      if (!layout) throw new Error("That tab is no longer in this workspace.");
+      return { groupId, saved: commit(workspace, layout) };
+    },
+    addToGroup: (workspace: Workspace, tabId: TabId, groupId: string) =>
+      commitChange(workspace, addTabToGroup(workspace.layout, tabId, groupId)),
+    removeFromGroup: (workspace: Workspace, tabId: TabId) =>
+      commitChange(workspace, removeTabFromGroup(workspace.layout, tabId)),
+    ungroup: (workspace: Workspace, groupId: string) =>
+      commitChange(workspace, ungroup(workspace.layout, groupId)),
+    updateGroup: (workspace: Workspace, groupId: string, patch: TabGroupPatch) =>
+      commitChange(workspace, updateGroup(workspace.layout, groupId, patch)),
+    toggleCollapsed: (workspace: Workspace, groupId: string) => {
+      const group = layoutGroups(workspace.layout).find((candidate) => candidate.id === groupId);
+      if (!group) return Promise.resolve(workspace);
+      return commitChange(
+        workspace,
+        updateGroup(workspace.layout, groupId, { collapsed: !group.collapsed }),
+      );
+    },
+    /** The add-tab flow, with the new tab put at the group's end and into it. */
+    createTabInGroup: async (workspace: Workspace, groupId: string) => {
+      const tabId = randomUUID();
+      const added = addTab(workspace.layout, tabId);
+      if (!added) throw new Error("A workspace can have up to 8 tabs.");
+      return commit(workspace, addTabToGroup(added, tabId, groupId));
     },
     renameWorkspace: async (workspace: Workspace, name: string) => {
       const saved = normalizeWorkspace(await patchWorkspace(workspace.id, { name }));

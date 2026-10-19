@@ -5,9 +5,10 @@ import {
   MovePaneSheet,
   PaneActionsSheet,
   TabActionsSheet,
+  TabGroupPickerSheet,
   WorkspaceActionsSheet,
 } from "@/components/workspace-detail/action-sheets";
-import type { Tile } from "@/data/types/layout";
+import type { TabGroup, Tile } from "@/data/types/layout";
 
 import { makeHost, makeSession, makeTab, makeWorkspace } from "./fixtures";
 
@@ -145,6 +146,9 @@ describe("workspace action sheets", () => {
       <TabActionsSheet
         onDelete={jest.fn()}
         onDismiss={jest.fn()}
+        onNewGroup={jest.fn()}
+        onPickGroup={jest.fn()}
+        onRemoveFromGroup={jest.fn()}
         onRename={jest.fn()}
         onReorder={jest.fn()}
         tab={tabs[0] ?? null}
@@ -214,5 +218,134 @@ describe("moving a window to another host", () => {
     expect(onSelect).toHaveBeenCalledWith(there, "/Users/me/site");
     actions[3]?.onPress();
     expect(onBrowse).toHaveBeenCalled();
+  });
+});
+
+describe("tab group actions", () => {
+  beforeEach(() => mockActionSets.splice(0));
+
+  const agents: TabGroup = {
+    id: "agents",
+    name: "Agents",
+    color: "orange",
+    collapsed: false,
+    tab_ids: ["tests"],
+  };
+  const unnamed: TabGroup = {
+    id: "unnamed",
+    name: "",
+    color: "#ff8800",
+    collapsed: false,
+    tab_ids: ["docs"],
+  };
+
+  function groupedWorkspace(groups: TabGroup[]) {
+    const workspace = makeWorkspace([makeTab("main"), makeTab("tests"), makeTab("docs")]);
+    return { ...workspace, layout: { ...workspace.layout, groups } };
+  }
+
+  function sheetFor(tabId: string, groups: TabGroup[]) {
+    const workspace = groupedWorkspace(groups);
+    const handlers = {
+      onNewGroup: jest.fn(),
+      onPickGroup: jest.fn(),
+      onRemoveFromGroup: jest.fn(),
+    };
+    const tab = workspace.layout.tabs.find((candidate) => candidate.id === tabId) ?? null;
+    return { workspace, handlers, tab };
+  }
+
+  it("offers an ungrouped tab a new group, and the groups there are", async () => {
+    const { workspace, handlers, tab } = sheetFor("main", [agents]);
+    await render(
+      <TabActionsSheet
+        onDelete={jest.fn()}
+        onDismiss={jest.fn()}
+        onRename={jest.fn()}
+        onReorder={jest.fn()}
+        tab={tab}
+        visible
+        workspace={workspace}
+        {...handlers}
+      />,
+    );
+    const actions = latestActions() as Array<CapturedAction & { label: string }>;
+    expect(actions.map((action) => action.label)).toEqual(
+      expect.arrayContaining(["Add tab to new group", "Add tab to group…"]),
+    );
+    expect(actions.find((action) => action.id === "remove-from-group")).toBeUndefined();
+
+    actions.find((action) => action.id === "new-group")?.onPress();
+    expect(handlers.onNewGroup).toHaveBeenCalledWith(tab);
+    actions.find((action) => action.id === "pick-group")?.onPress();
+    expect(handlers.onPickGroup).toHaveBeenCalledWith(tab);
+  });
+
+  it("offers a grouped tab a move, and removal, but no picker with nowhere else to go", async () => {
+    const { workspace, handlers, tab } = sheetFor("tests", [agents]);
+    await render(
+      <TabActionsSheet
+        onDelete={jest.fn()}
+        onDismiss={jest.fn()}
+        onRename={jest.fn()}
+        onReorder={jest.fn()}
+        tab={tab}
+        visible
+        workspace={workspace}
+        {...handlers}
+      />,
+    );
+    const actions = latestActions() as Array<CapturedAction & { label: string }>;
+    const labels = actions.map((action) => action.label);
+    expect(labels).toContain("Move tab to new group");
+    expect(labels).toContain("Remove from group");
+    expect(labels).not.toContain("Move tab to group…");
+    const remove = actions.find((action) => action.id === "remove-from-group");
+    expect(remove?.detail).toBe("Agents");
+    remove?.onPress();
+    expect(handlers.onRemoveFromGroup).toHaveBeenCalledWith(tab);
+  });
+
+  it("names the move when a grouped tab has another group to go to", async () => {
+    const { workspace, handlers, tab } = sheetFor("tests", [agents, unnamed]);
+    await render(
+      <TabActionsSheet
+        onDelete={jest.fn()}
+        onDismiss={jest.fn()}
+        onRename={jest.fn()}
+        onReorder={jest.fn()}
+        tab={tab}
+        visible
+        workspace={workspace}
+        {...handlers}
+      />,
+    );
+    const labels = (latestActions() as Array<CapturedAction & { label: string }>).map(
+      (action) => action.label,
+    );
+    expect(labels).toContain("Move tab to group…");
+  });
+
+  it("lists a new group, then every group the tab is not in, unnamed ones by that name", async () => {
+    const { workspace, tab } = sheetFor("tests", [agents, unnamed]);
+    const onNewGroup = jest.fn();
+    const onPick = jest.fn();
+    await render(
+      <TabGroupPickerSheet
+        onDismiss={jest.fn()}
+        onNewGroup={onNewGroup}
+        onPick={onPick}
+        tab={tab}
+        visible
+        workspace={workspace}
+      />,
+    );
+    const actions = latestActions() as Array<CapturedAction & { label: string; icon?: unknown }>;
+    expect(actions.map((action) => action.label)).toEqual(["New group", "Unnamed group"]);
+    expect(actions[1]?.icon).toBeTruthy();
+    actions[0]?.onPress();
+    expect(onNewGroup).toHaveBeenCalledWith(tab);
+    actions[1]?.onPress();
+    expect(onPick).toHaveBeenCalledWith(tab, unnamed);
   });
 });
