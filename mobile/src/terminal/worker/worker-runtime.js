@@ -37,6 +37,8 @@
     serializeAddon: null,
     webglAddon: null,
     renderer: null,
+    /** Claude Code's spinner drawn as a ritual (web/src/components/terminal/ritual-spinner.mjs). */
+    ritualSpinner: null,
     follow: true,
     newOutputWhileAway: false,
     /** null until the daemon reports who owns the shared PTY geometry. */
@@ -600,6 +602,8 @@
     state.term = terminal;
     state.fitAddon = fitAddon;
     state.serializeAddon = serializeAddon;
+    // Inlined from the web app at build time (build-worker.mjs).
+    state.ritualSpinner = SpawnRitualSpinner.createRitualSpinner(terminal);
     // Before anything is drawn or requested: the initial history render and the
     // PTY resize both quote state.cols, so the grid has to be the real one by
     // the time the control channel opens.
