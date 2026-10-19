@@ -41,7 +41,12 @@ import {
   type TileWidget,
   validate,
 } from "@/lib/grid";
-import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
+import {
+  detectAppleModifiers,
+  gridShortcut,
+  keystrokeBelongsToText,
+  keystrokeHeldBySurface,
+} from "@/lib/keyboard-chords";
 import { recordPaneFocus } from "@/lib/pane-focus";
 import { sessionAgent, sessionTitle } from "@/lib/sessions";
 import {
@@ -211,11 +216,13 @@ function ownStripGroundAt(under: Element | null | undefined, workspaceId: string
   const strip = under?.closest?.("[data-workspace-tab-strip]");
   if (!strip || strip.getAttribute("data-workspace-tab-strip-owner") !== workspaceId) return false;
   // A tab is its own target — the drop moves the pane into it — and a rename
-  // in flight keeps its input. Everything else in the band counts as ground,
-  // buttons included: they are inert to a drag anyway, and excluding the "+"
-  // would let the chip's own arrival shove it under the pointer and steal
-  // the drop it just promised.
-  return !under?.closest?.("[data-workspace-tab], form, input");
+  // in flight keeps its input. A tab group's label is not ground either: it
+  // sits among the tabs, where a "New tab" promised at the far end of the
+  // strip would be a lie about where the drop lands. Everything else in the
+  // band counts as ground, buttons included: they are inert to a drag anyway,
+  // and excluding the "+" would let the chip's own arrival shove it under the
+  // pointer and steal the drop it just promised.
+  return !under?.closest?.("[data-workspace-tab], [data-workspace-tab-group], form, input");
 }
 
 /** The tile a gesture is actually dragging — the copy, when ⌘ is down. */
@@ -1554,6 +1561,8 @@ export function WorkspaceGrid({
     // holds the whole rule and why.
     const apple = detectAppleModifiers();
     const onKeyDown = (event: KeyboardEvent) => {
+      // A panel that owns its keys — the tab group editor — keeps them all.
+      if (keystrokeHeldBySurface(event.target)) return;
       const shortcut = gridShortcut(event, {
         apple,
         textHasKey: keystrokeBelongsToText(event.target),

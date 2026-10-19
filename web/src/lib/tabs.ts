@@ -6,6 +6,7 @@ import {
   remove,
   type Tile,
 } from "@/lib/grid";
+import { normalizeGroups, regroup } from "@/lib/tab-groups";
 
 /**
  * Layout schema v3 — the tab envelope. Contract: proto/README.md,
@@ -40,11 +41,32 @@ export interface Home {
   cwd: string;
 }
 
+/**
+ * A named, coloured run of adjacent tabs (proto/README.md, "Tab groups";
+ * the rules live in `lib/tab-groups`). `color` is a preset name or a custom
+ * `#rrggbb`; an empty `name` is shown as "Unnamed group".
+ */
+export interface TabGroup {
+  id: string;
+  name: string;
+  color: string;
+  collapsed: boolean;
+  /** In strip order, and always next to each other in the strip. */
+  tab_ids: string[];
+}
+
 export interface LayoutV3 {
   version: 3;
   /** The tab the workspace last had open; null falls back to the first. */
   active_tab: string | null;
   tabs: WorkspaceTab[];
+  /**
+   * Groups, listed in strip order. Optional because an envelope written before
+   * groups has none; every write from here sends the key (`workspaces.update`
+   * fills it in), since a server reads a missing one as an old client's and
+   * keeps what it stored.
+   */
+  groups?: TabGroup[];
 }
 
 export const MAX_TABS = 8;
@@ -105,13 +127,40 @@ export function nextTabName(layout: LayoutV3): string {
   return `Tab ${n}`;
 }
 
-/** Append an empty tab and make it active; null when the envelope is full. */
+/**
+ * The envelope with `tabs` as its strip and `groups` re-read against it, so a
+ * tab that is gone leaves its group. An envelope from before groups stays
+ * without the key, exactly as it came.
+ */
+function withStrip(layout: LayoutV3, tabs: WorkspaceTab[], groups = layout.groups): LayoutV3 {
+  if (groups === undefined) return { ...layout, tabs };
+  return {
+    ...layout,
+    tabs,
+    groups: normalizeGroups(
+      tabs.map((tab) => tab.id),
+      groups,
+    ),
+  };
+}
+
+/** The envelope's groups as they stand, read against its own strip. */
+function currentGroups(layout: LayoutV3) {
+  return normalizeGroups(
+    layout.tabs.map((tab) => tab.id),
+    layout.groups ?? [],
+  );
+}
+
+/**
+ * Append an empty tab and make it active; null when the envelope is full. The
+ * end of the strip is past every group, so the new tab joins none.
+ */
 export function addTab(layout: LayoutV3, id: string, name: string): LayoutV3 | null {
   if (layout.tabs.length >= MAX_TABS || tabById(layout, id)) return null;
   return {
-    version: 3,
+    ...withStrip(layout, [...layout.tabs, { id, name, layout: { version: 3, tiles: [] } }]),
     active_tab: id,
-    tabs: [...layout.tabs, { id, name, layout: { version: 3, tiles: [] } }],
   };
 }
 
@@ -141,6 +190,10 @@ export function copyTabName(layout: LayoutV3, name: string): string {
  * clamped to it; left out, the copy goes on the end. The source keeps its own
  * slot either way — a copy never displaces the tab it came from.
  *
+ * A copy that lands beside a tab of the source's group joins that group, as
+ * Firefox keeps a duplicate with its original; anywhere else it is grouped
+ * like any other tab dropped there (`regroup`).
+ *
  * Null when the envelope is full or the tab is unknown.
  */
 export function duplicateTab(
@@ -169,7 +222,25 @@ export function duplicateTab(
     cwd: source.cwd ?? null,
     layout: { version: 3, tiles },
   });
-  return { version: 3, active_tab: id, tabs };
+  if (layout.groups === undefined) return { ...layout, active_tab: id, tabs };
+  const ids = tabs.map((tab) => tab.id);
+  const groups = currentGroups(layout);
+  const own = groups.find((group) => group.tab_ids.includes(tabId));
+  const besideOwn =
+    own !== undefined &&
+    [ids[at - 1], ids[at + 1]].some((neighbour) => neighbour && own.tab_ids.includes(neighbour));
+  return {
+    ...withStrip(
+      layout,
+      tabs,
+      besideOwn
+        ? groups.map((group) =>
+            group === own ? { ...group, tab_ids: [...group.tab_ids, id] } : group,
+          )
+        : regroup(ids, groups, id),
+    ),
+    active_tab: id,
+  };
 }
 
 /**
@@ -183,7 +254,7 @@ export function removeTab(layout: LayoutV3, tabId: string): LayoutV3 | null {
   const tabs = layout.tabs.filter((tab) => tab.id !== tabId);
   const active =
     layout.active_tab === tabId ? (tabs[Math.max(0, index - 1)]?.id ?? null) : layout.active_tab;
-  return { version: 3, active_tab: active, tabs };
+  return { ...withStrip(layout, tabs), active_tab: active };
 }
 
 export function renameTab(layout: LayoutV3, tabId: string, name: string): LayoutV3 {
@@ -194,9 +265,11 @@ export function renameTab(layout: LayoutV3, tabId: string, name: string): Layout
 }
 
 /**
- * Move a tab to another slot in the strip, the index clamped to it. Null when
- * the id is unknown or the order would not change — callers treat null as
- * "nothing to persist".
+ * Move a tab to another slot in the strip, the index clamped to it, and
+ * regroup it where it lands: between two tabs of one group it joins that
+ * group, out of touch with its own it leaves (`regroup` has the whole rule).
+ * Null when the id is unknown or the order would not change — callers treat
+ * null as "nothing to persist".
  */
 export function reorderTab(layout: LayoutV3, tabId: string, toIndex: number): LayoutV3 | null {
   const from = layout.tabs.findIndex((tab) => tab.id === tabId);
@@ -206,7 +279,16 @@ export function reorderTab(layout: LayoutV3, tabId: string, toIndex: number): La
   const tabs = [...layout.tabs];
   const [moved] = tabs.splice(from, 1);
   tabs.splice(to, 0, moved as WorkspaceTab);
-  return { ...layout, tabs };
+  if (layout.groups === undefined) return { ...layout, tabs };
+  return withStrip(
+    layout,
+    tabs,
+    regroup(
+      tabs.map((tab) => tab.id),
+      currentGroups(layout),
+      tabId,
+    ),
+  );
 }
 
 /**

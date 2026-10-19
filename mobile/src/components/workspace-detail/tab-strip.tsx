@@ -29,10 +29,21 @@ import {
   type TabDragValues,
 } from "@/components/workspace-detail/draggable-tab";
 import { type PaneDragValues, tabIndexAtPoint } from "@/components/workspace-detail/pane-drag";
+import { TabGroupLabel } from "@/components/workspace-detail/tab-group-label";
 import { tabDestinationIndex, tabInsertionX } from "@/components/workspace-detail/tab-reorder";
-import { tabAttentionSummary } from "@/data/queries/alerts";
+import {
+  slotDestination,
+  stepDestination,
+  tabStripModel,
+} from "@/components/workspace-detail/tab-strip-model";
+import { resolveGroupColor } from "@/data/layout/tab-groups";
+import {
+  type AttentionSummary,
+  attentionSummaryFromCounts,
+  tabAttentionSummary,
+} from "@/data/queries/alerts";
 import type { Session } from "@/data/types/domain";
-import type { WorkspaceTab } from "@/data/types/layout";
+import type { TabGroup, WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
 import { useReducedMotion } from "@/lib/motion/reduced-motion";
 import { borderWidth, duration, layer, opacity, spacing, tabSurfaces, useTheme } from "@/theme";
@@ -48,6 +59,8 @@ const MILLISECONDS_PER_SECOND = 1_000;
 
 export interface TabStripProps {
   tabs: readonly WorkspaceTab[];
+  /** The workspace's tab groups, in strip order. */
+  groups?: readonly TabGroup[];
   sessionsById: ReadonlyMap<string, Session>;
   activeIndex: number;
   canAdd: boolean;
@@ -55,10 +68,32 @@ export interface TabStripProps {
   onSelect: (index: number) => void;
   onActions: (tab: WorkspaceTab) => void;
   onClose: (tab: WorkspaceTab) => void;
+  /** `toIndex` is the tab's index in the whole strip once it has moved. */
   onReorder: (tabId: string, toIndex: number) => void;
   onAdd: () => void;
+  /** A group's label was tapped: collapse it, or expand it. */
+  onToggleGroup?: (group: TabGroup) => void;
+  /** A group's label was held: open its sheet. */
+  onManageGroup?: (group: TabGroup) => void;
   /** Shared with the pane list, so a carried pane can be dropped on a tab. */
   paneDrag?: PaneDragValues;
+}
+
+const NO_GROUPS: readonly TabGroup[] = [];
+
+/** What a collapsed group's hidden tabs need, taken together. */
+function hiddenAttention(
+  hidden: readonly WorkspaceTab[],
+  sessionsById: ReadonlyMap<string, Session>,
+): AttentionSummary | null {
+  let waiting = 0;
+  let dead = 0;
+  for (const tab of hidden) {
+    const summary = tabAttentionSummary(tab, sessionsById);
+    waiting += summary?.waiting ?? 0;
+    dead += summary?.dead ?? 0;
+  }
+  return attentionSummaryFromCounts(waiting, dead);
 }
 
 function announce(message: string): void {
@@ -87,6 +122,7 @@ function endDragFeedback(name: string, index: number, count: number): void {
 
 export function TabStrip({
   tabs,
+  groups = NO_GROUPS,
   sessionsById,
   activeIndex,
   canAdd,
@@ -96,9 +132,23 @@ export function TabStrip({
   onClose,
   onReorder,
   onAdd,
+  onToggleGroup,
+  onManageGroup,
   paneDrag,
 }: TabStripProps) {
   const theme = useTheme();
+  /*
+   * Labels share the row and a collapsed group hides tabs, so the drag works
+   * in visible slots against the positions the model lays out; a drop is
+   * turned back into a whole-strip index before it leaves this component.
+   */
+  const model = useMemo(
+    () => tabStripModel(tabs, groups, activeIndex),
+    [activeIndex, groups, tabs],
+  );
+  const { slots, slotLefts, tabLefts } = model;
+  const visibleCount = slots.length;
+  const geometry = useMemo(() => ({ ...TAB_GEOMETRY, slotLefts }), [slotLefts]);
   const reducedMotion = useReducedMotion();
   const scrollRef = useAnimatedRef<ComponentRef<typeof Animated.ScrollView>>();
   const stripRef = useRef<View>(null);
@@ -168,12 +218,13 @@ export function TabStrip({
     [publishStripRect, viewportWidth],
   );
 
+  const activeLeft = tabLefts[activeIndex] ?? activeIndex * TAB_STEP;
   useEffect(() => {
     scrollRef.current?.scrollTo({
       animated: !reducedMotion,
-      x: Math.max(0, activeIndex * TAB_STEP - TAB_SCROLL_BREATHING_ROOM),
+      x: Math.max(0, activeLeft - TAB_SCROLL_BREATHING_ROOM),
     });
-  }, [activeIndex, reducedMotion, scrollRef]);
+  }, [activeLeft, reducedMotion, scrollRef]);
 
   const beginDrag = useCallback((tabId: string, name: string, index: number, count: number) => {
     suppressPressRef.current = true;
@@ -182,13 +233,21 @@ export function TabStrip({
     beginDragFeedback(name, index, count);
   }, []);
 
+  /** A move between visible slots, handed on as the tab's index in the whole strip. */
+  const reorderSlot = useCallback(
+    (tabId: string, fromSlot: number, toSlot: number) => {
+      onReorder(tabId, slotDestination(tabs, groups, slots, fromSlot, toSlot));
+    },
+    [groups, onReorder, slots, tabs],
+  );
+
   const finishDrag = useCallback(
-    (tabId: string, name: string, fromIndex: number, toIndex: number, moved: boolean) => {
+    (tabId: string, name: string, fromSlot: number, toSlot: number, moved: boolean) => {
       setDraggingId(null);
       setScrollEnabled(true);
-      if (fromIndex !== toIndex) {
-        endDragFeedback(name, toIndex, tabs.length);
-        onReorder(tabId, toIndex);
+      if (fromSlot !== toSlot) {
+        endDragFeedback(name, toSlot, visibleCount);
+        reorderSlot(tabId, fromSlot, toSlot);
       } else if (!moved) {
         const tab = tabs.find((candidate) => candidate.id === tabId);
         if (tab) onActions(tab);
@@ -197,7 +256,7 @@ export function TabStrip({
         suppressPressRef.current = false;
       }, duration.instant);
     },
-    [onActions, onReorder, tabs],
+    [onActions, reorderSlot, tabs, visibleCount],
   );
 
   const cancelDrag = useCallback((name: string) => {
@@ -235,18 +294,13 @@ export function TabStrip({
     scrollX.value = nextScroll;
     scrollTo(scrollRef, nextScroll, 0, false);
     const contentPointer = pointerAbsoluteX.value - stripWindowLeft.value + nextScroll;
-    const sourceLeft = activeFrom.value * TAB_STEP;
+    const sourceLeft = slotLefts[activeFrom.value] ?? activeFrom.value * TAB_STEP;
     const translation = contentPointer - pointerOffset.value - sourceLeft;
     translationX.value = translation;
-    const destination = tabDestinationIndex(
-      activeFrom.value,
-      translation,
-      tabs.length,
-      TAB_GEOMETRY,
-    );
+    const destination = tabDestinationIndex(activeFrom.value, translation, visibleCount, geometry);
     if (destination !== activeTo.value) {
       activeTo.value = destination;
-      scheduleOnRN(indexDragFeedback, destination, tabs.length);
+      scheduleOnRN(indexDragFeedback, destination, visibleCount);
     }
   });
 
@@ -278,7 +332,7 @@ export function TabStrip({
         : null,
     (current) => {
       if (!paneDrag || !current) return;
-      const next =
+      const slot =
         current.carrying === 1
           ? tabIndexAtPoint(current.x, current.y, {
               stripLeft: paneDrag.stripLeft.value,
@@ -289,36 +343,42 @@ export function TabStrip({
               contentInset: TAB_CONTENT_INSET,
               tabWidth: TAB_WIDTH,
               tabGap: TAB_GAP,
-              tabCount: tabs.length,
+              tabCount: visibleCount,
+              slotLefts,
             })
           : -1;
+      // The pane list speaks whole-strip indices, as the layout does.
+      const next = slot >= 0 ? (slots[slot] ?? -1) : -1;
       if (next === paneDrag.hovered.value) return;
       paneDrag.hovered.value = next;
       const name = tabs[next]?.name;
       if (name) scheduleOnRN(paneHoverFeedback, name);
     },
-    [paneDrag, tabs],
+    [paneDrag, slotLefts, slots, tabs, visibleCount],
   );
 
   const paneDropStyle = useAnimatedStyle(() => {
     const index = paneDrag?.hovered.value ?? -1;
     return {
       opacity: index >= 0 ? opacity.opaque : opacity.hidden,
-      transform: [{ translateX: Math.max(0, index) * TAB_STEP }],
+      transform: [{ translateX: Math.max(0, tabLefts[index] ?? 0) }],
     };
-  });
+  }, [paneDrag, tabLefts]);
 
-  const indicatorStyle = useAnimatedStyle(() => ({
-    opacity:
-      activeFrom.value >= 0 && activeFrom.value !== activeTo.value
-        ? opacity.opaque
-        : opacity.hidden,
-    transform: [
-      {
-        translateX: tabInsertionX(activeFrom.value, activeTo.value, TAB_GEOMETRY),
-      },
-    ],
-  }));
+  const indicatorStyle = useAnimatedStyle(
+    () => ({
+      opacity:
+        activeFrom.value >= 0 && activeFrom.value !== activeTo.value
+          ? opacity.opaque
+          : opacity.hidden,
+      transform: [
+        {
+          translateX: tabInsertionX(activeFrom.value, activeTo.value, geometry),
+        },
+      ],
+    }),
+    [activeFrom, activeTo, geometry],
+  );
 
   const handleSelect = (index: number) => {
     if (suppressPressRef.current) return;
@@ -347,32 +407,63 @@ export function TabStrip({
         testID="workspace-tab-strip"
       >
         <View style={styles.tabs}>
-          {tabs.map((tab, index) => (
-            <DraggableTab
-              active={index === activeIndex}
-              attention={tabAttentionSummary(tab, sessionsById)}
-              canClose={tabs.length > 1}
-              dragValues={dragValues}
-              dragging={draggingId === tab.id}
-              index={index}
-              key={tab.id}
-              onAccessibleReorder={(toIndex) => onReorder(tab.id, toIndex)}
-              onActions={() => onActions(tab)}
-              onBeginDrag={beginDrag}
-              onCancelDrag={cancelDrag}
-              onClose={() => {
-                haptics.impact("light");
-                onClose(tab);
-              }}
-              onFinishDrag={finishDrag}
-              onIndexChange={indexDragFeedback}
-              onSelect={() => handleSelect(index)}
-              reducedMotion={reducedMotion}
-              surfaces={surfaces}
-              tab={tab}
-              tabCount={tabs.length}
-            />
-          ))}
+          {model.items.map((item) => {
+            if (item.kind === "label") {
+              const { group } = item;
+              return (
+                <TabGroupLabel
+                  attention={hiddenAttention(item.hidden, sessionsById)}
+                  color={resolveGroupColor(group.color, theme.colors.tabGroup)}
+                  group={group}
+                  hiddenCount={item.hidden.length}
+                  key={item.key}
+                  onManage={() => {
+                    haptics.impact("medium");
+                    onManageGroup?.(group);
+                  }}
+                  onToggle={() => {
+                    haptics.selection();
+                    onToggleGroup?.(group);
+                  }}
+                  width={item.width}
+                />
+              );
+            }
+            const { tab, index, slot } = item;
+            return (
+              <DraggableTab
+                active={index === activeIndex}
+                attention={tabAttentionSummary(tab, sessionsById)}
+                canClose={tabs.length > 1}
+                dragValues={dragValues}
+                dragging={draggingId === tab.id}
+                groupColor={
+                  item.group ? resolveGroupColor(item.group.color, theme.colors.tabGroup) : null
+                }
+                groupContinues={item.joinsNext}
+                index={slot}
+                key={item.key}
+                onAccessibleReorder={(toSlot) =>
+                  onReorder(tab.id, stepDestination(tabs, groups, tab.id, toSlot < slot ? -1 : 1))
+                }
+                onActions={() => onActions(tab)}
+                onBeginDrag={beginDrag}
+                onCancelDrag={cancelDrag}
+                onClose={() => {
+                  haptics.impact("light");
+                  onClose(tab);
+                }}
+                onFinishDrag={finishDrag}
+                onIndexChange={indexDragFeedback}
+                onSelect={() => handleSelect(index)}
+                reducedMotion={reducedMotion}
+                slotLefts={slotLefts}
+                surfaces={surfaces}
+                tab={tab}
+                tabCount={visibleCount}
+              />
+            );
+          })}
           <Animated.View
             pointerEvents="none"
             style={[styles.dropIndicator, { backgroundColor: theme.colors.ring }, indicatorStyle]}

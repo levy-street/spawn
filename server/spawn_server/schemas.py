@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-from . import grid
+from . import grid, tab_groups
 from .browser_registration import ED25519_SIGNATURE_B64URL_LENGTH
 from .host_identity import (
     decode_ed25519_public_key,
@@ -1483,6 +1483,32 @@ class WorkspaceTab(BaseModel):
     cwd: str | None = Field(default=None, max_length=1024)
 
 
+class TabGroup(BaseModel):
+    """A named, coloured run of adjacent tabs (proto/README.md, "Tab groups").
+
+    Shapes are checked here; what only the strip can answer — that every tab
+    exists, sits in one group, and next to the rest of its group — is checked
+    against the envelope by `tab_groups.validate_groups`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=tab_groups.MAX_ID_LENGTH)
+    name: str = Field(default="", max_length=tab_groups.MAX_NAME_LENGTH)
+    # A preset name, or a custom colour stored as lowercase #rrggbb.
+    color: str
+    collapsed: bool = False
+    tab_ids: list[str] = Field(max_length=8)
+
+    @field_validator("color")
+    @classmethod
+    def _validate_color(cls, value: str) -> str:
+        color = tab_groups.normalize_color(value)
+        if color is None:
+            raise ValueError("color must be a preset name or #rrggbb")
+        return color
+
+
 class WorkspaceLayoutV3(BaseModel):
     """The workspace layout envelope: an ordered list of tabs, each holding a
     tile grid. The grid algebra (grid.py / grid.ts and the shared fixtures)
@@ -1497,6 +1523,10 @@ class WorkspaceLayoutV3(BaseModel):
     # along on layout writes rather than written on every switch.
     active_tab: str | None = None
     tabs: list[WorkspaceTab] = Field(min_length=1, max_length=8)
+    # Absent on a write means "keep the stored groups": clients from before tab
+    # groups know nothing of them, and must not erase them by saving a layout.
+    # Every read answers with the list, empty when there are none.
+    groups: list[TabGroup] | None = None
 
 
 class WorkspaceFirstSession(BaseModel):

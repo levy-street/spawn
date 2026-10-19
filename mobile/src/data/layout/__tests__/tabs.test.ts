@@ -101,3 +101,49 @@ describe("tab algebra", () => {
     expect(original.tabs[0]?.layout.tiles).toHaveLength(1);
   });
 });
+
+describe("tab algebra with groups", () => {
+  function grouped(): WorkspaceLayoutV3 {
+    const base = layout();
+    const blank = { host_id: null, cwd: null, layout: { version: 3 as const, tiles: [] } };
+    return {
+      ...base,
+      tabs: [
+        ...base.tabs,
+        { id: "three", name: "Three", ...blank },
+        { id: "four", name: "Four", ...blank },
+      ],
+      groups: [
+        { id: "g", name: "Agents", color: "orange", collapsed: false, tab_ids: ["two", "three"] },
+      ],
+    };
+  }
+
+  it("regroups a reordered tab by where it lands", () => {
+    const joined = reorderTab(grouped(), "four", 2);
+    expect(joined.tabs.map((tab) => tab.id)).toEqual(["one", "two", "four", "three"]);
+    expect(joined.groups?.[0]?.tab_ids).toEqual(["two", "four", "three"]);
+
+    const left = reorderTab(grouped(), "two", 0);
+    expect(left.groups?.[0]?.tab_ids).toEqual(["three"]);
+  });
+
+  it("prunes a closed tab from its group and drops a group left empty", () => {
+    const pruned = removeTab(grouped(), "two");
+    expect(pruned?.groups?.[0]?.tab_ids).toEqual(["three"]);
+    const emptied = removeTab(pruned as WorkspaceLayoutV3, "three");
+    expect(emptied?.groups).toEqual([]);
+  });
+
+  it("carries groups through adding, renaming and moving a pane untouched", () => {
+    const source = grouped();
+    expect(addTab(source, "five")?.groups).toBe(source.groups);
+    expect(renameTab(source, "two", "Build").groups).toBe(source.groups);
+    expect(movePaneToTab(source, "files-1", "two")?.groups).toBe(source.groups);
+  });
+
+  it("leaves a layout without groups without the key", () => {
+    expect(reorderTab(layout(), "two", 0)).not.toHaveProperty("groups");
+    expect(removeTab(layout(), "two")).not.toHaveProperty("groups");
+  });
+});

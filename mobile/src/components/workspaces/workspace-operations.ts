@@ -17,6 +17,7 @@ import type {
   WorkspaceOut,
   WorkspaceTile,
 } from "@/data/api/schemas/workspaces";
+import { normalizeGroups } from "@/data/layout/tab-groups";
 import {
   agentLaunchCommand,
   newAgentConversationId,
@@ -108,7 +109,8 @@ function initialTemplateLayout(
       ),
     },
   }));
-  return { version: 3, active_tab: tabs[0]?.id ?? null, tabs };
+  // A template records tabs, not how they were grouped.
+  return { version: 3, active_tab: tabs[0]?.id ?? null, tabs, groups: [] };
 }
 
 async function activateTab(
@@ -221,10 +223,24 @@ function initialDuplicateLayout(
   const activeIndex = workspace.layout.tabs.findIndex(
     (tab) => tab.id === workspace.layout.active_tab,
   );
+  // The copy is grouped as the source is, under group ids of its own.
+  const copyOf = new Map(workspace.layout.tabs.map((tab, index) => [tab.id, tabs[index]?.id]));
+  const groups = workspace.layout.groups.map((group) => ({
+    ...group,
+    id: randomId(),
+    tab_ids: group.tab_ids.flatMap((tabId) => {
+      const copy = copyOf.get(tabId);
+      return copy ? [copy] : [];
+    }),
+  }));
   return {
     version: 3,
     active_tab: tabs[activeIndex]?.id ?? tabs[0]?.id ?? null,
     tabs,
+    groups: normalizeGroups(
+      tabs.map((tab) => tab.id),
+      groups,
+    ),
   };
 }
 

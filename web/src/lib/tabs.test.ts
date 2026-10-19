@@ -14,6 +14,7 @@ import {
   removeTab,
   renameTab,
   reorderTab,
+  type TabGroup,
   tabOfSession,
   tabTiles,
   withActiveTab,
@@ -338,5 +339,79 @@ describe("mergeTabs", () => {
       { id: "t2", tiles: [tile("s1", 0, 0, 12, 24), tile("s2", 12, 0, 12, 24)] },
     ]);
     expect(mergeTabs(layout, "t2", "t1")).toBeNull();
+  });
+});
+
+describe("tab groups ride along", () => {
+  function grouped(ids: string[], groups: TabGroup[]): LayoutV3 {
+    return { ...envelope(ids.map((id) => ({ id }))), groups };
+  }
+  const g = (id: string, tabIds: string[]): TabGroup => ({
+    id,
+    name: id,
+    color: "red",
+    collapsed: true,
+    tab_ids: tabIds,
+  });
+  const ids = (layout: LayoutV3 | null) => layout?.tabs.map((tab) => tab.id);
+
+  test("an envelope from before groups stays without the key", () => {
+    const old = envelope([{ id: "a" }, { id: "b" }]);
+    for (const next of [
+      addTab(old, "c", "C"),
+      removeTab(old, "b"),
+      reorderTab(old, "a", 1),
+      duplicateTab(old, "a", "c", "C", new Map()),
+      renameTab(old, "a", "x"),
+      withActiveTab(old, "b"),
+    ]) {
+      expect(next).not.toBeNull();
+      expect(next && "groups" in next).toBe(false);
+    }
+  });
+
+  test("every envelope helper carries the groups", () => {
+    const layout = grouped(["a", "b", "c"], [g("g", ["a", "b"])]);
+    expect(addTab(layout, "d", "D")?.groups).toEqual([g("g", ["a", "b"])]);
+    expect(renameTab(layout, "c", "x").groups).toEqual([g("g", ["a", "b"])]);
+    expect(withTabTiles(layout, "c", [tile("s", 0, 0, 24, 24)]).groups).toEqual([
+      g("g", ["a", "b"]),
+    ]);
+    expect(withActiveTab(layout, "c").groups).toEqual([g("g", ["a", "b"])]);
+  });
+
+  test("a closed or merged tab leaves its group, and an emptied group goes", () => {
+    const layout = grouped(["a", "b", "c"], [g("g", ["a", "b"]), g("h", ["c"])]);
+    expect(removeTab(layout, "a")?.groups).toEqual([g("g", ["b"]), g("h", ["c"])]);
+    expect(removeTab(layout, "c")?.groups).toEqual([g("g", ["a", "b"])]);
+    expect(mergeTabs(layout, "c", "a")?.groups).toEqual([g("g", ["a", "b"])]);
+    expect(mergeTabs(layout, "b", "c")?.groups).toEqual([g("g", ["a"]), g("h", ["c"])]);
+  });
+
+  test("reorderTab regroups the moved tab", () => {
+    const layout = grouped(["a", "b", "c", "d"], [g("g", ["b", "c"])]);
+    // Dropped between b and c: it joins.
+    const joined = reorderTab(layout, "d", 2);
+    expect(ids(joined)).toEqual(["a", "b", "d", "c"]);
+    expect(joined?.groups).toEqual([g("g", ["b", "d", "c"])]);
+    // Carried off to the far end: it leaves.
+    const left = reorderTab(layout, "b", 3);
+    expect(ids(left)).toEqual(["a", "c", "d", "b"]);
+    expect(left?.groups).toEqual([g("g", ["c"])]);
+  });
+
+  test("a copy beside its source's group joins it; elsewhere it is regrouped", () => {
+    const layout = grouped(["a", "b", "c"], [g("g", ["a", "b"])]);
+    // Right after b, the group's last tab: kept with its original.
+    const beside = duplicateTab(layout, "a", "x", "X", new Map(), 2);
+    expect(ids(beside)).toEqual(["a", "b", "x", "c"]);
+    expect(beside?.groups).toEqual([g("g", ["a", "b", "x"])]);
+    // On the end, past c: a tab like any other.
+    const away = duplicateTab(layout, "a", "x", "X", new Map());
+    expect(away?.groups).toEqual([g("g", ["a", "b"])]);
+    // A copy of an ungrouped tab dropped inside a group joins it.
+    const inside = duplicateTab(layout, "c", "x", "X", new Map(), 1);
+    expect(ids(inside)).toEqual(["a", "x", "b", "c"]);
+    expect(inside?.groups).toEqual([g("g", ["a", "x", "b"])]);
   });
 });

@@ -82,6 +82,7 @@ function workspaceWithWindow() {
     layout: {
       version: 3,
       active_tab: "tab-1",
+      groups: [],
       tabs: [
         makeTab(),
         makeTab({

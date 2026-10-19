@@ -53,6 +53,17 @@ describe("dropping a carried pane on a tab", () => {
     expect(tabIndexAtPoint(-20, 120, GEOMETRY)).toBe(-1);
   });
 
+  test("reads tabs at the positions a group's label leaves them, and not the label", () => {
+    // Slot 0 at 0, a 96pt label, then slot 1 past it.
+    const slotLefts = [0, 152 + 96];
+    const geometry = { ...GEOMETRY, tabCount: 2, slotLefts };
+    const at = (left: number) => GEOMETRY.contentInset + left + GEOMETRY.tabWidth / 2;
+    expect(tabIndexAtPoint(at(0), 120, geometry)).toBe(0);
+    expect(tabIndexAtPoint(at(slotLefts[1] as number), 120, geometry)).toBe(1);
+    // Over the label itself: no tab.
+    expect(tabIndexAtPoint(GEOMETRY.contentInset + 152 + 40, 120, geometry)).toBe(-1);
+  });
+
   test("has no target at all before the strip has been measured", () => {
     expect(tabIndexAtPoint(80, 120, { ...GEOMETRY, stripWidth: 0, stripHeight: 0 })).toBe(-1);
     expect(tabIndexAtPoint(80, 120, { ...GEOMETRY, tabCount: 0 })).toBe(-1);

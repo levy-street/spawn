@@ -1,3 +1,4 @@
+import { PRESET_COLORS } from "@/data/layout/tab-groups";
 import {
   clampDisplay,
   darkColors,
@@ -46,9 +47,13 @@ describe("semantic colors", () => {
   });
 
   it("uses React Native-compatible literals for every color token", () => {
+    const { tabGroup: lightTabGroup, ...lightTokens } = lightColors;
+    const { tabGroup: darkTabGroup, ...darkTokens } = darkColors;
     const palettes = [
-      lightColors,
-      darkColors,
+      lightTokens,
+      darkTokens,
+      lightTabGroup,
+      darkTabGroup,
       pressroomColors,
       grimoireColors,
       tabSurfaces.light,
@@ -61,6 +66,11 @@ describe("semantic colors", () => {
     for (const palette of palettes) {
       expectValidColors(palette);
     }
+  });
+
+  it("gives every tab group preset a colour in both themes, in preset order", () => {
+    expect(Object.keys(lightColors.tabGroup)).toEqual([...PRESET_COLORS]);
+    expect(Object.keys(darkColors.tabGroup)).toEqual([...PRESET_COLORS]);
   });
 
   it("keeps light and dark terminal keys in parity", () => {

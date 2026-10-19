@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, grid, schemas
+from .. import auth, grid, schemas, tab_groups
 from ..db import get_session
 from ..models import Host, Session, User, Workspace
 from . import capabilities
@@ -52,6 +52,7 @@ def _single_tab_layout(tiles: list[dict]) -> dict:
                 "layout": {"version": grid.LAYOUT_VERSION, "tiles": tiles},
             }
         ],
+        "groups": [],
     }
 
 
@@ -95,7 +96,10 @@ def parse_workspace_layout(raw: object) -> dict:
             active = raw.get("active_tab")
             if not any(tab["id"] == active for tab in tabs):
                 active = tabs[0]["id"]
-            return {"version": 3, "active_tab": active, "tabs": tabs}
+            # Read leniently, like the tabs: a group that no longer fits the
+            # strip is trimmed to what does rather than failing the read.
+            groups = tab_groups.normalize_groups([tab["id"] for tab in tabs], raw.get("groups"))
+            return {"version": 3, "active_tab": active, "tabs": tabs, "groups": groups}
     # Envelope schema v2: a bare grid, from before tabs existed.
     if isinstance(raw, dict) and raw.get("version") == 2 and isinstance(raw.get("tiles"), list):
         lifted = grid.lift_layout({"version": 2, "tiles": [dict(t) for t in raw["tiles"]]})
@@ -184,13 +188,24 @@ async def prune_workspace_tiles(db: AsyncSession, user: User, layout: dict) -> d
                 "layout": {"version": grid.LAYOUT_VERSION, "tiles": kept},
             }
         )
-    return {"version": 3, "active_tab": layout.get("active_tab"), "tabs": tabs}
+    return {
+        "version": 3,
+        "active_tab": layout.get("active_tab"),
+        "tabs": tabs,
+        "groups": layout.get("groups") or [],
+    }
 
 
 async def _validated_layout(
-    db: AsyncSession, user: User, layout: schemas.WorkspaceLayoutV3
+    db: AsyncSession, user: User, layout: schemas.WorkspaceLayoutV3, stored: object
 ) -> dict:
-    pruned = await prune_workspace_tiles(db, user, layout.model_dump(mode="json"))
+    """The envelope a PATCH writes. `stored` is the layout it replaces: a
+    client from before tab groups sends none, and keeps the stored ones,
+    re-fitted to the strip it did send."""
+    body = layout.model_dump(mode="json")
+    sent_groups = "groups" in layout.model_fields_set
+    groups = body.pop("groups", None) or []
+    pruned = await prune_workspace_tiles(db, user, body)
     tab_ids = [tab["id"] for tab in pruned["tabs"]]
     if len(set(tab_ids)) != len(tab_ids):
         raise HTTPException(status_code=400, detail="tab ids must be unique")
@@ -201,6 +216,13 @@ async def _validated_layout(
             raise HTTPException(
                 status_code=400, detail="layout violates the grid invariants"
             )
+    if sent_groups:
+        problem = tab_groups.validate_groups(tab_ids, groups)
+        if problem is not None:
+            raise HTTPException(status_code=400, detail=f"tab groups: {problem}")
+    else:
+        groups = parse_workspace_layout(stored)["groups"]
+    pruned["groups"] = tab_groups.normalize_groups(tab_ids, groups)
     return pruned
 
 
@@ -422,7 +444,7 @@ async def update_workspace(
             raise HTTPException(status_code=400, detail="name is required")
         workspace.name = name
     if body.layout is not None:
-        workspace.layout = await _validated_layout(db, user, body.layout)
+        workspace.layout = await _validated_layout(db, user, body.layout, workspace.layout)
     if body.host_id is not None:
         home_host = await db.get(Host, body.host_id)
         if home_host is None or home_host.owner_user_id != user.id:

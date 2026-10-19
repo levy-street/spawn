@@ -20,7 +20,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { useReducedMotionPreference } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, type Colors, opacity, useTheme } from "@/theme";
+import { borderWidth, type ColorToken, opacity, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 export type ButtonVariant = "default" | "secondary" | "outline" | "ghost" | "destructive" | "link";
@@ -42,14 +42,14 @@ export interface ButtonProps
 interface ButtonPalette {
   backgroundColor: string;
   borderColor: string;
-  contentColor: keyof Colors;
+  contentColor: ColorToken;
   pressedBackgroundColor: string;
   pressedOpacity: number;
 }
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
-export function buttonContentColor(variant: ButtonVariant): keyof Colors {
+export function buttonContentColor(variant: ButtonVariant): ColorToken {
   switch (variant) {
     case "default":
       return "primaryForeground";
@@ -81,7 +81,7 @@ function ButtonContent({
   linkPressed,
 }: {
   children: ReactNode;
-  color: keyof Colors;
+  color: ColorToken;
   linkPressed: boolean;
 }) {
   return Children.map(children, (child) => {

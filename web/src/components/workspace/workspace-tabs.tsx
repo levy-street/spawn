@@ -3,8 +3,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
+  CircleMinus,
   Copy,
   Ellipsis,
+  FolderInput,
+  Group,
   ImagePlus,
   LayoutTemplate,
   Merge,
@@ -25,6 +28,7 @@ import {
 } from "react";
 import { AttentionBadge } from "@/components/ui/attention-badge";
 import { Button } from "@/components/ui/button";
+import type { CascadeMenuHandle } from "@/components/ui/cascade-menu";
 import { confirm } from "@/components/ui/confirm";
 import {
   Dialog,
@@ -40,6 +44,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import type { MenuAnchor } from "@/components/ui/menu-position";
 import { toast } from "@/components/ui/toast";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import {
@@ -55,6 +60,19 @@ import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE, isFilesWidget } from "@/lib/grid";
 import { sessionAgent } from "@/lib/sessions";
 import {
+  addTabToGroup,
+  createGroup,
+  hiddenTabIds,
+  layoutGroups,
+  nextGroupColor,
+  removeTabFromGroup,
+  stripIndexForGap,
+  stripIndexForSlot,
+  UNNAMED_GROUP,
+  ungroup,
+  updateGroup,
+} from "@/lib/tab-groups";
+import {
   addTab,
   allTiles,
   copyTabName,
@@ -65,6 +83,7 @@ import {
   removeTab,
   renameTab,
   reorderTab,
+  type TabGroup,
   tabById,
   tabTiles,
   type WorkspaceTab,
@@ -73,6 +92,7 @@ import {
 import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
 import {
+  type AttentionLevel,
   tabAttentionCount,
   tabAttentionLevel,
   workspaceFolder,
@@ -83,6 +103,7 @@ import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
 import { type SplitChrome, SplitWorkspaceMenu, UnsplitButton } from "./split-chrome";
+import { groupColorStyle, TabGroupEditor } from "./tab-group-editor";
 import { type MergeDrop, type MergeRefusal, planMerge, WHOLE_CANVAS } from "./tab-merge";
 import { dockZoneAt, freeRects, wantsDuplicate } from "./workspace-grid-helpers";
 
@@ -99,6 +120,23 @@ const DRAG_THRESHOLD_PX = 4;
 const MERGE_ENTER_PX = 28;
 const MERGE_EXIT_PX = 8;
 
+/**
+ * How long a group's name or colour waits for the next keystroke or drag step
+ * before it is written. The strip shows each change at once; this only spares
+ * the server a PATCH per letter, and a close or any other write sends what is
+ * pending straight away.
+ */
+const GROUP_WRITE_DEBOUNCE_MS = 400;
+
+/** The tab group panel, and which label it hangs from. */
+type GroupEditorState = {
+  groupId: string;
+  mode: "create" | "manage";
+  /** Measured off the label once it is on screen; a group just created has
+   *  no label until the render that follows. */
+  anchor: MenuAnchor | null;
+};
+
 /** A pointerdown on a tab, waiting to see whether it becomes a reorder. */
 type ArmedTabDrag = {
   move: (event: PointerEvent) => void;
@@ -110,6 +148,11 @@ type TabSlot = { id: string; left: number; width: number };
 
 type TabDrag = {
   tabId: string;
+  /** The tabs on screen when the drag began, in strip order. A collapsed
+   *  group keeps most of its tabs out of sight, so `from`, `to` and
+   *  `insertAt` count these, and the drop maps them back to the whole strip
+   *  (`stripIndexForSlot`, `stripIndexForGap`). */
+  visibleIds: string[];
   from: number;
   /** The slot the tab would land in were the pointer lifted now. */
   to: number;
@@ -126,7 +169,7 @@ type TabDrag = {
    *  and `insertAt` — not `to` — is the slot that matters. */
   duplicating: boolean;
   /** The slot the copy would take were the pointer lifted now, counted in the
-   *  strip as it stands (so `tabs.length` means the end). */
+   *  visible strip as it stands (so `visibleIds.length` means the end). */
   insertAt: number;
   /** This half's canvas, for the hit-test that turns the drag into a merge.
    *  Null when the strip is not inside a workspace half. */
@@ -193,6 +236,12 @@ function mergeAimLabel(aim: MergeAim): string {
  * into it (see WorkspaceGrid) — and `data-workspace-tab-owner`, which says
  * whose strip it is, since in a split window a hit-test finds either.
  *
+ * Tabs can be gathered into groups, as Firefox has them: a coloured label
+ * before the group's first tab (click to fold the group away, right-click for
+ * its panel) and a line of the same colour over its tabs. Labels carry
+ * `data-workspace-tab-group`, never `data-workspace-tab`, so nothing that
+ * hit-tests the strip for tabs mistakes one for a tab.
+ *
  * Tab CRUD writes the whole v3 envelope through PATCH and updates both query
  * caches optimistically, mirroring the grid's own save path.
  */
@@ -253,6 +302,20 @@ export function WorkspaceTabs({
   // One context menu serves the whole strip: right-click records which tab it
   // was aimed at and opens the menu at the cursor.
   const tabMenuRef = useRef<DropdownMenuHandle>(null);
+  /*
+   * "Add tab to group…" needs a list, and the menu has no submenus: picking it
+   * closes the tab menu and opens this one at the same point, which is where
+   * the right-click left the pointer.
+   */
+  const groupMenuRef = useRef<DropdownMenuHandle>(null);
+  const menuPointRef = useRef({ x: 0, y: 0 });
+  const [editor, setEditor] = useState<GroupEditorState | null>(null);
+  /** "New tab in group": the group the next tab is for, and a count that
+   *  re-opens the picker when asked twice for the same group. */
+  const [groupNewTab, setGroupNewTab] = useState<{ groupId: string; nonce: number } | null>(null);
+  const groupNewTabMenuRef = useRef<CascadeMenuHandle>(null);
+  /** A name or colour change waiting to be written; see patchM. */
+  const groupWriteRef = useRef<number | null>(null);
   const tabGhostRef = useRef<HTMLDivElement>(null);
   const tabGhostLabelRef = useRef<HTMLSpanElement>(null);
   // The merge drag's two pieces of chrome: the tab carried under the pointer
@@ -286,19 +349,44 @@ export function WorkspaceTabs({
     );
   };
 
+  const cancelGroupWrite = () => {
+    if (groupWriteRef.current === null) return;
+    window.clearTimeout(groupWriteRef.current);
+    groupWriteRef.current = null;
+  };
+
   const patchM = useMutation({
     mutationFn: (layout: LayoutV3) => workspaces.update(workspace.id, { layout }),
     onMutate: (layout) => {
+      // Every write carries the whole envelope, so it carries a pending group
+      // edit too; the debounced write it was waiting for has nothing left to say.
+      cancelGroupWrite();
       onError?.(null);
       writeCaches({ ...workspace, layout });
     },
-    onSuccess: writeCaches,
+    onSuccess: (saved) => {
+      // A name still being typed is newer than what this write took with it:
+      // keep showing it rather than flick back to the saved spelling for the
+      // length of the debounce.
+      writeCaches(groupWriteRef.current === null ? saved : { ...saved, layout: layoutRef.current });
+    },
     onError: (error) => {
       queryClient.invalidateQueries({ queryKey: ["workspace", workspace.id] });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       onError?.(error instanceof Error ? error.message : String(error));
     },
   });
+
+  /**
+   * Every strip write goes through here. The live layout moves at once rather
+   * than when the optimistic write has rendered: two Alt+Shift+Arrow presses
+   * inside a frame, or a fold straight after a regroup, must each start from
+   * what the one before them did.
+   */
+  const writeLayout = (next: LayoutV3) => {
+    layoutRef.current = next;
+    patchM.mutate(next);
+  };
 
   useEffect(() => {
     if (renamingId && !workspace.layout.tabs.some((tab) => tab.id === renamingId)) {
@@ -321,15 +409,17 @@ export function WorkspaceTabs({
   const draggedRef = useRef(false);
   /** The strip's live layout, for the drag's reads between renders. */
   const layoutRef = useRef(workspace.layout);
-  /** The dropped order, held until the optimistic write carries it — without
-   *  it the strip paints one frame of the old order and reads as a snap-back. */
-  const [droppedOrder, setDroppedOrder] = useState<string[] | null>(null);
+  /** The dropped envelope, held until the optimistic write carries it —
+   *  without it the strip paints one frame of the old order and reads as a
+   *  snap-back. The whole envelope rather than the order, because a drop can
+   *  regroup the tab as well as move it. */
+  const [dropped, setDropped] = useState<LayoutV3 | null>(null);
 
   useEffect(() => {
     layoutRef.current = workspace.layout;
     // Whatever the patch settled on — the dropped order or a rollback — is the
     // truth now, so the local hold has done its one frame of work.
-    setDroppedOrder(null);
+    setDropped(null);
   }, [workspace.layout]);
 
   // Unmounting mid-drag — a workspace switch, say — must not leave listeners
@@ -354,14 +444,21 @@ export function WorkspaceTabs({
     [],
   );
 
-  const orderedTabs = useMemo(() => {
+  /** The envelope the strip paints: the dropped one while it is held. */
+  const view = useMemo(() => {
     const list = workspace.layout.tabs;
-    if (!droppedOrder) return list;
-    const held = droppedOrder
-      .map((id) => list.find((tab) => tab.id === id))
+    if (!dropped) return workspace.layout;
+    const held = dropped.tabs
+      .map((item) => list.find((tab) => tab.id === item.id))
       .filter((tab): tab is WorkspaceTab => Boolean(tab));
-    return held.length === list.length ? held : list;
-  }, [droppedOrder, workspace.layout.tabs]);
+    return held.length === list.length
+      ? { ...workspace.layout, tabs: held, groups: dropped.groups }
+      : workspace.layout;
+  }, [dropped, workspace.layout]);
+  const orderedTabs = view.tabs;
+  const groups = useMemo(() => layoutGroups(view), [view]);
+  /** Folded groups keep all but the open tab out of sight. */
+  const hidden = useMemo(() => hiddenTabIds(view, activeTabId), [view, activeTabId]);
 
   const disarmDrag = () => {
     const armed = armedDragRef.current;
@@ -427,14 +524,26 @@ export function WorkspaceTabs({
       else if (drag.mergeRefusal) onError?.(mergeRefusalMessage(drag));
       return;
     }
+    const layout = layoutRef.current;
     if (commit && drag.duplicating) {
-      duplicateM.mutate({ tabId: drag.tabId, index: drag.insertAt });
+      duplicateM.mutate({
+        tabId: drag.tabId,
+        index: stripIndexForGap(layout, drag.visibleIds, drag.insertAt),
+      });
       return;
     }
-    const next = commit ? reorderTab(layoutRef.current, drag.tabId, drag.to) : null;
+    // The slot counts tabs on screen; the hidden tabs of a folded group move
+    // with it as a block, so the drop never lands inside what nobody can see.
+    const next = commit
+      ? reorderTab(
+          layout,
+          drag.tabId,
+          stripIndexForSlot(layout, drag.visibleIds, drag.tabId, drag.to),
+        )
+      : null;
     if (!next) return;
-    setDroppedOrder(next.tabs.map((tab) => tab.id));
-    patchM.mutate(next);
+    setDropped(next);
+    writeLayout(next);
   };
 
   const beginDrag = (
@@ -443,7 +552,9 @@ export function WorkspaceTabs({
     clientX: number,
     duplicating: boolean,
   ) => {
-    const list = layoutRef.current.tabs;
+    // Only what is on screen is measured: a folded group's hidden tabs have no
+    // element, and the drop maps the visible slot back to the whole strip.
+    const list = layoutRef.current.tabs.filter((tab) => tabElementsRef.current.has(tab.id));
     const from = list.findIndex((tab) => tab.id === tabId);
     const elements = list.map((tab) => tabElementsRef.current.get(tab.id));
     if (from === -1 || elements.length === 0 || elements.some((element) => !element)) return;
@@ -745,6 +856,7 @@ export function WorkspaceTabs({
 
     const drag: TabDrag = {
       tabId,
+      visibleIds: list.map((tab) => tab.id),
       from,
       to: from,
       startClientX,
@@ -827,11 +939,17 @@ export function WorkspaceTabs({
   };
 
   /** The same reorder without a pointer. Alt+Arrow alone walks the grid's
-   *  panes, so the shift keeps the two apart. */
+   *  panes, so the shift keeps the two apart. A step is one tab on screen: a
+   *  folded group is passed over whole, the way a drag passes it. */
   const nudge = (tabId: string, delta: number) => {
-    const from = layoutRef.current.tabs.findIndex((tab) => tab.id === tabId);
-    const next = from === -1 ? null : reorderTab(layoutRef.current, tabId, from + delta);
-    if (next) patchM.mutate(next);
+    const layout = layoutRef.current;
+    const folded = hiddenTabIds(layout, activeTabId);
+    const visibleIds = layout.tabs.map((tab) => tab.id).filter((id) => !folded.has(id));
+    const from = visibleIds.indexOf(tabId);
+    if (from === -1) return;
+    const to = Math.min(Math.max(from + delta, 0), visibleIds.length - 1);
+    const next = reorderTab(layout, tabId, stripIndexForSlot(layout, visibleIds, tabId, to));
+    if (next) writeLayout(next);
   };
 
   // biome-ignore lint/correctness/useExhaustiveDependencies(renamingId): the rename input swaps a tab for an input, changing every tab's width — re-measure.
@@ -882,11 +1000,14 @@ export function WorkspaceTabs({
    * which is what tells the create that follows where its window goes — and
    * hands back the undo for a create that never lands.
    */
-  const addTabForWindow = async () => {
+  const addTabForWindow = async (groupId?: string) => {
     const layout = layoutRef.current;
     const id = crypto.randomUUID();
-    const next = addTab(layout, id, nextTabName(layout));
-    if (!next) throw new Error(`A workspace holds at most ${MAX_TABS} tabs.`);
+    const added = addTab(layout, id, nextTabName(layout));
+    if (!added) throw new Error(`A workspace holds at most ${MAX_TABS} tabs.`);
+    // "New tab in group" puts the tab at the group's end in the same write, so
+    // there is never a moment where it sits ungrouped at the end of the strip.
+    const next = (groupId && addTabToGroup(added, id, groupId)) || added;
     const wasActive = activeTabId;
     writeCaches(await workspaces.update(workspace.id, { layout: next }));
     onSwitch(id);
@@ -1041,7 +1162,7 @@ export function WorkspaceTabs({
         return;
       }
     }
-    patchM.mutate(next);
+    writeLayout(next);
     if (tabId === activeTabId) onSwitch(next.active_tab as string);
   };
 
@@ -1135,7 +1256,7 @@ export function WorkspaceTabs({
     const tab = workspace.layout.tabs.find((item) => item.id === tabId);
     setRenamingId(null);
     if (!tab || !name || name === tab.name) return;
-    patchM.mutate(renameTab(workspace.layout, tabId, name.slice(0, 64)));
+    writeLayout(renameTab(workspace.layout, tabId, name.slice(0, 64)));
   };
 
   // The middle of the arriving block, where the outline's label sits.
@@ -1151,6 +1272,216 @@ export function WorkspaceTabs({
     () => new Map((sessionsQ.data ?? []).map((session) => [session.id, session])),
     [sessionsQ.data],
   );
+
+  // ---------------------------------------------------------------------------
+  // Tab groups.
+  // ---------------------------------------------------------------------------
+
+  const groupOfTabId = useMemo(
+    () => new Map(groups.flatMap((group) => group.tab_ids.map((id) => [id, group] as const))),
+    [groups],
+  );
+
+  /** A group's label in this strip: what the panel hangs from and where the
+   *  focus goes back to when it closes. */
+  const groupLabel = (groupId: string) =>
+    stripRef.current?.querySelector<HTMLElement>(
+      `[data-workspace-tab-group="${CSS.escape(groupId)}"]`,
+    ) ?? null;
+
+  const tabButton = (tabId: string) =>
+    stripRef.current?.querySelector<HTMLElement>(`[data-workspace-tab="${CSS.escape(tabId)}"]`) ??
+    null;
+
+  /**
+   * Show a name or colour change at once and write it when the typing or the
+   * dragging stops. The caches carry it in the meantime, so anything else
+   * written first — a reorder, a collapse — takes it along (and patchM then
+   * drops the timer, having said it already).
+   */
+  const editGroup = (groupId: string, patch: { name?: string; color?: string }) => {
+    const next = updateGroup(layoutRef.current, groupId, patch);
+    if (!next) return;
+    layoutRef.current = next;
+    const current = queryClient.getQueryData<Workspace>(["workspace", workspace.id]) ?? workspace;
+    writeCaches({ ...current, layout: next });
+    cancelGroupWrite();
+    groupWriteRef.current = window.setTimeout(() => {
+      groupWriteRef.current = null;
+      writeLayout(layoutRef.current);
+    }, GROUP_WRITE_DEBOUNCE_MS);
+  };
+
+  const flushGroupWrite = () => {
+    if (groupWriteRef.current === null) return;
+    cancelGroupWrite();
+    writeLayout(layoutRef.current);
+  };
+
+  // A name still waiting to be written when the strip goes — a workspace
+  // switch mid-word — is sent rather than dropped.
+  useEffect(
+    () => () => {
+      if (groupWriteRef.current === null) return;
+      window.clearTimeout(groupWriteRef.current);
+      groupWriteRef.current = null;
+      workspaces.update(workspace.id, { layout: layoutRef.current }).catch(() => undefined);
+    },
+    [workspace.id],
+  );
+
+  // The panel hangs from its label, which a group made a moment ago does not
+  // have until the optimistic write lands; and a group that goes away under
+  // an open panel — its last tab closed from another device — takes it along.
+  useLayoutEffect(() => {
+    if (!editor) return;
+    const label = groupLabel(editor.groupId);
+    if (!label) {
+      if (editor.anchor) setEditor(null);
+      return;
+    }
+    if (editor.anchor) return;
+    label.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const rect = label.getBoundingClientRect();
+    setEditor({
+      ...editor,
+      anchor: { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right },
+    });
+  });
+
+  // "New tab in group" opens the strip's own new-tab picker, hung from the
+  // label, once the panel that asked for it has gone.
+  useEffect(() => {
+    if (!groupNewTab) return;
+    const frame = requestAnimationFrame(() => groupNewTabMenuRef.current?.open());
+    return () => cancelAnimationFrame(frame);
+  }, [groupNewTab]);
+
+  const closeEditor = (restoreFocus: boolean) => {
+    const groupId = editor?.groupId;
+    flushGroupWrite();
+    setEditor(null);
+    if (restoreFocus && groupId) requestAnimationFrame(() => groupLabel(groupId)?.focus());
+  };
+
+  /** Put a tab in a group of its own and open the panel to name it. */
+  const groupTab = (tabId: string) => {
+    const layout = layoutRef.current;
+    const id = crypto.randomUUID();
+    const next = createGroup(layout, tabId, { id, name: "", color: nextGroupColor(layout) });
+    if (!next) return;
+    writeLayout(next);
+    setEditor({ groupId: id, mode: "create", anchor: null });
+  };
+
+  const moveTabToGroup = (tabId: string, groupId: string) => {
+    const next = addTabToGroup(layoutRef.current, tabId, groupId);
+    if (next) writeLayout(next);
+  };
+
+  const toggleGroup = (groupId: string) => {
+    const group = groups.find((item) => item.id === groupId);
+    const next = group && updateGroup(layoutRef.current, groupId, { collapsed: !group.collapsed });
+    if (next) writeLayout(next);
+  };
+
+  const contextGroup = contextTabId ? (groupOfTabId.get(contextTabId) ?? null) : null;
+  const otherGroups = groups.filter((group) => group.id !== contextGroup?.id);
+  const editorGroup = editor ? groups.find((group) => group.id === editor.groupId) : undefined;
+
+  /**
+   * The label before a group's first tab: its colour, its name, and — folded —
+   * how many tabs it is keeping out of sight and whether any of them wants
+   * you. Click folds or unfolds it; right-click, Shift+F10 or the menu key
+   * opens its panel.
+   */
+  const renderGroupLabel = (group: TabGroup) => {
+    const { fill, ink } = groupColorStyle(group.color);
+    const name = group.name || UNNAMED_GROUP;
+    const folded = group.tab_ids.filter((id) => hidden.has(id));
+    let attention: AttentionLevel | null = null;
+    for (const id of folded) {
+      const tab = tabById(view, id);
+      const level = tab ? tabAttentionLevel(tab, sessionsById) : null;
+      if (level === "dead") {
+        attention = "dead";
+        break;
+      }
+      if (level === "waiting") attention = "waiting";
+    }
+    const count = group.tab_ids.length;
+    const attentionText =
+      attention === "dead"
+        ? "A hidden tab has a window that stopped or needs you"
+        : attention === "waiting"
+          ? "A hidden tab has a window waiting on you"
+          : null;
+    return (
+      <div key={`group:${group.id}`} className="relative mb-1 shrink-0">
+        <button
+          type="button"
+          data-workspace-tab-group={group.id}
+          data-workspace-tab-group-owner={workspace.id}
+          aria-label={name}
+          aria-expanded={!group.collapsed}
+          title={[`${name} — ${count} ${count === 1 ? "tab" : "tabs"}`, attentionText]
+            .filter(Boolean)
+            .join(". ")}
+          onClick={() => toggleGroup(group.id)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            setEditor({ groupId: group.id, mode: "manage", anchor: null });
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            setEditor({ groupId: group.id, mode: "manage", anchor: null });
+          }}
+          style={{ backgroundColor: fill, color: ink }}
+          className={cn(
+            "flex h-6 min-w-6 max-w-40 items-center justify-center gap-1 rounded-md px-2 text-xs font-semibold outline-none transition-[filter]",
+            "hover:brightness-110 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-shell",
+          )}
+        >
+          {group.name && <span className="min-w-0 truncate">{group.name}</span>}
+          {folded.length > 0 && (
+            <span data-group-hidden-count className="shrink-0 tabular-nums opacity-85">
+              +{folded.length}
+            </span>
+          )}
+        </button>
+        {/* Folded tabs still owe their news: the same tones the badge on a
+            tab wears, as a dot, since there is no tab left to wear one. */}
+        {attention && attentionText && (
+          <span
+            role="img"
+            aria-label={attentionText}
+            data-group-attention={attention}
+            className={cn(
+              "pointer-events-none absolute -right-1 -top-1 size-2.5 rounded-full ring-2 ring-shell",
+              attention === "dead" ? "bg-destructive" : "bg-warning",
+            )}
+          />
+        )}
+        {groupNewTab?.groupId === group.id && (
+          <NewSessionMenu
+            key={groupNewTab.nonce}
+            mode="session"
+            workspaceId={workspace.id}
+            tabId={null}
+            heading="New tab in group"
+            hideHeading
+            menuRef={groupNewTabMenuRef}
+            beforeCreate={() => addTabForWindow(group.id)}
+            className="absolute bottom-0 left-0"
+            menuClassName="w-72"
+            trigger={<span hidden />}
+          />
+        )}
+      </div>
+    );
+  };
 
   /**
    * Put the workspace away: its shape is kept and its sessions stop. Only
@@ -1224,7 +1555,31 @@ export function WorkspaceTabs({
           onDelete={() => void deleteWorkspace()}
         />
       )}
-      {orderedTabs.map((tab) => {
+      {orderedTabs.flatMap((tab) => {
+        const group = groupOfTabId.get(tab.id) ?? null;
+        // The label goes before the group's first tab whether or not that tab
+        // is on show, so a folded group keeps its place in the strip.
+        const label = group?.tab_ids[0] === tab.id ? renderGroupLabel(group) : null;
+        if (hidden.has(tab.id)) return label ? [label] : [];
+        // A line of the group's colour over its tabs — over, not under: the
+        // open tab is joined to the panel below it, and a rule there would
+        // cut the two apart. It runs on across the gap to the next tab of the
+        // group, so the group reads as one run.
+        const lastOnShow = group
+          ? group.tab_ids.filter((id) => !hidden.has(id)).at(-1) === tab.id
+          : false;
+        const groupLine = group ? (
+          <span
+            aria-hidden
+            key="group-line"
+            data-tab-group-line={group.id}
+            style={{ backgroundColor: groupColorStyle(group.color).fill }}
+            className={cn(
+              "pointer-events-none absolute -top-1 left-0 h-0.5 rounded-full",
+              lastOnShow ? "right-0" : "-right-1",
+            )}
+          />
+        ) : null;
         const active = tab.id === activeTabId;
         const attention = tabAttentionCount(tab, sessionsById);
         const attentionLevel = tabAttentionLevel(tab, sessionsById);
@@ -1251,8 +1606,10 @@ export function WorkspaceTabs({
           !active && "text-muted-foreground hover:bg-background/50 hover:text-foreground",
         );
         if (renamingId === tab.id) {
-          return (
+          return [
+            label,
             <div key={tab.id} className="relative shrink-0">
+              {groupLine}
               <form
                 onSubmit={(event) => submitRename(tab.id, event)}
                 className={cn(shape, "pr-3.5")}
@@ -1285,10 +1642,11 @@ export function WorkspaceTabs({
                   )}
                 />
               </form>
-            </div>
-          );
+            </div>,
+          ];
         }
-        return (
+        return [
+          label,
           // The wrapper is what a reorder slides: the dragged tab rides the
           // pointer with no transition, the tabs it passes ease into its slot.
           <div
@@ -1299,6 +1657,7 @@ export function WorkspaceTabs({
             }}
             className="group/tab relative shrink-0 data-[dragging]:z-10 data-[merging]:opacity-35"
           >
+            {groupLine}
             <button
               type="button"
               role="tab"
@@ -1310,6 +1669,7 @@ export function WorkspaceTabs({
               onContextMenu={(event) => {
                 event.preventDefault();
                 setContextTabId(tab.id);
+                menuPointRef.current = { x: event.clientX, y: event.clientY };
                 tabMenuRef.current?.openAt(event.clientX, event.clientY);
               }}
               onKeyDown={(event) => {
@@ -1363,8 +1723,8 @@ export function WorkspaceTabs({
                 <X className="size-3" aria-hidden />
               </button>
             )}
-          </div>
-        );
+          </div>,
+        ];
       })}
       {/* Where a ⌘/⌥ drag will drop the copy. It lives in flow past the last
           tab — the strip makes room for it while the drag is live — and rides
@@ -1462,6 +1822,44 @@ export function WorkspaceTabs({
           <Pencil className="size-4" aria-hidden />
           Rename tab
         </DropdownMenuItem>
+        {/* Firefox's wording: "Add" while the tab is loose, "Move" once it
+            already belongs somewhere and the choice takes it out of there. */}
+        <DropdownMenuItem
+          disabled={contextTabId === null}
+          onSelect={() => {
+            if (contextTabId) groupTab(contextTabId);
+          }}
+        >
+          <Group className="size-4" aria-hidden />
+          {contextGroup ? "Move tab to new group" : "Add tab to new group"}
+        </DropdownMenuItem>
+        {otherGroups.length > 0 && (
+          <DropdownMenuItem
+            disabled={contextTabId === null}
+            onSelect={() => {
+              // Opened once this menu has finished closing, at the point the
+              // right-click left — the list is this item's submenu.
+              const { x, y } = menuPointRef.current;
+              requestAnimationFrame(() => groupMenuRef.current?.openAt(x, y));
+            }}
+          >
+            <FolderInput className="size-4" aria-hidden />
+            {contextGroup ? "Move tab to group…" : "Add tab to group…"}
+          </DropdownMenuItem>
+        )}
+        {contextGroup && (
+          <DropdownMenuItem
+            onSelect={() => {
+              const next = contextTabId
+                ? removeTabFromGroup(layoutRef.current, contextTabId)
+                : null;
+              if (next) writeLayout(next);
+            }}
+          >
+            <CircleMinus className="size-4" aria-hidden />
+            Remove from group
+          </DropdownMenuItem>
+        )}
         <DropdownMenuSeparator />
         <DropdownMenuItem
           destructive
@@ -1474,6 +1872,84 @@ export function WorkspaceTabs({
           Close tab
         </DropdownMenuItem>
       </DropdownMenu>
+
+      {/* "Add tab to group…": every group the tab is not already in, each
+          with its colour, and a fresh one first. */}
+      <DropdownMenu
+        ref={groupMenuRef}
+        align="start"
+        className="hidden"
+        menuClassName="max-w-72"
+        renderTrigger={() => null}
+      >
+        <DropdownMenuItem
+          disabled={contextTabId === null}
+          onSelect={() => {
+            if (contextTabId) groupTab(contextTabId);
+          }}
+        >
+          <Plus className="size-4" aria-hidden />
+          New group
+        </DropdownMenuItem>
+        {otherGroups.length > 0 && <DropdownMenuSeparator />}
+        {otherGroups.map((group) => (
+          <DropdownMenuItem
+            key={group.id}
+            disabled={contextTabId === null}
+            onSelect={() => {
+              if (contextTabId) moveTabToGroup(contextTabId, group.id);
+            }}
+          >
+            <span
+              aria-hidden
+              style={{ backgroundColor: groupColorStyle(group.color).fill }}
+              className="mx-0.5 size-3 shrink-0 rounded-full"
+            />
+            <span className="min-w-0 truncate">{group.name || UNNAMED_GROUP}</span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenu>
+
+      {editor?.anchor && editorGroup && (
+        <TabGroupEditor
+          // One panel per group: another group opens on its own name.
+          key={editorGroup.id}
+          mode={editor.mode}
+          group={editorGroup}
+          anchor={editor.anchor}
+          canAddTab={workspace.layout.tabs.length < MAX_TABS && !patchM.isPending}
+          onEdit={(patch) => editGroup(editorGroup.id, patch)}
+          onDone={closeEditor}
+          onCancel={() => {
+            // Creating, Cancel takes the group back off again; its tab stays
+            // where it is, and keeps the focus the panel had.
+            const first = editorGroup.tab_ids[0];
+            cancelGroupWrite();
+            setEditor(null);
+            const next = ungroup(layoutRef.current, editorGroup.id);
+            if (next) writeLayout(next);
+            if (first) requestAnimationFrame(() => tabButton(first)?.focus());
+          }}
+          onToggleCollapsed={() => {
+            closeEditor(true);
+            toggleGroup(editorGroup.id);
+          }}
+          onUngroup={() => {
+            const first = editorGroup.tab_ids[0];
+            closeEditor(false);
+            const next = ungroup(layoutRef.current, editorGroup.id);
+            if (next) writeLayout(next);
+            if (first) requestAnimationFrame(() => tabButton(first)?.focus());
+          }}
+          onNewTab={() => {
+            closeEditor(false);
+            setGroupNewTab((current) => ({
+              groupId: editorGroup.id,
+              nonce: (current?.nonce ?? 0) + 1,
+            }));
+          }}
+        />
+      )}
 
       {/* Core workspace settings live at the strip's far right; adding panes
           is the floating launcher's job (bottom-right of the viewport). */}
