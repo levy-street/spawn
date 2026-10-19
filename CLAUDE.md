@@ -19,9 +19,7 @@ docs/     design docs; docs/RELEASE.md — the release process,
           docs/WINDOWS_VALIDATION.md — the Windows evidence gate, and
           docs/AZURE_SIGNING_SETUP.md — the Windows signing identity, for
           whoever holds Azure
-tools/    development utilities; firefox-tab-groups/ is a Firefox add-on and
-          userscript that adds tab groups to the web tab strip from outside
-          the product (its README covers the DOM it relies on)
+tools/    development utilities
 .github/  CI workflows: tests, native connection acceptance and its promotion
           gate, the rolling daemon prebuilts, the Windows check
           and its unsigned packaging rehearsal, and the signed desktop
