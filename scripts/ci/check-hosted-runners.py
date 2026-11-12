@@ -9,7 +9,7 @@ import yaml
 STANDARD_RUNNERS = {
     "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-22.04-arm",
     "ubuntu-24.04-arm", "windows-latest", "windows-2025", "windows-2022",
-    "macos-latest", "macos-15", "macos-14",
+    "macos-latest", "macos-15",
 }
 
 

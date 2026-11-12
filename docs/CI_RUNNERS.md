@@ -16,7 +16,7 @@ own existing quota and signing credentials.
 | --- | --- |
 | Full Linux suite, isolated canary and acceptance coordination | Ubuntu 24.04 |
 | Linux release-profile binaries | Ubuntu 22.04 x86-64 and native ARM64 |
-| Darwin daemon and signed desktop builds | macOS 14 |
+| Darwin daemon and signed desktop builds | macOS 15 (the macOS 14 image was retired 2026-11-02) |
 | iOS simulator acceptance | macOS 15 |
 | Android emulator acceptance | Ubuntu 24.04 with KVM |
 | Windows daemon, desktop tests and unsigned packaging | windows-latest |
