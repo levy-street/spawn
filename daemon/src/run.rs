@@ -614,7 +614,8 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     // What each Codex window is in, kept on this host so a restart after
     // Codex has gone still names its thread (`host_conv`).
     if crate::host_conv::SUPPORTED {
-        if let Some(memory) = crate::host_conv::ConversationMemory::for_this_instance() {
+        if let Ok(homes) = config::window_homes_dir() {
+            let memory = crate::host_conv::ConversationMemory::new(homes);
             let windows = registry.clone();
             tokio::spawn(crate::host_conv::watch(
                 move || windows.foregrounds(),

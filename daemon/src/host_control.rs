@@ -939,13 +939,13 @@ impl Context {
         // A window that does not run here can still be answered for, from
         // the Codex thread this host last saw it in.
         let shell_pid = windows.shell_pid(session_id);
+        let memory = windows.memory().cloned();
         let inspected = self
             .files
             .run_blocking(
                 Arc::clone(&self.file_operations),
                 crate::host_files::HostOperationKind::List,
                 move |_| {
-                    let memory = crate::host_conv::ConversationMemory::for_this_instance();
                     Ok(crate::host_conv::answer_for_window(
                         session_id,
                         shell_pid,

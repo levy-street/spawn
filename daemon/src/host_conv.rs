@@ -108,17 +108,29 @@ pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub(crate) struct WindowShells {
     resolve: Arc<dyn Fn(Uuid) -> Option<u32> + Send + Sync>,
+    memory: Option<ConversationMemory>,
 }
 
 impl WindowShells {
     pub(crate) fn new(resolve: impl Fn(Uuid) -> Option<u32> + Send + Sync + 'static) -> Self {
         Self {
             resolve: Arc::new(resolve),
+            memory: None,
         }
+    }
+
+    /// Where this daemon notes each Codex window's thread (`ConversationMemory`).
+    pub(crate) fn with_memory(mut self, memory: Option<ConversationMemory>) -> Self {
+        self.memory = memory;
+        self
     }
 
     pub(crate) fn shell_pid(&self, session_id: Uuid) -> Option<u32> {
         (self.resolve)(session_id).filter(|pid| *pid > 1)
+    }
+
+    pub(crate) fn memory(&self) -> Option<&ConversationMemory> {
+        self.memory.as_ref()
     }
 }
 
@@ -794,13 +806,11 @@ pub(crate) struct ConversationMemory {
 }
 
 impl ConversationMemory {
+    /// `homes` is the daemon instance's window homes folder, handed in by
+    /// whoever builds the inspector: this module reaches nothing else of
+    /// spawnd's.
     pub(crate) fn new(homes: PathBuf) -> Self {
         Self { homes }
-    }
-
-    /// The memory of this daemon instance, in its window homes.
-    pub(crate) fn for_this_instance() -> Option<Self> {
-        crate::config::window_homes_dir().ok().map(Self::new)
     }
 
     fn path(&self, session_id: Uuid) -> PathBuf {
@@ -845,23 +855,45 @@ impl ConversationMemory {
         canonical_uuid(object.get("conversation_id")?.as_str()?)
     }
 
+    /// The note, written whole or not at all, readable by this user alone:
+    /// a private folder (0700), a new no-follow file (0600), then a rename
+    /// over the last note. Plain `std` on purpose — the inspector depends on
+    /// nothing crate-local (scripts/check-no-server-agent-upload.sh), so it
+    /// does what `platform::create_private_dir_all` and
+    /// `platform::create_private_file_new` do itself, as it does its reads.
+    #[cfg(unix)]
     fn write(&self, session_id: Uuid, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
         let path = self.path(session_id);
         let folder = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-        crate::platform::create_private_dir_all(folder)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(folder)?;
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
         let temporary = folder.join(format!("{MEMORY_FILE}.{}.tmp", Uuid::new_v4()));
         let written = (|| {
-            let mut file = crate::platform::create_private_file_new(&temporary)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(&temporary)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            crate::platform::durable_replace(&temporary, &path)
+            std::fs::rename(&temporary, &path)
         })();
         if written.is_err() {
             let _ = std::fs::remove_file(&temporary);
         }
         written
+    }
+
+    #[cfg(not(unix))]
+    fn write(&self, _session_id: Uuid, _bytes: &[u8]) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 
