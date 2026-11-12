@@ -227,6 +227,24 @@ impl SessionRegistry {
             .and_then(|entry| entry.handle.shell_pid())
     }
 
+    /// Every window whose worker has reported both its shell and what runs
+    /// in its foreground: (session, shell pid, foreground basename), for
+    /// `host_conv::watch`.
+    pub fn foregrounds(&self) -> Vec<(Uuid, u32, String)> {
+        self.inner
+            .lock()
+            .expect("sessions lock")
+            .iter()
+            .filter_map(|(id, entry)| {
+                Some((
+                    *id,
+                    entry.handle.shell_pid()?,
+                    entry.handle.control.foreground()?,
+                ))
+            })
+            .collect()
+    }
+
     pub fn cwd_for_binding(&self, binding: SessionBinding) -> Option<Arc<str>> {
         let guard = self.inner.lock().expect("sessions lock");
         guard

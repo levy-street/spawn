@@ -2246,6 +2246,7 @@ mod tests {
                     "state": "unknown",
                     "cli_version": null,
                     "live_elsewhere": false,
+                    "fresh": false,
                     "source": "none",
                 })
             );

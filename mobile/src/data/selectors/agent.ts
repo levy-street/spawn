@@ -203,8 +203,10 @@ const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> 
   // Codex names its own sessions, so it cannot be launched under an id, and a
   // restart never trusts a recorded one; it takes `resume` as a subcommand
   // after the global flags. A conversation the host names for the window
-  // (`conv.inspect`) is resumed by that id, and "the latest one here" stands
-  // in wherever the host names none.
+  // (`conv.inspect`) is resumed by that id, one the host says has nothing in
+  // it yet is started afresh, and "the latest one here" stands in only where
+  // the host can say nothing: with several Codex windows in a folder it is
+  // whichever wrote last.
   codex: {
     launch: null,
     resume: (id) => `resume ${id}`,

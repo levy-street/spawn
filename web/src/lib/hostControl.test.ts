@@ -2712,6 +2712,7 @@ describe("HostControlClient conversation inspection", () => {
       state: "idle",
       cli_version: "2.1.288",
       live_elsewhere: true,
+      fresh: false,
       source: "parked",
     };
     pc.channel.receive(

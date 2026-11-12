@@ -46,8 +46,10 @@ src/
                  CODEX_HOME name, by Claude Code's exact folder rule — pinned
                  by proto/claude-project-folder.json; reading stays with
                  host_files.rs; host_conv.rs answers `conv.inspect` from a
-                 window's process tree and Claude Code's live-session
-                 registry, and executes nothing), codex_home.rs (a skilled
+                 window's process tree, Claude Code's live-session
+                 registry and the thread files a Codex holds open, notes
+                 each Codex window's thread for restarts after Codex has
+                 gone, and executes nothing), codex_home.rs (a skilled
                  window's own CODEX_HOME, reconciled against the user's — see
                  "A skilled window's home"), upload.rs, sessions.rs,
                  service.rs + service/ (launchd/systemd dispatch, Windows Task

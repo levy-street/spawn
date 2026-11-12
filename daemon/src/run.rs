@@ -611,6 +611,17 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             );
         }
     });
+    // What each Codex window is in, kept on this host so a restart after
+    // Codex has gone still names its thread (`host_conv`).
+    if crate::host_conv::SUPPORTED {
+        if let Some(memory) = crate::host_conv::ConversationMemory::for_this_instance() {
+            let windows = registry.clone();
+            tokio::spawn(crate::host_conv::watch(
+                move || windows.foregrounds(),
+                memory,
+            ));
+        }
+    }
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
     // reset it: a key revoked on one control connection stays revoked on every

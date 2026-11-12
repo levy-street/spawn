@@ -32,8 +32,15 @@ export interface ConversationInspection {
    *  background session, an attach target, another window. Restart resumes
    *  it all the same: resuming a running background session attaches to it. */
   readonly live_elsewhere: boolean;
+  /** The agent's conversation has nothing written to it yet (a Codex just
+   *  launched, or just after `/new`): there is nothing to resume, and a
+   *  restart starts a new one. Its id is not named. False where the host
+   *  cannot tell, and from a daemon that predates the field. */
+  readonly fresh: boolean;
   /** What the daemon read: `registry`, `parked`, `attach`, `open_file`,
-   *  `process`, `none`. A hint for diagnostics, never for gating. */
+   *  `process`, `remembered` (the Codex thread the host last saw a window
+   *  in, once Codex has gone), `none`. A hint for diagnostics, never for
+   *  gating. */
   readonly source: string;
 }
 
@@ -71,12 +78,14 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   const conversationId = nullableConversationId(record["conversation_id"]);
   const cliVersion = nullableText(record["cli_version"], SHORT_TEXT);
   const liveElsewhere = record["live_elsewhere"];
+  const fresh = record["fresh"];
   const source = record["source"];
   const state = record["state"];
   if (agent === undefined || conversationId === undefined || cliVersion === undefined) {
     throw invalid();
   }
   if (typeof liveElsewhere !== "boolean" || typeof source !== "string") throw invalid();
+  if (fresh !== undefined && typeof fresh !== "boolean") throw invalid();
   return {
     agent,
     conversation_id: conversationId,
@@ -84,6 +93,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
       typeof state === "string" && STATES.has(state) ? (state as ConversationState) : "unknown",
     cli_version: cliVersion,
     live_elsewhere: liveElsewhere,
+    fresh: fresh === true,
     source,
   };
 }

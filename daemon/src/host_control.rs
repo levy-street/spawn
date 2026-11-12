@@ -936,28 +936,37 @@ impl Context {
                 )
                 .await;
         };
-        let Some(shell_pid) = windows.shell_pid(session_id) else {
-            return self
-                .error(
-                    request_id,
-                    "session_not_found",
-                    "no window with this id is running on this host",
-                )
-                .await;
-        };
+        // A window that does not run here can still be answered for, from
+        // the Codex thread this host last saw it in.
+        let shell_pid = windows.shell_pid(session_id);
         let inspected = self
             .files
             .run_blocking(
                 Arc::clone(&self.file_operations),
                 crate::host_files::HostOperationKind::List,
-                move |_| Ok(crate::host_conv::inspect_window(shell_pid)),
+                move |_| {
+                    let memory = crate::host_conv::ConversationMemory::for_this_instance();
+                    Ok(crate::host_conv::answer_for_window(
+                        session_id,
+                        shell_pid,
+                        memory.as_ref(),
+                    ))
+                },
             )
             .await;
         match inspected {
-            Ok(inspection) => match serde_json::to_value(&inspection) {
+            Ok(Some(inspection)) => match serde_json::to_value(&inspection) {
                 Ok(result) => self.response(request_id, result).await,
                 Err(_) => false,
             },
+            Ok(None) => {
+                self.error(
+                    request_id,
+                    "session_not_found",
+                    "no window with this id is running on this host",
+                )
+                .await
+            }
             Err(error) => self.error(request_id, error.code, &error.detail).await,
         }
     }
