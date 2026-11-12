@@ -17,6 +17,7 @@ const answer: ConversationInspection = {
   state: "idle",
   cli_version: "2.1.288",
   live_elsewhere: false,
+  fresh: false,
   source: "registry",
 };
 const report: AgentTranscriptReport = {

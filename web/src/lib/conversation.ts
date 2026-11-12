@@ -28,8 +28,15 @@ export interface ConversationInspection {
    *  background session, an attach target, another window. Restart resumes
    *  it all the same: resuming a running background session attaches to it. */
   live_elsewhere: boolean;
+  /** The agent's conversation has nothing written to it yet (a Codex just
+   *  launched, or just after `/new`): there is nothing to resume, and a
+   *  restart starts a new one. Its id is not named. False where the host
+   *  cannot tell, and from a daemon that predates the field. */
+  fresh: boolean;
   /** What the daemon read: `registry`, `parked`, `attach`, `open_file`,
-   *  `process`, `none`. A hint for diagnostics, never for gating. */
+   *  `process`, `remembered` (the Codex thread the host last saw a window
+   *  in, once Codex has gone), `none`. A hint for diagnostics, never for
+   *  gating. */
   source: string;
 }
 
@@ -81,6 +88,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   const cliVersion = nullableText(record.cli_version, SHORT_TEXT);
   if (agent === undefined || conversationId === undefined || cliVersion === undefined) return null;
   if (typeof record.live_elsewhere !== "boolean" || typeof record.source !== "string") return null;
+  if (record.fresh !== undefined && typeof record.fresh !== "boolean") return null;
   const state = typeof record.state === "string" && STATES.has(record.state) ? record.state : null;
   return {
     agent,
@@ -88,6 +96,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
     state: (state ?? "unknown") as ConversationState,
     cli_version: cliVersion,
     live_elsewhere: record.live_elsewhere,
+    fresh: record.fresh === true,
     source: record.source,
   };
 }

@@ -40,7 +40,10 @@ import { pendingLaunch } from "./pending-launch";
  * an id with no transcript behind it, and `--resume` of it stops at "No
  * conversation found". Where the host can look (`agent.transcripts`) and
  * finds no record of the id, the agent starts afresh under that same id
- * instead (`--session-id`); where it cannot say, the restart resumes.
+ * instead (`--session-id`); where it cannot say, the restart resumes. A
+ * Codex the host sees in a thread with nothing written yet (`fresh`: just
+ * launched, or just after `/new`) is started afresh too, rather than sent to
+ * "the latest one here", which would be another thread.
  *
  * What goes on the command line: only a UUID (`canonicalConversationId`).
  * The recorded id is the server's to hand back, and the server is not
@@ -60,10 +63,12 @@ export type AgentRestartResult = { plan: AgentRestartPlan };
  * latest one here".
  *
  * An answer from the host about this window's agent decides it: the id the
- * host names, or none when it deliberately names none (a Codex holding several
- * conversations open, a parked window whose background job has gone, an
+ * host names, or none when it deliberately names none (a Codex whose threads
+ * it cannot tell apart, a parked window whose background job has gone, an
  * attach client). The recorded id is never offered in its place: in each of
- * those cases it can be a thread the window has already left.
+ * those cases it can be a thread the window has already left. For Codex the
+ * host answers from the threads the process holds, or, once Codex has gone,
+ * from the thread it last saw the window in (`source: "remembered"`).
  *
  * Without such an answer — a daemon without `conv.v1`, no connection to the
  * host, a timeout, an answer about another program — the recorded id stands,
@@ -167,6 +172,16 @@ export function planAgentRestart(
     return { kind: "agent", agent, command: agentLaunchCommand(agent, null), resumes: false };
   }
   const conversationId = restartConversation(agent, session, live);
+  // The host sees the agent in a conversation with nothing in it yet: there
+  // is nothing to resume.
+  if (answersFor(agent, live) && live.fresh) {
+    return {
+      kind: "agent",
+      agent,
+      command: agentLaunchCommand(agent, conversationId),
+      resumes: false,
+    };
+  }
   if (conversationId && onRecord === false && launchesUnderId(agent)) {
     return {
       kind: "agent",
@@ -230,7 +245,14 @@ export async function restartSessionAgent({
     // A conversation with no transcript yet cannot be resumed. Only the id
     // about to be resumed is looked for, and only where the agent can be
     // started afresh under it.
-    if (agent && conversationId && onRecord === null && transcripts && launchesUnderId(agent)) {
+    if (
+      agent &&
+      conversationId &&
+      onRecord === null &&
+      !(answersFor(agent, live) && live.fresh) &&
+      transcripts &&
+      launchesUnderId(agent)
+    ) {
       const report = await transcripts({
         agentKind: agent.kind,
         conversationId,

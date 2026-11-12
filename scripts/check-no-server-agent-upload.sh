@@ -229,7 +229,10 @@ if control.count(expected_control_imports) != 1:
 # in, read from the window's process tree and the agent's own live-session
 # registry. It is handed only a pid resolver for the device's windows, never
 # the session registry, and is pinned below to depend on nothing crate-local
-# and to execute nothing.
+# and to execute nothing. Since 2026-11-12 it also reads which Codex thread
+# files a window's Codex holds open (and each held rollout's first line), and
+# keeps one note per Codex window, the thread id it last named, in a folder
+# the caller hands it (spawnd's own window homes); it writes nothing else.
 if set(re.findall(r"crate::(\w+)", control)) != {
     "host_conv",
     "host_desktop",
@@ -274,6 +277,10 @@ if re.search(
     conv_runtime,
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector may not execute anything")
+if len(re.findall(r"\.create_new\(true\)", conv_runtime)) != 1 or re.search(
+    r"\bfs::write\b|\bFile::create\b|\.append\(true\)|\.truncate\(true\)", conv_runtime
+):
+    raise SystemExit("no-server-agent-upload: conversation inspector writes more than its window note")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))

@@ -386,7 +386,12 @@ impl RtcSessions {
                     // the registry is handed over.
                     let registry = pair.registry.clone();
                     let windows =
-                        crate::host_conv::WindowShells::new(move |id| registry.shell_pid(id));
+                        crate::host_conv::WindowShells::new(move |id| registry.shell_pid(id))
+                            .with_memory(
+                                crate::config::window_homes_dir()
+                                    .ok()
+                                    .map(crate::host_conv::ConversationMemory::new),
+                            );
                     pair.register_host(install_host_control_channel(
                         dc,
                         signal_id,
@@ -2246,6 +2251,7 @@ mod tests {
                     "state": "unknown",
                     "cli_version": null,
                     "live_elsewhere": false,
+                    "fresh": false,
                     "source": "none",
                 })
             );

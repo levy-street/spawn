@@ -153,6 +153,7 @@ function live(overrides: Partial<ConversationInspection> = {}): ConversationInsp
     state: "idle",
     cli_version: "2.1.288",
     live_elsewhere: false,
+    fresh: false,
     source: "registry",
     ...overrides,
   };
@@ -241,6 +242,38 @@ describe("planAgentRestart with the host's answer", () => {
         ),
       ),
     ).toBe(`codex resume ${liveCodex}`);
+    // Codex has gone: the thread the host last saw the window in.
+    expect(
+      command(
+        planAgentRestart(
+          codexSession(),
+          [codex],
+          live({ agent: "codex", conversation_id: liveCodex, source: "remembered" }),
+        ),
+      ),
+    ).toBe(`codex resume ${liveCodex}`);
+  });
+
+  test("a Codex thread with nothing written yet starts afresh, never the latest one here", () => {
+    const plan = planAgentRestart(
+      codexSession(),
+      [codex],
+      live({ agent: "codex", conversation_id: null, fresh: true, source: "open_file" }),
+    );
+    expect(plan).toEqual({ kind: "agent", agent: codex, command: "codex", resumes: false });
+    // A fresh answer about another program decides nothing.
+    const other = planAgentRestart(
+      codexSession(),
+      [codex],
+      live({ agent: "claude-code", conversation_id: null, fresh: true }),
+    );
+    expect(other.kind === "agent" ? other.command : null).toBe("codex resume --last");
+    // Were a host to call a Claude Code conversation fresh, it would start
+    // under the id it names.
+    const claudeFresh = planAgentRestart(session(), [claude], live({ fresh: true }));
+    expect(claudeFresh.kind === "agent" ? claudeFresh.command : null).toBe(
+      `claude --session-id ${moved}`,
+    );
   });
 
   test("Claude Code continues the latest conversation when the host names none", () => {
@@ -364,8 +397,8 @@ describe("restartSessionAgent with the host's answer", () => {
     expect(recordConversation).not.toHaveBeenCalled();
     expect(pendingLaunch.take(session().id, session().host_id)).toBe(`codex resume ${liveCodex}`);
 
-    // After `/new` the host sees two conversations open and names neither;
-    // a recorded id is not the way back in.
+    // A host that cannot tell which thread Codex is in, or no answer at
+    // all: a recorded id is not the way back in.
     for (const inspect of [
       async () => live({ agent: "codex", conversation_id: null, source: "process" }),
       async () => null,
@@ -380,6 +413,21 @@ describe("restartSessionAgent with the host's answer", () => {
       expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex resume --last");
     }
     expect(recordConversation).not.toHaveBeenCalled();
+  });
+
+  test("a fresh Codex thread is relaunched without asking for transcripts", async () => {
+    const transcripts = mock(async () => null);
+    const result = await restartSessionAgent({
+      session: codexSession(),
+      agents: [codex],
+      restart: async () => codexSession({ status: "starting" }),
+      inspect: async () =>
+        live({ agent: "codex", conversation_id: null, fresh: true, source: "open_file" }),
+      transcripts,
+    });
+    expect(result.plan).toEqual({ kind: "agent", agent: codex, command: "codex", resumes: false });
+    expect(transcripts).not.toHaveBeenCalled();
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex");
   });
 
   test("a shell window never asks the host", async () => {

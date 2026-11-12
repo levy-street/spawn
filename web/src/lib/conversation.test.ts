@@ -11,6 +11,7 @@ const answer: ConversationInspection = {
   state: "blocked",
   cli_version: "2.1.288",
   live_elsewhere: false,
+  fresh: false,
   source: "registry",
 };
 
@@ -23,9 +24,22 @@ describe("parseConversationInspection", () => {
       state: "unknown",
       cli_version: null,
       live_elsewhere: false,
+      fresh: false,
       source: "none",
     };
     expect(parseConversationInspection(nothing)).toEqual(nothing);
+    const fresh: ConversationInspection = {
+      ...nothing,
+      agent: "codex",
+      fresh: true,
+      source: "open_file",
+    };
+    expect(parseConversationInspection(fresh)).toEqual(fresh);
+  });
+
+  test("an answer from a daemon that predates `fresh` is not fresh", () => {
+    const { fresh: _, ...older } = answer;
+    expect(parseConversationInspection(older)).toEqual({ ...answer, fresh: false });
   });
 
   test("a state this client does not know yet reads as unknown, not as malformed", () => {
@@ -38,6 +52,8 @@ describe("parseConversationInspection", () => {
       [],
       "registry",
       { ...answer, live_elsewhere: "no" },
+      { ...answer, fresh: "yes" },
+      { ...answer, fresh: null },
       { ...answer, source: 7 },
       { ...answer, conversation_id: "../../etc/passwd" },
       { ...answer, conversation_id: "x".repeat(65) },

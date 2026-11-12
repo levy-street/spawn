@@ -880,6 +880,7 @@ describe("HostTransport conversation inspection", () => {
       state: "running",
       cli_version: "2.1.288",
       live_elsewhere: false,
+      fresh: false,
       source: "registry",
     };
     respond(bridge, request, result);
