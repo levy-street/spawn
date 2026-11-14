@@ -123,6 +123,18 @@ impl SessionRegistry {
         transition.lock_owned().await
     }
 
+    /// How many hold or wait for `id`'s generation transition right now. A
+    /// test that holds the transition itself reads two once something else
+    /// has reached the lock and is parked on it.
+    #[cfg(test)]
+    pub(crate) fn generation_transition_holders(&self, id: Uuid) -> usize {
+        self.generation_transitions
+            .lock()
+            .expect("session generation transitions lock")
+            .get(&id)
+            .map_or(0, Weak::strong_count)
+    }
+
     pub fn contains(&self, id: Uuid) -> bool {
         self.inner.lock().expect("sessions lock").contains_key(&id)
     }

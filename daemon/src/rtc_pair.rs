@@ -862,6 +862,115 @@ mod tests {
         )
     }
 
+    /// Ask a host consumer something and wait for its answer: the proof of
+    /// admission a test on the daemon's own multi-thread runtime uses. The
+    /// daemon's `hello` is unprompted and can reach a channel before the
+    /// test has put a handler on it; a request is sent after the handler
+    /// is there, and waits in its stream until the daemon admits the
+    /// channel. A channel the daemon refused never answers.
+    async fn consumer_answers(
+        channel: &Arc<RTCDataChannel>,
+        rx: &mut mpsc::UnboundedReceiver<Value>,
+        wait: Duration,
+    ) -> bool {
+        let request_id = Uuid::new_v4().to_string();
+        let request = json!({
+            "version": 1, "type": "request", "request_id": request_id,
+            "operation": "fs.home", "payload": {}
+        });
+        tokio::time::timeout(wait, async {
+            // A channel made before this side's association is up opens
+            // when it is.
+            while channel.ready_state() == RTCDataChannelState::Connecting {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if channel.send_text(request.to_string()).await.is_err() {
+                return false;
+            }
+            while let Some(value) = rx.recv().await {
+                if value["request_id"] == request_id.as_str() {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Wait until a session control channel answers, for the same reason as
+    /// `consumer_answers`: `ready` is said once, perhaps before anyone here
+    /// listens. A control request is dropped until its attachment is live
+    /// and answered from then on, so one is asked until one is answered.
+    async fn control_answers(ctl: &Arc<RTCDataChannel>, wait: Duration) -> bool {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ctl.on_message(Box::new(move |message| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if let Ok(value) = serde_json::from_slice::<Value>(&message.data) {
+                    let _ = tx.send(value);
+                }
+            })
+        }));
+        tokio::time::timeout(wait, async {
+            while ctl.ready_state() == RTCDataChannelState::Connecting {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut asked = HashSet::new();
+            loop {
+                let request_id = Uuid::new_v4().to_string();
+                let request = json!({
+                    "version": 1, "kind": "request", "request_id": request_id,
+                    "operation": "focus_view", "cols": 100, "rows": 30,
+                });
+                if ctl.send_text(request.to_string()).await.is_err() {
+                    return false;
+                }
+                asked.insert(request_id);
+                let pause = tokio::time::sleep(Duration::from_millis(50));
+                tokio::pin!(pause);
+                loop {
+                    tokio::select! {
+                        _ = &mut pause => break,
+                        value = rx.recv() => {
+                            let Some(value) = value else { return false };
+                            if value["event"] == "ready"
+                                || value["request_id"].as_str().is_some_and(|id| asked.contains(id))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// `attach`, for a test on a multi-thread runtime: both channels of a
+    /// new attachment to `session`, returned once its control channel
+    /// answers.
+    async fn attach_answered(
+        pc: &Arc<RTCPeerConnection>,
+        session: Uuid,
+    ) -> (Arc<RTCDataChannel>, Arc<RTCDataChannel>) {
+        let suffix = format!("{session}/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let pty = pc
+            .create_data_channel(&format!("spawn.pty/{suffix}"), None)
+            .await
+            .unwrap();
+        let ctl = pc
+            .create_data_channel(&format!("spawn.ctl/{suffix}"), None)
+            .await
+            .unwrap();
+        assert!(
+            control_answers(&ctl, Duration::from_secs(10)).await,
+            "session attached over existing connection"
+        );
+        (pty, ctl)
+    }
+
     /// A stream whose first message is not a channel OPEN never becomes a
     /// channel. The acceptor refuses that stream and goes on to the next:
     /// upstream's left its loop for good on any such error — a stream reset
@@ -1008,7 +1117,7 @@ mod tests {
     /// acceptor ending is the word: the pair leaves the host map and the
     /// server hears `unavailable`, which a device answers with a new
     /// connection.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_pair_whose_association_ended_is_retired_and_announced() {
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;
@@ -1028,9 +1137,9 @@ mod tests {
         assert_eq!(sessions.peer_admission.charged(), 1);
         // Both associations are up and the acceptor is running: a transport
         // can report connected before SCTP has finished its handshake.
-        let (_consumer, mut consumer_rx) = open_host_consumer(&pc).await;
+        let (consumer, mut consumer_rx) = open_host_consumer(&pc).await;
         assert!(
-            hello_within(&mut consumer_rx, Duration::from_secs(5)).await,
+            consumer_answers(&consumer, &mut consumer_rx, Duration::from_secs(5)).await,
             "a channel opens on a fresh pair"
         );
 
@@ -1039,26 +1148,42 @@ mod tests {
         // watches the connection state, has nothing to act on.
         pc.sctp().stop().await.unwrap();
 
-        let retired = tokio::time::timeout(Duration::from_secs(5), async {
-            while !sessions.host_peers.lock().await.is_empty() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        // The goodbye is what is waited for, not the empty host map: the
+        // peer leaves the map before its status is sent, and on the
+        // daemon's own multi-thread runtime a reader of the map can get in
+        // between.
+        let mut announced = Vec::new();
+        let said_goodbye = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = signal_rx.recv().await {
+                let value: Value = serde_json::from_str(frame.as_str()).unwrap();
+                if value["type"] == "rtc.status" && value["session_id"] == signal_id.as_str() {
+                    let status = value["status"].as_str().unwrap_or_default().to_owned();
+                    let goodbye = status != "connected";
+                    announced.push(status);
+                    if goodbye {
+                        break;
+                    }
+                }
             }
         })
         .await;
         let state = peer.pc.connection_state();
-        let mut announced = Vec::new();
+        let resident = sessions.host_peers.lock().await.len();
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        // Whatever follows the goodbye for this binding would be a second
+        // word; the teardown above has run, so it is all here by now.
         while let Ok(frame) = signal_rx.try_recv() {
             let value: Value = serde_json::from_str(frame.as_str()).unwrap();
             if value["type"] == "rtc.status" && value["session_id"] == signal_id.as_str() {
                 announced.push(value["status"].as_str().unwrap_or_default().to_owned());
             }
         }
-        sessions.close_all().await;
-        let _ = pc.close().await;
         assert!(
-            retired.is_ok(),
-            "a pair with no association stayed in the host map; its transport says {state:?}"
+            said_goodbye.is_ok(),
+            "a pair with no association was never announced gone; its transport says {state:?}, and {resident} host peer(s) are in the map"
         );
+        assert_eq!(resident, 0, "the pair left the host map before its goodbye");
         // The channels that opened said `connected`; the goodbye is the
         // last word for this binding and is said once.
         assert_eq!(
@@ -1097,15 +1222,21 @@ mod tests {
         })
     }
 
-    /// Open the first channel of an attachment to `session` and give the
-    /// daemon time to reach whatever that attach waits on. While it waits
-    /// holding the admission lock, that is seen at once; when it does not,
-    /// there is nothing to see and the pause is all there is.
+    /// Open the first channel of an attachment to `session`, whose
+    /// transition the caller holds, and return once the daemon's attach for
+    /// it is parked on that transition: the lock then has a second holder,
+    /// the attach's own wait. Whatever else the attach holds while it waits
+    /// there, it holds from this point on.
     async fn begin_attach_that_waits(
-        sessions: &RtcSessions,
+        registry: &SessionRegistry,
         pc: &Arc<RTCPeerConnection>,
         session: Uuid,
     ) -> Arc<RTCDataChannel> {
+        assert_eq!(
+            registry.generation_transition_holders(session),
+            1,
+            "the caller holds the session's transition, and nothing else does yet"
+        );
         let channel = pc
             .create_data_channel(
                 &format!("spawn.pty/{session}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
@@ -1113,12 +1244,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let _ = tokio::time::timeout(Duration::from_millis(500), async {
-            while sessions.admission.try_lock().is_ok() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.generation_transition_holders(session) < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await;
+        .await
+        .expect("the attach reached the session's transition and is waiting on it");
         channel
     }
 
@@ -1128,7 +1260,7 @@ mod tests {
     /// on the daemon-wide admission lock while it does — every offer and
     /// every other attach on the daemon serializes on that lock, so one
     /// device opening a restarting window would stall every other device.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_attach_waiting_on_a_restarting_session_does_not_hold_admission() {
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;
@@ -1143,9 +1275,10 @@ mod tests {
         let second = connect_pair(&sessions, &registry, [15; 32]).await;
 
         let transition = registry.lock_generation_transition(restarting).await;
-        let _waiting = begin_attach_that_waits(&sessions, &first, restarting).await;
+        let _waiting = begin_attach_that_waits(&registry, &first, restarting).await;
 
-        let attached = tokio::time::timeout(Duration::from_secs(5), attach(&second, steady)).await;
+        let attached =
+            tokio::time::timeout(Duration::from_secs(5), attach_answered(&second, steady)).await;
         let admission_free = sessions.admission.try_lock().is_ok();
         drop(transition);
         assert!(
@@ -1168,7 +1301,7 @@ mod tests {
     /// its attach waits on that session's transition. The acceptor must not
     /// wait with it — the window opened next is on the same connection, and
     /// so is every channel the device opens until the restart is over.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_channel_waiting_on_admission_does_not_hold_up_the_next_on_its_connection() {
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;
@@ -1182,12 +1315,19 @@ mod tests {
         let pc = connect_pair(&sessions, &registry, [16; 32]).await;
 
         let transition = registry.lock_generation_transition(restarting).await;
-        let waiting = begin_attach_that_waits(&sessions, &pc, restarting).await;
+        let waiting = begin_attach_that_waits(&registry, &pc, restarting).await;
 
-        let attached = tokio::time::timeout(Duration::from_secs(5), attach(&pc, steady)).await;
+        let attached =
+            tokio::time::timeout(Duration::from_secs(5), attach_answered(&pc, steady)).await;
         let (consumer, mut consumer_rx) = open_host_consumer(&pc).await;
-        let consumer_admitted = hello_within(&mut consumer_rx, Duration::from_secs(5)).await;
+        let consumer_admitted =
+            consumer_answers(&consumer, &mut consumer_rx, Duration::from_secs(5)).await;
+        let still_waiting = registry.generation_transition_holders(restarting);
         drop(transition);
+        assert_eq!(
+            still_waiting, 2,
+            "the first window's attach is still parked on its session's transition"
+        );
         assert!(
             attached.is_ok(),
             "a terminal waited behind another window's attach on the same connection"
@@ -1207,24 +1347,10 @@ mod tests {
             .create_data_channel(&format!("spawn.ctl/{suffix}"), None)
             .await
             .unwrap();
-        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
-        ctl.on_message(Box::new(move |message| {
-            let ready_tx = ready_tx.clone();
-            Box::pin(async move {
-                if let Ok(value) = serde_json::from_slice::<Value>(&message.data) {
-                    let _ = ready_tx.send(value);
-                }
-            })
-        }));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(value) = ready_rx.recv().await {
-                if value["event"] == "ready" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("the attach that waited on the transition completes after it");
+        assert!(
+            control_answers(&ctl, Duration::from_secs(5)).await,
+            "the attach that waited on the transition completes after it"
+        );
         drop(consumer);
         sessions.close_all().await;
         let _ = pc.close().await;
