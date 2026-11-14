@@ -92,55 +92,6 @@ fn built_beside(exe: &std::path::Path, name: &std::ffi::OsStr) -> Option<PathBuf
         .find(|candidate| candidate.is_file())
 }
 
-#[cfg(test)]
-mod built_worker_tests {
-    use super::built_beside;
-    use std::ffi::OsStr;
-
-    /// Both places Cargo has kept a test binary lead to the same worker, and
-    /// a profile directory without one leads nowhere rather than to some
-    /// other file.
-    #[test]
-    fn the_built_worker_is_found_from_either_cargo_test_layout() {
-        let target = tempfile::tempdir().unwrap();
-        let profile = target.path().join("debug");
-        let through_1_99 = profile.join("deps");
-        let from_1_100 = profile
-            .join("build")
-            .join("spawnd")
-            .join("47a0d17e")
-            .join("out");
-        std::fs::create_dir_all(&through_1_99).unwrap();
-        std::fs::create_dir_all(&from_1_100).unwrap();
-        let old_test = through_1_99.join("spawnd-6d610854");
-        let new_test = from_1_100.join("spawnd-47a0d17e");
-        assert_eq!(built_beside(&old_test, OsStr::new("spawn-worker")), None);
-        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
-
-        // The worker's own intermediate output is not beside anything the
-        // test binary sits under, and is not what is found.
-        let worker_unit = profile
-            .join("build")
-            .join("spawnd")
-            .join("f2563374")
-            .join("out");
-        std::fs::create_dir_all(&worker_unit).unwrap();
-        std::fs::write(worker_unit.join("spawn-worker"), b"").unwrap();
-        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
-
-        let worker = profile.join("spawn-worker");
-        std::fs::write(&worker, b"").unwrap();
-        assert_eq!(
-            built_beside(&old_test, OsStr::new("spawn-worker")),
-            Some(worker.clone())
-        );
-        assert_eq!(
-            built_beside(&new_test, OsStr::new("spawn-worker")),
-            Some(worker)
-        );
-    }
-}
-
 /// Directory holding worker sockets or Windows endpoint metadata:
 /// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir on
 /// Unix, or `%LOCALAPPDATA%/spawn/state/<instance>/workers` on Windows. Unix
@@ -1360,5 +1311,56 @@ mod tests {
             Some(value) => std::env::set_var("SPAWND_WORKER_BIN", value),
             None => std::env::remove_var("SPAWND_WORKER_BIN"),
         }
+    }
+}
+
+// Last in the file on every platform: `mod tests` above is Unix-only, and
+// Clippy refuses items after a test module (`items_after_test_module`).
+#[cfg(test)]
+mod built_worker_tests {
+    use super::built_beside;
+    use std::ffi::OsStr;
+
+    /// Both places Cargo has kept a test binary lead to the same worker, and
+    /// a profile directory without one leads nowhere rather than to some
+    /// other file.
+    #[test]
+    fn the_built_worker_is_found_from_either_cargo_test_layout() {
+        let target = tempfile::tempdir().unwrap();
+        let profile = target.path().join("debug");
+        let through_1_99 = profile.join("deps");
+        let from_1_100 = profile
+            .join("build")
+            .join("spawnd")
+            .join("47a0d17e")
+            .join("out");
+        std::fs::create_dir_all(&through_1_99).unwrap();
+        std::fs::create_dir_all(&from_1_100).unwrap();
+        let old_test = through_1_99.join("spawnd-6d610854");
+        let new_test = from_1_100.join("spawnd-47a0d17e");
+        assert_eq!(built_beside(&old_test, OsStr::new("spawn-worker")), None);
+        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
+
+        // The worker's own intermediate output is not beside anything the
+        // test binary sits under, and is not what is found.
+        let worker_unit = profile
+            .join("build")
+            .join("spawnd")
+            .join("f2563374")
+            .join("out");
+        std::fs::create_dir_all(&worker_unit).unwrap();
+        std::fs::write(worker_unit.join("spawn-worker"), b"").unwrap();
+        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
+
+        let worker = profile.join("spawn-worker");
+        std::fs::write(&worker, b"").unwrap();
+        assert_eq!(
+            built_beside(&old_test, OsStr::new("spawn-worker")),
+            Some(worker.clone())
+        );
+        assert_eq!(
+            built_beside(&new_test, OsStr::new("spawn-worker")),
+            Some(worker)
+        );
     }
 }
