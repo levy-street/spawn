@@ -1350,18 +1350,24 @@ impl RtcSessions {
         // used to invalidate the registry entry and scan old peers.
         #[cfg(test)]
         self.peer_insert_attempted.notify_waiters();
-        let _admission = self.admission.lock().await;
-        if !self.trust_epoch_is_current(binding.trust_epoch) {
-            drop(_admission);
-            let _ = pc.close().await;
-            anyhow::bail!("credential trust changed during RTC negotiation");
-        }
+        // The transition before the admission lock, as in
+        // `attach_pair_channel` and for its reason: a restart holds the
+        // transition for seconds, and nothing waits that long holding the
+        // lock every offer on the daemon serializes on. One order in both
+        // places, or the two deadlock against each other.
         let transition = registry
             .lock_generation_transition(binding.signaling.session_id)
             .await;
-        if !registry.is_current(binding.session) {
-            drop(transition);
+        let _admission = self.admission.lock().await;
+        if !self.trust_epoch_is_current(binding.trust_epoch) {
             drop(_admission);
+            drop(transition);
+            let _ = pc.close().await;
+            anyhow::bail!("credential trust changed during RTC negotiation");
+        }
+        if !registry.is_current(binding.session) {
+            drop(_admission);
+            drop(transition);
             let _ = pc.close().await;
             anyhow::bail!("session backend was replaced during RTC negotiation");
         }
@@ -1406,8 +1412,8 @@ impl RtcSessions {
                 false
             }
         };
-        drop(transition);
         drop(_admission);
+        drop(transition);
         if collision_or_capacity {
             let _ = pc.close().await;
             anyhow::bail!("rtc session admission rejected");

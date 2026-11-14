@@ -430,15 +430,22 @@ impl RtcSessions {
         label: AttachmentLabel,
         dc: Arc<RTCDataChannel>,
     ) -> Result<()> {
+        // The session's transition first, the admission lock second, here
+        // and in `create_answer`: a transition is held across a whole
+        // restart — the session's peers closing, TERM, the wait for its
+        // worker to go — and every offer and every attach on the daemon
+        // serializes on admission. Taken the other way round, one device
+        // opening a restarting window held admission for all of that, and
+        // every other device's channels and offers waited behind it.
+        let transition = pair
+            .registry
+            .lock_generation_transition(label.session)
+            .await;
         let _admission = self.admission.lock().await;
         anyhow::ensure!(
             self.pair_is_current(parent_id, pc, pair.trust_epoch).await,
             "retired device connection"
         );
-        let transition = pair
-            .registry
-            .lock_generation_transition(label.session)
-            .await;
         let parent = self
             .host_peers
             .lock()
@@ -588,8 +595,8 @@ impl RtcSessions {
             .await
             .as_mut()
             .context("closed attachment")?(dc);
-        drop(transition);
         drop(_admission);
+        drop(transition);
         future.await;
         Ok(())
     }
@@ -1005,6 +1012,89 @@ mod tests {
             0,
             "the retired pair returned its slot"
         );
+    }
+
+    /// A stand-in worker that answers the replay every attach asks for.
+    fn spawn_replay_worker(registry: &SessionRegistry, id: Uuid) -> tokio::task::JoinHandle<()> {
+        let (binding, mut commands) = crate::rtc::tests::insert_test_worker(registry, id);
+        let control = registry.control_for_binding(binding).unwrap();
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                        control.source_offset(),
+                        vec![],
+                    )));
+                }
+            }
+        })
+    }
+
+    /// Open the first channel of an attachment to `session` and give the
+    /// daemon time to reach whatever that attach waits on. While it waits
+    /// holding the admission lock, that is seen at once; when it does not,
+    /// there is nothing to see and the pause is all there is.
+    async fn begin_attach_that_waits(
+        sessions: &RtcSessions,
+        pc: &Arc<RTCPeerConnection>,
+        session: Uuid,
+    ) -> Arc<RTCDataChannel> {
+        let channel = pc
+            .create_data_channel(
+                &format!("spawn.pty/{session}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+            while sessions.admission.try_lock().is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        channel
+    }
+
+    /// A session that is restarting holds its generation transition for as
+    /// long as its old worker takes to go: the peers close, TERM, the wait
+    /// for the socket, KILL. An attach for it waits there, and must not sit
+    /// on the daemon-wide admission lock while it does — every offer and
+    /// every other attach on the daemon serializes on that lock, so one
+    /// device opening a restarting window would stall every other device.
+    #[tokio::test]
+    async fn an_attach_waiting_on_a_restarting_session_does_not_hold_admission() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let steady = Uuid::new_v4();
+        let restarting = Uuid::new_v4();
+        let workers = [
+            spawn_replay_worker(&registry, steady),
+            spawn_replay_worker(&registry, restarting),
+        ];
+        let first = connect_pair(&sessions, &registry, [14; 32]).await;
+        let second = connect_pair(&sessions, &registry, [15; 32]).await;
+
+        let transition = registry.lock_generation_transition(restarting).await;
+        let _waiting = begin_attach_that_waits(&sessions, &first, restarting).await;
+
+        let attached = tokio::time::timeout(Duration::from_secs(5), attach(&second, steady)).await;
+        let admission_free = sessions.admission.try_lock().is_ok();
+        drop(transition);
+        assert!(
+            attached.is_ok(),
+            "another device's attach to another session waited on a restarting session's transition"
+        );
+        assert!(
+            admission_free,
+            "an attach waiting on a session's transition holds the admission lock"
+        );
+        sessions.close_all().await;
+        let _ = first.close().await;
+        let _ = second.close().await;
+        for worker in workers {
+            worker.abort();
+        }
     }
 
     #[test]

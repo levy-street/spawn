@@ -444,7 +444,12 @@ A duplicate close of a transport some other teardown owns — a reaper firing
 for a pc already leaving — does nothing at all. No path awaits a transport close while holding the
 admission lock, which every offer serializes on, or ahead of an answer: a
 superseded pair closes in a tracked task after the lock drops, and trust
-invalidation waits for host closes only until the teardown deadline. A
+invalidation waits for host closes only until the teardown deadline. Nor
+does any path wait for a session's generation transition while holding it:
+a restart holds the transition across the session's peer closes, TERM and
+the wait for its worker, so both inserters (`attach_pair_channel`,
+`create_answer`) take the transition first and the admission lock second —
+one order in both, or they deadlock against each other. A
 device re-attaching a view of its superseded connection (the mobile client
 keeps its attachment ids across a reconnect) finds nothing stale: the old
 attachment left the peer map when its pair was superseded, and one another
