@@ -1083,6 +1083,19 @@ impl RtcSessions {
         sender.try_send(WsOutbound::json(text)).is_ok()
     }
 
+    /// The control connection a frame may go out on now: the live one, once
+    /// its registration is acknowledged (the same two conditions as
+    /// `send_now`). A peer outlives the control connection its offer
+    /// arrived on, so nothing a peer says later may go through a sender
+    /// captured at admission — after a reconnect that is a socket nobody
+    /// reads.
+    fn registered_sender(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
+        if !self.deferred_pruned.load(Ordering::Acquire) {
+            return None;
+        }
+        self.signaling.load()
+    }
+
     /// Send a status, or hold it for the next chance. Synchronous: a status
     /// is on its way or held by the time this returns, so nothing that sends
     /// one can be dropped part-way.
@@ -3421,7 +3434,7 @@ fn session_data_channel_handler(
             let session_id = session.session_id();
 
             let input_registry = registry.clone();
-            let input_out_tx = out_tx.clone();
+            let input_live = sessions.clone();
             let input_active = Arc::clone(&active);
             let input_fence = Arc::clone(&fence);
             let input_channels = Arc::clone(&channels);
@@ -3434,7 +3447,7 @@ fn session_data_channel_handler(
             let input_session_id = binding.signaling.signal_id.clone();
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
-                let out_tx = input_out_tx.clone();
+                let live = input_live.clone();
                 let active = Arc::clone(&input_active);
                 let fence = Arc::clone(&input_fence);
                 let channels = Arc::clone(&input_channels);
@@ -3468,12 +3481,19 @@ fn session_data_channel_handler(
                         {
                             return None;
                         }
+                        // Reported on the control connection that is
+                        // live at this keystroke. The sender this handler
+                        // was built with is the offer's, and the peer
+                        // outlives it: after a control reconnect every
+                        // activity ping from a surviving peer went to a
+                        // socket nobody read.
+                        let out_tx = live.registered_sender();
                         forward_bound_data_channel_input(
                             session,
                             msg.is_string,
                             &msg.data,
                             &registry,
-                            &out_tx,
+                            out_tx.as_deref(),
                         )
                     };
                     let result = if require_owner {
@@ -4828,7 +4848,7 @@ fn forward_bound_data_channel_input(
     is_string: bool,
     data: &[u8],
     registry: &SessionRegistry,
-    out_tx: &mpsc::Sender<WsOutbound>,
+    out_tx: Option<&mpsc::Sender<WsOutbound>>,
 ) -> Option<Result<bool>> {
     let mut result = None;
     registry.with_bound_handle(session, |handle| {
@@ -4853,7 +4873,7 @@ fn forward_data_channel_input<W>(
     is_string: bool,
     data: &[u8],
     control: &crate::pty::ForwarderControl,
-    out_tx: &mpsc::Sender<WsOutbound>,
+    out_tx: Option<&mpsc::Sender<WsOutbound>>,
     write_stdin: W,
 ) -> Result<bool>
 where
@@ -4866,8 +4886,12 @@ where
     // Focus-weighted scheduling: the session being typed into gets its CPU
     // scope boosted so its response wins the scheduler under host load.
     crate::cpu_scopes::note_input(session_id);
+    // The classifier sees every byte whether or not there is a control
+    // connection to report on; without one the ping has nowhere to go.
     if control.note_input(data) {
-        crate::pty::try_emit_activity(out_tx, session_id, crate::pty::ActivityKind::Input);
+        if let Some(out_tx) = out_tx {
+            crate::pty::try_emit_activity(out_tx, session_id, crate::pty::ActivityKind::Input);
+        }
     }
     Ok(true)
 }
@@ -9563,10 +9587,14 @@ mod tests {
         assert_ne!(old, current);
 
         let (out_tx, _out_rx) = mpsc::channel(4);
-        assert!(
-            forward_bound_data_channel_input(old, false, b"stale input", &registry, &out_tx)
-                .is_none()
-        );
+        assert!(forward_bound_data_channel_input(
+            old,
+            false,
+            b"stale input",
+            &registry,
+            Some(&out_tx)
+        )
+        .is_none());
         assert!(current_commands.try_recv().is_err());
 
         assert!(forward_bound_data_channel_input(
@@ -9574,7 +9602,7 @@ mod tests {
             false,
             b"current input",
             &registry,
-            &out_tx,
+            Some(&out_tx),
         )
         .expect("current binding")
         .expect("current input write"));
@@ -9921,7 +9949,7 @@ mod tests {
                 false,
                 data,
                 &control,
-                &out_tx,
+                Some(&out_tx),
                 |bytes| {
                     writes.lock().unwrap().push(bytes.to_vec());
                     Ok(())
@@ -9951,26 +9979,36 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let write_calls = std::sync::atomic::AtomicUsize::new(0);
 
-        assert!(
-            !forward_data_channel_input(session_id, true, b"text", &control, &out_tx, |_| {
+        assert!(!forward_data_channel_input(
+            session_id,
+            true,
+            b"text",
+            &control,
+            Some(&out_tx),
+            |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
-            },)
-            .unwrap()
-        );
-        assert!(
-            !forward_data_channel_input(session_id, false, b"", &control, &out_tx, |_| {
+            },
+        )
+        .unwrap());
+        assert!(!forward_data_channel_input(
+            session_id,
+            false,
+            b"",
+            &control,
+            Some(&out_tx),
+            |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
-            },)
-            .unwrap()
-        );
+            },
+        )
+        .unwrap());
         assert!(forward_data_channel_input(
             session_id,
             false,
             b"failed secret",
             &control,
-            &out_tx,
+            Some(&out_tx),
             |_| anyhow::bail!("write failed"),
         )
         .is_err());
@@ -10007,7 +10045,7 @@ mod tests {
             false,
             &oversized,
             &control,
-            &activity_tx,
+            Some(&activity_tx),
             |bytes| handle.write_stdin(bytes),
         )
         .is_err());

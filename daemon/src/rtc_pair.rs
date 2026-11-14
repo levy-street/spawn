@@ -12,6 +12,9 @@ const MAX_PAIR_CONTROLS: usize = 32;
 pub(super) struct PairContext {
     pub(super) device_key: [u8; 32],
     registry: SessionRegistry,
+    /// The control connection the offer arrived on. The pair outlives it:
+    /// after a reconnect nobody reads this, so nothing an attachment says
+    /// later may go through it (`RtcSessions::registered_sender`).
     out_tx: mpsc::Sender<WsOutbound>,
     trust_epoch: u64,
     ice_restart: bool,
@@ -1228,6 +1231,101 @@ mod tests {
         for worker in workers {
             worker.abort();
         }
+    }
+
+    /// A device connection outlives the control connection its offer came
+    /// on: the daemon keeps its peers across a reconnect. A window attached
+    /// on it afterwards works, and what the daemon reports for it — that
+    /// someone is typing, which is all the server ever learns of input —
+    /// goes out on the connection that is live now, once that connection is
+    /// registered, not on the one the offer arrived on.
+    #[tokio::test]
+    async fn a_pair_admitted_before_a_reconnect_reports_input_on_the_live_connection() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let early = Uuid::new_v4();
+        let late = Uuid::new_v4();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let mut workers = Vec::new();
+        for id in [early, late] {
+            let (binding, mut commands) = crate::rtc::tests::insert_test_worker(&registry, id);
+            let control = registry.control_for_binding(binding).unwrap();
+            let input_tx = input_tx.clone();
+            workers.push(tokio::spawn(async move {
+                while let Some(command) = commands.recv().await {
+                    match command {
+                        crate::pty::WorkerCmd::Replay { resp, .. } => {
+                            let _ = resp.send(Ok(crate::pty::WorkerReplay::new(
+                                control.source_offset(),
+                                vec![],
+                            )));
+                        }
+                        crate::pty::WorkerCmd::Input(bytes) => {
+                            let _ = input_tx.send((id, bytes.to_vec()));
+                        }
+                        _ => {}
+                    }
+                }
+            }));
+        }
+        // The control connection the offer arrives on ends with this call:
+        // its receiving half is dropped when the pair is connected.
+        let pc = connect_pair(&sessions, &registry, [18; 32]).await;
+        assert_eq!(sessions.host_peers.lock().await.len(), 1);
+
+        // The control socket drops and a new one connects. Its `register`
+        // is not acknowledged yet.
+        sessions.clear_ws_sender();
+        let (live_tx, mut live_rx) = mpsc::channel(64);
+        sessions.install_ws_sender(live_tx);
+        let mut input_activity = move || {
+            let mut reported = Vec::new();
+            while let Ok(frame) = live_rx.try_recv() {
+                let value: Value = serde_json::from_str(frame.as_str()).unwrap();
+                if value["type"] == "session.input_activity" {
+                    reported.push(value["session_id"].as_str().unwrap().to_owned());
+                }
+            }
+            reported
+        };
+
+        let (early_pty, _early_ctl) = attach(&pc, early).await;
+        early_pty.send(&Bytes::from_static(b"typed")).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), input_rx.recv())
+                .await
+                .expect("input reaches the session while the control connection registers")
+                .unwrap(),
+            (early, b"typed".to_vec())
+        );
+        assert!(
+            input_activity().is_empty(),
+            "nothing but `register` goes out before the server acknowledges it"
+        );
+
+        // Registered: the replay has run.
+        sessions.reannounce_live_statuses(&HashSet::new()).await;
+        let (late_pty, _late_ctl) = attach(&pc, late).await;
+        late_pty.send(&Bytes::from_static(b"typed")).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), input_rx.recv())
+                .await
+                .expect("input reaches the session after the reconnect")
+                .unwrap(),
+            (late, b"typed".to_vec())
+        );
+        let reported = input_activity();
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        for worker in workers {
+            worker.abort();
+        }
+        assert_eq!(
+            reported,
+            [late.to_string()],
+            "input on a pair admitted before the reconnect is reported on the live control connection"
+        );
     }
 
     #[test]

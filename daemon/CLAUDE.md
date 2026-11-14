@@ -490,7 +490,13 @@ active binding is a refusal of its offer and it drops its trust verdict,
 while `unavailable` is a connection that is gone, answered with a new one.
 No status goes out before a connection's registration is acknowledged
 (`deferred_pruned`): the server refuses frames before `register`, and one
-refused would be one never deferred. A status deferred for that, or for
+refused would be one never deferred. A peer outlives the control connection
+its offer arrived on, so nothing it says later goes through a sender
+captured at admission — after a reconnect that is a socket nobody reads,
+which is where every input-activity ping from a surviving peer went. The
+ping goes out on `registered_sender`, the live connection once registered;
+`PairContext.out_tx` and the `out_tx` a session handler is built with are
+the offer's; nothing sends through them once the peer is admitted. A status deferred for that, or for
 want of channel room, is retried from the control connection's heartbeat
 once registration's replay has run; at reconnect a deferred terminal
 status is replayed only for a binding the register frame carried (the
