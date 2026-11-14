@@ -6663,14 +6663,6 @@ mod tests {
         .expect("RTC resident session count did not converge");
     }
 
-    fn built_worker_bin() -> std::path::PathBuf {
-        let exe = std::env::current_exe().expect("current_exe");
-        exe.parent()
-            .and_then(|deps| deps.parent())
-            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
-            .expect("worker bin path")
-    }
-
     struct WorkerTestEnv {
         old_dir: Option<std::ffi::OsString>,
         old_bin: Option<std::ffi::OsString>,
@@ -6702,7 +6694,10 @@ mod tests {
             #[cfg(not(windows))]
             let worker_dir = dir.path();
             std::env::set_var("SPAWND_WORKER_DIR", worker_dir);
-            std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
+            std::env::set_var(
+                "SPAWND_WORKER_BIN",
+                crate::worker_backend::built_worker_bin(),
+            );
             Self {
                 old_dir,
                 old_bin,

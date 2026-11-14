@@ -60,6 +60,87 @@ fn worker_frame_limit(frame_type: u8) -> Option<usize> {
 #[cfg(test)]
 pub(crate) static WORKER_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The `spawn-worker` Cargo built with this test binary, for the tests that
+/// launch a real worker.
+///
+/// Cargo puts the finished worker in the profile directory (`target/debug/`)
+/// and a test binary somewhere below it, and where below is Cargo's to
+/// change: `deps/` through Rust 1.99, `build/<package>/<hash>/out/` from
+/// 1.100. Counting two levels up found nothing there, and a worker that is
+/// not found is reported as one that "does not match this spawnd build". So
+/// the worker is looked for beside each directory above this binary, nearest
+/// first, and a missing one is named as missing.
+#[cfg(test)]
+pub(crate) fn built_worker_bin() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let name = crate::platform::executable_name("spawn-worker");
+    built_beside(&exe, &name).unwrap_or_else(|| {
+        panic!(
+            "no {} in any directory above {}; `cargo test` without a target filter builds it, as does `cargo build`",
+            name.to_string_lossy(),
+            exe.display()
+        )
+    })
+}
+
+/// The nearest directory above `exe` that holds a file called `name`.
+#[cfg(test)]
+fn built_beside(exe: &std::path::Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod built_worker_tests {
+    use super::built_beside;
+    use std::ffi::OsStr;
+
+    /// Both places Cargo has kept a test binary lead to the same worker, and
+    /// a profile directory without one leads nowhere rather than to some
+    /// other file.
+    #[test]
+    fn the_built_worker_is_found_from_either_cargo_test_layout() {
+        let target = tempfile::tempdir().unwrap();
+        let profile = target.path().join("debug");
+        let through_1_99 = profile.join("deps");
+        let from_1_100 = profile
+            .join("build")
+            .join("spawnd")
+            .join("47a0d17e")
+            .join("out");
+        std::fs::create_dir_all(&through_1_99).unwrap();
+        std::fs::create_dir_all(&from_1_100).unwrap();
+        let old_test = through_1_99.join("spawnd-6d610854");
+        let new_test = from_1_100.join("spawnd-47a0d17e");
+        assert_eq!(built_beside(&old_test, OsStr::new("spawn-worker")), None);
+        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
+
+        // The worker's own intermediate output is not beside anything the
+        // test binary sits under, and is not what is found.
+        let worker_unit = profile
+            .join("build")
+            .join("spawnd")
+            .join("f2563374")
+            .join("out");
+        std::fs::create_dir_all(&worker_unit).unwrap();
+        std::fs::write(worker_unit.join("spawn-worker"), b"").unwrap();
+        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
+
+        let worker = profile.join("spawn-worker");
+        std::fs::write(&worker, b"").unwrap();
+        assert_eq!(
+            built_beside(&old_test, OsStr::new("spawn-worker")),
+            Some(worker.clone())
+        );
+        assert_eq!(
+            built_beside(&new_test, OsStr::new("spawn-worker")),
+            Some(worker)
+        );
+    }
+}
+
 /// Directory holding worker sockets or Windows endpoint metadata:
 /// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir on
 /// Unix, or `%LOCALAPPDATA%/spawn/state/<instance>/workers` on Windows. Unix
@@ -1010,16 +1091,6 @@ mod tests {
         drop(worker_stream);
         reader.await.unwrap();
         forwarder.await.unwrap();
-    }
-
-    /// The spawn-worker binary as built alongside this test binary
-    /// (target/debug/deps/spawnd-<hash> → target/debug/spawn-worker).
-    fn built_worker_bin() -> PathBuf {
-        let exe = std::env::current_exe().expect("current_exe");
-        exe.parent()
-            .and_then(|deps| deps.parent())
-            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
-            .expect("worker bin path")
     }
 
     /// Wait for `needle` on the direct sink.
