@@ -129,7 +129,8 @@ tokio = { version = "1.42", features = ["test-util"] }
 [patch.crates-io]
 webrtc-sctp = { path = "vendor/sctp" }
 # Keep closed channels out of the shared parent's live registry, retaining
-# cumulative close stats and stream-ID reservations. See vendor/webrtc/PATCHES.md.
+# cumulative close stats and stream-ID reservations, and keep accepting
+# channels after one stream fails to become one. See vendor/webrtc/PATCHES.md.
 webrtc = { path = "vendor/webrtc" }
 # A temporary unreachable UDP route during ICE restart is packet loss, not
 # the end of the DTLS/SCTP association. See vendor/ice/PATCHES.md.

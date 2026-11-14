@@ -44,3 +44,38 @@ normal and diagnostics daemon suites, including native Windows CI.
 
 Remove the override once an upstream release provides equivalent closed
 channel cleanup without unsafe stream-ID reuse.
+
+## The accept loop outlives a stream that never became a channel
+
+`src/sctp_transport/mod.rs`, `accept_data_channels`: one task accepts every
+incoming data channel of a peer connection, and upstream left its loop on any
+error from `DataChannel::accept` — silently, unless the error was the
+association's own `ErrStreamClosed`. A device that opens a channel and closes
+it before the daemon has read its OPEN produces exactly such an error: the
+reset stream reads as end-of-stream, which is not a DCEP OPEN
+(`InvalidPayloadProtocolIdentifier`). The acceptor was gone from that moment
+while ICE, DTLS, the association and every channel already open stayed up, so
+the connection looked healthy to both ends and no channel opened on it again
+until the daemon restarted. A browser abandons a channel that way whenever an
+open takes longer than its timeout, which is whenever the acceptor is held up
+— it runs the application's `on_data_channel` handler inline.
+
+The patch separates the two cases. `ErrStreamClosed` — the association has no
+more streams to give — still ends the loop and still reaches `on_error`. Any
+other error is the end of that one stream: it is logged at warning level and
+the loop goes on to the next. Each iteration consumes one stream from the
+association's accept queue, so a failing stream cannot spin the loop.
+
+A stream that failed for a reason other than its own reset (a first message
+that is not an OPEN, a label that is not UTF-8) stays registered in the
+association with nobody reading it, as it did upstream; this patch does not
+reset it.
+
+The native daemon regression
+`a_channel_reset_before_it_is_accepted_leaves_the_pair_accepting` in
+`rtc_pair.rs` holds the acceptor in admission, opens and closes a channel
+behind it, waits until the daemon's association has performed the reset, and
+requires the next channel on the same connection to open.
+
+Remove this part of the override once an upstream release keeps accepting
+after a per-stream failure.

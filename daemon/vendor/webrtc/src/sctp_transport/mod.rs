@@ -272,15 +272,24 @@ impl RTCSctpTransport {
                 ) => {
                     match result {
                         Ok(dc) => dc,
-                        Err(err) => {
-                            if data::Error::ErrStreamClosed == err {
-                                log::error!("Failed to accept data channel: {err}");
-                                if let Some(handler) = &*param.on_error_handler.load() {
-                                    let mut f = handler.lock().await;
-                                    f(err.into()).await;
-                                }
+                        // The association has no more streams to give.
+                        Err(err @ data::Error::ErrStreamClosed) => {
+                            log::error!("Failed to accept data channel: {err}");
+                            if let Some(handler) = &*param.on_error_handler.load() {
+                                let mut f = handler.lock().await;
+                                f(err.into()).await;
                             }
                             break;
+                        }
+                        // One stream never became a channel: reset before
+                        // its OPEN was read, a first message that was not an
+                        // OPEN, an acknowledgement its stream refused. That
+                        // is the end of that stream, not of the acceptor:
+                        // upstream broke out here, without a word, and the
+                        // connection accepted nothing ever again.
+                        Err(err) => {
+                            log::warn!("Failed to accept one data channel; still accepting: {err}");
+                            continue;
                         }
                     }
                 }

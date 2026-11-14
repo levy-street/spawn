@@ -823,6 +823,110 @@ mod tests {
         signal_sink.abort();
     }
 
+    /// Open a host consumer channel the way a device does, and collect what
+    /// the daemon says on it. The daemon's `hello` is the proof the channel
+    /// was accepted and admitted.
+    async fn open_host_consumer(
+        pc: &Arc<RTCPeerConnection>,
+    ) -> (Arc<RTCDataChannel>, mpsc::UnboundedReceiver<Value>) {
+        let channel = pc
+            .create_data_channel(&format!("spawn.host.ctl/{}", Uuid::new_v4()), None)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        channel.on_message(Box::new(move |message| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if let Ok(value) = serde_json::from_slice::<Value>(&message.data) {
+                    let _ = tx.send(value);
+                }
+            })
+        }));
+        (channel, rx)
+    }
+
+    async fn hello_within(rx: &mut mpsc::UnboundedReceiver<Value>, wait: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(wait, rx.recv()).await,
+            Ok(Some(value)) if value["type"] == "hello"
+        )
+    }
+
+    /// A device opens a channel, gives up on it, and closes it — the web
+    /// client does exactly that when an open takes longer than ten seconds —
+    /// while the daemon is still busy admitting the channel before it. The
+    /// stream is reset before its OPEN is ever read. That is one channel
+    /// lost; it must not be every channel after it on a connection whose
+    /// ICE, DTLS and root channel all stay up.
+    #[tokio::test]
+    async fn a_channel_reset_before_it_is_accepted_leaves_the_pair_accepting() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_pair(&sessions, &registry, [12; 32]).await;
+
+        // Admitted before anything goes wrong. Its requests are answered by
+        // its own reader whatever the acceptor is doing, which is how this
+        // test knows how far the daemon's association has read.
+        let (probe, mut probe_rx) = open_host_consumer(&pc).await;
+        assert!(
+            hello_within(&mut probe_rx, Duration::from_secs(5)).await,
+            "a channel opens on a fresh pair"
+        );
+
+        // Admission is busy: every offer and every attach on the daemon
+        // serializes on this lock. The acceptor waits in the handler of the
+        // next channel, and what arrives meanwhile queues behind it.
+        let admission = Arc::clone(&sessions.admission).lock_owned().await;
+        let (_waiting, mut waiting_rx) = open_host_consumer(&pc).await;
+        let (abandoned, _abandoned_rx) = open_host_consumer(&pc).await;
+        abandoned.close().await.unwrap();
+
+        // SCTP sends the reset behind the OPEN it follows, and a request
+        // sent only after an earlier reply came back is behind both. Two
+        // round trips, since the first request can share a flight with the
+        // reset: once the second is answered the daemon has reset the
+        // abandoned stream, with its OPEN still unread.
+        for round in 0..2 {
+            let request_id = format!("drain-{round}");
+            probe
+                .send_text(
+                    json!({
+                        "version": 1, "type": "request", "request_id": request_id,
+                        "operation": "fs.home", "payload": {}
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(5), probe_rx.recv())
+                .await
+                .expect("an admitted channel answers while admission is busy")
+                .unwrap();
+            assert_eq!(reply["request_id"], request_id);
+        }
+        assert!(
+            waiting_rx.try_recv().is_err(),
+            "the acceptor is still waiting on admission"
+        );
+        drop(admission);
+        assert!(
+            hello_within(&mut waiting_rx, Duration::from_secs(5)).await,
+            "the channel that waited on admission is admitted"
+        );
+
+        let (_next, mut next_rx) = open_host_consumer(&pc).await;
+        let accepted = hello_within(&mut next_rx, Duration::from_secs(5)).await;
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Connected);
+        assert_eq!(sessions.host_peers.lock().await.len(), 1);
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        assert!(
+            accepted,
+            "no channel opens on a live pair after one was reset before its OPEN was read"
+        );
+    }
+
     #[test]
     fn attachment_labels_are_exact_and_canonical() {
         let session = Uuid::new_v4();

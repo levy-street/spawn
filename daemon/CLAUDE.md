@@ -81,7 +81,9 @@ vendor/          exact upstream crate sources for narrowly documented patches;
                  webrtc-ice 0.17.2
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
-                 with closed-channel registry pruning (webrtc/PATCHES.md).
+                 with closed-channel registry pruning and a channel acceptor
+                 that outlives a stream that never became a channel
+                 (webrtc/PATCHES.md).
                  SCTP and ICE also allow clippy::double_must_use at the
                  crate root: Rust 1.99 Clippy flags the #[must_use] that
                  async_trait puts on every boxed future it generates.
