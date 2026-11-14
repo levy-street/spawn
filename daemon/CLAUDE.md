@@ -86,7 +86,8 @@ vendor/          exact upstream crate sources for narrowly documented patches;
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
                  with closed-channel registry pruning and a channel acceptor
-                 that outlives a stream that never became a channel
+                 that outlives a stream that never became a channel, admits
+                 each channel in its own task, and reports its own end
                  (webrtc/PATCHES.md).
                  SCTP and ICE also allow clippy::double_must_use at the
                  crate root: Rust 1.99 Clippy flags the #[must_use] that
@@ -595,6 +596,14 @@ network-unreachable errors drop the UDP datagram so SCTP can retransmit after
 ICE recovery; they must not close the shared association. Other IO errors
 and explicit connection closure still fail. The tests inject the route error
 and require the next datagram to reach a real receiver on the same connection.
+
+A channel's admission runs in a task of its own (the vendored WebRTC accept
+loop, webrtc/PATCHES.md): the future an `on_data_channel` handler returns
+completes before that channel opens or delivers a message, as always, but
+the futures for different channels of one connection run concurrently and
+finish in any order. A handler must not assume the channel before it has
+been admitted, and may wait — on the admission lock, on a session's
+transition — without holding up any other channel on the connection.
 
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed

@@ -72,13 +72,54 @@ association with nobody reading it, as it did upstream; this patch does not
 reset it.
 
 The native daemon regression
-`a_channel_reset_before_it_is_accepted_leaves_the_pair_accepting` in
-`rtc_pair.rs` holds the acceptor in admission, opens and closes a channel
-behind it, waits until the daemon's association has performed the reset, and
+`a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting` in
+`rtc_pair.rs` sends a first message that is not an OPEN on a new stream and
 requires the next channel on the same connection to open.
+`a_channel_abandoned_while_admission_is_busy_leaves_the_pair_accepting`
+opens and closes a channel while admission is held; that reproduced the
+reset-before-OPEN failure for as long as admission ran inside the accept
+loop (see the next section), and now covers a channel reset while it waits
+to be admitted.
 
 Remove this part of the override once an upstream release keeps accepting
 after a per-stream failure.
+
+## A channel's admission runs in a task of its own
+
+`src/sctp_transport/mod.rs`, `accept_data_channels`, and
+`src/peer_connection/peer_connection_internal.rs`, the wrapper that hands an
+accepted channel to the application's `on_data_channel` handler. Upstream
+awaited the handler's future inside the accept loop, and the wrapper held the
+handler's mutex across that future as well. One channel whose admission
+waited — in the daemon, on the admission lock or on a restarting session's
+transition — therefore held up every channel behind it on the connection.
+The peer's opens for those timed out, it reset their streams, and (before the
+patch above) the first of those resets ended the acceptor.
+
+The loop now calls the handler in the order channels arrive and spawns one
+task per channel for the rest: the handler's future, then the registry
+insert and accepted count, then `handle_open`, then the opened handler. Each
+channel keeps upstream's order of its own steps, so callbacks a handler
+installs are in place before the channel opens and before its first message
+is read. The wrapper locks the application's handler to call it and releases
+the lock before awaiting what it returned.
+
+What changed for a handler: futures it returns for different channels of one
+connection can run concurrently and complete in any order, and the wrapper's
+lock no longer makes the application's handler be called in strict arrival
+order when two channels arrive together. It is still never called
+concurrently with itself. A handler future that panics ends that channel's
+task, not the acceptor. Nothing bounds how many admissions wait at once
+except the peer's own rate of opening channels; upstream's bound was one,
+with sixteen more streams queued in the association.
+
+The native daemon regression
+`a_channel_waiting_on_admission_does_not_hold_up_the_next_on_its_connection`
+in `rtc_pair.rs` holds one session's transition, starts an attach for it,
+and requires a second attach and a host channel on the same connection to be
+admitted meanwhile, then the first attach to complete once the transition is
+released. `a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting`
+pins the patch above on its own: it needs no held acceptor.
 
 ## The acceptor's end is reported, not logged
 

@@ -200,10 +200,18 @@ impl PeerConnectionInternal {
             .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
                 let on_data_channel_handler = Arc::clone(&on_data_channel_handler);
                 Box::pin(async move {
-                    if let Some(handler) = &*on_data_channel_handler.load() {
-                        let mut f = handler.lock().await;
-                        f(d).await;
-                    }
+                    // The handler's lock is held to call it, not across what
+                    // it returns: held across that, as upstream did, it
+                    // made every channel's admission wait for the one before
+                    // it, whichever task each ran in.
+                    let admission = match &*on_data_channel_handler.load() {
+                        Some(handler) => {
+                            let mut f = handler.lock().await;
+                            f(d)
+                        }
+                        None => return,
+                    };
+                    admission.await;
                 })
             }));
 

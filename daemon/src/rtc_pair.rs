@@ -859,14 +859,79 @@ mod tests {
         )
     }
 
+    /// A stream whose first message is not a channel OPEN never becomes a
+    /// channel. The acceptor refuses that stream and goes on to the next:
+    /// upstream's left its loop for good on any such error — a stream reset
+    /// before its OPEN was read is another — and nothing opened on the
+    /// connection again while ICE, DTLS and the root channel all stayed up.
+    #[tokio::test]
+    async fn a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_pair(&sessions, &registry, [17; 32]).await;
+        let (probe, mut probe_rx) = open_host_consumer(&pc).await;
+        assert!(
+            hello_within(&mut probe_rx, Duration::from_secs(5)).await,
+            "a channel opens on a fresh pair"
+        );
+
+        // A channel the device calls pre-negotiated sends no OPEN. The
+        // daemon negotiated no such thing, so what arrives is a stream it
+        // has never heard of whose first message is the device's text.
+        let stray = pc
+            .create_data_channel(
+                "stray",
+                Some(
+                    webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                        negotiated: Some(1001),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        stray.send_text("not an open").await.unwrap();
+        // Answered after the stray message was sent, so the stray stream is
+        // in the acceptor's queue ahead of anything opened from here on.
+        probe
+            .send_text(
+                json!({
+                    "version": 1, "type": "request", "request_id": "after-stray",
+                    "operation": "fs.home", "payload": {}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), probe_rx.recv())
+            .await
+            .expect("an admitted channel still answers")
+            .unwrap();
+        assert_eq!(reply["request_id"], "after-stray");
+
+        let (_next, mut next_rx) = open_host_consumer(&pc).await;
+        let accepted = hello_within(&mut next_rx, Duration::from_secs(5)).await;
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Connected);
+        assert_eq!(sessions.host_peers.lock().await.len(), 1);
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        assert!(
+            accepted,
+            "no channel opens on a live pair after a stream failed to become one"
+        );
+    }
+
     /// A device opens a channel, gives up on it, and closes it — the web
     /// client does exactly that when an open takes longer than ten seconds —
-    /// while the daemon is still busy admitting the channel before it. The
-    /// stream is reset before its OPEN is ever read. That is one channel
-    /// lost; it must not be every channel after it on a connection whose
-    /// ICE, DTLS and root channel all stay up.
+    /// while admission is busy. That is one channel lost; it must not be
+    /// every channel after it on a connection whose ICE, DTLS and root
+    /// channel all stay up. While the acceptor ran admission inline, the
+    /// abandoned stream was reset before its OPEN was read and the acceptor
+    /// left its loop on it; now the OPEN is read at once and the reset finds
+    /// a channel still waiting to be admitted.
     #[tokio::test]
-    async fn a_channel_reset_before_it_is_accepted_leaves_the_pair_accepting() {
+    async fn a_channel_abandoned_while_admission_is_busy_leaves_the_pair_accepting() {
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;
         let registry = SessionRegistry::new();
@@ -882,8 +947,7 @@ mod tests {
         );
 
         // Admission is busy: every offer and every attach on the daemon
-        // serializes on this lock. The acceptor waits in the handler of the
-        // next channel, and what arrives meanwhile queues behind it.
+        // serializes on this lock, and the next channels wait on it.
         let admission = Arc::clone(&sessions.admission).lock_owned().await;
         let (_waiting, mut waiting_rx) = open_host_consumer(&pc).await;
         let (abandoned, _abandoned_rx) = open_host_consumer(&pc).await;
@@ -893,7 +957,7 @@ mod tests {
         // sent only after an earlier reply came back is behind both. Two
         // round trips, since the first request can share a flight with the
         // reset: once the second is answered the daemon has reset the
-        // abandoned stream, with its OPEN still unread.
+        // abandoned stream, with its channel still unadmitted.
         for round in 0..2 {
             let request_id = format!("drain-{round}");
             probe
@@ -914,7 +978,7 @@ mod tests {
         }
         assert!(
             waiting_rx.try_recv().is_err(),
-            "the acceptor is still waiting on admission"
+            "the channel opened first is still waiting on admission"
         );
         drop(admission);
         assert!(
@@ -930,7 +994,7 @@ mod tests {
         let _ = pc.close().await;
         assert!(
             accepted,
-            "no channel opens on a live pair after one was reset before its OPEN was read"
+            "no channel opens on a live pair after one was abandoned while admission was busy"
         );
     }
 
@@ -1092,6 +1156,75 @@ mod tests {
         sessions.close_all().await;
         let _ = first.close().await;
         let _ = second.close().await;
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    /// One device, two windows: the one it opens first is restarting and
+    /// its attach waits on that session's transition. The acceptor must not
+    /// wait with it — the window opened next is on the same connection, and
+    /// so is every channel the device opens until the restart is over.
+    #[tokio::test]
+    async fn a_channel_waiting_on_admission_does_not_hold_up_the_next_on_its_connection() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let steady = Uuid::new_v4();
+        let restarting = Uuid::new_v4();
+        let workers = [
+            spawn_replay_worker(&registry, steady),
+            spawn_replay_worker(&registry, restarting),
+        ];
+        let pc = connect_pair(&sessions, &registry, [16; 32]).await;
+
+        let transition = registry.lock_generation_transition(restarting).await;
+        let waiting = begin_attach_that_waits(&sessions, &pc, restarting).await;
+
+        let attached = tokio::time::timeout(Duration::from_secs(5), attach(&pc, steady)).await;
+        let (consumer, mut consumer_rx) = open_host_consumer(&pc).await;
+        let consumer_admitted = hello_within(&mut consumer_rx, Duration::from_secs(5)).await;
+        drop(transition);
+        assert!(
+            attached.is_ok(),
+            "a terminal waited behind another window's attach on the same connection"
+        );
+        assert!(
+            consumer_admitted,
+            "a host channel waited behind a window's attach on the same connection"
+        );
+        // The attach that waited is admitted once the restart lets go: the
+        // device's second channel for it completes the attachment.
+        let suffix = waiting
+            .label()
+            .strip_prefix("spawn.pty/")
+            .unwrap()
+            .to_owned();
+        let ctl = pc
+            .create_data_channel(&format!("spawn.ctl/{suffix}"), None)
+            .await
+            .unwrap();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        ctl.on_message(Box::new(move |message| {
+            let ready_tx = ready_tx.clone();
+            Box::pin(async move {
+                if let Ok(value) = serde_json::from_slice::<Value>(&message.data) {
+                    let _ = ready_tx.send(value);
+                }
+            })
+        }));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(value) = ready_rx.recv().await {
+                if value["event"] == "ready" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the attach that waited on the transition completes after it");
+        drop(consumer);
+        sessions.close_all().await;
+        let _ = pc.close().await;
         for worker in workers {
             worker.abort();
         }

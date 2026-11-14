@@ -346,23 +346,44 @@ impl RTCSctpTransport {
                 Arc::clone(&param.setting_engine),
             ));
 
-            if let Some(handler) = &*param.on_data_channel_handler.load() {
-                let mut f = handler.lock().await;
-                f(Arc::clone(&rtc_dc)).await;
+            // The handler is called here, in the order channels arrive, but
+            // what it returns runs in a task of the channel's own. Upstream
+            // awaited it in this loop, so one channel whose admission waited
+            // — on a lock, on anything — held up every channel behind it on
+            // the connection, and a peer that gave up on those and reset
+            // them was resetting streams nobody had read yet. Each channel
+            // still sees its own steps in upstream's order: the handler's
+            // future completes, the channel is registered, and only then is
+            // it opened and read.
+            let admission = match &*param.on_data_channel_handler.load() {
+                Some(handler) => {
+                    let mut f = handler.lock().await;
+                    Some(f(Arc::clone(&rtc_dc)))
+                }
+                None => None,
+            };
+            let data_channels = Arc::clone(&param.data_channels);
+            let data_channels_accepted = Arc::clone(&param.data_channels_accepted);
+            let data_channels_opened = Arc::clone(&param.data_channels_opened);
+            let on_data_channel_opened_handler = Arc::clone(&param.on_data_channel_opened_handler);
+            tokio::spawn(async move {
+                if let Some(admission) = admission {
+                    admission.await;
 
-                param.data_channels_accepted.fetch_add(1, Ordering::SeqCst);
+                    data_channels_accepted.fetch_add(1, Ordering::SeqCst);
 
-                let mut dcs = param.data_channels.lock().await;
-                dcs.insert(Arc::clone(&rtc_dc));
-            }
+                    let mut dcs = data_channels.lock().await;
+                    dcs.insert(Arc::clone(&rtc_dc));
+                }
 
-            rtc_dc.handle_open(Arc::new(dc)).await;
+                rtc_dc.handle_open(Arc::new(dc)).await;
 
-            if let Some(handler) = &*param.on_data_channel_opened_handler.load() {
-                let mut f = handler.lock().await;
-                f(rtc_dc).await;
-                param.data_channels_opened.fetch_add(1, Ordering::SeqCst);
-            }
+                if let Some(handler) = &*on_data_channel_opened_handler.load() {
+                    let mut f = handler.lock().await;
+                    f(rtc_dc).await;
+                    data_channels_opened.fetch_add(1, Ordering::SeqCst);
+                }
+            });
         }
     }
 
