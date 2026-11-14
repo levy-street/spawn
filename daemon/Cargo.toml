@@ -125,7 +125,8 @@ tokio = { version = "1.42", features = ["test-util"] }
 
 # Remove this override after a published webrtc-sctp release contains the
 # receiver zero-window re-admission fix from webrtc-rs/rtc#201 and the stream
-# reset notification fix documented in CLAUDE.md.
+# reset notification, pending-queue close and accept-queue close fixes
+# documented in CLAUDE.md.
 [patch.crates-io]
 webrtc-sctp = { path = "vendor/sctp" }
 # Keep closed channels out of the shared parent's live registry, retaining

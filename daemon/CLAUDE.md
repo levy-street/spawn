@@ -74,10 +74,14 @@ tests/           integration tests (worker_e2e.rs), and
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix,
-                 a read/reset missed-notification fix, and closing the
+                 a read/reset missed-notification fix, closing the
                  association closing its pending queue (a writer waiting on a
                  silent peer gets `ErrStreamClosed` instead of holding the
                  stream shutdowns, and so the peer connection close, forever),
+                 and closing the association closing its accept queue
+                 (`accept_stream` returns `None` instead of waiting for ever,
+                 which is how a channel acceptor learns the association under
+                 a connected transport is gone),
                  webrtc-ice 0.17.2
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
@@ -453,10 +457,20 @@ acknowledging those wait behind a writer that never gets room; the closed
 association releases the writer and the shutdowns bail on state. Every
 retirement the daemon starts on its own — the reaper's never-connected,
 failed, and stayed-disconnected closes, a session that ended, was replaced,
-or is restarting, and a device connection superseded by a newer one — tells
+or is restarting, a device connection superseded by a newer one, and a host
+peer whose channel acceptor ended — tells
 the server `unavailable` for that binding, once it has claimed the peer
 (`reap_session_peer`, `close_for_session`, `retire_host_if_same`,
-`take_device_pair`). A session close hands its announcements back
+`take_device_pair`). The acceptor ends when the SCTP association does, and
+an association can end under a transport that stays connected (the device's
+SCTP went away; the write loop closed it over a send error ICE recovered
+from): nothing opens on that peer again and the reaper, which watches the
+connection state, never hears of it, so `install_host_acceptor_watch`
+retires it from the SCTP transport's `on_error`. A peer the daemon is
+already closing left the host map before its association stopped, and the
+watch does nothing for it; a device's own close ends the association too
+when word of it arrives (a DTLS close_notify, an SCTP ABORT), and that peer
+is retired the same way, ahead of the reaper's grace. A session close hands its announcements back
 (`Announcements`, sent on drop if never sent) for the caller in `run.rs` to
 send once the exit or the replacement is on the wire: sent earlier, a device
 re-offers into a session that is not running, is refused with `failed`, and

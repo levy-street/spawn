@@ -79,3 +79,23 @@ requires the next channel on the same connection to open.
 
 Remove this part of the override once an upstream release keeps accepting
 after a per-stream failure.
+
+## The acceptor's end is reported, not logged
+
+`ErrStreamClosed` from `DataChannel::accept` means the association's accept
+queue closed. Upstream's webrtc-sctp never closed it, so that branch was
+unreachable and an acceptor waited on a closed association until the
+transport was stopped locally. The vendored webrtc-sctp now closes the queue
+when the association closes (see the `vendor/` entry in `daemon/CLAUDE.md`),
+which makes the branch the ordinary end of every acceptor — after a local
+`stop()` as much as after an association that died under a connected
+transport. The branch therefore logs at debug level instead of error, and
+still calls `on_error` before the loop ends. The daemon installs that handler
+on host peers (`install_host_acceptor_watch` in `rtc.rs`) and retires a peer
+that is still in its host map.
+
+The native daemon regression
+`a_pair_whose_association_ended_is_retired_and_announced` in `rtc_pair.rs`
+stops the device's SCTP transport under a pair whose ICE stays connected and
+requires the pair to leave the host map with one `unavailable` for its
+binding.

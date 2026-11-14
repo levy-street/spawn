@@ -927,6 +927,86 @@ mod tests {
         );
     }
 
+    /// The association under a device connection can end while ICE stays
+    /// connected: the device's SCTP goes away, or this side's write loop
+    /// closes it over a send error ICE itself recovers from. Nothing opens
+    /// on such a pair again and no transport state will ever say so, so the
+    /// acceptor ending is the word: the pair leaves the host map and the
+    /// server hears `unavailable`, which a device answers with a new
+    /// connection.
+    #[tokio::test]
+    async fn a_pair_whose_association_ended_is_retired_and_announced() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_pair(&sessions, &registry, [13; 32]).await;
+        let (signal_tx, mut signal_rx) = mpsc::channel(16);
+        sessions.signaling.install(signal_tx);
+        sessions.deferred_pruned.store(true, Ordering::Release);
+        let (signal_id, peer) = sessions
+            .host_peers
+            .lock()
+            .await
+            .iter()
+            .next()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .unwrap();
+        assert_eq!(sessions.peer_admission.charged(), 1);
+        // Both associations are up and the acceptor is running: a transport
+        // can report connected before SCTP has finished its handshake.
+        let (_consumer, mut consumer_rx) = open_host_consumer(&pc).await;
+        assert!(
+            hello_within(&mut consumer_rx, Duration::from_secs(5)).await,
+            "a channel opens on a fresh pair"
+        );
+
+        // The device's association and the DTLS connection under it close;
+        // its ICE agent keeps answering, so the daemon's reaper, which
+        // watches the connection state, has nothing to act on.
+        pc.sctp().stop().await.unwrap();
+
+        let retired = tokio::time::timeout(Duration::from_secs(5), async {
+            while !sessions.host_peers.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let state = peer.pc.connection_state();
+        let mut announced = Vec::new();
+        while let Ok(frame) = signal_rx.try_recv() {
+            let value: Value = serde_json::from_str(frame.as_str()).unwrap();
+            if value["type"] == "rtc.status" && value["session_id"] == signal_id.as_str() {
+                announced.push(value["status"].as_str().unwrap_or_default().to_owned());
+            }
+        }
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        assert!(
+            retired.is_ok(),
+            "a pair with no association stayed in the host map; its transport says {state:?}"
+        );
+        // The channels that opened said `connected`; the goodbye is the
+        // last word for this binding and is said once.
+        assert_eq!(
+            announced.last().map(String::as_str),
+            Some("unavailable"),
+            "the server hears the pair is gone: {announced:?}"
+        );
+        assert_eq!(
+            announced
+                .iter()
+                .filter(|status| *status != "connected")
+                .count(),
+            1,
+            "the goodbye is said once: {announced:?}"
+        );
+        assert_eq!(
+            sessions.peer_admission.charged(),
+            0,
+            "the retired pair returned its slot"
+        );
+    }
+
     #[test]
     fn attachment_labels_are_exact_and_canonical() {
         let session = Uuid::new_v4();

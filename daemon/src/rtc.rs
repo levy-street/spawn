@@ -1718,6 +1718,7 @@ impl RtcSessions {
             );
         }
         self.install_host_reaper(&pc, signal_id.clone());
+        self.install_host_acceptor_watch(&pc, signal_id.clone());
 
         let local_sdp = match negotiate(&pc, sdp).await {
             Ok(sdp) => sdp,
@@ -1804,6 +1805,44 @@ impl RtcSessions {
                             .await;
                     }
                 });
+            })
+        }));
+    }
+
+    /// Retire a host peer whose data channel acceptor has ended. The
+    /// acceptor ends when the SCTP association does, and an association can
+    /// end under a transport that stays connected: the device's SCTP went
+    /// away, or this side's write loop closed it over a send error ICE
+    /// itself recovers from. Nothing opens on such a peer again, and the
+    /// reaper, which watches the connection state, never hears of it — the
+    /// device goes on retrying channels on a connection it believes healthy.
+    /// So the peer leaves the host map here and the server hears
+    /// `unavailable`, which a device answers with a new connection. A peer
+    /// this daemon is closing left the map before its association stopped,
+    /// and for it this does nothing. A device's own close ends the
+    /// association too when word of it arrives — a DTLS close_notify, an
+    /// SCTP ABORT — so this is also what retires such a peer, ahead of the
+    /// reaper's grace; it is logged at info, and the vendored SCTP's own
+    /// warning beside it says which it was.
+    fn install_host_acceptor_watch(&self, pc: &Arc<RTCPeerConnection>, signal_id: String) {
+        let sessions = self.clone();
+        let weak = Arc::downgrade(pc);
+        pc.sctp().on_error(Box::new(move |error| {
+            let sessions = sessions.clone();
+            let signal_id = signal_id.clone();
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(pc) = weak.upgrade() else { return };
+                if sessions
+                    .retire_host_if_same(&signal_id, &pc, Some("data channel acceptor ended"))
+                    .await
+                {
+                    tracing::info!(
+                        signal_id = %signal_id,
+                        %error,
+                        "host rtc peer retired: its data channel acceptor ended while the peer was in service"
+                    );
+                }
             })
         }));
     }
@@ -1906,20 +1945,21 @@ impl RtcSessions {
     /// never sends `rtc.close` for it at all. Not `failed`: to the device
     /// that is a refusal of its offer and it drops its trust verdict;
     /// `unavailable` is a connection that is gone, which it answers by
-    /// building a new one.
+    /// building a new one. Returns whether this call was the one that took
+    /// the peer out of the map.
     async fn retire_host_if_same(
         &self,
         signal_id: &str,
         pc: &Arc<RTCPeerConnection>,
         reason: Option<&str>,
-    ) {
+    ) -> bool {
         let Some(retired) = self.take_host_if_same(signal_id, pc).await else {
             tracing::debug!(
                 signal_id,
                 reason = ?reason,
                 "host rtc peer already left the map; its teardown is owned elsewhere"
             );
-            return;
+            return false;
         };
         if let Some(reason) = reason {
             tracing::debug!(signal_id, reason, "host rtc peer reaped");
@@ -1931,6 +1971,7 @@ impl RtcSessions {
             ));
         }
         self.spawn_host_closes(vec![retired]).await;
+        true
     }
 
     /// The whole of a retired host peer's teardown, in order: its

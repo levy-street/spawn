@@ -272,9 +272,13 @@ impl RTCSctpTransport {
                 ) => {
                     match result {
                         Ok(dc) => dc,
-                        // The association has no more streams to give.
+                        // The association has no more streams to give:
+                        // it closed. That is how every peer connection
+                        // ends, so it is not logged as an error here;
+                        // `on_error` hears of it, and whoever installed a
+                        // handler knows whether the close was its own.
                         Err(err @ data::Error::ErrStreamClosed) => {
-                            log::error!("Failed to accept data channel: {err}");
+                            log::debug!("Data channel acceptor ended: {err}");
                             if let Some(handler) = &*param.on_error_handler.load() {
                                 let mut f = handler.lock().await;
                                 f(err.into()).await;
