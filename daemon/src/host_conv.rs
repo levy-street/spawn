@@ -2018,6 +2018,24 @@ mod tests {
         assert_eq!(home.inspect(), started(THREAD_B));
     }
 
+    #[test]
+    fn a_subagents_lock_before_its_first_write_reads_as_a_fresh_thread() {
+        // What the process holds cannot tell this from the person's `/new`:
+        // a lock newer than every rollout, and no rollout for it. Codex's
+        // lock files carry nothing to go on, so this pins today's answer
+        // rather than guessing: fresh, until the subagent's first write
+        // (its `session_meta` says subagent) puts the person's thread back.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        home.lock(THREAD_B, 30);
+        let inspection = home.inspect();
+        assert_eq!(inspection.conversation_id, None);
+        assert!(inspection.fresh);
+        home.subagent(THREAD_B, THREAD_A, 31);
+        assert_eq!(home.inspect(), started(THREAD_A));
+    }
+
     /// A rollout held under a lock, with `contents` written to it at `at`.
     fn rollout_with(home: &mut CodexHome, id: &str, at: u64, contents: &str) {
         let path = home
