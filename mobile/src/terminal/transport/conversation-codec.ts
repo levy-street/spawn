@@ -37,6 +37,10 @@ export interface ConversationInspection {
    *  restart starts a new one. Its id is not named. False where the host
    *  cannot tell, and from a daemon that predates the field. */
   readonly fresh: boolean;
+  /** The window's Codex keeps its threads in Codex's shared background
+   *  server, outside the window, so which one it is on cannot be named. False
+   *  otherwise, and from a daemon that predates the field. */
+  readonly shared_server: boolean;
   /** What the daemon read: `registry`, `parked`, `attach`, `open_file`,
    *  `process`, `remembered` (the Codex thread the host last saw a window
    *  in, once Codex has gone), `none`. A hint for diagnostics, never for
@@ -79,6 +83,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   const cliVersion = nullableText(record["cli_version"], SHORT_TEXT);
   const liveElsewhere = record["live_elsewhere"];
   const fresh = record["fresh"];
+  const sharedServer = record["shared_server"];
   const source = record["source"];
   const state = record["state"];
   if (agent === undefined || conversationId === undefined || cliVersion === undefined) {
@@ -86,6 +91,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   }
   if (typeof liveElsewhere !== "boolean" || typeof source !== "string") throw invalid();
   if (fresh !== undefined && typeof fresh !== "boolean") throw invalid();
+  if (sharedServer !== undefined && typeof sharedServer !== "boolean") throw invalid();
   return {
     agent,
     conversation_id: conversationId,
@@ -94,6 +100,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
     cli_version: cliVersion,
     live_elsewhere: liveElsewhere,
     fresh: fresh === true,
+    shared_server: sharedServer === true,
     source,
   };
 }

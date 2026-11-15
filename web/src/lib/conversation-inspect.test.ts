@@ -18,6 +18,7 @@ const answer: ConversationInspection = {
   cli_version: "2.1.288",
   live_elsewhere: false,
   fresh: false,
+  shared_server: false,
   source: "registry",
 };
 const report: AgentTranscriptReport = {

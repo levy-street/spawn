@@ -1,5 +1,6 @@
 import type { Agent } from "@/lib/api";
 import { canonicalConversationId } from "@/lib/conversation";
+import { type HostLaunchFacts, NO_LAUNCH_FACTS } from "@/lib/host-launch-facts";
 
 /**
  * Pure command construction for the agent switcher (§5.5). Everything the
@@ -62,6 +63,22 @@ function yoloOn(agent: AgentYolo): boolean {
 }
 
 /**
+ * Flags the host asks for, after the agent's own command. Codex gets
+ * `--no-daemon` where its host said its `codex` accepts it
+ * (`hostLaunchFacts`): the window's threads then stay in the window's own
+ * process, where the host can tell which one it is on, instead of Codex's
+ * shared background server. Only the plain `codex` the host checked gets it:
+ * a definition that runs something else under the name is left alone.
+ */
+function hostFlags(
+  agent: Pick<Agent, "command"> & Partial<Pick<Agent, "kind">>,
+  facts: HostLaunchFacts,
+): string {
+  const codex = agent.kind?.trim().toLowerCase() === "codex" && agent.command.trim() === "codex";
+  return codex && facts.codexNoDaemon ? " --no-daemon" : "";
+}
+
+/**
  * What picking an installed agent types (before the newline).
  *
  * In yolo mode the agent's `yolo_env` is merged over its own environment and
@@ -69,11 +86,14 @@ function yoloOn(agent: AgentYolo): boolean {
  * everything else the switcher types: turning permission prompts off is not
  * something that should happen where the user cannot read it.
  */
-export function agentRunCommand(agent: Pick<Agent, "command" | "env"> & AgentYolo): string {
+export function agentRunCommand(
+  agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+): string {
   const yolo = yoloOn(agent);
   const env = yolo ? { ...agent.env, ...(agent.yolo_env ?? {}) } : agent.env;
   const args = yolo ? agent.yolo_args?.trim() : "";
-  return `${envPrefix(env)}${agent.command}${args ? ` ${args}` : ""}`;
+  return `${envPrefix(env)}${agent.command}${hostFlags(agent, facts)}${args ? ` ${args}` : ""}`;
 }
 
 /**
@@ -85,10 +105,11 @@ export function agentRunCommand(agent: Pick<Agent, "command" | "env"> & AgentYol
 export function agentInstallAndRunCommand(
   agent: Pick<Agent, "command" | "env" | "install"> & Partial<Pick<Agent, "kind">> & AgentYolo,
   conversationId: string | null = null,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
 ): string | null {
   const install = agent.install?.trim();
   if (!install) return null;
-  return `${install} && ${agentLaunchCommand(agent, conversationId)}`;
+  return `${install} && ${agentLaunchCommand(agent, conversationId, facts)}`;
 }
 
 /**
@@ -164,8 +185,9 @@ export function newAgentConversationId(kind: string | null | undefined): string 
 export function agentLaunchCommand(
   agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
   conversationId: string | null,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
 ): string {
-  const run = agentRunCommand(agent);
+  const run = agentRunCommand(agent, facts);
   const launch = agentConversationGrammar(agent.kind)?.launch;
   const id = canonicalConversationId(conversationId);
   return launch && id ? `${run} ${launch(id)}` : run;
@@ -182,10 +204,11 @@ export function agentLaunchCommand(
 export function agentResumeCommand(
   agent: Pick<Agent, "command" | "env"> & Partial<Pick<Agent, "kind">> & AgentYolo,
   conversationId: string | null,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
 ): string | null {
   const grammar = agentConversationGrammar(agent.kind);
   if (!grammar) return null;
-  const run = agentRunCommand(agent);
+  const run = agentRunCommand(agent, facts);
   const id = canonicalConversationId(conversationId);
   if (id && grammar.resume) return `${run} ${grammar.resume(id)}`;
   if (grammar.withoutId) return `${run} ${grammar.withoutId}`;

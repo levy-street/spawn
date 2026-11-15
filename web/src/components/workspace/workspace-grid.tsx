@@ -41,6 +41,7 @@ import {
   type TileWidget,
   validate,
 } from "@/lib/grid";
+import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
 import { recordPaneFocus } from "@/lib/pane-focus";
 import { sessionAgent, sessionTitle } from "@/lib/sessions";
@@ -674,7 +675,11 @@ export function WorkspaceGrid({
           ...(skillIds.length > 0 && { skill_ids: skillIds }),
         });
         if (agent)
-          pendingLaunch.set(created.id, created.host_id, agentLaunchCommand(agent, conversation));
+          pendingLaunch.set(
+            created.id,
+            created.host_id,
+            agentLaunchCommand(agent, conversation, hostLaunchFacts(created.host_id)),
+          );
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});
           throw new Error("This tab is full — close a window before duplicating another.");

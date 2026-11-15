@@ -10,6 +10,7 @@ const answer: ConversationInspection = {
   cli_version: "2.1.288",
   live_elsewhere: false,
   fresh: false,
+  shared_server: false,
   source: "registry",
 };
 
@@ -23,6 +24,7 @@ describe("parseConversationInspection", () => {
       cli_version: null,
       live_elsewhere: false,
       fresh: false,
+      shared_server: false,
       source: "none",
     };
     expect(parseConversationInspection(nothing)).toEqual(nothing);
@@ -33,6 +35,19 @@ describe("parseConversationInspection", () => {
       source: "open_file",
     };
     expect(parseConversationInspection(fresh)).toEqual(fresh);
+    const shared: ConversationInspection = {
+      ...nothing,
+      agent: "codex",
+      shared_server: true,
+      source: "process",
+    };
+    expect(parseConversationInspection(shared)).toEqual(shared);
+  });
+
+  test("an answer from a daemon that predates `shared_server` is not on it", () => {
+    const { shared_server: _, ...older } = answer;
+    expect(parseConversationInspection(older)).toEqual({ ...answer, shared_server: false });
+    expect(() => parseConversationInspection({ ...answer, shared_server: "yes" })).toThrow();
   });
 
   test("an answer from a daemon that predates `fresh` is not fresh", () => {

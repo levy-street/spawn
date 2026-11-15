@@ -9,6 +9,7 @@ import {
 import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { Agent, Session } from "@/lib/api";
 import type { ConversationInspection } from "@/lib/conversation";
+import { forgetHostLaunchFacts, recordHostLaunchFacts } from "@/lib/host-launch-facts";
 import type { AgentTranscriptReport } from "@/lib/hostControl";
 
 const claude: Agent = {
@@ -154,6 +155,7 @@ function live(overrides: Partial<ConversationInspection> = {}): ConversationInsp
     cli_version: "2.1.288",
     live_elsewhere: false,
     fresh: false,
+    shared_server: false,
     source: "registry",
     ...overrides,
   };
@@ -266,6 +268,51 @@ describe("planAgentRestart with the host's answer", () => {
     );
   });
 
+  test("a Codex restart keeps the window's threads in its own process where the host says so", async () => {
+    const facts = { codexNoDaemon: true };
+    const command = (plan: ReturnType<typeof planAgentRestart>) =>
+      plan.kind === "agent" ? plan.command : null;
+    const named = live({ agent: "codex", conversation_id: liveCodex, source: "open_file" });
+    const fresh = live({ agent: "codex", conversation_id: null, fresh: true, source: "open_file" });
+    const shared = live({
+      agent: "codex",
+      conversation_id: null,
+      shared_server: true,
+      source: "process",
+    });
+    expect(command(planAgentRestart(codexSession(), [codex], named, null, facts))).toBe(
+      `codex --no-daemon resume ${liveCodex}`,
+    );
+    expect(command(planAgentRestart(codexSession(), [codex], fresh, null, facts))).toBe(
+      "codex --no-daemon",
+    );
+    expect(command(planAgentRestart(codexSession(), [codex], shared, null, facts))).toBe(
+      "codex --no-daemon resume",
+    );
+    // The restart reads what the window's host last said by default.
+    recordHostLaunchFacts(session().host_id, facts);
+    try {
+      await restartSessionAgent({
+        session: codexSession(),
+        agents: [codex],
+        restart: async () => codexSession({ status: "starting" }),
+        inspect: async () => named,
+      });
+      expect(pendingLaunch.take(session().id, session().host_id)).toBe(
+        `codex --no-daemon resume ${liveCodex}`,
+      );
+    } finally {
+      forgetHostLaunchFacts();
+    }
+    await restartSessionAgent({
+      session: codexSession(),
+      agents: [codex],
+      restart: async () => codexSession({ status: "starting" }),
+      inspect: async () => named,
+    });
+    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`codex resume ${liveCodex}`);
+  });
+
   test("no Codex restart ever types resume --last", () => {
     // With Codex's shared background server, the folder's latest thread can
     // be one another window is live in: the picker lets the person choose.
@@ -275,18 +322,22 @@ describe("planAgentRestart with the host's answer", () => {
       live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
       live({ agent: "codex", conversation_id: liveCodex, source: "remembered" }),
       live({ agent: "codex", conversation_id: null, fresh: true, source: "open_file" }),
+      live({ agent: "codex", conversation_id: null, shared_server: true, source: "process" }),
       live({ agent: "claude-code" }),
     ];
     for (const answer of answers) {
       for (const record of [null, staleCodex, "--last", "not-a-uuid"]) {
         for (const onRecord of [null, true, false]) {
-          const plan = planAgentRestart(
-            codexSession({ agent_session_id: record }),
-            [codex],
-            answer,
-            onRecord,
-          );
-          expect(plan.kind === "agent" ? plan.command : "").not.toContain("--last");
+          for (const facts of [undefined, { codexNoDaemon: true }]) {
+            const plan = planAgentRestart(
+              codexSession({ agent_session_id: record }),
+              [codex],
+              answer,
+              onRecord,
+              facts,
+            );
+            expect(plan.kind === "agent" ? plan.command : "").not.toContain("--last");
+          }
         }
       }
     }

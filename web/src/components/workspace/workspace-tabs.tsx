@@ -53,6 +53,7 @@ import {
 } from "@/lib/api";
 import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE, isFilesWidget } from "@/lib/grid";
+import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { sessionAgent } from "@/lib/sessions";
 import {
   addTab,
@@ -973,7 +974,11 @@ export function WorkspaceTabs({
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
           if (agent)
-            pendingLaunch.set(copy.id, copy.host_id, agentLaunchCommand(agent, conversation));
+            pendingLaunch.set(
+              copy.id,
+              copy.host_id,
+              agentLaunchCommand(agent, conversation, hostLaunchFacts(copy.host_id)),
+            );
         }
         const next = duplicateTab(
           layout,

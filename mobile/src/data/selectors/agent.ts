@@ -1,3 +1,4 @@
+import { type HostLaunchFacts, NO_LAUNCH_FACTS } from "@/data/stores/host-launch-facts";
 import type { AgentDef, AgentIdentity, AgentLogoKey, Session } from "@/data/types/domain";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 
@@ -130,16 +131,32 @@ function envPrefix(env: Readonly<Record<string, string>>): string {
   return assignments.length > 0 ? `${assignments.join(" ")} ` : "";
 }
 
-export function agentRunCommand(agent: AgentDef): string {
+/**
+ * Flags the host asks for, after the agent's own command. Codex gets
+ * `--no-daemon` where its host said its `codex` accepts it
+ * (`hostLaunchFacts`): the window's threads then stay in the window's own
+ * process, where the host can tell which one it is on, instead of Codex's
+ * shared background server. Only the plain `codex` the host checked gets it:
+ * a definition that runs something else under the name is left alone.
+ */
+function hostFlags(agent: AgentDef, facts: HostLaunchFacts): string {
+  const codex = agent.kind?.trim().toLowerCase() === "codex" && agent.command.trim() === "codex";
+  return codex && facts.codexNoDaemon ? " --no-daemon" : "";
+}
+
+export function agentRunCommand(agent: AgentDef, facts: HostLaunchFacts = NO_LAUNCH_FACTS): string {
   const useYolo = agent.yolo && agentYoloAvailable(agent);
   const env = useYolo ? { ...agent.env, ...agent.yolo_env } : agent.env;
   const args = useYolo ? agent.yolo_args?.trim() : "";
-  return `${envPrefix(env)}${agent.command}${args ? ` ${args}` : ""}`;
+  return `${envPrefix(env)}${agent.command}${hostFlags(agent, facts)}${args ? ` ${args}` : ""}`;
 }
 
-export function agentInstallAndRunCommand(agent: AgentDef): string | null {
+export function agentInstallAndRunCommand(
+  agent: AgentDef,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+): string | null {
   const install = agent.install?.trim();
-  return install ? `${install} && ${agentRunCommand(agent)}` : null;
+  return install ? `${install} && ${agentRunCommand(agent, facts)}` : null;
 }
 
 export interface RunningAgentGroup {
@@ -250,8 +267,12 @@ export function newAgentConversationId(
  * UUID is an id here (`canonicalConversationId`): anything else is typed as
  * no id at all, never as a word after the agent's flags.
  */
-export function agentLaunchCommand(agent: AgentDef, conversationId: string | null): string {
-  const run = agentRunCommand(agent);
+export function agentLaunchCommand(
+  agent: AgentDef,
+  conversationId: string | null,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+): string {
+  const run = agentRunCommand(agent, facts);
   const launch = agentConversationGrammar(agent.kind)?.launch;
   const id = canonicalConversationId(conversationId);
   return launch && id ? `${run} ${launch(id)}` : run;
@@ -261,9 +282,10 @@ export function agentLaunchCommand(agent: AgentDef, conversationId: string | nul
 export function agentInstallAndLaunchCommand(
   agent: AgentDef,
   conversationId: string | null,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
 ): string | null {
   const install = agent.install?.trim();
-  return install ? `${install} && ${agentLaunchCommand(agent, conversationId)}` : null;
+  return install ? `${install} && ${agentLaunchCommand(agent, conversationId, facts)}` : null;
 }
 
 /**
@@ -274,10 +296,14 @@ export function agentInstallAndLaunchCommand(
  * cannot be resumed at all, so the caller falls back to a plain relaunch and
  * says so. An id that is not a UUID names nothing (`canonicalConversationId`).
  */
-export function agentResumeCommand(agent: AgentDef, conversationId: string | null): string | null {
+export function agentResumeCommand(
+  agent: AgentDef,
+  conversationId: string | null,
+  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+): string | null {
   const grammar = agentConversationGrammar(agent.kind);
   if (!grammar) return null;
-  const run = agentRunCommand(agent);
+  const run = agentRunCommand(agent, facts);
   const id = canonicalConversationId(conversationId);
   if (id && grammar.resume) return `${run} ${grammar.resume(id)}`;
   if (grammar.withoutId) return `${run} ${grammar.withoutId}`;

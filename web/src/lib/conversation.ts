@@ -33,6 +33,10 @@ export interface ConversationInspection {
    *  restart starts a new one. Its id is not named. False where the host
    *  cannot tell, and from a daemon that predates the field. */
   fresh: boolean;
+  /** The window's Codex keeps its threads in Codex's shared background
+   *  server, outside the window, so which one it is on cannot be named. False
+   *  otherwise, and from a daemon that predates the field. */
+  shared_server: boolean;
   /** What the daemon read: `registry`, `parked`, `attach`, `open_file`,
    *  `process`, `remembered` (the Codex thread the host last saw a window
    *  in, once Codex has gone), `none`. A hint for diagnostics, never for
@@ -89,6 +93,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   if (agent === undefined || conversationId === undefined || cliVersion === undefined) return null;
   if (typeof record.live_elsewhere !== "boolean" || typeof record.source !== "string") return null;
   if (record.fresh !== undefined && typeof record.fresh !== "boolean") return null;
+  if (record.shared_server !== undefined && typeof record.shared_server !== "boolean") return null;
   const state = typeof record.state === "string" && STATES.has(record.state) ? record.state : null;
   return {
     agent,
@@ -97,6 +102,7 @@ export function parseConversationInspection(value: unknown): ConversationInspect
     cli_version: cliVersion,
     live_elsewhere: record.live_elsewhere,
     fresh: record.fresh === true,
+    shared_server: record.shared_server === true,
     source: record.source,
   };
 }

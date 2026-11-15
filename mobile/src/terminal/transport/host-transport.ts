@@ -1,4 +1,5 @@
 import { openHostSignal } from "@/data/realtime/host-signal";
+import { parseHostLaunchFacts, recordHostLaunchFacts } from "@/data/stores/host-launch-facts";
 import { loadMemoizedCarriedEndorsements } from "@/data/trust/carried-endorsements";
 import {
   DEVICE_NOT_TRUSTED_CODE,
@@ -1401,6 +1402,12 @@ class WebViewHostTransport implements StreamingHostTransport {
       try {
         this.#capabilities = parseHostHello(message.result);
         this.#consumerRefusals = 0;
+        // What the host knows about starting agents there, said only on this
+        // device's own connection to it (the pair-admitted parent channel).
+        if (!this.parent) {
+          const hello = message.result as { agents?: unknown } | null;
+          recordHostLaunchFacts(this.hostId, parseHostLaunchFacts(hello?.agents));
+        }
         if (!this.parent && !this.hasCapability("session.transport.v1")) {
           this.#fail(
             "daemon_update_required",

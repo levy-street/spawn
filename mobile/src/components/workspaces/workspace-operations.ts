@@ -23,6 +23,7 @@ import {
   runningAgent,
   sessionAgent,
 } from "@/data/selectors/agent";
+import { hostLaunchFacts } from "@/data/stores/host-launch-facts";
 import { isFilesWidget } from "@/data/types/layout";
 
 export interface WorkspaceOperationResult {
@@ -180,7 +181,7 @@ export async function instantiateWorkspaceTemplate(
       });
       if (tile.run.kind === "agent") {
         const command = templateAgent
-          ? agentLaunchCommand(templateAgent, conversation)
+          ? agentLaunchCommand(templateAgent, conversation, hostLaunchFacts(session.host_id))
           : storedCommand;
         if (command) {
           try {

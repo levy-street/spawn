@@ -170,6 +170,31 @@ describe("conversation grammar", () => {
     ).toBe("codex --dangerously-bypass-approvals-and-sandbox resume");
   });
 
+  test("Codex keeps its threads in its own window where the host says it can", () => {
+    // `--no-daemon`, typed only where the host's own `codex` accepted it.
+    const facts = { codexNoDaemon: true };
+    expect(agentLaunchCommand(codex, null, facts)).toBe("codex --no-daemon");
+    expect(agentResumeCommand(codex, id, facts)).toBe(`codex --no-daemon resume ${id}`);
+    expect(agentResumeCommand(codex, null, facts)).toBe("codex --no-daemon resume");
+    const yolo = { ...codex, yolo: true, yolo_args: "--dangerously-bypass-approvals-and-sandbox" };
+    expect(agentResumeCommand(yolo, id, facts)).toBe(
+      `codex --no-daemon --dangerously-bypass-approvals-and-sandbox resume ${id}`,
+    );
+    expect(
+      agentInstallAndRunCommand({ ...codex, install: "npm i -g @openai/codex" }, null, facts),
+    ).toBe("npm i -g @openai/codex && codex --no-daemon");
+    // A host that said nothing, or no: Codex as it always was.
+    for (const said of [undefined, { codexNoDaemon: false }]) {
+      expect(agentLaunchCommand(codex, null, said)).toBe("codex");
+      expect(agentResumeCommand(codex, id, said)).toBe(`codex resume ${id}`);
+    }
+    // Only the plain `codex` the host checked; never another agent.
+    expect(agentLaunchCommand({ ...codex, command: "npx @openai/codex" }, null, facts)).toBe(
+      "npx @openai/codex",
+    );
+    expect(agentLaunchCommand(claude, id, facts)).toBe(`claude --session-id ${id}`);
+  });
+
   test("an agent with no grammar launches plainly and cannot be resumed", () => {
     expect(newAgentConversationId("hermes")).toBeNull();
     expect(agentLaunchCommand(hermes, id)).toBe("hermes");

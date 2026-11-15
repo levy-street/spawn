@@ -5,6 +5,7 @@ import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceLayoutV3, WorkspaceOut } from "@/data/api/schemas/workspaces";
+import { hostLaunchFacts } from "@/data/stores/host-launch-facts";
 import { isFilesWidget } from "@/data/types/layout";
 
 export type LaunchAvailabilityReason = "host_offline" | "tab_full" | null;
@@ -135,7 +136,11 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
       });
       if (!request.agent) return { status: "launched", session, pendingCommand: false };
 
-      const command = agentLaunchCommand(request.agent, conversation);
+      const command = agentLaunchCommand(
+        request.agent,
+        conversation,
+        hostLaunchFacts(session.host_id),
+      );
       try {
         await dependencies.pending.persist(session.id, session.host_id, command);
         return { status: "launched", session, pendingCommand: true };

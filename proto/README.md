@@ -1389,9 +1389,11 @@ the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
 `codex resume <id>`), a `fresh` Codex thread starts plain `codex`, and a null
 one otherwise falls back rather than to an id recorded earlier: Claude Code
 continues the latest one here (`--continue`), and Codex opens its own picker
-(`codex resume`). Never `codex resume --last`: that is whichever thread the
-folder wrote last, from any window, and with Codex's shared background server
-it attaches the window to a thread another window is live in. `live_elsewhere`
+(`codex resume`); a client types Codex's commands with `--no-daemon` where the
+host's `hello` says its Codex accepts it. Never `codex resume --last`: that is
+whichever thread the folder wrote last, from any window, and with Codex's
+shared background server it attaches the window to a thread another window is
+live in. `live_elsewhere`
 does not stop a restart, since resuming a running background session attaches
 to it. The server never sees the request or the answer; a device writes a
 Claude Code id the host named back to the window's `agent_session_id`, and

@@ -8,6 +8,7 @@ async function waitFor(cond: () => boolean, deadlineMs = 500): Promise<void> {
   while (!cond() && Date.now() < deadline) await Bun.sleep(2);
 }
 
+import { forgetHostLaunchFacts, hostLaunchFacts } from "./host-launch-facts";
 import {
   CHANNEL_REQUEST_BUDGET,
   CHANNEL_ROTATE_AFTER_REQUESTS,
@@ -385,6 +386,7 @@ describe("HostControlClient", () => {
             ...Array.from({ length: families }, (_, index) => `family${index}.v1`),
             supportsSessions ? "session.transport.v1" : "ping",
           ],
+          agents: { codex: { no_daemon: true } },
         }),
       );
       if (!supportsSessions) {
@@ -395,6 +397,10 @@ describe("HostControlClient", () => {
         return;
       }
       expect(client.getState()).toBe("ready");
+      // The device's own connection carries what the host said about
+      // starting agents there.
+      expect(hostLaunchFacts(hostId)).toEqual({ codexNoDaemon: true });
+      forgetHostLaunchFacts();
       pc.connectionState = "disconnected";
       window.dispatchEvent(new Event("online"));
       await waitFor(() => ws.sent.some((frame) => JSON.parse(frame).ice_restart === true));
@@ -1085,9 +1091,12 @@ describe("HostControlClient", () => {
         type: "hello",
         protocol: HOST_CONTROL_PROTOCOL,
         capabilities: ["ping"],
+        agents: { codex: { no_daemon: true } },
       }),
     );
     expect(client.getState()).toBe("ready");
+    // Only the device's own connection to the host speaks for it.
+    expect(hostLaunchFacts(hostId)).toEqual({ codexNoDaemon: false });
     const newSocketSignals = newWs.sent.length;
 
     staleOpen?.();
@@ -2713,6 +2722,7 @@ describe("HostControlClient conversation inspection", () => {
       cli_version: "2.1.288",
       live_elsewhere: true,
       fresh: false,
+      shared_server: false,
       source: "parked",
     };
     pc.channel.receive(

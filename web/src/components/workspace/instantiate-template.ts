@@ -7,6 +7,7 @@ import {
   type WorkspaceTemplate,
   workspaces,
 } from "@/lib/api";
+import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { basename } from "@/lib/paths";
 import { activeTab, type LayoutV3, withActiveTab } from "@/lib/tabs";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
@@ -96,7 +97,9 @@ export async function instantiateTemplate(
         pendingLaunch.set(
           session.id,
           session.host_id,
-          agent ? agentLaunchCommand(agent, conversation) : tile.run.command,
+          agent
+            ? agentLaunchCommand(agent, conversation, hostLaunchFacts(session.host_id))
+            : tile.run.command,
         );
       }
       focusSessionId ??= session.id;

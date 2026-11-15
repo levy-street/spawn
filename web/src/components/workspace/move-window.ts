@@ -1,6 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { incarnationKey, openIntent } from "@/components/terminal/incarnation";
 import { type Agent, ApiError, type Host, type Session, sessions } from "@/lib/api";
+import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { displayPath } from "@/lib/places";
 import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
 import { pendingLaunch } from "./pending-launch";
@@ -109,7 +110,13 @@ export async function moveWindow({
     openIntent.clear(intent);
     throw error;
   }
-  if (agent) pendingLaunch.set(session.id, moved.host_id, agentLaunchCommand(agent, conversation));
+  if (agent) {
+    pendingLaunch.set(
+      session.id,
+      moved.host_id,
+      agentLaunchCommand(agent, conversation, hostLaunchFacts(moved.host_id)),
+    );
+  }
   queryClient.setQueryData(["session", session.id], moved);
   queryClient.setQueryData<Session[]>(["sessions"], (current) =>
     current?.map((item) => (item.id === session.id ? moved : item)),

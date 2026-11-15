@@ -25,6 +25,7 @@ import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { qk } from "@/data/queryKeys";
 import { commandBasename, identifyAgent, isShellCommand, sortAgents } from "@/data/selectors/agent";
+import { hostLaunchFacts } from "@/data/stores/host-launch-facts";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import type { HostTransport, TransportState } from "@/terminal/transport/types";
 import { sizing } from "@/theme/sizing";
@@ -130,11 +131,12 @@ export function SessionTargetSheets({
   const foreground = session.foreground_command;
   const atShell = isShellCommand(foreground) || !commandBasename(foreground);
 
+  const facts = hostLaunchFacts(session.host_id);
   const agentCommand = (agent: AgentOut, conversation: string | null): string =>
     installed.has(agent.id)
-      ? agentLaunchCommand(agent, conversation)
-      : (agentInstallAndLaunchCommand(agent, conversation) ??
-        agentLaunchCommand(agent, conversation));
+      ? agentLaunchCommand(agent, conversation, facts)
+      : (agentInstallAndLaunchCommand(agent, conversation, facts) ??
+        agentLaunchCommand(agent, conversation, facts));
 
   const actions: ActionSheetAction[] = [
     {

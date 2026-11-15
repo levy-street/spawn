@@ -4,6 +4,7 @@ jest.mock("@/terminal/transport/daemon-trust", () => ({
   verifyDaemonHost: jest.fn(async () => {}),
 }));
 
+import { forgetHostLaunchFacts, hostLaunchFacts } from "@/data/stores/host-launch-facts";
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import { createHostPinStore, type HostPin } from "@/data/trust/host-pins";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
@@ -147,6 +148,7 @@ async function readyTransport(options?: {
   omitCapabilities?: boolean;
   streamTimeoutMs?: number;
   loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
+  agents?: unknown;
 }) {
   const bridge = new FakeBridge();
   const signal = new FakeSignal();
@@ -193,6 +195,7 @@ async function readyTransport(options?: {
         preview_bytes: 2 * 1024 * 1024,
         preview_pixels: [128, 256, 512, 1024],
       },
+      ...(options?.agents === undefined ? {} : { agents: options.agents }),
     },
   });
   bridge.emit({ v: 1, type: "state", state: "ready" });
@@ -204,6 +207,19 @@ async function readyTransport(options?: {
   }
   return { bridge, signal, transport };
 }
+
+test("the device connection's hello says what the host knows about starting agents", async () => {
+  forgetHostLaunchFacts();
+  const host = "00112233-4455-6677-8899-aabbccddeeff";
+  const said = await readyTransport({ agents: { codex: { no_daemon: true } } });
+  expect(hostLaunchFacts(host)).toEqual({ codexNoDaemon: true });
+  said.transport.close();
+  // A daemon that says nothing (an older one) takes it back.
+  const older = await readyTransport();
+  expect(hostLaunchFacts(host)).toEqual({ codexNoDaemon: false });
+  older.transport.close();
+  forgetHostLaunchFacts();
+});
 
 test("reconfirmed trust preserves a ready root and retries a refused root only once", async () => {
   const pins: HostPin[] = [];
@@ -881,6 +897,7 @@ describe("HostTransport conversation inspection", () => {
       cli_version: "2.1.288",
       live_elsewhere: false,
       fresh: false,
+      shared_server: false,
       source: "registry",
     };
     respond(bridge, request, result);

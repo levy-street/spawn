@@ -4,6 +4,7 @@ import {
   canonicalConversationId,
   parseConversationInspection,
 } from "@/lib/conversation";
+import { parseHostLaunchFacts, recordHostLaunchFacts } from "@/lib/host-launch-facts";
 import { parseCapabilities } from "@/lib/preview/capabilities";
 import { hashStream, Sha256 } from "@/lib/sha256";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
@@ -2278,6 +2279,7 @@ export class HostControlClient {
       sha256?: string;
       path?: string;
       capabilities?: unknown;
+      agents?: unknown;
     };
     if (message.version !== HOST_CONTROL_VERSION) {
       this.failRtc(sessionId);
@@ -2292,6 +2294,11 @@ export class HostControlClient {
       // malformed list degrades to "offers nothing extra" rather than failing
       // the channel: the connection is fine, we just cannot read its menu.
       this.capabilities = parseCapabilities(message.capabilities);
+      // What the host knows about starting agents there, said only on this
+      // device's own connection to it (a pair-admitted channel).
+      if (this.options.deviceConnection) {
+        recordHostLaunchFacts(this.hostId, parseHostLaunchFacts(message.agents));
+      }
       if (this.options.deviceConnection && !this.capabilities.has("session.transport.v1")) {
         this.requireTransportUpdate("Update SPAWN D on this host to share its connection.");
         return;
