@@ -125,7 +125,11 @@ recording tokens or request content. Provisioning gives the fixture daemon
 records how long it took; the macOS runner hashes the unoptimized pair into
 its release store before the daemon's first log line). Once provisioning is
 ready, app boot has its own 180-second limit; failure starts no connection
-cases. Runner
+cases. A hosted emulator can still be bringing its network up when the app
+starts, so the controller retries its first bootstrap request for up to 60
+seconds (backoff from 0.5 to 4 seconds) while the request gets no HTTP answer,
+and logs each retry as a `bootstrap-retry` startup phase. Any HTTP answer ends
+the retries: a refusal such as 403 or 503 fails boot at once. Runner
 failures capture a screenshot and a bounded, redacted Android accessibility
 dump on the validated emulator. Diagnostic failures preserve the original
 failure, and temporary accessibility files are removed from that emulator.
@@ -179,7 +183,8 @@ Foreground resumes the existing app directly with `simctl launch`; URL
 activation can leave it behind an iOS confirmation dialog. Only the explicit
 process-restart case terminates the app before launching it again.
 The suite continues to require actual native lifecycle callbacks and a measured
-short background interval below three seconds. It records the actual runtime,
+short background interval below three seconds (see the end of this file for how
+an over-long cycle is repeated). It records the actual runtime,
 simulator SDK, app build metadata, screenshots and sanitized native logs. The fixture
 writes the acceptance verdict and verifies real shell input, upload hashes and
 UDP fault counters. A native build, typecheck, Expo export, Jest result, or Expo
@@ -268,8 +273,16 @@ and [Android Emulator Runner configuration](https://github.com/ReactiveCircus/an
 Apple documents the application identifier's role in the
 [default keychain access group](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps).
 
-The short-background case uses one `background-cycle` command with no added
-sleep, removing fixture acknowledgements and polling from the interval. It still
+The short-background case uses a `background-cycle` command with no added
+sleep, removing fixture acknowledgements and polling from the interval. It
 requires retained native callbacks proving a nonzero background interval below
-three seconds and the same peer afterward. Long cases keep their five-second
-delay. A slow native activation still fails the short-case gate.
+three seconds and the same peer afterward. A slow hosted simulator can take
+three seconds or more just to leave and re-enter the app; that cycle never
+tested a short background, so it is not a verdict. The app is right to retire
+its parent after such a cycle, but the shells must survive and the app must
+recover to one measured ready peer with fresh input before the case repeats
+the cycle from that peer, for at most three cycles. The first cycle measured
+below three seconds is judged: it must keep the parent it started with. The case
+fails if all three are too slow. `background_attempts` records each cycle's
+measured interval, whether it was inside the interval, and whether it kept its
+parent. Long cases keep their five-second delay and are not repeated.

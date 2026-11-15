@@ -114,6 +114,21 @@ async function until(check: () => boolean, message: string, timeout = 60_000): P
     await wait(100);
   }
 }
+/** The fixture gave no HTTP answer: it neither received nor refused the request. */
+class ControlUnanswered extends Error {
+  constructor(path: string, cause: unknown) {
+    super(`Acceptance control ${path} got no answer: ${String(cause)}`);
+    this.name = "ControlUnanswered";
+  }
+}
+// A hosted emulator can still be bringing its network up as the app starts:
+// Android has reset Wi-Fi just as the app launched, and the app's other
+// requests reached the fixture four seconds after its first bootstrap request
+// failed. That request is retried while it gets no HTTP answer, well inside the
+// suite's 180-second boot budget. A refusal (wrong token, fixture not ready)
+// is an answer, and still fails at once.
+const BOOTSTRAP_RETRY_MS = 60_000;
+
 async function control<T>(path: string, body?: unknown): Promise<T> {
   if (!build || build.token.length < 32) throw new Error("Acceptance configuration is absent.");
   const origin = new URL(await getBaseUrl());
@@ -135,6 +150,8 @@ async function control<T>(path: string, body?: unknown): Promise<T> {
       method: body === undefined ? "GET" : "POST",
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: controller.signal,
+    }).catch((error: unknown) => {
+      throw new ControlUnanswered(path, error);
     });
     if (!response.ok) throw new Error(`Acceptance control ${path}: ${response.status}`);
     return (await response.json()) as T;
@@ -535,7 +552,27 @@ export function NativeAcceptanceController(): React.JSX.Element {
     void (async () => {
       try {
         diagnostic("bootstrap");
-        current = await control<Bootstrap>("/__acceptance/bootstrap");
+        const retryUntil = Date.now() + BOOTSTRAP_RETRY_MS;
+        for (let delay = 500; ; delay = Math.min(delay * 2, 4_000)) {
+          try {
+            current = await control<Bootstrap>("/__acceptance/bootstrap");
+            break;
+          } catch (error) {
+            if (!(error instanceof ControlUnanswered) || Date.now() + delay >= retryUntil)
+              throw error;
+            // An unanswered request never reaches the fixture's trace; keep a local one.
+            console.warn(
+              JSON.stringify({
+                type: "native-acceptance-startup",
+                phase: "bootstrap-retry",
+                error: startupError(error),
+                retry_in_ms: delay,
+              }),
+            );
+            await wait(delay);
+            if (stopped) return;
+          }
+        }
         if (current.candidateCommit !== build?.candidateCommit)
           throw new Error("Fixture candidate differs from the embedded native candidate.");
         diagnostic("authentication");

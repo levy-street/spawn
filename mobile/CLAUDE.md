@@ -169,7 +169,10 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   background cycle returns to the app within one native command, keeping fixture
   HTTP/polling outside the measured interval. The short case requests immediate
   return and still requires real callbacks proving a nonzero gap below three
-  seconds with the original parent; slow OS transitions fail that gate.
+  seconds with the original parent. A cycle the OS itself made three seconds or
+  longer is an unmet precondition, not a verdict: the suite checks that shells
+  survived and the app recovered, then repeats the cycle (three cycles at most)
+  and judges the first short one. It fails if every cycle is too slow.
   The bounded lifecycle journal retains actual callbacks through suspension; missing,
   reordered or replaced observations fail
   acceptance rather than depending on diagnostic HTTP delivery.
@@ -195,7 +198,10 @@ installation. Startup and liveness failures fail evidence without restarting
 fixture processes. The fixture daemon has 180 seconds to register (the macOS
 runner hashes the unoptimized pair into its release store first); the
 lifecycle log records how long it took.
-After fixture readiness, app boot has a separate 180-second deadline. Local
+After fixture readiness, app boot has a separate 180-second deadline. Inside
+it the controller retries its first bootstrap request for up to 60 seconds
+while the request gets no HTTP answer (a hosted emulator's network can come up
+after the app starts); a refusal is an answer and fails boot at once. Local
 startup diagnostics and validated-device failure captures remain available
 when the acceptance control channel cannot report an error.
 

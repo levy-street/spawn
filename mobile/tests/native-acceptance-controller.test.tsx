@@ -230,28 +230,136 @@ test("boot waits for authentication reset and endorses the server device row", a
   }
 });
 
+function fixturePath(input: RequestInfo | URL): string {
+  return new URL(String(input)).pathname;
+}
+
 test("bootstrap request failure stays locally visible when failure reporting also fails", async () => {
+  jest.useFakeTimers();
   const secret = "t".repeat(32);
   const log = jest.spyOn(console, "error").mockImplementation(() => {});
-  const fetch = jest
-    .spyOn(globalThis, "fetch")
-    .mockRejectedValue(new Error(`Network request failed ${secret} Bearer private-token`));
+  const retries = jest.spyOn(console, "warn").mockImplementation(() => {});
+  const attempts: number[] = [];
+  const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    if (fixturePath(input) === "/__acceptance/bootstrap") attempts.push(Date.now());
+    throw new Error(`Network request failed ${secret} Bearer private-token`);
+  });
   const view = await renderWithProviders(<NativeAcceptanceController />);
   try {
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    // The network never returns: retries stop inside their bounded window,
+    // then the failure is reported once and logged locally.
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(120_000);
+    });
+    expect(attempts.length).toBeGreaterThan(1);
+    expect((attempts.at(-1) ?? 0) - (attempts[0] ?? 0)).toBeLessThan(60_000);
+    expect(retries).toHaveBeenCalledTimes(attempts.length - 1);
+    const paths = fetch.mock.calls.map(([input]) => fixturePath(input));
+    expect(paths.filter((path) => path === "/__acceptance/bootstrap")).toHaveLength(
+      attempts.length,
+    );
+    expect(paths.at(-1)).toBe("/__acceptance/event");
     expect(log).toHaveBeenCalledWith(expect.stringContaining('"phase":"bootstrap"'));
-    const diagnostic = log.mock.calls.map((call) => call.join(" ")).join("\n");
+    const diagnostic = [...log.mock.calls, ...retries.mock.calls]
+      .map((call) => call.join(" "))
+      .join("\n");
     expect(diagnostic).toContain("Network request failed");
     expect(diagnostic).toContain('"candidate_commit":"candidate"');
     expect(diagnostic).not.toContain(secret);
     expect(diagnostic).not.toContain("private-token");
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(120_000);
+    });
+    expect(fetch).toHaveBeenCalledTimes(paths.length);
   } finally {
     await view.unmount();
     view.queryClient.clear();
     fetch.mockRestore();
     log.mockRestore();
+    retries.mockRestore();
   }
 });
+
+test("an unanswered first bootstrap is retried until the fixture answers", async () => {
+  jest.useFakeTimers();
+  const retries = jest.spyOn(console, "warn").mockImplementation(() => {});
+  const events: Array<{ type: string; status?: string }> = [];
+  let unanswered = 3;
+  const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = fixturePath(input);
+    let body: unknown = null;
+    if (path === "/__acceptance/bootstrap") {
+      // A hosted emulator's network coming up after the app has started.
+      if (unanswered-- > 0) throw new TypeError("Network request failed");
+      body = { accountId: ACCOUNT_ID, bearerToken: "fixture-token", candidateCommit: "candidate" };
+    } else if (path === "/__acceptance/device") {
+      body = { approved: true };
+    } else if (path === "/__acceptance/event") {
+      events.push(JSON.parse(String(init?.body)));
+    } else if (path !== "/__acceptance/command") {
+      throw new Error(`Unexpected fixture path: ${path}`);
+    }
+    return new Response(JSON.stringify(body), { status: 200 });
+  });
+  const view = await renderWithProviders(<NativeAcceptanceController />);
+  try {
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(10_000);
+    });
+    await waitFor(() =>
+      expect(events.find((entry) => entry.type === "boot")?.status).toBe("passed"),
+    );
+    const bootstraps = fetch.mock.calls.filter(
+      ([input]) => fixturePath(input) === "/__acceptance/bootstrap",
+    );
+    expect(bootstraps).toHaveLength(4);
+    expect(retries).toHaveBeenCalledTimes(3);
+    expect(events.filter((entry) => entry.type === "boot")).toHaveLength(1);
+  } finally {
+    await view.unmount();
+    view.queryClient.clear();
+    fetch.mockRestore();
+    retries.mockRestore();
+  }
+});
+
+test.each([403, 503])(
+  "a refused first bootstrap (%s) fails at once without a retry",
+  async (status) => {
+    const log = jest.spyOn(console, "error").mockImplementation(() => {});
+    const retries = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const events: Array<{
+      type: string;
+      status?: string;
+      details: { values: { error?: string } };
+    }> = [];
+    const fetch = jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = fixturePath(input);
+      if (path === "/__acceptance/bootstrap")
+        return new Response(JSON.stringify({ detail: "refused" }), { status });
+      if (path === "/__acceptance/event") events.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify(null), { status: 200 });
+    });
+    const view = await renderWithProviders(<NativeAcceptanceController />);
+    try {
+      await waitFor(() => expect(events.some((entry) => entry.type === "boot")).toBe(true));
+      const boot = events.find((entry) => entry.type === "boot");
+      expect(boot?.status).toBe("failed");
+      expect(boot?.details.values.error).toContain(`/__acceptance/bootstrap: ${status}`);
+      const bootstraps = fetch.mock.calls.filter(
+        ([input]) => fixturePath(input) === "/__acceptance/bootstrap",
+      );
+      expect(bootstraps).toHaveLength(1);
+      expect(retries).not.toHaveBeenCalled();
+    } finally {
+      await view.unmount();
+      view.queryClient.clear();
+      fetch.mockRestore();
+      log.mockRestore();
+      retries.mockRestore();
+    }
+  },
+);
 
 test("an authentication failure redacts both fixture accounts and JWTs before local reporting", async () => {
   const firstToken = "first-fixture-account-secret";

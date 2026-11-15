@@ -13,11 +13,64 @@ from datetime import UTC, datetime
 from typing import Any
 
 NATIVE_BOOT_TIMEOUT_SECONDS = 180
+# The app retires its parent connection once it has spent three seconds in the
+# background (mobile/src/terminal/TerminalSurface.tsx, HostTransportSurface.tsx).
+BACKGROUND_GRACE_MS = 3000
+# A slow hosted simulator can take longer than the grace interval just to leave
+# and re-enter the app. Such a cycle never tests a short background, so the
+# short case repeats it a bounded number of times before failing.
+SHORT_BACKGROUND_ATTEMPTS = 3
 
 
 def require(condition: Any, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+async def short_background(cycle: Any) -> dict[str, Any]:
+    """Judge the first background cycle that is actually short.
+
+    `cycle()` backgrounds and foregrounds the app once and returns only after
+    the app has recovered to one ready, measured parent with fresh input and
+    the same session shells. A cycle measured at or beyond the grace interval
+    is an unmet precondition, not a verdict: the app may rightly have retired
+    its parent then, and the next cycle measures from the recovered parent.
+    The first cycle inside the interval must keep the parent it started with.
+    """
+    attempts: list[dict[str, Any]] = []
+
+    def measured() -> str:
+        return ", ".join(f"{item['measured_background_ms']:.0f}" for item in attempts)
+
+    for number in range(1, SHORT_BACKGROUND_ATTEMPTS + 1):
+        try:
+            result = await cycle()
+        except AssertionError as error:
+            if not attempts:
+                raise
+            raise AssertionError(
+                f"{error} (attempt {number} of {SHORT_BACKGROUND_ATTEMPTS}; "
+                f"earlier cycles measured {measured()} ms)"
+            ) from error
+        within_grace = result["measured_background_ms"] < BACKGROUND_GRACE_MS
+        attempts.append(
+            {
+                "measured_background_ms": result["measured_background_ms"],
+                "within_grace": within_grace,
+                "kept_parent": result["same_parent"],
+            }
+        )
+        if within_grace:
+            require(
+                result["same_parent"],
+                "short background unexpectedly retired the parent "
+                f"(attempt {number} of {SHORT_BACKGROUND_ATTEMPTS}; measured {measured()} ms)",
+            )
+            return {**result, "background_attempts": attempts}
+    raise AssertionError(
+        "short-background test exceeded the grace interval on all "
+        f"{SHORT_BACKGROUND_ATTEMPTS} attempts (measured {measured()} ms)"
+    )
 
 
 def lifecycle_interval(before: dict, after: dict) -> tuple[float, float] | None:
@@ -379,7 +432,7 @@ async def exercise(fixture: Any) -> None:
         await case("shared_transport", shared)
         initial_pids = process_ids()
 
-        async def background(milliseconds: int) -> dict[str, Any]:
+        async def background_cycle(milliseconds: int) -> dict[str, Any]:
             before = await snapshot()
             started = time.monotonic()
             await fixture.command(
@@ -400,41 +453,43 @@ async def exercise(fixture: Any) -> None:
             measured_ms = active_ms - inactive_ms
             after = await wait_ready(min_sample_ms=active_ms)
             require(measured_ms > 0, "native background interval was not measured")
-            same_parent = (
-                before["peer"]["workerId"] == after["peer"]["workerId"]
-                and before["peer"]["createdPeerCount"]
-                == after["peer"]["createdPeerCount"]
-            )
+            # No background of any length may replace a session shell.
             require(
                 process_ids() == initial_pids, "backgrounding replaced a live shell"
             )
-            if milliseconds < 3000:
-                require(
-                    measured_ms < 3000,
-                    "short-background test exceeded the grace interval",
-                )
-                require(
-                    same_parent,
-                    "short background unexpectedly retired the parent",
-                )
-            else:
-                require(
-                    measured_ms >= 3000,
-                    "long-background test did not cross the retirement interval",
-                )
-                require(not same_parent, "long background did not retire the parent")
             return {
                 "background_ms": milliseconds,
                 "measured_background_ms": measured_ms,
+                "same_parent": (
+                    before["peer"]["workerId"] == after["peer"]["workerId"]
+                    and before["peer"]["createdPeerCount"]
+                    == after["peer"]["createdPeerCount"]
+                ),
                 "recovery_ms": (time.monotonic() - started) * 1000,
                 "shell_pids": initial_pids,
                 "live_peers": after["peer"]["livePeerCount"],
             }
 
+        async def background(milliseconds: int) -> dict[str, Any]:
+            result = await background_cycle(milliseconds)
+            same_parent = result.pop("same_parent")
+            require(
+                result["measured_background_ms"] >= BACKGROUND_GRACE_MS,
+                "long-background test did not cross the retirement interval",
+            )
+            require(not same_parent, "long background did not retire the parent")
+            return result
+
         # OS activation itself takes time. Immediately request foreground for
         # the short case; accept it only if real callbacks prove a nonzero gap
-        # below three seconds and the original parent survives unchanged.
-        await case("background_short", lambda: background(0))
+        # below three seconds and the original parent survives unchanged. A
+        # cycle the OS itself made too long is repeated (short_background).
+        async def short() -> dict[str, Any]:
+            result = await short_background(lambda: background_cycle(0))
+            del result["same_parent"]  # Kept per attempt as kept_parent.
+            return result
+
+        await case("background_short", short)
         await case("background_retire", lambda: background(5000))
 
         async def restart() -> dict[str, Any]:
