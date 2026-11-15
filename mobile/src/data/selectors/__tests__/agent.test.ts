@@ -194,17 +194,17 @@ describe("conversation grammar", () => {
     );
   });
 
-  test("Codex names its own sessions: resumed by an id the host named, else the latest one", () => {
+  test("Codex names its own sessions: resumed by an id the host named, else its own picker", () => {
     expect(newAgentConversationId("codex", () => id)).toBeNull();
     expect(agentLaunchCommand(codex, id)).toBe("codex");
     expect(agentResumeCommand(codex, id)).toBe(`codex resume ${id}`);
-    expect(agentResumeCommand(codex, null)).toBe("codex resume --last");
+    expect(agentResumeCommand(codex, null)).toBe("codex resume");
     expect(
       agentResumeCommand(
         { ...codex, yolo: true, yolo_args: "--dangerously-bypass-approvals-and-sandbox" },
         null,
       ),
-    ).toBe("codex --dangerously-bypass-approvals-and-sandbox resume --last");
+    ).toBe("codex --dangerously-bypass-approvals-and-sandbox resume");
   });
 
   test("an agent with no grammar launches plainly and cannot be resumed", () => {
@@ -233,7 +233,7 @@ describe("conversation grammar", () => {
     ]) {
       expect(agentLaunchCommand(yolo, bad)).toBe("claude");
       expect(agentResumeCommand(yolo, bad)).toBe("claude --continue");
-      expect(agentResumeCommand(codex, bad)).toBe("codex resume --last");
+      expect(agentResumeCommand(codex, bad)).toBe("codex resume");
       expect(agentInstallAndLaunchCommand({ ...claude, install: "npm i -g x" }, bad)).toBe(
         "npm i -g x && claude",
       );

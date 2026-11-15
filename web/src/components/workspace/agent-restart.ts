@@ -42,8 +42,11 @@ import { pendingLaunch } from "./pending-launch";
  * finds no record of the id, the agent starts afresh under that same id
  * instead (`--session-id`); where it cannot say, the restart resumes. A
  * Codex the host sees in a thread with nothing written yet (`fresh`: just
- * launched, or just after `/new`) is started afresh too, rather than sent to
- * "the latest one here", which would be another thread.
+ * launched, or just after `/new`) is started afresh too. A Codex whose thread
+ * no one can name opens Codex's own picker (`codex resume`), never "the latest
+ * one here" (`resume --last`): that is whichever thread in the folder was
+ * written last, from any window, and with Codex's shared background server it
+ * would attach this window to a thread another window is live in.
  *
  * What goes on the command line: only a UUID (`canonicalConversationId`).
  * The recorded id is the server's to hand back, and the server is not
@@ -59,8 +62,9 @@ export type AgentRestartPlan =
 export type AgentRestartResult = { plan: AgentRestartPlan };
 
 /**
- * The conversation a restart brings the agent back into, or null for "the
- * latest one here".
+ * The conversation a restart brings the agent back into, or null for none to
+ * name (Claude Code then continues the latest one here; Codex shows its
+ * picker).
  *
  * An answer from the host about this window's agent decides it: the id the
  * host names, or none when it deliberately names none (a Codex whose threads
@@ -74,7 +78,7 @@ export type AgentRestartResult = { plan: AgentRestartPlan };
  * host, a timeout, an answer about another program — the recorded id stands,
  * but only for a CLI that SPAWN D launches under an id it chose (Claude
  * Code). A CLI that names its own conversations (Codex) has no recorded id
- * worth trusting and reopens the latest one here, as it always has.
+ * worth trusting, and opens its own picker.
  *
  * A conversation that something outside the window also holds is resumed all
  * the same: on the same host `claude --resume <id>` of a running background

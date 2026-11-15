@@ -189,28 +189,31 @@ export interface AgentConversationGrammar {
   launch: ((conversationId: string) => string) | null;
   /** Flags that reopen a known conversation. Null when the CLI cannot. */
   resume: ((conversationId: string) => string) | null;
-  /** Flags that reopen the most recent conversation in this folder, for a
-   *  window whose conversation cannot be named. Null when it cannot. */
-  continueLatest: string | null;
+  /** Flags for a window whose conversation cannot be named: Claude Code
+   *  continues the folder's latest; Codex opens its own picker. Null when the
+   *  CLI has neither. */
+  withoutId: string | null;
 }
 
 const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> = {
   "claude-code": {
     launch: (id) => `--session-id ${id}`,
     resume: (id) => `--resume ${id}`,
-    continueLatest: "--continue",
+    withoutId: "--continue",
   },
   // Codex names its own sessions, so it cannot be launched under an id, and a
   // restart never trusts a recorded one; it takes `resume` as a subcommand
   // after the global flags. A conversation the host names for the window
-  // (`conv.inspect`) is resumed by that id, one the host says has nothing in
-  // it yet is started afresh, and "the latest one here" stands in only where
-  // the host can say nothing: with several Codex windows in a folder it is
-  // whichever wrote last.
+  // (`conv.inspect`) is resumed by that id, and one the host says has nothing
+  // in it yet is started afresh. Where the host can name none, Codex shows its
+  // own picker (`resume` alone) and the person chooses. Never `resume --last`:
+  // that is whichever thread in the folder was written last, from any window,
+  // and with Codex's shared background server it attaches this window to a
+  // thread another window is live in.
   codex: {
     launch: null,
     resume: (id) => `resume ${id}`,
-    continueLatest: "resume --last",
+    withoutId: "resume",
   },
 };
 
@@ -225,7 +228,7 @@ export function agentConversationGrammar(
 /** Whether a window of this kind can be brought back to its conversation at all. */
 export function agentCanResume(kind: string | null | undefined): boolean {
   const grammar = agentConversationGrammar(kind);
-  return Boolean(grammar && (grammar.resume || grammar.continueLatest));
+  return Boolean(grammar && (grammar.resume || grammar.withoutId));
 }
 
 /**
@@ -265,8 +268,9 @@ export function agentInstallAndLaunchCommand(
 
 /**
  * What a restart types to bring the agent back where it was: resume the
- * conversation it names (`restartConversation` decides which), or the latest
- * one in this folder when there is none to name. Null when this kind of agent
+ * conversation it names (`restartConversation` decides which), or, when there
+ * is none to name, what the CLI does without one (`withoutId`: Claude Code's
+ * latest here, Codex's picker). Null when this kind of agent
  * cannot be resumed at all, so the caller falls back to a plain relaunch and
  * says so. An id that is not a UUID names nothing (`canonicalConversationId`).
  */
@@ -276,7 +280,7 @@ export function agentResumeCommand(agent: AgentDef, conversationId: string | nul
   const run = agentRunCommand(agent);
   const id = canonicalConversationId(conversationId);
   if (id && grammar.resume) return `${run} ${grammar.resume(id)}`;
-  if (grammar.continueLatest) return `${run} ${grammar.continueLatest}`;
+  if (grammar.withoutId) return `${run} ${grammar.withoutId}`;
   return null;
 }
 

@@ -1382,16 +1382,20 @@ thread before it, or a fresh thread, which restarts as plain `codex` (a
 `/new` whose first message was missed). A window the server stops for good
 (`session.kill`: deleted, archived, or moved to another host) is forgotten
 there, archiving included: a Codex window restored from an archived workspace
-restarts with `codex resume --last`, as before the note existed.
+restarts into Codex's own picker.
 
 A restart asks first where `conv.v1` is advertised. When the answer is about
 the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
 `codex resume <id>`), a `fresh` Codex thread starts plain `codex`, and a null
-one otherwise resumes "the latest one here" (`--continue`, `resume --last`)
-rather than an id recorded earlier; `live_elsewhere` does not stop a restart,
-since resuming a running background session attaches to it. The server never
-sees the request or the answer; a device writes a Claude Code id the host
-named back to the window's `agent_session_id`, and nothing else.
+one otherwise falls back rather than to an id recorded earlier: Claude Code
+continues the latest one here (`--continue`), and Codex opens its own picker
+(`codex resume`). Never `codex resume --last`: that is whichever thread the
+folder wrote last, from any window, and with Codex's shared background server
+it attaches the window to a thread another window is live in. `live_elsewhere`
+does not stop a restart, since resuming a running background session attaches
+to it. The server never sees the request or the answer; a device writes a
+Claude Code id the host named back to the window's `agent_session_id`, and
+nothing else.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit

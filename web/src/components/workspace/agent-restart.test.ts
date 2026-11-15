@@ -220,10 +220,10 @@ describe("restartConversation", () => {
 });
 
 describe("planAgentRestart with the host's answer", () => {
-  test("Codex reopens the latest conversation here unless the host names one", () => {
+  test("Codex shows its own picker unless the host names a conversation", () => {
     const command = (plan: ReturnType<typeof planAgentRestart>) =>
       plan.kind === "agent" ? plan.command : null;
-    expect(command(planAgentRestart(codexSession(), [codex]))).toBe("codex resume --last");
+    expect(command(planAgentRestart(codexSession(), [codex]))).toBe("codex resume");
     expect(
       command(
         planAgentRestart(
@@ -232,7 +232,7 @@ describe("planAgentRestart with the host's answer", () => {
           live({ agent: "codex", conversation_id: null, source: "process" }),
         ),
       ),
-    ).toBe("codex resume --last");
+    ).toBe("codex resume");
     expect(
       command(
         planAgentRestart(
@@ -244,7 +244,7 @@ describe("planAgentRestart with the host's answer", () => {
     ).toBe(`codex resume ${liveCodex}`);
   });
 
-  test("a Codex thread with nothing written yet starts afresh, never the latest one here", () => {
+  test("a Codex thread with nothing written yet starts afresh, never the picker", () => {
     const plan = planAgentRestart(
       codexSession(),
       [codex],
@@ -257,13 +257,39 @@ describe("planAgentRestart with the host's answer", () => {
       [codex],
       live({ agent: "claude-code", conversation_id: null, fresh: true }),
     );
-    expect(other.kind === "agent" ? other.command : null).toBe("codex resume --last");
+    expect(other.kind === "agent" ? other.command : null).toBe("codex resume");
     // Were a host to call a Claude Code conversation fresh, it would start
     // under the id it names.
     const claudeFresh = planAgentRestart(session(), [claude], live({ fresh: true }));
     expect(claudeFresh.kind === "agent" ? claudeFresh.command : null).toBe(
       `claude --session-id ${moved}`,
     );
+  });
+
+  test("no Codex restart ever types resume --last", () => {
+    // With Codex's shared background server, the folder's latest thread can
+    // be one another window is live in: the picker lets the person choose.
+    const answers = [
+      null,
+      live({ agent: "codex", conversation_id: null, source: "process" }),
+      live({ agent: "codex", conversation_id: liveCodex, source: "open_file" }),
+      live({ agent: "codex", conversation_id: liveCodex, source: "remembered" }),
+      live({ agent: "codex", conversation_id: null, fresh: true, source: "open_file" }),
+      live({ agent: "claude-code" }),
+    ];
+    for (const answer of answers) {
+      for (const record of [null, staleCodex, "--last", "not-a-uuid"]) {
+        for (const onRecord of [null, true, false]) {
+          const plan = planAgentRestart(
+            codexSession({ agent_session_id: record }),
+            [codex],
+            answer,
+            onRecord,
+          );
+          expect(plan.kind === "agent" ? plan.command : "").not.toContain("--last");
+        }
+      }
+    }
   });
 
   test("Claude Code continues the latest conversation when the host names none", () => {
@@ -400,7 +426,7 @@ describe("restartSessionAgent with the host's answer", () => {
         inspect,
         recordConversation,
       });
-      expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex resume --last");
+      expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex resume");
     }
     expect(recordConversation).not.toHaveBeenCalled();
   });
@@ -696,7 +722,7 @@ describe("a recorded id that is not a UUID", () => {
         resumes: false,
       });
       const codexPlan = planAgentRestart(codexSession({ agent_session_id: bad }), [codex]);
-      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume --last");
+      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume");
     }
   });
 
@@ -767,7 +793,7 @@ describe("a recorded id that is not a UUID", () => {
     expect(recordConversation).toHaveBeenCalledTimes(1);
   });
 
-  test("a Codex window falls back to the latest conversation and writes nothing", async () => {
+  test("a Codex window falls back to Codex's picker and writes nothing", async () => {
     const recordConversation = mock(async (_id: string) => undefined);
     for (const bad of REFUSED) {
       await restartSessionAgent({
@@ -777,7 +803,7 @@ describe("a recorded id that is not a UUID", () => {
         inspect: async () => null,
         recordConversation,
       });
-      expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex resume --last");
+      expect(pendingLaunch.take(session().id, session().host_id)).toBe("codex resume");
     }
     expect(recordConversation).not.toHaveBeenCalled();
   });
@@ -794,7 +820,7 @@ describe("a recorded id that is not a UUID", () => {
         [codex],
         live({ agent: "codex", conversation_id: bad, source: "open_file" }),
       );
-      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume --last");
+      expect(codexPlan.kind === "agent" ? codexPlan.command : null).toBe("codex resume");
     }
   });
 
