@@ -29,6 +29,8 @@ src/
                   (grimoire/ is the frame and templates of the SEO pages;
                   hosts/ holds the sidebar's Hosts strip, the Hosts page's
                   cards and the shared host connection provider)
+  fonts/          the two brand faces (latin woff2 + OFL), loaded by
+                  lib/fonts.ts through next/font/local; the build fetches no font
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files
