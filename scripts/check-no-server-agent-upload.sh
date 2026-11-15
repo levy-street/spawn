@@ -279,11 +279,25 @@ if re.search(
     conv_runtime,
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector may not execute anything")
-# Every way the inspector changes a file, counted: the notes folder (one
-# DirBuilder, made 0700), one new file opened for writing, one rename over
-# the last note, and two removals (a failed note's temporary file, and the
-# note of a window that is forgotten). Anything else that writes, copies,
-# links, truncates, removes or re-permissions is refused outright.
+# The inspector's runtime is everything before its test module, and that
+# module must be the file's last item: anything placed after it is refused
+# rather than left unread.
+conv_test_marker = "#[cfg(all(test, unix))]\nmod tests {"
+if conv.count(conv_test_marker) != 1 or [
+    line
+    for line in conv.split(conv_test_marker, 1)[1].splitlines()
+    if line and not line[0].isspace()
+] != ["}"]:
+    raise SystemExit("no-server-agent-upload: conversation inspector code sits after its test module")
+# Every way the inspector's runtime changes a file, counted: the notes folder
+# (one DirBuilder, made 0700), one new file opened for writing, one rename
+# over the last note, and two removals (a failed note's temporary file, and
+# the note of a window that is forgotten). Enforced besides, as patterns:
+# no std write, copy, link, truncate, create_dir, removal or re-permission
+# beyond those counts; no `nix` module but `nix::libc`, no `extern` block,
+# and no libc name outside the read-only list below (nor a glob, group or
+# alias import of libc that would hide one); and every `custom_flags` is
+# O_NOFOLLOW, optionally with O_NONBLOCK.
 conv_mutations = {
     r"\.write\(true\)": 1,
     r"\.create_new\(true\)": 1,
@@ -292,16 +306,34 @@ conv_mutations = {
     r"\brename\s*\(": 1,
     r"\bremove_file\b": 2,
 }
-if any(
-    len(re.findall(pattern, conv_runtime)) != expected
-    for pattern, expected in conv_mutations.items()
-) or re.search(
-    r"\bfs::write\b|\bFile::create\b|\bFile::options\b|\.append\(|\.truncate\(|"
-    r"\.create\(true\)|\bcopy\s*\(|\bremove_dir|\bhard_link\b|\bsymlink\s*\(|"
-    r"\bset_len\b|\bset_modified\b|\bset_times\b|\b(?:f|l)?chown\b|\bfchmod\b|"
-    r"\bunlink(?:at)?\b|libc::(?:open|openat|creat|write|pwrite|rename|renameat|mkdir|chmod|"
-    r"truncate|ftruncate|link|symlink)\s*\(",
-    conv_runtime,
+conv_libc_reads = {
+    "O_NOFOLLOW", "O_NONBLOCK", "PROC_PIDLISTFDS", "PROC_PIDTBSDINFO",
+    "PROX_FDTYPE_VNODE", "c_int", "c_void", "off_t", "pid_t", "proc_bsdinfo",
+    "proc_fdinfo", "proc_listchildpids", "proc_pidfdinfo", "proc_pidinfo",
+    "proc_pidpath", "vnode_info_path",
+}
+conv_flags = re.findall(r"custom_flags\(([^)]*)\)", conv_runtime)
+if (
+    any(
+        len(re.findall(pattern, conv_runtime)) != expected
+        for pattern, expected in conv_mutations.items()
+    )
+    or re.search(
+        r"\bfs::write\b|\bFile::create\b|\bFile::options\b|\.append\(|\.truncate\(|"
+        r"\.create\(true\)|\bcreate_dir(?:_all)?\b|\bcopy\s*\(|\bremove_dir|\bhard_link\b|"
+        r"\bsymlink\s*\(|\bset_len\b|\bset_modified\b|\bset_times\b|\b(?:f|l)?chown\b|"
+        r"\bfchmod\b|\bunlink(?:at)?\b|\bnix::(?!libc\b)\w+|\bextern\s+\"|"
+        r"\blibc\s*::\s*[{*]|\blibc\s+as\b",
+        conv_runtime,
+    )
+    or set(re.findall(r"\blibc::(\w+)", conv_runtime)) - conv_libc_reads
+    or not conv_flags
+    or any(
+        not re.fullmatch(
+            r"\s*nix::libc::O_NOFOLLOW(?:\s*\|\s*nix::libc::O_NONBLOCK)?\s*", flags
+        )
+        for flags in conv_flags
+    )
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector writes more than its window notes")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
@@ -890,7 +922,16 @@ self_test() {
     'fn sneaky(path: &Path) { let _ = std::fs::remove_dir_all(path); }' \
     'fn sneaky(path: &Path) { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)); }' \
     'fn sneaky(path: &Path) { let _ = std::fs::write(path, b"x"); }' \
-    'fn sneaky(path: &Path) { let _ = std::os::unix::fs::symlink(path, "/tmp/x"); }'; do
+    'fn sneaky(path: &Path) { let _ = std::os::unix::fs::symlink(path, "/tmp/x"); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::create_dir_all(path); }' \
+    'fn sneaky(path: &Path) { let _ = nix::unistd::truncate(path, 0); }' \
+    'fn sneaky(path: &Path) { let _ = nix::unistd::mkdir(path, nix::sys::stat::Mode::S_IRWXU); }' \
+    'fn sneaky(path: &Path) { let _ = nix::fcntl::renameat(None, path, None, "/tmp/x"); }' \
+    'fn sneaky(path: &Path) { let _ = nix::sys::stat::fchmodat(None, path, nix::sys::stat::Mode::S_IRWXU, nix::sys::stat::FchmodatFlags::FollowSymlink); }' \
+    'fn sneaky(path: &Path) { use std::os::unix::fs::OpenOptionsExt; let _ = std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_TRUNC).open(path); }' \
+    'fn sneaky(path: &Path) { use std::os::unix::fs::OpenOptionsExt; let _ = std::fs::OpenOptions::new().read(true).custom_flags(0o1000).open(path); }' \
+    'use nix::libc::*;' \
+    'extern "C" { fn unlink(path: *const u8) -> i32; }'; do
     printf '%s\n%s\n%s' "$conv_runtime_part" "$conv_case" "$conv_tests_part" \
       >"$fixture/daemon/src/host_conv.rs"
     if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
@@ -898,6 +939,12 @@ self_test() {
       return 1
     fi
   done
+  printf '%s\n%s\n' "$conv_original" 'fn after_tests(path: &Path) { let _ = std::fs::write(path, b"x"); }' \
+    >"$fixture/daemon/src/host_conv.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' "no-server-agent-upload self-test: inspector code after its test module passed" >&2
+    return 1
+  fi
   printf '%s\n' "$conv_original" >"$fixture/daemon/src/host_conv.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
