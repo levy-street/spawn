@@ -1288,30 +1288,36 @@ search itself is bounded (at most 24 answers, 512 directories, 2000 files).
 The server never sees the request or a byte of a transcript.
 
 `conv.inspect` (family `conv.v1`, pair channels of Linux and macOS daemons
-only) accepts `{session_id}` — the id of a window this daemon runs, as a
-canonical lower-case UUID — and answers which agent conversation that window
-is actually in:
+only) accepts `{session_id}` — a window's id, as a canonical lower-case UUID —
+and answers which agent conversation that window is actually in:
 
 ```json
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"conv.inspect","payload":{"session_id":"33333333-3333-4333-8333-333333333333"}}
-{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"agent":"claude-code","conversation_id":"064c9faa-9990-4b0c-9d35-f06ae2dd0d05","state":"idle","cli_version":"2.1.288","live_elsewhere":false,"source":"registry"}}
+{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"agent":"claude-code","conversation_id":"064c9faa-9990-4b0c-9d35-f06ae2dd0d05","state":"idle","cli_version":"2.1.288","live_elsewhere":false,"fresh":false,"source":"registry"}}
 ```
 
 `agent` is the agent kind as agent definitions spell it (`claude-code`,
 `codex`), or null for a window running no agent. `conversation_id` is the
 conversation's id, or null when the host cannot name one with certainty: a
 window parked in Claude's agent view whose background job has gone, a
-`claude attach` client, a Codex holding several rollouts open. `state` is
-`running`, `blocked` (a permission prompt or question), `idle` or `unknown`,
-and a client reads a value it does not know as `unknown`. `cli_version` is the
-agent's own version, or null. `live_elsewhere` is true when a process the
-window's stop would not stop holds the conversation — a Claude background
-session (including the one a window in agent view shows), an attach target,
-another window. `source` says what the answer rests on (`registry`, `parked`,
-`attach`, `open_file`, `process`, `none`); it is a hint for diagnostics, and
-clients never gate on it. A `session_id` that is not a canonical UUID answers
-`invalid_request`; a window this daemon is not running, or whose worker never
-reported its shell, answers `session_not_found`.
+`claude attach` client, a Codex whose threads it cannot tell apart, or a
+conversation with nothing written to it yet. `state` is `running`, `blocked`
+(a permission prompt or question), `idle` or `unknown`, and a client reads a
+value it does not know as `unknown`. `cli_version` is the agent's own
+version, or null. `live_elsewhere` is true when a process the window's stop
+would not stop holds the conversation — a Claude background session
+(including the one a window in agent view shows), an attach target, another
+window. `fresh` is true when the window's agent is in a conversation with
+nothing written to it yet (a Codex just launched, or just after `/new`):
+there is nothing to resume, and its id is not named, so a client that does
+not know the field never types a resume of it; it is false wherever the host
+cannot tell, and a daemon that predates it omits it, which reads as false.
+`source` says what the answer rests on (`registry`, `parked`, `attach`,
+`open_file`, `process`, `remembered`, `none`); it is a hint for diagnostics,
+and clients never gate on it. A `session_id` that is not a canonical UUID
+answers `invalid_request`; a window this daemon is not running, or whose
+worker never reported its shell, is answered from its Codex note (below),
+and answers `session_not_found` when it has none.
 
 The daemon walks the window's own processes from the shell its worker
 reported — `/proc` on Linux, libproc on macOS; a process that left the shell's
@@ -1319,19 +1325,39 @@ terminal session is not the window's — and matches Claude Code's live-session
 registry (`<config>/sessions/<pid>.json`), believing a record only while that
 exact process runs (pid, `pidDomain`, and `procStart` where it can be
 compared; where it cannot, the process must at least be Claude). A Codex
-window is named by the one rollout file its process holds open. Nothing is
+window is named from the thread files its process holds open: a writer lock
+for each thread it has loaded (`<CODEX_HOME>/thread-writer-locks/<id>.lock`,
+held from the thread's start) and each thread's rollout (from its first
+message, or at once on resume). Where the process holds any lock, only
+threads whose lock it holds are its own; a Codex that takes no locks is read
+by its rollouts alone. The thread in front of the person is the one written
+last (the later of its lock's and its rollout's modification times) that is
+not a subagent's: a rollout's first line, `session_meta`, says whether it is.
+A thread whose newest mark is its lock alone is `fresh`; a rollout whose
+first line has not ended yet names nothing, since it may be either. Nothing is
 executed, no process's arguments or environment are read, every registry file
-is read bounded and without following links, and the answer carries no paths
-and fits one control frame.
+and rollout is read bounded and without following links, and the answer
+carries no paths and fits one control frame.
+
+The daemon also notes, per window, the Codex thread a live answer found it in
+(or that it was on a fresh one), from every answer and from a look every 5 s
+at the windows whose foreground may be Codex, in a folder of its own
+(`<config>/conversations/<session id>.json`). When no agent runs in the
+window, or the window does not run there, the answer comes from that note:
+`agent` `codex`, `state` `unknown`, `source` `remembered`, and either the
+noted id or `fresh`. A thread changed less than 5 s before Codex went can be
+missed, and the note then names the thread before it. A window the server
+stops for good (`session.kill`: deleted, archived, or moved to another host)
+is forgotten there.
 
 A restart asks first where `conv.v1` is advertised. When the answer is about
 the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
-`codex resume <id>`), and a null one resumes "the latest one here"
-(`--continue`, `resume --last`) rather than an id recorded earlier;
-`live_elsewhere` does not stop a restart, since resuming a running background
-session attaches to it. The server never sees the request or the answer; a
-device writes a Claude Code id the host named back to the window's
-`agent_session_id`, and nothing else.
+`codex resume <id>`), a `fresh` Codex thread starts plain `codex`, and a null
+one otherwise resumes "the latest one here" (`--continue`, `resume --last`)
+rather than an id recorded earlier; `live_elsewhere` does not stop a restart,
+since resuming a running background session attaches to it. The server never
+sees the request or the answer; a device writes a Claude Code id the host
+named back to the window's `agent_session_id`, and nothing else.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit
