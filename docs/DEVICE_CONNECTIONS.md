@@ -48,6 +48,43 @@ A tab whose own timers were suspended does not count that gap as the owner's
 silence. A connection that retires itself is rebuilt by the provider rather
 than left closed until a reload.
 
+An owner can also keep announcing while it holds nothing usable — page code
+from before a fix, or a client that lost track of its own peer — and every
+other tab used to wait behind it for as long as it stayed open (one did for
+four days). A link is stuck when its owner has spent thirty seconds trying
+(connecting, or signalling with no working peer) with nothing to show for it:
+no refusal or error, and no offer answered `failed` in the last fifteen
+seconds, which is how a host that has not approved this device answers every
+one (an owner on page code from before this rule does not report that, so its
+refused link counts as trying). The host list this tab polls must also have
+said since then, within the last 75 seconds, that the host is online. Only a
+visible tab judges: hidden tabs do not poll the host list, and the tab a
+person is looking at is the one worth the next attempt. A waiting tab that
+sees a stuck link takes the lock, as from a silent owner, whatever page code
+the owner runs. An owner that sees its own keeps the lock and replaces its
+connection, under the same term with the epoch moved on; giving the lock up
+would hand it to the tab that has waited longest, as likely as not a hidden
+one on older page code. Each take-over in a row doubles the wait, to at most
+ten minutes. Every tab reads the row from local storage and writes it under a
+lock of its own, so one tab acts per wait; it ends when the link becomes
+ready, and a row twenty minutes old counts as none. Where local storage cannot
+be used, the term and the row stay with the tab, and each tab backs off on its
+own. A host the server calls offline, a network down for everyone (the host
+list stops refreshing) and a machine that slept (the sleep is not counted)
+cause no take-over, and a ready owner is never taken over. Each take-over logs
+one line naming the host and the wait. A tab that fails while it holds the
+lock, other than by losing it, asks for it again on its next heartbeat.
+
+A deposed owner stands down when its lock request rejects or when it hears
+the newer term, and follows. Page code from before #101 does neither: it
+copies the newer term it hears and goes on announcing its own old name under
+it, answering every new tab's hello, and it keeps its own peer — the daemon
+keeps only a device's newest offer, so that tab's next offer displaces the new
+owner's peer until it closes. Every owner since the first shared connection
+names itself `<tab>:<term>` and announces under that term while it leads, so
+a snapshot whose owner's name does not end in its term is no owner's: no tab
+follows it, including one that has followed no one yet.
+
 A connection is ready only while a child channel can open on it. A peer can
 stay connected, its root channel answering, while no new channel opens: a
 daemon built before #122 lost its channel acceptor to one reset stream and

@@ -432,6 +432,10 @@ export class HostControlClient {
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. Terminal: blocks auto-reconnect.
   private signedRtcRefusal: SignedRtcRefusalReason | null = null;
+  // When the server or daemon last answered an offer of this client's with
+  // `failed` or `disabled` (a host that has not approved this device answers
+  // so, without a reason): it retries, but it has been told no.
+  private offerFailedAt = 0;
   // A wire-version refusal is terminal too, but it is not a trust refusal and
   // must never be surfaced as one. The release watcher owns its recovery UI.
   private terminalReason: HostControlTerminalReason | null = null;
@@ -792,6 +796,11 @@ export class HostControlClient {
 
   getConnectionError(): string | null {
     return this.connectionError;
+  }
+
+  /** When an offer was last refused (`failed` or `disabled`); 0 if never. */
+  getOfferFailedAt(): number {
+    return this.offerFailedAt;
   }
 
   private requireTransportUpdate(message: string): void {
@@ -1819,6 +1828,8 @@ export class HostControlClient {
           this.fallBackFromResume();
           return;
         }
+        if (message.status === "failed" || message.status === "disabled")
+          this.offerFailedAt = Date.now();
         if (["failed", "disabled", "unavailable"].includes(message.status)) {
           if (this.iceRestartInFlight && message.status === "unavailable") {
             this.fallBackToFreshRtc(this.sessionId);
