@@ -1409,7 +1409,7 @@ line is `true`, a non-zero exit `false`. It is `null` for a window whose shell
 this daemon did not start (one it adopted after a restart), with no `codex` on
 that path, on a timeout or a run that could not start, for output that is not
 Codex's, and when three probes are already running and none frees up within
-250 ms; nothing is kept between asks. Codex parses its arguments first, so
+1 s; nothing is kept between asks. Codex parses its arguments first, so
 the run prints a version and connects to nothing; like any `codex` run it
 refreshes Codex's own scratch folder under `<CODEX_HOME>/tmp/`.
 
@@ -1426,7 +1426,11 @@ unexpected argument '--no-daemon' found` from column 0 (rows the terminal
 wrapped joined first), and types the plain command once — only while that
 view still holds the window's display on that host, the window's reported
 foreground is a shell, and a `conv.inspect` asked then finds no agent
-running there. Where any of that cannot be known, nothing is typed.
+running there. Where any of that cannot be known, nothing is typed. So a host
+too slow to answer `conv.launch` inside the client's 1.5 s always gets plain
+`codex`; and just after a Restart, before the new shell's worker has reported
+its foreground (an empty foreground is not known to be a shell), the recovery
+does nothing and Codex's refusal stays on screen for the person to retype.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit

@@ -58,7 +58,7 @@ const PROBE_OUTPUT_BYTES: usize = 4096;
 pub(crate) const PROBE_LIMIT: usize = 3;
 /// How long a launch waits for a probe to be free before it is answered
 /// "unknown".
-pub(crate) const PERMIT_WAIT: Duration = Duration::from_millis(250);
+pub(crate) const PERMIT_WAIT: Duration = Duration::from_secs(1);
 static PROBES: Semaphore = Semaphore::const_new(PROBE_LIMIT);
 
 /// Whether the `codex` that `env`'s PATH finds, run in `cwd`, accepts

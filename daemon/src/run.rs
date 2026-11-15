@@ -3849,21 +3849,37 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let capture = run_program_capture_in(
-            program.to_str().unwrap(),
-            &[],
-            Duration::from_millis(700),
-            4096,
-            None,
-            Some(dir.path()),
-        )
-        .await;
+        // Generous, for a loaded runner: the grandchild's id is read as soon
+        // as it is written, while the capture waits out its timeout.
+        let timeout = Duration::from_secs(2);
+        let written = async {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return Some(pid);
+                }
+                if std::time::Instant::now() > deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let (capture, grandchild) = tokio::join!(
+            run_program_capture_in(
+                program.to_str().unwrap(),
+                &[],
+                timeout,
+                4096,
+                None,
+                Some(dir.path()),
+            ),
+            written,
+        );
         assert!(!capture.exited);
-        let grandchild: i32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let grandchild = grandchild.expect("the program never started its grandchild");
         // Gone, or a zombie its new parent has yet to reap.
         let running = |pid: i32| {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
