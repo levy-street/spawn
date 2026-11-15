@@ -27,14 +27,25 @@
 //! launches: a timeout, a missing `codex` or a run that could not start
 //! answers "unknown", and the client types plain `codex`.
 //!
+//! The run is the daemon's own child, as its user, in spawnd's own process
+//! (and, on Linux, its service's cgroup), outside every window's scope. It
+//! gets a process group of its own, killed whole at the timeout, so a `codex`
+//! that hangs leaves nothing it started behind; and at most
+//! [`PROBE_LIMIT`] run at once across the daemon: a launch that cannot start
+//! one within [`PERMIT_WAIT`] is answered "unknown" rather than queued.
+//! Relative `PATH` entries (`node_modules/.bin`) are looked up from the
+//! window's folder, as the window's shell would.
+//!
 //! What this cannot see is what only the window's interactive shell knows: an
 //! alias or function named `codex`, or a PATH a shell hook changes on `cd`.
 //! There a "yes" can still be wrong, and the client undoes it: it watches for
 //! Codex's refusal of the flag and types the command again without it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 /// The program SPAWN D types to start Codex, as agent definitions spell it.
 const PROGRAM: &str = "codex";
@@ -43,22 +54,33 @@ const PROGRAM: &str = "codex";
 const PROBE_ARGS: [&str; 2] = ["--no-daemon", "--version"];
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_BYTES: usize = 4096;
+/// How many probes may run at once across the daemon.
+pub(crate) const PROBE_LIMIT: usize = 3;
+/// How long a launch waits for a probe to be free before it is answered
+/// "unknown".
+pub(crate) const PERMIT_WAIT: Duration = Duration::from_millis(250);
+static PROBES: Semaphore = Semaphore::const_new(PROBE_LIMIT);
 
 /// Whether the `codex` that `env`'s PATH finds, run in `cwd`, accepts
 /// `--no-daemon`: yes for its version line, no for a non-zero exit, None for
 /// anything else (no `codex`, a timeout, a run that could not start, output
 /// that is not Codex's).
 pub(crate) async fn accepts_no_daemon(env: &BTreeMap<String, String>, cwd: &Path) -> Option<bool> {
-    accepts_no_daemon_within(env, cwd, PROBE_TIMEOUT).await
+    accepts_no_daemon_within(env, cwd, PROBE_TIMEOUT, &PROBES).await
 }
 
 async fn accepts_no_daemon_within(
     env: &BTreeMap<String, String>,
     cwd: &Path,
     timeout: Duration,
+    probes: &Semaphore,
 ) -> Option<bool> {
+    let _permit = tokio::time::timeout(PERMIT_WAIT, probes.acquire())
+        .await
+        .ok()?
+        .ok()?;
     // By the path found, so what runs is what was found.
-    let found = crate::run::resolve_program_in_env(Path::new(PROGRAM), env)?;
+    let found = crate::run::resolve_program_in_env(Path::new(PROGRAM), &lookup_env(env, cwd))?;
     let program = found.path.to_str()?;
     let capture = crate::run::run_program_capture_in(
         program,
@@ -74,6 +96,32 @@ async fn accepts_no_daemon_within(
         (true, false) => Some(false),
         (false, _) => None,
     }
+}
+
+/// `env` with its relative `PATH` entries (an empty one is the current
+/// folder) made absolute from `cwd`, the window's folder: where its shell
+/// looks for them when it starts. For the lookup only; the run gets `env`.
+fn lookup_env(env: &BTreeMap<String, String>, cwd: &Path) -> BTreeMap<String, String> {
+    let mut lookup = env.clone();
+    for (key, value) in lookup.iter_mut() {
+        if !key.eq_ignore_ascii_case("PATH") {
+            continue;
+        }
+        let dirs = std::env::split_paths(value.as_str()).map(|dir| {
+            if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            }
+        });
+        if let Some(joined) = std::env::join_paths(dirs.collect::<Vec<PathBuf>>())
+            .ok()
+            .and_then(|joined| joined.into_string().ok())
+        {
+            *value = joined;
+        }
+    }
+    lookup
 }
 
 /// `codex-cli 0.167.2`: Codex's version line, not some other program's
@@ -108,8 +156,10 @@ mod tests {
 
     async fn answer(script: &str, timeout: Duration) -> Option<bool> {
         let (dir, env) = fake_codex(script);
-        accepts_no_daemon_within(&env, dir.path(), timeout).await
+        accepts_no_daemon_within(&env, dir.path(), timeout, &Semaphore::new(1)).await
     }
+
+    const KNOWS_THE_FLAG: &str = r#"echo "codex-cli 0.167.2""#;
 
     #[tokio::test]
     async fn a_codex_that_knows_the_flag_says_so_with_its_version() {
@@ -162,6 +212,40 @@ mod tests {
         std::fs::write(project.path().join(".new-codex"), "").unwrap();
         assert_eq!(accepts_no_daemon(&env, project.path()).await, Some(true));
         drop(dir);
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_cannot_get_a_probe_promptly_is_unknown_and_not_queued() {
+        let (dir, env) = fake_codex(KNOWS_THE_FLAG);
+        let busy = Semaphore::new(0);
+        let started = Instant::now();
+        assert_eq!(
+            accepts_no_daemon_within(&env, dir.path(), PROBE_TIMEOUT, &busy).await,
+            None
+        );
+        assert!(started.elapsed() < PERMIT_WAIT + Duration::from_secs(2));
+        // A free one answers.
+        assert_eq!(
+            accepts_no_daemon_within(&env, dir.path(), PROBE_TIMEOUT, &Semaphore::new(1)).await,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_path_entry_is_looked_up_from_the_windows_folder() {
+        // `node_modules/.bin` on the window's PATH: its shell finds the
+        // project's own Codex, and so does the probe — not one relative to
+        // wherever spawnd runs.
+        let project = tempfile::tempdir().unwrap();
+        let bin = project.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join(PROGRAM);
+        std::fs::write(&codex, format!("#!/bin/sh\n{KNOWS_THE_FLAG}\n")).unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = BTreeMap::from([("PATH".to_string(), "node_modules/.bin".to_string())]);
+        assert_eq!(accepts_no_daemon(&env, project.path()).await, Some(true));
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(accepts_no_daemon(&env, elsewhere.path()).await, None);
     }
 
     #[test]

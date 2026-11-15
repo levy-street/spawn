@@ -3053,6 +3053,10 @@ pub(crate) async fn run_program_capture_in(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    // A group of its own, so a timeout stops everything the program started
+    // (an npm launcher's native binary, a shell's children), not only it.
+    #[cfg(unix)]
+    command.process_group(0);
 
     // `exec` of a file something still has open for writing — one just
     // updated, or written by a test while another thread forks — fails with
@@ -3069,14 +3073,30 @@ pub(crate) async fn run_program_capture_in(
         }
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    #[cfg(unix)]
+    let group = child.id();
+    // Kept alive past a timeout, so the program is not reaped before its
+    // group is killed; while anything in the group lives, its id is not
+    // handed to another process.
+    let waiting = child.wait_with_output();
+    tokio::pin!(waiting);
+    match tokio::time::timeout(timeout, &mut waiting).await {
         Ok(Ok(output)) => CommandCapture {
             success: output.status.success(),
             output: combined_output(&output.stdout, &output.stderr, output_limit),
             exited: true,
         },
         Ok(Err(_)) => CommandCapture::failed(),
-        Err(_) => CommandCapture::failed(),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            CommandCapture::failed()
+        }
     }
 }
 
@@ -3809,6 +3829,59 @@ mod tests {
     use futures_util::SinkExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+
+    /// A program that hangs past a capture's timeout is stopped with
+    /// everything it started: its process group goes whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_capture_that_times_out_takes_what_it_started_with_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let program = dir.path().join("hangs");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nPATH=/bin:/usr/bin\nsleep 30 &\necho $! > '{}'\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = run_program_capture_in(
+            program.to_str().unwrap(),
+            &[],
+            Duration::from_millis(700),
+            4096,
+            None,
+            Some(dir.path()),
+        )
+        .await;
+        assert!(!capture.exited);
+        let grandchild: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Gone, or a zombie its new parent has yet to reap.
+        let running = |pid: i32| {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map_or(true, |stat| !stat.contains(") Z "))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(grandchild) {
+            if std::time::Instant::now() > deadline {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(grandchild),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                panic!("the capture's grandchild {grandchild} outlived its timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 
     /// A deleted, archived or moved window leaves no note of its Codex
     /// thread on this host: not the one it had, and not one a last look
