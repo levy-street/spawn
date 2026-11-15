@@ -3795,6 +3795,7 @@ mod tests {
             live_elsewhere: false,
             fresh: false,
             source: Source::OpenFile,
+            fresh_thread: None,
         };
         memory.note(window, &codex);
         assert!(memory.recall(window).is_some());

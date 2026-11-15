@@ -187,6 +187,11 @@ pub(crate) struct Inspection {
     /// types a resume of it. False wherever the host cannot tell.
     pub fresh: bool,
     pub source: Source,
+    /// A fresh Codex thread's id, kept on this host and never put on the
+    /// wire (there is nothing to resume): what tells a thread with nothing
+    /// written yet from one letting go of its rollout.
+    #[serde(skip)]
+    pub fresh_thread: Option<String>,
 }
 
 impl Inspection {
@@ -199,15 +204,16 @@ impl Inspection {
             live_elsewhere: false,
             fresh: false,
             source: Source::None,
+            fresh_thread: None,
         }
     }
 
     /// A Codex window, as far as `thread` tells.
     fn codex(thread: CodexThread) -> Self {
-        let (conversation_id, fresh, source) = match thread {
-            CodexThread::Started(id) => (Some(id), false, Source::OpenFile),
-            CodexThread::Fresh => (None, true, Source::OpenFile),
-            CodexThread::Unknown => (None, false, Source::Process),
+        let (conversation_id, fresh_thread, source) = match thread {
+            CodexThread::Started(id) => (Some(id), None, Source::OpenFile),
+            CodexThread::Fresh(id) => (None, Some(id), Source::OpenFile),
+            CodexThread::Unknown => (None, None, Source::Process),
         };
         Self {
             agent: Some(CODEX),
@@ -215,8 +221,9 @@ impl Inspection {
             state: ConversationState::Unknown,
             cli_version: None,
             live_elsewhere: false,
-            fresh,
+            fresh: fresh_thread.is_some(),
             source,
+            fresh_thread,
         }
     }
 
@@ -227,9 +234,9 @@ impl Inspection {
         if self.agent != Some(CODEX) {
             return None;
         }
-        match (&self.conversation_id, self.fresh) {
-            (Some(id), false) => Some(CodexThread::Started(id.clone())),
-            (None, true) => Some(CodexThread::Fresh),
+        match (&self.conversation_id, self.fresh, &self.fresh_thread) {
+            (Some(id), false, None) => Some(CodexThread::Started(id.clone())),
+            (None, true, Some(id)) => Some(CodexThread::Fresh(id.clone())),
             _ => None,
         }
     }
@@ -330,6 +337,7 @@ pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBu
                 live_elsewhere: true,
                 fresh: false,
                 source: Source::Attach,
+                fresh_thread: None,
             };
         }
         let Some(executable) = table.executable(pid) else {
@@ -347,6 +355,7 @@ pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBu
                 live_elsewhere: false,
                 fresh: false,
                 source: Source::Process,
+                fresh_thread: None,
             };
         }
     }
@@ -377,6 +386,7 @@ fn from_record(
             }),
             fresh: false,
             source: Source::Registry,
+            fresh_thread: None,
         },
         // The record's own `sessionId` is the conversation the window left
         // when it parked; the one it shows now is the background job's.
@@ -394,6 +404,7 @@ fn from_record(
                 live_elsewhere: holder.is_some_and(|holder| !in_window.contains(&holder.pid)),
                 fresh: false,
                 source: Source::Parked,
+                fresh_thread: None,
             }
         }
         Parked::Unreadable => Inspection {
@@ -404,6 +415,7 @@ fn from_record(
             live_elsewhere: false,
             fresh: false,
             source: Source::Parked,
+            fresh_thread: None,
         },
     }
 }
@@ -765,8 +777,9 @@ fn codex_lock_id(path: &Path) -> Option<String> {
 enum CodexThread {
     /// A thread with a rollout: something to resume.
     Started(String),
-    /// A thread with nothing written to it yet: there is nothing to resume.
-    Fresh,
+    /// A thread with nothing written to it yet, as far as what the process
+    /// holds tells: there is nothing to resume. Its id stays on this host.
+    Fresh(String),
     /// Nothing held, or nothing to tell the threads it holds apart.
     Unknown,
 }
@@ -821,7 +834,7 @@ fn codex_thread(open: &[PathBuf]) -> CodexThread {
     let mut reads = 0..MAX_SESSION_META_READS;
     for (_, id, thread) in threads {
         let Some(rollout) = thread.rollout else {
-            return CodexThread::Fresh;
+            return CodexThread::Fresh(id);
         };
         if reads.next().is_none() {
             break;
@@ -929,19 +942,27 @@ impl ConversationMemory {
 
     /// Note the Codex thread a live answer finds the window in — a thread
     /// with something to resume, or a fresh one — when it is not the one
-    /// already noted.
+    /// already noted. A thread noted with something to resume is never noted
+    /// fresh again: seen holding its lock alone, it is letting go of its
+    /// rollout (Codex 0.167.2 closes a thread's rollout before its lock, on
+    /// quit and when it unloads a thread the person left, 2 to 50 ms apart).
     pub(crate) fn note(&self, session_id: Uuid, inspection: &Inspection) {
         let Some(thread) = inspection.codex_thread() else {
             return;
         };
-        if self.recall_thread(session_id).as_ref() == Some(&thread) {
-            return;
+        let noted = self.recall_thread(session_id);
+        match (&thread, &noted) {
+            (thread, Some(noted)) if thread == noted => return,
+            (CodexThread::Fresh(id), Some(CodexThread::Started(started))) if id == started => {
+                return
+            }
+            _ => {}
         }
         let body = match &thread {
             CodexThread::Started(id) => {
                 serde_json::json!({ "agent": CODEX, "conversation_id": id })
             }
-            CodexThread::Fresh => serde_json::json!({ "agent": CODEX, "fresh": true }),
+            CodexThread::Fresh(id) => serde_json::json!({ "agent": CODEX, "fresh_thread": id }),
             CodexThread::Unknown => return,
         };
         if let Err(error) = self.write(session_id, body.to_string().as_bytes()) {
@@ -958,7 +979,7 @@ impl ConversationMemory {
     }
 
     /// `{"agent":"codex","conversation_id":<canonical UUID>}` or
-    /// `{"agent":"codex","fresh":true}`, and nothing else.
+    /// `{"agent":"codex","fresh_thread":<canonical UUID>}`, and nothing else.
     fn recall_thread(&self, session_id: Uuid) -> Option<CodexThread> {
         let bytes = read_small_file(&self.path(session_id), MAX_MEMORY_BYTES)?;
         let value: Value = serde_json::from_slice(&bytes).ok()?;
@@ -966,9 +987,9 @@ impl ConversationMemory {
         if object.get("agent")?.as_str()? != CODEX {
             return None;
         }
-        match (object.get("conversation_id"), object.get("fresh")) {
+        match (object.get("conversation_id"), object.get("fresh_thread")) {
             (Some(Value::String(id)), None) => canonical_uuid(id).map(CodexThread::Started),
-            (None, Some(Value::Bool(true))) => Some(CodexThread::Fresh),
+            (None, Some(Value::String(id))) => canonical_uuid(id).map(CodexThread::Fresh),
             _ => None,
         }
     }
@@ -1711,6 +1732,7 @@ mod tests {
                 live_elsewhere: false,
                 fresh: false,
                 source: Source::Registry,
+                fresh_thread: None,
             }
         );
     }
@@ -1862,6 +1884,7 @@ mod tests {
                 live_elsewhere: true,
                 fresh: false,
                 source: Source::Parked,
+                fresh_thread: None,
             }
         );
     }
@@ -1914,6 +1937,7 @@ mod tests {
                 live_elsewhere: true,
                 fresh: false,
                 source: Source::Attach,
+                fresh_thread: None,
             }
         );
 
@@ -2052,6 +2076,7 @@ mod tests {
             live_elsewhere: false,
             fresh: false,
             source: Source::OpenFile,
+            fresh_thread: None,
         }
     }
 
@@ -2292,6 +2317,42 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_letting_go_of_its_rollout_is_not_noted_fresh() {
+        // Codex 0.167.2 closes a thread's rollout before its lock — on quit,
+        // and when it unloads a thread the person left — 2 to 50 ms apart.
+        // A look in between sees the noted thread holding its lock alone.
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        assert_eq!(
+            answer(window, Some(home.inspect()), Some(&memory)),
+            Some(started(THREAD_A))
+        );
+        home.table
+            .open
+            .get_mut(&CODEX_PID)
+            .unwrap()
+            .retain(|path| codex_rollout_id(path).is_none());
+        let letting_go = answer(window, Some(home.inspect()), Some(&memory)).unwrap();
+        assert!(
+            letting_go.fresh,
+            "the live answer is what the process holds"
+        );
+        let remembered = Inspection {
+            source: Source::Remembered,
+            ..started(THREAD_A)
+        };
+        assert_eq!(memory.recall(window), Some(remembered));
+        // A thread that never had a rollout is noted fresh as ever.
+        home.lock(THREAD_B, 20);
+        answer(window, Some(home.inspect()), Some(&memory));
+        assert!(memory.recall(window).unwrap().fresh);
+    }
+
+    #[test]
     fn a_fresh_thread_is_noted_in_place_of_the_one_before_it() {
         // `/new`, then Codex quits before a message: there is nothing to
         // resume, and the thread before it is one the person left.
@@ -2299,10 +2360,13 @@ mod tests {
         let memory = ConversationMemory::new(notes.path().to_path_buf());
         let window = Uuid::new_v4();
         memory.note(window, &started(THREAD_A));
-        memory.note(window, &Inspection::codex(CodexThread::Fresh));
+        memory.note(
+            window,
+            &Inspection::codex(CodexThread::Fresh(THREAD_B.into())),
+        );
         let fresh = Inspection {
             source: Source::Remembered,
-            ..Inspection::codex(CodexThread::Fresh)
+            ..Inspection::codex(CodexThread::Fresh(THREAD_B.into()))
         };
         assert_eq!(memory.recall(window), Some(fresh.clone()));
         assert_eq!(answer(window, None, Some(&memory)), Some(fresh.clone()));
@@ -2385,11 +2449,14 @@ mod tests {
             serde_json::json!({"agent": "codex", "conversation_id": THREAD_A.to_uppercase()})
                 .to_string(),
             serde_json::json!({"agent": "codex"}).to_string(),
-            serde_json::json!({"agent": "codex", "fresh": false}).to_string(),
-            serde_json::json!({"agent": "codex", "fresh": "true"}).to_string(),
-            serde_json::json!({"agent": "codex", "conversation_id": THREAD_A, "fresh": true})
+            serde_json::json!({"agent": "codex", "fresh": true}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh_thread": true}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh_thread": "--last"}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh_thread": THREAD_A.to_uppercase()})
                 .to_string(),
-            serde_json::json!({"agent": "claude-code", "fresh": true}).to_string(),
+            serde_json::json!({"agent": "codex", "conversation_id": THREAD_A, "fresh_thread": THREAD_B})
+                .to_string(),
+            serde_json::json!({"agent": "claude-code", "fresh_thread": THREAD_A}).to_string(),
             format!(
                 "{{\"agent\":\"codex\",\"conversation_id\":\"{THREAD_A}\",\"pad\":\"{}\"}}",
                 "x".repeat(2048)
@@ -2448,7 +2515,7 @@ mod tests {
             Some(unknown)
         );
         assert_eq!(answer(window, None, Some(&memory)), remembered);
-        let fresh = Inspection::codex(CodexThread::Fresh);
+        let fresh = Inspection::codex(CodexThread::Fresh(THREAD_B.into()));
         assert_eq!(
             answer(window, Some(fresh.clone()), Some(&memory)),
             Some(fresh.clone())
@@ -2732,6 +2799,7 @@ mod tests {
             live_elsewhere: true,
             fresh: false,
             source: Source::Registry,
+            fresh_thread: None,
         };
         let encoded = serde_json::to_string(&inspection).unwrap();
         assert!(encoded.len() < 512, "{encoded}");
@@ -2747,7 +2815,12 @@ mod tests {
                 "source": "registry",
             })
         );
-        let fresh = serde_json::to_value(Inspection::codex(CodexThread::Fresh)).unwrap();
+        let fresh =
+            serde_json::to_value(Inspection::codex(CodexThread::Fresh(THREAD_B.into()))).unwrap();
+        assert!(
+            !fresh.to_string().contains(THREAD_B),
+            "a fresh thread's id stays on the host"
+        );
         assert_eq!(fresh["fresh"], true);
         assert_eq!(fresh["conversation_id"], Value::Null);
         assert_eq!(fresh["source"], "open_file");
