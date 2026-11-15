@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { drawnColumns, evenSizes, MIN_COLUMN_PX } from "@/lib/split-group";
 import {
   type DropZone,
   dragModeAt,
@@ -132,12 +133,12 @@ const CANVAS = rect(268, 56, 1432, 892);
 
 /** Columns laid across `CANVAS` at these shares, as panes the carry would measure. */
 function panesAt(members: readonly string[], sizes: readonly number[], canvas = CANVAS) {
-  return layoutColumns(canvas, { members, sizes }, 4, 0, null);
+  return layoutColumns(canvas, { members, sizes }, { start: 0, ids: members });
 }
 
-/** The window a drop sees when these columns are all on screen. */
+/** The window a drop sees when these columns are all on screen, the URL on the first. */
 function shown(members: string[], sizes: number[]): ShownWindow {
-  return { members, sizes, drawn: members };
+  return { members, sizes, drawn: members, routed: members[0] ?? null };
 }
 
 describe("dropZones: one workspace on screen", () => {
@@ -280,9 +281,14 @@ describe("dropZones: a group folded on a narrow window", () => {
     members: ["a", "b", "c", "d"],
     sizes: [0.25, 0.25, 0.25, 0.25],
     drawn: ["b", "c"],
+    routed: "b",
   };
   const canvas = rect(320, 56, 900, 792);
-  const panes = layoutColumns(canvas, { members: ["b", "c"], sizes: [0.5, 0.5] }, 2, 0, null);
+  const panes = layoutColumns(
+    canvas,
+    { members: ["b", "c"], sizes: [0.5, 0.5] },
+    { start: 0, ids: ["b", "c"] },
+  );
 
   test("only the drawn columns are zones", () => {
     expect(dropZones("z", folded, panes).map((zone) => zone.next?.members)).toEqual([
@@ -295,6 +301,76 @@ describe("dropZones: a group folded on a narrow window", () => {
     const zones = dropZones("d", folded, panes);
     expect(zones[0]?.next?.members).toEqual(["a", "d", "b", "c"]);
     expect(drawnAfter(zones[0])).toEqual(["d", "b"]);
+  });
+});
+
+describe("dropZones: the preview is the window the drop gives you", () => {
+  /**
+   * What the window draws once a drop has landed: the drop arranges the
+   * group, makes the dropped workspace the active column, and moves the
+   * address bar to `zone.route`; the window then asks `drawnColumns` — the
+   * same rule it always draws by — starting from the run it was showing.
+   */
+  function windowAfter(zone: DropZone, dragged: string, capacity: number, start: number) {
+    const next = zone.next;
+    if (!next) throw new Error("no change to draw");
+    return drawnColumns(next.members, capacity, start, dragged, zone.route).ids;
+  }
+
+  test("a hidden member dropped where the address bar's column would scroll off takes the route", () => {
+    // Two fit; the split is a, b, c with a and b drawn and the URL on b. The
+    // hidden c dropped onto a: the preview shows c and a. Before, the store
+    // held c, a, b but the window kept drawing a and b, so c never appeared.
+    const canvas = rect(0, 0, 2 * MIN_COLUMN_PX + 10, 800);
+    const members = ["a", "b", "c"];
+    const drawn = drawnColumns(members, 2, 0, "b", "b").ids;
+    expect(drawn).toEqual(["a", "b"]);
+    const panes = layoutColumns(
+      canvas,
+      { members: drawn, sizes: [0.5, 0.5] },
+      { start: 0, ids: drawn },
+    );
+    const zones = dropZones("c", { members, sizes: evenSizes(3), drawn, routed: "b" }, panes);
+    const ontoA = zones[0];
+    expect(ontoA?.columns.map((column) => column.workspaceId)).toEqual(["c", "a"]);
+    expect(ontoA?.route).toBe("c");
+    expect(ontoA ? windowAfter(ontoA, "c", 2, 0) : []).toEqual(["c", "a"]);
+  });
+
+  test("every drop on a narrow window draws exactly its preview", () => {
+    // The reviewer's sweep: two and three columns fitting, groups of three
+    // and four, the URL on each member, every member and an outsider dragged
+    // onto every zone. 98 drops, of which 11 used to draw another window.
+    let drops = 0;
+    for (const capacity of [2, 3]) {
+      const canvas = rect(0, 0, capacity * MIN_COLUMN_PX + 10, 800);
+      for (const members of [
+        ["a", "b", "c"],
+        ["a", "b", "c", "d"],
+      ]) {
+        if (members.length <= capacity) continue;
+        for (const routed of members) {
+          const { start, ids: drawn } = drawnColumns(members, capacity, 0, routed, routed);
+          const panes = layoutColumns(
+            canvas,
+            { members: drawn, sizes: evenSizes(drawn.length) },
+            { start: 0, ids: drawn },
+          );
+          const shown: ShownWindow = { members, sizes: evenSizes(members.length), drawn, routed };
+          for (const dragged of [...members, "z"]) {
+            for (const zone of dropZones(dragged, shown, panes)) {
+              if (!zone.next) continue;
+              drops += 1;
+              const preview = zone.columns.map((column) => column.workspaceId);
+              expect(windowAfter(zone, dragged, capacity, start)).toEqual(preview);
+              // And what was dropped is on screen afterwards.
+              expect(preview).toContain(dragged);
+            }
+          }
+        }
+      }
+    }
+    expect(drops).toBe(98);
   });
 });
 
@@ -398,31 +474,40 @@ describe("layoutColumns", () => {
   test("lays the columns edge to edge at their shares, the last one closing on the canvas edge", () => {
     expect(
       layoutColumns(
-        rect(0, 0, 1000, 500),
+        rect(0, 0, 1500, 500),
         { members: ["a", "b", "c"], sizes: [0.5, 0.3, 0.2] },
-        4,
-        0,
-        null,
+        { start: 0, ids: ["a", "b", "c"] },
       ),
     ).toEqual([
-      { workspaceId: "a", rect: rect(0, 0, 500, 500) },
-      { workspaceId: "b", rect: rect(500, 0, 800, 500) },
-      { workspaceId: "c", rect: rect(800, 0, 1000, 500) },
+      { workspaceId: "a", rect: rect(0, 0, 750, 500) },
+      { workspaceId: "b", rect: rect(750, 0, 1200, 500) },
+      { workspaceId: "c", rect: rect(1200, 0, 1500, 500) },
     ]);
   });
 
-  test("a canvas too narrow for them all draws the run around the focused column", () => {
+  test("a run of a wider group fills the canvas between its own columns", () => {
     const laid = layoutColumns(
       rect(0, 0, 600, 500),
       { members: ["a", "b", "c", "d"], sizes: [0.25, 0.25, 0.25, 0.25] },
-      2,
-      0,
-      "d",
+      { start: 2, ids: ["c", "d"] },
     );
     expect(laid).toEqual([
       { workspaceId: "c", rect: rect(0, 0, 300, 500) },
       { workspaceId: "d", rect: rect(300, 0, 600, 500) },
     ]);
+  });
+
+  test("columns are drawn no narrower than the minimum, whatever is stored", () => {
+    // Stored at an eighth after the window was wider: 1416px still draws
+    // them at 280.
+    const laid = layoutColumns(
+      rect(0, 0, 1416, 500),
+      { members: ["a", "b", "c", "d"], sizes: [0.125, 0.125, 0.375, 0.375] },
+      { start: 0, ids: ["a", "b", "c", "d"] },
+    );
+    for (const column of laid) {
+      expect(Math.round(column.rect.right - column.rect.left)).toBeGreaterThanOrEqual(280);
+    }
   });
 });
 

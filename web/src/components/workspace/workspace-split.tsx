@@ -14,14 +14,15 @@ import {
 } from "react";
 import { workspaces } from "@/lib/api";
 import {
+  clampSizes,
   columnCapacity,
+  columnFloor,
+  dragSeam,
+  drawnColumns,
+  drawnShares,
   MAX_MEMBERS,
-  moveSeam,
-  runShares,
   SEAM_STEP,
   seamPosition,
-  visibleRun,
-  withRunShares,
 } from "@/lib/split-group";
 import { splitFor, splitStore, useSplit } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
@@ -69,7 +70,9 @@ interface ColumnHandlers {
  * A window too narrow to give every column `MIN_COLUMN_PX` draws as many
  * neighbouring columns as fit — never fewer than two, so a pair is drawn at
  * any width, as it always was — keeping the column being worked in on screen.
- * The rest stay in the group and come back when there is room.
+ * The rest stay in the group and come back when there is room. Three or four
+ * columns are drawn no narrower than that minimum, whatever widths are stored
+ * (see `drawnShares`).
  */
 export function WorkspaceSplit({
   workspaceId,
@@ -83,15 +86,38 @@ export function WorkspaceSplit({
 }) {
   const router = useRouter();
   const containerRef = useRef<HTMLDivElement>(null);
-  const { group, activeId } = useSplit();
+  const { group, activeId, heading } = useSplit();
   const [resizing, setResizing] = useState(false);
-  /** How many columns the canvas holds; all of them until it has been measured. */
-  const [capacity, setCapacity] = useState(MAX_MEMBERS);
+  /**
+   * The canvas's width, or null until it has been measured. Nothing is
+   * mounted before then: drawing every member of a group before the window
+   * knows how many fit would mount — and claim terminals for — columns the
+   * narrow-window fold then takes away again a moment later.
+   */
+  const [canvasWidth, setCanvasWidth] = useState<number | null>(null);
+  const capacity = canvasWidth === null ? MAX_MEMBERS : columnCapacity(canvasWidth);
+  /**
+   * The widths a seam drag is showing. Kept here until the seam is let go,
+   * and only then stored: the sidebar and localStorage hear about a seam when
+   * it has been put down, not at pointer rate while it moves.
+   */
+  const [liveSizes, setLiveSizes] = useState<readonly number[] | null>(null);
 
+  /*
+   * Where the address bar is going, if something has just sent it somewhere
+   * (a member leaving, a drop), or else where it is. The route trails the
+   * change by a render or more, and the window draws its destination rather
+   * than one frame of what the old route named.
+   */
+  const routeId = heading ?? workspaceId;
   /** The group this route draws, or null when it draws one workspace. */
-  const drawnGroup = splitFor(group, workspaceId);
-  const members = drawnGroup ? drawnGroup.members : [workspaceId];
-  const sizes = drawnGroup ? drawnGroup.sizes : WHOLE;
+  const drawnGroup = splitFor(group, routeId);
+  const members = drawnGroup ? drawnGroup.members : [routeId];
+  const sizes = drawnGroup
+    ? liveSizes?.length === drawnGroup.members.length
+      ? liveSizes
+      : drawnGroup.sizes
+    : WHOLE;
 
   /*
    * Which of the group fit, as a run of neighbours that scrolls only as far
@@ -100,24 +126,15 @@ export function WorkspaceSplit({
    * window", and remembering it must not cost a render of its own.
    */
   const runStartRef = useRef(0);
-  const runLength = Math.min(members.length, capacity);
-  const routedIndex = members.indexOf(workspaceId);
-  const activeIndex = activeId ? members.indexOf(activeId) : -1;
-  const aroundActive = visibleRun(
-    members.length,
+  const { start: runStart, ids: visible } = drawnColumns(
+    members,
     capacity,
     runStartRef.current,
-    activeIndex >= 0 ? activeIndex : routedIndex,
+    activeId,
+    routeId,
   );
-  // The column the address bar is about is always drawn — on the render
-  // after a navigation the keyboard has not followed the route yet, and a
-  // window that did not show the workspace its URL names would be wrong.
-  const runStart =
-    routedIndex < aroundActive || routedIndex >= aroundActive + runLength
-      ? visibleRun(members.length, capacity, aroundActive, routedIndex)
-      : aroundActive;
-  const visible = members.slice(runStart, runStart + runLength);
-  const visibleKey = visible.join(" ");
+  const runLength = visible.length;
+  const visibleKey = canvasWidth === null ? "" : visible.join(" ");
   useEffect(() => {
     runStartRef.current = runStart;
   }, [runStart]);
@@ -128,11 +145,13 @@ export function WorkspaceSplit({
    * than collapse. Brought up to date during render rather than in an effect,
    * so a route onto some other workspace never draws one frame of the old one.
    */
-  const [columns, setColumns] = useState<MountedColumn[]>(() => settledColumns(visible));
-  const [mountedKey, setMountedKey] = useState(visibleKey);
+  const [columns, setColumns] = useState<MountedColumn[]>([]);
+  const [mountedKey, setMountedKey] = useState("");
   if (mountedKey !== visibleKey) {
     setMountedKey(visibleKey);
-    setColumns(mountColumns(columns, visible));
+    // The first columns, once the canvas has been measured, are simply there:
+    // a window opening is not a window rearranging itself.
+    setColumns(mountedKey === "" ? settledColumns(visible) : mountColumns(columns, visible));
   }
 
   const entering = columns.some(({ state }) => state === "entering");
@@ -153,16 +172,30 @@ export function WorkspaceSplit({
     return () => window.clearTimeout(timer);
   }, [leavingKey]);
 
+  /*
+   * Measured before the first paint, so the columns mount once, at the
+   * number that fits. The container's width does not depend on its columns
+   * — it is the main panel's — so an empty container measures true.
+   */
   useIsoLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    setCapacity(columnCapacity(container.getBoundingClientRect().width));
+    setCanvasWidth(container.getBoundingClientRect().width);
     const observer = new ResizeObserver(([entry]) => {
-      setCapacity(columnCapacity(entry?.contentRect.width ?? 0));
+      setCanvasWidth(entry?.contentRect.width ?? 0);
     });
     observer.observe(container);
     return () => observer.disconnect();
   }, []);
+
+  /*
+   * The route and router, for callbacks made once and kept — the column
+   * handlers below, and the reconcile that follows a member that has gone.
+   */
+  const routeRef = useRef(workspaceId);
+  routeRef.current = workspaceId;
+  const routerRef = useRef(router);
+  routerRef.current = router;
 
   const workspacesQ = useQuery({
     queryKey: ["workspaces"],
@@ -181,8 +214,15 @@ export function WorkspaceSplit({
   );
   const nameOf = (id: string) => workspacesQ.data?.find((workspace) => workspace.id === id)?.name;
 
+  /*
+   * A member that stopped existing leaves the group here when the list
+   * refresh beats its own 404 — and when it was the one the address bar is
+   * on, the route goes to the column that took its place, exactly as the 404
+   * would have sent it. The window is already drawing that destination.
+   */
   useEffect(() => {
-    splitStore.reconcile(knownIds);
+    const destination = splitStore.reconcile(knownIds, routeRef.current);
+    if (destination) routerRef.current.replace(`/w/${destination}`);
   }, [knownIds]);
 
   /*
@@ -209,7 +249,15 @@ export function WorkspaceSplit({
    * already dismissed.
    */
   const split = columns.length > 1;
-  const shares = settledShares(columns, members, sizes);
+  /*
+   * Each settled column's share, held to the floor for this canvas: three or
+   * four columns are never drawn under `MIN_COLUMN_PX` while the window holds
+   * them, whatever is stored. The drop preview holds its columns the same way
+   * (`drawnShares`), so the two cannot disagree about a width.
+   */
+  const settled = settledShares(columns, members, sizes);
+  const held = clampSizes([...settled.values()], columnFloor(settled.size, canvasWidth ?? 0));
+  const shares = new Map([...settled.keys()].map((id, index) => [id, held[index] ?? 0]));
 
   /*
    * The measurement only this component can make, published for the surfaces
@@ -234,10 +282,6 @@ export function WorkspaceSplit({
    * screen at pointer rate while a seam is dragged. They read the route and
    * router through refs, so being made once does not make them stale.
    */
-  const routeRef = useRef(workspaceId);
-  routeRef.current = workspaceId;
-  const routerRef = useRef(router);
-  routerRef.current = router;
   const handlersRef = useRef(new Map<string, ColumnHandlers>());
   const handlersFor = (id: string): ColumnHandlers => {
     const known = handlersRef.current.get(id);
@@ -264,46 +308,67 @@ export function WorkspaceSplit({
   const runRef = useRef({ start: runStart, length: runLength });
   runRef.current = { start: runStart, length: runLength };
 
-  /** Move seam `seam` of the drawn run to `boundary`, a share of the canvas. */
-  const placeSeam = (seam: number, boundary: number) => {
-    const current = splitStore.get().group;
-    if (!current) return;
-    const { start, length } = runRef.current;
-    const moved = moveSeam(runShares(current.sizes, start, length), seam, boundary);
-    splitStore.setSizes(withRunShares(current.sizes, start, moved));
-  };
-
   /*
    * The sidebar's grip, at `AppShell.startSidebarResize`, with the container's
-   * bounds standing in for the aside's: listeners on the document rather than
-   * the button so the pointer may leave the 8px target, and `resizing` drops
-   * the transition for the length of the gesture so the columns track the
-   * cursor exactly instead of easing towards it. Only the two columns either
-   * side of the seam change; every other seam stays where it is.
+   * bounds standing in for the aside's: the pointer may leave the 8px target,
+   * and `resizing` drops the transition for the length of the gesture so the
+   * columns track the cursor exactly instead of easing towards it. Only the
+   * two columns either side of the seam change; every other seam stays where
+   * it is, and neither neighbour goes under its floor (`dragSeam`).
+   *
+   * The pointer is captured, so the release comes back here wherever it
+   * happens; a move with no button held ends the drag too — a release the
+   * page never heard, over another window or after the tab lost focus, would
+   * otherwise leave the seam following a mouse nobody is holding.
    */
   const startSeamResize = (seam: number) => (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const handle = event.currentTarget;
     const bounds = containerRef.current?.getBoundingClientRect();
-    if (!bounds || bounds.width <= 0) return;
+    const from = splitStore.get().group;
+    if (!bounds || bounds.width <= 0 || !from) return;
     event.preventDefault();
+    const { pointerId } = event;
+    try {
+      handle.setPointerCapture(pointerId);
+    } catch {
+      // The pointer went away already; the document listeners still end it.
+    }
+    const { start, length } = runRef.current;
+    let latest: readonly number[] = from.sizes;
+    let done = false;
     setResizing(true);
 
     const onMove = (moveEvent: PointerEvent) => {
-      placeSeam(seam, (moveEvent.clientX - bounds.left) / bounds.width);
+      if (moveEvent.buttons === 0) {
+        finish();
+        return;
+      }
+      const boundary = (moveEvent.clientX - bounds.left) / bounds.width;
+      latest = dragSeam(from.sizes, start, length, seam, boundary, bounds.width);
+      setLiveSizes(latest);
     };
-    const onUp = () => {
+    const finish = () => {
+      if (done) return;
+      done = true;
       document.removeEventListener("pointermove", onMove);
-      document.removeEventListener("pointerup", onUp);
-      document.removeEventListener("pointercancel", onUp);
+      document.removeEventListener("pointerup", finish);
+      document.removeEventListener("pointercancel", finish);
+      handle.removeEventListener("lostpointercapture", finish);
+      if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      // Stored once, now that the seam has been put down.
+      splitStore.setSizes(latest);
+      setLiveSizes(null);
       setResizing(false);
     };
 
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
     document.addEventListener("pointermove", onMove);
-    document.addEventListener("pointerup", onUp, { once: true });
-    document.addEventListener("pointercancel", onUp, { once: true });
+    document.addEventListener("pointerup", finish);
+    document.addEventListener("pointercancel", finish);
+    handle.addEventListener("lostpointercapture", finish);
   };
 
   /** Arrows step the seam; Home and End take it as far as either neighbour allows. */
@@ -311,7 +376,8 @@ export function WorkspaceSplit({
     const current = splitStore.get().group;
     if (!current) return;
     const { start, length } = runRef.current;
-    const at = seamPosition(runShares(current.sizes, start, length), seam);
+    const width = containerRef.current?.getBoundingClientRect().width ?? 0;
+    const at = seamPosition(drawnShares(current.sizes, start, length, width), seam);
     const target =
       event.key === "ArrowLeft"
         ? at - SEAM_STEP
@@ -324,7 +390,7 @@ export function WorkspaceSplit({
               : null;
     if (target === null) return;
     event.preventDefault();
-    placeSeam(seam, target);
+    splitStore.setSizes(dragSeam(current.sizes, start, length, seam, target, width));
   };
 
   /*
@@ -335,9 +401,9 @@ export function WorkspaceSplit({
   const activeColumn =
     activeId && showing.includes(activeId)
       ? activeId
-      : showing.includes(workspaceId)
-        ? workspaceId
-        : (showing[0] ?? workspaceId);
+      : showing.includes(routeId)
+        ? routeId
+        : (showing[0] ?? routeId);
 
   // Every column moves on the same clock, so the seams read as things
   // sweeping across rather than panels resizing next to each other.
@@ -394,7 +460,9 @@ export function WorkspaceSplit({
                   // wins that tie and punches its own height out of the seam.
                   // The seam is one line down the whole window or it is not a
                   // seam.
-                  className="group absolute inset-y-0 -left-1 z-30 w-2 cursor-col-resize focus-visible:outline-none disabled:pointer-events-none"
+                  // `touch-none`: a finger on the seam drags it, rather than the
+                  // browser taking the gesture for a scroll and cancelling it.
+                  className="group absolute inset-y-0 -left-1 z-30 w-2 cursor-col-resize touch-none focus-visible:outline-none disabled:pointer-events-none"
                 >
                   <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border transition-colors group-hover:bg-ring/60 group-focus-visible:bg-ring" />
                 </button>

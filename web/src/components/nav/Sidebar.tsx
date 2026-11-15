@@ -314,10 +314,13 @@ export function Sidebar({
     const rowElement = event.currentTarget;
     // On the collapsed rail the ghost is cut from the tile that was pressed,
     // not the row: a split's row there is a column of tiles, and a ghost the
-    // height of all of them would not read as the one workspace in hand.
-    const pressedTile = collapsed
-      ? (pressedControl ?? (event.target as Element).closest?.("a"))?.getBoundingClientRect()
+    // height of all of them would not read as the one workspace in hand. The
+    // same tile is the one that dims while it is carried, not the whole group.
+    const pressedTileElement = collapsed
+      ? ((pressedControl ?? (event.target as Element).closest?.("a")) as HTMLElement | null)
       : null;
+    const pressedTile = pressedTileElement?.getBoundingClientRect() ?? null;
+    const carriedElement = pressedTileElement ?? rowElement;
     const startY = event.clientY;
     const startX = event.clientX;
     let dragging = false;
@@ -369,7 +372,7 @@ export function Sidebar({
       // The row itself stays in the rail, dimmed, and a ghost is what follows
       // the pointer: pulling the element out of flow would close the list up
       // under it and invalidate the very rects the reorder half measures from.
-      rowElement.style.opacity = "0.4";
+      carriedElement.style.opacity = "0.4";
       const cutFrom = pressedTile ?? fromRect;
       const box = {
         left: cutFrom?.left ?? 0,
@@ -396,7 +399,7 @@ export function Sidebar({
 
     const enterReorder = () => {
       rowElement.style.transition = "";
-      rowElement.style.opacity = "";
+      carriedElement.style.opacity = "";
       lift(true);
       carry?.hide();
     };
@@ -461,7 +464,7 @@ export function Sidebar({
         row.style.transition = "";
       }
       lift(false);
-      rowElement.style.opacity = "";
+      carriedElement.style.opacity = "";
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       if (!dragging) return;
@@ -765,10 +768,10 @@ export function Sidebar({
                           const pressed = (event.target as Element)
                             .closest?.("[data-split-member]")
                             ?.getAttribute("data-split-member");
-                          startWorkspaceDrag(
-                            (pressed ? workspaceById.get(pressed) : null) ?? workspace,
-                            event,
-                          );
+                          const member = pressed ? workspaceById.get(pressed) : null;
+                          // The plate around the tiles is not any one of
+                          // them: pressing it is not picking a workspace up.
+                          if (member) startWorkspaceDrag(member, event);
                         }
                   }
                 />

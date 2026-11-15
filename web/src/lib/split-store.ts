@@ -82,6 +82,14 @@ export interface SplitState {
    * about.
    */
   activeId: string | null;
+  /**
+   * Where the address bar is about to go, set by whatever just sent it there
+   * and cleared the moment any route arrives. The route trails the change
+   * that made it — a member leaving, a drop that moves the URL — by a render
+   * or more, and in between the window draws towards this rather than
+   * flashing the arrangement the route still names. Session-only.
+   */
+  heading: string | null;
 }
 
 const NOTHING_RENDERED: readonly string[] = [];
@@ -90,6 +98,7 @@ const DEFAULT_STATE: SplitState = {
   group: null,
   rendered: NOTHING_RENDERED,
   activeId: null,
+  heading: null,
 };
 
 /** Whether `workspaceId` is one of the group's columns. */
@@ -144,6 +153,7 @@ export function normalizeSplit(value: unknown): SplitState {
     // Never restored: which column you were last typing in is a fact about a
     // session, and a reload starts at whichever column the URL names.
     activeId: null,
+    heading: null,
   };
 }
 
@@ -165,6 +175,13 @@ export function readStoredSplit(): SplitState {
 const listeners = new Set<() => void>();
 let state: SplitState = { ...DEFAULT_STATE };
 let initialised = false;
+/**
+ * Where each workspace that has left the group handed its column, for the
+ * length of the session. Two things notice a workspace going — the list
+ * refresh that reconciles the group, and the 404 its own column gets — in
+ * either order, and both have to send the address bar to the same place.
+ */
+const departed = new Map<string, string>();
 
 function emit(): void {
   for (const listener of listeners) listener();
@@ -176,14 +193,31 @@ function ensureInitialised(): void {
   state = readStoredSplit();
 }
 
+/**
+ * The value a group is stored as. Its members and widths, and beside them the
+ * pair the two-workspace shape wrote — its first two columns, and the first
+ * one's share of those two — for the builds that only know that shape: a
+ * rollback, or a tab still open on the previous deploy, reads this through
+ * master's reader and finds a split rather than nothing. This build reads
+ * `members` first, so the pair beside it is never what it acts on.
+ */
+export function storedSplit(group: SplitGroup): Record<string, unknown> {
+  const [primaryId, secondaryId] = group.members;
+  const [first = 0.5, second = 0.5] = group.sizes;
+  return {
+    members: group.members,
+    sizes: group.sizes,
+    primaryId,
+    secondaryId,
+    ratio: first + second > 0 ? first / (first + second) : 0.5,
+  };
+}
+
 /** Write the persistable part of the state; what is drawn and active is session-only. */
 function persist(): void {
   try {
     if (state.group) {
-      window.localStorage.setItem(
-        SPLIT_STORAGE_KEY,
-        JSON.stringify({ members: state.group.members, sizes: state.group.sizes }),
-      );
+      window.localStorage.setItem(SPLIT_STORAGE_KEY, JSON.stringify(storedSplit(state.group)));
     } else {
       // No split is nothing to remember, not an empty one to restore.
       window.localStorage.removeItem(SPLIT_STORAGE_KEY);
@@ -207,7 +241,8 @@ function set(next: SplitState): void {
   if (
     sameGroup(next.group, state.group) &&
     sameList(next.rendered, state.rendered) &&
-    next.activeId === state.activeId
+    next.activeId === state.activeId &&
+    next.heading === state.heading
   ) {
     return;
   }
@@ -215,6 +250,27 @@ function set(next: SplitState): void {
   state = next;
   if (persistable) persist();
   emit();
+}
+
+/**
+ * The column that takes over from `workspaceId` when the members in `gone`
+ * leave: the nearest one still standing to its right, or to its left at the
+ * end of the row — the neighbour that slides into its slot. Null when none
+ * is left.
+ */
+function successorOf(
+  members: readonly string[],
+  workspaceId: string,
+  gone: ReadonlySet<string>,
+): string | null {
+  const at = members.indexOf(workspaceId);
+  if (at < 0) return null;
+  const after = members.slice(at + 1).find((id) => !gone.has(id));
+  const before = members
+    .slice(0, at)
+    .reverse()
+    .find((id) => !gone.has(id));
+  return after ?? before ?? null;
 }
 
 /** The group minus one member, or null once that leaves a single workspace. */
@@ -259,7 +315,8 @@ export const splitStore = {
   /** No split at all, whichever workspace the window ends up showing. */
   clear(): void {
     ensureInitialised();
-    set({ ...state, group: null, activeId: null });
+    departed.clear();
+    set({ ...state, group: null, activeId: null, heading: null });
   },
 
   /**
@@ -276,15 +333,19 @@ export const splitStore = {
    */
   remove(workspaceId: string, routedId: string | null): string | null {
     ensureInitialised();
+    const routed = routedId === workspaceId;
     const group = state.group;
-    const index = group ? group.members.indexOf(workspaceId) : -1;
-    if (!group || index < 0) return null;
-    const rest = group.members.filter((id) => id !== workspaceId);
-    const successor = rest[Math.min(index, rest.length - 1)] ?? null;
+    if (!group || !isMember(group, workspaceId)) {
+      // Already gone — a list refresh reconciled it first. Where it went is
+      // still where a route onto it has to go.
+      return routed ? (departed.get(workspaceId) ?? null) : null;
+    }
+    const successor = successorOf(group.members, workspaceId, new Set([workspaceId]));
+    if (successor) departed.set(workspaceId, successor);
     const next = without(group, workspaceId);
     const activeId = !next ? null : state.activeId === workspaceId ? successor : state.activeId;
-    set({ ...state, group: next, activeId });
-    return routedId === workspaceId ? successor : null;
+    set({ ...state, group: next, activeId, heading: routed ? successor : state.heading });
+    return routed ? successor : null;
   },
 
   /**
@@ -297,8 +358,9 @@ export const splitStore = {
   unsplit(keepId: string, routedId: string | null): string | null {
     ensureInitialised();
     const onSplit = isMember(state.group, routedId);
-    set({ ...state, group: null, activeId: null });
-    return onSplit && routedId !== keepId ? keepId : null;
+    const destination = onSplit && routedId !== keepId ? keepId : null;
+    set({ ...state, group: null, activeId: null, heading: destination ?? state.heading });
+    return destination;
   },
 
   /**
@@ -341,7 +403,21 @@ export const splitStore = {
    */
   followRoute(routedId: string | null): void {
     ensureInitialised();
-    set({ ...state, activeId: isMember(state.group, routedId) ? routedId : null });
+    set({
+      ...state,
+      activeId: isMember(state.group, routedId) ? routedId : null,
+      heading: null,
+    });
+  },
+
+  /**
+   * Say the address bar is on its way to `workspaceId`, for whoever sends it
+   * there without going through `remove` — a drop that has to take the route
+   * with it. Cleared by the route arriving (`followRoute`).
+   */
+  setHeading(workspaceId: string): void {
+    ensureInitialised();
+    set({ ...state, heading: workspaceId });
   },
 
   /**
@@ -358,20 +434,35 @@ export const splitStore = {
    * `knownIds` null means "the list has not loaded yet" — the group is left
    * alone rather than being cleared against an empty list, which would drop
    * the arrangement on every cold load.
+   *
+   * Returns where the address bar has to go when `routedId` was one of the
+   * members that went — the column that took its place — or null when the
+   * route can stay. This can arrive before the 404 the routed column gets for
+   * itself, or after it; `remove` answers that 404 with the same destination.
    */
-  reconcile(knownIds: ReadonlySet<string> | null): void {
+  reconcile(knownIds: ReadonlySet<string> | null, routedId: string | null = null): string | null {
     ensureInitialised();
     const group = state.group;
-    if (!group || !knownIds) return;
+    if (!group || !knownIds) return null;
     const missing = group.members.filter((id) => !knownIds.has(id));
-    if (missing.length === 0) return;
+    if (missing.length === 0) return null;
+    const gone = new Set(missing);
+    for (const id of missing) {
+      const successor = successorOf(group.members, id, gone);
+      if (successor) departed.set(id, successor);
+    }
     let next: SplitGroup | null = group;
     for (const id of missing) next = next ? without(next, id) : null;
+    // The address bar was on one that went: it goes to the column that took
+    // its place, and the window draws that while the route catches up.
+    const destination = routedId && gone.has(routedId) ? (departed.get(routedId) ?? null) : null;
     set({
       ...state,
       group: next,
       activeId: isMember(next, state.activeId) ? state.activeId : null,
+      heading: destination ?? state.heading,
     });
+    return destination;
   },
 };
 

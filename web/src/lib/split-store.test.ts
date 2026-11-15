@@ -8,6 +8,7 @@ import {
   splitFor,
   splitStore,
 } from "./split-store";
+import { normalizeSplit as previousBuildReads } from "./split-store-pair-reader.fixture";
 
 /**
  * The stateful half is a module singleton, so every test here starts from the
@@ -48,7 +49,7 @@ function fakeStorage(initial: Record<string, string> = {}): Partial<Storage> {
   };
 }
 
-const NO_SPLIT = { group: null, rendered: [], activeId: null };
+const NO_SPLIT = { group: null, rendered: [], activeId: null, heading: null };
 
 /** The members of the group the store holds, or null. */
 function members(): readonly string[] | null {
@@ -112,6 +113,7 @@ describe("normalizeSplit", () => {
       group: { members: ["a", "b", "c"], sizes: [0.5, 0.25, 0.25] },
       rendered: [],
       activeId: null,
+      heading: null,
     });
     expect(normalizeSplit({ members: ["a", "b", "c", "d"] }).group?.sizes).toEqual([
       0.25, 0.25, 0.25, 0.25,
@@ -130,6 +132,7 @@ describe("normalizeSplit", () => {
       group: { members: ["a", "b"], sizes: [0.3, 0.7] },
       rendered: [],
       activeId: null,
+      heading: null,
     });
     // The right-hand one first is a different window, and stays one.
     expect(normalizeSplit({ primaryId: "b", secondaryId: "a", ratio: 0.5 }).group?.members).toEqual(
@@ -195,6 +198,7 @@ describe("readStoredSplit", () => {
           group: { members: ["a", "b"], sizes: [0.3, 0.7] },
           rendered: [],
           activeId: null,
+          heading: null,
         });
       },
     );
@@ -502,6 +506,51 @@ describe("splitStore.reconcile", () => {
     expect(members()).toEqual(["a", "b", "c"]);
   });
 
+  test("the column the address bar is on stopping existing names where it goes next", () => {
+    reset();
+    splitStore.arrange(["a", "b", "c"]);
+    // The list refresh got here before the 404 did: it still has to say where
+    // the URL goes, or the window falls back to a lone dead workspace.
+    expect(splitStore.reconcile(new Set(["a", "c"]), "b")).toBe("c");
+    expect(members()).toEqual(["a", "c"]);
+    // And the window can draw that destination before the route arrives.
+    expect(splitStore.get().heading).toBe("c");
+    // The 404 that arrives after it agrees, rather than picking by position.
+    expect(splitStore.remove("b", "b")).toBe("c");
+  });
+
+  test("a pair whose routed member stops existing hands the address bar to the survivor", () => {
+    reset();
+    splitStore.arrange(["a", "b"]);
+    expect(splitStore.reconcile(new Set(["a"]), "b")).toBe("a");
+    expect(splitStore.get().group).toBeNull();
+  });
+
+  test("several gone at once: the nearest survivor to its right, else to its left", () => {
+    reset();
+    splitStore.arrange(["a", "b", "c", "d"]);
+    expect(splitStore.reconcile(new Set(["a", "d"]), "b")).toBe("d");
+    reset();
+    splitStore.arrange(["a", "b", "c", "d"]);
+    expect(splitStore.reconcile(new Set(["a", "b"]), "d")).toBe("b");
+  });
+
+  test("a member leaving that the address bar is not on moves nothing", () => {
+    reset();
+    splitStore.arrange(["a", "b", "c"]);
+    expect(splitStore.reconcile(new Set(["a", "b"]), "a")).toBeNull();
+    expect(splitStore.get().heading).toBeNull();
+    expect(splitStore.reconcile(new Set(["a", "b"]), "z")).toBeNull();
+  });
+
+  test("arriving anywhere ends the heading", () => {
+    reset();
+    splitStore.arrange(["a", "b", "c"]);
+    splitStore.reconcile(new Set(["a", "c"]), "b");
+    splitStore.followRoute("c");
+    expect(splitStore.get().heading).toBeNull();
+  });
+
   test("a list that has not loaded yet is not evidence of anything", () => {
     reset();
     splitStore.arrange(["a", "b"]);
@@ -565,8 +614,13 @@ describe("splitStore persistence", () => {
       // column was drawn before anything had been rendered.
       splitStore.setRendered(["a", "b", "c"]);
     });
-    const written = storage.getItem?.(SPLIT_STORAGE_KEY) ?? "";
-    expect(JSON.parse(written)).toEqual({ members: ["a", "b", "c"], sizes: [0.5, 0.25, 0.25] });
+    const written = JSON.parse(storage.getItem?.(SPLIT_STORAGE_KEY) ?? "");
+    expect(written.members).toEqual(["a", "b", "c"]);
+    expect(written.sizes).toEqual([0.5, 0.25, 0.25]);
+    // Nothing about the session: what is drawn and active stay out of it.
+    expect(Object.keys(written).sort()).toEqual(
+      ["members", "primaryId", "ratio", "secondaryId", "sizes"].sort(),
+    );
   });
 
   test("what it writes reads back as the same split", () => {
@@ -579,6 +633,48 @@ describe("splitStore persistence", () => {
         sizes: [0.5, 0.25, 0.125, 0.125],
       });
     });
+  });
+
+  test("a build from before four columns reads what this one writes as the pair it knows", () => {
+    // A rollback, or a tab still open on the previous deploy, reads storage
+    // through master's own reader. It must find a split, not lose one.
+    for (const [members, sizes, ratio] of [
+      [["a", "b"], [0.3, 0.7], 0.3],
+      [["a", "b", "c"], [0.5, 0.25, 0.25], 2 / 3],
+      [["a", "b", "c", "d"], [0.25, 0.25, 0.25, 0.25], 0.5],
+    ] as const) {
+      const storage = fakeStorage();
+      withStorage(storage, () => {
+        reset();
+        splitStore.arrange(members, sizes);
+      });
+      const written = JSON.parse(storage.getItem?.(SPLIT_STORAGE_KEY) ?? "null");
+      const old = previousBuildReads(written);
+      expect(old.pair).toEqual({ primaryId: "a", secondaryId: "b" });
+      expect(old.ratio).toBeCloseTo(ratio, 9);
+      // And this build still reads its own shape, not the pair beside it.
+      expect(normalizeSplit(written).group?.members).toEqual([...members]);
+    }
+  });
+
+  test("a pair round-trips through the previous build unchanged", () => {
+    // Written here, read there and written back in its shape, read here
+    // again: the same two workspaces in the same order at the same seam.
+    const storage = fakeStorage();
+    withStorage(storage, () => {
+      reset();
+      splitStore.arrange(["b", "a"], [0.3, 0.7]);
+    });
+    const old = previousBuildReads(JSON.parse(storage.getItem?.(SPLIT_STORAGE_KEY) ?? "null"));
+    const rewritten = {
+      primaryId: old.pair?.primaryId,
+      secondaryId: old.pair?.secondaryId,
+      ratio: old.ratio,
+    };
+    const back = normalizeSplit(rewritten).group;
+    expect(back?.members).toEqual(["b", "a"]);
+    expect(back?.sizes[0]).toBeCloseTo(0.3, 9);
+    expect(back?.sizes[1]).toBeCloseTo(0.7, 9);
   });
 
   test("no split is nothing stored", () => {

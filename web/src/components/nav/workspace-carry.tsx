@@ -128,9 +128,9 @@ function shownWindow(routedId: string | null): ShownWindow | null {
   const { group, rendered } = splitStore.get();
   const drawn = group ? rendered.filter((id) => group.members.includes(id)) : [];
   if (group && drawn.length > 0) {
-    return { members: group.members, sizes: group.sizes, drawn };
+    return { members: group.members, sizes: group.sizes, drawn, routed: routedId };
   }
-  return routedId ? { members: [routedId], sizes: [1], drawn: [routedId] } : null;
+  return routedId ? { members: [routedId], sizes: [1], drawn: [routedId], routed: routedId } : null;
 }
 
 /** Whether a point is on the grip of a seam between two columns. */
@@ -280,20 +280,27 @@ export function createWorkspaceCarry({
     },
 
     drop(clientX, clientY) {
-      const next = zoneUnder(clientX, clientY)?.next;
+      const zone = zoneUnder(clientX, clientY);
+      const next = zone?.next;
       // Null is the drop that asks for the arrangement already on screen —
       // released onto the column the workspace is in. Ending here rather than
       // reasserting it is what keeps that from flickering.
-      if (!next || next.members.length < 2) return;
+      if (!zone || !next || next.members.length < 2) return;
       splitStore.arrange(next.members, next.sizes);
       // Whatever you just placed is what you meant to work in.
       splitStore.setActive(workspace.id);
-      // A split is only drawn while the URL names one of its members, so a
-      // drop that displaces the routed workspace has to take the address bar
-      // with it. One that does not — the ordinary case, including every move
-      // and every column added — leaves the route exactly where the user
-      // left it.
-      if (!routedId || !next.members.includes(routedId)) navigate(workspace.id);
+      // The route the preview was drawn with. A split is only drawn while the
+      // URL names one of its members, and the URL's column is always drawn,
+      // so a drop that displaces the routed workspace — or, on a window too
+      // narrow for the whole group, one that would push the URL's column and
+      // the new one apart — takes the address bar with it. The window draws
+      // towards it at once, so it never shows a frame of anything else. The
+      // ordinary drop, every swap and every column added included, leaves the
+      // route exactly where the user left it.
+      if (zone.route && zone.route !== routedId) {
+        splitStore.setHeading(zone.route);
+        navigate(zone.route);
+      }
     },
 
     end() {

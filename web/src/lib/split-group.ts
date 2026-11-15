@@ -68,14 +68,22 @@ function sum(values: readonly number[]): number {
  *
  * Water-filling rather than one pass: lifting a column to the floor can push a
  * neighbour under it, so a pinned column stays pinned and the rest are scaled
- * again. It always ends — the floor is half an even share, so the columns left
- * free can always share what is left above it.
+ * again. It always ends — the floor is never more than an even share, so the
+ * columns left free can always share what is left above it.
+ *
+ * The floor is half an even share unless the caller has a better one: what
+ * the window draws holds its columns to `columnFloor`, which knows the pixels.
  */
-export function clampSizes(sizes: readonly number[]): number[] {
+export function clampSizes(
+  sizes: readonly number[],
+  minimum: number = minShare(sizes.length),
+): number[] {
   const count = sizes.length;
   if (count === 0) return [];
   if (!(sum(sizes) > 0)) return evenSizes(count);
-  const floor = minShare(count);
+  // A floor above an even share cannot be met by every column at once; an
+  // even split is the nearest thing to it.
+  const floor = Math.min(minimum, 1 / count);
   const pinned = new Set<number>();
   let result = [...sizes];
   for (let pass = 0; pass <= count; pass += 1) {
@@ -206,16 +214,23 @@ export function seamPosition(sizes: readonly number[], seam: number): number {
  * Move one seam to `boundary`, a share of the canvas measured from its left
  * edge. Only the two columns either side of it change, and between them they
  * keep the width they had: every other seam stays exactly where it was. Held
- * so neither neighbour drops under its floor, so a caller may hand it raw
- * pointer arithmetic. A boundary that is not a number moves nothing.
+ * so neither neighbour drops under `floor` (half an even share unless the
+ * caller knows better), so a caller may hand it raw pointer arithmetic. A
+ * boundary that is not a number moves nothing.
  */
-export function moveSeam(sizes: readonly number[], seam: number, boundary: number): number[] {
+export function moveSeam(
+  sizes: readonly number[],
+  seam: number,
+  boundary: number,
+  floor: number = minShare(sizes.length),
+): number[] {
   const left = sizes[seam];
   const right = sizes[seam + 1];
   if (left === undefined || right === undefined || !Number.isFinite(boundary)) return [...sizes];
-  const floor = minShare(sizes.length);
   const start = seamPosition(sizes, seam - 1);
   const pair = left + right;
+  // Two neighbours already at their floor between them have nowhere to go.
+  if (pair < 2 * floor) return [...sizes];
   const nextLeft = Math.min(pair - floor, Math.max(floor, boundary - start));
   const next = [...sizes];
   next[seam] = nextLeft;
@@ -262,11 +277,103 @@ export function visibleRun(
   return start;
 }
 
+/**
+ * Which of a group's columns a window draws: the run that fits `capacity`,
+ * scrolled as little as it must to keep the column being worked in
+ * (`activeId`) on screen — and always holding the column the address bar is
+ * about (`routedId`), because a window that does not show the workspace its
+ * URL names is wrong.
+ *
+ * The one rule for it. The window asks it what to draw, and the drop preview
+ * asks it what the window will draw once the drop has landed, so a preview
+ * can never promise a window the drop then does not give.
+ */
+export function drawnColumns(
+  members: readonly string[],
+  capacity: number,
+  previousStart: number,
+  activeId: string | null,
+  routedId: string | null,
+): { start: number; ids: string[] } {
+  const length = Math.min(members.length, capacity);
+  const routedIndex = routedId ? members.indexOf(routedId) : -1;
+  const activeIndex = activeId ? members.indexOf(activeId) : -1;
+  const aroundActive = visibleRun(
+    members.length,
+    capacity,
+    previousStart,
+    activeIndex >= 0 ? activeIndex : routedIndex,
+  );
+  const start =
+    routedIndex >= 0 && (routedIndex < aroundActive || routedIndex >= aroundActive + length)
+      ? visibleRun(members.length, capacity, aroundActive, routedIndex)
+      : aroundActive;
+  return { start, ids: members.slice(start, start + length) };
+}
+
 /** The shares of `length` columns from `start`, scaled to fill the canvas between them. */
 export function runShares(sizes: readonly number[], start: number, length: number): number[] {
   const run = sizes.slice(start, start + length);
   const total = sum(run);
   return total > 0 ? run.map((size) => size / total) : evenSizes(run.length);
+}
+
+/**
+ * The narrowest share of a `widthPx` canvas one of `count` drawn columns may
+ * be. Three or four keep `MIN_COLUMN_PX` each — the width a column was
+ * promised when the window agreed to hold it — as far as the canvas allows:
+ * never more than an even share, so a canvas with only just room for them all
+ * holds them even rather than refusing. A pair keeps the quarter it always
+ * had, at any width, because a pair is drawn at any width.
+ */
+export function columnFloor(count: number, widthPx: number): number {
+  if (count <= MIN_MEMBERS) return minShare(MIN_MEMBERS);
+  const pixels = Number.isFinite(widthPx) && widthPx > 0 ? MIN_COLUMN_PX / widthPx : 0;
+  return Math.max(minShare(count), Math.min(pixels, 1 / count));
+}
+
+/**
+ * The drawn run's shares of the canvas: the run's own widths, held to the
+ * floor for this canvas. What the window draws and what the drop preview
+ * draws, so neither shows a column narrower than the other.
+ *
+ * Held here rather than in what is stored, because the floor depends on how
+ * wide the window is right now: a column left at its minimum on a wide window
+ * is not squeezed under it when the window narrows, or when a column joins.
+ */
+export function drawnShares(
+  sizes: readonly number[],
+  start: number,
+  length: number,
+  widthPx: number,
+): number[] {
+  return clampSizes(runShares(sizes, start, length), columnFloor(length, widthPx));
+}
+
+/**
+ * A seam of the drawn run dragged to `boundary` (a share of the canvas), as
+ * the window does it, written back into the whole group's widths.
+ *
+ * It starts from what is drawn and stops at the drawn floor (`columnFloor`).
+ * It also never takes a column under the floor the whole group is stored at:
+ * on a window too narrow for the group the run is part of the group, and a
+ * drawn column dragged under that floor would be pulled back up when stored
+ * by squeezing the columns that are not drawn — which are meant to keep their
+ * widths. The seam stops instead.
+ */
+export function dragSeam(
+  sizes: readonly number[],
+  start: number,
+  length: number,
+  seam: number,
+  boundary: number,
+  widthPx: number,
+): number[] {
+  const runTotal = sum(sizes.slice(start, start + length));
+  const groupFloor = runTotal > 0 ? minShare(sizes.length) / runTotal : 0;
+  const floor = Math.max(columnFloor(length, widthPx), groupFloor);
+  const moved = moveSeam(drawnShares(sizes, start, length, widthPx), seam, boundary, floor);
+  return withRunShares(sizes, start, moved);
 }
 
 /**

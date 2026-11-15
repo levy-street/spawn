@@ -1,12 +1,12 @@
 import {
   type Columns,
   columnCapacity,
+  drawnColumns,
+  drawnShares,
   insertColumn,
   MAX_MEMBERS,
   moveColumn,
   replaceColumn,
-  runShares,
-  visibleRun,
 } from "@/lib/split-group";
 
 /**
@@ -112,9 +112,11 @@ export interface ShownWindow {
   sizes: readonly number[];
   /**
    * The members actually drawn, left to right: all of them, unless the window
-   * is too narrow to hold the whole group (see `visibleRun`).
+   * is too narrow to hold the whole group (see `drawnColumns`).
    */
   drawn: readonly string[];
+  /** The workspace the address bar is on, or null off a workspace page. */
+  routed: string | null;
 }
 
 /** A workspace in the window a drop would make, and where it would be drawn. */
@@ -135,6 +137,12 @@ export interface DropZone {
   rect: Rect;
   /** The arrangement a release here leaves behind, or null when it changes nothing. */
   next: Columns | null;
+  /**
+   * Where the address bar is once a release here has landed: where it was,
+   * when that workspace is still drawn alongside the one just placed, or the
+   * one just placed when it would otherwise be drawn off the window.
+   */
+  route: string | null;
   /** That arrangement as it would be drawn, column by column. */
   columns: PreviewColumn[];
 }
@@ -150,27 +158,22 @@ function boundsOf(rects: readonly Rect[]): Rect {
 }
 
 /**
- * Some columns laid across a canvas the way the window lays them: the run that
- * fits (see `visibleRun`), at their own shares of the width. The seams between
- * columns take no width of their own, so these are the boxes the panes will
- * actually occupy, to the pixel.
+ * Some columns laid across a canvas the way the window lays them: the run
+ * `drawnColumns` chose, at the widths `drawnShares` holds them to on a canvas
+ * this wide. The seams between columns take no width of their own, so these
+ * are the boxes the panes will actually occupy, to the pixel.
  */
 export function layoutColumns(
   canvas: Rect,
   columns: Columns,
-  capacity: number,
-  previousStart: number,
-  focusId: string | null,
+  run: { start: number; ids: readonly string[] },
 ): PreviewColumn[] {
-  const count = columns.members.length;
-  const focusIndex = focusId ? columns.members.indexOf(focusId) : -1;
-  const start = visibleRun(count, capacity, previousStart, focusIndex);
-  const shares = runShares(columns.sizes, start, Math.min(count, capacity));
   const width = canvas.right - canvas.left;
+  const shares = drawnShares(columns.sizes, run.start, run.ids.length, width);
   const laid: PreviewColumn[] = [];
   let left = canvas.left;
   for (const [offset, share] of shares.entries()) {
-    const workspaceId = columns.members[start + offset];
+    const workspaceId = run.ids[offset];
     if (workspaceId === undefined) continue;
     // Each edge named, never `{...canvas, left, right}`: a canvas is very
     // often built from live `DOMRect`s, whose edges are prototype getters
@@ -180,6 +183,26 @@ export function layoutColumns(
     left = right;
   }
   return laid;
+}
+
+/**
+ * Where the address bar is after `placedId` lands in `members`. It stays put
+ * whenever it can: the workspace it is on is still in the split, and the
+ * window that keeps it drawn draws the one just placed too. Otherwise it
+ * follows the workspace just placed — on a window too narrow for the whole
+ * group, the URL's column and the new one may not both fit, and a drop whose
+ * workspace never appeared would be a drop that did nothing.
+ */
+export function routeAfterDrop(
+  members: readonly string[],
+  capacity: number,
+  previousStart: number,
+  placedId: string,
+  routedId: string | null,
+): string {
+  if (!routedId || !members.includes(routedId)) return placedId;
+  const kept = drawnColumns(members, capacity, previousStart, placedId, routedId);
+  return kept.ids.includes(placedId) ? routedId : placedId;
 }
 
 /**
@@ -203,7 +226,8 @@ export function layoutColumns(
  *
  * The cuts are where the columns' middles are on screen now, so the boundary
  * the pointer flips at is always one the user can see; the preview then draws
- * the window that release would make.
+ * the window that release would make — the one the window really does draw
+ * afterwards, address bar and all (see `routeAfterDrop`).
  */
 export function dropZones(
   draggedId: string,
@@ -228,28 +252,33 @@ export function dropZones(
     workspaceId,
     rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
   }));
-  // The window after a release, drawn around the workspace just placed: on a
-  // window too narrow for the whole group, that is the column it scrolls to.
-  const picture = (next: Columns | null): PreviewColumn[] =>
-    next ? layoutColumns(canvas, next, capacity, runStart, draggedId) : asDrawn;
+  // A release here, as the window will then draw it: the drop makes the
+  // workspace just placed the active column and takes the route where
+  // `routeAfterDrop` says, and the window asks `drawnColumns` — the rule it
+  // always draws by — from the run it is showing now.
+  const landing = (next: Columns | null): Pick<DropZone, "next" | "route" | "columns"> => {
+    if (!next) return { next, route: shown.routed, columns: asDrawn };
+    const route = routeAfterDrop(next.members, capacity, runStart, draggedId, shown.routed);
+    const run = drawnColumns(next.members, capacity, runStart, draggedId, route);
+    return { next, route, columns: layoutColumns(canvas, next, run) };
+  };
 
   const member = shown.members.includes(draggedId);
   const room = shown.members.length < MAX_MEMBERS && shown.members.length < capacity;
   if (!member && room) {
     const middles = drawn.map(({ rect }) => (rect.left + rect.right) / 2);
-    return Array.from({ length: drawn.length + 1 }, (_, slot): DropZone => {
-      const next = insertColumn(current, draggedId, slot);
-      return {
+    return Array.from(
+      { length: drawn.length + 1 },
+      (_, slot): DropZone => ({
         rect: {
           left: middles[slot - 1] ?? canvas.left,
           top: canvas.top,
           right: middles[slot] ?? canvas.right,
           bottom: canvas.bottom,
         },
-        next,
-        columns: picture(next),
-      };
-    });
+        ...landing(insertColumn(current, draggedId, slot)),
+      }),
+    );
   }
   return drawn.map(({ workspaceId, rect }): DropZone => {
     const at = shown.members.indexOf(workspaceId);
@@ -258,8 +287,7 @@ export function dropZones(
       : replaceColumn(current, at, draggedId);
     return {
       rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
-      next,
-      columns: picture(next),
+      ...landing(next),
     };
   });
 }

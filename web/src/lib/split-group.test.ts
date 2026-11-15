@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   clampSizes,
   columnCapacity,
+  dragSeam,
   evenSizes,
   insertColumn,
   MAX_MEMBERS,
@@ -300,5 +301,52 @@ describe("runShares and withRunShares", () => {
     const moved = withRunShares(sizes, 1, [0.75, 0.25]);
     expectShares(moved, [0.4, 0.3, 0.1, 0.2]);
     expect(total(moved)).toBeCloseTo(1, 9);
+  });
+});
+
+describe("dragSeam", () => {
+  /** Each column's width in pixels, as the window will draw `sizes` across `width`. */
+  function pixels(sizes: readonly number[], width: number): number[] {
+    return sizes.map((share) => Math.round(share * width));
+  }
+
+  test("four columns: a seam stops where a column would drop under the minimum width", () => {
+    // 1416px holds four; a seam dragged as far left as it goes used to stop
+    // at an eighth of the canvas, 177px.
+    const four = [0.25, 0.25, 0.25, 0.25];
+    const dragged = dragSeam(four, 0, 4, 0, 0, 1416);
+    expect(Math.min(...pixels(dragged, 1416))).toBeGreaterThanOrEqual(MIN_COLUMN_PX);
+    expect(pixels(dragged, 1416)[0]).toBe(MIN_COLUMN_PX);
+    // The other way, the column to its right stops there instead.
+    const back = dragSeam(four, 0, 4, 0, 1, 1416);
+    expect(pixels(back, 1416)[1]).toBe(MIN_COLUMN_PX);
+  });
+
+  test("three columns hold the minimum too, and a canvas with just room for them all holds them even", () => {
+    const three = [1 / 3, 1 / 3, 1 / 3];
+    expect(Math.min(...pixels(dragSeam(three, 0, 3, 1, 0.9, 1200), 1200))).toBe(MIN_COLUMN_PX);
+    expect(pixels(dragSeam(three, 0, 3, 1, 0.9, 3 * MIN_COLUMN_PX), 3 * MIN_COLUMN_PX)).toEqual([
+      280, 280, 280,
+    ]);
+  });
+
+  test("a pair keeps the quarter it always had, at any width", () => {
+    expectShares(dragSeam([0.5, 0.5], 0, 2, 0, 0, 1416), [0.25, 0.75]);
+    expectShares(dragSeam([0.5, 0.5], 0, 2, 0, 0, 500), [0.25, 0.75]);
+    expectShares(dragSeam([0.5, 0.5], 0, 2, 0, 0.6, 500), [0.6, 0.4]);
+  });
+
+  test("on a folded window the columns it does not draw keep their widths", () => {
+    // Four in the group, the first two drawn. The seam between them dragged
+    // hard left used to leave it at 42% and squeeze the two hidden columns,
+    // because the whole group's floor pulled the drawn one back up.
+    const sizes = [0.125, 0.125, 0.375, 0.375];
+    const dragged = normalizeSizes(dragSeam(sizes, 0, 2, 0, 0.1, 600), 4);
+    expect(dragged[2]).toBeCloseTo(0.375, 9);
+    expect(dragged[3]).toBeCloseTo(0.375, 9);
+    // And what the window then draws is where the seam was left.
+    const drawn = runShares(dragged, 0, 2);
+    const once = runShares(dragSeam(sizes, 0, 2, 0, 0.1, 600), 0, 2);
+    expect(drawn[0]).toBeCloseTo(once[0] ?? 0, 9);
   });
 });
