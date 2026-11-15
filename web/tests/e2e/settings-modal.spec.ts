@@ -303,3 +303,43 @@ test("Admin row is shown for administrators", async ({ page }) => {
   await openSettings(page);
   await expect(page.getByRole("link", { name: "Admin" })).toBeVisible();
 });
+
+test("removing the only passkey warns that browsers that got back in with it need approving again", async ({
+  page,
+}) => {
+  await mockApp(page);
+  // Registered after the app mocks, so it wins: the account has one passkey.
+  await page.route("**/api/trust/passkeys", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: [
+        {
+          id: "00000000-0000-4000-8000-000000000501",
+          credential_id: "only-passkey",
+          label: "Laptop passkey",
+          created_at: "2026-11-01T00:00:00Z",
+        },
+      ],
+    }),
+  );
+  await openSettings(page, "account");
+  const passkeys = page.getByTestId("passkey-list");
+  await expect(passkeys).toContainText("Laptop passkey");
+
+  // #130: removing it revokes what such a browser was approved through, so
+  // the warning must not promise that every device keeps working.
+  // The dialog is answered from its own handler, or the click would stall.
+  let asked = "";
+  page.once("dialog", async (dialog) => {
+    asked = dialog.message();
+    await dialog.dismiss();
+  });
+  await passkeys.getByTestId("revoke-passkey").click();
+  await expect
+    .poll(() => asked)
+    .toContain("Browsers that got back in with this passkey will need approving again.");
+  expect(asked).not.toContain("keep working");
+  // Cancelled: the passkey is still there.
+  await expect(passkeys).toContainText("Laptop passkey");
+});

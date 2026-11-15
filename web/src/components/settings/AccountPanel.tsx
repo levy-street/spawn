@@ -36,9 +36,9 @@ function PasskeysSection() {
     if (count === 1) {
       if (
         !confirm(
-          "Remove your only passkey?\n\nYour devices keep working, but the " +
-            "protection it provides ends: if you ever lose every device, nothing " +
-            "will bring this account's hosts back.",
+          "Remove your only passkey?\n\nBrowsers that got back in with this passkey will " +
+            "need approving again. The protection it provides ends too: if you ever lose " +
+            "every device, nothing will bring this account's hosts back.",
         )
       ) {
         return;

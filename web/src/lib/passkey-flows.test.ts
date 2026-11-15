@@ -11,6 +11,7 @@ import {
 import {
   addBackupPasskey,
   type DeviceRosterRow,
+  describeLastPasskeyRemoval,
   describeUnlockImport,
   type PasskeyFlowsIo,
   type PasskeyRow,
@@ -185,7 +186,7 @@ async function storeBundle(
   credentialId: string,
   seed: number,
   withRoot = false,
-): Promise<void> {
+): Promise<string | null> {
   harness.authenticator.set(credentialId, secretFor(seed));
   const root = withRoot ? await exportAccountRootMaterial(await generateAccountRoot()) : null;
   const { sealed, revision } = await sealCurrentTrust(
@@ -195,6 +196,8 @@ async function storeBundle(
     root,
   );
   harness.bundle = { sealed, revision };
+  // The sealed root's public key, so a test can put it on the roster.
+  return root?.publicKeyWire ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +388,27 @@ describe("removeLastPasskey", () => {
     // and the skip is loud.
     expect(harness.revokedRows).toHaveLength(0);
     expect(outcome.skippedRootReason).toContain("could not be opened");
+    // Nothing was revoked, so every device does keep working.
+    expect(outcome.rootRevoked).toBe(false);
+    expect(describeLastPasskeyRemoval(outcome)).toContain("Your devices keep working");
+  });
+
+  test("revoking the sealed root says who needs approving again, not that devices keep working (#130)", async () => {
+    const harness = new Harness();
+    const rootPublicKey = await storeBundle(harness, "cred-a", 1, true);
+    if (rootPublicKey === null) throw new Error("the bundle was sealed without a root");
+    harness.roster = [
+      { id: "root-row", public_key: rootPublicKey, revoked_at: null, is_root: true },
+    ];
+    const row = harness.listCredential("cred-a");
+
+    const outcome = await removeLastPasskey(harness.io(), row);
+    expect(harness.revokedRows).toEqual([{ id: "root-row", public_key: rootPublicKey }]);
+    expect(outcome.rootRevoked).toBe(true);
+    expect(describeLastPasskeyRemoval(outcome)).toBe(
+      "Passkey removed. Browsers that got back in with it will need approving again. If you " +
+        "lose every device, nothing brings this account's hosts back.",
+    );
   });
 
   test("a transient bundle-fetch failure fails the operation outright", async () => {
