@@ -26,11 +26,12 @@ const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
 // How many terminals stay warm (connected, rendered) in the background. The
 // foreground one is never evicted; the least-recently-active parked ones go
 // first once this is exceeded. Sized for the panes that can be on screen at
-// once rather than for one grid's worth: a split window shows two workspaces
-// side by side, and a pane that is on screen holds its terminal against
-// eviction, so a pool sized for one grid would be entirely spoken for by what
-// is visible and keep nothing warm behind it.
-const WARM_LIMIT = 10;
+// once rather than for one grid's worth: a split window shows up to four
+// workspaces side by side, and a pane that is on screen holds its terminal
+// against eviction, so a pool sized for one grid would be entirely spoken for
+// by what is visible and keep nothing warm behind it. Six for one grid, ten
+// for two, and the same four a grid for each column after that.
+const WARM_LIMIT = 18;
 
 export type SessionLive = {
   connInfo: SessionConnectionInfo | null;

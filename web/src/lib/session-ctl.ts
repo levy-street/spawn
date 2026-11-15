@@ -1,3 +1,10 @@
+import {
+  DAEMON_MAX_COLS,
+  DAEMON_MAX_ROWS,
+  DAEMON_MIN_COLS,
+  DAEMON_MIN_ROWS,
+} from "./terminal-grid";
+
 export const SESSION_CTL_VERSION = 1;
 export const SESSION_CTL_MAX_REQUEST_BYTES = 16 * 1024;
 export const SESSION_CTL_MAX_REPLAY_BYTES = 12 * 1024 * 1024;
@@ -791,12 +798,12 @@ export function parseSessionCtlText(raw: string): SessionCtlTextMessage | null {
       (value.viewers as number) >= 1 &&
       (value.cols === null ||
         (Number.isSafeInteger(value.cols) &&
-          (value.cols as number) >= 20 &&
-          (value.cols as number) <= 400)) &&
+          (value.cols as number) >= DAEMON_MIN_COLS &&
+          (value.cols as number) <= DAEMON_MAX_COLS)) &&
       (value.rows === null ||
         (Number.isSafeInteger(value.rows) &&
-          (value.rows as number) >= 5 &&
-          (value.rows as number) <= 200)) &&
+          (value.rows as number) >= DAEMON_MIN_ROWS &&
+          (value.rows as number) <= DAEMON_MAX_ROWS)) &&
       (value.cols === null) === (value.rows === null)
     ) {
       return value as unknown as SessionCtlDisplayEvent;
