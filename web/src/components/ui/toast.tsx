@@ -64,6 +64,12 @@ export interface ToastOptions {
   actions?: ToastAction[];
   /** Draws a progress bar under the text. */
   progress?: ToastProgress;
+  /**
+   * Called when the person closes the notice with its X — not when it
+   * expires or its owner drops it. For a notice whose "go away" has to be
+   * remembered past this page.
+   */
+  onDismiss?: () => void;
 }
 
 type Toast = {
@@ -77,6 +83,7 @@ type Toast = {
   persistent?: boolean;
   actions?: ToastAction[];
   progress?: ToastProgress;
+  onDismiss?: () => void;
   expiresAt: number;
   /** Playing its exit animation; removed a beat later. */
   leaving?: boolean;
@@ -136,6 +143,7 @@ function push(kind: ToastKind, message: string, options?: ToastOptions): number 
     persistent: options?.persistent,
     actions: options?.actions,
     progress: options?.progress,
+    onDismiss: options?.onDismiss,
     expiresAt,
   };
   // Keep the newest MAX_VISIBLE. Anything already on its way out does not
@@ -321,7 +329,10 @@ export function ToastHost() {
           <button
             type="button"
             aria-label="Dismiss"
-            onClick={() => dismiss(item.id)}
+            onClick={() => {
+              item.onDismiss?.();
+              dismiss(item.id);
+            }}
             className="grid size-5 shrink-0 place-items-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <X className="size-3.5" aria-hidden />
