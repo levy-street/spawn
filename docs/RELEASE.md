@@ -525,9 +525,12 @@ else unknown if either is.
 It also reports `mobile_runtime`, the runtime version an update of this tree
 would carry (from `mobile/app.json`), and `mobile_native_ios_runtime` /
 `mobile_native_android_runtime`, the runtime of each platform's last build.
-Every build so far shares runtime `0.1.0`, because `runtimeVersion` follows an
-unchanged `version`, and every installed app on a runtime receives every update
-published for it. See the runtime warning in "The phone" before building.
+`runtimeVersion` uses the `appVersion` policy, so a runtime is the `expo.version`
+in `mobile/app.json` of the commit an update was published from or a build was
+made from; read the current value there. Nothing bumps it automatically, so
+every build made since the last bump shares one runtime, and every installed
+app on a runtime receives every update published for it. See the runtime
+warning in "The phone" before building.
 
 The fingerprint hashes the whole evaluated app config, `extra` included, and
 `app.config.ts` stamps two values there that are not native: `extra.mobileTree`
@@ -896,10 +899,14 @@ itself, last, when `mobile/` changed, through the script below — but only with
 the native shell still fits (`mobile_native_build=no`). Unset, as in any
 deploy run by hand, it prints the command and that condition instead. Run it
 by hand only after that question has been answered no for the commit you
-publish, on a clean checkout of it after `npm ci` in `mobile/` (the
-fingerprint finds native modules through `node_modules`). The script publishes
-the checked-out branch, so publish from master only while master is still the
-deployed commit; never publish a newer master tip than the server runs:
+publish, as in release checklist step 7: in a clean clone or worktree,
+`git fetch origin && git checkout -B master <deployed commit>`, `npm ci` in
+`mobile/` (the fingerprint finds native modules through `node_modules`), the
+plan, then the script from that same checkout. The script publishes the
+checked-out master's tree and passes its unpushed-commit check because that
+commit is on `origin/master`, so this publishes exactly the deployed commit
+even when `origin/master` has moved on. Never publish from another master,
+stale or newer:
 
 ```bash
 scripts/update-mobile-prod.sh -m "<same summary as the deploy>"
@@ -955,14 +962,19 @@ cd mobile && EXPO_NO_CAPABILITY_SYNC=1 \
   eas build -p ios -e production --non-interactive --auto-submit
 ```
 
-**The runtime warning.** Every build so far has runtime `0.1.0`: `runtimeVersion`
-follows `version`, and `version` has never changed. Every installed app on a
-runtime receives every update published for it. Store builds go to TestFlight
-and Play internal testing, not to the public, and the plan compares only
-against the newest production build of each platform. So: a native module is
-added along with JavaScript that uses it; the release says yes; both platforms
-are built on `0.1.0`. The next release that changes only JavaScript matches
-those new builds, reads no, and publishes an update to every `0.1.0` app — the
+**The runtime warning.** `runtimeVersion` uses the `appVersion` policy: a
+build's runtime is the `expo.version` in `mobile/app.json` at the commit it was
+built from, and nothing bumps it automatically, so every build made since the
+last bump shares one runtime. Read the current value in `mobile/app.json`; the
+plan prints it as `mobile_runtime` and each last build's as
+`mobile_native_ios_runtime` / `mobile_native_android_runtime`. Every installed
+app on a runtime receives every update published for it. Store builds go to
+TestFlight and Play internal testing, not to the public, and the plan compares
+only against the newest production build of each platform. So: a native module
+is added along with JavaScript that uses it; the release says yes; both
+platforms are built without a version bump, on the runtime the installed apps
+already have. The next release that changes only JavaScript matches those new
+builds, reads no, and publishes an update to every app on that runtime — the
 public ones without the module included — and they crash at launch. If the new
 JavaScript cannot run on the app people already have, do not build from that
 release: bump `expo.version` in `mobile/app.json` first and build from the
@@ -1764,14 +1776,18 @@ standard-user accounts.
    It publishes no mobile OTA unless `SPAWN_DEPLOY_MOBILE=1`; leave that unset
    and let step 7 decide.
 7. If `mobile/` changed, ask whether the native shell still fits, for exactly
-   the commit you deployed: on a clean checkout of it, run `npm ci` in `mobile/`
-   (the fingerprint finds native modules through `node_modules`), then
+   the commit you deployed. In a clean clone or worktree (`-B` moves its local
+   master), run `git fetch origin && git checkout -B master <that commit>`, then
+   `npm ci` in `mobile/` (the fingerprint finds native modules through
+   `node_modules`), then
    `scripts/release-plan.sh --from <previous production commit> --to <that commit>`.
-   Only when its mobile store build is `no`, publish that commit with
-   `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"` (from master
-   only while master is still that commit). When it is `yes`, publish no update;
-   read the runtime warning in "The phone", then start a real store build for
-   each platform it names. When it is `unknown`, find out before doing either.
+   Only when its mobile store build is `no`, publish from that same checkout
+   with `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"`; it
+   publishes exactly that commit's tree even when `origin/master` has moved on.
+   Never publish from another master, stale or newer. When it is `yes`, publish
+   nothing for this tree; read the runtime warning in "The phone", then start a
+   real store build for each platform it names. When it is `unknown`, find out
+   before doing either.
 8. Exercise the changed user flow. For network or signalling changes, also run
    `scripts/health-check.sh` with the production `SPAWN_TURN_URLS`; this checks
    the public WebSocket upgrade and the configured UDP TURN listener. Keep the

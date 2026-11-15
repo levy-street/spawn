@@ -251,7 +251,8 @@ class ReleaseWorkflowStoreRule(unittest.TestCase):
         self.assertIn("did not answer", summary)
         # Pinned to the run: master's tip may be newer than the deployed server,
         # and a stale install can hide a new native module from the fingerprint.
-        self.assertIn(f"git fetch origin && git checkout --detach {SHA}", summary)
+        self.assertIn(f"git fetch origin && git checkout -B master {SHA}", summary)
+        self.assertNotIn("--allow-branch", summary)
         self.assertIn("(cd mobile && npm ci)", summary)
         self.assertIn(f"scripts/release-plan.sh --from {BASE} --to {SHA}", summary)
         self.assertNotIn("--to HEAD", summary)

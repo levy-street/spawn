@@ -409,23 +409,23 @@ jobs:
               echo "Deploy job: **$DEPLOY_RESULT**; server, web and daemon do not wait on this"
               echo "check. Nothing was published to phones, because nothing proved this tree"
               echo "still fits the shell they run, and no store build was started. Ask again for"
-              echo "exactly this commit, where Expo is signed in. \`npm ci\` matters: the"
-              echo "fingerprint finds native modules through \`mobile/node_modules\`, so a stale"
-              echo "install can miss a new native dependency."
+              echo "exactly this commit, where Expo is signed in, in a clean clone or worktree"
+              echo "(\`-B\` moves its local master to this commit, as the deploy job does)."
+              echo "\`npm ci\` matters: the fingerprint finds native modules through"
+              echo "\`mobile/node_modules\`, so a stale install can miss a new native dependency."
               echo
               echo '```'
-              echo "git fetch origin && git checkout --detach $CANDIDATE"
+              echo "git fetch origin && git checkout -B master $CANDIDATE"
               echo "(cd mobile && npm ci)"
               echo "scripts/release-plan.sh --from $BASELINE --to $CANDIDATE"
               echo '```'
               echo
-              echo "If its mobile store build is **no**, publish exactly $CANDIDATE and nothing"
-              echo "newer: master may be ahead of the server this run deployed. Run"
-              echo "\`scripts/update-mobile-prod.sh -m \"<summary>\"\` on master only if master is"
-              echo "still at that commit; otherwise from an exact-candidate branch with"
-              echo "\`--allow-branch\` (\"The master pipeline\" in docs/RELEASE.md). If it is"
-              echo "**yes**, publish nothing: a store build is owed for the platforms it names;"
-              echo "read \"The phone\" in docs/RELEASE.md, runtime warning included, first."
+              echo "If its mobile store build is **no**, publish from that same checkout, which"
+              echo "publishes exactly this commit's tree even when origin/master has moved on:"
+              echo "\`scripts/update-mobile-prod.sh -m \"<summary>\"\`. Never publish from another"
+              echo "master, stale or newer. If it is **yes**, publish nothing for this tree: a"
+              echo "store build is owed for the platforms it names; read \"The phone\" in"
+              echo "docs/RELEASE.md, runtime warning first."
             fi
             echo
             echo "Do not use **Re-run all jobs** on this release: it plans again from production,"

@@ -644,9 +644,23 @@ else:
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("deploy-prod: complete", result.stdout)
                 self.assertIn("NOT published", result.stdout)
-                self.assertIn("only if the original release plan", result.stdout)
-                self.assertIn("mobile_native_build=no", result.stdout)
                 self.assertFalse((self.directory / "ota-attempts").exists())
+                # The three plan answers get three distinct lines, and the
+                # publish command is offered under "no" and nowhere else.
+                lines = result.stdout.splitlines()
+                answers = {
+                    answer: [line for line in lines if line.startswith(f"  - {answer}: ")]
+                    for answer in ("no", "yes", "unknown")
+                }
+                for answer, found in answers.items():
+                    self.assertEqual(len(found), 1, (answer, result.stdout))
+                offered = [line for line in lines if "update-mobile-prod.sh" in line]
+                self.assertEqual(offered, answers["no"], result.stdout)
+                self.assertIn("publish it with: scripts/update-mobile-prod.sh -m ", offered[0])
+                for answer in ("yes", "unknown"):
+                    self.assertIn("publish nothing", answers[answer][0])
+                self.assertIn("runtime warning", answers["yes"][0])
+                self.assertIn("ask the plan again", answers["unknown"][0])
 
 
 class CITests(unittest.TestCase):

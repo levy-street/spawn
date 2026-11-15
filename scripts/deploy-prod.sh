@@ -781,11 +781,16 @@ if ! git diff --quiet "$accepted_baseline" "$target_commit" -- mobile; then
   [[ "$branch" == "master" ]] || mobile_args+=(--allow-branch)
 
   if ! mobile_publish_requested; then
+    # Three answers, three different next steps. The publish command belongs
+    # to "no" alone: after a "yes", publishing — even once store builds exist
+    # on an unchanged runtime — reaches installed apps that cannot run it.
     printf 'deploy-prod: mobile/ changed; the phone update was NOT published (SPAWN_DEPLOY_MOBILE is not 1).\n'
-    printf '  Publish it only if the original release plan for %s said mobile_native_build=no;\n' \
+    printf '  What to do depends on mobile_native_build in the original release plan for %s:\n' \
       "$(git rev-parse --short "$target_commit")"
-    printf '  otherwise a store build is owed first (docs/RELEASE.md, "The phone"). Then:\n'
-    printf "    scripts/update-mobile-prod.sh %s\n" "${mobile_args[*]}"
+    printf '  - no: publish it with: scripts/update-mobile-prod.sh%s\n' "$(printf ' %q' "${mobile_args[@]}")"
+    printf '  - yes: publish nothing for this tree; follow "The phone" in docs/RELEASE.md, runtime warning first.\n'
+    printf '  - unknown: publish nothing yet; ask the plan again for exactly %s (docs/RELEASE.md, release checklist step 7).\n' \
+      "$(git rev-parse --short "$target_commit")"
   elif [[ -z "$mobile_channel" ]]; then
     printf 'deploy-prod: mobile/ changed, but no EAS channel is known for %s.\n' "$public_origin" >&2
     printf '  Set SPAWN_DEPLOY_MOBILE_CHANNEL, or publish it yourself:\n' >&2
