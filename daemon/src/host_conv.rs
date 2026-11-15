@@ -47,9 +47,11 @@
 //! A Codex window's thread is also remembered on this host, one note per
 //! window in a folder of spawnd's own (`<config>/conversations/<session
 //! id>.json`). It is noted from every answer and from a look every
-//! `WATCH_INTERVAL` at each window whose foreground may be Codex. Then a
-//! restart after Codex has gone — it quit, crashed, or the host restarted —
-//! still names the thread. A guess at "the latest one in this folder" would
+//! `WATCH_INTERVAL` (5 s) at each window whose foreground may be Codex, and
+//! a fresh thread is noted too, so the thread the person left with `/new`
+//! is not resumed. Then a restart after Codex has gone — it quit, crashed,
+//! or the host restarted — still names the thread, unless it changed in the
+//! last few seconds before. A guess at "the latest one in this folder" would
 //! pick whichever of the folder's windows wrote last. A window stopped here
 //! for good (deleted, archived, moved to another host) is forgotten.
 //!
@@ -97,8 +99,9 @@ const MAX_SESSION_META_BYTES: u64 = 256 * 1024;
 /// A window's remembered thread: one small JSON object.
 const MAX_MEMORY_BYTES: u64 = 1024;
 /// How often each window whose foreground may be Codex is looked at, so its
-/// remembered thread follows `/new` and `/resume`.
-pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(30);
+/// remembered thread follows `/new` and `/resume`: a change made less than
+/// this long before Codex goes can be missed.
+pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Resolves a window's shell from the daemon's session registry, and nothing
 /// else: the only part of that registry `spawn.host.ctl` can reach. Only a
@@ -216,11 +219,18 @@ impl Inspection {
         }
     }
 
-    /// The Codex thread a live answer names, the one worth remembering.
-    fn codex_thread(&self) -> Option<&str> {
-        (self.agent == Some(CODEX))
-            .then_some(self.conversation_id.as_deref())
-            .flatten()
+    /// The Codex thread a live answer finds the window in, worth
+    /// remembering: one with something to resume, or a fresh one, which the
+    /// thread before it must not outlive. None where it tells nothing.
+    fn codex_thread(&self) -> Option<CodexThread> {
+        if self.agent != Some(CODEX) {
+            return None;
+        }
+        match (&self.conversation_id, self.fresh) {
+            (Some(id), false) => Some(CodexThread::Started(id.clone())),
+            (None, true) => Some(CodexThread::Fresh),
+            _ => None,
+        }
     }
 }
 
@@ -890,16 +900,23 @@ impl ConversationMemory {
         }
     }
 
-    /// Note the Codex thread a live answer names, when it is not the one
+    /// Note the Codex thread a live answer finds the window in — a thread
+    /// with something to resume, or a fresh one — when it is not the one
     /// already noted.
     pub(crate) fn note(&self, session_id: Uuid, inspection: &Inspection) {
         let Some(thread) = inspection.codex_thread() else {
             return;
         };
-        if self.recall_thread(session_id).as_deref() == Some(thread) {
+        if self.recall_thread(session_id).as_ref() == Some(&thread) {
             return;
         }
-        let body = serde_json::json!({ "agent": CODEX, "conversation_id": thread });
+        let body = match &thread {
+            CodexThread::Started(id) => {
+                serde_json::json!({ "agent": CODEX, "conversation_id": id })
+            }
+            CodexThread::Fresh => serde_json::json!({ "agent": CODEX, "fresh": true }),
+            CodexThread::Unknown => return,
+        };
         if let Err(error) = self.write(session_id, body.to_string().as_bytes()) {
             tracing::debug!(%session_id, %error, "could not note the window's Codex thread");
         }
@@ -908,24 +925,25 @@ impl ConversationMemory {
     /// The answer for a window no agent runs in, from what was noted.
     pub(crate) fn recall(&self, session_id: Uuid) -> Option<Inspection> {
         Some(Inspection {
-            agent: Some(CODEX),
-            conversation_id: Some(self.recall_thread(session_id)?),
-            state: ConversationState::Unknown,
-            cli_version: None,
-            live_elsewhere: false,
-            fresh: false,
             source: Source::Remembered,
+            ..Inspection::codex(self.recall_thread(session_id)?)
         })
     }
 
-    fn recall_thread(&self, session_id: Uuid) -> Option<String> {
+    /// `{"agent":"codex","conversation_id":<canonical UUID>}` or
+    /// `{"agent":"codex","fresh":true}`, and nothing else.
+    fn recall_thread(&self, session_id: Uuid) -> Option<CodexThread> {
         let bytes = read_small_file(&self.path(session_id), MAX_MEMORY_BYTES)?;
         let value: Value = serde_json::from_slice(&bytes).ok()?;
         let object = value.as_object()?;
         if object.get("agent")?.as_str()? != CODEX {
             return None;
         }
-        canonical_uuid(object.get("conversation_id")?.as_str()?)
+        match (object.get("conversation_id"), object.get("fresh")) {
+            (Some(Value::String(id)), None) => canonical_uuid(id).map(CodexThread::Started),
+            (None, Some(Value::Bool(true))) => Some(CodexThread::Fresh),
+            _ => None,
+        }
     }
 
     /// The note, written whole or not at all, readable by this user alone:
@@ -1003,9 +1021,9 @@ fn may_be_codex(foreground: &str) -> bool {
 }
 
 /// Keep each Codex window's note current. Every `WATCH_INTERVAL`, `windows`
-/// lists this host's windows as (session, shell, foreground); those whose
-/// foreground may be Codex are inspected off the runtime and their notes
-/// updated. Runs for the life of the daemon.
+/// lists this host's windows as (session, shell, foreground), and those
+/// whose foreground may be Codex are looked at off the runtime (`look`).
+/// Runs for the life of the daemon.
 pub(crate) async fn watch(
     windows: impl Fn() -> Vec<(Uuid, u32, String)> + Send + 'static,
     memory: ConversationMemory,
@@ -1014,23 +1032,58 @@ pub(crate) async fn watch(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        let candidates: Vec<(Uuid, u32)> = windows()
-            .into_iter()
-            .filter(|(_, _, foreground)| may_be_codex(foreground))
-            .map(|(session_id, shell, _)| (session_id, shell))
-            .collect();
-        if candidates.is_empty() {
+        let windows = windows();
+        if !windows
+            .iter()
+            .any(|(_, _, foreground)| may_be_codex(foreground))
+        {
             continue;
         }
         let memory = memory.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            for (session_id, shell) in candidates {
-                let _look = looking();
-                memory.note(session_id, &inspect_window(shell));
-            }
+            look(windows, shared_table, &claude_stores(), &memory);
         })
         .await;
     }
+}
+
+/// One look: each window whose foreground may be Codex is inspected and its
+/// note brought up to date, against one reading of the process table,
+/// `table()`, taken only when there is such a window. A host whose
+/// `next dev` and `vite` windows all show `node` reads the table once a
+/// look, not once a window.
+fn look<T: ProcessTable>(
+    windows: Vec<(Uuid, u32, String)>,
+    table: impl FnOnce() -> T,
+    stores: &[PathBuf],
+    memory: &ConversationMemory,
+) {
+    let candidates: Vec<(Uuid, u32)> = windows
+        .into_iter()
+        .filter(|(_, _, foreground)| may_be_codex(foreground))
+        .map(|(session_id, shell, _)| (session_id, shell))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let table = table();
+    for (session_id, shell) in candidates {
+        let _look = looking();
+        memory.note(session_id, &inspect(shell, &table, stores));
+    }
+}
+
+/// The process table for one look at several windows: on Linux one walk of
+/// `/proc`, shared by all of them; on macOS the live table, which lists a
+/// window's own children directly and has no walk to share.
+#[cfg(target_os = "linux")]
+fn shared_table() -> system::Snapshot {
+    system::Snapshot::take()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shared_table() -> SystemProcesses {
+    SystemProcesses
 }
 
 /// This host's processes.
@@ -1079,28 +1132,67 @@ mod system {
         })
     }
 
-    impl ProcessTable for SystemProcesses {
-        fn tree(&self, root: u32) -> Vec<Process> {
-            let Ok(entries) = std::fs::read_dir("/proc") else {
-                return Vec::new();
-            };
+    /// Every process's parent and terminal session, from one walk of
+    /// `/proc`: what a window's tree is read from. A look at several windows
+    /// shares one; everything else is read live.
+    pub(super) struct Snapshot {
+        children: HashMap<u32, Vec<u32>>,
+        sessions: HashMap<u32, u32>,
+    }
+
+    impl Snapshot {
+        pub(super) fn take() -> Self {
             let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
             let mut sessions: HashMap<u32, u32> = HashMap::new();
-            for entry in entries.take(MAX_PROC_ENTRIES).filter_map(Result::ok) {
-                let Some(pid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse::<u32>().ok())
-                else {
-                    continue;
-                };
-                let Some(stat) = stat(pid).filter(|stat| !stat.zombie) else {
-                    continue;
-                };
-                children.entry(stat.ppid).or_default().push(pid);
-                sessions.insert(pid, stat.session);
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.take(MAX_PROC_ENTRIES).filter_map(Result::ok) {
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(stat) = stat(pid).filter(|stat| !stat.zombie) else {
+                        continue;
+                    };
+                    children.entry(stat.ppid).or_default().push(pid);
+                    sessions.insert(pid, stat.session);
+                }
             }
-            walk(root, &children, &sessions)
+            Self { children, sessions }
+        }
+    }
+
+    impl ProcessTable for Snapshot {
+        fn tree(&self, root: u32) -> Vec<Process> {
+            walk(root, &self.children, &self.sessions)
+        }
+
+        fn alive(&self, pid: u32) -> bool {
+            SystemProcesses.alive(pid)
+        }
+
+        fn start_identity(&self, pid: u32) -> Option<String> {
+            SystemProcesses.start_identity(pid)
+        }
+
+        fn executable(&self, pid: u32) -> Option<PathBuf> {
+            SystemProcesses.executable(pid)
+        }
+
+        fn open_files(&self, pid: u32) -> Vec<PathBuf> {
+            SystemProcesses.open_files(pid)
+        }
+
+        fn pid_domain(&self) -> Option<String> {
+            SystemProcesses.pid_domain()
+        }
+    }
+
+    impl ProcessTable for SystemProcesses {
+        fn tree(&self, root: u32) -> Vec<Process> {
+            Snapshot::take().tree(root)
         }
 
         fn alive(&self, pid: u32) -> bool {
@@ -2119,7 +2211,8 @@ mod tests {
         let memory = ConversationMemory::new(notes.path().to_path_buf());
         let window = Uuid::new_v4();
         assert_eq!(memory.recall(window), None);
-        // Nothing to remember: no agent, a Claude Code window, a fresh thread.
+        // Nothing to remember: no agent, a Claude Code window, a Codex whose
+        // threads cannot be told apart.
         memory.note(window, &Inspection::nothing());
         memory.note(
             window,
@@ -2128,13 +2221,17 @@ mod tests {
                 ..started(CONVERSATION)
             },
         );
-        memory.note(window, &Inspection::codex(CodexThread::Fresh));
+        memory.note(window, &Inspection::codex(CodexThread::Unknown));
         assert_eq!(memory.recall(window), None);
         memory.note(window, &started(THREAD_A));
         let remembered = Inspection {
             source: Source::Remembered,
             ..started(THREAD_A)
         };
+        assert_eq!(memory.recall(window), Some(remembered.clone()));
+        // Neither moves it on.
+        memory.note(window, &Inspection::nothing());
+        memory.note(window, &Inspection::codex(CodexThread::Unknown));
         assert_eq!(memory.recall(window), Some(remembered));
         memory.note(window, &started(THREAD_B));
         assert_eq!(
@@ -2143,6 +2240,36 @@ mod tests {
         );
         // One window's note is its own.
         assert_eq!(memory.recall(Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn a_fresh_thread_is_noted_in_place_of_the_one_before_it() {
+        // `/new`, then Codex quits before a message: there is nothing to
+        // resume, and the thread before it is one the person left.
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        memory.note(window, &started(THREAD_A));
+        memory.note(window, &Inspection::codex(CodexThread::Fresh));
+        let fresh = Inspection {
+            source: Source::Remembered,
+            ..Inspection::codex(CodexThread::Fresh)
+        };
+        assert_eq!(memory.recall(window), Some(fresh.clone()));
+        assert_eq!(answer(window, None, Some(&memory)), Some(fresh.clone()));
+        assert_eq!(
+            answer(window, Some(Inspection::nothing()), Some(&memory)),
+            Some(fresh)
+        );
+        // The first message in it gives it a thread to resume.
+        memory.note(window, &started(THREAD_B));
+        assert_eq!(
+            memory.recall(window),
+            Some(Inspection {
+                source: Source::Remembered,
+                ..started(THREAD_B)
+            })
+        );
     }
 
     #[test]
@@ -2209,6 +2336,11 @@ mod tests {
             serde_json::json!({"agent": "codex", "conversation_id": THREAD_A.to_uppercase()})
                 .to_string(),
             serde_json::json!({"agent": "codex"}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh": false}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh": "true"}).to_string(),
+            serde_json::json!({"agent": "codex", "conversation_id": THREAD_A, "fresh": true})
+                .to_string(),
+            serde_json::json!({"agent": "claude-code", "fresh": true}).to_string(),
             format!(
                 "{{\"agent\":\"codex\",\"conversation_id\":\"{THREAD_A}\",\"pad\":\"{}\"}}",
                 "x".repeat(2048)
@@ -2259,18 +2391,89 @@ mod tests {
         );
         assert_eq!(answer(window, None, Some(&memory)), remembered);
         // An agent running in the window is answered for live, whatever was
-        // noted: a fresh Codex thread, or a Codex the host cannot read.
-        let fresh = Inspection::codex(CodexThread::Fresh);
-        assert_eq!(
-            answer(window, Some(fresh.clone()), Some(&memory)),
-            Some(fresh)
-        );
+        // noted: a Codex the host cannot read leaves the note as it was, a
+        // fresh Codex thread replaces it.
         let unknown = Inspection::codex(CodexThread::Unknown);
         assert_eq!(
             answer(window, Some(unknown.clone()), Some(&memory)),
             Some(unknown)
         );
         assert_eq!(answer(window, None, Some(&memory)), remembered);
+        let fresh = Inspection::codex(CodexThread::Fresh);
+        assert_eq!(
+            answer(window, Some(fresh.clone()), Some(&memory)),
+            Some(fresh.clone())
+        );
+        assert_eq!(
+            answer(window, None, Some(&memory)),
+            Some(Inspection {
+                source: Source::Remembered,
+                ..fresh
+            })
+        );
+    }
+
+    #[test]
+    fn a_codex_window_is_looked_at_every_five_seconds() {
+        // The longest a thread change can go unseen before Codex goes
+        // (docs/INTERFACE_MATRIX.md says so).
+        assert_eq!(WATCH_INTERVAL, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn one_look_reads_the_process_table_once_for_every_window() {
+        // Two Codex windows (one under npm's node launcher) and a shell.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        let other = 2000;
+        home.table.spawn(other, 1, Some(2000), "/bin/zsh", "20");
+        home.table
+            .spawn(other + 1, other, Some(2000), "/usr/local/bin/codex", "21");
+        let rollout = home
+            .dir
+            .path()
+            .join("sessions/2026/10/29")
+            .join(format!("rollout-2026-10-29T00-44-04-{THREAD_B}.jsonl"));
+        std::fs::write(&rollout, "{}\n").unwrap();
+        home.table.open.insert(other + 1, vec![rollout]);
+        home.table.spawn(3000, 1, Some(3000), "/bin/bash", "30");
+
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let (node, codex, shell) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let windows = vec![
+            (node, SHELL, "node".to_string()),
+            (codex, other, "codex".to_string()),
+            (shell, 3000, "bash".to_string()),
+        ];
+        let taken = std::cell::Cell::new(0);
+        let table = home.table;
+        look(
+            windows.clone(),
+            || {
+                taken.set(taken.get() + 1);
+                table
+            },
+            &[],
+            &memory,
+        );
+        assert_eq!(taken.get(), 1);
+        let noted = |id| memory.recall(id).and_then(|answer| answer.conversation_id);
+        assert_eq!(noted(node).as_deref(), Some(THREAD_A));
+        assert_eq!(noted(codex).as_deref(), Some(THREAD_B));
+        assert_eq!(noted(shell), None);
+        // A look with no window that may be Codex reads no table at all.
+        look(
+            vec![(shell, 3000, "bash".to_string())],
+            || -> FakeTable {
+                taken.set(taken.get() + 1);
+                FakeTable::default()
+            },
+            &[],
+            &memory,
+        );
+        assert_eq!(taken.get(), 1);
     }
 
     #[test]
@@ -2514,6 +2717,27 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!SystemProcesses.alive(child.id()));
+    }
+
+    /// One reading of the table, shared by a look's windows, walks the
+    /// same tree as the live table does.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_shared_table_walks_a_real_tree() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let me = std::process::id();
+        let table = shared_table();
+        let tree = table.tree(me);
+        assert_eq!(tree.first().map(|process| process.pid), Some(me));
+        assert!(tree.iter().any(|process| process.pid == child.id()));
+        assert_eq!(tree.first(), SystemProcesses.tree(me).first());
+        assert!(table.alive(child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!table.alive(child.id()), "everything but the tree is live");
     }
 
     /// The files this very test holds open, as Codex's would be read: on
