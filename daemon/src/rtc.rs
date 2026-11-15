@@ -9756,6 +9756,85 @@ mod tests {
         offer_pc.close().await.unwrap();
     }
 
+    /// The offer half of the one lock order: a session-scope offer waiting
+    /// on its session's transition — held for a whole restart — does not
+    /// hold the admission lock while it waits. Taken the other way round,
+    /// it holds admission for the length of the restart, and with an attach
+    /// for the same session (transition, then admission) the two deadlock
+    /// and every offer and attach on the daemon with them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_offer_waiting_on_a_session_transition_does_not_hold_admission() {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offer_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        offer_pc
+            .create_data_channel(PTY_DATA_CHANNEL_LABEL, None)
+            .await
+            .unwrap();
+        let offer = offer_pc.create_offer(None).await.unwrap();
+        let mut gathered = offer_pc.gathering_complete_promise().await;
+        offer_pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer_sdp = offer_pc.local_description().await.unwrap().sdp;
+
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (_binding, _commands) = insert_test_worker(&registry, session_id);
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(session_id).await;
+        let (out_tx, _out_rx) = mpsc::channel(16);
+        let offer_sessions = sessions.clone();
+        let offer_registry = registry.clone();
+        let offer_task = tokio::spawn(async move {
+            offer_sessions
+                .handle_offer(
+                    RtcSignalBinding::new(
+                        "waiting-offer".to_string(),
+                        "offer-generation".to_string(),
+                        session_id,
+                    ),
+                    offer_sdp,
+                    Vec::new(),
+                    None,
+                    false,
+                    None,
+                    offer_registry,
+                    out_tx,
+                    None,
+                )
+                .await;
+        });
+        // Whatever the offer holds while it waits on the transition, it
+        // holds once the lock has a second holder: its own wait.
+        let parked = tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.generation_transition_holders(session_id) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let admission_free = sessions.admission.try_lock().is_ok();
+        drop(transition);
+        tokio::time::timeout(Duration::from_secs(10), offer_task)
+            .await
+            .expect("the offer finished once the transition was free")
+            .unwrap();
+        sessions.close_all().await;
+        offer_pc.close().await.unwrap();
+        assert!(
+            parked.is_ok(),
+            "the offer never reached its session's transition"
+        );
+        assert!(
+            admission_free,
+            "an offer waiting on a session's transition holds the admission lock"
+        );
+    }
+
     #[tokio::test]
     async fn backend_transition_closes_real_offer_inserted_before_replacement() {
         let mut media_engine = MediaEngine::default();
