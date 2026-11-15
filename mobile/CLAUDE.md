@@ -137,7 +137,10 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   view attachments. Host-tool surfaces own separate consumer channels;
   `worker/worker-host-consumers.js` isolates their queues and protocol failures
   from the root and sibling consumers. `worker/worker-pair.js` proxies terminal
-  channels through the native bridge. Rebuild `worker.html` and `worker-html.ts` with
+  channels through the native bridge. `worker/worker-channel-watch.js` is the
+  browser's `channel-watch.ts` rule for the host worker's peer; when it finds
+  one on which no channel opens, native `host-transport.ts` replaces the peer.
+  Rebuild `worker.html` and `worker-html.ts` with
   `node src/terminal/worker/build-worker.mjs` after worker source edits.
   Terminal preparation opens session channels while its renderer loads; a bounded
   native queue holds attachment-scoped events until the renderer can consume them.

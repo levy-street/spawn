@@ -1,3 +1,4 @@
+import { REBUILDING_MESSAGE } from "./channel-watch";
 import type { DaemonSnapshot } from "./daemon-connection";
 
 export type HostLiveTone = "active" | "warning" | "offline";
@@ -20,7 +21,7 @@ export type HostLiveStatus = {
  */
 export function hostLiveStatus(
   host: { name: string; status: string },
-  snapshot: Pick<DaemonSnapshot, "state" | "error"> | null,
+  snapshot: Pick<DaemonSnapshot, "state" | "error" | "rebuilding"> | null,
 ): HostLiveStatus {
   if (host.status !== "online") {
     return {
@@ -41,6 +42,16 @@ export function hostLiveStatus(
   if (snapshot.error || snapshot.state === "error" || snapshot.state === "unauthorized") {
     const problem = snapshot.error ?? `Can't reach ${host.name} from this device.`;
     return { tone: "warning", label: problem, problem, reconnecting: true };
+  }
+  // Being replaced because nothing new opened on it (channel-watch.ts): the
+  // row says why, as the phone's host card does.
+  if (snapshot.rebuilding) {
+    return {
+      tone: "warning",
+      label: REBUILDING_MESSAGE,
+      problem: REBUILDING_MESSAGE,
+      reconnecting: true,
+    };
   }
   return {
     tone: "warning",

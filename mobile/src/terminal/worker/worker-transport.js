@@ -164,7 +164,9 @@
     if (state.mode !== "host") throw new Error("Terminal views attach to the daemon connection.");
     if (state.pc?.connectionState === "connected" && message.forceRebuild !== true) return;
     if (state.pc && state.rtcSessionId === message.rtcSessionId) return;
-    teardown(false);
+    // A peer replaced because no channel opened on it tells the server and
+    // daemon its binding is closed; any other replacement's binding is gone.
+    teardown(message.closePrevious === true);
     state.stopped = false;
     state.rtcSessionId = message.rtcSessionId;
     state.bindingNonce = message.bindingNonce;
@@ -193,6 +195,8 @@
     };
     pc.onconnectionstatechange = () => {
       if (pc !== state.pc) return;
+      // What the channel watch was waiting on belonged to the readiness that ended.
+      if (pc.connectionState !== "connected") api.channelWatch?.reset();
       if (["failed", "disconnected"].includes(pc.connectionState)) {
         api.post({ type: "state", state: "connecting" });
       }
@@ -312,6 +316,7 @@
   }
 
   function teardown(sendClose) {
+    api.channelWatch?.reset();
     api.resetHostGeneration?.();
     api.closeHostConsumers?.();
     api.closePairChannels?.();

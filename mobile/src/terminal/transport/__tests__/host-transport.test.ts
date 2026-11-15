@@ -498,6 +498,93 @@ describe("HostTransport signalling", () => {
     }
   });
 
+  test("a peer on which no channel opens is replaced at the worker's word, and views are told why", async () => {
+    const { transport, bridge, signal } = await readyTransport();
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errors: unknown[] = [];
+    transport.on("error", (error) => errors.push(error));
+    const states: string[] = [];
+    transport.on("state", (state) => states.push(state));
+    try {
+      const connects = () =>
+        bridge.sent.filter(
+          (message): message is Extract<NativeToWorkerMessage, { type: "connect" }> =>
+            message.type === "connect",
+        );
+      const active = connects()[0]?.rtcSessionId ?? "";
+      const rebuild = (rtcSessionId: string, rebuilds: number) =>
+        bridge.emit({
+          v: 1,
+          type: "rebuild",
+          reason: "channels_unanswered",
+          rtcSessionId,
+          waitedMs: 10_000,
+          probeMs: 20_000,
+          rootAnswered: true,
+          rootMs: 42,
+          rebuilds,
+        });
+      rebuild(active, 1);
+      // A fresh peer on the same signalling socket, closing the old binding.
+      expect(connects()).toHaveLength(2);
+      expect(connects()[1]).toMatchObject({ forceRebuild: true, closePrevious: true });
+      // The signalling socket stays open: it carries the old binding's close
+      // and the new offer.
+      expect(signal.listeners.size).toBeGreaterThan(0);
+      expect(states).toEqual(["connecting"]);
+      expect(errors).toEqual([
+        {
+          code: "channels_unanswered",
+          message:
+            "The connection stopped opening new terminals and tools. SPAWN D is making a new one.",
+          retryable: true,
+        },
+      ]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toBe(
+        "SPAWN D: host 00112233-4455-6677-8899-aabbccddeeff: no new channel opens on its " +
+          "connection (one waited 10.0 s, two probes 20.0 s, while the root channel answered " +
+          "a ping in 42 ms); making a new connection (1 in a row).",
+      );
+
+      // Not ready: nothing to replace, and no second peer is stacked on it.
+      rebuild(active, 2);
+      expect(connects()).toHaveLength(2);
+    } finally {
+      warn.mockRestore();
+      transport.close();
+    }
+  });
+
+  test("a rebuild the worker asked for about a peer native has since replaced is ignored", async () => {
+    const { transport, bridge } = await readyTransport();
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errors: unknown[] = [];
+    transport.on("error", (error) => errors.push(error));
+    try {
+      const connects = () => bridge.sent.filter((message) => message.type === "connect");
+      // Ready on its current peer; the message names the one before it.
+      bridge.emit({
+        v: 1,
+        type: "rebuild",
+        reason: "channels_unanswered",
+        rtcSessionId: "a-peer-already-replaced",
+        waitedMs: 10_000,
+        probeMs: 20_000,
+        rootAnswered: true,
+        rootMs: 1,
+        rebuilds: 1,
+      });
+      expect(connects()).toHaveLength(1);
+      expect(transport.state).toBe("ready");
+      expect(errors).toEqual([]);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      transport.close();
+    }
+  });
+
   test("fatal signalling retires the worker and rejects active work without losing the failure", async () => {
     const { bridge, signal, transport } = await readyTransport();
     const pending = transport.request("host.metrics", {});
