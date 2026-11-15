@@ -28,21 +28,37 @@
 //! the shell's terminal session.
 //!
 //! Codex keeps no registry and cannot be launched under an id. Its threads
-//! are told apart by what the process holds open (Codex 0.155.1):
+//! are told apart by what the process holds open (Codex 0.155.1, and 0.167.2
+//! re-checked with strace on 2026-11-15):
 //!
 //! * a writer lock per thread it has loaded,
 //!   `<CODEX_HOME>/thread-writer-locks/<id>.lock`, from the moment the
 //!   thread starts, before anything is written to it;
 //! * the thread's rollout, `…/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`,
-//!   from its first message, or at once when it is resumed.
+//!   from its first message, or at once when it is resumed — about 1 ms
+//!   after its lock, which a resume creates afresh (an in-app `/resume`
+//!   first lets the thread go, even one still loaded).
 //!
-//! Neither is let go when the person moves on. `/new` and `/resume` start or
-//! load another thread and keep the last one, and a subagent's thread has
-//! its own. So a long-lived Codex holds several. The one in front of the
-//! person is the primary thread written last: starting or resuming a thread
-//! writes its lock, and resuming or messaging it writes its rollout. A
-//! subagent's thread is never that thread, and its rollout's first line
-//! (`session_meta`) says so.
+//! `/new` and `/resume` start or load another thread, and a subagent's
+//! thread has its own, so Codex can hold several. 0.155.1 kept them all;
+//! 0.167.2 lets a thread the person has left go about a minute later. Letting
+//! go — then, and on quit — closes the rollout first and the lock 2 to 50 ms
+//! after, and removes the lock's file. The thread in front of the person is
+//! the primary thread written last: starting or resuming a thread creates
+//! its lock, and messaging it writes its rollout. A subagent's thread is
+//! never that thread, and its rollout's first line (`session_meta`) says so.
+//! Codex also reads other threads' rollouts for a moment (at start, and when
+//! resuming), always while holding a lock of its own, which is why a rollout
+//! held without its lock is not counted where any lock is held; with no lock
+//! held, the only rollout seen open is the one a resume is about to lock.
+//!
+//! By default Codex 0.167.2 keeps its threads in a shared background server
+//! (`codex app-server`, started by the first Codex and used by every later
+//! one: the `daemon_auto_start` feature), a process in a session of its own,
+//! outside every window. A window's Codex then holds none of its threads: it
+//! is answered as Codex with no id, nothing is noted, and a restart falls
+//! back to "the latest one here" as before. Only a Codex run without that
+//! server (`--no-daemon`, or a version without it) is named.
 //!
 //! A Codex window's thread is also remembered on this host, one note per
 //! window in a folder of spawnd's own (`<config>/conversations/<session
@@ -2234,6 +2250,20 @@ mod tests {
             .join(format!("rollout-2026-10-29T00-50-00-{id}.jsonl"));
         home.lock(id, at - 1);
         home.hold(path, at, contents);
+    }
+
+    #[test]
+    fn a_resume_before_its_lock_is_told_by_its_rollout_alone() {
+        // `codex resume` (0.167.2): the picker holds nothing; once a thread is
+        // chosen, Codex reads its rollout for some 270 ms before taking its
+        // lock, and no other rollout is open meanwhile. With no lock held,
+        // the rollouts are what there is, and they name the thread being
+        // resumed. (Decided from strace, 2026-11-15: no answer of "unknown"
+        // for a Codex home that keeps locks but holds none.)
+        let mut home = CodexHome::new();
+        home.primary(THREAD_A, 12);
+        assert!(home.dir.path().join("thread-writer-locks").is_dir());
+        assert_eq!(home.inspect(), started(THREAD_A));
     }
 
     #[test]
