@@ -4,7 +4,7 @@ import { type DeviceStorageNoticeFacts, deviceStorageNoticeWanted } from "./devi
 const atRisk: DeviceStorageNoticeFacts = {
   persistence: "refused",
   hasPasskey: false,
-  localHostCount: 1,
+  approved: true,
   dismissed: false,
   desktopShell: false,
 };
@@ -24,9 +24,9 @@ test("nothing is shown when the account already has a passkey, or before that is
   expect(deviceStorageNoticeWanted({ ...atRisk, hasPasskey: null })).toBe(false);
 });
 
-test("a browser with no approval to lose yet is left to the waiting card", () => {
-  expect(deviceStorageNoticeWanted({ ...atRisk, localHostCount: 0 })).toBe(false);
-  expect(deviceStorageNoticeWanted({ ...atRisk, localHostCount: null })).toBe(false);
+test("a browser that is registered but not approved is left to the waiting card", () => {
+  expect(deviceStorageNoticeWanted({ ...atRisk, approved: false })).toBe(false);
+  expect(deviceStorageNoticeWanted({ ...atRisk, approved: null })).toBe(false);
 });
 
 test("a dismissal is final in this browser, and the desktop app never shows it", () => {

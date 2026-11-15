@@ -18,8 +18,8 @@ import type { DeviceStoragePersistence } from "./persistent-storage";
 export const DEVICE_STORAGE_NOTICE = {
   title: "This browser may forget its approval",
   body:
-    "Your browser can clear the key that marks it as approved. Add a passkey and it can get " +
-    "back in on its own, without another device.",
+    "Your browser can clear what marks it as approved. Add a passkey and it can get back in " +
+    "on its own, without another device.",
   addPasskey: "Add passkey",
   notNow: "Not now",
 } as const;
@@ -46,11 +46,13 @@ export interface DeviceStorageNoticeFacts {
    */
   hasPasskey: boolean | null;
   /**
-   * Hosts this browser itself holds trust for. A browser that holds none has
-   * no approval to lose yet (a brand-new one is still on the waiting card,
-   * which says the same thing in its own place). Null while unknown.
+   * Whether this browser is approved now, by the session gate's own test
+   * (`useCurrentDeviceApproval`). One that is not has no approval to lose: a
+   * brand-new or removed browser is on the waiting card, which says the same
+   * thing in its own place. Host trust this browser holds is not the test — it
+   * outlives the browser's removal. Null while unknown.
    */
-  localHostCount: number | null;
+  approved: boolean | null;
   /** "Not now", or the notice's X, earlier in this browser. */
   dismissed: boolean;
   /** Inside the desktop app rather than a browser tab. */
@@ -66,8 +68,7 @@ export function deviceStorageNoticeWanted(facts: DeviceStorageNoticeFacts): bool
   return (
     facts.persistence === "refused" &&
     facts.hasPasskey === false &&
-    facts.localHostCount !== null &&
-    facts.localHostCount > 0 &&
+    facts.approved === true &&
     !facts.dismissed &&
     !facts.desktopShell
   );

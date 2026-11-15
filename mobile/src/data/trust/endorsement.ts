@@ -48,8 +48,7 @@ const endpointApi: EndorsementApi = { createEndorsement, createAccountEndorsemen
  */
 export const passkeyPrfCapability = {
   available: false as const,
-  reason:
-    "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
+  reason: "Passkeys are added and used in SPAWN D in a browser.",
 };
 
 export function probePasskeyPrfCapability(): Promise<typeof passkeyPrfCapability> {

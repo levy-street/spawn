@@ -119,5 +119,9 @@ describe("trust registration and endorsement flows", () => {
     // The installed build cannot use one either; pointing at it was untrue (#121).
     expect(passkeyPrfCapability.reason).not.toMatch(/installed build|Expo Go/);
     expect(passkeyPrfCapability.reason).toMatch(/SPAWN D in a browser/);
+    // Shown on an already approved phone too, so it gives no instruction.
+    expect(passkeyPrfCapability.reason).toBe(
+      "Passkeys are added and used in SPAWN D in a browser.",
+    );
   });
 });

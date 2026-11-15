@@ -365,6 +365,13 @@ export interface AppMockOptions {
   pairings?: Array<Record<string, unknown>>;
   /** Seeded durable host-introduction rows (continuous gossip store). */
   hostIntroductions?: Array<Record<string, unknown>>;
+  /**
+   * Let the "This browser may forget its approval" notice (#121) appear. Off
+   * by default, as if answered Not now earlier: headless Chromium refuses to
+   * keep storage on its own, so on every approved mock browser without a
+   * passkey the notice would sit over the top right of whatever a spec clicks.
+   */
+  storageNotice?: boolean;
 }
 
 export async function mockApp(page: Page, options: AppMockOptions = {}): Promise<AppMockStore> {
@@ -438,6 +445,17 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
   const hostIntroductionRows: Array<Record<string, unknown>> = (
     options.hostIntroductions ?? []
   ).map((row) => ({ ...row }));
+
+  const accountId = (store.user as { id?: unknown } | null)?.id;
+  if (options.storageNotice !== true && typeof accountId === "string") {
+    await page.addInitScript((key) => {
+      try {
+        window.localStorage.setItem(key, "1");
+      } catch {
+        // about:blank and opaque origins have no storage; nothing shows there.
+      }
+    }, `spawn:access:storage-notice:${accountId}`);
+  }
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,

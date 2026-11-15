@@ -86,7 +86,7 @@ function PasskeysSection() {
           brings everything back.
         </p>
         <p className="mt-1 text-sm text-muted-foreground" data-testid="passkey-way-back">
-          A passkey lets a browser or device that has lost its approval get back in on its own.
+          A passkey lets a browser that has lost its approval get back in on its own.
         </p>
       </div>
       {!passkey.supported && (

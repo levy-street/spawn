@@ -67,7 +67,9 @@ export interface ToastOptions {
   /**
    * Called when the person closes the notice with its X — not when it
    * expires or its owner drops it. For a notice whose "go away" has to be
-   * remembered past this page.
+   * remembered past this page. A duplicate push (same message and detail as a
+   * live notice) only refreshes that notice, so it keeps the first push's
+   * handler and this one is dropped.
    */
   onDismiss?: () => void;
 }
@@ -330,8 +332,13 @@ export function ToastHost() {
             type="button"
             aria-label="Dismiss"
             onClick={() => {
-              item.onDismiss?.();
-              dismiss(item.id);
+              // The row leaves even if its owner's handler throws: a notice
+              // whose X does nothing would be stuck on screen for good.
+              try {
+                item.onDismiss?.();
+              } finally {
+                dismiss(item.id);
+              }
             }}
             className="grid size-5 shrink-0 place-items-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >

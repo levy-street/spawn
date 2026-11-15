@@ -113,13 +113,11 @@ jest.mock("@/data/trust/host-pins", () => ({
 jest.mock("@/data/trust/endorsement", () => ({
   passkeyPrfCapability: {
     available: false,
-    reason:
-      "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
+    reason: "Passkeys are added and used in SPAWN D in a browser.",
   },
   probePasskeyPrfCapability: jest.fn(async () => ({
     available: false,
-    reason:
-      "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
+    reason: "Passkeys are added and used in SPAWN D in a browser.",
   })),
 }));
 
@@ -214,9 +212,7 @@ describe("settings panel behavior", () => {
       ),
     ).toBeOnTheScreen();
     expect(
-      screen.getAllByText(
-        "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
-      ).length,
+      screen.getAllByText("Passkeys are added and used in SPAWN D in a browser.").length,
     ).toBeGreaterThan(0);
   });
 

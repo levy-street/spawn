@@ -1,4 +1,4 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Page, type Route, test } from "@playwright/test";
 import { BROWSER_DEVICE_ID, HOST_ID, host, mockApp, USER_ID } from "./app-mocks";
 
 // #121: Chrome clears a best-effort origin's IndexedDB — the device key with
@@ -11,6 +11,12 @@ const KEYED_HOST = {
   host_public_key: "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
 };
 const TITLE = "This browser may forget its approval";
+/** An approved browser (a host pins it) on an account without a passkey. */
+const APPROVED = {
+  hosts: [KEYED_HOST],
+  hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
+  storageNotice: true,
+};
 
 async function answerPersist(page: Page, granted: boolean): Promise<void> {
   await page.addInitScript((answer) => {
@@ -20,7 +26,11 @@ async function answerPersist(page: Page, granted: boolean): Promise<void> {
   }, granted);
 }
 
-/** This browser holds trust for one host: it has an approval worth keeping. */
+/**
+ * This browser holds trust for one host, as an approved one does. It is not
+ * what makes the browser approved — that is the server's pins and chains, the
+ * session gate's own test — and it outlives the browser's removal.
+ */
 async function seedLocalHostPin(page: Page): Promise<void> {
   await page.evaluate(
     async ({ accountId, hostId, hostPublicKey }) => {
@@ -83,13 +93,13 @@ test("a refused browser on an account without a passkey is told once, and Not no
   page,
 }) => {
   await answerPersist(page, false);
-  await mockApp(page, { hosts: [KEYED_HOST], hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] } });
+  await mockApp(page, APPROVED);
   await openApprovedBrowser(page);
 
   const notice = page.getByRole("status").filter({ hasText: TITLE });
   await expect(notice).toBeVisible();
   await expect(notice).toContainText(
-    "Your browser can clear the key that marks it as approved. Add a passkey and it can get back in on its own, without another device.",
+    "Your browser can clear what marks it as approved. Add a passkey and it can get back in on its own, without another device.",
   );
   await expect(notice.getByRole("button", { name: "Add passkey" })).toBeVisible();
   await notice.getByRole("button", { name: "Not now" }).click();
@@ -103,7 +113,7 @@ test("a refused browser on an account without a passkey is told once, and Not no
 
 test("closing it with its X is remembered too", async ({ page }) => {
   await answerPersist(page, false);
-  await mockApp(page, { hosts: [KEYED_HOST], hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] } });
+  await mockApp(page, APPROVED);
   await openApprovedBrowser(page);
 
   const notice = page.getByRole("status").filter({ hasText: TITLE });
@@ -117,7 +127,7 @@ test("closing it with its X is remembered too", async ({ page }) => {
 
 test("Add passkey goes to Account, where passkeys are added", async ({ page }) => {
   await answerPersist(page, false);
-  await mockApp(page, { hosts: [KEYED_HOST], hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] } });
+  await mockApp(page, APPROVED);
   await openApprovedBrowser(page);
 
   const notice = page.getByRole("status").filter({ hasText: TITLE });
@@ -126,13 +136,13 @@ test("Add passkey goes to Account, where passkeys are added", async ({ page }) =
   const passkeys = page.getByTestId("passkey-list");
   await expect(passkeys).toBeVisible();
   await expect(passkeys.getByTestId("passkey-way-back")).toHaveText(
-    "A passkey lets a browser or device that has lost its approval get back in on its own.",
+    "A passkey lets a browser that has lost its approval get back in on its own.",
   );
 });
 
 test("nothing is shown when the browser keeps its storage", async ({ page }) => {
   await answerPersist(page, true);
-  await mockApp(page, { hosts: [KEYED_HOST], hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] } });
+  await mockApp(page, APPROVED);
   await openApprovedBrowser(page);
   await expect(page.getByRole("button", { name: "New workspace" }).first()).toBeVisible();
   await page.waitForTimeout(1500);
@@ -141,7 +151,7 @@ test("nothing is shown when the browser keeps its storage", async ({ page }) => 
 
 test("nothing is shown when the account already has a passkey", async ({ page }) => {
   await answerPersist(page, false);
-  await mockApp(page, { hosts: [KEYED_HOST], hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] } });
+  await mockApp(page, APPROVED);
   // Registered after the app mocks, so it wins: a sealed bundle exists.
   await page.route("**/api/trust/bundle", (route) =>
     route.fulfill({
@@ -154,4 +164,80 @@ test("nothing is shown when the account already has a passkey", async ({ page })
   await expect(page.getByRole("button", { name: "New workspace" }).first()).toBeVisible();
   await page.waitForTimeout(1500);
   await expect(page.getByRole("status").filter({ hasText: TITLE })).toHaveCount(0);
+});
+
+test("a removed browser that still holds host trust is not told, it is waiting", async ({
+  page,
+}) => {
+  await answerPersist(page, false);
+  // The host now trusts another device only: this browser was removed and
+  // registered again, but the host trust it held stays in its storage.
+  await mockApp(page, {
+    ...APPROVED,
+    hostPins: { [HOST_ID]: ["00000000-0000-4000-8000-000000000099"] },
+  });
+  await page.goto("/app");
+  // The workspace is a live-terminal surface, so the waiting card covers it.
+  const waitingCard = page.getByTestId("session-approval-gate");
+  await expect(waitingCard).toBeVisible();
+  await seedLocalHostPin(page);
+  await page.reload();
+  await expect(waitingCard).toBeVisible();
+  // The card carries the passkey line; the notice would only repeat it, wrongly.
+  await expect(waitingCard.getByTestId("session-gate-passkey-hint")).toBeVisible();
+  await page.waitForTimeout(1500);
+  await expect(page.getByRole("status").filter({ hasText: TITLE })).toHaveCount(0);
+});
+
+test("nothing is shown while the passkey check is still loading, or when it fails", async ({
+  page,
+}) => {
+  await answerPersist(page, false);
+  await mockApp(page, APPROVED);
+  // Registered after the app mocks, so it wins. Held first, then failing:
+  // an unknown answer must never read as "no passkey".
+  let bundleAnswer: "hold" | "fail" | "none" = "hold";
+  let held: Route | null = null;
+  await page.route("**/api/trust/bundle", async (route) => {
+    if (bundleAnswer === "hold") {
+      held = route;
+      return;
+    }
+    if (bundleAnswer === "fail") {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        json: { detail: "down" },
+      });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", json: null });
+  });
+  await openApprovedBrowser(page);
+  await expect(page.getByRole("button", { name: "New workspace" }).first()).toBeVisible();
+  await expect.poll(() => held !== null).toBe(true);
+  await page.waitForTimeout(1500);
+  const notice = page.getByRole("status").filter({ hasText: TITLE });
+  await expect(notice).toHaveCount(0);
+
+  // The check fails (and its one retry fails too): still nothing.
+  bundleAnswer = "fail";
+  let failures = 0;
+  page.on("response", (response) => {
+    if (response.url().endsWith("/api/trust/bundle") && response.status() === 503) failures += 1;
+  });
+  await (held as Route | null)?.fulfill({
+    status: 503,
+    contentType: "application/json",
+    json: { detail: "down" },
+  });
+  await expect.poll(() => failures).toBeGreaterThanOrEqual(2);
+  await page.waitForTimeout(1000);
+  await expect(notice).toHaveCount(0);
+
+  // The same browser, once the check answers "no passkey", is told: the
+  // silence above was the unknown answer, not something else.
+  bundleAnswer = "none";
+  await page.reload();
+  await expect(notice).toBeVisible();
 });

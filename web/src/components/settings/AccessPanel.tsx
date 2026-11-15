@@ -13,6 +13,7 @@ import { IntroductionPanel } from "@/components/trust/introduction-panel";
 import { Button } from "@/components/ui/button";
 import { confirm as confirmAction } from "@/components/ui/confirm";
 import { Input } from "@/components/ui/input";
+import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { type AccessPinDetail, deriveAccessView } from "@/lib/access-view";
 import { type BrowserDevice, browserDevices, hosts as hostsApi, trust } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
@@ -314,6 +315,9 @@ export function AccessPanel() {
   const [legacyNote, setLegacyNote] = useState<string | null>(null);
   const [nudgeDismissed, setNudgeDismissed] = useState(true);
   const storagePersistence = useDeviceStoragePersistence();
+  // Passkeys are unproven inside the desktop app's webview, so the waiting
+  // callout's passkey line stays out of it, as the storage notice does (#121).
+  const desktopShell = useDesktopShell(true);
   useEffect(() => {
     if (!user) return;
     setNudgeDismissed(window.localStorage.getItem(NUDGE_DISMISSED_KEY(user.id)) === "1");
@@ -452,7 +456,7 @@ export function AccessPanel() {
             Approve it from a device you already use — you'll type this device's number there
             {passkey.hasBundle ? ", or use your passkey here" : ""}.
           </p>
-          {passkey.bundle.data === null && (
+          {passkey.bundle.data === null && !desktopShell && (
             <p className="text-xs text-muted-foreground" data-testid="untrusted-passkey-hint">
               {NO_PASSKEY_WAITING_HINT}
             </p>

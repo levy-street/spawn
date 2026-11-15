@@ -47,7 +47,11 @@ Anything that needs an additional concept gets redesigned until it doesn't.
 - **device** — the phone or laptop you're holding. Not "browser" (users don't think of a
   phone as a browser), not "client". A host is colloquially also a device, but no screen
   ever mixes the two lists, so the collision is never experienced — and the guard below
-  keeps it that way.
+  keeps it that way. *(Exception, 2026-11-15, #121.)* Copy about the browser's own
+  storage says "browser": the notice *"This browser may forget its approval"* (§6) and
+  the passkey caption below. Only a browser's storage can be cleared out from under the
+  person, and the phone cannot use a passkey, so "device" there would promise the wrong
+  thing.
 - **host** — what your agents run on. The rest of the product already calls them Hosts
   (the sidebar, the pages), and it is the protocol's own word — one noun, one name,
   everywhere. "Your devices reach your hosts."
@@ -68,7 +72,8 @@ Anything that needs an additional concept gets redesigned until it doesn't.
 - **passkey** — used as-is, lowercase, exactly as the platform means it. Its extra
   powers get plain captions where passkeys are managed: *"Your passkey also restores
   your devices and hosts if you lose everything."* and, since 2026-11-15 (#121), *"A
-  passkey lets a browser or device that has lost its approval get back in on its own."*
+  passkey lets a browser that has lost its approval get back in on its own."* (the
+  phone's Device trust screen says the same).
 
 Words that never appear: root, chain, anchor, pin, bundle, heal, endorsement, SAS,
 fingerprint, key, revoke, mesh, ceremony, tombstone, TOFU, signature, **recovery**.
@@ -174,7 +179,8 @@ terminal state precisely so the residual is a chosen, contained trade.
   account with no passkey the card — and the Access panel's waiting callout — adds one
   line: *"Once you're in, add a passkey in Account. Next time this device can get back
   in without another one."* The phone's waiting sheet does not: the app cannot use a
-  passkey (below, §6), so the line would be untrue there.
+  passkey (below, §6), so the line would be untrue there. Nor does the desktop app,
+  where passkeys are unproven in its webview.
 - existing device: the request arrives as a prompt (`ApproveRequest`) → NumberCheck
   (enter side). The roster's waiting row is the pull path to the same place. *(The
   desktop corner toast that offered "Enter its number" for every unapproved sign-in
@@ -278,15 +284,18 @@ device key lives in the origin's IndexedDB, which Chrome clears under disk press
 `navigator.storage.persist()` silently by heuristic. The app keeps the browser's answer
 (granted / refused / unsupported; Access shows it under "Browser storage") and asks
 again when notifications are allowed, since Chrome keeps the storage of a site that may
-notify. When the answer is *refused*, the account has no passkey, and this browser holds
-host trust worth keeping, it shows one quiet notice in the ordinary notice place:
-*"This browser may forget its approval"* / *"Your browser can clear the key that marks
-it as approved. Add a passkey and it can get back in on its own, without another
-device."* — *Add passkey* (opens Account) and *Not now*. *Not now* and the notice's X
-are remembered in that browser; the notice never appears once the account has a
-passkey, in a browser that kept its storage, or inside the desktop app (whose webview
-storage is a separate question). The phone's key sits in the OS keychain/keystore and is
-not cleared this way.
+notify. When the answer is *refused*, the account has no passkey, and this browser is
+approved now — by the waiting card's own test (§3), not by the host trust it holds,
+which outlives its removal — it shows one quiet notice in the ordinary notice place:
+*"This browser may forget its approval"* / *"Your browser can clear what marks it as
+approved. Add a passkey and it can get back in on its own, without another device."* —
+*Add passkey* (opens Account) and *Not now*. *Not now* and the notice's X are remembered
+in that browser; *Add passkey* puts it away until the next page load. It is raised once
+per page load and stays put across pages. It never appears while the passkey check is
+still loading or has failed, once the account has a passkey, in a browser that kept
+its storage, to a browser that is waiting for approval (the card says it there), or
+inside the desktop app (whose webview storage is a separate question). The phone's
+identity sits in the OS keychain/keystore and is not cleared this way.
 
 **As built on the phone:** the mobile app cannot add or use a passkey in any build —
 opening the sealed trust needs a WebAuthn PRF secret and a cipher it does not have
