@@ -1358,9 +1358,11 @@ threads in a shared background server (`codex app-server`, the
 `daemon_auto_start` feature), a process in a session of its own outside every
 window, so the window's Codex holds none of them: it is answered as `codex`
 with no id, `source` `process` and `shared_server` true, and nothing is
-noted. The daemon says so when that Codex holds no thread file while the
-server's own record, `<CODEX_HOME>/app-server-daemon/daemon.pid`, names a
-live Codex process (on Linux, the same one, by its start ticks). Only a Codex run
+noted. The daemon says so when that Codex holds no thread file and no Codex
+state database (`state_<n>.sqlite`, which every Codex running its own app
+server holds, even at its resume picker) while the server's own record,
+`<CODEX_HOME>/app-server-daemon/daemon.pid`, names a live Codex process (on
+Linux, the same one, by its start ticks). Only a Codex run
 without that server (`--no-daemon`, or a version without it) is named.
 Nothing is executed, no process's arguments or environment are read, every
 registry file and rollout is read bounded and without following links, and

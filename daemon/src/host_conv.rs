@@ -57,10 +57,12 @@
 //! one: the `daemon_auto_start` feature), a process in a session of its own,
 //! outside every window. A window's Codex then holds none of its threads: it
 //! is answered as Codex with no id, and nothing is noted. Only a Codex run
-//! without that server (`--no-daemon`, or a version without it) is named. Such a window is said
-//! to be on the server (`shared_server`) when its Codex holds no thread file
-//! while the server's own record (`<CODEX_HOME>/app-server-daemon/daemon.pid`)
-//! names a live Codex.
+//! without that server (`--no-daemon`, or a version without it) is named.
+//! Such a window is said to be on the server (`shared_server`) when its Codex
+//! holds no thread file and no Codex state database (which every Codex
+//! running its own app server holds, even at its resume picker) while the
+//! server's own record (`<CODEX_HOME>/app-server-daemon/daemon.pid`) names a
+//! live Codex.
 //!
 //! A Codex window's thread is also remembered on this host, one note per
 //! window in a folder of spawnd's own (`<config>/conversations/<session
@@ -436,12 +438,14 @@ pub(crate) fn inspect_with(
         if is_codex(&executable) {
             let open = table.open_files(pid);
             let thread = codex_thread(&open);
-            // A Codex that holds none of its threads' files, while the
-            // shared background server runs, keeps them there.
+            // A Codex that holds none of its threads' files and runs no app
+            // server of its own (no state database open), while the shared
+            // background server runs, keeps them there.
             if thread == CodexThread::Unknown
                 && !open
                     .iter()
                     .any(|path| codex_rollout_id(path).is_some() || codex_lock_id(path).is_some())
+                && !open.iter().any(|path| is_codex_state_database(path))
                 && codex_homes
                     .iter()
                     .any(|home| shared_server_running(home, table))
@@ -852,6 +856,20 @@ fn is_codex_name(name: &str) -> bool {
         || name
             .strip_prefix("codex-")
             .is_some_and(|target| CODEX_TARGETS.contains(&target))
+}
+
+/// Codex's state database, `<CODEX_HOME>/state_<n>.sqlite` (`state_5` in
+/// 0.167.2): held open by every Codex that runs its own app server — one
+/// started with `--no-daemon`, and the shared server itself — and by no
+/// client of the shared server.
+fn is_codex_state_database(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("state_"))
+        .and_then(|rest| rest.strip_suffix(".sqlite"))
+        .is_some_and(|version| {
+            !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 /// The managed server's own record, `<home>/app-server-daemon/daemon.pid`: a
@@ -2552,6 +2570,27 @@ mod tests {
         let home = CodexHome::new();
         let mut table = shared_server(&home, server_record());
         table.starts.remove(&5000);
+        assert!(inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        // A Codex that runs its own app server (`--no-daemon`) holds Codex's
+        // state database even with no thread open — at its resume picker,
+        // say — and is not on the shared one (Codex 0.167.2).
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        table.open.get_mut(&CODEX_PID).unwrap().extend([
+            home.dir.path().join("state_5.sqlite"),
+            home.dir.path().join("state_5.sqlite-wal"),
+            home.dir.path().join("logs_2.sqlite"),
+        ]);
+        let inspection = inspect_with(SHELL, &table, &[], &homes(&home));
+        assert!(!inspection.shared_server);
+        assert_eq!(inspection, Inspection::codex(CodexThread::Unknown));
+        // A client of the shared server holds only its logs.
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        table.open.get_mut(&CODEX_PID).unwrap().extend([
+            home.dir.path().join("logs_2.sqlite"),
+            home.dir.path().join(".sqlite-maintenance.lock"),
+        ]);
         assert!(inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
         // A Codex holding its own threads (`--no-daemon`, beside a running
         // server) is read as ever.
