@@ -1266,6 +1266,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     () => daemonConnection?.getSnapshot().state === "ready",
     () => false,
   );
+  const daemonRebuilding = useSyncExternalStore(
+    subscribeDaemon,
+    () => daemonConnection?.getSnapshot().rebuilding === true,
+    () => false,
+  );
   const socket = useSessionSocket({
     connection: daemonConnection,
     sessionId,
@@ -3503,6 +3508,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           the way the moment output arrives. */}
       <ConnectingOverlay
         sharedConnectionReady={daemonReady}
+        rebuilding={daemonRebuilding}
         socketState={socket.state}
         v3={socket.v3}
         dcOpen={socket.dcOpen}

@@ -336,6 +336,27 @@ describe("session channels on the shared daemon connection", () => {
     expect(transport.state).toBe("ready");
     expect(commands).toHaveLength(count);
   });
+  test("views on a peer that is replaced attach again on its successor by themselves", async () => {
+    const a = await readyTransport(),
+      b = await readyTransport();
+    const before = commands
+      .filter((message) => message.type === "pair-attach")
+      .map((message) => message.attachmentId);
+    // The host transport replaces its peer (a rebuild for unanswered
+    // channels is one such replacement): readiness ends, then returns.
+    state("connecting");
+    expect([a.transport.state, b.transport.state]).toEqual(["reconnecting", "reconnecting"]);
+    state("ready");
+    const after = commands
+      .filter((message) => message.type === "pair-attach")
+      .map((message) => message.attachmentId)
+      .slice(before.length);
+    expect(after).toHaveLength(2);
+    expect(after.some((id) => before.includes(id))).toBe(false);
+    for (const { bridge } of [a, b]) bridge.emit({ v: 1, type: "state", state: "ready" });
+    expect([a.transport.state, b.transport.state]).toEqual(["ready", "ready"]);
+    expect(mockCreateHostTransport).toHaveBeenCalledTimes(1);
+  });
   test("closing the view cancels attachment retries and preserves the daemon lease", async () => {
     jest.useFakeTimers();
     try {

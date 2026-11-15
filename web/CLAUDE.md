@@ -129,6 +129,9 @@ from the catalogue. Every claim about spawnd survives a diff against
   `lib/daemon-connection.ts` shares it across tabs with
   Web Locks and BroadcastChannel; terminal hooks and host/file consumers own
   channels only. Never create a peer or signaling websocket in a terminal.
+  The owner treats a peer as ready only while a child channel can open on it:
+  `lib/channel-watch.ts` probes a peer whose daemon-first channels go
+  unanswered and has `HostControlClient.rebuildPeer` replace it.
   Read `docs/DEVICE_CONNECTIONS.md` before changing attachment or control rules.
 
 ## Before calling a change done

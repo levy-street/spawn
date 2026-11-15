@@ -2162,7 +2162,12 @@ def _schedule_daemon_orphan_expiry(binding: RtcSessionBinding) -> None:
             side="daemon",
         )
         if expired is not None:
-            await _send_server_binding_status(expired, "unavailable")
+            # From the daemon that holds the binding now. A binding carried
+            # over by a re-registration (`rebound`) is that daemon's, and the
+            # browser's pump takes statuses only from the binding's current
+            # owner: one sent as the owner the binding was made under is
+            # dropped there, and the device keeps a peer nobody will answer.
+            await _send_server_binding_status(expired, "unavailable", owner=expired.daemon)
 
     task = asyncio.create_task(expire())
     _daemon_orphan_expiry_tasks.add(task)
@@ -3078,7 +3083,8 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                 grace_seconds=RTC_BINDING_ORPHAN_GRACE_SECONDS,
             )
             for binding in orphaned:
-                await _send_server_binding_status(binding, "signalling_lost")
+                # As its current owner: see `_schedule_daemon_orphan_expiry`.
+                await _send_server_binding_status(binding, "signalling_lost", owner=conn)
                 _schedule_daemon_orphan_expiry(binding)
         else:
             await _revoke_host_rtc_sessions(conn)

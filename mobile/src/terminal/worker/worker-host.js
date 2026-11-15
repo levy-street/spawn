@@ -199,6 +199,8 @@
         return;
       }
       if (message.type !== "response" || typeof message.request_id !== "string") return;
+      // The channel watch's own ping on the root (worker-channel-watch.js).
+      if (api.channelWatch?.pong(message.request_id)) return;
       postResponse(message.request_id, message.ok === true, message.result, message.error);
     };
 
