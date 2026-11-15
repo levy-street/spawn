@@ -1337,10 +1337,15 @@ A thread whose newest mark is its lock alone is `fresh`; a rollout whose
 first line has not ended yet names nothing, since it may be either. A Codex
 process is known by its executable's name: `codex` (npm), or `codex-<target>`
 for a release target Codex publishes (`codex-aarch64-apple-darwin` from a
-standalone install), either with `.exe`. Nothing is executed, no process's
-arguments or environment are read, every registry file and rollout is read
-bounded and without following links, and the answer carries no paths and
-fits one control frame.
+standalone install), either with `.exe`. By default Codex 0.167.2 keeps its
+threads in a shared background server (`codex app-server`, the
+`daemon_auto_start` feature), a process in a session of its own outside every
+window, so the window's Codex holds none of them: it is answered as `codex`
+with no id and `source` `process`, and nothing is noted. Only a Codex run
+without that server (`--no-daemon`, or a version without it) is named.
+Nothing is executed, no process's arguments or environment are read, every
+registry file and rollout is read bounded and without following links, and
+the answer carries no paths and fits one control frame.
 
 The daemon also notes, per window, the Codex thread a live answer found it in
 (or that it was on a fresh one), from every answer and from a look every 5 s
@@ -1349,12 +1354,16 @@ at the windows whose foreground may be Codex (one of those names, its
 (`<config>/conversations/<session id>.json`). When no agent runs in the
 window, or the window does not run there, the answer comes from that note:
 `agent` `codex`, `state` `unknown`, `source` `remembered`, and either the
-noted id or `fresh`. A thread changed less than 5 s before Codex went can be
-missed, and the note then names the thread before it. A window the server
-stops for good (`session.kill`: deleted, archived, or moved to another host)
-is forgotten there, archiving included: a Codex window restored from an
-archived workspace restarts with `codex resume --last`, as before the note
-existed.
+noted id or `fresh`. A fresh answer for a thread already noted with an id
+leaves the note alone: Codex closes a thread's rollout before its lock (on
+quit, and when it lets go of a thread the person left), so a thread being let
+go holds its lock alone for a moment. A thread changed less than 5 s before
+Codex went can be missed, and the note then holds what the host saw last: the
+thread before it, or a fresh thread, which restarts as plain `codex` (a
+`/new` whose first message was missed). A window the server stops for good
+(`session.kill`: deleted, archived, or moved to another host) is forgotten
+there, archiving included: a Codex window restored from an archived workspace
+restarts with `codex resume --last`, as before the note existed.
 
 A restart asks first where `conv.v1` is advertised. When the answer is about
 the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
