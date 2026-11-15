@@ -1306,7 +1306,7 @@ and answers which agent conversation that window is actually in:
 
 ```json
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"conv.inspect","payload":{"session_id":"33333333-3333-4333-8333-333333333333"}}
-{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"agent":"claude-code","conversation_id":"064c9faa-9990-4b0c-9d35-f06ae2dd0d05","state":"idle","cli_version":"2.1.288","live_elsewhere":false,"fresh":false,"source":"registry"}}
+{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"agent":"claude-code","conversation_id":"064c9faa-9990-4b0c-9d35-f06ae2dd0d05","state":"idle","cli_version":"2.1.288","live_elsewhere":false,"fresh":false,"shared_server":false,"source":"registry"}}
 ```
 
 `agent` is the agent kind as agent definitions spell it (`claude-code`,
@@ -1325,7 +1325,10 @@ nothing written to it yet (a Codex just launched, or just after `/new`):
 there is nothing to resume, and its id is not named, so a client that does
 not know the field never types a resume of it; it is false wherever the host
 cannot tell, and a daemon that predates it omits it, which reads as false.
-`source` says what the answer rests on (`registry`, `parked`, `attach`,
+`shared_server` is true when the window's Codex keeps its threads in Codex's
+shared background server, outside the window, so which one it is on cannot be
+named here (`conversation_id` null, `fresh` false); false otherwise, and
+absent from an older daemon. `source` says what the answer rests on (`registry`, `parked`, `attach`,
 `open_file`, `process`, `remembered`, `none`); it is a hint for diagnostics,
 and clients never gate on it. A `session_id` that is not a canonical UUID
 answers `invalid_request`; a window this daemon is not running, or whose
@@ -1354,7 +1357,10 @@ standalone install), either with `.exe`. By default Codex 0.167.2 keeps its
 threads in a shared background server (`codex app-server`, the
 `daemon_auto_start` feature), a process in a session of its own outside every
 window, so the window's Codex holds none of them: it is answered as `codex`
-with no id and `source` `process`, and nothing is noted. Only a Codex run
+with no id, `source` `process` and `shared_server` true, and nothing is
+noted. The daemon says so when that Codex holds no thread file while the
+server's own record, `<CODEX_HOME>/app-server-daemon/daemon.pid`, names a
+live Codex process (on Linux, the same one, by its start ticks). Only a Codex run
 without that server (`--no-daemon`, or a version without it) is named.
 Nothing is executed, no process's arguments or environment are read, every
 registry file and rollout is read bounded and without following links, and

@@ -56,9 +56,11 @@
 //! (`codex app-server`, started by the first Codex and used by every later
 //! one: the `daemon_auto_start` feature), a process in a session of its own,
 //! outside every window. A window's Codex then holds none of its threads: it
-//! is answered as Codex with no id, nothing is noted, and a restart falls
-//! back to "the latest one here" as before. Only a Codex run without that
-//! server (`--no-daemon`, or a version without it) is named.
+//! is answered as Codex with no id, and nothing is noted. Only a Codex run
+//! without that server (`--no-daemon`, or a version without it) is named. Such a window is said
+//! to be on the server (`shared_server`) when its Codex holds no thread file
+//! while the server's own record (`<CODEX_HOME>/app-server-daemon/daemon.pid`)
+//! names a live Codex.
 //!
 //! A Codex window's thread is also remembered on this host, one note per
 //! window in a folder of spawnd's own (`<config>/conversations/<session
@@ -220,6 +222,11 @@ pub(crate) struct Inspection {
     /// id is not named, so a client that does not know this field never
     /// types a resume of it. False wherever the host cannot tell.
     pub fresh: bool,
+    /// The window's Codex keeps its threads in Codex's shared background
+    /// server (`codex app-server`), outside the window, so which one it is
+    /// on cannot be told from here: no id is named. False otherwise,
+    /// including wherever the host cannot tell.
+    pub shared_server: bool,
     pub source: Source,
     /// A fresh Codex thread's id, kept on this host and never put on the
     /// wire (there is nothing to resume): what tells a thread with nothing
@@ -239,6 +246,7 @@ impl Inspection {
             fresh: false,
             source: Source::None,
             fresh_thread: None,
+            shared_server: false,
         }
     }
 
@@ -258,6 +266,15 @@ impl Inspection {
             fresh: fresh_thread.is_some(),
             source,
             fresh_thread,
+            shared_server: false,
+        }
+    }
+
+    /// A Codex window whose threads are in Codex's shared background server.
+    fn codex_on_shared_server() -> Self {
+        Self {
+            shared_server: true,
+            ..Self::codex(CodexThread::Unknown)
         }
     }
 
@@ -305,7 +322,12 @@ pub(crate) trait ProcessTable {
 
 /// The window behind `shell_pid`, inspected on this host.
 pub(crate) fn inspect_window(shell_pid: u32) -> Inspection {
-    inspect(shell_pid, &SystemProcesses, &claude_stores())
+    inspect_with(
+        shell_pid,
+        &SystemProcesses,
+        &claude_stores(),
+        &codex_homes(),
+    )
 }
 
 /// Claude Code's configuration folders this daemon can name: the one
@@ -327,7 +349,40 @@ fn claude_stores() -> Vec<PathBuf> {
     stores
 }
 
+/// Codex's homes this daemon can name: the one `CODEX_HOME` points the
+/// daemon at, and the default `~/.codex`, where Codex keeps its shared
+/// background server's records. A window whose shell exports another (a
+/// skilled window's own) is not found to be on that home's server.
+fn codex_homes() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Some(dir) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
+        if dir.is_absolute() {
+            homes.push(dir);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let default = home.join(".codex");
+        if !homes.contains(&default) {
+            homes.push(default);
+        }
+    }
+    homes
+}
+
+/// `inspect_with`, for a host where Codex keeps no shared server.
+#[cfg(test)]
 pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBuf]) -> Inspection {
+    inspect_with(shell_pid, table, stores, &[])
+}
+
+/// The window behind `shell_pid`: Claude Code's records are looked for in
+/// `stores`, Codex's shared background server in `codex_homes`.
+pub(crate) fn inspect_with(
+    shell_pid: u32,
+    table: &dyn ProcessTable,
+    stores: &[PathBuf],
+    codex_homes: &[PathBuf],
+) -> Inspection {
     let tree = table.tree(shell_pid);
     let Some(shell) = tree.first().copied() else {
         return Inspection::nothing();
@@ -372,13 +427,28 @@ pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBu
                 fresh: false,
                 source: Source::Attach,
                 fresh_thread: None,
+                shared_server: false,
             };
         }
         let Some(executable) = table.executable(pid) else {
             continue;
         };
         if is_codex(&executable) {
-            return Inspection::codex(codex_thread(&table.open_files(pid)));
+            let open = table.open_files(pid);
+            let thread = codex_thread(&open);
+            // A Codex that holds none of its threads' files, while the
+            // shared background server runs, keeps them there.
+            if thread == CodexThread::Unknown
+                && !open
+                    .iter()
+                    .any(|path| codex_rollout_id(path).is_some() || codex_lock_id(path).is_some())
+                && codex_homes
+                    .iter()
+                    .any(|home| shared_server_running(home, table))
+            {
+                return Inspection::codex_on_shared_server();
+            }
+            return Inspection::codex(thread);
         }
         if is_claude(&executable) {
             return Inspection {
@@ -390,6 +460,7 @@ pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBu
                 fresh: false,
                 source: Source::Process,
                 fresh_thread: None,
+                shared_server: false,
             };
         }
     }
@@ -421,6 +492,7 @@ fn from_record(
             fresh: false,
             source: Source::Registry,
             fresh_thread: None,
+            shared_server: false,
         },
         // The record's own `sessionId` is the conversation the window left
         // when it parked; the one it shows now is the background job's.
@@ -439,6 +511,7 @@ fn from_record(
                 fresh: false,
                 source: Source::Parked,
                 fresh_thread: None,
+                shared_server: false,
             }
         }
         Parked::Unreadable => Inspection {
@@ -450,6 +523,7 @@ fn from_record(
             fresh: false,
             source: Source::Parked,
             fresh_thread: None,
+            shared_server: false,
         },
     }
 }
@@ -778,6 +852,44 @@ fn is_codex_name(name: &str) -> bool {
         || name
             .strip_prefix("codex-")
             .is_some_and(|target| CODEX_TARGETS.contains(&target))
+}
+
+/// The managed server's own record, `<home>/app-server-daemon/daemon.pid`: a
+/// small JSON object.
+const MAX_SERVER_RECORD_BYTES: u64 = 4096;
+
+/// Whether Codex's shared background server for `home` runs: the pid its own
+/// record names is alive and is Codex, and — where the start can be compared
+/// (Linux: `processIdentity.startTicks`, the same clock ticks `/proc` gives)
+/// — the same process that wrote it. The record is hostile input, read as
+/// every other file here.
+fn shared_server_running(home: &Path, table: &dyn ProcessTable) -> bool {
+    let path = home.join("app-server-daemon").join("daemon.pid");
+    let Some(bytes) = read_small_file(&path, MAX_SERVER_RECORD_BYTES) else {
+        return false;
+    };
+    let Ok(Value::Object(record)) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(pid) = record
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+    else {
+        return false;
+    };
+    if !table.alive(pid) || !table.executable(pid).is_some_and(|path| is_codex(&path)) {
+        return false;
+    }
+    let recorded = record
+        .get("processIdentity")
+        .and_then(|identity| identity.get("startTicks"))
+        .and_then(Value::as_u64);
+    match (recorded, table.start_identity(pid)) {
+        (Some(recorded), Some(actual)) => actual == recorded.to_string(),
+        _ => true,
+    }
 }
 
 /// The id at the end of a rollout Codex holds open:
@@ -1158,7 +1270,14 @@ pub(crate) async fn watch(
         let memory = memory.clone();
         let runs = Arc::clone(&runs);
         let _ = tokio::task::spawn_blocking(move || {
-            look(windows, shared_table, &claude_stores(), &memory, &*runs);
+            look(
+                windows,
+                shared_table,
+                &claude_stores(),
+                &codex_homes(),
+                &memory,
+                &*runs,
+            );
         })
         .await;
     }
@@ -1179,6 +1298,7 @@ fn look<T: ProcessTable>(
     windows: Vec<(Uuid, u32, String)>,
     table: impl FnOnce() -> T,
     stores: &[PathBuf],
+    codex_homes: &[PathBuf],
     memory: &ConversationMemory,
     runs: &dyn Fn(Uuid) -> Option<u32>,
 ) {
@@ -1196,7 +1316,10 @@ fn look<T: ProcessTable>(
         if runs(session_id) != Some(shell) {
             continue;
         }
-        memory.note(session_id, &inspect(shell, &table, stores));
+        memory.note(
+            session_id,
+            &inspect_with(shell, &table, stores, codex_homes),
+        );
     }
 }
 
@@ -1790,6 +1913,7 @@ mod tests {
                 fresh: false,
                 source: Source::Registry,
                 fresh_thread: None,
+                shared_server: false,
             }
         );
     }
@@ -1942,6 +2066,7 @@ mod tests {
                 fresh: false,
                 source: Source::Parked,
                 fresh_thread: None,
+                shared_server: false,
             }
         );
     }
@@ -1995,6 +2120,7 @@ mod tests {
                 fresh: false,
                 source: Source::Attach,
                 fresh_thread: None,
+                shared_server: false,
             }
         );
 
@@ -2134,6 +2260,7 @@ mod tests {
             fresh: false,
             source: Source::OpenFile,
             fresh_thread: None,
+            shared_server: false,
         }
     }
 
@@ -2329,6 +2456,117 @@ mod tests {
         home.primary(THREAD_A, 12);
         rollout_with(&mut home, THREAD_B, 20, &format!("{meta}\n"));
         assert_eq!(home.inspect(), started(THREAD_A));
+    }
+
+    /// A Codex home whose shared background server, pid 5000, wrote its
+    /// record as Codex 0.169.0 does, and a table where `server` runs.
+    fn shared_server(home: &CodexHome, record: Value) -> FakeTable {
+        let dir = home.dir.path().join("app-server-daemon");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("daemon.pid"), record.to_string()).unwrap();
+        let mut table = FakeTable::window();
+        table.spawn(1001, SHELL, Some(WINDOW_TTY), "/usr/bin/node", "77");
+        table.spawn(
+            CODEX_PID,
+            1001,
+            Some(WINDOW_TTY),
+            "/home/me/.codex/packages/standalone/releases/0.167.2-x86_64-unknown-linux-musl/bin/codex",
+            "78",
+        );
+        table
+            .open
+            .insert(CODEX_PID, home.table.open[&CODEX_PID].clone());
+        table.spawn(
+            5000,
+            4999,
+            None,
+            "/home/me/.codex/packages/app-server-daemon/releases/0.169.0-x86_64-unknown-linux-musl/bin/codex",
+            "626900621",
+        );
+        table
+    }
+
+    fn server_record() -> Value {
+        serde_json::json!({
+            "pid": 5000,
+            "processStartTime": "Fri Nov 13 09:23:24 2026",
+            "processIdentity": {"bootId": "4db4828d-e45b-41a3-a06e-2297648a1a9a", "startTicks": 626900621},
+        })
+    }
+
+    #[test]
+    fn a_codex_on_the_shared_server_is_said_to_be_there_and_names_nothing() {
+        // Codex 0.167.2 by default: the window's Codex holds no thread file,
+        // its shared `codex app-server` (another session) holds them all.
+        let home = CodexHome::new();
+        let table = shared_server(&home, server_record());
+        let homes = [home.dir.path().to_path_buf()];
+        let inspection = inspect_with(SHELL, &table, &[], &homes);
+        assert_eq!(inspection, Inspection::codex_on_shared_server());
+        assert_eq!(inspection.agent, Some("codex"));
+        assert_eq!(inspection.conversation_id, None);
+        assert!(!inspection.fresh);
+        assert!(inspection.shared_server);
+        // Nothing to note, and a note already there is not answered over it.
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        memory.note(window, &inspection);
+        assert_eq!(memory.recall(window), None);
+        memory.note(window, &started(THREAD_A));
+        assert_eq!(
+            answer(window, Some(inspection.clone()), Some(&memory)),
+            Some(inspection)
+        );
+    }
+
+    #[test]
+    fn a_codex_is_on_the_shared_server_only_while_that_server_runs_and_holds_its_threads() {
+        let homes = |home: &CodexHome| [home.dir.path().to_path_buf()];
+        // No record, a record naming nothing believable, a dead pid, a pid
+        // reused by another process, one that is not Codex.
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        std::fs::remove_file(home.dir.path().join("app-server-daemon/daemon.pid")).unwrap();
+        assert!(!inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        for record in [
+            serde_json::json!({"pid": "5000"}),
+            serde_json::json!({"pid": 1}),
+            serde_json::json!({"pid": 6000}),
+            serde_json::json!({"pid": 5000, "processIdentity": {"startTicks": 1}}),
+        ] {
+            let home = CodexHome::new();
+            let table = shared_server(&home, record.clone());
+            assert!(
+                !inspect_with(SHELL, &table, &[], &homes(&home)).shared_server,
+                "{record}"
+            );
+        }
+        let home = CodexHome::new();
+        table = shared_server(&home, server_record());
+        table
+            .executables
+            .insert(5000, PathBuf::from("/usr/bin/python3"));
+        assert!(!inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        // A start that cannot be compared (macOS): alive and Codex will do.
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        table.starts.remove(&5000);
+        assert!(inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        // A Codex holding its own threads (`--no-daemon`, beside a running
+        // server) is read as ever.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        let table = shared_server(&home, server_record());
+        let inspection = inspect_with(SHELL, &table, &[], &homes(&home));
+        assert!(inspection.fresh);
+        assert!(!inspection.shared_server);
+        home.primary(THREAD_A, 12);
+        let table = shared_server(&home, server_record());
+        assert_eq!(
+            inspect_with(SHELL, &table, &[], &homes(&home)),
+            started(THREAD_A)
+        );
     }
 
     #[test]
@@ -2644,6 +2882,7 @@ mod tests {
                 table
             },
             &[],
+            &[],
             &memory,
             &runs,
         );
@@ -2659,6 +2898,7 @@ mod tests {
                 taken.set(taken.get() + 1);
                 FakeTable::default()
             },
+            &[],
             &[],
             &memory,
             &runs,
@@ -2682,18 +2922,18 @@ mod tests {
         let window = Uuid::new_v4();
         let windows = vec![(window, SHELL, "codex".to_string())];
         let home = codex_in_a_window();
-        look(windows.clone(), || home.table, &[], &memory, &|_| None);
+        look(windows.clone(), || home.table, &[], &[], &memory, &|_| None);
         assert_eq!(memory.recall(window), None, "gone from this host");
         // Nor a window this host now runs from another shell: a later
         // incarnation, not the one the look listed.
         let home = codex_in_a_window();
-        look(windows.clone(), || home.table, &[], &memory, &|_| {
+        look(windows.clone(), || home.table, &[], &[], &memory, &|_| {
             Some(SHELL + 7)
         });
         assert_eq!(memory.recall(window), None, "restarted since");
         // The window as listed is noted.
         let home = codex_in_a_window();
-        look(windows, || home.table, &[], &memory, &|_| Some(SHELL));
+        look(windows, || home.table, &[], &[], &memory, &|_| Some(SHELL));
         assert_eq!(
             memory.recall(window).unwrap().conversation_id.as_deref(),
             Some(THREAD_A)
@@ -2908,6 +3148,7 @@ mod tests {
             fresh: false,
             source: Source::Registry,
             fresh_thread: None,
+            shared_server: false,
         };
         let encoded = serde_json::to_string(&inspection).unwrap();
         assert!(encoded.len() < 512, "{encoded}");
@@ -2920,9 +3161,14 @@ mod tests {
                 "cli_version": "x".repeat(32),
                 "live_elsewhere": true,
                 "fresh": false,
+                "shared_server": false,
                 "source": "registry",
             })
         );
+        let shared = serde_json::to_value(Inspection::codex_on_shared_server()).unwrap();
+        assert_eq!(shared["shared_server"], true);
+        assert_eq!(shared["conversation_id"], Value::Null);
+        assert_eq!(shared["fresh"], false);
         let fresh =
             serde_json::to_value(Inspection::codex(CodexThread::Fresh(THREAD_B.into()))).unwrap();
         assert!(

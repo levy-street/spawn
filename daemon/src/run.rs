@@ -3803,6 +3803,7 @@ mod tests {
             fresh: false,
             source: Source::OpenFile,
             fresh_thread: None,
+            shared_server: false,
         };
         memory.note(window, &codex);
         assert!(memory.recall(window).is_some());

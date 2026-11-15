@@ -2253,6 +2253,7 @@ mod tests {
                     "cli_version": null,
                     "live_elsewhere": false,
                     "fresh": false,
+                    "shared_server": false,
                     "source": "none",
                 })
             );
