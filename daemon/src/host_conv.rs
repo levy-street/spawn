@@ -906,6 +906,15 @@ pub(crate) struct ConversationMemory {
 /// window being forgotten, by every `ConversationMemory` in this process: a
 /// look that read a window's Codex before the window stopped cannot write
 /// its note after the window was forgotten.
+///
+/// It is held across the whole inspection, reads under `CODEX_HOME` and
+/// `~/.claude` included, so one read that hangs (a home on a stalled NFS
+/// mount) holds up every `conv.inspect`, every look and every forget on the
+/// host until it returns. Accepted: each runs off the async runtime (a
+/// blocking task; `conv.inspect` under its channel's operation accounting),
+/// so what waits is those three and nothing else of the daemon; a host whose
+/// homes hang is already stalling its agents; and the lock is the only thing
+/// that keeps a forgotten window from being noted again.
 static LOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn looking() -> std::sync::MutexGuard<'static, ()> {
