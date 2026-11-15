@@ -48,6 +48,30 @@ A tab whose own timers were suspended does not count that gap as the owner's
 silence. A connection that retires itself is rebuilt by the provider rather
 than left closed until a reload.
 
+An owner can also keep announcing while it holds nothing usable — page code
+from before a fix, or a client that lost track of its own peer — and every
+other tab used to wait behind it for as long as it stayed open (one did for
+four days). A link is stuck when its owner has spent thirty seconds trying
+(connecting, or signalling with no working peer) with no refusal or error to
+show for it, and the host list this tab polls has said since then, within the
+last 75 seconds, that the host is online. Only a visible tab judges: hidden
+tabs do not poll the host list, and the tab a person is looking at is the one
+worth the next attempt. A waiting tab that sees a stuck link takes the lock,
+as from a silent owner, whatever page code the owner runs; an owner that sees
+its own gives the lock up and queues again behind any tab that waits, or takes
+it straight back with a fresh connection when none does. Each take-over in a
+row doubles the wait, to at most ten minutes. Every tab reads the row from
+local storage and writes it under a lock of its own, so one tab acts per wait;
+it ends when the link becomes ready. A host the server calls offline, a
+network down for everyone (the host list stops refreshing) and a machine that
+slept (the sleep is not counted) cause no take-over, and a ready owner is
+never taken over. Each take-over logs one line naming the host and the wait.
+A deposed owner stands down when its lock request rejects or when it hears
+the newer term, and follows. Page code too old to do either keeps announcing
+under its old term, which every tab ignores; code from before #101 also keeps
+its own peer, and since the daemon keeps only a device's newest offer, its
+next offer displaces the new owner's peer until that tab closes.
+
 A connection is ready only while a child channel can open on it. A peer can
 stay connected, its root channel answering, while no new channel opens: a
 daemon built before #122 lost its channel acceptor to one reset stream and

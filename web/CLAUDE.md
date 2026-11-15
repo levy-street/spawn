@@ -133,7 +133,11 @@ from the catalogue. Every claim about spawnd survives a diff against
   channels only. Never create a peer or signaling websocket in a terminal.
   The owner treats a peer as ready only while a child channel can open on it:
   `lib/channel-watch.ts` probes a peer whose daemon-first channels go
-  unanswered and has `HostControlClient.rebuildPeer` replace it.
+  unanswered and has `HostControlClient.rebuildPeer` replace it. An owner of
+  any page-code age that keeps announcing a link that never becomes usable is
+  taken over by a visible tab (`stuck` in `lib/daemon-connection.ts`), on the
+  server's recent word that the host is online and with a backoff every tab
+  shares.
   Read `docs/DEVICE_CONNECTIONS.md` before changing attachment or control rules.
 
 ## Before calling a change done

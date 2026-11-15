@@ -42,6 +42,16 @@ const HEARTBEAT_MS = 2_000;
 // this long while it waits for the lock takes it: the owner is hung, or frozen
 // without the freeze event releasing it, and waiting on it was indefinite.
 const OWNER_SILENCE_MS = 10_000;
+// An owner can also announce faithfully and still hold nothing usable: page
+// code from before a fix, or a client that lost track of its own peer. A
+// connection that has gone this long without a usable link, while it keeps
+// trying and the server keeps saying its host is online, gets a fresh attempt
+// from the tab a person is looking at (`stuck`). Each take-over in a row
+// doubles the wait, up to the cap; a connection that becomes ready ends the row.
+export const STUCK_LEAD_MS = 30_000;
+export const STUCK_LEAD_CAP_MS = 600_000;
+// How recent the server's word that the host is online must be to count.
+const HOST_CONFIRMED_MS = 75_000;
 const VIEW_LEASE_MS = 12_000;
 const MAX_CHANNELS = 256;
 const RECEIVE_WINDOW_BYTES = 2 * 1024 * 1024;
@@ -75,6 +85,47 @@ type OwnedChannel = {
   heard: boolean;
 };
 
+/** The owner is trying with nothing to show for it: connecting, or signalling
+ *  with no working peer, and no refusal or error that explains why. Only time
+ *  spent like this counts towards a take-over; ready, or a verdict, resets it. */
+function trying(snapshot: DaemonSnapshot): boolean {
+  return (
+    (snapshot.state === "open" || snapshot.state === "connecting") &&
+    !snapshot.refusal &&
+    !snapshot.error
+  );
+}
+
+/** How long a link must be stuck before the next take-over in a row. */
+export function stuckBound(takeovers: number): number {
+  return Math.min(STUCK_LEAD_MS * 2 ** Math.min(takeovers, 16), STUCK_LEAD_CAP_MS);
+}
+
+/** Take-overs in the current row, and when the last one was, shared by every
+ *  tab of this origin; an unreadable record reads as none. */
+function readTakeovers(key: string): { count: number; at: number } {
+  try {
+    const [count, at] = (localStorage.getItem(`spawn.daemon.takeover:${key}`) ?? "")
+      .split(":")
+      .map(Number);
+    return {
+      count: Number.isSafeInteger(count) && count > 0 ? count : 0,
+      at: Number.isFinite(at) ? at : 0,
+    };
+  } catch {
+    return { count: 0, at: 0 };
+  }
+}
+
+function clearTakeovers(key: string): void {
+  try {
+    if (localStorage.getItem(`spawn.daemon.takeover:${key}`) !== null)
+      localStorage.removeItem(`spawn.daemon.takeover:${key}`);
+  } catch {
+    // Nothing to clear in a store this tab cannot use.
+  }
+}
+
 /** One physical connection across same-origin tabs, with bounded per-view channels. */
 export class SharedDaemonConnection implements DaemonConnection {
   private snapshot: DaemonSnapshot = INITIAL;
@@ -92,6 +143,11 @@ export class SharedDaemonConnection implements DaemonConnection {
   private ownerSeen = 0;
   private waitingSince = 0;
   private lastBeat = Date.now();
+  // When this tab last knew the link to be usable, or had no grounds to judge
+  // it: while it is not `trying` (ready, or with a verdict), when an owner
+  // appears, after this tab's own timers stood still. `stuck` measures from here.
+  private usableAt = Date.now();
+  private takingOver = false;
   private lockAbort: AbortController | null = null;
   private releaseLock: (() => void) | null = null;
   private stopRoot: (() => void) | null = null;
@@ -110,6 +166,9 @@ export class SharedDaemonConnection implements DaemonConnection {
     private readonly createRoot: () => HostControlClient,
     private readonly isActive: () => boolean = () => true,
     private readonly onRetired: () => void = () => {},
+    /** When the server last said, in this tab, that the host is online; 0 when
+     *  it does not say so. Without it this tab never judges a link stuck. */
+    private readonly hostOnlineAt: () => number = () => 0,
     private readonly timing: {
       heartbeatMs: number;
       ownerSilenceMs: number;
@@ -132,8 +191,12 @@ export class SharedDaemonConnection implements DaemonConnection {
         this.publish({ ...this.snapshot, state: "connecting", generation: null });
       }
       const now = Date.now();
-      const suspended = now - this.lastBeat > 3 * this.timing.heartbeatMs;
+      const gap = now - this.lastBeat;
+      const suspended = gap > 3 * this.timing.heartbeatMs;
       this.lastBeat = now;
+      // A machine that slept, or a tab frozen in the background, says nothing
+      // about the owner's link: judge it afresh from now.
+      if (suspended || gap < 0 || !trying(this.snapshot)) this.usableAt = now;
       if (!this.root && suspended) {
         // This tab was frozen or throttled, not the owner: ask it to announce
         // and measure its silence from now.
@@ -144,6 +207,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         if (!this.lockAbort) this.elect();
         else if (document.visibilityState === "visible" && now - heard > this.timing.ownerSilenceMs)
           this.elect(true);
+        else if (this.stuck(now)) this.takeOver();
       }
       this.post({ type: "heartbeat" });
       if (this.root) {
@@ -151,6 +215,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         for (const [id, entry] of this.owned) {
           if (now - (this.leases.get(entry.tab) ?? 0) > VIEW_LEASE_MS) this.closeOwned(id);
         }
+        if (this.stuck(now)) this.takeOver();
       }
     }, this.timing.heartbeatMs);
     window.addEventListener("pagehide", this.onHide);
@@ -232,9 +297,10 @@ export class SharedDaemonConnection implements DaemonConnection {
   }
 
   /**
-   * Queue for the owner lock, or with `steal` take it from a silent owner. A
-   * stolen owner's request rejects; it stands down and queues again (so does
-   * one that hears a newer owner's term first).
+   * Queue for the owner lock, or with `steal` take it from a silent or stuck
+   * owner. A stolen owner's request rejects; it stands down and queues again
+   * (so does one that hears a newer owner's term first). Page code too old to
+   * do either keeps announcing under its old term, which every tab ignores.
    */
   private elect(steal = false): void {
     if (this.closed || (this.lockAbort && !steal)) return;
@@ -263,6 +329,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         this.term = Math.max(Date.now(), saved + 1, this.term + 1);
         localStorage.setItem(termKey, String(this.term));
         this.leader = `${this.tab}:${this.term}`;
+        this.usableAt = Date.now();
         this.epoch = 0;
         this.owner = null;
         this.scheduler = new DaemonSendScheduler();
@@ -307,6 +374,62 @@ export class SharedDaemonConnection implements DaemonConnection {
       })
       .finally(() => {
         if (this.lockAbort === abort) this.lockAbort = null;
+      });
+  }
+
+  /**
+   * Whether the link this tab sees has been stuck for the current bound: its
+   * owner, whichever tab and page code that is, has had nothing usable while
+   * it keeps trying (connecting, or signalling with no working peer), nothing
+   * has given it a verdict to wait on (a refusal, an error to show), and the
+   * server has said since then, recently, that the host is online. Only a
+   * visible tab judges: hidden tabs do not poll the host list, and the tab a
+   * person is looking at is the one worth giving the next attempt to.
+   */
+  private stuck(now: number): boolean {
+    if (!trying(this.snapshot) || !this.owner || document.visibilityState !== "visible")
+      return false;
+    const confirmed = this.hostOnlineAt();
+    if (confirmed <= this.usableAt || now - confirmed > HOST_CONFIRMED_MS) return false;
+    const { count, at } = readTakeovers(this.key);
+    const bound = stuckBound(count);
+    const since = now - at;
+    return now - this.usableAt >= bound && !(since >= 0 && since < bound);
+  }
+
+  /**
+   * Give a stuck link a fresh attempt. A waiting tab takes the lock, as from a
+   * silent owner; an owner gives the lock up and queues again behind any tab
+   * that waits, or takes it straight back with a new connection when none
+   * does. One tab acts per bound, whatever code the others run: every tab
+   * reads the same record of take-overs in a row, and writes it holding a
+   * lock of its own.
+   */
+  private takeOver(): void {
+    if (this.takingOver || !navigator.locks) return;
+    this.takingOver = true;
+    const owner = this.owner;
+    void navigator.locks
+      .request(`spawn.daemon.takeover:${this.key}`, { ifAvailable: true }, async (lock) => {
+        const now = Date.now();
+        if (!lock || this.closed || this.owner !== owner || !this.stuck(now)) return;
+        const count = readTakeovers(this.key).count + 1;
+        try {
+          localStorage.setItem(`spawn.daemon.takeover:${this.key}`, `${count}:${now}`);
+        } catch {
+          return;
+        }
+        console.warn(
+          `SPAWN D: host ${this.key.split(":").at(-1)} has had no usable connection for ${Math.round((now - this.usableAt) / 1000)} s; ${this.root ? "this tab hands it" : "this tab takes it"} over (${count} in a row).`,
+        );
+        if (this.root) {
+          this.relinquish();
+          this.elect();
+        } else this.elect(true);
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.takingOver = false;
       });
   }
 
@@ -372,7 +495,12 @@ export class SharedDaemonConnection implements DaemonConnection {
       retireChildren ||
       this.snapshot.generation !== snapshot.generation ||
       (this.snapshot.state === "ready" && snapshot.state !== "ready");
+    const wasReady = this.snapshot.state === "ready";
+    const wasTrying = trying(this.snapshot);
     this.snapshot = snapshot;
+    if (!wasTrying || !trying(snapshot)) this.usableAt = Date.now();
+    // A link that works ends a row of take-overs, whoever made it work.
+    if (!wasReady && snapshot.state === "ready") clearTakeovers(this.key);
     if (changed) {
       // Readiness can be lost without replacing the physical peer. Retire
       // every child at that boundary, including the owner's unsent queues;
@@ -412,6 +540,7 @@ export class SharedDaemonConnection implements DaemonConnection {
       this.term = message.term!;
       this.ownerSeen = Date.now();
       const retireChildren = this.owner !== message.owner || this.epoch !== message.epoch;
+      if (this.owner !== message.owner) this.usableAt = Date.now();
       this.owner = message.owner;
       this.epoch = message.epoch!;
       this.publish(message.snapshot, retireChildren);

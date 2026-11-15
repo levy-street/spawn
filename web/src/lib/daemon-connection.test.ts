@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, expect, jest, type Mock, spyOn, test } from "bun:test";
 import { CHANNEL_WATCH_TIMING, type ChannelWatchTiming } from "./channel-watch";
 import { DaemonSendScheduler, RemoteDaemonChannel } from "./daemon-channel";
-import { type DaemonSnapshot, SharedDaemonConnection } from "./daemon-connection";
+import {
+  type DaemonSnapshot,
+  SharedDaemonConnection,
+  STUCK_LEAD_MS,
+  stuckBound,
+} from "./daemon-connection";
 import type { HostControlClient, HostControlState } from "./hostControl";
 
 class Bus {
@@ -33,18 +38,22 @@ class Locks {
   queues = new Map<string, Array<{ begin: () => void; stolen?: () => void }>>();
   request(
     name: string,
-    options: { signal?: AbortSignal; steal?: boolean },
-    callback: () => Promise<void>,
+    options: { signal?: AbortSignal; steal?: boolean; ifAvailable?: boolean },
+    callback: (lock: { name: string } | null) => Promise<void>,
   ) {
     return new Promise<void>((resolve, reject) => {
       const queue = this.queues.get(name) ?? [];
       this.queues.set(name, queue);
+      if (options.ifAvailable && queue.length > 0) {
+        void callback(null).then(() => resolve(), reject);
+        return;
+      }
       let started = false;
       let stolen = false;
       const entry = {
         begin: () => {
           started = true;
-          void callback()
+          void callback({ name })
             .then(
               () => !stolen && resolve(),
               (error) => !stolen && reject(error),
@@ -113,8 +122,12 @@ const silent: Daemon = () => {};
 const speaks: Daemon = (dc) => dc.onmessage?.({ data: '{"type":"hello"}' });
 const refuses: Daemon = (dc) => dc.close();
 class Root {
+  /** Where a new peer's link gets to; "open" is signalling with no working peer. */
+  static reaches: HostControlState = "ready";
   readonly hostId = "host-under-test";
+  readonly createdAt = Date.now();
   state: HostControlState = "idle";
+  error: string | null = null;
   retryCalls = 0;
   daemon: Daemon = silent;
   rootAnswers = true;
@@ -133,7 +146,7 @@ class Root {
     for (const fn of this.listeners) fn();
   }
   connect() {
-    this.setState("ready");
+    this.setState(Root.reaches);
   }
   close() {
     this.closed = true;
@@ -152,7 +165,7 @@ class Root {
     return null;
   }
   getConnectionError() {
-    return null;
+    return this.error;
   }
   getSignalingTrust() {
     return "verified";
@@ -207,6 +220,7 @@ function connect(
   active = () => true,
   onRetired = () => {},
   timing?: { heartbeatMs: number; ownerSilenceMs: number; watch?: ChannelWatchTiming },
+  hostOnlineAt?: () => number,
 ) {
   const connection = new SharedDaemonConnection(
     key,
@@ -217,6 +231,7 @@ function connect(
     },
     active,
     onRetired,
+    hostOnlineAt,
     timing,
   );
   connections.push(connection);
@@ -238,8 +253,10 @@ beforeEach(() => {
     localStorage: {
       getItem: (key: string) => values.get(key) ?? null,
       setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
     },
   };
+  Root.reaches = "ready";
   for (const [key, value] of Object.entries(replacements)) {
     originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { value, configurable: true });
@@ -792,4 +809,226 @@ test("a view given up on after the abandon threshold raises suspicion; one close
   await advance(T.abandonedAfterMs);
   late.close();
   await within(() => root.probes().length === 1, 1_000);
+});
+
+// A link that never becomes usable, under an owner that keeps announcing it.
+/** The server's word, fresh at every read, that the host is online. */
+const online = () => Date.now();
+/** A tab with no such word: the host is offline, or the tab's list is not polled. */
+const unheard = () => 0;
+function tab(hostOnlineAt: () => number = online) {
+  return connect("account:host", undefined, undefined, undefined, hostOnlineAt);
+}
+
+/**
+ * A tab on page code from before take-overs, holding the lock with a link that
+ * never comes up: it announces every heartbeat, answers no open, and once its
+ * lock is taken keeps right on talking under its old term.
+ */
+function staleOwner(key = "account:host") {
+  const name = `spawn.daemon.v2:${key}`;
+  const term = Date.now() - 4 * 86_400_000;
+  const from = crypto.randomUUID();
+  const owner = `${from}:${term}`;
+  const bus = new Bus(name);
+  let deposed = false;
+  void navigator.locks
+    .request(name, {}, () => new Promise<void>(() => {}))
+    .catch(() => {
+      deposed = true;
+    });
+  const say = (message: Record<string, unknown>) =>
+    bus.postMessage({ v: 1, from, owner, term, epoch: 0, ...message });
+  const announce = (state: HostControlState = "open") =>
+    say({
+      type: "snapshot",
+      snapshot: {
+        state,
+        generation: state === "ready" ? "stale-peer" : null,
+        capabilities: [],
+        refusal: null,
+        trust: null,
+      },
+    });
+  announce();
+  const beat = setInterval(() => announce(), 2_000);
+  return {
+    say,
+    announce,
+    deposed: () => deposed,
+    stop: () => {
+      clearInterval(beat);
+      bus.close();
+    },
+  };
+}
+
+test("a waiting tab takes the lead from an owner on old page code whose link never comes up, then ignores it", async () => {
+  jest.useFakeTimers();
+  const stale = staleOwner();
+  const first = tab();
+  const second = tab();
+  await within(
+    () => first.getSnapshot().state === "open" && second.getSnapshot().state === "open",
+    3_000,
+  );
+  await advance(STUCK_LEAD_MS - 2_000, 500);
+  expect(roots).toHaveLength(0);
+  const waited = performance.now();
+  await within(() => roots.length === 1, 5_000);
+  expect(stale.deposed()).toBe(true);
+  await within(
+    () => first.getSnapshot().state === "ready" && second.getSnapshot().state === "ready",
+    1_000,
+  );
+  const generation = roots[0].generation;
+  expect(performance.now() - waited).toBeLessThan(5_000);
+
+  // The deposed tab's code keeps announcing and answering under its old term.
+  const view = second.createChannel(label());
+  const heard = heardOn(view);
+  await within(() => view.readyState === "open", 1_000);
+  const open = Bus.messages.findLast(
+    (message) => (message as { type: string }).type === "channel-open",
+  ) as { channel: string };
+  stale.announce("ready");
+  stale.say({
+    type: "channel-data",
+    channel: open.channel,
+    data: "from the deposed tab",
+    sequence: 1,
+  });
+  stale.say({ type: "channel-closed", channel: open.channel });
+  await advance(10_000, 500);
+  expect(first.getSnapshot().generation).toBe(generation);
+  expect(second.getSnapshot().generation).toBe(generation);
+  expect(view.readyState).toBe("open");
+  expect(heard).toEqual([]);
+  view.send("typed");
+  await within(() => roots[0].channels[0]?.sent.length === 1, 1_000);
+
+  // A ready owner is never taken over, by either tab.
+  await advance(10 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  stale.stop();
+});
+
+test("an owner whose link never comes up hands the lead to a waiting tab once, then the wait doubles", async () => {
+  jest.useFakeTimers();
+  Root.reaches = "open";
+  const owner = tab();
+  await within(() => roots.length === 1, 1_000);
+  // A waiting tab with no word from the server of its own (a hidden tab's host
+  // list is not polled): here only the owner can judge its own link.
+  const waiting = tab(unheard);
+  await within(() => waiting.getSnapshot().state === "open", 1_000);
+  await advance(STUCK_LEAD_MS - 2_000, 500);
+  expect(roots).toHaveLength(1);
+  await within(() => roots.length === 2, 5_000);
+  // The owner gave the lock up, closing its peer; both tabs follow the new one.
+  expect(roots[0].closed).toBe(true);
+  await within(() => owner.getSnapshot().generation === roots[1].generation, 1_000);
+  expect(waiting.getSnapshot().generation).toBe(roots[1].generation);
+  const handedAt = roots[1].createdAt;
+
+  // The tab that gave it up does not take it straight back.
+  await advance(stuckBound(1) - 3_000, 500);
+  expect(roots).toHaveLength(2);
+  await within(() => roots.length === 3, 6_000);
+  expect(roots[2].createdAt - handedAt).toBeGreaterThanOrEqual(stuckBound(1));
+});
+
+test("a lone tab whose link never comes up starts it afresh, at a falling rate", async () => {
+  jest.useFakeTimers();
+  Root.reaches = "open";
+  const only = tab();
+  await within(() => roots.length === 1, 1_000);
+  await within(() => roots.length === 2, STUCK_LEAD_MS + 5_000);
+  expect(roots[0].closed).toBe(true);
+  await within(() => only.getSnapshot().generation === roots[1].generation, 1_000);
+  await advance(stuckBound(1) - 3_000, 500);
+  expect(roots).toHaveLength(2);
+});
+
+test("no tab takes over while the host is offline, the server's word is old, or nobody is looking", async () => {
+  jest.useFakeTimers();
+  Root.reaches = "open";
+  const start = Date.now();
+  let word: () => number = unheard;
+  tab(() => word());
+  tab(() => word());
+  await advance(20 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  // Online, but said before the link was lost: what a list that stopped
+  // refreshing leaves behind, a network down for everyone among them.
+  word = () => start - 1;
+  await advance(20 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  // Fresh word, but both tabs are hidden.
+  word = online;
+  Object.assign(globalThis.document, { visibilityState: "hidden" });
+  await advance(20 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  // Someone looks: the link has been stuck all along, so the attempt comes at once.
+  Object.assign(globalThis.document, { visibilityState: "visible" });
+  await within(() => roots.length === 2, 5_000);
+});
+
+test("a ready owner keeps the lead, and so do one slow within the bound and one with a verdict to show", async () => {
+  jest.useFakeTimers();
+  tab();
+  const waiting = tab();
+  await within(() => waiting.getSnapshot().state === "ready", 1_000);
+  await advance(10 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  // The link drops and comes back just inside the bound.
+  roots[0].setState("connecting");
+  await advance(STUCK_LEAD_MS - 3_000, 500);
+  roots[0].setState("ready");
+  await advance(10 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  // Retrying with an error to show (here, an unreadable device key): another
+  // tab would read the same store.
+  roots[0].error = "SPAWN D could not load this browser's device key. Retrying…";
+  roots[0].setState("connecting");
+  await advance(10 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  // Past the bound with nothing to wait on, the waiting tab gets its attempt.
+  roots[0].error = null;
+  roots[0].setState("open");
+  const lost = performance.now();
+  await within(() => roots.length === 2, STUCK_LEAD_MS + 5_000);
+  expect(performance.now() - lost).toBeGreaterThanOrEqual(STUCK_LEAD_MS);
+});
+
+test("two tabs on a link that never comes up pass the lead at a falling rate, never straight back", async () => {
+  jest.useFakeTimers();
+  Root.reaches = "open";
+  tab();
+  tab();
+  await advance(32 * 60_000, 500);
+  const gaps = roots.slice(1).map((root, n) => root.createdAt - roots[n].createdAt);
+  expect(gaps.length).toBeGreaterThanOrEqual(5);
+  expect(gaps.length).toBeLessThanOrEqual(7);
+  for (const [n, gap] of gaps.entries()) expect(gap).toBeGreaterThanOrEqual(stuckBound(n));
+  expect(roots.slice(0, -1).every((root) => root.closed)).toBe(true);
+  // A link that works ends the row, and a working link is left alone.
+  const count = roots.length;
+  roots[count - 1].setState("ready");
+  await advance(30 * 60_000, 500);
+  expect(roots).toHaveLength(count);
+  expect(localStorage.getItem("spawn.daemon.takeover:account:host")).toBeNull();
+});
+
+test("a machine that slept does not count its sleep against the owner's link", async () => {
+  jest.useFakeTimers();
+  tab();
+  const waiting = tab();
+  await within(() => waiting.getSnapshot().state === "ready", 1_000);
+  // The link drops as the lid closes; for an hour no timer runs.
+  roots[0].setState("open");
+  jest.setSystemTime(Date.now() + 3_600_000);
+  await advance(STUCK_LEAD_MS - 3_000, 500);
+  expect(roots).toHaveLength(1);
+  await within(() => roots.length === 2, 6_000);
 });

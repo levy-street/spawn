@@ -109,6 +109,18 @@ export function DaemonConnectionsProvider({ children }: { children: ReactNode })
             }),
           isActive,
           () => setRetired((count) => count + 1),
+          // The host list this provider polls while the tab is visible: when
+          // it last said this host is online. A stuck link is taken over only
+          // on the server's recent word that its host is there to connect to.
+          () => {
+            const state = queryClient.getQueryState<Host[]>([
+              "hosts",
+              "daemon-connections",
+              accountId,
+            ]);
+            const online = state?.data?.some((host) => host.id === id && host.status === "online");
+            return online ? (state?.dataUpdatedAt ?? 0) : 0;
+          },
         ),
       );
     }
