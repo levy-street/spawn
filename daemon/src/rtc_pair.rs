@@ -391,7 +391,8 @@ impl RtcSessions {
                                 crate::config::conversation_notes_dir()
                                     .ok()
                                     .map(crate::host_conv::ConversationMemory::new),
-                            );
+                            )
+                            .with_codex_no_daemon(crate::codex_launch::accepts_no_daemon);
                     pair.register_host(install_host_control_channel(
                         dc,
                         signal_id,

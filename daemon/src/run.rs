@@ -613,6 +613,11 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     });
     // What each Codex window is in, kept on this host so a restart after
     // Codex has gone still names its thread (`host_conv`).
+    // Whether this host's Codex accepts `--no-daemon`, for the clients that
+    // launch it (`codex_launch`).
+    if crate::host_conv::SUPPORTED {
+        tokio::spawn(crate::codex_launch::watch());
+    }
     if let Some(memory) = conversation_notes() {
         let windows = registry.clone();
         let runs = registry.clone();
@@ -2681,7 +2686,7 @@ fn env_insert_ci(env: &mut BTreeMap<String, String>, name: &str, value: String) 
     env.insert(key, value);
 }
 
-fn resolve_program_in_env(
+pub(crate) fn resolve_program_in_env(
     path: &Path,
     env: &BTreeMap<String, String>,
 ) -> Option<crate::platform::ResolvedProgram> {
@@ -2954,12 +2959,12 @@ fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
 }
 
 #[derive(Debug)]
-struct CommandCapture {
-    success: bool,
-    output: String,
+pub(crate) struct CommandCapture {
+    pub(crate) success: bool,
+    pub(crate) output: String,
 }
 
-async fn run_program_capture(
+pub(crate) async fn run_program_capture(
     program: &str,
     args: &[&str],
     timeout: Duration,
@@ -3395,7 +3400,7 @@ fn login_shell_argv(shell: String) -> Vec<String> {
     }
 }
 
-async fn resolved_command_env() -> BTreeMap<String, String> {
+pub(crate) async fn resolved_command_env() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     normalize_session_env(&mut env).await;
     env

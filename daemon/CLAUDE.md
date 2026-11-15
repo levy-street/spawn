@@ -53,9 +53,13 @@ src/
                  window's thread for restarts after Codex has gone —
                  `<config>/conversations/<session id>.json`, dropped on the
                  window's every `session.kill`, archiving included — and
-                 executes nothing), codex_home.rs (a skilled window's own
-                 CODEX_HOME, reconciled against the user's — see "A skilled
-                 window's home"), upload.rs, sessions.rs,
+                 executes nothing), codex_launch.rs (whether this host's
+                 `codex` accepts `--no-daemon`: `codex --no-daemon
+                 --version`, run by the daemon itself at start and when the
+                 executable changes, reported in a pair channel's hello),
+                 codex_home.rs (a skilled window's own CODEX_HOME,
+                 reconciled against the user's — see "A skilled window's
+                 home"), upload.rs, sessions.rs,
                  service.rs + service/ (launchd/systemd dispatch, Windows Task
                  Scheduler/Run watchdog and control pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame

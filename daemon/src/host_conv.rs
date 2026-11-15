@@ -127,6 +127,7 @@ pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) struct WindowShells {
     resolve: Arc<dyn Fn(Uuid) -> Option<u32> + Send + Sync>,
     memory: Option<ConversationMemory>,
+    codex_no_daemon: Arc<dyn Fn() -> Option<bool> + Send + Sync>,
 }
 
 impl WindowShells {
@@ -134,7 +135,24 @@ impl WindowShells {
         Self {
             resolve: Arc::new(resolve),
             memory: None,
+            codex_no_daemon: Arc::new(|| None),
         }
+    }
+
+    /// What the daemon knows about whether this host's Codex accepts
+    /// `--no-daemon`, read from what the daemon found out on its own
+    /// (`codex_launch`): this module runs nothing to learn it.
+    pub(crate) fn with_codex_no_daemon(
+        mut self,
+        known: impl Fn() -> Option<bool> + Send + Sync + 'static,
+    ) -> Self {
+        self.codex_no_daemon = Arc::new(known);
+        self
+    }
+
+    /// Whether this host's Codex accepts `--no-daemon`; None when unknown.
+    pub(crate) fn codex_no_daemon(&self) -> Option<bool> {
+        (self.codex_no_daemon)()
     }
 
     /// Where this daemon notes each Codex window's thread (`ConversationMemory`).

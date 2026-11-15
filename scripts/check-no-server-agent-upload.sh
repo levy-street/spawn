@@ -234,7 +234,10 @@ if control.count(expected_control_imports) != 1:
 # keeps one note per Codex window, the thread id it last named, in a folder
 # the caller hands it (spawnd's own <config>/conversations/), removing a
 # window's note when the server stops the window for good; it writes nothing
-# else.
+# else. Since 2026-11-15 it also carries, for the hello of a pair channel,
+# whether this host's Codex accepts `--no-daemon`: a value the daemon found
+# out on its own (codex_launch, pinned below), read here and run by nothing
+# here.
 if set(re.findall(r"crate::(\w+)", control)) != {
     "host_conv",
     "host_desktop",
@@ -336,6 +339,32 @@ if (
     )
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector writes more than its window notes")
+# codex_launch (2026-11-15) is the one program the daemon runs on its own
+# initiative for the device channels: `codex --no-daemon --version`, by the
+# path of the `codex` its user's shells find, with a timeout, at start and
+# when that executable changes — never at a device's or the server's request.
+# Pinned to that one invocation, to the run helpers alone, and to no
+# transport and no write.
+launch_path = os.path.join(root, "daemon/src/codex_launch.rs")
+with open(launch_path, encoding="utf-8") as source:
+    launch = source.read()
+launch_runtime = launch.split("#[cfg(all(test, unix))]\nmod tests {")[0]
+if set(re.findall(r"crate::(\w+)", launch)) != {"run"}:
+    raise SystemExit("no-server-agent-upload: codex launch probe gained a crate dependency")
+if re.search(r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|TcpStream|UdpSocket|mpsc)\b", launch):
+    raise SystemExit("no-server-agent-upload: codex launch probe gained a transport")
+if (
+    launch_runtime.count("run_program_capture(") != 1
+    or launch_runtime.count('const PROGRAM: &str = "codex";') != 1
+    or launch_runtime.count('const PROBE_ARGS: [&str; 2] = ["--no-daemon", "--version"];') != 1
+    or re.search(
+        r"process::Command|\bCommand::new\b|\b(?:posix_spawnp?|execv[pe]*|execl[pe]*|fexecve|v?fork|system)\s*\(|"
+        r"\bfs::write\b|\bFile::create\b|\bOpenOptions\b|\bremove_(?:file|dir)|\brename\b|"
+        r"\bset_permissions\b|\bcreate_dir|\bnix::|\blibc::",
+        launch_runtime,
+    )
+):
+    raise SystemExit("no-server-agent-upload: codex launch probe runs or writes more than its one version check")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
@@ -772,6 +801,7 @@ self_test() {
   cp "$source_root/daemon/src/host_transcripts.rs" "$fixture/daemon/src/host_transcripts.rs"
   cp "$source_root/daemon/src/config.rs" "$fixture/daemon/src/config.rs"
   cp "$source_root/daemon/src/host_conv.rs" "$fixture/daemon/src/host_conv.rs"
+  cp "$source_root/daemon/src/codex_launch.rs" "$fixture/daemon/src/codex_launch.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
   printf '%s\n' \
@@ -946,6 +976,21 @@ self_test() {
     return 1
   fi
   printf '%s\n' "$conv_original" >"$fixture/daemon/src/host_conv.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  local launch_original
+  launch_original="$(<"$fixture/daemon/src/codex_launch.rs")"
+  for launch_case in \
+    'fn sneaky() { let _ = std::process::Command::new("sh").spawn(); }' \
+    'async fn sneaky(env: &BTreeMap<String, String>) { let _ = crate::run::run_program_capture("codex", &["update"], PROBE_TIMEOUT, 1, Some(env)).await; }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::write(path, b"x"); }'; do
+    printf '%s\n%s\n' "$launch_case" "$launch_original" >"$fixture/daemon/src/codex_launch.rs"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: codex launch probe change passed: %s\n' "$launch_case" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$launch_original" >"$fixture/daemon/src/codex_launch.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   local config_original

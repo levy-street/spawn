@@ -2516,7 +2516,7 @@ pub(crate) fn install(
             if publication_context.pair.is_some() && crate::host_conv::SUPPORTED {
                 capabilities.push(crate::host_conv::CAPABILITY);
             }
-            let hello = json!({
+            let mut hello = json!({
                 "version": VERSION,
                 "type": "hello",
                 "protocol": PROTOCOL,
@@ -2535,6 +2535,9 @@ pub(crate) fn install(
                     "write_reapers": 1,
                 }
             });
+            if let Some(agents) = agent_launch_facts(publication_context.pair.as_ref()) {
+                hello["agents"] = agents;
+            }
             if !publication_context.send(hello).await {
                 close_with_deadline_later(Arc::clone(&dc));
                 return;
@@ -2633,9 +2636,37 @@ fn tombstone_deadline() -> Instant {
     Instant::now() + lifetime
 }
 
+/// What the `hello` of a pair-admitted channel says about launching agents on
+/// this host: `{"codex": {"no_daemon": bool}}`, whether the `codex` this
+/// host's shells find accepts `--no-daemon` (`codex_launch`), as of the
+/// channel's opening. Absent when that is not known, which a client reads as
+/// "do not add the flag"; never on a channel with no device behind it.
+fn agent_launch_facts(pair: Option<&crate::host_conv::WindowShells>) -> Option<Value> {
+    let no_daemon = pair?.codex_no_daemon()?;
+    Some(json!({ "codex": { "no_daemon": no_daemon } }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pair_channels_hello_says_whether_codex_takes_no_daemon_when_known() {
+        let shells = |known: Option<bool>| {
+            crate::host_conv::WindowShells::new(|_| None).with_codex_no_daemon(move || known)
+        };
+        assert_eq!(
+            agent_launch_facts(Some(&shells(Some(true)))),
+            Some(json!({"codex": {"no_daemon": true}}))
+        );
+        assert_eq!(
+            agent_launch_facts(Some(&shells(Some(false)))),
+            Some(json!({"codex": {"no_daemon": false}}))
+        );
+        // Not known yet, and no device behind the channel: nothing said.
+        assert_eq!(agent_launch_facts(Some(&shells(None))), None);
+        assert_eq!(agent_launch_facts(None), None);
+    }
 
     fn ticket(window: &Arc<StdMutex<RequestWindow>>, id: &str) -> Option<RequestTicket> {
         window.lock().unwrap().admit(id).then(|| RequestTicket {

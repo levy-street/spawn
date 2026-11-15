@@ -1233,6 +1233,19 @@ with the ordinary error `pair_required`, whatever the client sends. A daemon
 that cannot perform a family on its platform does not advertise it there
 either, and answers `unsupported_operation`.
 
+A pair-admitted channel's `hello` also says what the host knows about
+starting agents there, as of the channel's opening: `"agents":{"codex":
+{"no_daemon":true}}` when the `codex` its user's shells find accepts
+`--no-daemon`, `false` when it refuses it. The daemon learns it on its own,
+never at a request: it runs `codex --no-daemon --version` by that
+executable's path, with a timeout, when it starts and again when the
+executable changes (Codex parses its arguments first, so this prints a
+version and connects to nothing; like any `codex` run it refreshes Codex's
+own scratch folder under `<CODEX_HOME>/tmp/`). `agents` is absent when that
+is not known, on a channel with no device behind it, on a platform without
+`conv.v1`, and from an older daemon; a client reads every one of those as "do
+not add the flag".
+
 `fs.read.range` accepts `{path, offset?, length, if_version?}` and streams a
 bounded slice: `length` is capped at 16 MiB and clamped down to what remains,
 and the declared `sha256` covers **exactly the returned slice**, not the whole
