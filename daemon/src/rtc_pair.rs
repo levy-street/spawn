@@ -8,6 +8,18 @@ use super::*;
 
 const MAX_PAIR_SESSIONS: usize = 128;
 const MAX_PAIR_CONTROLS: usize = 32;
+/// Channels of one device connection whose admission has begun and not been
+/// decided — each waiting on the admission lock or a session's transition,
+/// holding its channel, its stream and the peer connection. A channel past
+/// this is refused at once. Every channel a pair can hold at one time —
+/// both channels of each of its terminal attachments, its host consumers
+/// and its root — may arrive together (a device re-attaching every view
+/// after a reconnect does), so the bound is that many and refuses nothing
+/// the caps above could all admit. Before admission ran in a task per
+/// channel, SCTP's own backpressure kept this to one channel in the handler
+/// and sixteen streams queued; without a bound a device could park one
+/// task per stream id, some 65,000, each on a lock.
+const MAX_PAIR_PENDING_CHANNELS: usize = 2 * MAX_PAIR_SESSIONS + MAX_PAIR_CONTROLS + 1;
 
 pub(super) struct PairContext {
     pub(super) device_key: [u8; 32],
@@ -22,6 +34,30 @@ pub(super) struct PairContext {
     restart: Mutex<()>,
     retired: AtomicBool,
     host_channels: std::sync::Mutex<Vec<Weak<crate::host_control::Lifetime>>>,
+    /// How many of this connection's channels are being admitted now
+    /// (`PendingChannel`), at most `MAX_PAIR_PENDING_CHANNELS`.
+    pending_channels: AtomicUsize,
+}
+
+/// One device channel from the moment its handler is called until its
+/// admission is decided, counted against `MAX_PAIR_PENDING_CHANNELS`.
+struct PendingChannel(Arc<PairContext>);
+
+impl PendingChannel {
+    fn begin(pair: &Arc<PairContext>) -> Option<Self> {
+        pair.pending_channels
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                (pending < MAX_PAIR_PENDING_CHANNELS).then_some(pending + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(pair)))
+    }
+}
+
+impl Drop for PendingChannel {
+    fn drop(&mut self) {
+        self.0.pending_channels.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl PairContext {
@@ -186,6 +222,7 @@ impl RtcSessions {
             restart: Mutex::new(()),
             retired: AtomicBool::new(false),
             host_channels: std::sync::Mutex::new(Vec::new()),
+            pending_channels: AtomicUsize::new(0),
         });
         if let Err(error) = self
             .create_host_answer(
@@ -334,13 +371,25 @@ impl RtcSessions {
         let weak_pc = Arc::downgrade(pc);
         let controls = Arc::new(Mutex::new(HashMap::<String, Weak<RTCDataChannel>>::new()));
         pc.on_data_channel(Box::new(move |dc| {
+            // Counted from here until the future below has decided, and
+            // refused past the bound before it holds the connection.
+            let pending = PendingChannel::begin(&pair);
             let sessions = sessions.clone();
-            let pc = weak_pc.upgrade();
+            let pc = pending.as_ref().and_then(|_| weak_pc.upgrade());
             let signal_id = signal_id.clone();
             let binding = binding.clone();
             let pair = Arc::clone(&pair);
             let controls = Arc::clone(&controls);
             Box::pin(async move {
+                let Some(_pending) = pending else {
+                    tracing::debug!(
+                        %signal_id,
+                        bound = MAX_PAIR_PENDING_CHANNELS,
+                        "device channel refused: as many of its connection's channels are waiting for admission already"
+                    );
+                    reject_channel(&dc).await;
+                    return;
+                };
                 let Some(pc) = pc else { return };
                 let reliable = dc.ordered()
                     && dc.max_packet_lifetime().is_none()
@@ -440,6 +489,22 @@ impl RtcSessions {
         // serializes on admission. Taken the other way round, one device
         // opening a restarting window held admission for all of that, and
         // every other device's channels and offers waited behind it.
+        //
+        // A label is the device's to choose, so a session this daemon is
+        // not running, and that no launch or restart is in the middle of,
+        // is refused before its transition is taken: otherwise every such
+        // label would be a lock of its own, made for it and waited on
+        // behind admission. Nothing is weakened: the session is checked
+        // again under both locks below, and a session with a transition in
+        // progress — a launch about to register it — is waited for as
+        // before.
+        anyhow::ensure!(
+            pair.registry.binding_for(label.session).is_some()
+                || pair
+                    .registry
+                    .generation_transition_in_progress(label.session),
+            "session not running on this daemon"
+        );
         let transition = pair
             .registry
             .lock_generation_transition(label.session)
@@ -1359,6 +1424,188 @@ mod tests {
         }
     }
 
+    /// A device can open channels faster than they are admitted, and while
+    /// admission is held — another device's offer, trust invalidation —
+    /// each one waits there, holding its channel, its stream and the
+    /// connection. No more wait than the pair could hold at once: the rest
+    /// are refused there and then, admission still held, and the pair
+    /// works as before once admission is free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn channels_past_the_admission_bound_are_refused_and_the_pair_keeps_working() {
+        const EXCESS: usize = 8;
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let session = Uuid::new_v4();
+        let worker = spawn_replay_worker(&registry, session);
+        let pc = connect_pair(&sessions, &registry, [19; 32]).await;
+        let pair = sessions
+            .host_peers
+            .lock()
+            .await
+            .values()
+            .next()
+            .and_then(|peer| peer.pair.clone())
+            .unwrap();
+        let (probe, mut probe_rx) = open_host_consumer(&pc).await;
+        assert!(
+            consumer_answers(&probe, &mut probe_rx, Duration::from_secs(5)).await,
+            "a channel opens on a fresh pair"
+        );
+
+        let refused = |flood: &[Arc<RTCDataChannel>]| {
+            flood
+                .iter()
+                .filter(|channel| channel.ready_state() == RTCDataChannelState::Closed)
+                .count()
+        };
+        let admission = Arc::clone(&sessions.admission).lock_owned().await;
+        // Opened a few at a time, each few accounted for — waiting or
+        // refused — before the next: the association queues sixteen new
+        // streams for its acceptor and drops the DATA of any more until
+        // the device retransmits, which would make this test's pace SCTP's
+        // retransmission backoff.
+        let mut flood = Vec::new();
+        let settled = tokio::time::timeout(Duration::from_secs(60), async {
+            while flood.len() < MAX_PAIR_PENDING_CHANNELS + EXCESS {
+                let batch = (MAX_PAIR_PENDING_CHANNELS + EXCESS - flood.len()).min(8);
+                for _ in 0..batch {
+                    flood.push(
+                        pc.create_data_channel(&format!("spawn.host.ctl/{}", Uuid::new_v4()), None)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                while refused(&flood) + pair.pending_channels.load(Ordering::Acquire) < flood.len()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+        .await;
+        let (closed, waiting) = (
+            refused(&flood),
+            pair.pending_channels.load(Ordering::Acquire),
+        );
+        drop(admission);
+
+        // The channels that waited are decided once admission is free (the
+        // host consumers among them up to their own cap), and then a window
+        // opens on the pair as on any other.
+        let drained = tokio::time::timeout(Duration::from_secs(30), async {
+            while pair.pending_channels.load(Ordering::Acquire) > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let attached =
+            tokio::time::timeout(Duration::from_secs(10), attach_answered(&pc, session)).await;
+        let probe_answers = consumer_answers(&probe, &mut probe_rx, Duration::from_secs(5)).await;
+        let resident = sessions.host_peers.lock().await.len();
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        worker.abort();
+        assert!(
+            settled.is_ok(),
+            "{closed} channel(s) refused and {waiting} waiting of {} opened with admission held",
+            flood.len()
+        );
+        assert_eq!(
+            (closed, waiting),
+            (EXCESS, MAX_PAIR_PENDING_CHANNELS),
+            "exactly the channels past the bound are refused while admission is held"
+        );
+        assert!(
+            drained.is_ok(),
+            "the waiting channels were decided once admission was free"
+        );
+        assert!(
+            attached.is_ok(),
+            "a window opens on the pair after the flood"
+        );
+        assert!(
+            probe_answers,
+            "a channel admitted before the flood still answers"
+        );
+        assert_eq!(resident, 1, "the pair stayed in service");
+    }
+
+    /// A terminal's label names its session, and the device chooses it. One
+    /// naming no session this daemon runs is refused at once: it takes no
+    /// transition, which would otherwise be a lock made for that id alone,
+    /// held while it waits behind admission and scanned by every later
+    /// transition on the daemon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attach_for_a_session_this_daemon_does_not_run_is_refused_without_waiting() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_pair(&sessions, &registry, [20; 32]).await;
+
+        let admission = Arc::clone(&sessions.admission).lock_owned().await;
+        let unknown = Uuid::new_v4();
+        let channel = pc
+            .create_data_channel(
+                &format!("spawn.pty/{unknown}/{}/{}", Uuid::new_v4(), Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(5), async {
+            while channel.ready_state() != RTCDataChannelState::Closed {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let holders = registry.generation_transition_holders(unknown);
+        drop(admission);
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        assert!(
+            refused.is_ok(),
+            "an attach for a session nobody runs waited behind admission"
+        );
+        assert_eq!(
+            holders, 0,
+            "an attach for a session nobody runs took its transition"
+        );
+    }
+
+    /// The other side of the refusal above: a session that is not
+    /// registered yet but whose launch holds its transition is about to
+    /// exist, and an attach for it waits for the launch as it always has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attach_for_a_session_being_launched_waits_for_the_launch() {
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let launching = Uuid::new_v4();
+        let pc = connect_pair(&sessions, &registry, [21; 32]).await;
+
+        let launch = registry.lock_generation_transition(launching).await;
+        let waiting = begin_attach_that_waits(&registry, &pc, launching).await;
+        let worker = spawn_replay_worker(&registry, launching);
+        drop(launch);
+
+        let suffix = waiting
+            .label()
+            .strip_prefix("spawn.pty/")
+            .unwrap()
+            .to_owned();
+        let ctl = pc
+            .create_data_channel(&format!("spawn.ctl/{suffix}"), None)
+            .await
+            .unwrap();
+        let attached = control_answers(&ctl, Duration::from_secs(5)).await;
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        worker.abort();
+        assert!(
+            attached,
+            "an attach for a session being launched was refused"
+        );
+    }
+
     /// A device connection outlives the control connection its offer came
     /// on: the daemon keeps its peers across a reconnect. A window attached
     /// on it afterwards works, and what the daemon reports for it — that
@@ -2128,6 +2375,7 @@ mod tests {
             restart: Mutex::new(()),
             retired: AtomicBool::new(false),
             host_channels: std::sync::Mutex::new(Vec::new()),
+            pending_channels: AtomicUsize::new(0),
         });
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),

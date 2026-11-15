@@ -609,7 +609,14 @@ completes before that channel opens or delivers a message, as always, but
 the futures for different channels of one connection run concurrently and
 finish in any order. A handler must not assume the channel before it has
 been admitted, and may wait — on the admission lock, on a session's
-transition — without holding up any other channel on the connection.
+transition — without holding up any other channel on the connection. What
+SCTP no longer bounds the daemon does: at most `MAX_PAIR_PENDING_CHANNELS`
+of one device connection's channels wait at once (every channel the pair
+could hold together: two per terminal attachment, its host consumers, its
+root), and one past that is refused there and then. A terminal label
+naming a session the daemon neither runs nor has a transition in progress
+for is refused before the transition is taken, so a device cannot mint a
+lock per made-up id.
 
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed

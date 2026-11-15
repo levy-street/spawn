@@ -109,9 +109,15 @@ connection can run concurrently and complete in any order, and the wrapper's
 lock no longer makes the application's handler be called in strict arrival
 order when two channels arrive together. It is still never called
 concurrently with itself. A handler future that panics ends that channel's
-task, not the acceptor. Nothing bounds how many admissions wait at once
-except the peer's own rate of opening channels; upstream's bound was one,
-with sixteen more streams queued in the association.
+task, not the acceptor. Nothing in this crate bounds how many admissions
+wait at once except the peer's own rate of opening channels; upstream's
+bound was one, with sixteen more streams queued in the association. The
+daemon's handler for a device connection bounds them itself
+(`MAX_PAIR_PENDING_CHANNELS` in `rtc_pair.rs`: every channel the pair could
+hold at once) and refuses a channel past that at once; the native daemon
+regression
+`channels_past_the_admission_bound_are_refused_and_the_pair_keeps_working`
+pins it.
 
 The native daemon regression
 `a_channel_waiting_on_admission_does_not_hold_up_the_next_on_its_connection`
