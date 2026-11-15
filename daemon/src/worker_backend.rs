@@ -69,27 +69,38 @@ pub(crate) static WORKER_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mu
 /// 1.100. Counting two levels up found nothing there, and a worker that is
 /// not found is reported as one that "does not match this spawnd build". So
 /// the worker is looked for beside each directory above this binary, nearest
-/// first, and a missing one is named as missing.
+/// first, up to Cargo's target directory and no further, and a missing one is
+/// named as missing.
 #[cfg(test)]
 pub(crate) fn built_worker_bin() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     let name = crate::platform::executable_name("spawn-worker");
     built_beside(&exe, &name).unwrap_or_else(|| {
         panic!(
-            "no {} in any directory above {}; `cargo test` without a target filter builds it, as does `cargo build`",
+            "no {} in any directory above {} up to Cargo's target directory; `cargo test` without a target filter builds it, as does `cargo build`",
             name.to_string_lossy(),
             exe.display()
         )
     })
 }
 
-/// The nearest directory above `exe` that holds a file called `name`.
+/// The nearest directory above `exe` that holds a file called `name`, up to
+/// and including Cargo's target directory — `target/`, or a CARGO_TARGET_DIR
+/// of any name, which Cargo marks with `CACHEDIR.TAG` — and never above it,
+/// where a file of that name (in a home directory, say) is not this build's.
 #[cfg(test)]
 fn built_beside(exe: &std::path::Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
-    exe.ancestors()
-        .skip(1)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    for dir in exe.ancestors().skip(1) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.file_name().is_some_and(|dir| dir == "target") || dir.join("CACHEDIR.TAG").is_file()
+        {
+            return None;
+        }
+    }
+    None
 }
 
 /// Directory holding worker sockets or Windows endpoint metadata:
@@ -1362,5 +1373,38 @@ mod built_worker_tests {
             built_beside(&new_test, OsStr::new("spawn-worker")),
             Some(worker)
         );
+    }
+
+    /// The search ends at Cargo's target directory: a `spawn-worker` above
+    /// it (a home directory, `/usr/local`) is never taken for the build's.
+    #[test]
+    fn the_built_worker_is_never_found_above_the_target_directory() {
+        let above = tempfile::tempdir().unwrap();
+        std::fs::write(above.path().join("spawn-worker"), b"").unwrap();
+        // The default `target/`, and a CARGO_TARGET_DIR of any name, which
+        // Cargo marks with CACHEDIR.TAG.
+        for (target, tag) in [("target", false), ("ci-build", true)] {
+            let target = above.path().join(target);
+            let test = target.join("debug").join("deps").join("spawnd-6d610854");
+            std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+            if tag {
+                std::fs::write(
+                    target.join("CACHEDIR.TAG"),
+                    b"Signature: 8a477f597d28d172789f06886806bc55",
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                built_beside(&test, OsStr::new("spawn-worker")),
+                None,
+                "{}",
+                target.display()
+            );
+            std::fs::write(target.join("debug").join("spawn-worker"), b"").unwrap();
+            assert_eq!(
+                built_beside(&test, OsStr::new("spawn-worker")),
+                Some(target.join("debug").join("spawn-worker"))
+            );
+        }
     }
 }
