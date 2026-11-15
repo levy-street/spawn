@@ -12,9 +12,13 @@ import { isDesktopShell } from "@/lib/platform";
  * so a component that answered `true` on its first client render would not
  * match the HTML it is hydrating. The first paint is therefore the browser's
  * paint, and the chrome that leads out of the app is dropped a frame later.
+ *
+ * `untilKnown` is the answer before that effect has run. A line that must
+ * never appear inside the app, not even for a frame, passes `true` and shows
+ * a frame late in a browser instead.
  */
-export function useDesktopShell(): boolean {
-  const [inShell, setInShell] = useState(false);
+export function useDesktopShell(untilKnown = false): boolean {
+  const [inShell, setInShell] = useState(untilKnown);
 
   useEffect(() => {
     setInShell(isDesktopShell(window.navigator.userAgent));

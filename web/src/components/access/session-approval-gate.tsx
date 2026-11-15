@@ -6,15 +6,15 @@ import { Loader2 } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef } from "react";
-import { useDeviceTrustMap } from "@/components/trust/device-endorsement";
+import { useCurrentDeviceApproval } from "@/components/access/use-current-device-approval";
 import { Button } from "@/components/ui/button";
+import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { browserDevices, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import { NO_PASSKEY_WAITING_HINT } from "@/lib/device-storage-notice";
 import { isAgentSessionPath } from "@/lib/session-approval";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
-import { computeTrustRoster } from "@/lib/trust-roster";
 
 /** Roster poll cadence while the card is on screen. */
 export const GATE_POLL_UP_MS = 4_000;
@@ -44,52 +44,28 @@ export function SessionApprovalGate() {
   const sessionOpen = isAgentSessionPath(pathname);
   const enabled = user !== null && sessionOpen;
 
-  const registration = useBrowserDeviceRegistration(user?.id);
   // While the card is up the flip to "approved" should feel immediate, matching
   // the Access panel's open-state cadence. Every open agent session runs these
-  // two queries, nearly always for a device that is already trusted, so with
+  // queries, nearly always for a device that is already trusted, so with
   // the card down they idle — the interval is read when each refetch is
   // scheduled, so the ref below is current by then.
   const cardUp = useRef(false);
   const gateInterval = () => (cardUp.current ? GATE_POLL_UP_MS : GATE_POLL_DOWN_MS);
-  const devices = useQuery({
-    queryKey: ["browser-devices"],
-    queryFn: browserDevices.list,
-    enabled,
-    refetchInterval: gateInterval,
-  });
-  const edges = useQuery({
-    queryKey: ["account-endorsements"],
-    queryFn: trust.accountEndorsements,
-    enabled,
-    refetchInterval: gateInterval,
-  });
-  const trustMap = useDeviceTrustMap(enabled);
+  const approval = useCurrentDeviceApproval({ enabled, refetchInterval: gateInterval });
   const passkey = usePasskeyTrust();
+  // Passkeys are unproven inside the desktop app's webview, so the waiting
+  // card's passkey line stays out of it, as the storage notice does (#121).
+  const desktopShell = useDesktopShell(true);
 
-  const currentPublicKey = registration.data?.publicKey ?? null;
-  const currentDevice =
-    (devices.data ?? []).find((device) => device.public_key === currentPublicKey) ??
-    (registration.data?.status === "ready" ? registration.data.device : undefined);
-
-  const roster = computeTrustRoster(devices.data ?? [], edges.data ?? [], trustMap.pinnedDeviceIds);
-  const ready =
-    registration.data?.status === "ready" &&
-    trustMap.ready &&
-    devices.data !== undefined &&
-    edges.data !== undefined;
-  const currentTrusted =
-    currentDevice !== undefined &&
-    ((roster.get(currentDevice.id)?.chainTrusted ?? false) ||
-      trustMap.trustedHostIdsFor(currentDevice.id).length > 0);
+  const currentDevice = approval.currentDevice;
   // Same condition as the Access panel's waiting callout: only hosts with an
   // identity key refuse an unapproved device, so only they make this gate real.
   const show =
     sessionOpen &&
-    ready &&
-    trustMap.keyedHosts.length > 0 &&
+    approval.ready &&
+    approval.keyedHostCount > 0 &&
     currentDevice !== undefined &&
-    !currentTrusted;
+    !approval.trusted;
   cardUp.current = show;
 
   // Yield to the ceremony dialog the moment a pairing involving this device is
@@ -170,6 +146,17 @@ export function SessionApprovalGate() {
                 : "Waiting for approval…"}
             </span>
           </div>
+
+          {/* No passkey: nothing here can let this device in by itself, but
+              the next time it loses its approval can be one touch (#121). */}
+          {passkey.bundle.data === null && !desktopShell && (
+            <p
+              className="mt-3 text-center text-xs leading-relaxed text-muted-foreground"
+              data-testid="session-gate-passkey-hint"
+            >
+              {NO_PASSKEY_WAITING_HINT}
+            </p>
+          )}
 
           {passkey.status !== null && (
             <p className="mt-3 text-center text-sm font-medium" role="status">

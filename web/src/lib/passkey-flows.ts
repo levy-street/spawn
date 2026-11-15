@@ -620,6 +620,25 @@ export class UnreadableTrustStateError extends Error {
 
 export interface RemoveLastPasskeyOutcome {
   readonly skippedRootReason: string | null;
+  /**
+   * The root this passkey sealed was revoked. Everything that came in through
+   * the passkey (every browser that got in with it, first time or returning,
+   * and any device approved only from those browsers) hangs off that root, so
+   * it needs approving again (#130).
+   */
+  readonly rootRevoked: boolean;
+}
+
+/**
+ * The status line after the only passkey goes. It must not say the devices
+ * keep working when the revoked root took some of them with it (#130).
+ */
+export function describeLastPasskeyRemoval(outcome: RemoveLastPasskeyOutcome): string {
+  return outcome.rootRevoked
+    ? "Passkey removed. Browsers that got in with it, and devices approved from them, will " +
+        "need approving again. If you lose every device, nothing brings this account's hosts back."
+    : "Passkey removed. Your devices keep working, but if you lose them all, nothing brings " +
+        "this account's hosts back.";
 }
 
 /**
@@ -714,5 +733,5 @@ export async function removeLastPasskey(
     reason !== null && bundleUnreadable
       ? "Your trust bundle could not be opened to verify the account root, so it was not revoked on the server's word."
       : reason;
-  return { skippedRootReason };
+  return { skippedRootReason, rootRevoked: row !== null };
 }
