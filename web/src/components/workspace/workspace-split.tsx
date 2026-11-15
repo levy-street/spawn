@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import {
   Fragment,
@@ -12,7 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { workspaces } from "@/lib/api";
+import { ApiError, workspaces } from "@/lib/api";
 import {
   clampSizes,
   columnCapacity,
@@ -173,6 +173,28 @@ export function WorkspaceSplit({
   }, [leavingKey]);
 
   /*
+   * Columns are on their way in or out, or their widths are still sweeping
+   * after one did. Published on the container (`data-split-settling`) for the
+   * terminals inside it, which hold their size and their claim on the display
+   * until it clears, then fit once at the width they end up at: a column
+   * added to a split used to take control two frames after it mounted, while
+   * it was still widening, and every column beside it refitted on the way —
+   * a reflow per step for everyone viewing those sessions. Only a
+   * rearranging split settles; opening a workspace, split or not, does not.
+   */
+  const animating = columns.some(({ state }) => state !== "in");
+  const [settling, setSettling] = useState(false);
+  useEffect(() => {
+    if (animating) {
+      setSettling(true);
+      return;
+    }
+    // The last transition runs on after the columns themselves have settled.
+    const timer = window.setTimeout(() => setSettling(false), OPEN_MS + 40);
+    return () => window.clearTimeout(timer);
+  }, [animating]);
+
+  /*
    * Measured before the first paint, so the columns mount once, at the
    * number that fits. The container's width does not depend on its columns
    * — it is the main panel's — so an empty container measures true.
@@ -215,15 +237,23 @@ export function WorkspaceSplit({
   const nameOf = (id: string) => workspacesQ.data?.find((workspace) => workspace.id === id)?.name;
 
   /*
-   * A member that stopped existing leaves the group here when the list
-   * refresh beats its own 404 — and when it was the one the address bar is
-   * on, the route goes to the column that took its place, exactly as the 404
-   * would have sent it. The window is already drawing that destination.
+   * A member that left the list leaves the group here. When it was the one
+   * the address bar is on, the route moves to the column that took its place
+   * only if the workspace was deleted — its own record already came back 404.
+   * An archived one leaves the list too, and stays on screen as its archived
+   * snapshot, as it always has; a 404 that comes after this is the
+   * workspace's own column's to act on, with the same destination.
    */
+  const queryClient = useQueryClient();
   useEffect(() => {
-    const destination = splitStore.reconcile(knownIds, routeRef.current);
-    if (destination) routerRef.current.replace(`/w/${destination}`);
-  }, [knownIds]);
+    const routed = routeRef.current;
+    const destination = splitStore.reconcile(knownIds, routed);
+    if (!destination) return;
+    const own = queryClient.getQueryState(["workspace", routed]);
+    if (!(own?.error instanceof ApiError && own.error.status === 404)) return;
+    splitStore.remove(routed, routed);
+    routerRef.current.replace(`/w/${destination}`);
+  }, [knownIds, queryClient]);
 
   /*
    * Arriving somewhere hands that column the keyboard. Keyed on the route
@@ -339,6 +369,8 @@ export function WorkspaceSplit({
     setResizing(true);
 
     const onMove = (moveEvent: PointerEvent) => {
+      // Another pointer — a second finger, a pen hovering — is not this drag.
+      if (moveEvent.pointerId !== pointerId) return;
       if (moveEvent.buttons === 0) {
         finish();
         return;
@@ -347,13 +379,16 @@ export function WorkspaceSplit({
       latest = dragSeam(from.sizes, start, length, seam, boundary, bounds.width);
       setLiveSizes(latest);
     };
+    const onEnd = (endEvent: PointerEvent) => {
+      if (endEvent.pointerId === pointerId) finish();
+    };
     const finish = () => {
       if (done) return;
       done = true;
       document.removeEventListener("pointermove", onMove);
-      document.removeEventListener("pointerup", finish);
-      document.removeEventListener("pointercancel", finish);
-      handle.removeEventListener("lostpointercapture", finish);
+      document.removeEventListener("pointerup", onEnd);
+      document.removeEventListener("pointercancel", onEnd);
+      handle.removeEventListener("lostpointercapture", onEnd);
       if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
@@ -366,9 +401,9 @@ export function WorkspaceSplit({
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
     document.addEventListener("pointermove", onMove);
-    document.addEventListener("pointerup", finish);
-    document.addEventListener("pointercancel", finish);
-    handle.addEventListener("lostpointercapture", finish);
+    document.addEventListener("pointerup", onEnd);
+    document.addEventListener("pointercancel", onEnd);
+    handle.addEventListener("lostpointercapture", onEnd);
   };
 
   /** Arrows step the seam; Home and End take it as far as either neighbour allows. */
@@ -410,7 +445,11 @@ export function WorkspaceSplit({
   const durationMs = leavingKey ? CLOSE_MS : OPEN_MS;
 
   return (
-    <div ref={containerRef} className="flex min-w-0">
+    <div
+      ref={containerRef}
+      data-split-settling={settling ? "" : undefined}
+      className="flex min-w-0"
+    >
       {columns.map((column, index) => {
         const left = columns[index - 1];
         const settled = column.state === "in";

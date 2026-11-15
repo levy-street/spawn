@@ -34,6 +34,14 @@ import { type Columns, MIN_MEMBERS, normalizeSizes, removeColumn, toGroup } from
  * The arithmetic of a group — adding, removing and moving columns, the seams
  * and their floors, how many columns a window holds — is `split-group`'s.
  * This module only holds the one group there is, and says when it changed.
+ *
+ * Builds from before groups only know a pair. What this one stores carries
+ * that pair beside the group (`storedSplit`), so a rollback or a tab still on
+ * the previous deploy shows the first two columns rather than no split. Such
+ * a build cannot keep a group of three or four, though: the first thing it
+ * changes — a seam, a swap — it writes back as the pair alone, and the third
+ * and fourth columns are gone when this build reads it again. Accepted for a
+ * rollback; `split-store.test.ts` states it.
  */
 
 export const SPLIT_STORAGE_KEY = "spawn.workspaces.split";
@@ -176,10 +184,11 @@ const listeners = new Set<() => void>();
 let state: SplitState = { ...DEFAULT_STATE };
 let initialised = false;
 /**
- * Where each workspace that has left the group handed its column, for the
- * length of the session. Two things notice a workspace going — the list
- * refresh that reconciles the group, and the 404 its own column gets — in
- * either order, and both have to send the address bar to the same place.
+ * Where each workspace that has just left the group handed its column. Two
+ * things notice a workspace going — the list refresh that reconciles the
+ * group, and the 404 its own column gets — in either order, and both have to
+ * send the address bar to the same place. Cleared as soon as any route
+ * arrives (`followRoute`): that is the only race it exists for.
  */
 const departed = new Map<string, string>();
 
@@ -338,7 +347,9 @@ export const splitStore = {
     if (!group || !isMember(group, workspaceId)) {
       // Already gone — a list refresh reconciled it first. Where it went is
       // still where a route onto it has to go.
-      return routed ? (departed.get(workspaceId) ?? null) : null;
+      const destination = routed ? (departed.get(workspaceId) ?? null) : null;
+      if (destination) set({ ...state, heading: destination });
+      return destination;
     }
     const successor = successorOf(group.members, workspaceId, new Set([workspaceId]));
     if (successor) departed.set(workspaceId, successor);
@@ -403,6 +414,10 @@ export const splitStore = {
    */
   followRoute(routedId: string | null): void {
     ensureInitialised();
+    // Where departed members went only matters until the route they sent
+    // somewhere has arrived; kept longer, a workspace opened on its own much
+    // later would be sent after a column it is no longer beside.
+    departed.clear();
     set({
       ...state,
       activeId: isMember(state.group, routedId) ? routedId : null,
@@ -435,10 +450,12 @@ export const splitStore = {
    * alone rather than being cleared against an empty list, which would drop
    * the arrangement on every cold load.
    *
-   * Returns where the address bar has to go when `routedId` was one of the
+   * Returns where the address bar would go when `routedId` was one of the
    * members that went — the column that took its place — or null when the
-   * route can stay. This can arrive before the 404 the routed column gets for
-   * itself, or after it; `remove` answers that 404 with the same destination.
+   * route can stay. Only for a member that was deleted: an archived one stays
+   * on screen, alone, as its archived snapshot. The list cannot tell the two
+   * apart; the workspace's own record can, and its 404 — before this or after
+   * — reaches `remove`, which answers with the same destination.
    */
   reconcile(knownIds: ReadonlySet<string> | null, routedId: string | null = null): string | null {
     ensureInitialised();
@@ -453,14 +470,16 @@ export const splitStore = {
     }
     let next: SplitGroup | null = group;
     for (const id of missing) next = next ? without(next, id) : null;
-    // The address bar was on one that went: it goes to the column that took
-    // its place, and the window draws that while the route catches up.
+    // The address bar was on one that left the list. Where it would go is the
+    // column that took its place — but leaving the list is not leaving the
+    // product: an archived workspace leaves it too and stays on screen as its
+    // archived snapshot. So this names the destination and does not head
+    // there; the caller moves only once it knows the workspace was deleted.
     const destination = routedId && gone.has(routedId) ? (departed.get(routedId) ?? null) : null;
     set({
       ...state,
       group: next,
       activeId: isMember(next, state.activeId) ? state.activeId : null,
-      heading: destination ?? state.heading,
     });
     return destination;
   },

@@ -56,7 +56,7 @@ import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
-import { daemonGrid } from "@/lib/terminal-grid";
+import { paneSizing } from "@/lib/terminal-grid";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import { viewportInset } from "@/lib/viewport";
 import type { DisplayControlState } from "@/lib/ws";
@@ -348,8 +348,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   }, []);
   const attachGpuRenderer = useCallback((term: XTerm, ref: { current: WebglAddon | null }) => {
     if (ref.current) return;
+    let webgl: WebglAddon | null = null;
     try {
-      const webgl = new WebglAddon();
+      webgl = new WebglAddon();
       term.loadAddon(webgl);
       // addon-webgl's dispose throws when the renderer never finished
       // initializing (strict-mode dev double-mounts, lost contexts) and is
@@ -363,9 +364,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           // Partially-initialized renderer; the terminal survives on DOM.
         }
       };
-      webgl.onContextLoss(() => {
-        webgl.dispose();
-        if (ref.current === webgl) ref.current = null;
+      const loaded = webgl;
+      loaded.onContextLoss(() => {
+        loaded.dispose();
+        if (ref.current === loaded) ref.current = null;
         gpuBudget.release(gpuOwnerRef.current);
         // Falls back to the DOM renderer — which the addon was meant to put
         // back itself and, in the versions we ship, cannot.
@@ -373,9 +375,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       });
       ref.current = webgl;
     } catch {
-      // No WebGL available (headless GL blocklist, exhausted contexts):
-      // xterm keeps its DOM renderer.
+      // No WebGL on this page (no WebGL2, a blocklisted GPU): xterm keeps its
+      // DOM renderer, and the page stops asking — every focus would otherwise
+      // try again. The addon was registered before it failed; take it out.
+      try {
+        webgl?.dispose();
+      } catch {
+        // It never finished activating; there is nothing more to undo.
+      }
       ref.current = null;
+      gpuBudget.markUnavailable();
     }
   }, []);
   /**
@@ -522,6 +531,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
    * daemon refuses and drawing nothing.
    */
   const gridClippedRef = useRef(false);
+  /**
+   * The pane is under the daemon's minimum grid (20×5). It then sends no size
+   * and takes no claim on the display of its own accord: a pane squeezed by
+   * layout must not shrink a session a phone, or an agent's full-screen
+   * interface, is sized for. It shows the session at the grid it already has
+   * — the owner's, or this terminal's own last real one — clipped, or a quiet
+   * placeholder when it knows neither.
+   */
+  const paneTooSmallRef = useRef(false);
+  const [tooSmallPlaceholder, setTooSmallPlaceholder] = useState(false);
+  /** The last grid this terminal really had: a fit at or above the minimum. */
+  const knownGridRef = useRef<TerminalGeometry | null>(null);
+  /**
+   * A display claim or a focus held back — the pane too small, or its split
+   * still settling. The next real fit pays it, so it is taken at the size the
+   * pane ends up at rather than at one it passes through.
+   */
+  const claimDeferredRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
   const lastSizeRef = useRef<TerminalGeometry>({ cols: 80, rows: 24 });
   const lastSentSizeRef = useRef<string | null>(null);
@@ -615,6 +642,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     rows: number;
   } | null>(null);
   const socketStartedRef = useRef(false);
+  /**
+   * The channel is wanted. Usually set with the first fit's size; a pane too
+   * small to have a size of its own starts it without one, which is how it
+   * learns the session's grid and still takes input.
+   */
+  const [socketWanted, setSocketWanted] = useState(false);
   // Set once the deep post-connect snapshot has rebuilt the live buffer at
   // full history depth (the connect seed carries only a shallow prefix).
   const unifiedDeepSeededRef = useRef(false);
@@ -958,40 +991,67 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     refreshLiveEdgeRef.current();
   }, []);
 
-  const requestDisplayControl = useCallback((operation: "take_control" | "focus_view"): boolean => {
-    const term = termRef.current;
-    if (!term) return false;
-    // Followers may be panning a virtual surface sized for another device.
-    // Measure this viewport without changing the displayed terminal or its lease.
-    const surfaces = [terminalSurfaceRef.current, containerRef.current].filter(
-      (surface): surface is HTMLDivElement => surface !== null,
-    );
-    const styles = surfaces.map((surface) => [surface.style.width, surface.style.height]);
-    const viewport = terminalViewportRef.current;
-    const scroll = { left: viewport?.scrollLeft ?? 0, top: viewport?.scrollTop ?? 0 };
-    let size = { cols: term.cols, rows: term.rows };
-    try {
-      for (const surface of surfaces) {
-        surface.style.width = "100%";
-        surface.style.height = "100%";
+  const requestDisplayControl = useCallback(
+    (operation: "take_control" | "focus_view", explicit = false): boolean => {
+      const term = termRef.current;
+      if (!term) return false;
+      // A split still widening or narrowing its columns: the size this pane
+      // would claim at is one it is only passing through. Held until it has
+      // settled; the fit that follows pays it at the final size.
+      if (!explicit && terminalViewportRef.current?.closest("[data-split-settling]")) {
+        claimDeferredRef.current = true;
+        return false;
       }
-      // Held to the grid the daemon accepts, as every fit is: a pane too
-      // small for it takes control at the minimum it then clips.
-      const proposed = fitRef.current?.proposeDimensions();
-      if (proposed) size = daemonGrid(proposed);
-    } finally {
-      surfaces.forEach((surface, index) => {
-        [surface.style.width, surface.style.height] = styles[index];
-      });
-      if (viewport) {
-        viewport.scrollLeft = scroll.left;
-        viewport.scrollTop = scroll.top;
+      // Followers may be panning a virtual surface sized for another device.
+      // Measure this viewport without changing the displayed terminal or its lease.
+      const surfaces = [terminalSurfaceRef.current, containerRef.current].filter(
+        (surface): surface is HTMLDivElement => surface !== null,
+      );
+      const styles = surfaces.map((surface) => [surface.style.width, surface.style.height]);
+      const viewport = terminalViewportRef.current;
+      const scroll = { left: viewport?.scrollLeft ?? 0, top: viewport?.scrollTop ?? 0 };
+      let proposed: { cols: number; rows: number } | undefined;
+      try {
+        for (const surface of surfaces) {
+          surface.style.width = "100%";
+          surface.style.height = "100%";
+        }
+        proposed = fitRef.current?.proposeDimensions();
+      } finally {
+        surfaces.forEach((surface, index) => {
+          [surface.style.width, surface.style.height] = styles[index];
+        });
+        if (viewport) {
+          viewport.scrollLeft = scroll.left;
+          viewport.scrollTop = scroll.top;
+        }
       }
-    }
-    return socketRef.current.sendJson({ type: operation, cols: size.cols, rows: size.rows });
-  }, []);
+      const sizing =
+        viewport && (viewport.clientWidth <= 0 || viewport.clientHeight <= 0)
+          ? ({ kind: "unmeasured" } as const)
+          : paneSizing(proposed);
+      if (sizing.kind === "fits") {
+        return socketRef.current.sendJson({
+          type: operation,
+          cols: sizing.cols,
+          rows: sizing.rows,
+        });
+      }
+      // Too small, or not measurable: no size of its own to claim at. Someone
+      // pressing "Take control" in a pane too small for a grid takes it at the
+      // size the session already has — the display is theirs, and nobody's
+      // terminal changes size.
+      if (explicit && sizing.kind === "too-small") {
+        const known = displayGeometryRef.current ?? knownGridRef.current;
+        if (known) return socketRef.current.sendJson({ type: operation, ...known });
+      }
+      claimDeferredRef.current = true;
+      return false;
+    },
+    [],
+  );
   const takeControlNow = useCallback(
-    () => requestDisplayControl("take_control"),
+    () => requestDisplayControl("take_control", true),
     [requestDisplayControl],
   );
   takeControlNowRef.current = takeControlNow;
@@ -1020,6 +1080,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
         if (state.owner) {
           fitTerminalRef.current(true);
+          // A pane too small for a grid of its own has no size to converge
+          // the PTY on; the session keeps the one it has.
+          if (paneTooSmallRef.current) return;
           // Ownership is confirmed asynchronously; a refit that landed
           // before this message recorded its size locally but never sent it
           // (resize only goes out while owner). Converge the PTY on our
@@ -1320,7 +1383,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     sessionId,
     sessionStatus: sessionIdentityQuery.data,
     enabled:
-      socketInitialSize !== null &&
+      socketWanted &&
       daemonConnection !== null &&
       sessionIdentityQuery.data?.status !== "exited" &&
       sessionIdentityQuery.data?.status !== "killed",
@@ -1967,35 +2030,29 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     /**
-     * In a pane too small for its grid, pan so the cursor's cell is on screen:
-     * the line being typed on is the part of a clipped terminal that has to be
-     * seen. Only the frame moves; the grid, and the size the daemon has, do
-     * not.
+     * In a pane too small for its grid, pan so the cursor's row is on screen
+     * and the left edge with it: the line being typed on, read from its
+     * start, is the part of a clipped terminal that has to be seen. Only the
+     * frame moves; the grid, and the size the daemon has, do not.
      */
     const keepCursorInClippedFrame = () => {
-      if (!gridClippedRef.current || term.rows <= 0 || term.cols <= 0) return;
+      if (!gridClippedRef.current || term.rows <= 0) return;
       const screen = terminalElement.querySelector<HTMLElement>(".xterm-screen");
       if (!screen) return;
       const screenRect = screen.getBoundingClientRect();
       const surfaceRect = terminalSurface.getBoundingClientRect();
       const cellHeight = screenRect.height / term.rows;
-      const cellWidth = screenRect.width / term.cols;
       const buffer = term.buffer.active;
       const row = buffer.baseY + buffer.cursorY - buffer.viewportY;
-      if (row < 0 || row >= term.rows || cellHeight <= 0 || cellWidth <= 0) return;
+      if (row < 0 || row >= term.rows || cellHeight <= 0) return;
       const top = screenRect.top - surfaceRect.top + row * cellHeight;
-      const left = screenRect.left - surfaceRect.left + buffer.cursorX * cellWidth;
       const view = terminalViewport;
       if (top + cellHeight > view.scrollTop + view.clientHeight) {
         view.scrollTop = Math.ceil(top + cellHeight - view.clientHeight);
       } else if (top < view.scrollTop) {
         view.scrollTop = Math.floor(top);
       }
-      if (left + cellWidth > view.scrollLeft + view.clientWidth) {
-        view.scrollLeft = Math.ceil(left + cellWidth - view.clientWidth);
-      } else if (left < view.scrollLeft) {
-        view.scrollLeft = Math.floor(left);
-      }
+      view.scrollLeft = 0;
     };
 
     const maxFrameScrollLeft = () => {
@@ -2641,10 +2698,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     const notifyResizeIfChanged = () => {
       const { cols, rows } = term;
+      knownGridRef.current = { cols, rows };
       if (!socketStartedRef.current) {
         socketStartedRef.current = true;
         lastSizeRef.current = { cols, rows };
         setSocketInitialSize({ cols, rows });
+        setSocketWanted(true);
         return;
       }
       const last = lastSizeRef.current;
@@ -2715,20 +2774,40 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
         return;
       }
+      // A column of a split still widening or narrowing: no size yet. Every
+      // terminal in the split waits for the layout to settle and fits once,
+      // at its final size, rather than sending each viewer a reflow per step
+      // of the animation.
+      if (terminalViewport.closest("[data-split-settling]")) {
+        scheduleFit();
+        return;
+      }
+      // Nothing to measure — hidden, or not laid out yet: no fit at all.
+      if (terminalViewport.clientWidth <= 0 || terminalViewport.clientHeight <= 0) return;
       // Measured at the pane's own size, never at a clipped grid's: the
       // surface a clipped grid is drawn on is bigger than the pane, and a fit
       // that measured it would never shrink back.
+      const wasClipped = gridClippedRef.current;
       gridClippedRef.current = false;
       layoutTerminalSurface(false);
       const proposed = fit.proposeDimensions();
-      const grid = proposed ? daemonGrid(proposed) : null;
+      const sizing = paneSizing(proposed);
+      if (sizing.kind === "unmeasured") {
+        // As FitAddon's own fit() would: leave the terminal as it was.
+        gridClippedRef.current = wasClipped;
+        layoutTerminalSurface(false);
+        return;
+      }
+      if (sizing.kind === "too-small") {
+        showTooSmall(anchor);
+        return;
+      }
+      paneTooSmallRef.current = false;
+      setTooSmallPlaceholder(false);
       try {
-        if (grid && proposed && (grid.cols !== proposed.cols || grid.rows !== proposed.rows)) {
-          // Outside the grid the daemon accepts: hold the terminal to it.
-          // Under the minimum the pane clips the grid; the size the daemon
-          // gets is the same however much of it the pane shows.
-          gridClippedRef.current = grid.clipped;
-          if (grid.cols !== term.cols || grid.rows !== term.rows) term.resize(grid.cols, grid.rows);
+        if (proposed && (sizing.cols !== proposed.cols || sizing.rows !== proposed.rows)) {
+          // Past the largest grid the daemon accepts: held to it.
+          term.resize(sizing.cols, sizing.rows);
         } else {
           // Every pane the daemon can take as it is: exactly the fit it has
           // always had.
@@ -2738,10 +2817,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         return;
       }
       layoutTerminalSurface(false);
-      if (gridClippedRef.current) {
-        keepCursorInClippedFrame();
-        requestAnimationFrame(keepCursorInClippedFrame);
-      }
       if (anchor) {
         restoreScrollAnchor(anchor);
         requestAnimationFrame(() => restoreScrollAnchor(anchor));
@@ -2749,6 +2824,61 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         alignViewportToRows();
       }
       notifyResizeIfChanged();
+      // A claim held back while the pane was too small, or its split was
+      // still settling, is taken now, at the size it has come to.
+      if (claimDeferredRef.current) {
+        claimDeferredRef.current = false;
+        if (displayClaimOwedRef.current) payDisplayClaimRef.current();
+      }
+    };
+
+    /**
+     * A pane under the daemon's minimum. It sends no size and takes no claim:
+     * the session keeps the grid it has, and this pane shows it — the owner's
+     * grid, or this terminal's own last real one — clipped, with the cursor's
+     * row and the left edge in view. Input still goes to the session when
+     * this terminal holds control. Knowing neither grid, it shows a quiet
+     * placeholder rather than a blank or a guess.
+     */
+    const showTooSmall = (anchor: ScrollAnchor | null) => {
+      paneTooSmallRef.current = true;
+      // The session must still be reachable — to learn its grid, and to take
+      // input — so the channel opens without a size of its own.
+      if (!socketStartedRef.current) {
+        socketStartedRef.current = true;
+        setSocketWanted(true);
+      }
+      const known = displayGeometryRef.current ?? knownGridRef.current;
+      if (!known) {
+        setTooSmallPlaceholder(true);
+        layoutTerminalSurface(false);
+        return;
+      }
+      setTooSmallPlaceholder(false);
+      const last = lastSizeRef.current;
+      if (known.cols !== term.cols || known.rows !== term.rows) {
+        try {
+          term.resize(known.cols, known.rows);
+        } catch {
+          return;
+        }
+      }
+      // Drawn at the session's grid now, locally — as a follower draws at its
+      // owner's — so a later real fit compares against it.
+      lastSizeRef.current = known;
+      if (known.cols !== last.cols || known.rows !== last.rows) {
+        resizeQuietUntilRef.current = performance.now() + RESIZE_QUIET_MS;
+        invalidateScrollbackForResizeRef.current();
+      }
+      if (known.cols !== last.cols) historyReseedPendingRef.current = true;
+      gridClippedRef.current = true;
+      layoutTerminalSurface(false);
+      keepCursorInClippedFrame();
+      requestAnimationFrame(keepCursorInClippedFrame);
+      if (anchor) {
+        restoreScrollAnchor(anchor);
+        requestAnimationFrame(() => restoreScrollAnchor(anchor));
+      }
     };
     fitTerminalRef.current = fitTerminal;
 
@@ -3217,6 +3347,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return;
     }
     if (displayOwnerRef.current !== true) return;
+    // A pane too small for a grid of its own resends nothing.
+    if (paneTooSmallRef.current) return;
     const { cols, rows } = lastSizeRef.current;
     const key = `${cols}x${rows}`;
     if (lastSentSizeRef.current === key) return;
@@ -3231,8 +3363,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         socket.sendBinary(data);
       },
       resize: (requestedCols, requestedRows) => {
-        // Never a size the daemon refuses.
-        const { cols, rows } = daemonGrid({ cols: requestedCols, rows: requestedRows });
+        // Never a size the daemon refuses, and nothing from a size too small
+        // to be one.
+        const sizing = paneSizing({ cols: requestedCols, rows: requestedRows });
+        if (sizing.kind !== "fits") return;
+        const { cols, rows } = sizing;
         const last = lastSizeRef.current;
         lastSizeRef.current = { cols, rows };
         if (cols !== last.cols || rows !== last.rows) {
@@ -3638,6 +3773,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         hostName={hostIdentityQuery.data?.name ?? null}
         hostOffline={hostIdentityQuery.data?.status === "offline"}
       />
+      {tooSmallPlaceholder && (
+        // A pane too small for any terminal, before it knows the session's
+        // own size: said quietly, in the pane's own ground, rather than left
+        // blank or drawn at a size the session does not have.
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-0.5 bg-[var(--color-terminal-bg)] p-2 text-center text-xs text-muted-foreground">
+          <span>Too small to show</span>
+          <span className="opacity-80">Make this pane larger</span>
+        </div>
+      )}
       {socket.state === "unauthorized" && (
         <div className="pointer-events-auto absolute inset-x-2 top-2 z-40 flex items-center justify-center gap-3 rounded-md border border-destructive/45 bg-background/95 px-3 py-2 text-xs text-foreground shadow-lg backdrop-blur">
           <span>You've been signed out.</span>

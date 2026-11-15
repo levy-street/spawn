@@ -29,6 +29,7 @@ export const GPU_RENDERER_BUDGET = 12;
 export function createGpuBudget(limit: number = GPU_RENDERER_BUDGET) {
   const holders = new Map<object, { demote: () => void; focusedAt: number }>();
   let clock = 0;
+  let unavailable = false;
   return {
     /**
      * A slot for `owner`, or false when there is none to be had. `demote` is
@@ -36,6 +37,7 @@ export function createGpuBudget(limit: number = GPU_RENDERER_BUDGET) {
      * more: it must drop the owner to the DOM renderer.
      */
     request(owner: object, demote: () => void, focused: boolean): boolean {
+      if (unavailable) return false;
       const held = holders.get(owner);
       if (held) {
         if (focused) held.focusedAt = ++clock;
@@ -53,6 +55,21 @@ export function createGpuBudget(limit: number = GPU_RENDERER_BUDGET) {
       }
       holders.set(owner, { demote, focusedAt: focused ? ++clock : 0 });
       return true;
+    },
+
+    /**
+     * The renderer could not be created on this page — no WebGL at all, or a
+     * blocklisted GPU. Remembered for the page: every later request is
+     * refused, rather than each focus making a canvas and leaving another
+     * dead addon behind. The DOM renderer draws everything from here.
+     */
+    markUnavailable(): void {
+      unavailable = true;
+      holders.clear();
+    },
+
+    available(): boolean {
+      return !unavailable;
     },
 
     /** `owner` no longer draws through WebGL. */

@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import {
   isMember,
@@ -506,17 +508,20 @@ describe("splitStore.reconcile", () => {
     expect(members()).toEqual(["a", "b", "c"]);
   });
 
-  test("the column the address bar is on stopping existing names where it goes next", () => {
+  test("the column the address bar is on leaving the list names where it would go", () => {
     reset();
     splitStore.arrange(["a", "b", "c"]);
-    // The list refresh got here before the 404 did: it still has to say where
-    // the URL goes, or the window falls back to a lone dead workspace.
+    // The list refresh got here first. It cannot tell an archive from a
+    // delete — an archived workspace leaves the list too, and stays on
+    // screen as its snapshot — so it names the destination without heading
+    // there: the window keeps showing b until something knows b is gone.
     expect(splitStore.reconcile(new Set(["a", "c"]), "b")).toBe("c");
     expect(members()).toEqual(["a", "c"]);
-    // And the window can draw that destination before the route arrives.
-    expect(splitStore.get().heading).toBe("c");
-    // The 404 that arrives after it agrees, rather than picking by position.
+    expect(splitStore.get().heading).toBeNull();
+    // b's own 404 is that something. It agrees on where, rather than picking
+    // by position, and the window draws it while the route catches up.
     expect(splitStore.remove("b", "b")).toBe("c");
+    expect(splitStore.get().heading).toBe("c");
   });
 
   test("a pair whose routed member stops existing hands the address bar to the survivor", () => {
@@ -543,10 +548,24 @@ describe("splitStore.reconcile", () => {
     expect(splitStore.reconcile(new Set(["a", "b"]), "z")).toBeNull();
   });
 
+  test("where a departed member went is forgotten once the route arrives", () => {
+    // [a, b]: a removed while the URL is on it, the route goes to b. Long
+    // after, a is opened alone and deleted: it must not send the URL to b
+    // again — b may be gone too, and a's own way out is /app or the next row.
+    reset();
+    splitStore.arrange(["a", "b"]);
+    expect(splitStore.remove("a", "a")).toBe("b");
+    // Until the route has arrived, a late 404 for a still agrees.
+    expect(splitStore.remove("a", "a")).toBe("b");
+    splitStore.followRoute("b");
+    expect(splitStore.remove("a", "a")).toBeNull();
+  });
+
   test("arriving anywhere ends the heading", () => {
     reset();
     splitStore.arrange(["a", "b", "c"]);
-    splitStore.reconcile(new Set(["a", "c"]), "b");
+    splitStore.remove("b", "b");
+    expect(splitStore.get().heading).toBe("c");
     splitStore.followRoute("c");
     expect(splitStore.get().heading).toBeNull();
   });
@@ -675,6 +694,38 @@ describe("splitStore persistence", () => {
     expect(back?.members).toEqual(["b", "a"]);
     expect(back?.sizes[0]).toBeCloseTo(0.3, 9);
     expect(back?.sizes[1]).toBeCloseTo(0.7, 9);
+  });
+
+  test("the previous build's reader is master's own, byte for byte", () => {
+    // `git show f1ca1b86:web/src/lib/split-store.ts | sha256sum`. The fixture
+    // is only evidence while it is exactly that file; this fails the moment
+    // anyone edits it, even to make a test pass.
+    const fixture = readFileSync(
+      new URL("./split-store-pair-reader.fixture.ts", import.meta.url),
+      "utf8",
+    );
+    const body = fixture.slice(fixture.indexOf(" */\n\n") + " */\n\n".length);
+    expect(createHash("sha256").update(body).digest("hex")).toBe(
+      "a9626168abb21975b42316502ef1c07604c97831765099cc21598f5d660b4e84",
+    );
+  });
+
+  test("an older build that rearranges a group of three or four keeps only its first two", () => {
+    // Accepted for a rollback, and stated here so nobody is surprised by it:
+    // that build only knows a pair, so the first change it makes — a seam
+    // drag, a swap — writes the pair back and the rest of the group is gone.
+    const storage = fakeStorage();
+    withStorage(storage, () => {
+      reset();
+      splitStore.arrange(["a", "b", "c", "d"], [0.25, 0.25, 0.25, 0.25]);
+    });
+    const old = previousBuildReads(JSON.parse(storage.getItem?.(SPLIT_STORAGE_KEY) ?? "null"));
+    const writtenBack = {
+      primaryId: old.pair?.primaryId,
+      secondaryId: old.pair?.secondaryId,
+      ratio: old.ratio,
+    };
+    expect(normalizeSplit(writtenBack).group?.members).toEqual(["a", "b"]);
   });
 
   test("no split is nothing stored", () => {

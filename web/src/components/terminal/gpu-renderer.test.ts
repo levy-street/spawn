@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { createGpuBudget, GPU_RENDERER_BUDGET, restoreDomRenderer } from "./gpu-renderer";
 
 /** A terminal asking for the GPU, recording whether it was asked to give it back. */
@@ -52,6 +53,19 @@ describe("the GPU renderer budget", () => {
     expect(budget.request(b.owner, b.demote, false)).toBe(true);
   });
 
+  test("once WebGL has failed on the page, nobody asks for it again", () => {
+    // A browser with no WebGL at all: every focus used to try again, making a
+    // canvas and leaving another dead addon behind each time.
+    const budget = createGpuBudget(4);
+    const [a, b] = [terminal(), terminal()];
+    expect(budget.request(a.owner, a.demote, false)).toBe(true);
+    budget.markUnavailable();
+    expect(budget.available()).toBe(false);
+    expect(budget.size()).toBe(0);
+    expect(budget.request(b.owner, b.demote, true)).toBe(false);
+    expect(budget.request(a.owner, a.demote, true)).toBe(false);
+  });
+
   test("asking again while holding a slot is not a second slot", () => {
     const budget = createGpuBudget(2);
     const a = terminal();
@@ -103,5 +117,24 @@ describe("restoreDomRenderer", () => {
     const { term, calls } = fakeTerminal({ rows: false, disposed: true });
     restoreDomRenderer(term as never);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("the xterm pair restoreDomRenderer was written against", () => {
+  test("is still the one installed", () => {
+    // The hand-back exists because addon-webgl 0.19 expects xterm 6's
+    // internals (`_core._store`) and we ship xterm 5.5. An upgrade of either
+    // fails here so that someone looks again: the real fix is an addon set
+    // that matches the xterm version, at which point the addon restores the
+    // DOM renderer itself and this workaround can go.
+    const version = (name: string) =>
+      JSON.parse(
+        readFileSync(
+          new URL(`../../../node_modules/${name}/package.json`, import.meta.url),
+          "utf8",
+        ),
+      ).version;
+    expect(version("@xterm/xterm")).toBe("5.5.0");
+    expect(version("@xterm/addon-webgl")).toBe("0.19.0");
   });
 });

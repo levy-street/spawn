@@ -6,45 +6,41 @@
  * a resize, a take_control, a focus_view, a history sized for the screen — and
  * a terminal whose size it refused was left drawing nothing at all: a pane
  * under about 175px wide or 100px tall stayed blank. The mobile app holds its
- * grid to the same bounds (`GRID_BOUNDS` in its terminal worker).
+ * grid to the same bounds (`GRID_BOUNDS` in its terminal worker). The unit
+ * test reads these from session_ctl.rs, so the two cannot drift apart.
  */
 export const DAEMON_MIN_COLS = 20;
 export const DAEMON_MAX_COLS = 400;
 export const DAEMON_MIN_ROWS = 5;
 export const DAEMON_MAX_ROWS = 200;
 
-export interface TerminalGrid {
-  cols: number;
-  rows: number;
-  /**
-   * The grid is bigger than the pane in some dimension: the pane shows what
-   * fits of it, clipped, rather than asking for a size the daemon refuses.
-   */
-  clipped: boolean;
-}
-
-function within(value: number, low: number, high: number): number {
-  if (!Number.isFinite(value)) return low;
-  return Math.min(high, Math.max(low, Math.floor(value)));
-}
-
 /**
- * The grid a pane that fits `fits` asks the daemon for: exactly that, when it
- * is inside the bounds — which every pane bigger than 20 columns by 5 rows
- * is, so they behave exactly as they always have — or held to the nearest
- * bound when it is not.
+ * What a pane of a given size asks the daemon for.
  *
- * Under the minimum the grid stays at the minimum and the pane clips it. That
- * is also what keeps a pane hovering at the threshold quiet: every size at or
- * under the minimum asks for the same grid, so nothing new reaches the daemon
- * until the pane is past it again, and a clipped pane that only changes how
- * much of the grid it shows asks for nothing at all. Past the maximum the grid
- * is simply held to it; the pane has room to spare, so nothing is clipped.
+ * - `fits`: the grid it fits, which every pane of 20 columns by 5 rows or more
+ *   does — exactly the fit it has always had — held to the maximum past it.
+ * - `too-small`: under the minimum in either dimension. It asks for nothing:
+ *   no resize, no claim on the display. A pane squeezed by layout must not
+ *   shrink a session that a phone, or an agent drawing a full-screen
+ *   interface, is sized for; it shows the session at the size it already has,
+ *   clipped, instead (see the terminal's clipped frame).
+ * - `unmeasured`: no size could be read — not a number, or nothing at all. It
+ *   is not sized, as FitAddon's own `fit()` would not size it either.
  */
-export function daemonGrid(fits: { cols: number; rows: number }): TerminalGrid {
-  const cols = within(fits.cols, DAEMON_MIN_COLS, DAEMON_MAX_COLS);
-  const rows = within(fits.rows, DAEMON_MIN_ROWS, DAEMON_MAX_ROWS);
-  const narrow = !Number.isFinite(fits.cols) || fits.cols < DAEMON_MIN_COLS;
-  const short = !Number.isFinite(fits.rows) || fits.rows < DAEMON_MIN_ROWS;
-  return { cols, rows, clipped: narrow || short };
+export type PaneSizing =
+  | { kind: "fits"; cols: number; rows: number }
+  | { kind: "too-small" }
+  | { kind: "unmeasured" };
+
+export function paneSizing(fits: { cols: number; rows: number } | null | undefined): PaneSizing {
+  if (!fits || !Number.isFinite(fits.cols) || !Number.isFinite(fits.rows)) {
+    return { kind: "unmeasured" };
+  }
+  if (fits.cols <= 0 || fits.rows <= 0) return { kind: "unmeasured" };
+  if (fits.cols < DAEMON_MIN_COLS || fits.rows < DAEMON_MIN_ROWS) return { kind: "too-small" };
+  return {
+    kind: "fits",
+    cols: Math.min(DAEMON_MAX_COLS, Math.floor(fits.cols)),
+    rows: Math.min(DAEMON_MAX_ROWS, Math.floor(fits.rows)),
+  };
 }
