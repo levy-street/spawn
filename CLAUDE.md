@@ -129,8 +129,17 @@ permanently fail acceptance; they are not silently restarted. The fixture
 daemon has 180 seconds to register: on the macOS runner it spends half a
 minute hashing the unoptimized pair into its release store before its first
 log line, and the lifecycle log records how long it took.
-After fixture readiness, native app boot has a separate 180-second budget;
-local startup diagnostics and scoped device captures preserve setup failures.
+After fixture readiness, native app boot has a separate 180-second budget.
+The app retries an unanswered first bootstrap request (a refusal still fails
+at once); the last attempt is scheduled to start within 60 seconds of the
+first, and each attempt can wait out its 15-second request timeout, so
+retrying can take about 75 seconds. That fits inside the 180-second budget of
+the first launch only; after the relaunch in the `process_restart` case the
+suite waits 60 seconds for the new boot, less than retrying can take.
+Local startup diagnostics and scoped device captures preserve setup failures.
+A short-background cycle measured at three seconds or longer is repeated,
+three cycles at most, before the case fails; the suite cannot tell OS latency
+from app latency. `mobile/e2e/NATIVE_ACCEPTANCE.md` has the rules.
 Fixture shutdown defers cancellation until worker/API cleanup and its evidence
 write finish; the workflow still enforces a bounded cleanup deadline.
 

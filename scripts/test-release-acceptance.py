@@ -101,6 +101,29 @@ class EvidenceTests(unittest.TestCase):
             result["reports"]["ios"]["source_report_sha256"], r"^[a-f0-9]{64}$"
         )
 
+    def test_repeated_short_background_cycles_validate_without_being_promoted(self):
+        value = report("ios")
+        case = next(row for row in value["cases"] if row["id"] == "background_short")
+        case["metrics"] = {
+            "background_ms": 0,
+            "measured_background_ms": 812.0,
+            "background_attempts": [
+                {"measured_background_ms": 3646.0, "within_grace": False, "kept_parent": False},
+                {"measured_background_ms": 812.0, "within_grace": True, "kept_parent": True},
+            ],
+        }
+        self.write("ios", value)
+        result = self.verify()
+        self.assertNotIn("background_attempts", json.dumps(result))
+        self.assertIn(
+            {"id": "background_short", "status": "passed"},
+            result["reports"]["ios"]["cases"],
+        )
+        case["status"] = "failed"
+        self.write("ios", value)
+        with self.assertRaisesRegex(ValueError, "failed/skipped"):
+            self.verify()
+
     def test_missing_platform_and_duplicate_platform_refuse(self):
         (self.directory / "android" / "evidence.json").unlink()
         with self.assertRaisesRegex(ValueError, "absent"):

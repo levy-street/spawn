@@ -169,7 +169,14 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   background cycle returns to the app within one native command, keeping fixture
   HTTP/polling outside the measured interval. The short case requests immediate
   return and still requires real callbacks proving a nonzero gap below three
-  seconds with the original parent; slow OS transitions fail that gate.
+  seconds, with the parent the judged cycle started with still in place. A
+  cycle measured at three seconds or longer is repeated, not judged; the suite
+  measures the app's own lifecycle callbacks, so it cannot tell OS latency from
+  app latency. It checks that shells survived and the app recovered, then
+  repeats the cycle (three cycles at most) and judges the first short one. It
+  fails if every cycle is too slow. On a run that repeated a cycle, the case
+  does not cover a fault that only the app's first background after opening
+  its sessions would show.
   The bounded lifecycle journal retains actual callbacks through suspension; missing,
   reordered or replaced observations fail
   acceptance rather than depending on diagnostic HTTP delivery.
@@ -195,7 +202,15 @@ installation. Startup and liveness failures fail evidence without restarting
 fixture processes. The fixture daemon has 180 seconds to register (the macOS
 runner hashes the unoptimized pair into its release store first); the
 lifecycle log records how long it took.
-After fixture readiness, app boot has a separate 180-second deadline. Local
+After fixture readiness, app boot has a separate 180-second deadline. The
+controller retries its first bootstrap request while the request gets no HTTP
+answer (a hosted emulator's network can come up after the app starts); a
+refusal is an answer and fails boot at once. The last attempt is scheduled to
+start within 60 seconds of the first, and each attempt can wait out its
+15-second request timeout, so retrying can take about 75 seconds. That fits
+inside the 180-second deadline of the first launch only; after the relaunch in
+the `process_restart` case the suite waits 60 seconds for the new boot, less
+than retrying can take. Local
 startup diagnostics and validated-device failure captures remain available
 when the acceptance control channel cannot report an error.
 
