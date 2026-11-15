@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { detectAgentNotice } from "@/lib/agent-notice";
+import { detectAgentNotice, screenLines } from "@/lib/agent-notice";
 
 describe("detectAgentNotice", () => {
   test("recognises Claude Code's status bar after a background update", () => {
@@ -40,6 +40,10 @@ describe("a Codex that refuses --no-daemon", () => {
       ]),
     ).toBe("codex_no_daemon_refused");
     expect(detectAgentNotice(["error: unexpected argument '--foo' found"])).toBeNull();
+    // Trailing blanks do not matter.
+    expect(detectAgentNotice(["error: unexpected argument '--no-daemon' found   "])).toBe(
+      "codex_no_daemon_refused",
+    );
     // The update notice still wins where both show.
     expect(
       detectAgentNotice([
@@ -47,5 +51,37 @@ describe("a Codex that refuses --no-daemon", () => {
         "Update installed · Restart to update",
       ]),
     ).toBe("update_installed");
+  });
+
+  test("only the whole line from column 0 counts, not the words anywhere else", () => {
+    for (const line of [
+      // Mid-line, as typed or echoed at a shell.
+      "$ echo error: unexpected argument '--no-daemon' found",
+      "note: error: unexpected argument '--no-daemon' found",
+      // Indented, or inside Codex's own interface: a thread about the error.
+      "  error: unexpected argument '--no-daemon' found",
+      "• error: unexpected argument '--no-daemon' found",
+      "│ error: unexpected argument '--no-daemon' found │",
+      "› Why does it say error: unexpected argument '--no-daemon' found?",
+      // Longer than the refusal.
+      "error: unexpected argument '--no-daemon' found in the logs",
+      "unexpected argument '--no-daemon'",
+    ]) {
+      expect(detectAgentNotice([line])).toBeNull();
+    }
+  });
+
+  test("a refusal wrapped across rows of a narrow pane is read whole", () => {
+    const width = 20;
+    const line = "error: unexpected argument '--no-daemon' found";
+    const rows = [{ text: "$ codex --no-daemon", wrapped: false }];
+    for (let at = 0; at < line.length; at += width) {
+      rows.push({ text: line.slice(at, at + width).padEnd(width), wrapped: at > 0 });
+    }
+    rows.push({ text: "$ ", wrapped: false });
+    expect(screenLines(rows)).toEqual(["$ codex --no-daemon", line, "$"]);
+    expect(detectAgentNotice(screenLines(rows))).toBe("codex_no_daemon_refused");
+    // Read row by row, it would not be.
+    expect(detectAgentNotice(rows.map((row) => row.text))).toBeNull();
   });
 });

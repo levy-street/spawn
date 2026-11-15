@@ -62,6 +62,15 @@ describe("pending agent launches", () => {
       record: launch,
     });
 
+    // Asking whether it has the form claims nothing.
+    await store.persist("session-codex", HOST, launch);
+    await expect(store.hasNoDaemonForm?.("session-codex", HOST)).resolves.toBe(true);
+    await expect(store.hasNoDaemonForm?.("session-codex", "mac")).resolves.toBe(false);
+    await expect(store.take("session-codex", HOST)).resolves.toMatchObject({ status: "ready" });
+    await expect(store.hasNoDaemonForm?.("session-codex", HOST)).resolves.toBe(false);
+    await store.persist("session-plain", HOST, "codex");
+    await expect(store.hasNoDaemonForm?.("session-plain", HOST)).resolves.toBe(false);
+
     // Anything that is not the command with the flag added once is dropped.
     await store.persist("session-other", HOST, {
       command: "codex",

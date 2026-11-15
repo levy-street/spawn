@@ -23,21 +23,46 @@ export type AgentNotice = "update_installed" | "codex_no_daemon_refused";
 const CLAUDE_CODE_UPDATE_INSTALLED = /Update installed\s*\S?\s*Restart to (?:update|apply)/;
 
 /**
- * What the live screen says, if anything. `rows` is the text of the screen's
- * rows, top to bottom, as the terminal renders them — the whole live screen,
- * not just its bottom: an agent's status bar sits wherever its UI ended up,
- * which early in a session on a tall pane is nowhere near the last row.
+ * Codex's refusal of the flag, the whole line as Codex 0.155.1 prints it at a
+ * shell (clap's error, from column 0). Only that line counts: the same words
+ * mid-line, indented, or inside Codex's own interface — a thread that talks
+ * about this error — are not a refusal.
  */
-/** Codex's refusal of the flag (clap: `error: unexpected argument
- *  '--no-daemon' found`), from a Codex older than the flag. */
-const CODEX_NO_DAEMON_REFUSED = /unexpected argument '--no-daemon'/;
+export const CODEX_NO_DAEMON_REFUSAL = "error: unexpected argument '--no-daemon' found";
 
-export function detectAgentNotice(rows: readonly string[]): AgentNotice | null {
+/** One terminal row: its text with nothing trimmed, and whether it
+ *  continues the row above (the terminal wrapped a longer line). */
+export interface ScreenRow {
+  text: string;
+  wrapped: boolean;
+}
+
+/**
+ * The lines `rows` show, a wrapped row joined to the one it continues, so a
+ * pane narrower than a line still shows it whole; each with trailing blanks
+ * trimmed.
+ */
+export function screenLines(rows: readonly ScreenRow[]): string[] {
+  const lines: string[] = [];
   for (const row of rows) {
-    if (CLAUDE_CODE_UPDATE_INSTALLED.test(row)) return "update_installed";
+    if (row.wrapped && lines.length > 0) lines[lines.length - 1] += row.text;
+    else lines.push(row.text);
   }
-  for (const row of rows) {
-    if (CODEX_NO_DAEMON_REFUSED.test(row)) return "codex_no_daemon_refused";
+  return lines.map((line) => line.trimEnd());
+}
+
+/**
+ * What the live screen says, if anything. `lines` is the screen's lines, top
+ * to bottom (`screenLines`) — the whole live screen, not just its bottom: an
+ * agent's status bar sits wherever its UI ended up, which early in a session
+ * on a tall pane is nowhere near the last row.
+ */
+export function detectAgentNotice(lines: readonly string[]): AgentNotice | null {
+  for (const line of lines) {
+    if (CLAUDE_CODE_UPDATE_INSTALLED.test(line)) return "update_installed";
+  }
+  for (const line of lines) {
+    if (line.trimEnd() === CODEX_NO_DAEMON_REFUSAL) return "codex_no_daemon_refused";
   }
   return null;
 }

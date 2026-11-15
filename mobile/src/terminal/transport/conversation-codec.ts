@@ -120,3 +120,9 @@ export function parseConversationInspection(value: unknown): ConversationInspect
     source,
   };
 }
+
+/** Whether an inspection found an agent running in the window now, rather
+ *  than answering from the host's note of it (`remembered`) or finding none. */
+export function agentRunning(inspection: Pick<ConversationInspection, "source">): boolean {
+  return inspection.source !== "none" && inspection.source !== "remembered";
+}

@@ -92,6 +92,10 @@ export interface PendingLaunchStore {
   /** Durably claims delivery, into the window as it runs on `hostId`, before
    *  exposing command bytes. */
   take(sessionId: string, hostId: string): Promise<PendingLaunchRead>;
+  /** Whether a launch waits for the window as it runs on `hostId` with a
+   *  `--no-daemon` form, without claiming it or reading its command: what
+   *  delivery asks the host about before it claims. */
+  hasNoDaemonForm?(sessionId: string, hostId: string): Promise<boolean>;
   /** A terminal is attached to the window on `hostId`: a command queued for
    *  it as it ran anywhere else belongs to an incarnation that has gone, and
    *  is dropped. */
@@ -324,6 +328,18 @@ export function createPendingLaunchStore(
     },
 
     take: (sessionId, hostId) => serialized(sessionId, () => takePending(sessionId, hostId)),
+
+    async hasNoDaemonForm(sessionId, hostId) {
+      const manifest = await parseManifest(storage, sessionId);
+      return (
+        manifest !== null &&
+        manifest !== "invalid" &&
+        !manifest.delivered &&
+        !elsewhere(manifest, hostId) &&
+        manifest.expiresAt > now() &&
+        manifest.noDaemonAt !== undefined
+      );
+    },
 
     observe: (sessionId, hostId) => serialized(sessionId, () => observePending(sessionId, hostId)),
 

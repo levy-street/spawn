@@ -65,6 +65,16 @@ export const pendingLaunch = {
   has(sessionId: string, hostId: string, now: number = Date.now()): boolean {
     return waiting(sessionId, hostId, now) !== null;
   },
+  /** The launch waiting for the window as it runs on `hostId`, without
+   *  claiming it: what a view asks the host about before it claims. */
+  peekLaunch(
+    sessionId: string,
+    hostId: string,
+    now: number = Date.now(),
+  ): PendingLaunchCommand | null {
+    const launch = waiting(sessionId, hostId, now);
+    return launch ? { command: launch.command, codexNoDaemon: launch.codexNoDaemon } : null;
+  },
   /** Forget a queued command — the launch it was queued for never happened. */
   clear(sessionId: string): void {
     queued.delete(sessionId);

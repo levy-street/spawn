@@ -1403,19 +1403,30 @@ A client asks it just before it types a queued Codex launch into the window
 --no-daemon …` only on `true`. The daemon runs `codex --no-daemon --version`
 by the path the window's own launch environment finds (the environment it
 started the window's current shell with), with that environment, in the
-window's folder, with a 5 s timeout: a version line is `true`, a non-zero exit
-`false`. It is `null` for a window whose shell this daemon did not start (one
-it adopted after a restart), with no `codex` on that path, on a timeout or a
-run that could not start, and for output that is not Codex's; nothing is kept
-between asks. Codex parses its arguments first, so the run prints a version
-and connects to nothing; like any `codex` run it refreshes Codex's own scratch
-folder under `<CODEX_HOME>/tmp/`. A client reads `false`, `null`, an error,
+window's folder (relative `PATH` entries from that folder too), with a 5 s
+timeout, in a process group of its own killed whole at the timeout: a version
+line is `true`, a non-zero exit `false`. It is `null` for a window whose shell
+this daemon did not start (one it adopted after a restart), with no `codex` on
+that path, on a timeout or a run that could not start, for output that is not
+Codex's, and when three probes are already running and none frees up within
+250 ms; nothing is kept between asks. Codex parses its arguments first, so
+the run prints a version and connects to nothing; like any `codex` run it
+refreshes Codex's own scratch folder under `<CODEX_HOME>/tmp/`.
+
+A client asks before it claims the queued launch, so a view that cannot type
+by the time the answer comes leaves the launch queued; it waits at most 1.5 s
+for the channel and the answer together, and then types plain `codex`, which
+every Codex starts with. It reads `false`, `null`, an error, a late answer,
 an older daemon (`unsupported_operation`) and a host without `conv.v1` alike:
 plain `codex`. What the daemon cannot see is an alias or function named
 `codex` in the window's interactive shell, or a PATH a shell hook changes;
-there a `true` can be wrong, so a client that typed the flag watches the
-window for Codex's refusal (`unexpected argument '--no-daemon'`) for 60 s and
-types the plain command once if it appears.
+there a `true` can be wrong. So a client that typed the flag watches the
+window for 10 s for Codex's refusal as a whole line of its own, `error:
+unexpected argument '--no-daemon' found` from column 0 (rows the terminal
+wrapped joined first), and types the plain command once — only while that
+view still holds the window's display on that host, the window's reported
+foreground is a shell, and a `conv.inspect` asked then finds no agent
+running there. Where any of that cannot be known, nothing is typed.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit

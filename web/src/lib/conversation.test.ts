@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  agentRunning,
   type ConversationInspection,
   canonicalConversationId,
   parseConversationInspection,
@@ -128,5 +129,15 @@ describe("canonicalConversationId", () => {
         conversation_id: "4E0B4642-0972-40AC-9A18-61D542276B76",
       })?.conversation_id,
     ).toBe("4e0b4642-0972-40ac-9a18-61d542276b76");
+  });
+});
+
+describe("agentRunning", () => {
+  test("is an agent the host found in the window now, not one it remembers or none", () => {
+    for (const source of ["registry", "parked", "attach", "open_file", "process"]) {
+      expect(agentRunning({ source })).toBe(true);
+    }
+    expect(agentRunning({ source: "remembered" })).toBe(false);
+    expect(agentRunning({ source: "none" })).toBe(false);
   });
 });

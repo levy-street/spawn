@@ -4,6 +4,8 @@ import {
   type PendingLaunchStore,
 } from "@/components/launcher/pending-launch";
 import {
+  answerWithin,
+  CODEX_ANSWER_DEADLINE_MS,
   chooseLaunchCommand,
   observePendingLaunchDelivery,
   type PendingLaunchDeliveryResult,
@@ -115,6 +117,8 @@ function observe(
     initialSessionLife?: PendingSessionLife;
     getSessionLife?: () => Promise<PendingSessionLife>;
     askCodexNoDaemon?: () => Promise<boolean | null>;
+    foreground?: () => string | null | undefined;
+    agentRunning?: () => Promise<boolean | null>;
   } = {},
 ): () => void {
   return observePendingLaunchDelivery({
@@ -382,46 +386,125 @@ describe("pending launch delivery", () => {
   });
 
   describe("a Codex launch with a --no-daemon form", () => {
+    const SESSION = "session-codex";
     const LAUNCH = {
       command: "codex --profile work",
       codexNoDaemon: "codex --no-daemon --profile work",
     };
+    const FLAGGED = "codex --no-daemon --profile work\r";
+    const PLAIN = "codex --profile work\r";
 
-    test("is typed with the flag only when the host says yes, now", async () => {
-      const ask = (answer: boolean | null | Error) => () =>
-        answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer);
-      await expect(chooseLaunchCommand(LAUNCH, ask(true))).resolves.toBe(LAUNCH.codexNoDaemon);
-      for (const answer of [false, null, new Error("no channel")]) {
-        await expect(chooseLaunchCommand(LAUNCH, ask(answer))).resolves.toBe(LAUNCH.command);
+    test("is typed with the flag only on the host's explicit yes", () => {
+      expect(chooseLaunchCommand(LAUNCH, true)).toBe(LAUNCH.codexNoDaemon);
+      for (const answer of [false, null]) {
+        expect(chooseLaunchCommand(LAUNCH, answer)).toBe(LAUNCH.command);
       }
-      await expect(chooseLaunchCommand(LAUNCH, undefined)).resolves.toBe(LAUNCH.command);
-      // Nothing to ask about a launch without the form.
-      const asked = jest.fn(ask(true));
-      await expect(
-        chooseLaunchCommand({ command: "claude", codexNoDaemon: null }, asked),
-      ).resolves.toBe("claude");
-      expect(asked).not.toHaveBeenCalled();
+      expect(chooseLaunchCommand({ command: "claude", codexNoDaemon: null }, true)).toBe("claude");
     });
 
-    async function typedLaunch(answer: boolean | null) {
+    test("a host that fails or is slow to answer is not waited on", async () => {
+      await expect(answerWithin(async () => true, 50)).resolves.toBe(true);
+      await expect(answerWithin(() => Promise.reject(new Error("offline")), 50)).resolves.toBe(
+        null,
+      );
+      await expect(answerWithin(() => new Promise<boolean>(() => undefined), 20)).resolves.toBe(
+        null,
+      );
+    });
+
+    async function queued() {
       const storage = new MemoryStorage();
       const pending = createPendingLaunchStore(storage);
-      await pending.persist("session-codex", HOST, LAUNCH);
-      const transport = new FakeTransport("session-codex");
+      await pending.persist(SESSION, HOST, LAUNCH);
+      return pending;
+    }
+
+    async function typedLaunch(
+      answer: boolean | null,
+      options: {
+        foreground?: () => string | null | undefined;
+        agentRunning?: () => Promise<boolean | null>;
+      } = {},
+    ) {
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
       const results: PendingLaunchDeliveryResult[] = [];
       const askCodexNoDaemon = jest.fn(() => Promise.resolve(answer));
-      const stop = observe(transport, pending, results, { askCodexNoDaemon });
+      const stop = observe(transport, pending, results, {
+        askCodexNoDaemon,
+        foreground: () => "zsh",
+        agentRunning: async () => false,
+        ...options,
+      });
       transport.emit("ready");
       await flushDelivery();
       await flushDelivery();
       return { transport, results, askCodexNoDaemon, stop };
     }
 
-    test("asks the window's host just before typing", async () => {
+    test("asks the window's host before it claims the launch", async () => {
       const { transport, results, askCodexNoDaemon } = await typedLaunch(true);
       expect(askCodexNoDaemon).toHaveBeenCalledTimes(1);
-      expect(transport.typed()).toEqual(["codex --no-daemon --profile work\r"]);
+      expect(transport.typed()).toEqual([FLAGGED]);
       expect(results).toEqual([{ status: "sent" }]);
+    });
+
+    test("is typed plain when the host has not answered by the deadline", async () => {
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
+      const results: PendingLaunchDeliveryResult[] = [];
+      observe(transport, pending, results, {
+        askCodexNoDaemon: () => new Promise<boolean>(() => undefined),
+      });
+      transport.emit("ready");
+      await new Promise((resolve) => setTimeout(resolve, CODEX_ANSWER_DEADLINE_MS + 200));
+      await flushDelivery();
+      expect(transport.typed()).toEqual([PLAIN]);
+      expect(results).toEqual([{ status: "sent" }]);
+    });
+
+    test("a view that cannot type once the host answers loses nothing: the launch waits", async () => {
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
+      const results: PendingLaunchDeliveryResult[] = [];
+      let answer: (accepts: boolean) => void = () => undefined;
+      observe(transport, pending, results, {
+        askCodexNoDaemon: () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      });
+      transport.emit("ready");
+      await flushDelivery();
+      // The connection blips while the host is asked.
+      transport.emit("reconnecting");
+      answer(true);
+      await flushDelivery();
+      expect(transport.typed()).toEqual([]);
+      expect(results).toEqual([]);
+      await expect(pending.hasNoDaemonForm?.(SESSION, HOST)).resolves.toBe(true);
+      // Back: asked again, and typed once.
+      transport.emit("ready");
+      await flushDelivery();
+      answer(true);
+      await flushDelivery();
+      await flushDelivery();
+      expect(transport.typed()).toEqual([FLAGGED]);
+      expect(results).toEqual([{ status: "sent" }]);
+    });
+
+    test("two views asking at once type it once between them", async () => {
+      const pending = await queued();
+      const first = new FakeTransport(SESSION);
+      const second = new FakeTransport(SESSION);
+      for (const transport of [first, second]) {
+        observe(transport, pending, [], { askCodexNoDaemon: async () => true });
+        transport.emit("ready");
+      }
+      await flushDelivery();
+      await flushDelivery();
+      await flushDelivery();
+      expect([...first.typed(), ...second.typed()]).toEqual([FLAGGED]);
     });
 
     test("a refusal of the flag soon after is answered once, without it", async () => {
@@ -429,33 +512,71 @@ describe("pending launch delivery", () => {
       // was older than the flag.
       const { transport } = await typedLaunch(true);
       transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
       transport.emitNotice(null);
       transport.emitNotice("codex_no_daemon_refused");
-      expect(transport.typed()).toEqual([
-        "codex --no-daemon --profile work\r",
-        "codex --profile work\r",
-      ]);
+      await flushDelivery();
+      expect(transport.typed()).toEqual([FLAGGED, PLAIN]);
     });
 
     test("a refusal is not answered after a plain launch, late, or after the view went", async () => {
       const plain = await typedLaunch(null);
       plain.transport.emitNotice("codex_no_daemon_refused");
-      expect(plain.transport.typed()).toEqual(["codex --profile work\r"]);
+      await flushDelivery();
+      expect(plain.transport.typed()).toEqual([PLAIN]);
 
       const now = Date.now();
       const late = await typedLaunch(true);
-      const clock = jest.spyOn(Date, "now").mockReturnValue(now + 61_000);
+      const clock = jest.spyOn(Date, "now").mockReturnValue(now + 11_000);
       try {
         late.transport.emitNotice("codex_no_daemon_refused");
       } finally {
         clock.mockRestore();
       }
-      expect(late.transport.typed()).toEqual(["codex --no-daemon --profile work\r"]);
+      await flushDelivery();
+      expect(late.transport.typed()).toEqual([FLAGGED]);
 
       const gone = await typedLaunch(true);
       gone.stop();
       gone.transport.emitNotice("codex_no_daemon_refused");
-      expect(gone.transport.typed()).toEqual(["codex --no-daemon --profile work\r"]);
+      await flushDelivery();
+      expect(gone.transport.typed()).toEqual([FLAGGED]);
+
+      const notOwner = await typedLaunch(true);
+      notOwner.transport.emitDisplay(false);
+      notOwner.transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      expect(notOwner.transport.typed()).toEqual([FLAGGED]);
+    });
+
+    test("a refusal is answered only while the window's shell is in the foreground", async () => {
+      // A Codex that took the flag and runs, showing a thread about the
+      // error; a foreground never reported; a host that says an agent runs
+      // there, cannot say, or does not answer.
+      for (const options of [
+        { foreground: () => "codex" },
+        { foreground: () => "node" },
+        { foreground: () => null },
+        { agentRunning: async () => true },
+        { agentRunning: async () => null },
+        { agentRunning: () => Promise.reject(new Error("offline")) },
+      ]) {
+        const { transport } = await typedLaunch(true, options);
+        transport.emitNotice("codex_no_daemon_refused");
+        await flushDelivery();
+        await flushDelivery();
+        expect(transport.typed()).toEqual([FLAGGED]);
+      }
+      // No way to ask at all: not known, not typed.
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
+      observe(transport, pending, [], { askCodexNoDaemon: async () => true });
+      transport.emit("ready");
+      await flushDelivery();
+      await flushDelivery();
+      transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      expect(transport.typed()).toEqual([FLAGGED]);
     });
   });
 });

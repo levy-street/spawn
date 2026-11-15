@@ -138,6 +138,10 @@ export function TerminalOverlay({
   const transportRef = useRef<SessionTransport | null>(null);
   const scrollUnsubscribeRef = useRef<(() => void) | null>(null);
   const pendingLaunchUnsubscribeRef = useRef<(() => void) | null>(null);
+  // The window's foreground as its host last reported it, read when Codex
+  // refuses `--no-daemon` (`observePendingLaunchDelivery`).
+  const foregroundRef = useRef(session.foreground_command);
+  foregroundRef.current = session.foreground_command;
   const previousConnectionState = useRef<TransportState>("idle");
   const sessionUi = useSessionUiStore((state) => state.sessions[session.id]);
   const setStoredFollow = useSessionUiStore((state) => state.setFollow);
@@ -304,6 +308,7 @@ export function TerminalOverlay({
       pendingLaunchUnsubscribeRef.current = attachPendingLaunchDelivery(transport, {
         initialSessionStatus: session.status,
         hostIdentityPublicKey: host.host_public_key,
+        foreground: () => foregroundRef.current,
         onResult: (result) => {
           if (result.status === "sent") {
             updateFollow({ type: "input-sent" });

@@ -8,6 +8,8 @@ import {
 } from "@/components/launcher/launch-orchestrator";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
 import {
+  answerWithin,
+  CODEX_ANSWER_DEADLINE_MS,
   observePendingLaunchDelivery,
   type PendingLaunchDeliveryResult,
   type PendingSessionLife,
@@ -27,7 +29,8 @@ import type { RecentDirOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import { qk } from "@/data/queryKeys";
-import { askWindowHost } from "@/terminal/transport/inspect-conversation";
+import { agentRunning } from "@/terminal/transport/conversation-codec";
+import { askWindowHost, type WindowHostQuestions } from "@/terminal/transport/inspect-conversation";
 import type { SessionTransport } from "@/terminal/transport/types";
 
 export const launcherOrchestrator = createLaunchOrchestrator({
@@ -155,19 +158,24 @@ export function useAddFilesWidget() {
 export interface PendingLaunchBindingOptions {
   initialSessionStatus?: string;
   /** The window's host's identity key: with it, a queued Codex launch asks
-   *  the host whether the window's Codex accepts `--no-daemon`. */
+   *  the host whether the window's Codex accepts `--no-daemon`, and a refusal
+   *  of the flag asks whether an agent runs in the window. */
   hostIdentityPublicKey?: string | null;
+  /** The window's foreground process as its host last reported it. */
+  foreground?(): string | null | undefined;
   onResult?(result: PendingLaunchDeliveryResult): void;
 }
 
-/** One `conv.launch` question on a channel of its own, closed after. */
-async function askCodexNoDaemon(
+/** One question on a channel of its own, closed once answered or once the
+ *  delivery stops waiting for it. */
+async function askOnce<T>(
   host: { hostId: string; hostIdentityPublicKey: string },
   sessionId: string,
-): Promise<boolean | null> {
+  question: (questions: WindowHostQuestions) => Promise<T | null>,
+): Promise<T | null> {
   const questions = askWindowHost(host, sessionId);
   try {
-    return await questions.codexNoDaemon();
+    return await answerWithin(() => question(questions), CODEX_ANSWER_DEADLINE_MS);
   } finally {
     questions.doneAsking();
   }
@@ -195,17 +203,23 @@ export function attachPendingLaunchDelivery(
         : pendingSessionLifeFromStatus(options.initialSessionStatus),
     getSessionLife: () => pendingSessionLife(transport.sessionId),
     ...(options.hostIdentityPublicKey
-      ? {
-          askCodexNoDaemon: () =>
-            askCodexNoDaemon(
-              {
-                hostId: transport.hostId,
-                hostIdentityPublicKey: options.hostIdentityPublicKey as string,
-              },
-              transport.sessionId,
-            ),
-        }
+      ? (() => {
+          const host = {
+            hostId: transport.hostId,
+            hostIdentityPublicKey: options.hostIdentityPublicKey,
+          };
+          return {
+            askCodexNoDaemon: () =>
+              askOnce(host, transport.sessionId, (questions) => questions.codexNoDaemon()),
+            agentRunning: () =>
+              askOnce(host, transport.sessionId, async (questions) => {
+                const inspection = await questions.inspect();
+                return inspection ? agentRunning(inspection) : null;
+              }),
+          };
+        })()
       : {}),
+    ...(options.foreground ? { foreground: options.foreground } : {}),
     ...(options.onResult ? { onResult: options.onResult } : {}),
   });
 }

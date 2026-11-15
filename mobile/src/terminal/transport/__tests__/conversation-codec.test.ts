@@ -1,4 +1,5 @@
 import {
+  agentRunning,
   type ConversationInspection,
   parseConversationInspection,
 } from "@/terminal/transport/conversation-codec";
@@ -90,5 +91,15 @@ describe("parseConversationInspection", () => {
         "Host returned an invalid conversation report.",
       );
     }
+  });
+});
+
+describe("agentRunning", () => {
+  test("is an agent the host found in the window now, not one it remembers or none", () => {
+    for (const source of ["registry", "parked", "attach", "open_file", "process"]) {
+      expect(agentRunning({ source })).toBe(true);
+    }
+    expect(agentRunning({ source: "remembered" })).toBe(false);
+    expect(agentRunning({ source: "none" })).toBe(false);
   });
 });

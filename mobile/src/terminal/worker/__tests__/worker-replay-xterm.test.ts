@@ -202,6 +202,45 @@ function bufferLines(term: XTerm): string[] {
     });
   });
 
+  test("a refusal wrapped across the rows of a narrow screen is read whole", async () => {
+    const term = realTerminal(8, 20);
+    await runWorker(harness(term), async (worker) => {
+      const requestId = openGates(worker);
+      await replay(
+        worker,
+        requestId,
+        seed(["$ codex --no-daemon"], "error: unexpected argument '--no-daemon' found\r\n$ "),
+      );
+      await settle();
+      // Narrower than the line, so the terminal wrapped it.
+      expect(term.cols).toBe(20);
+      expect(noticePosts(worker)).toEqual(["codex_no_daemon_refused"]);
+    });
+  });
+
+  test("the refusal's words anywhere but a line of their own are not a refusal", async () => {
+    const term = realTerminal(8, 80);
+    await runWorker(harness(term), async (worker) => {
+      const requestId = openGates(worker);
+      await replay(
+        worker,
+        requestId,
+        seed(
+          ["$ codex --no-daemon"],
+          [
+            "$ echo error: unexpected argument '--no-daemon' found",
+            "  error: unexpected argument '--no-daemon' found",
+            "• error: unexpected argument '--no-daemon' found",
+            "› why error: unexpected argument '--no-daemon' found?",
+            "$ ",
+          ].join("\r\n"),
+        ),
+      );
+      await settle();
+      expect(noticePosts(worker)).toEqual([]);
+    });
+  });
+
   test("an ordinary screen says nothing, and a new generation withdraws a notice", async () => {
     const term = realTerminal(8, 60);
     await runWorker(harness(term), async (worker) => {
