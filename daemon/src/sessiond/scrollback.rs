@@ -257,7 +257,7 @@ impl ScrollbackLog {
                 break;
             }
             let data = match fs::read(&seg.path)
-                .with_context(|| format!("reading {}", seg.path.display()))
+                .with_context(|| format!("{SEGMENT_READ_CONTEXT}{}", seg.path.display()))
             {
                 Ok(data) => data,
                 Err(error) => {
@@ -626,10 +626,19 @@ fn encrypt_record(
     Ok(record)
 }
 
-const SEGMENT_PREFIX: &str = "seg-";
+/// Segment files are `seg-<8 digits>.log`.
+pub const SEGMENT_PREFIX: &str = "seg-";
+pub const SEGMENT_SUFFIX: &str = ".log";
+/// What a failed segment read is reported as: this, the segment's path, then
+/// the OS error. spawnd recognises a missing segment by these words, and every
+/// worker running today says them, so they must not change.
+pub const SEGMENT_READ_CONTEXT: &str = "reading ";
 
 fn segment_name(index: u64) -> String {
-    format!("{SEGMENT_PREFIX}{:08}.log", index % MAX_SEGMENTS as u64)
+    format!(
+        "{SEGMENT_PREFIX}{:08}{SEGMENT_SUFFIX}",
+        index % MAX_SEGMENTS as u64
+    )
 }
 
 fn nonce_for(seq: u64) -> [u8; 12] {

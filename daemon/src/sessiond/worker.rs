@@ -228,6 +228,11 @@ fn discard_events(events: Vec<HistoryEvent>) {
     }
 }
 
+/// A worker's refusal to replay once its log is disabled, which it never
+/// re-enables. spawnd recognises it by its start, and running workers say it:
+/// workers started from 2026-07-16 to 2026-08-19 end it "for this agent".
+pub const REPLAY_UNAVAILABLE: &str = "worker replay is unavailable for this session";
+
 /// How long a worker with no session command yet waits for `Start` before giving up.
 const AWAIT_START_TIMEOUT: Duration = Duration::from_secs(120);
 /// After the session exits, how long the worker lingers to deliver `Exit` to a
@@ -954,9 +959,7 @@ async fn handle_frame(
         }
         wire::T_REPLAY_REQ => {
             let max_bytes = wire::decode_replay_req(&payload)?;
-            let active_log = log
-                .as_mut()
-                .context("worker replay is unavailable for this session")?;
+            let active_log = log.as_mut().context(REPLAY_UNAVAILABLE)?;
             let emu = emulator
                 .as_mut()
                 .context("worker replay is unavailable before start")?;

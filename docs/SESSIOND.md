@@ -115,7 +115,10 @@ spawnd (host supervisor, one per host)
 ### Unix filesystem layout
 
 `worker_dir()` resolves `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers`
-→ `<config_dir>/workers`, created `0700`:
+→ `<config_dir>/workers`, created `0700`. When the chosen directory cannot
+hold the longest socket path (`<uuid>.lifecycle.sock` under `~/Library/Application
+Support` is past macOS's 104-byte `sun_path`), it diverts to the short
+`/tmp/spawn-<uid>[<tag>]/workers` — which is where every macOS host keeps it:
 
 ```
 workers/
@@ -134,6 +137,31 @@ released by a crash authorizes stale-socket recovery; no code unlinks an
 endpoint while the lock says a worker may still own it. Each endpoint cleanup
 also compares the socket's recorded device/inode identity, so a delayed old
 cleanup cannot unlink a replacement at the same pathname.
+
+A missing `.lock` is not a released one. The OS removes regular files in a
+temp directory that nothing has touched for days (macOS `110.clean-tmps`
+after three; `systemd-tmpfiles` later), and a worker keeps its lock on the
+deleted inode, so a new file at that path would lock freely beside a live
+worker. The reservation file is therefore created only when neither socket
+exists; a launch for a session whose sockets exist without it is refused.
+Stale-socket recovery with the file missing (a failed adoption) goes ahead
+only when nothing is bound to the lifecycle socket — a live worker keeps that
+datagram socket bound for its life, and a datagram `connect` reaches no
+process — and it then creates the reservation exclusively and holds it for
+the cleanup. The cleaners spare a live worker's sockets: macOS's removes
+regular files only, and `systemd-tmpfiles` skips a socket that is in use
+(listed in `/proc/net/unix`). A dead worker's sockets may be removed.
+
+While it runs, `spawnd` keeps those cleaners off its workers' files: when the
+worker directory is under a temporary location (`/tmp`, `/var/tmp`, the
+system temp directory, or `XDG_RUNTIME_DIR`, which asks for a touch every six
+hours), it sets the access and modification times of the `.lock` and
+`seg-*.log` of every session with a `.sock` in the directory to now, at
+startup and every hour (`worker_backend::refresh_worker_files`). That is the
+set startup adoption tries, so it includes a crashed worker's leftovers until
+an adoption attempt clears its sockets. Only regular files the user owns are
+touched, through a no-follow handle; no file is created or written. A host
+asleep longer than the cleaner's age can still lose them; see §15.
 
 Preferring `XDG_RUNTIME_DIR` puts sockets and ciphertext on tmpfs where
 available: gone on reboot, never on spinning rust. That is a feature — the
@@ -570,6 +598,42 @@ clients send `plain:false`. A `plain:true` request fails closed with
 `plain_replay_unsupported`; ANSI replay bytes are never mislabeled
 as plain text.
 
+Viewer replays — the attach barrier and the `spawn.ctl` history and snapshot
+requests — go through `SessionHandle::viewer_replay`, which does not let
+history the worker can no longer read keep a terminal from opening. When the
+worker refuses because a segment file is gone from disk, spawnd asks again
+with a quarter of the budget, down to one byte: the walk is newest-first and
+stops once the budget is full, so a smaller budget stops short of the hole,
+and the viewer gets the live screen and the newest contiguous run of
+history, never history with a gap in it.
+
+A budget that replayed after a larger one in the same request was refused is
+a hint, not a cap. It is learned only from a replay that succeeded, and every
+viewer request on that worker connection (barrier, history, snapshot) starts
+at the smaller of its own budget and the hint. The hint lapses five minutes
+after it was learned — use does not renew it — and a history wipe the worker
+reports (`T_HISTORY_WIPE`) voids it; either way the next request asks for its
+full budget again. A session whose readable history grows, or whose gap the
+worker evicts, is therefore never held at an old figure for long. The
+barrier shares the hint, because its success is real evidence of what the
+log can read now, and it saves the history request that follows a second
+round of refusals. The quarter steps keep the hint within a factor of four
+of the history readable at that moment.
+
+When even one byte reaches a missing segment, that viewer gets an empty
+replay at the live stream's current offset and the terminal opens on what
+the session prints next. Nothing is remembered: the next request asks the
+worker again, because a line committed into an empty newest segment, or a
+`clear` that starts a fresh one, makes history readable again. Only a worker
+that says its log is disabled ("worker replay is unavailable for this …") is
+not asked again for the life of that connection, since a worker never
+re-enables its log. Each degradation is logged once per session at warning
+level. The refusals are recognised by the words deployed workers use, shared
+as constants (`scrollback::SEGMENT_READ_CONTEXT`, `worker::REPLAY_UNAVAILABLE`)
+and pinned by a test, because running workers keep the binary they started
+with. Authentication, sequence, and framing failures are returned unchanged:
+tampered history still fails the replay closed.
+
 Replay correctness (PTY in → bytes out → reattach replays both the initial
 output and mid-session stdin echo) is asserted end-to-end in
 `daemon/tests/worker_e2e.rs` against a real `/bin/sh` on a real PTY, and
@@ -641,7 +705,7 @@ described in §6.2, including checkpoint and framing charges.
 | Event | Outcome |
 |---|---|
 | **Session exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and removes Unix sockets or the Windows marker, releases its lifetime reservation, and exits; spawnd forwards `session.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
-| **Worker crashes** | the session process tree dies with it (PTY ownership on Unix; kill-on-close Job Object on Windows) — identical blast radius to "tmux server crashed" but scoped to **one** session instead of every session on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the flock/exclusive HANDLE; the next launch, or a failed adoption that acquires that reservation, ownership-checks and removes stale endpoint metadata. Restart policy is user-driven `session.restart`; blind auto-respawn of stateful work inside the shell is not a recovery. |
+| **Worker crashes** | the session process tree dies with it (PTY ownership on Unix; kill-on-close Job Object on Windows) — identical blast radius to "tmux server crashed" but scoped to **one** session instead of every session on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the flock/exclusive HANDLE; the next launch, or a failed adoption that acquires that reservation, ownership-checks and removes stale endpoint metadata. On Unix, if the temp cleaner had already deleted the reservation file, only a failed adoption that finds nothing bound to the lifecycle socket recovers the endpoint (§3). Restart policy is user-driven `session.restart`; blind auto-respawn of stateful work inside the shell is not a recovery. |
 | **spawnd restarts / upgrades** | workers keep running in independent Unix process groups or detached Windows breakaway trees. On startup `rediscover_existing_sessions` scans protected `.sock` entries or `.endpoint` markers via `discover_ids`, connects, verifies `Hello.session_id`, and adopts from `Hello` (instance identity, state, pid, geometry, cwd) — no persistent supervisor state. The same lazy path (`ensure_session_attached`) recovers a session on first use if startup discovery raced. A reconnect displaces no session state; viewers re-seed from emulator-synthesized snapshots on demand. `Hello` accepts the former identity-key spelling as an adoption-only serde alias. |
 | **spawnd upgrade + protocol change** | `Hello.version` gates adoption; private worker protocol version 5 additionally requires the worker's retained canonical cwd capability root for direct session uploads. A mismatched or cwd-less worker is left untouched (its session keeps running) and surfaced in logs rather than driven with a protocol it does not speak or falling back to a server upload path. Old workers drain away as their sessions exit. |
 | **Worker binary upgrade** | applies to newly launched sessions only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`, using the platform executable suffix. |
@@ -760,3 +824,10 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
   single-user host model).
 - **`spawnd status` integration**: list worker-backed sessions with pid/state
   from `Hello` without attaching.
+- **Scrollback and reservations out of the temp directory** (#132): keep only
+  the sockets in the short directory `sun_path` forces on macOS, and give
+  `.lock` and `.scrollback/` a durable per-instance directory, as Windows
+  already does. Teach the worker to treat a missing older segment as the end
+  of retained history and to size its newest segment from the open handle,
+  so spawnd no longer has to recognise its refusals (§8.3). The timestamp
+  refresh (§3) cannot protect a host asleep longer than the cleaner's age.

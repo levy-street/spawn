@@ -611,6 +611,19 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             );
         }
     });
+    // Keep the OS temp cleaner off live workers' reservation files and
+    // scrollback: once at startup (the first tick is immediate), then hourly.
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(worker_backend::WORKER_FILE_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let refreshed = tokio::task::spawn_blocking(worker_backend::refresh_worker_files)
+                .await
+                .unwrap_or(0);
+            tracing::debug!(refreshed, "refreshed worker file timestamps");
+        }
+    });
     // What each Codex window is in, kept on this host so a restart after
     // Codex has gone still names its thread (`host_conv`).
     if let Some(memory) = conversation_notes() {
