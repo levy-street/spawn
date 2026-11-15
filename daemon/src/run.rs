@@ -615,8 +615,10 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     // Codex has gone still names its thread (`host_conv`).
     if let Some(memory) = conversation_notes() {
         let windows = registry.clone();
+        let runs = registry.clone();
         tokio::spawn(crate::host_conv::watch(
             move || windows.foregrounds(),
+            move |id| runs.shell_pid(id),
             memory,
         ));
     }

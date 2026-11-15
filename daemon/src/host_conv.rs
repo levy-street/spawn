@@ -1092,12 +1092,15 @@ fn may_be_codex(foreground: &str) -> bool {
 
 /// Keep each Codex window's note current. Every `WATCH_INTERVAL`, `windows`
 /// lists this host's windows as (session, shell, foreground), and those
-/// whose foreground may be Codex are looked at off the runtime (`look`).
+/// whose foreground may be Codex are looked at off the runtime (`look`);
+/// `runs` says which shell a window runs from now, if it still runs here.
 /// Runs for the life of the daemon.
 pub(crate) async fn watch(
     windows: impl Fn() -> Vec<(Uuid, u32, String)> + Send + 'static,
+    runs: impl Fn(Uuid) -> Option<u32> + Send + Sync + 'static,
     memory: ConversationMemory,
 ) {
+    let runs = Arc::new(runs);
     let mut interval = tokio::time::interval(WATCH_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1110,8 +1113,9 @@ pub(crate) async fn watch(
             continue;
         }
         let memory = memory.clone();
+        let runs = Arc::clone(&runs);
         let _ = tokio::task::spawn_blocking(move || {
-            look(windows, shared_table, &claude_stores(), &memory);
+            look(windows, shared_table, &claude_stores(), &memory, &*runs);
         })
         .await;
     }
@@ -1122,11 +1126,18 @@ pub(crate) async fn watch(
 /// `table()`, taken only when there is such a window. A host whose
 /// `next dev` and `vite` windows all show `node` reads the table once a
 /// look, not once a window.
+///
+/// A window is looked at only while `runs` still gives the shell the list
+/// gave, checked under the lock a window's forgetting takes: a window whose
+/// worker exited since the list was taken — and that was forgotten for
+/// good — is not noted again from a table that still shows its Codex
+/// shutting down.
 fn look<T: ProcessTable>(
     windows: Vec<(Uuid, u32, String)>,
     table: impl FnOnce() -> T,
     stores: &[PathBuf],
     memory: &ConversationMemory,
+    runs: &dyn Fn(Uuid) -> Option<u32>,
 ) {
     let candidates: Vec<(Uuid, u32)> = windows
         .into_iter()
@@ -1139,6 +1150,9 @@ fn look<T: ProcessTable>(
     let table = table();
     for (session_id, shell) in candidates {
         let _look = looking();
+        if runs(session_id) != Some(shell) {
+            continue;
+        }
         memory.note(session_id, &inspect(shell, &table, stores));
     }
 }
@@ -2565,6 +2579,7 @@ mod tests {
         ];
         let taken = std::cell::Cell::new(0);
         let table = home.table;
+        let runs = |id: Uuid| windows.iter().find(|w| w.0 == id).map(|w| w.1);
         look(
             windows.clone(),
             || {
@@ -2573,6 +2588,7 @@ mod tests {
             },
             &[],
             &memory,
+            &runs,
         );
         assert_eq!(taken.get(), 1);
         let noted = |id| memory.recall(id).and_then(|answer| answer.conversation_id);
@@ -2588,8 +2604,43 @@ mod tests {
             },
             &[],
             &memory,
+            &runs,
         );
         assert_eq!(taken.get(), 1);
+    }
+
+    #[test]
+    fn a_look_does_not_note_a_window_that_left_this_host_meanwhile() {
+        // The look took its list of windows and its table; then the window's
+        // worker exited and the window was forgotten (`session.kill`), while
+        // its Codex was still shutting down and the table still showed it.
+        let codex_in_a_window = || {
+            let mut home = CodexHome::new();
+            home.lock(THREAD_A, 10);
+            home.primary(THREAD_A, 12);
+            home
+        };
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        let windows = vec![(window, SHELL, "codex".to_string())];
+        let home = codex_in_a_window();
+        look(windows.clone(), || home.table, &[], &memory, &|_| None);
+        assert_eq!(memory.recall(window), None, "gone from this host");
+        // Nor a window this host now runs from another shell: a later
+        // incarnation, not the one the look listed.
+        let home = codex_in_a_window();
+        look(windows.clone(), || home.table, &[], &memory, &|_| {
+            Some(SHELL + 7)
+        });
+        assert_eq!(memory.recall(window), None, "restarted since");
+        // The window as listed is noted.
+        let home = codex_in_a_window();
+        look(windows, || home.table, &[], &memory, &|_| Some(SHELL));
+        assert_eq!(
+            memory.recall(window).unwrap().conversation_id.as_deref(),
+            Some(THREAD_A)
+        );
     }
 
     #[test]
