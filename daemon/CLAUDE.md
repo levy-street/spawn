@@ -451,7 +451,12 @@ does any path wait for a session's generation transition while holding it:
 a restart holds the transition across the session's peer closes, TERM and
 the wait for its worker, so both inserters (`attach_pair_channel`,
 `create_answer`) take the transition first and the admission lock second —
-one order in both, or they deadlock against each other. A
+one order in both, or they deadlock against each other. That order has a
+price, bounded and without a cycle: an attach holds its session's
+transition while it queues on admission, and trust invalidation holds
+admission for up to the teardown deadline (`invalidate_trust_and_close_all`),
+so that session's restart or exit can wait that long behind them. Nothing
+that holds admission waits on a transition. A
 device re-attaching a view of its superseded connection (the mobile client
 keeps its attachment ids across a reconnect) finds nothing stale: the old
 attachment left the peer map when its pair was superseded, and one another

@@ -144,6 +144,13 @@ admitted meanwhile, then the first attach to complete once the transition is
 released. `a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting`
 pins the patch above on its own: it needs no held acceptor.
 
+What stays inline in the loop: reading a stream's first message and writing
+the DCEP ACK (`accept_stream`). The ACK queues behind any writer of the
+association waiting for room in its pending queue, so while the peer is
+not acknowledging data (a network blip, a full receive window) the acceptor
+waits there until SACKs return, and the peer's opens behind it wait too.
+Admission no longer adds to that; this does not remove it.
+
 ## The acceptor's end is reported, not logged
 
 `ErrStreamClosed` from `DataChannel::accept` means the association's accept
