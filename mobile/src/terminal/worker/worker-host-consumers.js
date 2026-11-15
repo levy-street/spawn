@@ -37,6 +37,7 @@
     if (!entry) return;
     consumers.delete(id);
     clearTimeout(entry.timer);
+    api.channelWatch?.forget(entry.dc.label);
     entry.dc.onclose = entry.dc.onerror = entry.dc.onmessage = entry.dc.onopen = null;
     entry.dc.removeEventListener("bufferedamountlow", entry.onBuffered);
     entry.dc.close();
@@ -168,10 +169,15 @@
       entry.opened = true;
       protocol.hostChannelOpened();
     };
+    // Whether a channel can still open on this peer: worker-channel-watch.js.
+    api.channelWatch?.opened(dc.label);
     dc.onmessage = ({ data }) => {
-      if (consumers.get(id) === entry) protocol.receiveHostCtl(data);
+      if (consumers.get(id) !== entry) return;
+      api.channelWatch?.answered(dc.label);
+      protocol.receiveHostCtl(data);
     };
     dc.onclose = dc.onerror = () => {
+      api.channelWatch?.answered(dc.label);
       // Opened and closed by the daemon before its hello: refused, which is
       // what the daemon does past its tool limit. Native decides what that
       // means; one can be a race with a channel that is still closing.

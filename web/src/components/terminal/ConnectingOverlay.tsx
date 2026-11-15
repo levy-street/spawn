@@ -4,6 +4,7 @@ import { LoaderCircle, Lock, LockOpen, PlugZap, ShieldAlert, Unplug } from "luci
 import { useEffect, useState } from "react";
 import { REFUSAL_DETAIL } from "@/components/terminal/ConnectionChip";
 import type { SocketState } from "@/components/terminal/useSessionSocket";
+import { REBUILDING_MESSAGE } from "@/lib/channel-watch";
 import type { SignedRtcRefusalReason } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 
@@ -20,6 +21,7 @@ type Stage =
   | "disabled"
   | "host-offline"
   | "dropped"
+  | "rebuilding"
   | "reaching"
   | "securing"
   | "secured"
@@ -47,6 +49,7 @@ function stageFor(
   dcOpen: boolean,
   refusal: SignedRtcRefusalReason | null | undefined,
   hostOffline: boolean,
+  rebuilding: boolean,
 ): Stage {
   if (refusal) return "blocked";
   if (socketState === "unauthorized") return "unauthorized";
@@ -54,6 +57,7 @@ function stageFor(
   if (socketState === "open") return !v3 || dcOpen ? "secured" : "securing";
   if (hostOffline) return "host-offline";
   if (socketState === "closed" || socketState === "error") return "dropped";
+  if (rebuilding) return "rebuilding";
   return "reaching";
 }
 
@@ -114,6 +118,15 @@ function viewFor(
         ring: "ring-warning/40",
         lines: ["flowing", "waiting"],
       };
+    case "rebuilding":
+      return {
+        title: `Reconnecting${where}`,
+        body: REBUILDING_MESSAGE,
+        icon: PlugZap,
+        tone: "text-warning",
+        ring: "ring-warning/40",
+        lines: ["flowing", "waiting"],
+      };
     case "securing":
       return {
         title: `Connecting${where}`,
@@ -168,6 +181,7 @@ export function ConnectingOverlay({
   hostName = null,
   hostOffline = false,
   sharedConnectionReady = false,
+  rebuilding = false,
 }: {
   socketState: SocketState;
   v3: boolean;
@@ -178,8 +192,10 @@ export function ConnectingOverlay({
   hostName?: string | null;
   hostOffline?: boolean;
   sharedConnectionReady?: boolean;
+  /** The host's connection is being replaced because no channel opened on it. */
+  rebuilding?: boolean;
 }) {
-  const stage = stageFor(socketState, v3, dcOpen, refusal, hostOffline);
+  const stage = stageFor(socketState, v3, dcOpen, refusal, hostOffline, rebuilding);
   const secured = stage === "secured";
 
   const [slow, setSlow] = useState(false);

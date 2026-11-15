@@ -1,3 +1,4 @@
+import { CHANNEL_WATCH_TIMING, ChannelOpenWatch, type ChannelWatchTiming } from "./channel-watch";
 import {
   type ChannelBytes,
   type DaemonChannel,
@@ -19,6 +20,9 @@ export interface DaemonSnapshot {
     protocol: string | null;
   };
   error?: string | null;
+  /** The owner is replacing a peer on which no new channel opened
+   *  (`channel-watch.ts`); set until a fresh peer is ready. */
+  rebuilding?: boolean;
 }
 export interface DaemonConnection {
   getSnapshot(): DaemonSnapshot;
@@ -67,6 +71,8 @@ type OwnedChannel = {
   sequence: number;
   sendSequence: number;
   receipts: Map<number, number>;
+  /** The daemon has said something on it. */
+  heard: boolean;
 };
 
 /** One physical connection across same-origin tabs, with bounded per-view channels. */
@@ -89,6 +95,10 @@ export class SharedDaemonConnection implements DaemonConnection {
   private lockAbort: AbortController | null = null;
   private releaseLock: (() => void) | null = null;
   private stopRoot: (() => void) | null = null;
+  // Owner only: whether a child channel can still open on the peer, and
+  // whether the peer is being replaced because none could.
+  private watch: ChannelOpenWatch | null = null;
+  private rebuilding = false;
   private scheduler = new DaemonSendScheduler();
   private heartbeat: ReturnType<typeof setInterval>;
   private closed = false;
@@ -100,7 +110,11 @@ export class SharedDaemonConnection implements DaemonConnection {
     private readonly createRoot: () => HostControlClient,
     private readonly isActive: () => boolean = () => true,
     private readonly onRetired: () => void = () => {},
-    private readonly timing = { heartbeatMs: HEARTBEAT_MS, ownerSilenceMs: OWNER_SILENCE_MS },
+    private readonly timing: {
+      heartbeatMs: number;
+      ownerSilenceMs: number;
+      watch?: ChannelWatchTiming;
+    } = { heartbeatMs: HEARTBEAT_MS, ownerSilenceMs: OWNER_SILENCE_MS },
   ) {
     try {
       this.bus = new BroadcastChannel(`spawn.daemon.v2:${key}`);
@@ -252,9 +266,27 @@ export class SharedDaemonConnection implements DaemonConnection {
         this.epoch = 0;
         this.owner = null;
         this.scheduler = new DaemonSendScheduler();
-        this.root = this.createRoot();
-        this.stopRoot = this.root.subscribe(() => this.announce());
-        this.root.connect();
+        const root = this.createRoot();
+        this.root = root;
+        this.rebuilding = false;
+        this.watch = new ChannelOpenWatch(
+          {
+            openProbe: (label) => root.createDeviceChannel(label),
+            ping: (timeoutMs) => root.ping({ timeoutMs }),
+            rebuild: () => {
+              if (this.root !== root) return false;
+              // Set first: the peer's teardown announces synchronously.
+              this.rebuilding = true;
+              if (root.rebuildPeer()) return true;
+              this.rebuilding = false;
+              return false;
+            },
+          },
+          root.hostId,
+          this.timing.watch ?? CHANNEL_WATCH_TIMING,
+        );
+        this.stopRoot = root.subscribe(() => this.announce());
+        root.connect();
         await new Promise<void>((resolve) => {
           this.releaseLock = resolve;
         });
@@ -288,6 +320,9 @@ export class SharedDaemonConnection implements DaemonConnection {
       });
     this.stopRoot?.();
     this.stopRoot = null;
+    this.watch?.close();
+    this.watch = null;
+    this.rebuilding = false;
     for (const id of [...this.owned.keys()]) this.closeOwned(id);
     this.root?.close();
     this.root = null;
@@ -307,8 +342,13 @@ export class SharedDaemonConnection implements DaemonConnection {
     if (
       this.snapshot.generation !== root.getConnectionGeneration() ||
       (this.snapshot.state === "ready" && root.getState() !== "ready")
-    )
+    ) {
       this.epoch++;
+      // What the watch was waiting on belonged to the readiness that ended.
+      this.watch?.reset();
+    }
+    if (this.rebuilding && (root.getState() === "ready" || root.getState() === "error"))
+      this.rebuilding = false;
     this.post({
       type: "snapshot",
       owner: this.leader,
@@ -321,6 +361,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         trust: root.getSignalingTrust(),
         info: root.getConnectionInfo(),
         error: root.getConnectionError(),
+        ...(this.rebuilding ? { rebuilding: true } : {}),
       },
     });
   }
@@ -448,8 +489,10 @@ export class SharedDaemonConnection implements DaemonConnection {
           sequence: 0,
           sendSequence: 0,
           receipts: new Map(),
+          heard: false,
         };
         this.owned.set(id, entry);
+        this.watch?.opened(id, message.label);
         dc.binaryType = "arraybuffer";
         dc.onopen = () => this.reply(entry, id, { type: "channel-opened" });
         dc.onmessage = ({ data }) => {
@@ -458,6 +501,10 @@ export class SharedDaemonConnection implements DaemonConnection {
             (typeof data !== "string" && !(data instanceof ArrayBuffer))
           )
             return;
+          if (!entry.heard) {
+            entry.heard = true;
+            this.watch?.answered(id);
+          }
           const size =
             typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
           if (
@@ -473,8 +520,14 @@ export class SharedDaemonConnection implements DaemonConnection {
           entry.receipts.set(sequence, size);
           this.reply(entry, id, { type: "channel-data", data, sequence });
         };
-        dc.onclose = () => this.closeOwned(id);
-        dc.onerror = () => this.closeOwned(id);
+        // The daemon closed it: answered, whether or not it ever spoke.
+        // A daemon refuses a channel by closing it at once.
+        const closedByDaemon = () => {
+          this.watch?.answered(id);
+          this.closeOwned(id);
+        };
+        dc.onclose = closedByDaemon;
+        dc.onerror = closedByDaemon;
       } catch {
         this.post({ type: "channel-closed", channel: id, to: message.from, owner: this.leader });
       }
@@ -483,7 +536,7 @@ export class SharedDaemonConnection implements DaemonConnection {
     const entry = this.owned.get(id);
     if (!entry || entry.tab !== message.from) return;
     if (message.type === "channel-close") {
-      this.closeOwned(id);
+      this.closeOwned(id, true);
       return;
     }
     if (message.type === "channel-received" && typeof message.sequence === "number") {
@@ -521,10 +574,14 @@ export class SharedDaemonConnection implements DaemonConnection {
   private reply(entry: OwnedChannel, id: string, message: Omit<Wire, "v" | "from">): void {
     if (this.leader) this.post({ ...message, owner: this.leader, channel: id, to: entry.tab });
   }
-  private closeOwned(id: string): void {
+  /** `byConsumer`: the tab that asked for the channel closed it, which is the
+   *  evidence a consumer that gave up on an unanswered open leaves behind. */
+  private closeOwned(id: string, byConsumer = false): void {
     const entry = this.owned.get(id);
     if (!entry) return;
     this.owned.delete(id);
+    if (byConsumer) this.watch?.abandoned(id);
+    else this.watch?.forget(id);
     this.scheduler.remove(entry.channel);
     entry.channel.onclose = null;
     entry.channel.onerror = null;

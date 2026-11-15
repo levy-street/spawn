@@ -530,6 +530,21 @@ export class HostControlClient {
     this.connect();
   }
 
+  /**
+   * Replace a device connection's ready peer with a fresh one, on the same
+   * signalling socket: the owner's answer to a peer that is connected, its
+   * root channel answering, on which no new channel opens (`channel-watch.ts`).
+   * The server and daemon hear `rtc.close` for the old binding before the new
+   * offer. False when there is no ready peer of this client's own to replace.
+   */
+  rebuildPeer(): boolean {
+    const sessionId = this.sessionId;
+    if (this.options.sharedConnection || this.stopped || this.state !== "ready" || !sessionId)
+      return false;
+    this.fallBackToFreshRtc(sessionId);
+    return true;
+  }
+
   private connectShared(): void {
     const connection = this.options.sharedConnection;
     if (!connection || this.unsubscribeShared) return;

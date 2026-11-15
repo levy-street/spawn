@@ -498,6 +498,64 @@ describe("HostTransport signalling", () => {
     }
   });
 
+  test("a peer on which no channel opens is replaced at the worker's word, and views are told why", async () => {
+    const { transport, bridge, signal } = await readyTransport();
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errors: unknown[] = [];
+    transport.on("error", (error) => errors.push(error));
+    const states: string[] = [];
+    transport.on("state", (state) => states.push(state));
+    try {
+      const connects = () =>
+        bridge.sent.filter(
+          (message): message is Extract<NativeToWorkerMessage, { type: "connect" }> =>
+            message.type === "connect",
+        );
+      bridge.emit({
+        v: 1,
+        type: "rebuild",
+        reason: "channels_unanswered",
+        waitedMs: 10_000,
+        probeMs: 10_000,
+        pingMs: 42,
+        rebuilds: 1,
+      });
+      // A fresh peer on the same signalling socket, closing the old binding.
+      expect(connects()).toHaveLength(2);
+      expect(connects()[1]).toMatchObject({ forceRebuild: true, closePrevious: true });
+      // The signalling socket stays open: it carries the old binding's close
+      // and the new offer.
+      expect(signal.listeners.size).toBeGreaterThan(0);
+      expect(states).toEqual(["connecting"]);
+      expect(errors).toEqual([
+        {
+          code: "channels_unanswered",
+          message: "The connection stopped opening terminals. SPAWN D is making a new one.",
+          retryable: true,
+        },
+      ]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain(
+        "host 00112233-4455-6677-8899-aabbccddeeff",
+      );
+
+      // Not ready: nothing to replace, and no second peer is stacked on it.
+      bridge.emit({
+        v: 1,
+        type: "rebuild",
+        reason: "channels_unanswered",
+        waitedMs: 10_000,
+        probeMs: 10_000,
+        pingMs: 42,
+        rebuilds: 2,
+      });
+      expect(connects()).toHaveLength(2);
+    } finally {
+      warn.mockRestore();
+      transport.close();
+    }
+  });
+
   test("fatal signalling retires the worker and rejects active work without losing the failure", async () => {
     const { bridge, signal, transport } = await readyTransport();
     const pending = transport.request("host.metrics", {});

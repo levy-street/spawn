@@ -46,7 +46,38 @@ its freeze event) loses it: a visible tab that hears nothing for ten seconds
 steals the lock, and the silent owner stands down and follows when it resumes.
 A tab whose own timers were suspended does not count that gap as the owner's
 silence. A connection that retires itself is rebuilt by the provider rather
-than left closed until a reload. Unsupported
+than left closed until a reload.
+
+A connection is ready only while a child channel can open on it. A peer can
+stay connected, its root channel answering, while no new channel opens: a
+daemon built before #122 lost its channel acceptor to one reset stream and
+never noticed (#120). Whoever holds the physical peer — the browser's owner
+tab (`web/src/lib/channel-watch.ts`), the phone's host worker
+(`mobile/src/terminal/worker/worker-channel-watch.js`) — watches the channels
+the daemon speaks on first, a terminal's `spawn.ctl/…` and a tool's
+`spawn.host.ctl/<id>`. One the daemon neither speaks on nor closes for ten
+seconds (in the browser, also one a view gave up on after five) makes the peer
+suspect, and the holder opens one host-control channel of its own as a probe,
+which the daemon greets without any session involved. If the probe is silent
+for ten seconds while a root `ping` is answered within five, the holder sends
+`rtc.close` for the old binding and offers a fresh peer on the same signalling
+socket; views and tools attach again as after any reconnect. A refusal never
+counts — the daemon closes a channel it refuses at once — and a host that is
+slow or unreachable delays the ping as much as the probe, or leaves readiness,
+which resets the watch. One probe at a time; such rebuilds are at least thirty
+seconds apart, doubling to five minutes while nothing is answered between them.
+Each rebuild logs one line naming the host and how long each step waited, and
+nothing a terminal carries (the browser console; the phone's device log and
+the terminal's Diagnostics). Meanwhile a terminal that has drawn nothing yet
+says "The connection stopped opening terminals. SPAWN D is making a new one."
+in both clients, and the phone's host card carries the same reason.
+
+`signalling_lost` and `rebound` describe the daemon's control socket to the
+server, not the peer, which survives both by design; clients do not act on
+them. They act on the `unavailable` that ends a binding whose daemon did not
+come back within the orphan window, and the server sends that, like
+`signalling_lost`, as the binding's current owner, so it still arrives after a
+rebind. Unsupported
 coordination APIs produce an explicit error. Each account, registered device key,
 and host has its own lock and connection. Registration finishes before
 connection admission; replacing a

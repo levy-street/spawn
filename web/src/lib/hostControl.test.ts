@@ -977,6 +977,62 @@ describe("HostControlClient", () => {
     first.client.close();
   });
 
+  test("rebuildPeer retires the old binding and offers a fresh peer on the same socket", async () => {
+    const endpoint = await readyClient();
+    const binding = { binding_nonce: "e".repeat(32), binding_generation: 11 };
+    endpoint.ws.receive({
+      type: "rtc.status",
+      session_id: endpoint.offer.session_id,
+      status: "connected",
+      ...binding,
+      ...metadata,
+    });
+    expect(endpoint.client.getState()).toBe("ready");
+    const states: string[] = [];
+    endpoint.client.subscribe((state) => states.push(state));
+
+    expect(endpoint.client.rebuildPeer()).toBe(true);
+    // Readiness ends at once, so every view on the old peer is retired ...
+    expect(states).toContain("open");
+    expect(endpoint.client.getState()).not.toBe("ready");
+    // ... the server and daemon hear the old binding close ...
+    const close = await waitForSentFrame(endpoint.ws, "rtc.close");
+    expect(close).toMatchObject({ session_id: endpoint.offer.session_id, ...binding });
+    // ... and a fresh peer is offered on the signalling socket already open.
+    const offers = () => framesOf(endpoint.ws, "rtc.offer");
+    await waitFor(() => offers().length === 2);
+    const fresh = offers()[1];
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(fresh.session_id).not.toBe(endpoint.offer.session_id);
+    expect(fresh).not.toHaveProperty("ice_restart");
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(endpoint.client.getConnectionGeneration()).toBe(fresh.session_id);
+
+    // Not ready: nothing to replace, and a second call does not stack a peer.
+    expect(endpoint.client.rebuildPeer()).toBe(false);
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    endpoint.client.close();
+  });
+
+  test("rebuildPeer belongs to the connection's owner, never to a consumer of it", async () => {
+    const shared = {
+      getSnapshot: () => ({
+        state: "ready",
+        generation: "g",
+        capabilities: [],
+        refusal: null,
+        trust: null,
+      }),
+      subscribe: () => () => {},
+      createChannel: (label: string) => new FakeDataChannel(label),
+      retry: () => {},
+    };
+    const consumer = new HostControlClient(hostId, { sharedConnection: shared });
+    consumer.connect();
+    expect(consumer.rebuildPeer()).toBe(false);
+    consumer.close();
+  });
+
   test("wake redials a silent socket instead of signalling into a corpse", async () => {
     // A sleep leaves the socket claiming OPEN with the TCP side gone: nothing
     // arrives, nothing fires onclose, and an ICE restart offered into it goes

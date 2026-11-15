@@ -77,6 +77,8 @@ export type NativeToWorkerMessage =
       iceTransportPolicy: "all" | "relay";
       forceRelay: boolean;
       forceRebuild?: boolean;
+      /** Send `rtc.close` for the peer being replaced before the new offer. */
+      closePrevious?: boolean;
     })
   | (NativeMessage & { type: "signal-frame"; frame: unknown })
   | (NativeMessage & {
@@ -175,6 +177,16 @@ export type WorkerToNativeMessage =
   | (WorkerMessage & { type: "clipboard-read"; requestId: string })
   | (WorkerMessage & { type: "clipboard-write"; requestId: string; text: string })
   | (WorkerMessage & { type: "diagnostic"; diagnostic: WorkerDiagnostic })
+  | (WorkerMessage & {
+      /** The host worker found that no new channel opens on its peer while the
+       *  root still answers (`worker-channel-watch.js`); native replaces it. */
+      type: "rebuild";
+      reason: "channels_unanswered";
+      waitedMs: number;
+      probeMs: number;
+      pingMs: number;
+      rebuilds: number;
+    })
   | (WorkerMessage & { type: "connection-info"; info: ConnectionInfo })
   | (WorkerMessage & {
       type: "upload-progress";
@@ -320,6 +332,7 @@ const WORKER_MESSAGE_TYPES = new Set([
   "clipboard-read",
   "clipboard-write",
   "diagnostic",
+  "rebuild",
   "connection-info",
   "upload-progress",
   "host-response",

@@ -26,6 +26,7 @@
     if (!entry) return;
     attached.delete(id);
     for (const [kind, item] of entry) {
+      api.channelWatch?.forget(item.dc.label);
       item.dc.onclose = null;
       item.dc.onerror = null;
       item.dc.onmessage = null;
@@ -101,14 +102,25 @@
           pendingBytes: 0,
           pendingMessages: 0,
           tail: Promise.resolve(),
+          heard: false,
         };
         entry.set(kind, item);
+        // Whether a channel can still open on this peer: worker-channel-watch.js.
+        api.channelWatch?.opened(dc.label);
         dc.binaryType = "arraybuffer";
         dc.onopen = () => {
           if (attached.get(id) === entry) postEvent(id, kind, "open");
         };
-        dc.onclose = dc.onerror = () => detach(id);
+        // The daemon closed it, which answers it: a refusal is a close.
+        dc.onclose = dc.onerror = () => {
+          api.channelWatch?.answered(dc.label);
+          detach(id);
+        };
         dc.onmessage = ({ data }) => {
+          if (!item.heard) {
+            item.heard = true;
+            api.channelWatch?.answered(dc.label);
+          }
           const pendingBytes =
             typeof data === "string" ? sizeOf(data) : (data.byteLength ?? data.size);
           if (

@@ -2284,6 +2284,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
         return;
       }
       if (message.type !== "response" || typeof message.request_id !== "string") return;
+      // The channel watch's own ping on the root (worker-channel-watch.js).
+      if (api.channelWatch?.pong(message.request_id)) return;
       postResponse(message.request_id, message.ok === true, message.result, message.error);
     };
 
@@ -2334,6 +2336,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     if (!entry) return;
     consumers.delete(id);
     clearTimeout(entry.timer);
+    api.channelWatch?.forget(entry.dc.label);
     entry.dc.onclose = entry.dc.onerror = entry.dc.onmessage = entry.dc.onopen = null;
     entry.dc.removeEventListener("bufferedamountlow", entry.onBuffered);
     entry.dc.close();
@@ -2465,10 +2468,15 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       entry.opened = true;
       protocol.hostChannelOpened();
     };
+    // Whether a channel can still open on this peer: worker-channel-watch.js.
+    api.channelWatch?.opened(dc.label);
     dc.onmessage = ({ data }) => {
-      if (consumers.get(id) === entry) protocol.receiveHostCtl(data);
+      if (consumers.get(id) !== entry) return;
+      api.channelWatch?.answered(dc.label);
+      protocol.receiveHostCtl(data);
     };
     dc.onclose = dc.onerror = () => {
+      api.channelWatch?.answered(dc.label);
       // Opened and closed by the daemon before its hello: refused, which is
       // what the daemon does past its tool limit. Native decides what that
       // means; one can be a race with a channel that is still closing.
@@ -2527,6 +2535,192 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
 // biome-ignore-all lint: This source executes inside WKWebView, not the React Native runtime.
 (() => {
   "use strict";
+  // Whether the host worker's peer can still open channels: the phone's half
+  // of web/src/lib/channel-watch.ts, with the same rule and the same numbers.
+  //
+  // A peer can stay connected, its root channel answering, while no new
+  // channel opens on it (a daemon built before #122 let one reset stream end
+  // its channel acceptor for the peer's life, #120). Every terminal opened on
+  // that host then waited out its attachment deadline and attached again on
+  // the same peer, for good.
+  //
+  // Watched: the channels the daemon speaks on first, a terminal's spawn.ctl
+  // (its ready) and a host tool's spawn.host.ctl/<id> (its hello). A channel
+  // neither spoken on nor closed by the daemon for ten seconds makes the peer
+  // suspect; a phone's views wait twenty-five before they give up, so this
+  // deadline always comes first. A suspect peer gets one probe, a host-control
+  // channel of the worker's own that the daemon greets without any session
+  // involved. A probe silent for ten seconds is weighed against the root with
+  // one ping: only a ping answered within five seconds, the probe still
+  // silent, asks native to replace the peer. A host that is slow or briefly
+  // unreachable delays the ping as much as the probe; one that is gone takes
+  // the peer out of `connected`, which resets the watch.
+  //
+  // A refusal is an answer: the daemon closes a channel it refuses at once.
+  // Any answer clears the suspicion and the run of rebuilds. One probe at a
+  // time; rebuilds for this reason at least thirty seconds apart, doubling
+  // while nothing is answered between them, up to five minutes.
+  const api = globalThis.spawnWorker;
+  const state = api.state;
+  const UNANSWERED_MS = 10_000;
+  const PROBE_MS = 10_000;
+  const PING_MS = 5_000;
+  const REBUILD_BACKOFF_MS = 30_000;
+  const REBUILD_BACKOFF_CAP_MS = 300_000;
+  const DAEMON_SPEAKS_FIRST = /^spawn\.(?:ctl|host\.ctl)\//;
+  const pending = new Map();
+  const pings = new Map();
+  let probe = null;
+  let rebuilds = 0;
+  let notBefore = 0;
+
+  function peerReady() {
+    return (
+      state.mode === "host" &&
+      state.pc?.connectionState === "connected" &&
+      state.ctl?.readyState === "open"
+    );
+  }
+
+  function take(label) {
+    const entry = pending.get(label);
+    if (!entry) return null;
+    clearTimeout(entry.timer);
+    pending.delete(label);
+    return entry;
+  }
+
+  function heard() {
+    rebuilds = 0;
+    if (probe) endProbe(probe);
+  }
+
+  function endProbe(current) {
+    if (probe !== current) return;
+    probe = null;
+    clearTimeout(current.timer);
+    current.channel.onmessage = current.channel.onclose = current.channel.onerror = null;
+    try {
+      current.channel.close();
+    } catch {
+      // A channel of a peer that is already gone has nothing left to close.
+    }
+  }
+
+  function ping() {
+    return new Promise((resolve, reject) => {
+      const requestId = crypto.randomUUID();
+      const settle = (error) => {
+        clearTimeout(timer);
+        pings.delete(requestId);
+        if (error) reject(error);
+        else resolve();
+      };
+      const timer = setTimeout(
+        () => settle(new Error("The host did not answer its root channel.")),
+        PING_MS,
+      );
+      pings.set(requestId, settle);
+      try {
+        state.ctl.send(
+          JSON.stringify({ version: 1, type: "request", request_id: requestId, operation: "ping" }),
+        );
+      } catch (error) {
+        settle(error);
+      }
+    });
+  }
+
+  async function confirm(current) {
+    if (probe !== current) return;
+    const pinged = Date.now();
+    try {
+      await ping();
+    } catch {
+      // The root is silent as well: the whole peer is slow or gone, which
+      // ICE, the signalling socket and the daemon's own retirement deal with.
+      endProbe(current);
+      return;
+    }
+    if (probe !== current) return;
+    const pingMs = Date.now() - pinged;
+    const probeMs = Date.now() - current.since;
+    endProbe(current);
+    if (Date.now() < notBefore || !peerReady()) return;
+    rebuilds += 1;
+    notBefore =
+      Date.now() + Math.min(REBUILD_BACKOFF_CAP_MS, REBUILD_BACKOFF_MS * 2 ** (rebuilds - 1));
+    // Native replaces the peer and says why; nothing a terminal carries is in it.
+    api.post({
+      type: "rebuild",
+      reason: "channels_unanswered",
+      waitedMs: current.waitedMs,
+      probeMs,
+      pingMs,
+      rebuilds,
+    });
+  }
+
+  function suspect(waitedMs) {
+    if (probe || Date.now() < notBefore || !peerReady()) return;
+    let channel;
+    try {
+      channel = state.pc.createDataChannel(`spawn.host.ctl/${crypto.randomUUID()}`, {
+        ordered: true,
+      });
+    } catch {
+      return;
+    }
+    const current = { channel, since: Date.now(), waitedMs, timer: null };
+    probe = current;
+    const answered = () => {
+      if (probe === current) heard();
+    };
+    channel.onmessage = channel.onclose = channel.onerror = answered;
+    current.timer = setTimeout(() => void confirm(current), PROBE_MS);
+  }
+
+  api.channelWatch = {
+    /** The worker opened a child channel on the peer. */
+    opened(label) {
+      if (!DAEMON_SPEAKS_FIRST.test(label) || pending.has(label)) return;
+      const since = Date.now();
+      const timer = setTimeout(() => {
+        if (pending.get(label)?.timer !== timer) return;
+        pending.delete(label);
+        suspect(Date.now() - since);
+      }, UNANSWERED_MS);
+      pending.set(label, { since, timer });
+    },
+    /** The daemon spoke on the channel, or closed it: either way it answered. */
+    answered(label) {
+      if (take(label)) heard();
+    },
+    /** The channel went for a reason that says nothing about the daemon. */
+    forget(label) {
+      take(label);
+    },
+    /** The peer left `connected` or was torn down. The run of rebuilds and
+     * its backoff carry over to the next peer. */
+    reset() {
+      for (const entry of pending.values()) clearTimeout(entry.timer);
+      pending.clear();
+      for (const settle of [...pings.values()]) settle(new Error("The peer was replaced."));
+      if (probe) endProbe(probe);
+    },
+    /** A root response: true when it answered the watch's own ping. */
+    pong(requestId) {
+      const settle = pings.get(requestId);
+      if (!settle) return false;
+      settle();
+      return true;
+    },
+  };
+})();
+
+// biome-ignore-all lint: This source executes inside WKWebView, not the React Native runtime.
+(() => {
+  "use strict";
   const api = globalThis.spawnWorker;
   const state = api.state;
   const MAX_FRAME = 64 * 1024;
@@ -2552,6 +2746,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     if (!entry) return;
     attached.delete(id);
     for (const [kind, item] of entry) {
+      api.channelWatch?.forget(item.dc.label);
       item.dc.onclose = null;
       item.dc.onerror = null;
       item.dc.onmessage = null;
@@ -2627,14 +2822,25 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
           pendingBytes: 0,
           pendingMessages: 0,
           tail: Promise.resolve(),
+          heard: false,
         };
         entry.set(kind, item);
+        // Whether a channel can still open on this peer: worker-channel-watch.js.
+        api.channelWatch?.opened(dc.label);
         dc.binaryType = "arraybuffer";
         dc.onopen = () => {
           if (attached.get(id) === entry) postEvent(id, kind, "open");
         };
-        dc.onclose = dc.onerror = () => detach(id);
+        // The daemon closed it, which answers it: a refusal is a close.
+        dc.onclose = dc.onerror = () => {
+          api.channelWatch?.answered(dc.label);
+          detach(id);
+        };
         dc.onmessage = ({ data }) => {
+          if (!item.heard) {
+            item.heard = true;
+            api.channelWatch?.answered(dc.label);
+          }
           const pendingBytes =
             typeof data === "string" ? sizeOf(data) : (data.byteLength ?? data.size);
           if (
@@ -3050,7 +3256,9 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     if (state.mode !== "host") throw new Error("Terminal views attach to the daemon connection.");
     if (state.pc?.connectionState === "connected" && message.forceRebuild !== true) return;
     if (state.pc && state.rtcSessionId === message.rtcSessionId) return;
-    teardown(false);
+    // A peer replaced because no channel opened on it tells the server and
+    // daemon its binding is closed; any other replacement's binding is gone.
+    teardown(message.closePrevious === true);
     state.stopped = false;
     state.rtcSessionId = message.rtcSessionId;
     state.bindingNonce = message.bindingNonce;
@@ -3079,6 +3287,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     };
     pc.onconnectionstatechange = () => {
       if (pc !== state.pc) return;
+      // What the channel watch was waiting on belonged to the readiness that ended.
+      if (pc.connectionState !== "connected") api.channelWatch?.reset();
       if (["failed", "disconnected"].includes(pc.connectionState)) {
         api.post({ type: "state", state: "connecting" });
       }
@@ -3198,6 +3408,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   function teardown(sendClose) {
+    api.channelWatch?.reset();
     api.resetHostGeneration?.();
     api.closeHostConsumers?.();
     api.closePairChannels?.();

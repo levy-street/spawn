@@ -549,3 +549,10 @@ export const CONNECT_TIMEOUT_MESSAGE =
   "The host did not answer in time. It may be offline, or it may not have approved this device.";
 export const LOST_CONNECTION_MESSAGE =
   "SPAWN D lost the connection to this host and could not restore it.";
+/** A peer on which no new channel opened, while its host answered on the root,
+ *  is being replaced (`worker/worker-channel-watch.js`). */
+export const CHANNELS_UNANSWERED_CODE = "channels_unanswered";
+/** What a terminal and the host's card say meanwhile. The browser says the
+ *  same (web `REBUILDING_MESSAGE`, `lib/channel-watch.ts`). */
+export const CHANNELS_UNANSWERED_MESSAGE =
+  "The connection stopped opening terminals. SPAWN D is making a new one.";

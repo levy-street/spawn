@@ -334,6 +334,47 @@ describe("host-scoped signalling", () => {
     expect(harness.state["pc"]).toBeNull();
   });
 
+  test("a peer replaced because no channel opened on it closes its binding first", async () => {
+    for (const closePrevious of [true, false]) {
+      const harness = createHarness("host");
+      await connect(harness);
+      await signOffer(harness);
+      await harness.handleTransportMessage?.({ type: "signal-frame", frame: answerFrame() });
+      const first = FakePeerConnection.last;
+      if (first) first.connectionState = "connected";
+
+      await harness.handleTransportMessage?.({
+        type: "connect",
+        rtcSessionId: "rtc-session-rebuilt",
+        bindingNonce: SERVER_NONCE,
+        iceServers: [],
+        forceRelay: false,
+        forceRebuild: true,
+        ...(closePrevious ? { closePrevious: true } : {}),
+      });
+
+      expect(first?.connectionState).toBe("closed");
+      expect(FakePeerConnection.last).not.toBe(first);
+      const closes = emittedFrames(harness, "rtc.close");
+      if (closePrevious) {
+        // The old binding, as the server knows it, before the new offer.
+        expect(closes).toEqual([
+          expect.objectContaining({
+            session_id: RTC_SESSION_ID,
+            binding_nonce: CLIENT_NONCE,
+            scope_type: "host",
+            scope_id: HOST_ID,
+          }),
+        ]);
+      } else {
+        expect(closes).toEqual([]);
+      }
+      expect(posted(harness, "sign-request").at(-1)?.["transcript"]).toMatchObject({
+        sessionId: "rtc-session-rebuilt",
+      });
+    }
+  });
+
   test("still rejects a frame bound to a different host session", async () => {
     const harness = createHarness("host");
     await connect(harness);
