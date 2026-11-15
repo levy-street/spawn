@@ -17,7 +17,8 @@ NATIVE_BOOT_TIMEOUT_SECONDS = 180
 # background (mobile/src/terminal/TerminalSurface.tsx, HostTransportSurface.tsx).
 BACKGROUND_GRACE_MS = 3000
 # A slow hosted simulator can take longer than the grace interval just to leave
-# and re-enter the app. Such a cycle never tests a short background, so the
+# and re-enter the app, and the suite cannot tell that from an app reporting its
+# lifecycle late. A cycle measured at or beyond the interval is not judged; the
 # short case repeats it a bounded number of times before failing.
 SHORT_BACKGROUND_ATTEMPTS = 3
 
@@ -482,8 +483,10 @@ async def exercise(fixture: Any) -> None:
 
         # OS activation itself takes time. Immediately request foreground for
         # the short case; accept it only if real callbacks prove a nonzero gap
-        # below three seconds and the original parent survives unchanged. A
-        # cycle the OS itself made too long is repeated (short_background).
+        # below three seconds and the parent the judged cycle started with
+        # survives unchanged. A cycle measured at three seconds or longer is
+        # repeated (short_background); the suite cannot tell OS latency from
+        # app latency.
         async def short() -> dict[str, Any]:
             result = await short_background(lambda: background_cycle(0))
             del result["same_parent"]  # Kept per attempt as kept_parent.

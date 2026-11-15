@@ -126,10 +126,15 @@ records how long it took; the macOS runner hashes the unoptimized pair into
 its release store before the daemon's first log line). Once provisioning is
 ready, app boot has its own 180-second limit; failure starts no connection
 cases. A hosted emulator can still be bringing its network up when the app
-starts, so the controller retries its first bootstrap request for up to 60
-seconds (backoff from 0.5 to 4 seconds) while the request gets no HTTP answer,
-and logs each retry as a `bootstrap-retry` startup phase. Any HTTP answer ends
-the retries: a refusal such as 403 or 503 fails boot at once. Runner
+starts, so the controller retries its first bootstrap request (backoff from
+0.5 to 4 seconds) while the request gets no HTTP answer, and logs each retry as
+a `bootstrap-retry` startup phase. The last attempt is scheduled to start
+within 60 seconds of the first, and each attempt can wait out its 15-second
+request timeout, so retrying can take about 75 seconds. That fits inside the
+180-second limit of the first launch only; after the relaunch in the
+`process_restart` case the suite waits 60 seconds for the new boot, less than
+retrying can take. Any HTTP answer ends the retries: a refusal such as 403 or
+503 fails boot at once. Runner
 failures capture a screenshot and a bounded, redacted Android accessibility
 dump on the validated emulator. Diagnostic failures preserve the original
 failure, and temporary accessibility files are removed from that emulator.
@@ -276,13 +281,21 @@ Apple documents the application identifier's role in the
 The short-background case uses a `background-cycle` command with no added
 sleep, removing fixture acknowledgements and polling from the interval. It
 requires retained native callbacks proving a nonzero background interval below
-three seconds and the same peer afterward. A slow hosted simulator can take
-three seconds or more just to leave and re-enter the app; that cycle never
-tested a short background, so it is not a verdict. The app is right to retire
+three seconds and the same peer afterward. A cycle measured at three seconds
+or longer is repeated, not judged. The interval comes from the app's own
+lifecycle callbacks, so the suite cannot tell OS latency, such as a slow hosted
+simulator leaving and re-entering the app, from app latency. The app may retire
 its parent after such a cycle, but the shells must survive and the app must
 recover to one measured ready peer with fresh input before the case repeats
 the cycle from that peer, for at most three cycles. The first cycle measured
-below three seconds is judged: it must keep the parent it started with. The case
-fails if all three are too slow. `background_attempts` records each cycle's
-measured interval, whether it was inside the interval, and whether it kept its
-parent. Long cases keep their five-second delay and are not repeated.
+below three seconds is judged: it must keep the parent it started with. On a
+run that repeated a cycle, the judged cycle is not the app's first background
+and may start from a parent created during recovery, so the case does not cover
+a fault that only the app's first background after opening its sessions would
+show. The case fails if all three are too slow. If the cycles pass the case's
+checks, the case's metrics record `background_attempts`: each cycle's measured
+interval, whether it was inside the interval, and whether it kept its parent.
+Otherwise no metrics are written; an assertion failure's message names the
+intervals of the cycles that completed, and any other error is reported as
+raised, without them. Long cases keep their five-second delay and are not
+repeated.
