@@ -492,10 +492,11 @@ pub const WORKER_FILE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// deletes them while their worker runs: the session's history becomes
 /// unreadable and its reservation stops proving anything.
 ///
-/// Live means a worker socket is present, as for adoption. Only regular
-/// files this user owns are touched, through a handle opened without
-/// following links; no file is created, read, or written. Returns how many
-/// files were refreshed.
+/// Every session with a `<id>.sock` in the directory counts, the set startup
+/// adoption tries: that includes a crashed worker's leftovers until an
+/// adoption attempt clears its sockets. Only regular files this user owns are
+/// touched, through a handle opened without following links; no file is
+/// created, read, or written. Returns how many files were refreshed.
 pub fn refresh_worker_files() -> usize {
     #[cfg(unix)]
     {

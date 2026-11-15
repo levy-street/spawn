@@ -9751,7 +9751,9 @@ mod tests {
         );
 
         // Nothing left to read: the segment the worker appends to is gone
-        // too. The next output disables the worker's log altogether.
+        // too. The next output scrolls a line into history; appending it
+        // finds no newest segment and disables the worker's log, before the
+        // output is forwarded.
         std::fs::remove_file(&newest).expect("delete the newest segment");
         viewer
             .pty
@@ -9766,11 +9768,17 @@ mod tests {
             .await
             .expect("replay response")
             .expect_err("a log with no segment replayed");
-        let refusal = format!("{refusal:#}");
-        assert!(
-            refusal.contains("worker replay is unavailable for this session")
-                || refusal.contains("seg-00000002.log: No such file or directory (os error 2)"),
-            "{refusal}"
+        let refused = refusal
+            .downcast_ref::<crate::pty::WorkerReplayRefused>()
+            .expect("the worker's own refusal");
+        // The real worker's words, exactly, and read as a disabled log.
+        assert_eq!(
+            refused.message(),
+            spawnd::sessiond::worker::REPLAY_UNAVAILABLE
+        );
+        assert_eq!(
+            crate::pty::unreadable_history(refused.message()),
+            Some(crate::pty::UnreadableHistory::LogDisabled)
         );
 
         let mut late_viewer =

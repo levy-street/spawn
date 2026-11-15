@@ -148,16 +148,20 @@ Stale-socket recovery with the file missing (a failed adoption) goes ahead
 only when nothing is bound to the lifecycle socket — a live worker keeps that
 datagram socket bound for its life, and a datagram `connect` reaches no
 process — and it then creates the reservation exclusively and holds it for
-the cleanup. Sockets are never aged out by either cleaner.
+the cleanup. The cleaners spare a live worker's sockets: macOS's removes
+regular files only, and `systemd-tmpfiles` skips a socket that is in use
+(listed in `/proc/net/unix`). A dead worker's sockets may be removed.
 
 While it runs, `spawnd` keeps those cleaners off its workers' files: when the
 worker directory is under a temporary location (`/tmp`, `/var/tmp`, the
 system temp directory, or `XDG_RUNTIME_DIR`, which asks for a touch every six
-hours), it sets the access and modification times of each live session's
-`.lock` and `seg-*.log` to now, at startup and every hour
-(`worker_backend::refresh_worker_files`). Only regular files the user owns
-are touched, through a no-follow handle; nothing is created or written. A
-host asleep longer than the cleaner's age can still lose them; see §15.
+hours), it sets the access and modification times of the `.lock` and
+`seg-*.log` of every session with a `.sock` in the directory to now, at
+startup and every hour (`worker_backend::refresh_worker_files`). That is the
+set startup adoption tries, so it includes a crashed worker's leftovers until
+an adoption attempt clears its sockets. Only regular files the user owns are
+touched, through a no-follow handle; no file is created or written. A host
+asleep longer than the cleaner's age can still lose them; see §15.
 
 Preferring `XDG_RUNTIME_DIR` puts sockets and ciphertext on tmpfs where
 available: gone on reboot, never on spinning rust. That is a feature — the
@@ -601,15 +605,34 @@ worker refuses because a segment file is gone from disk, spawnd asks again
 with a quarter of the budget, down to one byte: the walk is newest-first and
 stops once the budget is full, so a smaller budget stops short of the hole,
 and the viewer gets the live screen and the newest contiguous run of
-history, never history with a gap in it. The budget that worked is kept for
-that worker connection's later viewers. When nothing is readable (the newest
-segment is gone too, or the worker has disabled its log) the viewer gets an
-empty replay at the live stream's current offset and the terminal opens on
-what the session prints next. Each case is logged once per session at warning
-level. The refusals are recognised by the words every deployed worker uses,
-because running workers keep the binary they started with. Authentication,
-sequence, and framing failures are returned unchanged: tampered history still
-fails the replay closed.
+history, never history with a gap in it.
+
+A budget that replayed after a larger one in the same request was refused is
+a hint, not a cap. It is learned only from a replay that succeeded, and every
+viewer request on that worker connection (barrier, history, snapshot) starts
+at the smaller of its own budget and the hint. The hint lapses five minutes
+after it was learned — use does not renew it — and a history wipe the worker
+reports (`T_HISTORY_WIPE`) voids it; either way the next request asks for its
+full budget again. A session whose readable history grows, or whose gap the
+worker evicts, is therefore never held at an old figure for long. The
+barrier shares the hint, because its success is real evidence of what the
+log can read now, and it saves the history request that follows a second
+round of refusals. The quarter steps keep the hint within a factor of four
+of the history readable at that moment.
+
+When even one byte reaches a missing segment, that viewer gets an empty
+replay at the live stream's current offset and the terminal opens on what
+the session prints next. Nothing is remembered: the next request asks the
+worker again, because a line committed into an empty newest segment, or a
+`clear` that starts a fresh one, makes history readable again. Only a worker
+that says its log is disabled ("worker replay is unavailable for this …") is
+not asked again for the life of that connection, since a worker never
+re-enables its log. Each degradation is logged once per session at warning
+level. The refusals are recognised by the words deployed workers use, shared
+as constants (`scrollback::SEGMENT_READ_CONTEXT`, `worker::REPLAY_UNAVAILABLE`)
+and pinned by a test, because running workers keep the binary they started
+with. Authentication, sequence, and framing failures are returned unchanged:
+tampered history still fails the replay closed.
 
 Replay correctness (PTY in → bytes out → reattach replays both the initial
 output and mid-session stdin echo) is asserted end-to-end in
