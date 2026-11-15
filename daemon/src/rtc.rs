@@ -1837,8 +1837,15 @@ impl RtcSessions {
     /// device goes on retrying channels on a connection it believes healthy.
     /// So the peer leaves the host map here and the server hears
     /// `unavailable`, which a device answers with a new connection. A peer
-    /// this daemon is closing left the map before its association stopped,
-    /// and for it this does nothing. A device's own close ends the
+    /// this daemon is closing has, as a rule, left the map before its
+    /// association stopped, and for it this does nothing. The exception is
+    /// a protocol-1 host peer whose handler refuses a channel
+    /// (`install_host_data_channel_handler`): it closes the connection with
+    /// the peer still in the map, and this can then be what retires it and
+    /// says `unavailable`, which is true of a connection that is gone and
+    /// which the reaper, ignoring a closed connection, would not say. Whether
+    /// it runs depends on whether the acceptor sees its association close
+    /// before the transport's stop wakes it. A device's own close ends the
     /// association too when word of it arrives — a DTLS close_notify, an
     /// SCTP ABORT — so this is also what retires such a peer, ahead of the
     /// reaper's grace; it is logged at info, and the vendored SCTP's own

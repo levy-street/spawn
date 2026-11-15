@@ -476,8 +476,13 @@ connection state, never hears of it, so `install_host_acceptor_watch`
 retires it from the SCTP transport's `on_error`. The acceptor also stops
 the association itself once `MAX_FAILED_DATA_CHANNEL_STREAMS` streams have
 failed to become channels, and that peer is retired the same way. A peer the daemon is
-already closing left the host map before its association stopped, and the
-watch does nothing for it; a device's own close ends the association too
+already closing has, as a rule, left the host map before its association
+stopped, and the watch does nothing for it. The exception is a protocol-1
+host peer whose handler refuses a channel: the handler closes the
+connection while the peer is still in the map, and the watch can then be
+what retires it and tells the server `unavailable`, which is true of a
+connection that is gone and which the reaper, ignoring a closed
+connection, would not say. A device's own close ends the association too
 when word of it arrives (a DTLS close_notify, an SCTP ABORT), and that peer
 is retired the same way, ahead of the reaper's grace. A session close hands its announcements back
 (`Announcements`, sent on drop if never sent) for the caller in `run.rs` to
