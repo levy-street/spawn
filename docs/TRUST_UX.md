@@ -65,9 +65,10 @@ Anything that needs an additional concept gets redesigned until it doesn't.
 - **the number check** — the SAS. Never "SAS" or "fingerprint". One side shows it, the
   other *types* it — typing is what proves the human actually compared. Copy is always
   the imperative: *"Enter the number shown on the other device."*
-- **passkey** — used as-is, lowercase, exactly as the platform means it. Its one extra
-  power here gets one caption where passkeys are managed: *"Your passkey also restores
-  your devices and hosts if you lose everything."*
+- **passkey** — used as-is, lowercase, exactly as the platform means it. Its extra
+  powers get plain captions where passkeys are managed: *"Your passkey also restores
+  your devices and hosts if you lose everything."* and, since 2026-11-15 (#121), *"A
+  passkey lets a browser or device that has lost its approval get back in on its own."*
 
 Words that never appear: root, chain, anchor, pin, bundle, heal, endorsement, SAS,
 fingerprint, key, revoke, mesh, ceremony, tombstone, TOFU, signature, **recovery**.
@@ -169,7 +170,11 @@ terminal state precisely so the residual is a chosen, contained trade.
   yields the screen to the NumberCheck the moment an approver starts, and offers the
   two escapes that need no other device (the passkey, possessing a host from its
   terminal). The stamp is advisory in both directions: it grants nothing, and a device
-  that never stamps is still a visible waiting row (R4).
+  that never stamps is still a visible waiting row (R4). *(2026-11-15, #121)* On an
+  account with no passkey the card — and the Access panel's waiting callout — adds one
+  line: *"Once you're in, add a passkey in Account. Next time this device can get back
+  in without another one."* The phone's waiting sheet does not: the app cannot use a
+  passkey (below, §6), so the line would be untrue there.
 - existing device: the request arrives as a prompt (`ApproveRequest`) → NumberCheck
   (enter side). The roster's waiting row is the pull path to the same place. *(The
   desktop corner toast that offered "Enter its number" for every unapproved sign-in
@@ -267,6 +272,28 @@ result; a simultaneous update from another device is named as such. The blocked-
 card (§3) shows these failure lines too, so a failed passkey attempt is never a silent
 spinner.
 
+**A browser that may forget its approval** *(2026-11-15, #121; web only)*. A browser's
+device key lives in the origin's IndexedDB, which Chrome clears under disk pressure
+(cookies kept) unless the origin is persisted, and Chrome grants or refuses
+`navigator.storage.persist()` silently by heuristic. The app keeps the browser's answer
+(granted / refused / unsupported; Access shows it under "Browser storage") and asks
+again when notifications are allowed, since Chrome keeps the storage of a site that may
+notify. When the answer is *refused*, the account has no passkey, and this browser holds
+host trust worth keeping, it shows one quiet notice in the ordinary notice place:
+*"This browser may forget its approval"* / *"Your browser can clear the key that marks
+it as approved. Add a passkey and it can get back in on its own, without another
+device."* — *Add passkey* (opens Account) and *Not now*. *Not now* and the notice's X
+are remembered in that browser; the notice never appears once the account has a
+passkey, in a browser that kept its storage, or inside the desktop app (whose webview
+storage is a separate question). The phone's key sits in the OS keychain/keystore and is
+not cleared this way.
+
+**As built on the phone:** the mobile app cannot add or use a passkey in any build —
+opening the sealed trust needs a WebAuthn PRF secret and a cipher it does not have
+(`passkeyPrfCapability` is hard `false`). Its Device trust screen says where passkeys
+work ("Passkeys are added and used in SPAWN D in a browser") instead of pointing at a
+build that would not help.
+
 ### 7. Connection refused — `AccessBlocked`
 - **removed** — *(refined 2026-08-21, owner review during field test)* there is no removed
   screen and no "Start over" button: a removed device that is still signed in seamlessly
@@ -300,6 +327,10 @@ spinner.
   cost: one click. The passkey nudge appears.
 - **Additional device, passkey.** Sign in with the passkey → done. Zero screens. (The
   heal endorses it off the root; the sealed vault delivers the hosts.)
+- **A browser that lost its key** *(as built, verified 2026-11-15, #121)*. Still signed
+  in, it registers a fresh key and opening a session shows the waiting card (§3); on an
+  account with a passkey, *Use passkey* → one touch → the card closes and the terminal
+  connects. No other device. Browser only: the phone cannot use a passkey (§6).
 - **Additional device, no passkey.** Sign in → it appears everywhere as *Waiting for
   approval* → the new device shows the number, a trusted one types it. One number (P4).
 - **Recovery after total loss.** Identical to "additional device, passkey". The disaster

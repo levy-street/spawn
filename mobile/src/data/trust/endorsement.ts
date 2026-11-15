@@ -38,9 +38,18 @@ export interface EndorsementApi {
 
 const endpointApi: EndorsementApi = { createEndorsement, createAccountEndorsement };
 
+/**
+ * This app cannot use a passkey, in Expo Go or in the installed build: opening
+ * the saved trust needs a WebAuthn PRF secret and a cipher, and the app has
+ * neither (see the export-compliance note in app.config.ts). Passkeys are
+ * added and used in SPAWN D in a browser, which is also the one place a key
+ * can be cleared out from under the person (#121). The reason says where they
+ * work, not a build the phone could switch to.
+ */
 export const passkeyPrfCapability = {
   available: false as const,
-  reason: "Needs the installed build, not Expo Go. Approve this phone from a trusted device.",
+  reason:
+    "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
 };
 
 export function probePasskeyPrfCapability(): Promise<typeof passkeyPrfCapability> {

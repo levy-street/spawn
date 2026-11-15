@@ -114,12 +114,12 @@ jest.mock("@/data/trust/endorsement", () => ({
   passkeyPrfCapability: {
     available: false,
     reason:
-      "Saved trust passkeys require an installed build. Approve this device from another trusted device, or pair a host directly.",
+      "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
   },
   probePasskeyPrfCapability: jest.fn(async () => ({
     available: false,
     reason:
-      "Saved trust passkeys require an installed build. Approve this device from another trusted device, or pair a host directly.",
+      "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
   })),
 }));
 
@@ -204,13 +204,18 @@ describe("settings panel behavior", () => {
     expect(screen.queryByTestId("push-open-settings")).toBeNull();
   });
 
-  test("passkey capability probe renders the honest Expo Go state", async () => {
+  test("passkey capability probe says where passkeys work, and what one buys", async () => {
     const screen = await render(<DeviceTrustPanel />, { wrapper });
     await waitFor(() => expect(screen.getByTestId("passkey-unavailable")).toBeOnTheScreen());
     expect(screen.getByText("Set up a passkey")).toBeOnTheScreen();
     expect(
+      screen.getByText(
+        "A passkey lets a browser that has lost its approval get back in on its own.",
+      ),
+    ).toBeOnTheScreen();
+    expect(
       screen.getAllByText(
-        "Saved trust passkeys require an installed build. Approve this device from another trusted device, or pair a host directly.",
+        "Passkeys are added and used in SPAWN D in a browser. Approve this phone from a device you already use.",
       ).length,
     ).toBeGreaterThan(0);
   });

@@ -100,7 +100,7 @@ export function DeviceTrustPanel(): React.JSX.Element {
           <Text color="mutedForeground" variant="body">
             {bundle.data
               ? `Your saved trust opens with any of ${passkeys.data?.length ?? 0} passkey(s).`
-              : `No saved trust yet. Passkeys need the installed build (${passkeys.data?.length ?? 0} registered).`}
+              : `No saved trust yet. Passkeys are set up in SPAWN D in a browser (${passkeys.data?.length ?? 0} registered).`}
           </Text>
         </View>
       </SettingsBlock>
@@ -156,7 +156,10 @@ export function DeviceTrustPanel(): React.JSX.Element {
         />
       </SettingsSection>
 
-      <SettingsSection title="Saved trust passkeys">
+      <SettingsSection
+        description="A passkey lets a browser that has lost its approval get back in on its own."
+        title="Saved trust passkeys"
+      >
         {!bundle.data ? (
           <UnavailableRow
             icon="KeyRound"

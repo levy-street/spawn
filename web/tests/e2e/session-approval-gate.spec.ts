@@ -45,6 +45,10 @@ test("an unapproved device opening an agent session gets the approval card and a
   await expect(gate.getByTestId("session-gate-fingerprint")).toContainText("SHA256:");
   // No passkey on this account: the escape hatch is possession, not unlock.
   await expect(gate.getByTestId("session-gate-passkey")).toHaveCount(0);
+  // ...and the card says what would make next time one touch (#121).
+  await expect(gate.getByTestId("session-gate-passkey-hint")).toHaveText(
+    "Once you're in, add a passkey in Account. Next time this device can get back in without another one.",
+  );
   await expect(gate.getByRole("link", { name: /Possess a host directly/u })).toBeVisible();
 
   // The ask landed on this device's roster row for every other device to see.

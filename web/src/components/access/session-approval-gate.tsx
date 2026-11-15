@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { browserDevices, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import { NO_PASSKEY_WAITING_HINT } from "@/lib/device-storage-notice";
 import { isAgentSessionPath } from "@/lib/session-approval";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
@@ -170,6 +171,17 @@ export function SessionApprovalGate() {
                 : "Waiting for approval…"}
             </span>
           </div>
+
+          {/* No passkey: nothing here can let this device in by itself, but
+              the next time it loses its approval can be one touch (#121). */}
+          {passkey.bundle.data === null && (
+            <p
+              className="mt-3 text-center text-xs leading-relaxed text-muted-foreground"
+              data-testid="session-gate-passkey-hint"
+            >
+              {NO_PASSKEY_WAITING_HINT}
+            </p>
+          )}
 
           {passkey.status !== null && (
             <p className="mt-3 text-center text-sm font-medium" role="status">

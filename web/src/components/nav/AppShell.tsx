@@ -12,6 +12,7 @@ import {
   useState,
 } from "react";
 import { AccessCeremonyHost } from "@/components/access/ceremony-host";
+import { DeviceStorageNotice } from "@/components/access/device-storage-notice";
 import { HostGossipSync } from "@/components/access/host-gossip-sync";
 import { SessionApprovalGate } from "@/components/access/session-approval-gate";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
@@ -307,6 +308,7 @@ export function AppShell({
       <ProfileDialog />
       <AccessCeremonyHost />
       <SessionApprovalGate />
+      <DeviceStorageNotice />
       <HostGossipSync />
       <DeviceApprovalPrompt accountId={user?.id ?? null} />
       <HostPinUndeliveredAlerts enabled={user !== null} />
