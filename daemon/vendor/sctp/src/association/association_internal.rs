@@ -76,7 +76,7 @@ pub struct AssociationInternal {
     streams: HashMap<u16, Arc<Stream>>,
 
     close_loop_ch_tx: Option<broadcast::Sender<()>>,
-    accept_ch_tx: mpsc::Sender<Arc<Stream>>,
+    accept_ch_tx: Option<mpsc::Sender<Arc<Stream>>>,
     handshake_completed_ch_tx: mpsc::Sender<Option<Error>>,
 
     // per inbound packet context
@@ -205,7 +205,7 @@ impl AssociationInternal {
             stored_cookie_echo: None,
             streams: HashMap::new(),
             close_loop_ch_tx: Some(close_loop_ch_tx),
-            accept_ch_tx,
+            accept_ch_tx: Some(accept_ch_tx),
             handshake_completed_ch_tx,
 
             delayed_ack_triggered: false,
@@ -280,6 +280,13 @@ impl AssociationInternal {
 
             // awake read/write_loop to exit
             self.close_loop_ch_tx.take();
+
+            // No stream is created after this, and whoever accepts them is
+            // told so: `accept_stream` returns `None` once it has drained
+            // what was queued. Upstream kept the sender for as long as the
+            // association object lived, so an acceptor waited on a closed
+            // association for ever.
+            self.accept_ch_tx.take();
 
             for si in self.streams.keys().cloned().collect::<Vec<u16>>() {
                 self.unregister_stream(si);
@@ -1128,14 +1135,21 @@ impl AssociationInternal {
         ));
 
         if accept {
-            if self.accept_ch_tx.try_send(Arc::clone(&s)).is_ok() {
+            if self
+                .accept_ch_tx
+                .as_ref()
+                .is_some_and(|accept_ch_tx| accept_ch_tx.try_send(Arc::clone(&s)).is_ok())
+            {
                 log::debug!(
                     "[{}] accepted a new stream (streamIdentifier: {})",
                     self.name,
                     stream_identifier
                 );
             } else {
-                log::debug!("[{}] dropped a new stream due to accept_ch full", self.name);
+                log::debug!(
+                    "[{}] dropped a new stream due to accept_ch full or closed",
+                    self.name
+                );
                 return None;
             }
         }
