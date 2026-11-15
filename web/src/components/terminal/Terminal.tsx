@@ -7,6 +7,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
+import { gpuBudget, restoreDomRenderer } from "./gpu-renderer";
 import { LatencyHud, latencyHudEnabled } from "./latency-hud";
 import { PredictiveEcho } from "./predictive-echo";
 import "@xterm/xterm/css/xterm.css";
@@ -311,12 +312,39 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // this device moved it (`claimDisplayOnOpen`).
   const displayClaimOwedRef = useRef(active && claimDisplayOnOpen);
   const payDisplayClaimRef = useRef<() => void>(() => {});
-  // GPU renderer for the FOREGROUND terminal only. The DOM renderer rebuilds
-  // row elements and forces style/layout/paint after every echo — measurable
-  // extra frames of felt keystroke latency. Parked terminals release their
-  // addon so the warm pool can never exhaust the browser's WebGL context
-  // budget; a lost context falls back to the DOM renderer silently.
+  // GPU renderer for FOREGROUND terminals, within the page's budget. The DOM
+  // renderer rebuilds row elements and forces style/layout/paint after every
+  // echo — measurable extra frames of felt keystroke latency. Parked
+  // terminals release their addon, and on-screen ones past `gpuBudget` stay on
+  // the DOM renderer: a split window can put more terminals on screen than
+  // the browser keeps WebGL contexts for, and a context it takes back by force
+  // left its terminal drawing nothing (see `gpu-renderer.ts`).
   const webglAddonRef = useRef<WebglAddon | null>(null);
+  /** This terminal's identity in the page's GPU budget. */
+  const gpuOwnerRef = useRef({});
+  /**
+   * Back to the DOM renderer, and the slot back to the budget. The context is
+   * freed now rather than whenever the canvas is collected: a released
+   * context the browser still counts as live is one that pushes some other
+   * terminal's out.
+   */
+  const releaseGpuRenderer = useCallback((keepDrawing = true) => {
+    gpuBudget.release(gpuOwnerRef.current);
+    const webgl = webglAddonRef.current;
+    webglAddonRef.current = null;
+    if (!webgl) return;
+    const term = termRef.current;
+    const canvases = [
+      ...(term?.element?.querySelectorAll<HTMLCanvasElement>(".xterm-screen canvas") ?? []),
+    ];
+    webgl.dispose();
+    for (const canvas of canvases) {
+      if (canvas.isConnected) continue;
+      canvas.getContext("webgl2")?.getExtension("WEBGL_lose_context")?.loseContext();
+    }
+    // A terminal that stays alive draws through the DOM from here.
+    if (term && keepDrawing) restoreDomRenderer(term);
+  }, []);
   const attachGpuRenderer = useCallback((term: XTerm, ref: { current: WebglAddon | null }) => {
     if (ref.current) return;
     try {
@@ -337,6 +365,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       webgl.onContextLoss(() => {
         webgl.dispose();
         if (ref.current === webgl) ref.current = null;
+        gpuBudget.release(gpuOwnerRef.current);
+        // Falls back to the DOM renderer — which the addon was meant to put
+        // back itself and, in the versions we ship, cannot.
+        restoreDomRenderer(term);
       });
       ref.current = webgl;
     } catch {
@@ -345,19 +377,35 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       ref.current = null;
     }
   }, []);
+  /**
+   * Take a GPU slot and attach the renderer, if the budget has one — asking
+   * as the terminal being typed in when `focused`, which may take a slot from
+   * a terminal nobody is working in.
+   */
+  const claimGpuRenderer = useCallback(
+    (focused: boolean) => {
+      const term = termRef.current;
+      if (!term || !wantsGpuRenderer()) return;
+      if (!gpuBudget.request(gpuOwnerRef.current, releaseGpuRenderer, focused)) return;
+      if (webglAddonRef.current) return;
+      attachGpuRenderer(term, webglAddonRef);
+      if (!webglAddonRef.current) gpuBudget.release(gpuOwnerRef.current);
+    },
+    [attachGpuRenderer, releaseGpuRenderer],
+  );
   const syncWebglRenderer = useCallback(
     (wantGpu: boolean) => {
       if (!wantGpu || !wantsGpuRenderer()) {
-        webglAddonRef.current?.dispose();
-        webglAddonRef.current = null;
+        releaseGpuRenderer();
         return;
       }
-      const term = termRef.current;
-      if (!term) return;
-      attachGpuRenderer(term, webglAddonRef);
+      claimGpuRenderer(false);
     },
-    [attachGpuRenderer],
+    [claimGpuRenderer, releaseGpuRenderer],
   );
+  // The bootstrap effect's teardown runs once, at unmount, and reads it here.
+  const releaseGpuRendererRef = useRef(releaseGpuRenderer);
+  releaseGpuRendererRef.current = releaseGpuRenderer;
   const syncWebglRendererRef = useRef(syncWebglRenderer);
   syncWebglRendererRef.current = syncWebglRenderer;
   useEffect(() => {
@@ -2747,8 +2795,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         predictionSweepRef.current = null;
       }
       predictorRef.current.clear();
-      webglAddonRef.current?.dispose();
-      webglAddonRef.current = null;
+      releaseGpuRendererRef.current(false);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -3442,6 +3489,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       aria-busy={!socket.dcOpen}
       onFocusCapture={() => {
         focusViewRef.current();
+        // The terminal being typed in is the one the GPU renderer is for.
+        if (activeRef.current) claimGpuRenderer(true);
       }}
       className="relative size-full touch-none bg-[var(--color-terminal-bg)]"
       onPasteCapture={onPasteCapture}
