@@ -9,7 +9,6 @@ import {
 import { pendingLaunch } from "@/components/workspace/pending-launch";
 import type { Agent, Session } from "@/lib/api";
 import type { ConversationInspection } from "@/lib/conversation";
-import { forgetHostLaunchFacts, recordHostLaunchFacts } from "@/lib/host-launch-facts";
 import type { AgentTranscriptReport } from "@/lib/hostControl";
 
 const claude: Agent = {
@@ -268,7 +267,7 @@ describe("planAgentRestart with the host's answer", () => {
     );
   });
 
-  test("a Codex restart keeps the window's threads in its own process where the host says so", async () => {
+  test("a Codex restart is queued with its --no-daemon form, for the new shell's host to allow", async () => {
     const facts = { codexNoDaemon: true };
     const command = (plan: ReturnType<typeof planAgentRestart>) =>
       plan.kind === "agent" ? plan.command : null;
@@ -289,28 +288,29 @@ describe("planAgentRestart with the host's answer", () => {
     expect(command(planAgentRestart(codexSession(), [codex], shared, null, facts))).toBe(
       "codex --no-daemon resume",
     );
-    // The restart reads what the window's host last said by default.
-    recordHostLaunchFacts(session().host_id, facts);
-    try {
-      await restartSessionAgent({
-        session: codexSession(),
-        agents: [codex],
-        restart: async () => codexSession({ status: "starting" }),
-        inspect: async () => named,
-      });
-      expect(pendingLaunch.take(session().id, session().host_id)).toBe(
-        `codex --no-daemon resume ${liveCodex}`,
-      );
-    } finally {
-      forgetHostLaunchFacts();
-    }
+    // The restart queues both: the plain command, and the flagged one the
+    // drain types if the new shell's host says its Codex accepts it.
     await restartSessionAgent({
       session: codexSession(),
       agents: [codex],
       restart: async () => codexSession({ status: "starting" }),
       inspect: async () => named,
     });
-    expect(pendingLaunch.take(session().id, session().host_id)).toBe(`codex resume ${liveCodex}`);
+    expect(pendingLaunch.takeLaunch(session().id, session().host_id)).toEqual({
+      command: `codex resume ${liveCodex}`,
+      codexNoDaemon: `codex --no-daemon resume ${liveCodex}`,
+    });
+    // Claude Code has no such form.
+    await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      inspect: async () => live(),
+    });
+    expect(pendingLaunch.takeLaunch(session().id, session().host_id)).toEqual({
+      command: `claude --resume ${moved}`,
+      codexNoDaemon: null,
+    });
   });
 
   test("no Codex restart ever types resume --last", () => {

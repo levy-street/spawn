@@ -434,8 +434,11 @@ impl RtcSessions {
                     live.insert(label.to_string(), Arc::downgrade(&dc));
                     // An authenticated device: its channels may ask about
                     // the windows it can already see, and only that much of
-                    // the registry is handed over.
+                    // the registry is handed over — a window's shell, and
+                    // (to `codex_launch`, never to the channel) the
+                    // environment and folder it was started with.
                     let registry = pair.registry.clone();
+                    let launches = pair.registry.clone();
                     let windows =
                         crate::host_conv::WindowShells::new(move |id| registry.shell_pid(id))
                             .with_memory(
@@ -443,7 +446,7 @@ impl RtcSessions {
                                     .ok()
                                     .map(crate::host_conv::ConversationMemory::new),
                             )
-                            .with_codex_no_daemon(crate::codex_launch::accepts_no_daemon);
+                            .with_codex_no_daemon(codex_launch_asker(launches));
                     pair.register_host(install_host_control_channel(
                         dc,
                         signal_id,
@@ -675,6 +678,20 @@ impl RtcSessions {
         future.await;
         Ok(())
     }
+}
+
+/// How a pair channel asks whether a window's Codex accepts `--no-daemon`:
+/// `codex_launch`, with the environment and folder this daemon started the
+/// window's current shell with. A window it adopted rather than started has
+/// none, and is unknown.
+fn codex_launch_asker(registry: SessionRegistry) -> crate::host_conv::CodexNoDaemon {
+    Arc::new(move |session_id| {
+        let launch = registry.launch_context(session_id);
+        Box::pin(async move {
+            let (env, cwd) = launch?;
+            crate::codex_launch::accepts_no_daemon(&env, std::path::Path::new(&*cwd)).await
+        })
+    })
 }
 
 #[cfg(test)]
@@ -3379,6 +3396,60 @@ mod tests {
                     .unwrap();
                 assert_eq!(answer["request_id"], request_id);
                 assert_eq!(answer["error"]["code"], code, "{answer}");
+            }
+            // `conv.launch` asks the window's own Codex, in the environment
+            // and folder its shell was started with: none for a worker this
+            // daemon did not start, a fake `codex` that knows the flag once
+            // one is noted.
+            let launch = |request_id: &'static str| {
+                let host = Arc::clone(&host);
+                async move {
+                    host.send_text(
+                        json!({
+                            "version": 1, "type": "request", "request_id": request_id,
+                            "operation": "conv.launch", "payload": {"session_id": window.to_string()}
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            };
+            launch("launch-unknown").await;
+            let answer = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                answer["result"],
+                json!({"codex_no_daemon": null}),
+                "{answer}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let bin = tempfile::tempdir().unwrap();
+                let codex = bin.path().join("codex");
+                std::fs::write(&codex, "#!/bin/sh\necho \"codex-cli 0.167.2\"\n").unwrap();
+                std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+                registry.set_launch_env(
+                    window,
+                    Arc::new(std::collections::BTreeMap::from([(
+                        "PATH".to_string(),
+                        bin.path().to_string_lossy().into_owned(),
+                    )])),
+                );
+                launch("launch-known").await;
+                let answer = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(answer["request_id"], "launch-known");
+                assert_eq!(
+                    answer["result"],
+                    json!({"codex_no_daemon": true}),
+                    "{answer}"
+                );
             }
         } else {
             assert_eq!(answer["error"]["code"], "unsupported_operation");

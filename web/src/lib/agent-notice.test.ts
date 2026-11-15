@@ -27,3 +27,25 @@ describe("detectAgentNotice", () => {
     expect(detectAgentNotice(["Update installed"])).toBeNull();
   });
 });
+
+describe("a Codex that refuses --no-daemon", () => {
+  test("is recognised by clap's refusal on screen", () => {
+    expect(
+      detectAgentNotice([
+        "$ codex --no-daemon",
+        "error: unexpected argument '--no-daemon' found",
+        "",
+        "  tip: a similar argument exists: '--no-alt-screen'",
+        "$",
+      ]),
+    ).toBe("codex_no_daemon_refused");
+    expect(detectAgentNotice(["error: unexpected argument '--foo' found"])).toBeNull();
+    // The update notice still wins where both show.
+    expect(
+      detectAgentNotice([
+        "error: unexpected argument '--no-daemon' found",
+        "Update installed · Restart to update",
+      ]),
+    ).toBe("update_installed");
+  });
+});

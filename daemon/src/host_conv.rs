@@ -83,7 +83,9 @@
 //! version — no paths, no content — and is a few hundred bytes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -97,6 +99,9 @@ pub(crate) const CAPABILITY: &str = "conv.v1";
 /// window's restart would not reach. It changes nothing on the host but the
 /// window's Codex note.
 pub(crate) const INSPECT_OP: &str = "conv.inspect";
+/// Whether the Codex a window is about to run accepts `--no-daemon`
+/// (`codex_launch`), asked just before a client types it.
+pub(crate) const LAUNCH_OP: &str = "conv.launch";
 /// Where a window's process tree can be walked. Elsewhere the family is
 /// neither advertised nor answered, so a client keeps its old behaviour.
 pub(crate) const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
@@ -124,6 +129,12 @@ const MAX_MEMORY_BYTES: u64 = 1024;
 /// this long before Codex goes can be missed.
 pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Whether the Codex a window will run accepts `--no-daemon`, asked of the
+/// window's own launch environment (`codex_launch`, handed in by the caller:
+/// this module runs nothing to learn it). None when that is not known.
+pub(crate) type CodexNoDaemon =
+    Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<bool>> + Send>> + Send + Sync>;
+
 /// Resolves a window's shell from the daemon's session registry, and nothing
 /// else: the only part of that registry `spawn.host.ctl` can reach. Only a
 /// channel admitted through an authenticated device pair is given one.
@@ -131,7 +142,7 @@ pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) struct WindowShells {
     resolve: Arc<dyn Fn(Uuid) -> Option<u32> + Send + Sync>,
     memory: Option<ConversationMemory>,
-    codex_no_daemon: Arc<dyn Fn() -> Option<bool> + Send + Sync>,
+    codex_no_daemon: Option<CodexNoDaemon>,
 }
 
 impl WindowShells {
@@ -139,30 +150,28 @@ impl WindowShells {
         Self {
             resolve: Arc::new(resolve),
             memory: None,
-            codex_no_daemon: Arc::new(|| None),
+            codex_no_daemon: None,
         }
-    }
-
-    /// What the daemon knows about whether this host's Codex accepts
-    /// `--no-daemon`, read from what the daemon found out on its own
-    /// (`codex_launch`): this module runs nothing to learn it.
-    pub(crate) fn with_codex_no_daemon(
-        mut self,
-        known: impl Fn() -> Option<bool> + Send + Sync + 'static,
-    ) -> Self {
-        self.codex_no_daemon = Arc::new(known);
-        self
-    }
-
-    /// Whether this host's Codex accepts `--no-daemon`; None when unknown.
-    pub(crate) fn codex_no_daemon(&self) -> Option<bool> {
-        (self.codex_no_daemon)()
     }
 
     /// Where this daemon notes each Codex window's thread (`ConversationMemory`).
     pub(crate) fn with_memory(mut self, memory: Option<ConversationMemory>) -> Self {
         self.memory = memory;
         self
+    }
+
+    /// How a window's Codex is asked whether it accepts `--no-daemon`
+    /// (`conv.launch`).
+    pub(crate) fn with_codex_no_daemon(mut self, ask: CodexNoDaemon) -> Self {
+        self.codex_no_daemon = Some(ask);
+        self
+    }
+
+    /// Whether the Codex `session_id` will run accepts `--no-daemon`; None
+    /// when that cannot be told.
+    pub(crate) async fn codex_no_daemon(&self, session_id: Uuid) -> Option<bool> {
+        let ask = self.codex_no_daemon.as_ref()?;
+        ask(session_id).await
     }
 
     pub(crate) fn shell_pid(&self, session_id: Uuid) -> Option<u32> {

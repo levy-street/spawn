@@ -234,10 +234,9 @@ if control.count(expected_control_imports) != 1:
 # keeps one note per Codex window, the thread id it last named, in a folder
 # the caller hands it (spawnd's own <config>/conversations/), removing a
 # window's note when the server stops the window for good; it writes nothing
-# else. Since 2026-11-15 it also carries, for the hello of a pair channel,
-# whether this host's Codex accepts `--no-daemon`: a value the daemon found
-# out on its own (codex_launch, pinned below), read here and run by nothing
-# here.
+# else. Since 2026-11-15 it also carries, for `conv.launch`, a handle that
+# asks whether a window's Codex accepts `--no-daemon`: handed in by rtc_pair
+# and answered by codex_launch (pinned below), run by nothing here.
 if set(re.findall(r"crate::(\w+)", control)) != {
     "host_conv",
     "host_desktop",
@@ -286,11 +285,21 @@ if re.search(
 # module must be the file's last item: anything placed after it is refused
 # rather than left unread.
 conv_test_marker = "#[cfg(all(test, unix))]\nmod tests {"
-if conv.count(conv_test_marker) != 1 or [
-    line
-    for line in conv.split(conv_test_marker, 1)[1].splitlines()
-    if line and not line[0].isspace()
-] != ["}"]:
+
+
+def test_module_is_last(text):
+    """One test module, ending the file: its closing brace is the only line at
+    the top level after the marker and the last line with anything on it, so
+    nothing — indented or not — follows it."""
+    if text.count(conv_test_marker) != 1:
+        return False
+    lines = [line for line in text.split(conv_test_marker, 1)[1].splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == "}" and [
+        line for line in lines if not line[0].isspace()
+    ] == ["}"]
+
+
+if not test_module_is_last(conv):
     raise SystemExit("no-server-agent-upload: conversation inspector code sits after its test module")
 # Every way the inspector's runtime changes a file, counted: the notes folder
 # (one DirBuilder, made 0700), one new file opened for writing, one rename
@@ -339,22 +348,27 @@ if (
     )
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector writes more than its window notes")
-# codex_launch (2026-11-15) is the one program the daemon runs on its own
-# initiative for the device channels: `codex --no-daemon --version`, by the
-# path of the `codex` its user's shells find, with a timeout, at start and
-# when that executable changes — never at a device's or the server's request.
-# Pinned to that one invocation, to the run helpers alone, and to no
-# transport and no write.
+# codex_launch (2026-11-15) runs one program, when a pair-admitted device
+# asks `conv.launch` just before it types Codex into a window: `codex
+# --no-daemon --version`, by the path the window's own launch environment
+# finds, in the window's folder, with a timeout. A device that can do that can
+# already type into the window; nothing else triggers it and nothing is kept.
+# Pinned to that one invocation, to the two run helpers it uses, to no
+# transport and no write, with its test module last.
 launch_path = os.path.join(root, "daemon/src/codex_launch.rs")
 with open(launch_path, encoding="utf-8") as source:
     launch = source.read()
-launch_runtime = launch.split("#[cfg(all(test, unix))]\nmod tests {")[0]
-if set(re.findall(r"crate::(\w+)", launch)) != {"run"}:
+if not test_module_is_last(launch):
+    raise SystemExit("no-server-agent-upload: codex launch probe code sits after its test module")
+launch_runtime = launch.split(conv_test_marker)[0]
+if set(re.findall(r"crate::(\w+)", launch)) != {"run"} or set(
+    re.findall(r"crate::run::(\w+)", launch)
+) != {"resolve_program_in_env", "run_program_capture_in"}:
     raise SystemExit("no-server-agent-upload: codex launch probe gained a crate dependency")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|TcpStream|UdpSocket|mpsc)\b", launch):
     raise SystemExit("no-server-agent-upload: codex launch probe gained a transport")
 if (
-    launch_runtime.count("run_program_capture(") != 1
+    launch_runtime.count("run_program_capture_in(") != 1
     or launch_runtime.count('const PROGRAM: &str = "codex";') != 1
     or launch_runtime.count('const PROBE_ARGS: [&str; 2] = ["--no-daemon", "--version"];') != 1
     or re.search(
@@ -969,12 +983,15 @@ self_test() {
       return 1
     fi
   done
-  printf '%s\n%s\n' "$conv_original" 'fn after_tests(path: &Path) { let _ = std::fs::write(path, b"x"); }' \
-    >"$fixture/daemon/src/host_conv.rs"
-  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
-    printf '%s\n' "no-server-agent-upload self-test: inspector code after its test module passed" >&2
-    return 1
-  fi
+  for after_tests in \
+    'fn after_tests(path: &Path) { let _ = std::fs::write(path, b"x"); }' \
+    '    fn indented_after_tests(path: &Path) { let _ = std::fs::write(path, b"x"); }'; do
+    printf '%s\n%s\n' "$conv_original" "$after_tests" >"$fixture/daemon/src/host_conv.rs"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: inspector code after its test module passed: %s\n' "$after_tests" >&2
+      return 1
+    fi
+  done
   printf '%s\n' "$conv_original" >"$fixture/daemon/src/host_conv.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
@@ -982,7 +999,8 @@ self_test() {
   launch_original="$(<"$fixture/daemon/src/codex_launch.rs")"
   for launch_case in \
     'fn sneaky() { let _ = std::process::Command::new("sh").spawn(); }' \
-    'async fn sneaky(env: &BTreeMap<String, String>) { let _ = crate::run::run_program_capture("codex", &["update"], PROBE_TIMEOUT, 1, Some(env)).await; }' \
+    'async fn sneaky(env: &BTreeMap<String, String>) { let _ = crate::run::run_program_capture_in("codex", &["update"], PROBE_TIMEOUT, 1, Some(env), None).await; }' \
+    'fn sneaky() { crate::run::resolved_command_env(); }' \
     'fn sneaky(path: &Path) { let _ = std::fs::write(path, b"x"); }'; do
     printf '%s\n%s\n' "$launch_case" "$launch_original" >"$fixture/daemon/src/codex_launch.rs"
     if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
@@ -990,6 +1008,12 @@ self_test() {
       return 1
     fi
   done
+  printf '%s\n%s\n' "$launch_original" 'fn after_tests() { let _ = std::process::Command::new("sh").spawn(); }' \
+    >"$fixture/daemon/src/codex_launch.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' "no-server-agent-upload self-test: codex launch code after its test module passed" >&2
+    return 1
+  fi
   printf '%s\n' "$launch_original" >"$fixture/daemon/src/codex_launch.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 

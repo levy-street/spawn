@@ -8,6 +8,7 @@ import {
   agentYoloAvailable,
   envPrefix,
   newAgentConversationId,
+  queuedLaunch,
   shellQuote,
 } from "@/components/workspace/agent-command";
 
@@ -170,8 +171,7 @@ describe("conversation grammar", () => {
     ).toBe("codex --dangerously-bypass-approvals-and-sandbox resume");
   });
 
-  test("Codex keeps its threads in its own window where the host says it can", () => {
-    // `--no-daemon`, typed only where the host's own `codex` accepted it.
+  test("Codex can be built with --no-daemon, for the drain to type where the host allows it", () => {
     const facts = { codexNoDaemon: true };
     expect(agentLaunchCommand(codex, null, facts)).toBe("codex --no-daemon");
     expect(agentResumeCommand(codex, id, facts)).toBe(`codex --no-daemon resume ${id}`);
@@ -183,16 +183,29 @@ describe("conversation grammar", () => {
     expect(
       agentInstallAndRunCommand({ ...codex, install: "npm i -g @openai/codex" }, null, facts),
     ).toBe("npm i -g @openai/codex && codex --no-daemon");
-    // A host that said nothing, or no: Codex as it always was.
+    // Without the option: Codex as it always was.
     for (const said of [undefined, { codexNoDaemon: false }]) {
       expect(agentLaunchCommand(codex, null, said)).toBe("codex");
       expect(agentResumeCommand(codex, id, said)).toBe(`codex resume ${id}`);
     }
-    // Only the plain `codex` the host checked; never another agent.
+    // Only the plain `codex` the host asks about, with the window's PATH;
+    // never another agent.
     expect(agentLaunchCommand({ ...codex, command: "npx @openai/codex" }, null, facts)).toBe(
       "npx @openai/codex",
     );
+    expect(agentLaunchCommand({ ...codex, env: { PATH: "/opt/old/bin" } }, null, facts)).toBe(
+      "PATH=/opt/old/bin codex",
+    );
     expect(agentLaunchCommand(claude, id, facts)).toBe(`claude --session-id ${id}`);
+    // Queued: both forms for a plain Codex, one for anything else.
+    expect(queuedLaunch((options) => agentLaunchCommand(codex, null, options))).toEqual({
+      command: "codex",
+      codexNoDaemon: "codex --no-daemon",
+    });
+    expect(queuedLaunch((options) => agentLaunchCommand(claude, id, options))).toEqual({
+      command: `claude --session-id ${id}`,
+      codexNoDaemon: null,
+    });
   });
 
   test("an agent with no grammar launches plainly and cannot be resumed", () => {

@@ -4,7 +4,6 @@ jest.mock("@/terminal/transport/daemon-trust", () => ({
   verifyDaemonHost: jest.fn(async () => {}),
 }));
 
-import { forgetHostLaunchFacts, hostLaunchFacts } from "@/data/stores/host-launch-facts";
 import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import { createHostPinStore, type HostPin } from "@/data/trust/host-pins";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
@@ -148,7 +147,6 @@ async function readyTransport(options?: {
   omitCapabilities?: boolean;
   streamTimeoutMs?: number;
   loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
-  agents?: unknown;
 }) {
   const bridge = new FakeBridge();
   const signal = new FakeSignal();
@@ -195,7 +193,6 @@ async function readyTransport(options?: {
         preview_bytes: 2 * 1024 * 1024,
         preview_pixels: [128, 256, 512, 1024],
       },
-      ...(options?.agents === undefined ? {} : { agents: options.agents }),
     },
   });
   bridge.emit({ v: 1, type: "state", state: "ready" });
@@ -207,19 +204,6 @@ async function readyTransport(options?: {
   }
   return { bridge, signal, transport };
 }
-
-test("the device connection's hello says what the host knows about starting agents", async () => {
-  forgetHostLaunchFacts();
-  const host = "00112233-4455-6677-8899-aabbccddeeff";
-  const said = await readyTransport({ agents: { codex: { no_daemon: true } } });
-  expect(hostLaunchFacts(host)).toEqual({ codexNoDaemon: true });
-  said.transport.close();
-  // A daemon that says nothing (an older one) takes it back.
-  const older = await readyTransport();
-  expect(hostLaunchFacts(host)).toEqual({ codexNoDaemon: false });
-  older.transport.close();
-  forgetHostLaunchFacts();
-});
 
 test("reconfirmed trust preserves a ready root and retries a refused root only once", async () => {
   const pins: HostPin[] = [];
@@ -910,7 +894,32 @@ describe("HostTransport conversation inspection", () => {
     await expect(transport.inspectConversation(sessionId)).rejects.toMatchObject({
       code: "unsupported_operation",
     });
+    await expect(transport.codexNoDaemon(sessionId)).rejects.toMatchObject({
+      code: "unsupported_operation",
+    });
     expect(hostRequests(bridge, "conv.inspect")).toHaveLength(0);
+    expect(hostRequests(bridge, "conv.launch")).toHaveLength(0);
+    transport.close();
+  });
+
+  test("asks whether the window's Codex accepts --no-daemon, and reads only a yes, no or unknown", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["fs.list", "conv.v1"] });
+    const asked = async (count: number) => {
+      while (hostRequests(bridge, "conv.launch").length < count) await flush();
+      return hostRequests(bridge, "conv.launch")[count - 1];
+    };
+    let count = 0;
+    for (const answer of [true, false, null]) {
+      const pending = transport.codexNoDaemon(sessionId);
+      const request = await asked(++count);
+      expect(request?.payload).toEqual({ session_id: sessionId });
+      if (request) respond(bridge, request, { codex_no_daemon: answer });
+      await expect(pending).resolves.toBe(answer);
+    }
+    const malformed = transport.codexNoDaemon(sessionId);
+    const request = await asked(++count);
+    if (request) respond(bridge, request, { codex_no_daemon: "yes" });
+    await expect(malformed).rejects.toMatchObject({ code: "invalid_response" });
     transport.close();
   });
 });

@@ -20,16 +20,50 @@ export interface PendingLaunchRecord {
    *  earlier version of the app saved, which named none. */
   hostId: string | null;
   command: string;
+  /** The same command with Codex's `--no-daemon`, for a plain Codex launch:
+   *  typed instead where the window's host says, just before typing, that the
+   *  window's Codex accepts it. Null or absent for anything else. */
+  codexNoDaemon?: string | null;
   createdAt: number;
   expiresAt: number;
 }
 
-interface PendingManifest extends Omit<PendingLaunchRecord, "command" | "hostId"> {
+/** A command and, for a plain Codex, the same with `--no-daemon`
+ *  (`queuedLaunch` in the agent selectors). */
+export interface PendingLaunchCommand {
+  command: string;
+  codexNoDaemon: string | null;
+}
+
+/** What `--no-daemon` adds to a command, where a launch's two forms differ. */
+const NO_DAEMON_FLAG = " --no-daemon";
+
+/** Where a launch's `--no-daemon` form inserts the flag into its command, or
+ *  undefined when it is not that command with the flag added once. */
+function noDaemonOffset(launch: PendingLaunchCommand): number | undefined {
+  const { command, codexNoDaemon } = launch;
+  if (!codexNoDaemon) return undefined;
+  for (
+    let at = codexNoDaemon.indexOf(NO_DAEMON_FLAG);
+    at >= 0;
+    at = codexNoDaemon.indexOf(NO_DAEMON_FLAG, at + 1)
+  ) {
+    if (codexNoDaemon.slice(0, at) + codexNoDaemon.slice(at + NO_DAEMON_FLAG.length) === command) {
+      return at;
+    }
+  }
+  return undefined;
+}
+
+interface PendingManifest
+  extends Omit<PendingLaunchRecord, "command" | "hostId" | "codexNoDaemon"> {
   version: 1;
   hostId?: string;
   generation: string;
   chunks: number;
   delivered: boolean;
+  /** Where the `--no-daemon` form inserts the flag; absent without one. */
+  noDaemonAt?: number;
 }
 
 export interface PendingLaunchStorage {
@@ -50,7 +84,11 @@ export type PendingLaunchRead =
 export interface PendingLaunchStore {
   /** Queue `command` for the window as it runs on `hostId` — the host the
    *  caller just created, restarted or moved it on. */
-  persist(sessionId: string, hostId: string, command: string): Promise<PendingLaunchRecord>;
+  persist(
+    sessionId: string,
+    hostId: string,
+    command: string | PendingLaunchCommand,
+  ): Promise<PendingLaunchRecord>;
   /** Durably claims delivery, into the window as it runs on `hostId`, before
    *  exposing command bytes. */
   take(sessionId: string, hostId: string): Promise<PendingLaunchRead>;
@@ -113,7 +151,9 @@ function isManifest(value: unknown): value is PendingManifest {
     typeof candidate["generation"] === "string" &&
     Number.isInteger(candidate["chunks"]) &&
     Number(candidate["chunks"]) > 0 &&
-    (candidate["delivered"] === undefined || typeof candidate["delivered"] === "boolean")
+    (candidate["delivered"] === undefined || typeof candidate["delivered"] === "boolean") &&
+    (candidate["noDaemonAt"] === undefined ||
+      (Number.isInteger(candidate["noDaemonAt"]) && Number(candidate["noDaemonAt"]) >= 0))
   );
 }
 
@@ -196,12 +236,18 @@ export function createPendingLaunchStore(
 
     // The flag is written before bytes leave JS. A crash can lose a launch, but cannot replay it.
     await storage.set(manifestKey(sessionId), JSON.stringify({ ...manifest, delivered: true }));
+    const command = chunks.join("");
+    const at = manifest.noDaemonAt;
     return {
       status: "ready",
       record: {
         sessionId,
         hostId: manifest.hostId ?? null,
-        command: chunks.join(""),
+        command,
+        codexNoDaemon:
+          at !== undefined && at <= command.length
+            ? command.slice(0, at) + NO_DAEMON_FLAG + command.slice(at)
+            : null,
         createdAt: manifest.createdAt,
         expiresAt: manifest.expiresAt,
       },
@@ -227,7 +273,11 @@ export function createPendingLaunchStore(
   }
 
   return {
-    async persist(sessionId, hostId, command) {
+    async persist(sessionId, hostId, launch) {
+      const queued: PendingLaunchCommand =
+        typeof launch === "string" ? { command: launch, codexNoDaemon: null } : launch;
+      const { command } = queued;
+      const noDaemonAt = noDaemonOffset(queued);
       const previous = await parseManifest(storage, sessionId);
       const createdAt = now();
       const generation = `${createdAt.toString(36)}-${command.length.toString(36)}`;
@@ -241,6 +291,7 @@ export function createPendingLaunchStore(
         generation,
         chunks: chunks.length,
         delivered: false,
+        ...(noDaemonAt === undefined ? {} : { noDaemonAt }),
       };
 
       try {
@@ -262,7 +313,14 @@ export function createPendingLaunchStore(
           ),
         );
       }
-      return { sessionId, hostId, command, createdAt, expiresAt: manifest.expiresAt };
+      return {
+        sessionId,
+        hostId,
+        command,
+        codexNoDaemon: noDaemonAt === undefined ? null : (queued.codexNoDaemon ?? null),
+        createdAt,
+        expiresAt: manifest.expiresAt,
+      };
     },
 
     take: (sessionId, hostId) => serialized(sessionId, () => takePending(sessionId, hostId)),

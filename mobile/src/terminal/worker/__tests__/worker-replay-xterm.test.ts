@@ -185,6 +185,23 @@ function bufferLines(term: XTerm): string[] {
     });
   });
 
+  test("Codex refusing --no-daemon is reported, for the launch to type it again without", async () => {
+    const term = realTerminal(8, 80);
+    await runWorker(harness(term), async (worker) => {
+      const requestId = openGates(worker);
+      await replay(
+        worker,
+        requestId,
+        seed(
+          ["$ codex --no-daemon"],
+          "error: unexpected argument '--no-daemon' found\r\n\r\nUsage: codex [OPTIONS] [PROMPT]\r\n$ ",
+        ),
+      );
+      await settle();
+      expect(noticePosts(worker)).toEqual(["codex_no_daemon_refused"]);
+    });
+  });
+
   test("an ordinary screen says nothing, and a new generation withdraws a notice", async () => {
     const term = realTerminal(8, 60);
     await runWorker(harness(term), async (worker) => {

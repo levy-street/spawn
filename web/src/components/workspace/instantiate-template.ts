@@ -7,10 +7,9 @@ import {
   type WorkspaceTemplate,
   workspaces,
 } from "@/lib/api";
-import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { basename } from "@/lib/paths";
 import { activeTab, type LayoutV3, withActiveTab } from "@/lib/tabs";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId, queuedLaunch } from "./agent-command";
 import { pendingLaunch } from "./pending-launch";
 
 /** See the call in `instantiateTemplate`. */
@@ -98,7 +97,7 @@ export async function instantiateTemplate(
           session.id,
           session.host_id,
           agent
-            ? agentLaunchCommand(agent, conversation, hostLaunchFacts(session.host_id))
+            ? queuedLaunch((options) => agentLaunchCommand(agent, conversation, options))
             : tile.run.command,
         );
       }

@@ -38,6 +38,7 @@ function fakeClient(overrides: Partial<InspectingClient> = {}) {
     ),
     inspectConversation: mock(async () => answer),
     agentTranscripts: mock(async () => report),
+    codexNoDaemon: mock(async (): Promise<boolean | null> => true),
     close: mock(() => undefined),
     ...overrides,
   };
@@ -53,6 +54,23 @@ describe("askWindowHost", () => {
     expect(client.close).not.toHaveBeenCalled();
     host.doneAsking();
     expect(client.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("asks whether the window's Codex takes --no-daemon on the same channel", async () => {
+    const client = fakeClient();
+    const host = askWindowHost(hostId, connection, sessionId, { openClient: () => client });
+    expect(await host.codexNoDaemon()).toBe(true);
+    expect(client.codexNoDaemon).toHaveBeenCalledWith(sessionId, expect.anything());
+    host.doneAsking();
+    // A host without conv.v1, or an error, is "cannot tell".
+    const without = fakeClient({ hasCapability: mock(() => false) });
+    const old = askWindowHost(hostId, connection, sessionId, { openClient: () => without });
+    expect(await old.codexNoDaemon()).toBeNull();
+    const failing = fakeClient({
+      codexNoDaemon: mock(async () => Promise.reject(new Error("unsupported_operation"))),
+    });
+    const refused = askWindowHost(hostId, connection, sessionId, { openClient: () => failing });
+    expect(await refused.codexNoDaemon()).toBeNull();
   });
 
   test("both questions share one channel and one budget", async () => {

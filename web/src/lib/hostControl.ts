@@ -1,10 +1,11 @@
 import {
   CONVERSATION_INSPECT_OP,
+  CONVERSATION_LAUNCH_OP,
   type ConversationInspection,
   canonicalConversationId,
+  parseCodexNoDaemon,
   parseConversationInspection,
 } from "@/lib/conversation";
-import { parseHostLaunchFacts, recordHostLaunchFacts } from "@/lib/host-launch-facts";
 import { parseCapabilities } from "@/lib/preview/capabilities";
 import { hashStream, Sha256 } from "@/lib/sha256";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
@@ -1320,6 +1321,28 @@ export class HostControlClient {
   }
 
   /**
+   * Whether the Codex this window is about to run accepts `--no-daemon`: the
+   * daemon runs `codex --no-daemon --version` with the environment and in the
+   * folder the window's shell was started with. Null when it cannot tell.
+   * Gated on `conv.v1`; an older daemon answers `unsupported_operation`.
+   */
+  async codexNoDaemon(
+    sessionId: string,
+    options?: HostControlRequestOptions,
+  ): Promise<boolean | null> {
+    const result = await this.request<unknown>(
+      CONVERSATION_LAUNCH_OP,
+      { session_id: sessionId },
+      options,
+    );
+    const answer = parseCodexNoDaemon(result);
+    if (answer === undefined) {
+      throw new HostControlError("invalid_response", "Host returned an invalid launch report");
+    }
+    return answer;
+  }
+
+  /**
    * Select the file in the host's file manager.
    *
    * Reveal never executes the target, so unlike `openDefault` it is offered for
@@ -2279,7 +2302,6 @@ export class HostControlClient {
       sha256?: string;
       path?: string;
       capabilities?: unknown;
-      agents?: unknown;
     };
     if (message.version !== HOST_CONTROL_VERSION) {
       this.failRtc(sessionId);
@@ -2294,11 +2316,6 @@ export class HostControlClient {
       // malformed list degrades to "offers nothing extra" rather than failing
       // the channel: the connection is fine, we just cannot read its menu.
       this.capabilities = parseCapabilities(message.capabilities);
-      // What the host knows about starting agents there, said only on this
-      // device's own connection to it (a pair-admitted channel).
-      if (this.options.deviceConnection) {
-        recordHostLaunchFacts(this.hostId, parseHostLaunchFacts(message.agents));
-      }
       if (this.options.deviceConnection && !this.capabilities.has("session.transport.v1")) {
         this.requireTransportUpdate("Update SPAWN D on this host to share its connection.");
         return;

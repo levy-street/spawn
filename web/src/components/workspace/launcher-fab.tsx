@@ -25,10 +25,9 @@ import {
   workspaces,
 } from "@/lib/api";
 import { autoPlace, GRID_SIZE, type Rect, type Tile } from "@/lib/grid";
-import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { activeTab, tabById, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId, queuedLaunch } from "./agent-command";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { queryAllInPane, queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
@@ -257,7 +256,7 @@ export function LauncherFab({
         pendingLaunch.set(
           session.id,
           session.host_id,
-          agentLaunchCommand(choice.agent, conversation, hostLaunchFacts(session.host_id)),
+          queuedLaunch((options) => agentLaunchCommand(choice.agent, conversation, options)),
         );
       return { sessionId: session.id };
     },

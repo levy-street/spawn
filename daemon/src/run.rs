@@ -613,11 +613,6 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     });
     // What each Codex window is in, kept on this host so a restart after
     // Codex has gone still names its thread (`host_conv`).
-    // Whether this host's Codex accepts `--no-daemon`, for the clients that
-    // launch it (`codex_launch`).
-    if crate::host_conv::SUPPORTED {
-        tokio::spawn(crate::codex_launch::watch());
-    }
     if let Some(memory) = conversation_notes() {
         let windows = registry.clone();
         let runs = registry.clone();
@@ -2962,6 +2957,19 @@ fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
 pub(crate) struct CommandCapture {
     pub(crate) success: bool,
     pub(crate) output: String,
+    /// The program ran and exited on its own: not missing, not refused by
+    /// the system, not stopped at the timeout.
+    pub(crate) exited: bool,
+}
+
+impl CommandCapture {
+    fn failed() -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            exited: false,
+        }
+    }
 }
 
 pub(crate) async fn run_program_capture(
@@ -2970,6 +2978,18 @@ pub(crate) async fn run_program_capture(
     timeout: Duration,
     output_limit: usize,
     env: Option<&BTreeMap<String, String>>,
+) -> CommandCapture {
+    run_program_capture_in(program, args, timeout, output_limit, env, None).await
+}
+
+/// `run_program_capture`, run in `cwd` where one is given.
+pub(crate) async fn run_program_capture_in(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    output_limit: usize,
+    env: Option<&BTreeMap<String, String>>,
+    cwd: Option<&Path>,
 ) -> CommandCapture {
     let process_env;
     let resolution_env = match env {
@@ -2980,19 +3000,13 @@ pub(crate) async fn run_program_capture(
         }
     };
     let Some(resolved) = resolve_program_in_env(Path::new(program), resolution_env) else {
-        return CommandCapture {
-            success: false,
-            output: String::new(),
-        };
+        return CommandCapture::failed();
     };
     #[cfg(windows)]
     if resolved.kind == crate::platform::ProgramKind::CmdShim
         && cmd_shim_command_line(args).is_none()
     {
-        return CommandCapture {
-            success: false,
-            output: String::new(),
-        };
+        return CommandCapture::failed();
     }
     #[cfg(unix)]
     let mut command = {
@@ -3036,14 +3050,22 @@ pub(crate) async fn run_program_capture(
     if let Some(env) = env {
         command.envs(env);
     }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            return CommandCapture {
-                success: false,
-                output: String::new(),
-            };
+    // `exec` of a file something still has open for writing — one just
+    // updated, or written by a test while another thread forks — fails with
+    // ETXTBSY for a moment (as `install::spawn_probe` knows): retried briefly.
+    let mut busy = 0;
+    let child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 40 => {
+                busy += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(_) => return CommandCapture::failed(),
         }
     };
 
@@ -3051,15 +3073,10 @@ pub(crate) async fn run_program_capture(
         Ok(Ok(output)) => CommandCapture {
             success: output.status.success(),
             output: combined_output(&output.stdout, &output.stderr, output_limit),
+            exited: true,
         },
-        Ok(Err(_)) => CommandCapture {
-            success: false,
-            output: String::new(),
-        },
-        Err(_) => CommandCapture {
-            success: false,
-            output: String::new(),
-        },
+        Ok(Err(_)) => CommandCapture::failed(),
+        Err(_) => CommandCapture::failed(),
     }
 }
 
@@ -3264,7 +3281,18 @@ async fn handle_session_create(
         }
     };
 
-    register_attached(session_id, launched, registry, rtc_sessions, out_tx, true).await;
+    // Kept with the window: what a device asks this window's Codex with
+    // before typing it (`codex_launch`) is the environment its shell has.
+    register_attached(
+        session_id,
+        launched,
+        registry,
+        rtc_sessions,
+        out_tx,
+        true,
+        Some(Arc::new(env)),
+    )
+    .await;
 }
 
 /// Ask macOS for the folders this daemon reads — once, here, and never again.
@@ -6939,6 +6967,7 @@ async fn adopt_worker_session(
         rtc_sessions,
         out_tx,
         notify_started,
+        None,
     )
     .await;
     Ok(true)
@@ -6953,6 +6982,7 @@ async fn register_attached(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
+    launch_env: Option<crate::sessions::LaunchEnv>,
 ) {
     let pid = launched.pid;
     let exit_rx = launched.exit_rx;
@@ -6968,7 +6998,7 @@ async fn register_attached(
                 .await,
         );
     }
-    let generation = registry.insert(launched.handle);
+    let generation = registry.insert_launched(launched.handle, launch_env);
     drop(transition);
     crate::state::active_heartbeat(registry.ids().len());
 

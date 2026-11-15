@@ -8,9 +8,12 @@
  * front of the person looking at the pane that shows it.
  */
 
-/** The one notice recognised so far: the agent installed a newer version of
- *  itself in the background and is still running the old one. */
-export type AgentNotice = "update_installed";
+/** What is recognised: the agent installed a newer version of itself in the
+ *  background and is still running the old one (`update_installed`); or a
+ *  Codex refused `--no-daemon` as an unknown argument
+ *  (`codex_no_daemon_refused`), which the launch that typed it answers by
+ *  typing the command again without it (`usePendingLaunchDrain`). */
+export type AgentNotice = "update_installed" | "codex_no_daemon_refused";
 
 /**
  * Claude Code's status bar after a background self-update. Both spellings the
@@ -25,9 +28,16 @@ const CLAUDE_CODE_UPDATE_INSTALLED = /Update installed\s*\S?\s*Restart to (?:upd
  * not just its bottom: an agent's status bar sits wherever its UI ended up,
  * which early in a session on a tall pane is nowhere near the last row.
  */
+/** Codex's refusal of the flag (clap: `error: unexpected argument
+ *  '--no-daemon' found`), from a Codex older than the flag. */
+const CODEX_NO_DAEMON_REFUSED = /unexpected argument '--no-daemon'/;
+
 export function detectAgentNotice(rows: readonly string[]): AgentNotice | null {
   for (const row of rows) {
     if (CLAUDE_CODE_UPDATE_INSTALLED.test(row)) return "update_installed";
+  }
+  for (const row of rows) {
+    if (CODEX_NO_DAEMON_REFUSED.test(row)) return "codex_no_daemon_refused";
   }
   return null;
 }

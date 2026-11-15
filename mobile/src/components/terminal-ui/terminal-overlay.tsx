@@ -303,6 +303,7 @@ export function TerminalOverlay({
       });
       pendingLaunchUnsubscribeRef.current = attachPendingLaunchDelivery(transport, {
         initialSessionStatus: session.status,
+        hostIdentityPublicKey: host.host_public_key,
         onResult: (result) => {
           if (result.status === "sent") {
             updateFollow({ type: "input-sent" });
@@ -313,7 +314,7 @@ export function TerminalOverlay({
         },
       });
     },
-    [armLaunchFocus, session.status, transfers.setNotice, updateFollow],
+    [armLaunchFocus, host.host_public_key, session.status, transfers.setNotice, updateFollow],
   );
 
   const handleConnectionState = (next: TransportState): void => {

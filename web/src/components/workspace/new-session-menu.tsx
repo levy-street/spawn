@@ -24,10 +24,9 @@ import {
 } from "@/components/ui/cascade-menu";
 import { type Agent, ApiError, agents, type Host, sessions, workspaces } from "@/lib/api";
 import { autoPlace, type Rect } from "@/lib/grid";
-import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { activeTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId, queuedLaunch } from "./agent-command";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { pendingLaunch } from "./pending-launch";
 import { useWherePanel } from "./where-picker";
@@ -202,7 +201,7 @@ function useNewSessionChoices(
           pendingLaunch.set(
             session.id,
             session.host_id,
-            agentLaunchCommand(choice.agent, conversation, hostLaunchFacts(session.host_id)),
+            queuedLaunch((options) => agentLaunchCommand(choice.agent, conversation, options)),
           );
         return { workspaceId, sessionId: session.id };
       }
@@ -221,7 +220,7 @@ function useNewSessionChoices(
         pendingLaunch.set(
           result.session.id,
           result.session.host_id,
-          agentLaunchCommand(choice.agent, conversation, hostLaunchFacts(result.session.host_id)),
+          queuedLaunch((options) => agentLaunchCommand(choice.agent, conversation, options)),
         );
       return { workspaceId: result.workspace.id, sessionId: result.session.id };
     },

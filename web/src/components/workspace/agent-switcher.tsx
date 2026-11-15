@@ -11,7 +11,6 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { type Agent, agents, hosts, type Session, sessions } from "@/lib/api";
-import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { sessionAtShell } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import {
@@ -92,11 +91,9 @@ export function AgentSwitcher({
     // A launch is a new conversation: named up front where the CLI lets us,
     // so a restart later can resume this one rather than "the latest".
     const conversation = newAgentConversationId(agent.kind);
-    const facts = hostLaunchFacts(session.host_id);
     const command = installed
-      ? agentLaunchCommand(agent, conversation, facts)
-      : (agentInstallAndRunCommand(agent, conversation, facts) ??
-        agentLaunchCommand(agent, conversation, facts));
+      ? agentLaunchCommand(agent, conversation)
+      : (agentInstallAndRunCommand(agent, conversation) ?? agentLaunchCommand(agent, conversation));
     void runInShell({ session, handle, command, purpose: `Running ${agent.name}` }).then(
       (result) => {
         if (result !== "sent") return;

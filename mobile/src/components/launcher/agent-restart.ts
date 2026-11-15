@@ -6,14 +6,11 @@ import {
   agentLaunchCommand,
   agentResumeCommand,
   agentRunCommand,
+  type LaunchOptions,
   newAgentConversationId,
+  PLAIN_LAUNCH,
   sessionAgent,
 } from "@/data/selectors/agent";
-import {
-  type HostLaunchFacts,
-  hostLaunchFacts,
-  NO_LAUNCH_FACTS,
-} from "@/data/stores/host-launch-facts";
 import type { AgentDef, Session } from "@/data/types/domain";
 import type { ConversationInspection } from "@/terminal/transport/conversation-codec";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
@@ -170,15 +167,15 @@ export function conversationOnRecord(
  * conversation under the same one, since there is nothing to resume. A record
  * that is not a UUID (`recordRefused`) starts a fresh conversation too; the
  * restart itself replaces it with a new id first, so the planner sees it here
- * only when called alone, and then launches with no id at all. `facts` is what
- * the window's host said about starting agents there (`hostLaunchFacts`).
+ * only when called alone, and then launches with no id at all. `options` say
+ * how the command may be typed (`LaunchOptions`).
  */
 export function planAgentRestart(
   session: Pick<Session, "foreground_command" | "agent_id" | "agent_session_id">,
   agents: readonly AgentDef[],
   live: ConversationInspection | null = null,
   onRecord: boolean | null = null,
-  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+  options: LaunchOptions = PLAIN_LAUNCH,
 ): AgentRestartPlan {
   const agent = sessionAgent(session, agents);
   if (!agent) return { kind: "shell" };
@@ -186,7 +183,7 @@ export function planAgentRestart(
     return {
       kind: "agent",
       agent,
-      command: agentLaunchCommand(agent, null, facts),
+      command: agentLaunchCommand(agent, null, options),
       resumes: false,
     };
   }
@@ -197,7 +194,7 @@ export function planAgentRestart(
     return {
       kind: "agent",
       agent,
-      command: agentLaunchCommand(agent, conversationId, facts),
+      command: agentLaunchCommand(agent, conversationId, options),
       resumes: false,
     };
   }
@@ -205,14 +202,14 @@ export function planAgentRestart(
     return {
       kind: "agent",
       agent,
-      command: agentLaunchCommand(agent, conversationId, facts),
+      command: agentLaunchCommand(agent, conversationId, options),
       resumes: false,
     };
   }
-  const resume = agentResumeCommand(agent, conversationId, facts);
+  const resume = agentResumeCommand(agent, conversationId, options);
   return resume
     ? { kind: "agent", agent, command: resume, resumes: true }
-    : { kind: "agent", agent, command: agentRunCommand(agent, facts), resumes: false };
+    : { kind: "agent", agent, command: agentRunCommand(agent, options), resumes: false };
 }
 
 export async function restartSessionAgent({
@@ -225,7 +222,6 @@ export async function restartSessionAgent({
   doneAsking,
   recordConversation,
   newConversationId = randomUUID,
-  facts = hostLaunchFacts(session.host_id),
 }: {
   session: Session;
   agents: readonly AgentDef[];
@@ -251,9 +247,6 @@ export async function restartSessionAgent({
   /** Where the id comes from when a refused record (`recordRefused`) is
    *  replaced by a new conversation. */
   newConversationId?: () => string;
-  /** What the window's host said about starting agents there; by default
-   *  what its device connection last said (`hostLaunchFacts`). */
-  facts?: HostLaunchFacts;
 }): Promise<AgentRestartResult> {
   const agent = sessionAgent(session, agents);
   let live: ConversationInspection | null = null;
@@ -308,12 +301,19 @@ export async function restartSessionAgent({
   ) {
     await recordConversation?.(conversationId).catch(() => undefined);
   }
-  const plan = planAgentRestart(record, agents, live, onRecord, facts);
+  const plan = planAgentRestart(record, agents, live, onRecord);
   // Queued before the restart so the new shell's first keystrokes are the
   // command — for the window as it runs here, so a move that lands first
   // drops it rather than resuming the conversation over there; forgotten
   // again if the restart never happened.
-  if (plan.kind === "agent") await pending.persist(session.id, session.host_id, plan.command);
+  // A plain Codex is queued with its `--no-daemon` form too, typed if the
+  // new shell's host says so.
+  if (plan.kind === "agent") {
+    const flagged = planAgentRestart(record, agents, live, onRecord, { codexNoDaemon: true });
+    const codexNoDaemon =
+      flagged.kind === "agent" && flagged.command !== plan.command ? flagged.command : null;
+    await pending.persist(session.id, session.host_id, { command: plan.command, codexNoDaemon });
+  }
   try {
     await restart(session.id);
   } catch (error) {

@@ -20,7 +20,11 @@
  *  (mobile `PENDING_LAUNCH_TTL_MS`). */
 export const PENDING_LAUNCH_TTL_MS = 15 * 60 * 1_000;
 
-type QueuedLaunch = { hostId: string; command: string; expiresAt: number };
+/** A command and, for a plain Codex, the same with `--no-daemon`
+ *  (`queuedLaunch` in agent-command.ts). */
+export type PendingLaunchCommand = { command: string; codexNoDaemon: string | null };
+
+type QueuedLaunch = PendingLaunchCommand & { hostId: string; expiresAt: number };
 
 const queued = new Map<string, QueuedLaunch>();
 
@@ -39,8 +43,20 @@ function waiting(sessionId: string, hostId: string, now: number): QueuedLaunch |
 export const pendingLaunch = {
   /** Queue `command` for the window as it runs on `hostId` — the host the
    *  caller just created, restarted or moved it on. */
-  set(sessionId: string, hostId: string, command: string, now: number = Date.now()): void {
-    queued.set(sessionId, { hostId, command, expiresAt: now + PENDING_LAUNCH_TTL_MS });
+  set(
+    sessionId: string,
+    hostId: string,
+    launch: string | PendingLaunchCommand,
+    now: number = Date.now(),
+  ): void {
+    const { command, codexNoDaemon } =
+      typeof launch === "string" ? { command: launch, codexNoDaemon: null } : launch;
+    queued.set(sessionId, {
+      hostId,
+      command,
+      codexNoDaemon,
+      expiresAt: now + PENDING_LAUNCH_TTL_MS,
+    });
   },
   /** Whether a command is waiting for the window as it runs on `hostId`,
    *  without claiming it. A pane that has no terminal handle yet asks this
@@ -56,10 +72,19 @@ export const pendingLaunch = {
   /** Returns the command queued for the window as it runs on `hostId` once,
    *  then forgets it. */
   take(sessionId: string, hostId: string, now: number = Date.now()): string | null {
+    return this.takeLaunch(sessionId, hostId, now)?.command ?? null;
+  },
+  /** `take`, with the `--no-daemon` form a plain Codex launch was queued
+   *  with. */
+  takeLaunch(
+    sessionId: string,
+    hostId: string,
+    now: number = Date.now(),
+  ): PendingLaunchCommand | null {
     const launch = waiting(sessionId, hostId, now);
     if (!launch) return null;
     queued.delete(sessionId);
-    return launch.command;
+    return { command: launch.command, codexNoDaemon: launch.codexNoDaemon };
   },
   /**
    * The window has been seen running on `hostId`: a command queued for it as

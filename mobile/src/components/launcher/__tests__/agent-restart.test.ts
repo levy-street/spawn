@@ -6,7 +6,7 @@ import {
   restartConversation,
   restartSessionAgent,
 } from "@/components/launcher/agent-restart";
-import { forgetHostLaunchFacts, recordHostLaunchFacts } from "@/data/stores/host-launch-facts";
+import type { PendingLaunchCommand } from "@/components/launcher/pending-launch";
 import type { Session } from "@/data/types/domain";
 import type { ConversationInspection } from "@/terminal/transport/conversation-codec";
 import type { AgentTranscriptReport } from "@/terminal/transport/types";
@@ -57,13 +57,21 @@ function session(overrides: Partial<Session> = {}): Session {
 }
 
 function pendingStore() {
+  // The plain command, and the `--no-daemon` form queued beside it.
   const queued = new Map<string, string>();
+  const flagged = new Map<string, string | null>();
   return {
     queued,
-    persist: jest.fn(async (sessionId: string, hostId: string, command: string) => {
-      queued.set(sessionId, command);
-      return { sessionId, hostId, command, createdAt: 0, expiresAt: 0 };
-    }),
+    flagged,
+    persist: jest.fn(
+      async (sessionId: string, hostId: string, launch: string | PendingLaunchCommand) => {
+        const { command, codexNoDaemon } =
+          typeof launch === "string" ? { command: launch, codexNoDaemon: null } : launch;
+        queued.set(sessionId, command);
+        flagged.set(sessionId, codexNoDaemon);
+        return { sessionId, hostId, command, codexNoDaemon, createdAt: 0, expiresAt: 0 };
+      },
+    ),
     clear: jest.fn(async (sessionId: string) => {
       queued.delete(sessionId);
     }),
@@ -117,11 +125,10 @@ describe("restartSessionAgent", () => {
       "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
     );
     // For the window as it runs where it was restarted, and nowhere else.
-    expect(pending.persist).toHaveBeenCalledWith(
-      session().id,
-      session().host_id,
-      "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
-    );
+    expect(pending.persist).toHaveBeenCalledWith(session().id, session().host_id, {
+      command: "claude --resume 3f1c9b6e-2c7e-4f39-9a55-0d5b7d2f1a10",
+      codexNoDaemon: null,
+    });
   });
 
   test("queues before restarting, so the new shell cannot open ahead of its command", async () => {
@@ -293,7 +300,7 @@ describe("planAgentRestart with the host's answer", () => {
     );
   });
 
-  test("a Codex restart keeps the window's threads in its own process where the host says so", async () => {
+  test("a Codex restart is queued with its --no-daemon form, for the new shell's host to allow", async () => {
     const facts = { codexNoDaemon: true };
     const command = (plan: ReturnType<typeof planAgentRestart>) =>
       plan.kind === "agent" ? plan.command : null;
@@ -314,21 +321,8 @@ describe("planAgentRestart with the host's answer", () => {
     expect(command(planAgentRestart(codexSession(), [codex], shared, null, facts))).toBe(
       "codex --no-daemon resume",
     );
-    // The restart reads what the window's host last said by default.
-    recordHostLaunchFacts(session().host_id, facts);
-    try {
-      const pending = pendingStore();
-      await restartSessionAgent({
-        session: codexSession(),
-        agents: [codex],
-        restart: async () => codexSession({ status: "starting" }),
-        pending,
-        inspect: async () => named,
-      });
-      expect(pending.queued.get(session().id)).toBe(`codex --no-daemon resume ${liveCodex}`);
-    } finally {
-      forgetHostLaunchFacts();
-    }
+    // The restart queues both: the plain command, and the flagged one the
+    // terminal types if the new shell's host says its Codex accepts it.
     const pending = pendingStore();
     await restartSessionAgent({
       session: codexSession(),
@@ -338,6 +332,7 @@ describe("planAgentRestart with the host's answer", () => {
       inspect: async () => named,
     });
     expect(pending.queued.get(session().id)).toBe(`codex resume ${liveCodex}`);
+    expect(pending.flagged.get(session().id)).toBe(`codex --no-daemon resume ${liveCodex}`);
   });
 
   test("no Codex restart ever types resume --last", () => {
@@ -406,11 +401,10 @@ describe("restartSessionAgent with the host's answer", () => {
     expect(order).toEqual([`record ${moved}`, "restart"]);
     // Queued for the window as it runs on its host now: a move that lands
     // before the shell opens drops it rather than typing it over there.
-    expect(pending.persist).toHaveBeenCalledWith(
-      session().id,
-      session().host_id,
-      `claude --resume ${moved}`,
-    );
+    expect(pending.persist).toHaveBeenCalledWith(session().id, session().host_id, {
+      command: `claude --resume ${moved}`,
+      codexNoDaemon: null,
+    });
     expect(pending.queued.get(session().id)).toBe(`claude --resume ${moved}`);
   });
 

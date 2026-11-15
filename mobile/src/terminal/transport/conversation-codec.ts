@@ -18,6 +18,22 @@ import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 /** The `conv.*` family, one versioned capability for every operation in it. */
 export const CONVERSATION_CAPABILITY = "conv.v1";
 export const CONVERSATION_INSPECT_OP = "conv.inspect";
+/** Whether the Codex a window is about to run accepts `--no-daemon`, asked
+ *  just before the app types it (proto/README.md). */
+export const CONVERSATION_LAUNCH_OP = "conv.launch";
+
+/** `conv.launch`'s answer: true or false when the host could tell, null when
+ *  it could not. Anything else is malformed. */
+export function parseCodexNoDaemon(value: unknown): boolean | null {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const answer = (value as Record<string, unknown>)["codex_no_daemon"];
+    if (answer === null || typeof answer === "boolean") return answer;
+  }
+  throw new HostControlTransportError(
+    "invalid_response",
+    "Host returned an invalid launch report.",
+  );
+}
 
 export type ConversationState = "running" | "blocked" | "idle" | "unknown";
 

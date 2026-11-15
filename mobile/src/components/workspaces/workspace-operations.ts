@@ -20,10 +20,10 @@ import type {
 import {
   agentLaunchCommand,
   newAgentConversationId,
+  queuedLaunch,
   runningAgent,
   sessionAgent,
 } from "@/data/selectors/agent";
-import { hostLaunchFacts } from "@/data/stores/host-launch-facts";
 import { isFilesWidget } from "@/data/types/layout";
 
 export interface WorkspaceOperationResult {
@@ -181,7 +181,7 @@ export async function instantiateWorkspaceTemplate(
       });
       if (tile.run.kind === "agent") {
         const command = templateAgent
-          ? agentLaunchCommand(templateAgent, conversation, hostLaunchFacts(session.host_id))
+          ? queuedLaunch((options) => agentLaunchCommand(templateAgent, conversation, options))
           : storedCommand;
         if (command) {
           try {
@@ -277,7 +277,7 @@ export async function duplicateWorkspaceDeep(
             await dependencies.pending.persist(
               createdSession.id,
               createdSession.host_id,
-              agentLaunchCommand(currentAgent, conversation),
+              queuedLaunch((options) => agentLaunchCommand(currentAgent, conversation, options)),
             );
             queuedSessionIds.push(createdSession.id);
           } catch {

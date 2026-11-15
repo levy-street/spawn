@@ -219,6 +219,10 @@
   // daemon never sees the text either way.
   const AGENT_NOTICE_SCAN_MS = 400;
   const CLAUDE_CODE_UPDATE_INSTALLED = /Update installed\s*\S?\s*Restart to (?:update|apply)/;
+  // A Codex older than `--no-daemon` refusing it (clap: `error: unexpected
+  // argument '--no-daemon' found`): the launch that typed it types the
+  // command again without (`pending-launch-delivery.ts`).
+  const CODEX_NO_DAEMON_REFUSED = /unexpected argument '--no-daemon'/;
   let agentNotice = null;
   let agentNoticeTimer = null;
 
@@ -237,14 +241,16 @@
       return;
     }
     const end = buffer.baseY + term.rows;
+    let refused = false;
     for (let y = buffer.baseY; y < end; y += 1) {
       const row = buffer.getLine(y)?.translateToString(true) ?? "";
       if (CLAUDE_CODE_UPDATE_INSTALLED.test(row)) {
         reportAgentNotice("update_installed");
         return;
       }
+      if (CODEX_NO_DAEMON_REFUSED.test(row)) refused = true;
     }
-    reportAgentNotice(null);
+    reportAgentNotice(refused ? "codex_no_daemon_refused" : null);
   }
 
   function scheduleAgentNoticeScan() {

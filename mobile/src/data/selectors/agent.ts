@@ -1,4 +1,3 @@
-import { type HostLaunchFacts, NO_LAUNCH_FACTS } from "@/data/stores/host-launch-facts";
 import type { AgentDef, AgentIdentity, AgentLogoKey, Session } from "@/data/types/domain";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
 
@@ -132,31 +131,61 @@ function envPrefix(env: Readonly<Record<string, string>>): string {
 }
 
 /**
- * Flags the host asks for, after the agent's own command. Codex gets
- * `--no-daemon` where its host said its `codex` accepts it
- * (`hostLaunchFacts`): the window's threads then stay in the window's own
- * process, where the host can tell which one it is on, instead of Codex's
- * shared background server. Only the plain `codex` the host checked gets it:
- * a definition that runs something else under the name is left alone.
+ * How a launch may be typed. `codexNoDaemon`: Codex with `--no-daemon`, which
+ * keeps the window's threads in the window's own process, where the host can
+ * tell which one it is on, instead of Codex's shared background server. A
+ * Codex that does not know the flag refuses to start, so it is typed only
+ * where the window's host said, just before typing, that the window's Codex
+ * accepts it (`conv.launch`, `observePendingLaunchDelivery`). The web app
+ * spells the same options.
  */
-function hostFlags(agent: AgentDef, facts: HostLaunchFacts): string {
+export interface LaunchOptions {
+  readonly codexNoDaemon: boolean;
+}
+export const PLAIN_LAUNCH: LaunchOptions = Object.freeze({ codexNoDaemon: false });
+
+/**
+ * Flags the launch options ask for, after the agent's own command. Only the
+ * plain `codex` the host asks about gets `--no-daemon`, and not when the
+ * definition sets its own PATH (the host asked with the window's PATH): a
+ * definition that runs something else under the name is left alone.
+ */
+function launchFlags(agent: AgentDef, options: LaunchOptions): string {
+  const env =
+    agent.yolo && agentYoloAvailable(agent) ? { ...agent.env, ...agent.yolo_env } : agent.env;
+  const ownPath = Object.keys(env).some((key) => key.toUpperCase() === "PATH");
   const codex = agent.kind?.trim().toLowerCase() === "codex" && agent.command.trim() === "codex";
-  return codex && facts.codexNoDaemon ? " --no-daemon" : "";
+  return codex && !ownPath && options.codexNoDaemon ? " --no-daemon" : "";
 }
 
-export function agentRunCommand(agent: AgentDef, facts: HostLaunchFacts = NO_LAUNCH_FACTS): string {
+/**
+ * A launch as it is queued: the command, and — where the agent is a plain
+ * Codex — the same command with `--no-daemon`, to be typed instead if the
+ * window's host says so when the moment comes. `build` is any of the command
+ * builders here with its options applied.
+ */
+export function queuedLaunch(build: (options: LaunchOptions) => string): {
+  command: string;
+  codexNoDaemon: string | null;
+} {
+  const command = build(PLAIN_LAUNCH);
+  const flagged = build({ codexNoDaemon: true });
+  return { command, codexNoDaemon: flagged === command ? null : flagged };
+}
+
+export function agentRunCommand(agent: AgentDef, options: LaunchOptions = PLAIN_LAUNCH): string {
   const useYolo = agent.yolo && agentYoloAvailable(agent);
   const env = useYolo ? { ...agent.env, ...agent.yolo_env } : agent.env;
   const args = useYolo ? agent.yolo_args?.trim() : "";
-  return `${envPrefix(env)}${agent.command}${hostFlags(agent, facts)}${args ? ` ${args}` : ""}`;
+  return `${envPrefix(env)}${agent.command}${launchFlags(agent, options)}${args ? ` ${args}` : ""}`;
 }
 
 export function agentInstallAndRunCommand(
   agent: AgentDef,
-  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+  options: LaunchOptions = PLAIN_LAUNCH,
 ): string | null {
   const install = agent.install?.trim();
-  return install ? `${install} && ${agentRunCommand(agent, facts)}` : null;
+  return install ? `${install} && ${agentRunCommand(agent, options)}` : null;
 }
 
 export interface RunningAgentGroup {
@@ -270,9 +299,9 @@ export function newAgentConversationId(
 export function agentLaunchCommand(
   agent: AgentDef,
   conversationId: string | null,
-  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+  options: LaunchOptions = PLAIN_LAUNCH,
 ): string {
-  const run = agentRunCommand(agent, facts);
+  const run = agentRunCommand(agent, options);
   const launch = agentConversationGrammar(agent.kind)?.launch;
   const id = canonicalConversationId(conversationId);
   return launch && id ? `${run} ${launch(id)}` : run;
@@ -282,10 +311,10 @@ export function agentLaunchCommand(
 export function agentInstallAndLaunchCommand(
   agent: AgentDef,
   conversationId: string | null,
-  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+  options: LaunchOptions = PLAIN_LAUNCH,
 ): string | null {
   const install = agent.install?.trim();
-  return install ? `${install} && ${agentLaunchCommand(agent, conversationId, facts)}` : null;
+  return install ? `${install} && ${agentLaunchCommand(agent, conversationId, options)}` : null;
 }
 
 /**
@@ -299,11 +328,11 @@ export function agentInstallAndLaunchCommand(
 export function agentResumeCommand(
   agent: AgentDef,
   conversationId: string | null,
-  facts: HostLaunchFacts = NO_LAUNCH_FACTS,
+  options: LaunchOptions = PLAIN_LAUNCH,
 ): string | null {
   const grammar = agentConversationGrammar(agent.kind);
   if (!grammar) return null;
-  const run = agentRunCommand(agent, facts);
+  const run = agentRunCommand(agent, options);
   const id = canonicalConversationId(conversationId);
   if (id && grammar.resume) return `${run} ${grammar.resume(id)}`;
   if (grammar.withoutId) return `${run} ${grammar.withoutId}`;

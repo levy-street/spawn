@@ -1,11 +1,14 @@
-import { agentLaunchCommand, newAgentConversationId } from "@/components/launcher/agent-command";
+import {
+  agentLaunchCommand,
+  newAgentConversationId,
+  queuedLaunch,
+} from "@/components/launcher/agent-command";
 import { autoPlaceWorkspaceTiles } from "@/components/launcher/launcher-selection";
 import type { PendingLaunchStore } from "@/components/launcher/pending-launch";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceLayoutV3, WorkspaceOut } from "@/data/api/schemas/workspaces";
-import { hostLaunchFacts } from "@/data/stores/host-launch-facts";
 import { isFilesWidget } from "@/data/types/layout";
 
 export type LaunchAvailabilityReason = "host_offline" | "tab_full" | null;
@@ -136,19 +139,18 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
       });
       if (!request.agent) return { status: "launched", session, pendingCommand: false };
 
-      const command = agentLaunchCommand(
-        request.agent,
-        conversation,
-        hostLaunchFacts(session.host_id),
-      );
+      const agent = request.agent;
+      const launch = queuedLaunch((options) => agentLaunchCommand(agent, conversation, options));
       try {
-        await dependencies.pending.persist(session.id, session.host_id, command);
+        await dependencies.pending.persist(session.id, session.host_id, launch);
         return { status: "launched", session, pendingCommand: true };
       } catch (error) {
         return {
           status: "created_unqueued",
           session,
-          command,
+          // What the person can type by hand: the plain command, which every
+          // Codex accepts.
+          command: launch.command,
           message:
             error instanceof Error
               ? error.message

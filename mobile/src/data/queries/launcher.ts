@@ -27,6 +27,7 @@ import type { RecentDirOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import { qk } from "@/data/queryKeys";
+import { askWindowHost } from "@/terminal/transport/inspect-conversation";
 import type { SessionTransport } from "@/terminal/transport/types";
 
 export const launcherOrchestrator = createLaunchOrchestrator({
@@ -153,7 +154,23 @@ export function useAddFilesWidget() {
 
 export interface PendingLaunchBindingOptions {
   initialSessionStatus?: string;
+  /** The window's host's identity key: with it, a queued Codex launch asks
+   *  the host whether the window's Codex accepts `--no-daemon`. */
+  hostIdentityPublicKey?: string | null;
   onResult?(result: PendingLaunchDeliveryResult): void;
+}
+
+/** One `conv.launch` question on a channel of its own, closed after. */
+async function askCodexNoDaemon(
+  host: { hostId: string; hostIdentityPublicKey: string },
+  sessionId: string,
+): Promise<boolean | null> {
+  const questions = askWindowHost(host, sessionId);
+  try {
+    return await questions.codexNoDaemon();
+  } finally {
+    questions.doneAsking();
+  }
 }
 
 async function pendingSessionLife(sessionId: string): Promise<PendingSessionLife> {
@@ -177,6 +194,18 @@ export function attachPendingLaunchDelivery(
         ? "unknown"
         : pendingSessionLifeFromStatus(options.initialSessionStatus),
     getSessionLife: () => pendingSessionLife(transport.sessionId),
+    ...(options.hostIdentityPublicKey
+      ? {
+          askCodexNoDaemon: () =>
+            askCodexNoDaemon(
+              {
+                hostId: transport.hostId,
+                hostIdentityPublicKey: options.hostIdentityPublicKey as string,
+              },
+              transport.sessionId,
+            ),
+        }
+      : {}),
     ...(options.onResult ? { onResult: options.onResult } : {}),
   });
 }

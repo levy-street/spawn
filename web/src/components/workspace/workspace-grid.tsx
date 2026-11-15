@@ -41,7 +41,6 @@ import {
   type TileWidget,
   validate,
 } from "@/lib/grid";
-import { hostLaunchFacts } from "@/lib/host-launch-facts";
 import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
 import { recordPaneFocus } from "@/lib/pane-focus";
 import { sessionAgent, sessionTitle } from "@/lib/sessions";
@@ -57,7 +56,7 @@ import {
   withTabTiles,
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId, queuedLaunch } from "./agent-command";
 import { moveWindow, moveWindowConfirmation, moveWindowError } from "./move-window";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
@@ -678,7 +677,7 @@ export function WorkspaceGrid({
           pendingLaunch.set(
             created.id,
             created.host_id,
-            agentLaunchCommand(agent, conversation, hostLaunchFacts(created.host_id)),
+            queuedLaunch((options) => agentLaunchCommand(agent, conversation, options)),
           );
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});

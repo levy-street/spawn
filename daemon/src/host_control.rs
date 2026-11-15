@@ -895,6 +895,9 @@ impl Context {
             crate::host_conv::INSPECT_OP if crate::host_conv::SUPPORTED => {
                 self.inspect_conversation(request_id, payload).await
             }
+            crate::host_conv::LAUNCH_OP if crate::host_conv::SUPPORTED => {
+                self.codex_launch(request_id, payload).await
+            }
             _ => {
                 self.error(
                     request_id,
@@ -971,6 +974,37 @@ impl Context {
             }
             Err(error) => self.error(request_id, error.code, &error.detail).await,
         }
+    }
+
+    /// Whether the Codex a window is about to run accepts `--no-daemon`
+    /// (`codex_launch`, through the pair's window handle), asked just before
+    /// a client types it: `{"codex_no_daemon": true | false | null}`.
+    async fn codex_launch(&self, request_id: &str, payload: Option<&Map<String, Value>>) -> bool {
+        let Some(windows) = self.pair.clone() else {
+            return self
+                .error(
+                    request_id,
+                    "pair_required",
+                    "this operation needs an authenticated device connection",
+                )
+                .await;
+        };
+        let Some(session_id) = payload_string(payload, "session_id").and_then(|id| {
+            Uuid::parse_str(id)
+                .ok()
+                .filter(|uuid| uuid.to_string() == id)
+        }) else {
+            return self
+                .error(
+                    request_id,
+                    "invalid_request",
+                    "session_id must be a session UUID",
+                )
+                .await;
+        };
+        let accepts = windows.codex_no_daemon(session_id).await;
+        self.response(request_id, json!({ "codex_no_daemon": accepts }))
+            .await
     }
 
     async fn begin_read(
@@ -2516,7 +2550,7 @@ pub(crate) fn install(
             if publication_context.pair.is_some() && crate::host_conv::SUPPORTED {
                 capabilities.push(crate::host_conv::CAPABILITY);
             }
-            let mut hello = json!({
+            let hello = json!({
                 "version": VERSION,
                 "type": "hello",
                 "protocol": PROTOCOL,
@@ -2535,9 +2569,6 @@ pub(crate) fn install(
                     "write_reapers": 1,
                 }
             });
-            if let Some(agents) = agent_launch_facts(publication_context.pair.as_ref()) {
-                hello["agents"] = agents;
-            }
             if !publication_context.send(hello).await {
                 close_with_deadline_later(Arc::clone(&dc));
                 return;
@@ -2636,37 +2667,9 @@ fn tombstone_deadline() -> Instant {
     Instant::now() + lifetime
 }
 
-/// What the `hello` of a pair-admitted channel says about launching agents on
-/// this host: `{"codex": {"no_daemon": bool}}`, whether the `codex` this
-/// host's shells find accepts `--no-daemon` (`codex_launch`), as of the
-/// channel's opening. Absent when that is not known, which a client reads as
-/// "do not add the flag"; never on a channel with no device behind it.
-fn agent_launch_facts(pair: Option<&crate::host_conv::WindowShells>) -> Option<Value> {
-    let no_daemon = pair?.codex_no_daemon()?;
-    Some(json!({ "codex": { "no_daemon": no_daemon } }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_pair_channels_hello_says_whether_codex_takes_no_daemon_when_known() {
-        let shells = |known: Option<bool>| {
-            crate::host_conv::WindowShells::new(|_| None).with_codex_no_daemon(move || known)
-        };
-        assert_eq!(
-            agent_launch_facts(Some(&shells(Some(true)))),
-            Some(json!({"codex": {"no_daemon": true}}))
-        );
-        assert_eq!(
-            agent_launch_facts(Some(&shells(Some(false)))),
-            Some(json!({"codex": {"no_daemon": false}}))
-        );
-        // Not known yet, and no device behind the channel: nothing said.
-        assert_eq!(agent_launch_facts(Some(&shells(None))), None);
-        assert_eq!(agent_launch_facts(None), None);
-    }
 
     fn ticket(window: &Arc<StdMutex<RequestWindow>>, id: &str) -> Option<RequestTicket> {
         window.lock().unwrap().admit(id).then(|| RequestTicket {

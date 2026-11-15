@@ -1233,19 +1233,6 @@ with the ordinary error `pair_required`, whatever the client sends. A daemon
 that cannot perform a family on its platform does not advertise it there
 either, and answers `unsupported_operation`.
 
-A pair-admitted channel's `hello` also says what the host knows about
-starting agents there, as of the channel's opening: `"agents":{"codex":
-{"no_daemon":true}}` when the `codex` its user's shells find accepts
-`--no-daemon`, `false` when it refuses it. The daemon learns it on its own,
-never at a request: it runs `codex --no-daemon --version` by that
-executable's path, with a timeout, when it starts and again when the
-executable changes (Codex parses its arguments first, so this prints a
-version and connects to nothing; like any `codex` run it refreshes Codex's
-own scratch folder under `<CODEX_HOME>/tmp/`). `agents` is absent when that
-is not known, on a channel with no device behind it, on a platform without
-`conv.v1`, and from an older daemon; a client reads every one of those as "do
-not add the flag".
-
 `fs.read.range` accepts `{path, offset?, length, if_version?}` and streams a
 bounded slice: `length` is capped at 16 MiB and clamped down to what remains,
 and the declared `sha256` covers **exactly the returned slice**, not the whole
@@ -1392,7 +1379,7 @@ the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
 one otherwise falls back rather than to an id recorded earlier: Claude Code
 continues the latest one here (`--continue`), and Codex opens its own picker
 (`codex resume`); a client types Codex's commands with `--no-daemon` where the
-host's `hello` says its Codex accepts it. Never `codex resume --last`: that is
+new shell's host says its Codex accepts it (`conv.launch`, below). Never `codex resume --last`: that is
 whichever thread the folder wrote last, from any window, and with Codex's
 shared background server it attaches the window to a thread another window is
 live in. `live_elsewhere`
@@ -1400,6 +1387,35 @@ does not stop a restart, since resuming a running background session attaches
 to it. The server never sees the request or the answer; a device writes a
 Claude Code id the host named back to the window's `agent_session_id`, and
 nothing else.
+
+`conv.launch` (family `conv.v1`, pair channels only, like `conv.inspect`)
+accepts `{session_id}` and answers whether the Codex that window is about to
+run accepts `--no-daemon`, which keeps the window's threads in its own
+process, where `conv.inspect` can name them:
+
+```json
+{"version":1,"type":"request","request_id":"unguessable-id","operation":"conv.launch","payload":{"session_id":"33333333-3333-4333-8333-333333333333"}}
+{"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"codex_no_daemon":true}}
+```
+
+A client asks it just before it types a queued Codex launch into the window
+— a launch, a template, a duplicate, a restart or a move — and types `codex
+--no-daemon …` only on `true`. The daemon runs `codex --no-daemon --version`
+by the path the window's own launch environment finds (the environment it
+started the window's current shell with), with that environment, in the
+window's folder, with a 5 s timeout: a version line is `true`, a non-zero exit
+`false`. It is `null` for a window whose shell this daemon did not start (one
+it adopted after a restart), with no `codex` on that path, on a timeout or a
+run that could not start, and for output that is not Codex's; nothing is kept
+between asks. Codex parses its arguments first, so the run prints a version
+and connects to nothing; like any `codex` run it refreshes Codex's own scratch
+folder under `<CODEX_HOME>/tmp/`. A client reads `false`, `null`, an error,
+an older daemon (`unsupported_operation`) and a host without `conv.v1` alike:
+plain `codex`. What the daemon cannot see is an alias or function named
+`codex` in the window's interactive shell, or a PATH a shell hook changes;
+there a `true` can be wrong, so a client that typed the flag watches the
+window for Codex's refusal (`unexpected argument '--no-daemon'`) for 60 s and
+types the plain command once if it appears.
 
 `version` is an opaque validator over the file's identity, size, and
 nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit
