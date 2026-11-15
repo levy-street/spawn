@@ -617,35 +617,56 @@ fn read_small_file(_path: &Path, _cap: u64) -> Option<Vec<u8>> {
     None
 }
 
+/// The start of a file of any length, up to its first line ending.
+#[derive(Debug, PartialEq, Eq)]
+enum FirstLine {
+    /// The first line, without its newline.
+    Line(Vec<u8>),
+    /// The file ends before any line does: its first line is still being
+    /// written.
+    Unfinished,
+    /// The file cannot be opened as a regular file, or no line ends within
+    /// the bytes read.
+    Unreadable,
+}
+
 /// The first line of a file of any length, opened as `read_small_file`
-/// opens one and read no further than `cap` bytes; None when no line ends
-/// within them.
+/// opens one and read no further than `cap` bytes.
 #[cfg(unix)]
-fn read_first_line(path: &Path, cap: u64) -> Option<Vec<u8>> {
+fn read_first_line(path: &Path, cap: u64) -> FirstLine {
     use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::OpenOptionsExt;
 
-    let file = std::fs::OpenOptions::new()
+    let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+    else {
+        return FirstLine::Unreadable;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return FirstLine::Unreadable;
     }
     let mut line = Vec::new();
-    BufReader::new(file.take(cap))
+    if BufReader::new(file.take(cap))
         .read_until(b'\n', &mut line)
-        .ok()?;
-    line.ends_with(b"\n").then(|| {
+        .is_err()
+    {
+        return FirstLine::Unreadable;
+    }
+    if line.ends_with(b"\n") {
         line.pop();
-        line
-    })
+        FirstLine::Line(line)
+    } else if (line.len() as u64) < cap {
+        FirstLine::Unfinished
+    } else {
+        FirstLine::Unreadable
+    }
 }
 
 #[cfg(not(unix))]
-fn read_first_line(_path: &Path, _cap: u64) -> Option<Vec<u8>> {
-    None
+fn read_first_line(_path: &Path, _cap: u64) -> FirstLine {
+    FirstLine::Unreadable
 }
 
 /// The executable's own name; Linux appends " (deleted)" to one an update
@@ -768,35 +789,56 @@ fn codex_thread(open: &[PathBuf]) -> CodexThread {
         if reads.next().is_none() {
             break;
         }
-        if !is_subagent_rollout(rollout) {
-            return CodexThread::Started(id);
+        match rollout_owner(rollout) {
+            Owner::Person => return CodexThread::Started(id),
+            Owner::Subagent => {}
+            // Whose it is cannot be told yet, and passing it by would name
+            // the thread before it, which a person's new thread has left.
+            Owner::NotYetKnown => return CodexThread::Unknown,
         }
     }
     CodexThread::Unknown
 }
 
-/// Whether a rollout is a subagent's thread, by its first line:
+/// Whose thread a rollout is.
+#[derive(Debug, PartialEq, Eq)]
+enum Owner {
+    Person,
+    Subagent,
+    /// Its first line is still being written.
+    NotYetKnown,
+}
+
+/// Whose thread a rollout is, by its first line:
 /// `{"type":"session_meta","payload":{…,"source":{"subagent":…},
-/// "thread_source":"subagent",…}}`. Unreadable or unrecognised, it is taken
-/// for the person's own.
-fn is_subagent_rollout(path: &Path) -> bool {
-    let Some(line) = read_first_line(path, MAX_SESSION_META_BYTES) else {
-        return false;
+/// "thread_source":"subagent",…}}`. A first line that has not ended yet
+/// tells nothing; one that is complete but unreadable or unrecognised is
+/// taken for the person's own.
+fn rollout_owner(path: &Path) -> Owner {
+    let line = match read_first_line(path, MAX_SESSION_META_BYTES) {
+        FirstLine::Line(line) => line,
+        FirstLine::Unfinished => return Owner::NotYetKnown,
+        FirstLine::Unreadable => return Owner::Person,
     };
     let Ok(Value::Object(line)) = serde_json::from_slice::<Value>(&line) else {
-        return false;
+        return Owner::Person;
     };
     if line.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return false;
+        return Owner::Person;
     }
     let Some(meta) = line.get("payload").and_then(Value::as_object) else {
-        return false;
+        return Owner::Person;
     };
-    meta.get("thread_source").and_then(Value::as_str) == Some("subagent")
+    let subagent = meta.get("thread_source").and_then(Value::as_str) == Some("subagent")
         || meta
             .get("source")
             .and_then(Value::as_object)
-            .is_some_and(|source| source.contains_key("subagent"))
+            .is_some_and(|source| source.contains_key("subagent"));
+    if subagent {
+        Owner::Subagent
+    } else {
+        Owner::Person
+    }
 }
 
 /// What this host last saw each Codex window in: one note per window,
@@ -1976,32 +2018,62 @@ mod tests {
         assert_eq!(home.inspect(), started(THREAD_B));
     }
 
-    #[test]
-    fn a_rollout_whose_first_line_cannot_be_read_is_the_persons() {
-        let mut home = CodexHome::new();
-        home.lock(THREAD_A, 10);
-        home.primary(THREAD_A, 12);
-        home.lock(THREAD_B, 19);
+    /// A rollout held under a lock, with `contents` written to it at `at`.
+    fn rollout_with(home: &mut CodexHome, id: &str, at: u64, contents: &str) {
         let path = home
             .dir
             .path()
             .join("sessions/2026/10/29")
-            .join(format!("rollout-2026-10-29T00-50-00-{THREAD_B}.jsonl"));
+            .join(format!("rollout-2026-10-29T00-50-00-{id}.jsonl"));
+        home.lock(id, at - 1);
+        home.hold(path, at, contents);
+    }
+
+    #[test]
+    fn a_rollout_whose_first_line_is_complete_but_unrecognised_is_the_persons() {
         // A first line longer than is read, then one not JSON at all.
-        let long = format!(
-            "{{\"type\":\"session_meta\",\"x\":\"{}\"}}",
-            "y".repeat(300_000)
-        );
-        home.hold(path.clone(), 20, &long);
-        assert_eq!(home.inspect(), started(THREAD_B));
-        std::fs::write(&path, "not json\n").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(CodexHome::at(20))
-            .unwrap();
-        assert_eq!(home.inspect(), started(THREAD_B));
+        for contents in [
+            format!(
+                "{{\"type\":\"session_meta\",\"x\":\"{}\"}}\n",
+                "y".repeat(300_000)
+            ),
+            "not json\n".to_string(),
+        ] {
+            let mut home = CodexHome::new();
+            home.lock(THREAD_A, 10);
+            home.primary(THREAD_A, 12);
+            rollout_with(&mut home, THREAD_B, 20, &contents);
+            assert_eq!(home.inspect(), started(THREAD_B));
+        }
+    }
+
+    #[test]
+    fn a_rollout_whose_first_line_is_still_being_written_names_nothing() {
+        // Codex is writing a new thread's `session_meta` (about 22 KiB): it
+        // may be a subagent's or the person's, so neither it nor the thread
+        // before it is named, and nothing is noted.
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": THREAD_B, "source": {"subagent": {}}, "thread_source": "subagent"},
+        })
+        .to_string();
+        for contents in ["", &meta[..meta.len() / 2], &meta[..]] {
+            let mut home = CodexHome::new();
+            home.lock(THREAD_A, 10);
+            home.primary(THREAD_A, 12);
+            rollout_with(&mut home, THREAD_B, 20, contents);
+            let inspection = home.inspect();
+            assert_eq!(inspection.agent, Some("codex"), "{contents:?}");
+            assert_eq!(inspection.conversation_id, None, "{contents:?}");
+            assert!(!inspection.fresh, "{contents:?}");
+            assert_eq!(inspection.source, Source::Process, "{contents:?}");
+        }
+        // Once the line ends, it is told apart as ever.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        rollout_with(&mut home, THREAD_B, 20, &format!("{meta}\n"));
+        assert_eq!(home.inspect(), started(THREAD_A));
     }
 
     #[test]
