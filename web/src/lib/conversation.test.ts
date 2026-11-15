@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  agentRunning,
   type ConversationInspection,
   canonicalConversationId,
   parseConversationInspection,
@@ -11,6 +12,8 @@ const answer: ConversationInspection = {
   state: "blocked",
   cli_version: "2.1.288",
   live_elsewhere: false,
+  fresh: false,
+  shared_server: false,
   source: "registry",
 };
 
@@ -23,9 +26,36 @@ describe("parseConversationInspection", () => {
       state: "unknown",
       cli_version: null,
       live_elsewhere: false,
+      fresh: false,
+      shared_server: false,
       source: "none",
     };
     expect(parseConversationInspection(nothing)).toEqual(nothing);
+    const fresh: ConversationInspection = {
+      ...nothing,
+      agent: "codex",
+      fresh: true,
+      source: "open_file",
+    };
+    expect(parseConversationInspection(fresh)).toEqual(fresh);
+    const shared: ConversationInspection = {
+      ...nothing,
+      agent: "codex",
+      shared_server: true,
+      source: "process",
+    };
+    expect(parseConversationInspection(shared)).toEqual(shared);
+  });
+
+  test("an answer from a daemon that predates `shared_server` is not on it", () => {
+    const { shared_server: _, ...older } = answer;
+    expect(parseConversationInspection(older)).toEqual({ ...answer, shared_server: false });
+    expect(parseConversationInspection({ ...answer, shared_server: "yes" })).toBeNull();
+  });
+
+  test("an answer from a daemon that predates `fresh` is not fresh", () => {
+    const { fresh: _, ...older } = answer;
+    expect(parseConversationInspection(older)).toEqual({ ...answer, fresh: false });
   });
 
   test("a state this client does not know yet reads as unknown, not as malformed", () => {
@@ -38,6 +68,8 @@ describe("parseConversationInspection", () => {
       [],
       "registry",
       { ...answer, live_elsewhere: "no" },
+      { ...answer, fresh: "yes" },
+      { ...answer, fresh: null },
       { ...answer, source: 7 },
       { ...answer, conversation_id: "../../etc/passwd" },
       { ...answer, conversation_id: "x".repeat(65) },
@@ -97,5 +129,15 @@ describe("canonicalConversationId", () => {
         conversation_id: "4E0B4642-0972-40AC-9A18-61D542276B76",
       })?.conversation_id,
     ).toBe("4e0b4642-0972-40ac-9a18-61d542276b76");
+  });
+});
+
+describe("agentRunning", () => {
+  test("is an agent the host found in the window now, not one it remembers or none", () => {
+    for (const source of ["registry", "parked", "attach", "open_file", "process"]) {
+      expect(agentRunning({ source })).toBe(true);
+    }
+    expect(agentRunning({ source: "remembered" })).toBe(false);
+    expect(agentRunning({ source: "none" })).toBe(false);
   });
 });

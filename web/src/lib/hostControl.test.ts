@@ -2768,6 +2768,8 @@ describe("HostControlClient conversation inspection", () => {
       state: "idle",
       cli_version: "2.1.288",
       live_elsewhere: true,
+      fresh: false,
+      shared_server: false,
       source: "parked",
     };
     pc.channel.receive(
@@ -2780,6 +2782,47 @@ describe("HostControlClient conversation inspection", () => {
       }),
     );
     expect(await pending).toEqual(result);
+    client.close();
+  });
+
+  test("asks whether the window's Codex takes --no-daemon, and reads only the answer", async () => {
+    for (const [result, expected] of [
+      [{ codex_no_daemon: true }, true],
+      [{ codex_no_daemon: false }, false],
+      [{ codex_no_daemon: null }, null],
+    ] as const) {
+      const { client, pc } = await readyClient({}, hostId, WITH_CONV);
+      const pending = client.codexNoDaemon(sessionId);
+      await Promise.resolve();
+      const request = framesOf(pc.channel, "request").at(-1);
+      expect(request.operation).toBe("conv.launch");
+      expect(request.payload).toEqual({ session_id: sessionId });
+      pc.channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "response",
+          request_id: request.request_id,
+          ok: true,
+          result,
+        }),
+      );
+      expect(await pending).toBe(expected);
+      client.close();
+    }
+    const { client, pc } = await readyClient({}, hostId, WITH_CONV);
+    const pending = client.codexNoDaemon(sessionId);
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: { codex_no_daemon: "yes" },
+      }),
+    );
+    await expect(pending).rejects.toThrow("invalid launch report");
     client.close();
   });
 

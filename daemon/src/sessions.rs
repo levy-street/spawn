@@ -2,7 +2,7 @@
 //! holds the durable view; we use this map only to route inbound frames to
 //! the right PTY and to enumerate `existing_sessions` on (re)connect.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -33,7 +33,14 @@ pub struct SessionRegistry {
 struct RegistryEntry {
     generation: u64,
     handle: SessionHandle,
+    /// The environment this daemon started the window's shell with, when it
+    /// started it (not for a worker it adopted): what `codex_launch` asks the
+    /// window's Codex with.
+    launch_env: Option<LaunchEnv>,
 }
+
+/// The environment this daemon started a window's shell with.
+pub type LaunchEnv = Arc<BTreeMap<String, String>>;
 
 /// Immutable identity of one concrete backend registered for a session UUID.
 ///
@@ -169,13 +176,24 @@ impl SessionRegistry {
             .is_some_and(|entry| entry.generation == binding.generation)
     }
 
+    #[cfg(test)]
     pub fn insert(&self, handle: SessionHandle) -> u64 {
+        self.insert_launched(handle, None)
+    }
+
+    /// `insert`, with the environment this daemon started the shell with when
+    /// it started it (`handle_session_create`; none for an adopted worker).
+    pub fn insert_launched(&self, handle: SessionHandle, launch_env: Option<LaunchEnv>) -> u64 {
         let id = handle.session_id;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.inner
-            .lock()
-            .expect("sessions lock")
-            .insert(id, RegistryEntry { generation, handle });
+        self.inner.lock().expect("sessions lock").insert(
+            id,
+            RegistryEntry {
+                generation,
+                handle,
+                launch_env,
+            },
+        );
         generation
     }
 
@@ -239,7 +257,7 @@ impl SessionRegistry {
             .map(|entry| entry.handle.control.clone())
     }
 
-    /// The shell a window's processes hang from, for read-only inspection
+    /// The shell a window's processes hang from, for inspecting them
     /// (`host_conv`). `None` for an unknown session or a worker that never
     /// reported its shell.
     pub fn shell_pid(&self, id: Uuid) -> Option<u32> {
@@ -248,6 +266,41 @@ impl SessionRegistry {
             .expect("sessions lock")
             .get(&id)
             .and_then(|entry| entry.handle.shell_pid())
+    }
+
+    /// Note the environment the window's current shell was started with, as
+    /// `insert_launched` does.
+    #[cfg(all(test, unix))]
+    pub fn set_launch_env(&self, id: Uuid, env: LaunchEnv) {
+        if let Some(entry) = self.inner.lock().expect("sessions lock").get_mut(&id) {
+            entry.launch_env = Some(env);
+        }
+    }
+
+    /// The environment and folder the window's current shell was started
+    /// with, when this daemon started it.
+    pub fn launch_context(&self, id: Uuid) -> Option<(LaunchEnv, Arc<str>)> {
+        let guard = self.inner.lock().expect("sessions lock");
+        let entry = guard.get(&id)?;
+        Some((entry.launch_env.clone()?, Arc::clone(&entry.handle.cwd)))
+    }
+
+    /// Every window whose worker has reported both its shell and what runs
+    /// in its foreground: (session, shell pid, foreground basename), for
+    /// `host_conv::watch`.
+    pub fn foregrounds(&self) -> Vec<(Uuid, u32, String)> {
+        self.inner
+            .lock()
+            .expect("sessions lock")
+            .iter()
+            .filter_map(|(id, entry)| {
+                Some((
+                    *id,
+                    entry.handle.shell_pid()?,
+                    entry.handle.control.foreground()?,
+                ))
+            })
+            .collect()
     }
 
     pub fn cwd_for_binding(&self, binding: SessionBinding) -> Option<Arc<str>> {

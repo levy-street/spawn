@@ -20,6 +20,7 @@ import type {
 import {
   agentLaunchCommand,
   newAgentConversationId,
+  queuedLaunch,
   runningAgent,
   sessionAgent,
 } from "@/data/selectors/agent";
@@ -180,7 +181,7 @@ export async function instantiateWorkspaceTemplate(
       });
       if (tile.run.kind === "agent") {
         const command = templateAgent
-          ? agentLaunchCommand(templateAgent, conversation)
+          ? queuedLaunch((options) => agentLaunchCommand(templateAgent, conversation, options))
           : storedCommand;
         if (command) {
           try {
@@ -276,7 +277,7 @@ export async function duplicateWorkspaceDeep(
             await dependencies.pending.persist(
               createdSession.id,
               createdSession.host_id,
-              agentLaunchCommand(currentAgent, conversation),
+              queuedLaunch((options) => agentLaunchCommand(currentAgent, conversation, options)),
             );
             queuedSessionIds.push(createdSession.id);
           } catch {

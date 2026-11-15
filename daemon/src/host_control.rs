@@ -895,6 +895,9 @@ impl Context {
             crate::host_conv::INSPECT_OP if crate::host_conv::SUPPORTED => {
                 self.inspect_conversation(request_id, payload).await
             }
+            crate::host_conv::LAUNCH_OP if crate::host_conv::SUPPORTED => {
+                self.codex_launch(request_id, payload).await
+            }
             _ => {
                 self.error(
                     request_id,
@@ -907,8 +910,10 @@ impl Context {
     }
 
     /// Which conversation a window is in, read from its own processes and
-    /// the agent's live-session registry (`host_conv`). Read-only; the walk
-    /// runs off the control loop, under this channel's operation accounting.
+    /// the agent's live-session registry (`host_conv`). It changes nothing on
+    /// the host but the window's own Codex note in spawnd's folder for them;
+    /// the walk runs off the control loop, under this channel's operation
+    /// accounting.
     async fn inspect_conversation(
         &self,
         request_id: &str,
@@ -936,30 +941,70 @@ impl Context {
                 )
                 .await;
         };
-        let Some(shell_pid) = windows.shell_pid(session_id) else {
-            return self
-                .error(
-                    request_id,
-                    "session_not_found",
-                    "no window with this id is running on this host",
-                )
-                .await;
-        };
+        // A window that does not run here can still be answered for, from
+        // the Codex thread this host last saw it in.
+        let shell_pid = windows.shell_pid(session_id);
+        let memory = windows.memory().cloned();
         let inspected = self
             .files
             .run_blocking(
                 Arc::clone(&self.file_operations),
                 crate::host_files::HostOperationKind::List,
-                move |_| Ok(crate::host_conv::inspect_window(shell_pid)),
+                move |_| {
+                    Ok(crate::host_conv::answer_for_window(
+                        session_id,
+                        shell_pid,
+                        memory.as_ref(),
+                    ))
+                },
             )
             .await;
         match inspected {
-            Ok(inspection) => match serde_json::to_value(&inspection) {
+            Ok(Some(inspection)) => match serde_json::to_value(&inspection) {
                 Ok(result) => self.response(request_id, result).await,
                 Err(_) => false,
             },
+            Ok(None) => {
+                self.error(
+                    request_id,
+                    "session_not_found",
+                    "no window with this id is running on this host",
+                )
+                .await
+            }
             Err(error) => self.error(request_id, error.code, &error.detail).await,
         }
+    }
+
+    /// Whether the Codex a window is about to run accepts `--no-daemon`
+    /// (`codex_launch`, through the pair's window handle), asked just before
+    /// a client types it: `{"codex_no_daemon": true | false | null}`.
+    async fn codex_launch(&self, request_id: &str, payload: Option<&Map<String, Value>>) -> bool {
+        let Some(windows) = self.pair.clone() else {
+            return self
+                .error(
+                    request_id,
+                    "pair_required",
+                    "this operation needs an authenticated device connection",
+                )
+                .await;
+        };
+        let Some(session_id) = payload_string(payload, "session_id").and_then(|id| {
+            Uuid::parse_str(id)
+                .ok()
+                .filter(|uuid| uuid.to_string() == id)
+        }) else {
+            return self
+                .error(
+                    request_id,
+                    "invalid_request",
+                    "session_id must be a session UUID",
+                )
+                .await;
+        };
+        let accepts = windows.codex_no_daemon(session_id).await;
+        self.response(request_id, json!({ "codex_no_daemon": accepts }))
+            .await
     }
 
     async fn begin_read(

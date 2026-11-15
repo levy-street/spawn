@@ -171,7 +171,10 @@ export interface SessionTransport {
  * agent installed a newer version of itself in the background and is still
  * running the old one.
  */
-export type AgentNotice = "update_installed";
+/** What the terminal recognises on screen: an agent's "update installed"
+ *  status, or a Codex refusing `--no-daemon` (`codex_no_daemon_refused`),
+ *  which the launch that typed it answers by typing it again without. */
+export type AgentNotice = "update_installed" | "codex_no_daemon_refused";
 
 export interface HostControlError {
   code: string;
@@ -351,6 +354,9 @@ export interface HostTransport {
     sessionId: string,
     options?: HostRequestOptions,
   ): Promise<import("@/terminal/transport/conversation-codec").ConversationInspection>;
+  /** Whether the Codex a window is about to run accepts `--no-daemon`
+   *  (`conv.launch`, gated on `conv.v1`). */
+  codexNoDaemon?(sessionId: string, options?: HostRequestOptions): Promise<boolean | null>;
   readRange?(
     path: string,
     offset: number,
@@ -396,6 +402,7 @@ export interface StreamingHostTransport extends HostTransport {
     sessionId: string,
     options?: HostRequestOptions,
   ): Promise<import("@/terminal/transport/conversation-codec").ConversationInspection>;
+  codexNoDaemon(sessionId: string, options?: HostRequestOptions): Promise<boolean | null>;
   readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile>;
   readRange(
     path: string,

@@ -27,16 +27,67 @@
 //! is not one of the window's own processes — a descendant of its shell in
 //! the shell's terminal session.
 //!
-//! Read-only and inert. Nothing is executed, no process's arguments or
-//! environment are read, and every registry file is hostile input: a
-//! bounded, no-follow, non-blocking read of a regular file, parsed field by
-//! field with each value checked before it is believed. The answer names an
-//! agent, a conversation id, a state and a version — no paths, no content —
-//! and is a few hundred bytes.
+//! Codex keeps no registry and cannot be launched under an id. Its threads
+//! are told apart by what the process holds open (Codex 0.155.1, and 0.167.2
+//! re-checked with strace on 2026-11-15):
+//!
+//! * a writer lock per thread it has loaded,
+//!   `<CODEX_HOME>/thread-writer-locks/<id>.lock`, from the moment the
+//!   thread starts, before anything is written to it;
+//! * the thread's rollout, `…/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`,
+//!   from its first message, or at once when it is resumed — about 1 ms
+//!   after its lock, which a resume creates afresh (an in-app `/resume`
+//!   first lets the thread go, even one still loaded).
+//!
+//! `/new` and `/resume` start or load another thread, and a subagent's
+//! thread has its own, so Codex can hold several. 0.155.1 kept them all;
+//! 0.167.2 lets a thread the person has left go about a minute later. Letting
+//! go — then, and on quit — closes the rollout first and the lock 2 to 50 ms
+//! after, and removes the lock's file. The thread in front of the person is
+//! the primary thread written last: starting or resuming a thread creates
+//! its lock, and messaging it writes its rollout. A subagent's thread is
+//! never that thread, and its rollout's first line (`session_meta`) says so.
+//! Codex also reads other threads' rollouts for a moment (at start, and when
+//! resuming), always while holding a lock of its own, which is why a rollout
+//! held without its lock is not counted where any lock is held; with no lock
+//! held, the only rollout seen open is the one a resume is about to lock.
+//!
+//! By default Codex 0.167.2 keeps its threads in a shared background server
+//! (`codex app-server`, started by the first Codex and used by every later
+//! one: the `daemon_auto_start` feature), a process in a session of its own,
+//! outside every window. A window's Codex then holds none of its threads: it
+//! is answered as Codex with no id, and nothing is noted. Only a Codex run
+//! without that server (`--no-daemon`, or a version without it) is named.
+//! Such a window is said to be on the server (`shared_server`) when its Codex
+//! holds no thread file and no Codex state database (which every Codex
+//! running its own app server holds, even at its resume picker) while the
+//! server's own record (`<CODEX_HOME>/app-server-daemon/daemon.pid`) names a
+//! live Codex.
+//!
+//! A Codex window's thread is also remembered on this host, one note per
+//! window in a folder of spawnd's own (`<config>/conversations/<session
+//! id>.json`). It is noted from every answer and from a look every
+//! `WATCH_INTERVAL` (5 s) at each window whose foreground may be Codex, and
+//! a fresh thread is noted too, so the thread the person left with `/new`
+//! is not resumed. Then a restart after Codex has gone — it quit, crashed,
+//! or the host restarted — still names the thread, unless it changed in the
+//! last few seconds before. A guess at "the latest one in this folder" would
+//! pick whichever of the folder's windows wrote last. A window stopped here
+//! for good (deleted, archived, moved to another host) is forgotten.
+//!
+//! Read-only and inert toward everything but that note. Nothing is executed,
+//! and no process's arguments or environment are read. Every registry file
+//! and rollout is hostile input: a bounded, no-follow, non-blocking read of a
+//! regular file, parsed field by field with each value checked before it is
+//! believed. The answer names an agent, a conversation id, a state and a
+//! version — no paths, no content — and is a few hundred bytes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -44,9 +95,13 @@ use uuid::Uuid;
 
 /// The family capability `spawn.host.ctl` advertises for `conv.*`.
 pub(crate) const CAPABILITY: &str = "conv.v1";
-/// Read-only: which conversation a window is in, and whether it is held
-/// anywhere the window's restart would not reach.
+/// Which conversation a window is in, and whether it is held anywhere the
+/// window's restart would not reach. It changes nothing on the host but the
+/// window's Codex note.
 pub(crate) const INSPECT_OP: &str = "conv.inspect";
+/// Whether the Codex a window is about to run accepts `--no-daemon`
+/// (`codex_launch`), asked just before a client types it.
+pub(crate) const LAUNCH_OP: &str = "conv.launch";
 /// Where a window's process tree can be walked. Elsewhere the family is
 /// neither advertised nor answered, so a client keeps its old behaviour.
 pub(crate) const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
@@ -61,6 +116,24 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 /// Attach-journal entries read from one store.
 const MAX_JOURNAL_ENTRIES: usize = 64;
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
+/// Rollouts whose first line is read to tell a subagent's thread from the
+/// person's, newest first.
+const MAX_SESSION_META_READS: usize = 16;
+/// A rollout's first line, `session_meta`, carries Codex's base
+/// instructions: about 22 KiB in 0.155.1.
+const MAX_SESSION_META_BYTES: u64 = 256 * 1024;
+/// A window's remembered thread: one small JSON object.
+const MAX_MEMORY_BYTES: u64 = 1024;
+/// How often each window whose foreground may be Codex is looked at, so its
+/// remembered thread follows `/new` and `/resume`: a change made less than
+/// this long before Codex goes can be missed.
+pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether the Codex a window will run accepts `--no-daemon`, asked of the
+/// window's own launch environment (`codex_launch`, handed in by the caller:
+/// this module runs nothing to learn it). None when that is not known.
+pub(crate) type CodexNoDaemon =
+    Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<bool>> + Send>> + Send + Sync>;
 
 /// Resolves a window's shell from the daemon's session registry, and nothing
 /// else: the only part of that registry `spawn.host.ctl` can reach. Only a
@@ -68,17 +141,45 @@ const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
 #[derive(Clone)]
 pub(crate) struct WindowShells {
     resolve: Arc<dyn Fn(Uuid) -> Option<u32> + Send + Sync>,
+    memory: Option<ConversationMemory>,
+    codex_no_daemon: Option<CodexNoDaemon>,
 }
 
 impl WindowShells {
     pub(crate) fn new(resolve: impl Fn(Uuid) -> Option<u32> + Send + Sync + 'static) -> Self {
         Self {
             resolve: Arc::new(resolve),
+            memory: None,
+            codex_no_daemon: None,
         }
+    }
+
+    /// Where this daemon notes each Codex window's thread (`ConversationMemory`).
+    pub(crate) fn with_memory(mut self, memory: Option<ConversationMemory>) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// How a window's Codex is asked whether it accepts `--no-daemon`
+    /// (`conv.launch`).
+    pub(crate) fn with_codex_no_daemon(mut self, ask: CodexNoDaemon) -> Self {
+        self.codex_no_daemon = Some(ask);
+        self
+    }
+
+    /// Whether the Codex `session_id` will run accepts `--no-daemon`; None
+    /// when that cannot be told.
+    pub(crate) async fn codex_no_daemon(&self, session_id: Uuid) -> Option<bool> {
+        let ask = self.codex_no_daemon.as_ref()?;
+        ask(session_id).await
     }
 
     pub(crate) fn shell_pid(&self, session_id: Uuid) -> Option<u32> {
         (self.resolve)(session_id).filter(|pid| *pid > 1)
+    }
+
+    pub(crate) fn memory(&self) -> Option<&ConversationMemory> {
+        self.memory.as_ref()
     }
 }
 
@@ -105,10 +206,14 @@ pub(crate) enum Source {
     /// The window holds a Claude attach client; the conversation is held by
     /// a background session elsewhere.
     Attach,
-    /// The one rollout file a Codex process holds open.
+    /// The threads a Codex process holds open: its writer locks and
+    /// rollouts.
     OpenFile,
     /// An agent's executable, and nothing more to go on.
     Process,
+    /// No agent runs in the window, or the window does not run here: the
+    /// Codex thread this host last saw it in.
+    Remembered,
     /// No agent in the window.
     None,
 }
@@ -123,7 +228,22 @@ pub(crate) struct Inspection {
     /// Another process outside this window — a background session, an
     /// attach target, another window — holds the conversation.
     pub live_elsewhere: bool,
+    /// The window's agent is in a conversation with nothing written to it
+    /// yet: there is nothing to resume, and a restart starts a new one. Its
+    /// id is not named, so a client that does not know this field never
+    /// types a resume of it. False wherever the host cannot tell.
+    pub fresh: bool,
+    /// The window's Codex keeps its threads in Codex's shared background
+    /// server (`codex app-server`), outside the window, so which one it is
+    /// on cannot be told from here: no id is named. False otherwise,
+    /// including wherever the host cannot tell.
+    pub shared_server: bool,
     pub source: Source,
+    /// A fresh Codex thread's id, kept on this host and never put on the
+    /// wire (there is nothing to resume): what tells a thread with nothing
+    /// written yet from one letting go of its rollout.
+    #[serde(skip)]
+    pub fresh_thread: Option<String>,
 }
 
 impl Inspection {
@@ -134,7 +254,52 @@ impl Inspection {
             state: ConversationState::Unknown,
             cli_version: None,
             live_elsewhere: false,
+            fresh: false,
             source: Source::None,
+            fresh_thread: None,
+            shared_server: false,
+        }
+    }
+
+    /// A Codex window, as far as `thread` tells.
+    fn codex(thread: CodexThread) -> Self {
+        let (conversation_id, fresh_thread, source) = match thread {
+            CodexThread::Started(id) => (Some(id), None, Source::OpenFile),
+            CodexThread::Fresh(id) => (None, Some(id), Source::OpenFile),
+            CodexThread::Unknown => (None, None, Source::Process),
+        };
+        Self {
+            agent: Some(CODEX),
+            conversation_id,
+            state: ConversationState::Unknown,
+            cli_version: None,
+            live_elsewhere: false,
+            fresh: fresh_thread.is_some(),
+            source,
+            fresh_thread,
+            shared_server: false,
+        }
+    }
+
+    /// A Codex window whose threads are in Codex's shared background server.
+    fn codex_on_shared_server() -> Self {
+        Self {
+            shared_server: true,
+            ..Self::codex(CodexThread::Unknown)
+        }
+    }
+
+    /// The Codex thread a live answer finds the window in, worth
+    /// remembering: one with something to resume, or a fresh one, which the
+    /// thread before it must not outlive. None where it tells nothing.
+    fn codex_thread(&self) -> Option<CodexThread> {
+        if self.agent != Some(CODEX) {
+            return None;
+        }
+        match (&self.conversation_id, self.fresh, &self.fresh_thread) {
+            (Some(id), false, None) => Some(CodexThread::Started(id.clone())),
+            (None, true, Some(id)) => Some(CodexThread::Fresh(id.clone())),
+            _ => None,
         }
     }
 }
@@ -168,7 +333,12 @@ pub(crate) trait ProcessTable {
 
 /// The window behind `shell_pid`, inspected on this host.
 pub(crate) fn inspect_window(shell_pid: u32) -> Inspection {
-    inspect(shell_pid, &SystemProcesses, &claude_stores())
+    inspect_with(
+        shell_pid,
+        &SystemProcesses,
+        &claude_stores(),
+        &codex_homes(),
+    )
 }
 
 /// Claude Code's configuration folders this daemon can name: the one
@@ -190,7 +360,42 @@ fn claude_stores() -> Vec<PathBuf> {
     stores
 }
 
+/// Codex's homes this daemon can name: the one `CODEX_HOME` points the
+/// daemon at, and the default `~/.codex`, where Codex keeps its shared
+/// background server's records. A window whose shell exports another (a
+/// skilled window's own) is not found to be on that home's server.
+fn codex_homes() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Some(dir) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
+        if dir.is_absolute() {
+            homes.push(dir);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let default = home.join(".codex");
+        if !homes.contains(&default) {
+            homes.push(default);
+        }
+    }
+    homes
+}
+
+/// `inspect_with`, for a host where Codex keeps no shared server. Only the
+/// Unix tests call it, so it exists only there (Windows Clippy refuses an
+/// unused function).
+#[cfg(all(test, unix))]
 pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBuf]) -> Inspection {
+    inspect_with(shell_pid, table, stores, &[])
+}
+
+/// The window behind `shell_pid`: Claude Code's records are looked for in
+/// `stores`, Codex's shared background server in `codex_homes`.
+pub(crate) fn inspect_with(
+    shell_pid: u32,
+    table: &dyn ProcessTable,
+    stores: &[PathBuf],
+    codex_homes: &[PathBuf],
+) -> Inspection {
     let tree = table.tree(shell_pid);
     let Some(shell) = tree.first().copied() else {
         return Inspection::nothing();
@@ -232,35 +437,33 @@ pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBu
                 state: ConversationState::Unknown,
                 cli_version: None,
                 live_elsewhere: true,
+                fresh: false,
                 source: Source::Attach,
+                fresh_thread: None,
+                shared_server: false,
             };
         }
         let Some(executable) = table.executable(pid) else {
             continue;
         };
         if is_codex(&executable) {
-            // A long-lived Codex holds every rollout it has opened — earlier
-            // conversations, helpers — so only a lone one names the thread.
-            let mut rollouts: Vec<String> = table
-                .open_files(pid)
-                .iter()
-                .filter_map(|path| codex_rollout_id(path))
-                .collect();
-            rollouts.sort();
-            rollouts.dedup();
-            let conversation_id = (rollouts.len() == 1).then(|| rollouts.remove(0));
-            return Inspection {
-                agent: Some(CODEX),
-                source: if conversation_id.is_some() {
-                    Source::OpenFile
-                } else {
-                    Source::Process
-                },
-                conversation_id,
-                state: ConversationState::Unknown,
-                cli_version: None,
-                live_elsewhere: false,
-            };
+            let open = table.open_files(pid);
+            let thread = codex_thread(&open);
+            // A Codex that holds none of its threads' files and runs no app
+            // server of its own (no state database open), while the shared
+            // background server runs, keeps them there.
+            if thread == CodexThread::Unknown
+                && !open
+                    .iter()
+                    .any(|path| codex_rollout_id(path).is_some() || codex_lock_id(path).is_some())
+                && !open.iter().any(|path| is_codex_state_database(path))
+                && codex_homes
+                    .iter()
+                    .any(|home| shared_server_running(home, table))
+            {
+                return Inspection::codex_on_shared_server();
+            }
+            return Inspection::codex(thread);
         }
         if is_claude(&executable) {
             return Inspection {
@@ -269,7 +472,10 @@ pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBu
                 state: ConversationState::Unknown,
                 cli_version: None,
                 live_elsewhere: false,
+                fresh: false,
                 source: Source::Process,
+                fresh_thread: None,
+                shared_server: false,
             };
         }
     }
@@ -298,7 +504,10 @@ fn from_record(
                     && !in_window.contains(&other.pid)
                     && other.conversation_id == own.conversation_id
             }),
+            fresh: false,
             source: Source::Registry,
+            fresh_thread: None,
+            shared_server: false,
         },
         // The record's own `sessionId` is the conversation the window left
         // when it parked; the one it shows now is the background job's.
@@ -314,7 +523,10 @@ fn from_record(
                     .and_then(|holder| holder.version.clone())
                     .or_else(|| own.version.clone()),
                 live_elsewhere: holder.is_some_and(|holder| !in_window.contains(&holder.pid)),
+                fresh: false,
                 source: Source::Parked,
+                fresh_thread: None,
+                shared_server: false,
             }
         }
         Parked::Unreadable => Inspection {
@@ -323,7 +535,10 @@ fn from_record(
             state: ConversationState::Unknown,
             cli_version: own.version.clone(),
             live_elsewhere: false,
+            fresh: false,
             source: Source::Parked,
+            fresh_thread: None,
+            shared_server: false,
         },
     }
 }
@@ -548,6 +763,60 @@ fn read_small_file(_path: &Path, _cap: u64) -> Option<Vec<u8>> {
     None
 }
 
+/// The start of a file of any length, up to its first line ending.
+// Only the Unix read finds lines; elsewhere every file is unreadable.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum FirstLine {
+    /// The first line, without its newline.
+    Line(Vec<u8>),
+    /// The file ends before any line does: its first line is still being
+    /// written.
+    Unfinished,
+    /// The file cannot be opened as a regular file, or no line ends within
+    /// the bytes read.
+    Unreadable,
+}
+
+/// The first line of a file of any length, opened as `read_small_file`
+/// opens one and read no further than `cap` bytes.
+#[cfg(unix)]
+fn read_first_line(path: &Path, cap: u64) -> FirstLine {
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return FirstLine::Unreadable;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return FirstLine::Unreadable;
+    }
+    let mut line = Vec::new();
+    if BufReader::new(file.take(cap))
+        .read_until(b'\n', &mut line)
+        .is_err()
+    {
+        return FirstLine::Unreadable;
+    }
+    if line.ends_with(b"\n") {
+        line.pop();
+        FirstLine::Line(line)
+    } else if (line.len() as u64) < cap {
+        FirstLine::Unfinished
+    } else {
+        FirstLine::Unreadable
+    }
+}
+
+#[cfg(not(unix))]
+fn read_first_line(_path: &Path, _cap: u64) -> FirstLine {
+    FirstLine::Unreadable
+}
+
 /// The executable's own name; Linux appends " (deleted)" to one an update
 /// replaced while it ran.
 fn executable_name(path: &Path) -> Option<&str> {
@@ -573,7 +842,83 @@ fn is_claude(path: &Path) -> bool {
 
 /// Codex's native binary, whether started directly or by its npm launcher.
 fn is_codex(path: &Path) -> bool {
-    executable_name(path).is_some_and(|name| name == "codex" || name == "codex.exe")
+    executable_name(path).is_some_and(is_codex_name)
+}
+
+/// The release targets Codex publishes a native binary for. npm's package
+/// installs each as `codex`; a standalone install (a release download, the
+/// Homebrew cask) keeps the target in the name: `codex-aarch64-apple-darwin`.
+const CODEX_TARGETS: [&str; 8] = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+];
+
+/// `codex`, or `codex-<target>` for a target in `CODEX_TARGETS`, either with
+/// `.exe`; exactly, so `codex-wrapper` or `mycodex` is not Codex.
+fn is_codex_name(name: &str) -> bool {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    name == "codex"
+        || name
+            .strip_prefix("codex-")
+            .is_some_and(|target| CODEX_TARGETS.contains(&target))
+}
+
+/// Codex's state database, `<CODEX_HOME>/state_<n>.sqlite` (`state_5` in
+/// 0.167.2): held open by every Codex that runs its own app server — one
+/// started with `--no-daemon`, and the shared server itself — and by no
+/// client of the shared server.
+fn is_codex_state_database(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("state_"))
+        .and_then(|rest| rest.strip_suffix(".sqlite"))
+        .is_some_and(|version| {
+            !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+/// The managed server's own record, `<home>/app-server-daemon/daemon.pid`: a
+/// small JSON object.
+const MAX_SERVER_RECORD_BYTES: u64 = 4096;
+
+/// Whether Codex's shared background server for `home` runs: the pid its own
+/// record names is alive and is Codex, and — where the start can be compared
+/// (Linux: `processIdentity.startTicks`, the same clock ticks `/proc` gives)
+/// — the same process that wrote it. The record is hostile input, read as
+/// every other file here.
+fn shared_server_running(home: &Path, table: &dyn ProcessTable) -> bool {
+    let path = home.join("app-server-daemon").join("daemon.pid");
+    let Some(bytes) = read_small_file(&path, MAX_SERVER_RECORD_BYTES) else {
+        return false;
+    };
+    let Ok(Value::Object(record)) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(pid) = record
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+    else {
+        return false;
+    };
+    if !table.alive(pid) || !table.executable(pid).is_some_and(|path| is_codex(&path)) {
+        return false;
+    }
+    let recorded = record
+        .get("processIdentity")
+        .and_then(|identity| identity.get("startTicks"))
+        .and_then(Value::as_u64);
+    match (recorded, table.start_identity(pid)) {
+        (Some(recorded), Some(actual)) => actual == recorded.to_string(),
+        _ => true,
+    }
 }
 
 /// The id at the end of a rollout Codex holds open:
@@ -590,6 +935,434 @@ fn codex_rollout_id(path: &Path) -> Option<String> {
         .and_then(|dash| rest.as_bytes().get(dash))
         .filter(|byte| **byte == b'-')?;
     canonical_uuid(id)
+}
+
+/// The id of a thread whose writer lock Codex holds:
+/// `<CODEX_HOME>/thread-writer-locks/<uuid>.lock`.
+fn codex_lock_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let id = name.strip_suffix(".lock")?;
+    let folder = path.parent()?.file_name()?;
+    (folder == "thread-writer-locks").then(|| canonical_uuid(id))?
+}
+
+/// Which of the threads a Codex process holds is the one in front of the
+/// person.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexThread {
+    /// A thread with a rollout: something to resume.
+    Started(String),
+    /// A thread with nothing written to it yet, as far as what the process
+    /// holds tells: there is nothing to resume. Its id stays on this host.
+    Fresh(String),
+    /// Nothing held, or nothing to tell the threads it holds apart.
+    Unknown,
+}
+
+#[derive(Default)]
+struct HeldThread<'a> {
+    lock: Option<&'a Path>,
+    rollout: Option<&'a Path>,
+}
+
+impl HeldThread<'_> {
+    /// When the thread was last started, loaded or written: the later of its
+    /// lock's and its rollout's modification times.
+    fn last_written(&self) -> Option<SystemTime> {
+        [self.lock, self.rollout]
+            .into_iter()
+            .flatten()
+            .filter_map(|path| std::fs::symlink_metadata(path).ok()?.modified().ok())
+            .max()
+    }
+}
+
+/// The thread a Codex process is in, from the files it holds open: the
+/// primary thread written last (see the module notes). A thread whose newest
+/// mark is its lock alone has had nothing written to it.
+///
+/// Every thread held is weighed, however many: the open files are already
+/// bounded, and a cut taken in descriptor order could drop the newest. A
+/// Codex that takes writer locks holds one for each thread it has loaded, so
+/// there a rollout held without its lock — another thread's, open for a
+/// moment — is not one of its threads; a Codex that takes none is told by
+/// its rollouts alone.
+fn codex_thread(open: &[PathBuf]) -> CodexThread {
+    let mut held: BTreeMap<String, HeldThread> = BTreeMap::new();
+    for path in open {
+        if let Some(id) = codex_rollout_id(path) {
+            held.entry(id).or_default().rollout = Some(path);
+        } else if let Some(id) = codex_lock_id(path) {
+            held.entry(id).or_default().lock = Some(path);
+        }
+    }
+    if held.values().any(|thread| thread.lock.is_some()) {
+        held.retain(|_, thread| thread.lock.is_some());
+    }
+    let mut threads: Vec<(Option<SystemTime>, String, HeldThread)> = held
+        .into_iter()
+        .map(|(id, thread)| (thread.last_written(), id, thread))
+        .collect();
+    // Newest first; a thread whose time cannot be read goes last, and ids
+    // (time-ordered UUIDs) settle a tie.
+    threads.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+    let mut reads = 0..MAX_SESSION_META_READS;
+    for (_, id, thread) in threads {
+        let Some(rollout) = thread.rollout else {
+            return CodexThread::Fresh(id);
+        };
+        if reads.next().is_none() {
+            break;
+        }
+        match rollout_owner(rollout) {
+            Owner::Person => return CodexThread::Started(id),
+            Owner::Subagent => {}
+            // Whose it is cannot be told yet, and passing it by would name
+            // the thread before it, which a person's new thread has left.
+            Owner::NotYetKnown => return CodexThread::Unknown,
+        }
+    }
+    CodexThread::Unknown
+}
+
+/// Whose thread a rollout is.
+#[derive(Debug, PartialEq, Eq)]
+enum Owner {
+    Person,
+    Subagent,
+    /// Its first line is still being written.
+    NotYetKnown,
+}
+
+/// Whose thread a rollout is, by its first line:
+/// `{"type":"session_meta","payload":{…,"source":{"subagent":…},
+/// "thread_source":"subagent",…}}`. A first line that has not ended yet
+/// tells nothing; one that is complete but unreadable or unrecognised is
+/// taken for the person's own.
+fn rollout_owner(path: &Path) -> Owner {
+    let line = match read_first_line(path, MAX_SESSION_META_BYTES) {
+        FirstLine::Line(line) => line,
+        FirstLine::Unfinished => return Owner::NotYetKnown,
+        FirstLine::Unreadable => return Owner::Person,
+    };
+    let Ok(Value::Object(line)) = serde_json::from_slice::<Value>(&line) else {
+        return Owner::Person;
+    };
+    if line.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Owner::Person;
+    }
+    let Some(meta) = line.get("payload").and_then(Value::as_object) else {
+        return Owner::Person;
+    };
+    let subagent = meta.get("thread_source").and_then(Value::as_str) == Some("subagent")
+        || meta
+            .get("source")
+            .and_then(Value::as_object)
+            .is_some_and(|source| source.contains_key("subagent"));
+    if subagent {
+        Owner::Subagent
+    } else {
+        Owner::Person
+    }
+}
+
+/// What this host last saw each Codex window in: one note per window,
+/// `<notes>/<session id>.json`, in a folder of spawnd's own — not the
+/// window's home, which only a skilled window has and its agent may write
+/// to. Noted from live answers only and never trusted further than a
+/// canonical UUID; a note that cannot be written is a restart that falls
+/// back to what it did before.
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationMemory {
+    notes: PathBuf,
+}
+
+/// Held across each look at a window and the note it leaves, and across a
+/// window being forgotten, by every `ConversationMemory` in this process: a
+/// look that read a window's Codex before the window stopped cannot write
+/// its note after the window was forgotten.
+///
+/// It is held across the whole inspection, reads under `CODEX_HOME` and
+/// `~/.claude` included, so one read that hangs (a home on a stalled NFS
+/// mount) holds up every `conv.inspect`, every look and every forget on the
+/// host until it returns. Accepted: each runs off the async runtime (a
+/// blocking task; `conv.inspect` under its channel's operation accounting),
+/// so what waits is those three and nothing else of the daemon; a host whose
+/// homes hang is already stalling its agents; and the lock is the only thing
+/// that keeps a forgotten window from being noted again.
+static LOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn looking() -> std::sync::MutexGuard<'static, ()> {
+    LOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl ConversationMemory {
+    /// `notes` is the daemon instance's folder for them, handed in by
+    /// whoever builds the inspector: this module reaches nothing else of
+    /// spawnd's.
+    pub(crate) fn new(notes: PathBuf) -> Self {
+        Self { notes }
+    }
+
+    fn path(&self, session_id: Uuid) -> PathBuf {
+        self.notes.join(format!("{session_id}.json"))
+    }
+
+    /// Drop a window's note: the window is stopped here for good (deleted,
+    /// archived, or moved to another host), and a thread noted for it would
+    /// be a stranger's by the time anything asked again.
+    pub(crate) fn forget(&self, session_id: Uuid) {
+        let _look = looking();
+        match std::fs::remove_file(self.path(session_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::debug!(%session_id, %error, "could not forget the window's Codex thread");
+            }
+        }
+    }
+
+    /// Note the Codex thread a live answer finds the window in — a thread
+    /// with something to resume, or a fresh one — when it is not the one
+    /// already noted. A thread noted with something to resume is never noted
+    /// fresh again: seen holding its lock alone, it is letting go of its
+    /// rollout (Codex 0.167.2 closes a thread's rollout before its lock, on
+    /// quit and when it unloads a thread the person left, 2 to 50 ms apart).
+    pub(crate) fn note(&self, session_id: Uuid, inspection: &Inspection) {
+        let Some(thread) = inspection.codex_thread() else {
+            return;
+        };
+        let noted = self.recall_thread(session_id);
+        match (&thread, &noted) {
+            (thread, Some(noted)) if thread == noted => return,
+            (CodexThread::Fresh(id), Some(CodexThread::Started(started))) if id == started => {
+                return
+            }
+            _ => {}
+        }
+        let body = match &thread {
+            CodexThread::Started(id) => {
+                serde_json::json!({ "agent": CODEX, "conversation_id": id })
+            }
+            CodexThread::Fresh(id) => serde_json::json!({ "agent": CODEX, "fresh_thread": id }),
+            CodexThread::Unknown => return,
+        };
+        if let Err(error) = self.write(session_id, body.to_string().as_bytes()) {
+            tracing::debug!(%session_id, %error, "could not note the window's Codex thread");
+        }
+    }
+
+    /// The answer for a window no agent runs in, from what was noted.
+    pub(crate) fn recall(&self, session_id: Uuid) -> Option<Inspection> {
+        Some(Inspection {
+            source: Source::Remembered,
+            ..Inspection::codex(self.recall_thread(session_id)?)
+        })
+    }
+
+    /// `{"agent":"codex","conversation_id":<canonical UUID>}` or
+    /// `{"agent":"codex","fresh_thread":<canonical UUID>}`, and nothing else.
+    fn recall_thread(&self, session_id: Uuid) -> Option<CodexThread> {
+        let bytes = read_small_file(&self.path(session_id), MAX_MEMORY_BYTES)?;
+        let value: Value = serde_json::from_slice(&bytes).ok()?;
+        let object = value.as_object()?;
+        if object.get("agent")?.as_str()? != CODEX {
+            return None;
+        }
+        match (object.get("conversation_id"), object.get("fresh_thread")) {
+            (Some(Value::String(id)), None) => canonical_uuid(id).map(CodexThread::Started),
+            (None, Some(Value::String(id))) => canonical_uuid(id).map(CodexThread::Fresh),
+            _ => None,
+        }
+    }
+
+    /// The note, written whole or not at all, readable by this user alone:
+    /// a private folder (0700), a new no-follow file (0600), then a rename
+    /// over the last note. Plain `std` on purpose — the inspector depends on
+    /// nothing crate-local (scripts/check-no-server-agent-upload.sh), so it
+    /// does what `platform::create_private_dir_all` and
+    /// `platform::create_private_file_new` do itself, as it does its reads.
+    #[cfg(unix)]
+    fn write(&self, session_id: Uuid, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+        let path = self.path(session_id);
+        let folder = &self.notes;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(folder)?;
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
+        let temporary = folder.join(format!(".{session_id}.{}.tmp", Uuid::new_v4()));
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        written
+    }
+
+    #[cfg(not(unix))]
+    fn write(&self, _session_id: Uuid, _bytes: &[u8]) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// A live answer for a window, where one is to be had, falling back on what
+/// was noted when no agent runs in it; and the note brought up to date. None
+/// for a window that does not run here and was never noted.
+pub(crate) fn answer_for_window(
+    session_id: Uuid,
+    shell_pid: Option<u32>,
+    memory: Option<&ConversationMemory>,
+) -> Option<Inspection> {
+    let _look = looking();
+    answer(session_id, shell_pid.map(inspect_window), memory)
+}
+
+fn answer(
+    session_id: Uuid,
+    live: Option<Inspection>,
+    memory: Option<&ConversationMemory>,
+) -> Option<Inspection> {
+    if let (Some(memory), Some(live)) = (memory, live.as_ref()) {
+        memory.note(session_id, live);
+    }
+    match live {
+        Some(live) if live.agent.is_some() => Some(live),
+        live => memory.and_then(|memory| memory.recall(session_id)).or(live),
+    }
+}
+
+/// The bytes of a process's name Linux reports (`/proc/<pid>/comm`,
+/// `TASK_COMM_LEN` less its NUL).
+const LINUX_NAME_BYTES: usize = 15;
+
+/// Foreground names a Codex window shows: Codex's own binary under any of its
+/// names (`is_codex_name`), or `node` for npm's launcher.
+///
+/// On Linux the worker reports the name cut to 15 bytes, so a standalone
+/// Codex shows as one of exactly six cuts: `codex-aarch64-a` (Apple),
+/// `codex-aarch64-u` (Linux gnu and musl), `codex-aarch64-p` (Windows),
+/// `codex-x86_64-ap`, `codex-x86_64-un` and `codex-x86_64-pc`. A name is
+/// taken for such a cut only when it is exactly 15 bytes and begins a longer
+/// Codex name. Any other program whose name happens to begin with one of
+/// those six is looked at too, which costs a look and nothing more: `node`
+/// already admits every Node.js program a window runs (`next dev`, `vite`).
+/// This only picks the windows the watch looks at; whether a process is
+/// Codex is still `is_codex`, on its whole executable path, which is never
+/// cut.
+fn may_be_codex(foreground: &str) -> bool {
+    foreground == "node"
+        || is_codex_name(foreground)
+        || (foreground.len() == LINUX_NAME_BYTES
+            && CODEX_TARGETS.iter().any(|target| {
+                let name = format!("codex-{target}");
+                name.len() > LINUX_NAME_BYTES && name.starts_with(foreground)
+            }))
+}
+
+/// Keep each Codex window's note current. Every `WATCH_INTERVAL`, `windows`
+/// lists this host's windows as (session, shell, foreground), and those
+/// whose foreground may be Codex are looked at off the runtime (`look`);
+/// `runs` says which shell a window runs from now, if it still runs here.
+/// Runs for the life of the daemon.
+pub(crate) async fn watch(
+    windows: impl Fn() -> Vec<(Uuid, u32, String)> + Send + 'static,
+    runs: impl Fn(Uuid) -> Option<u32> + Send + Sync + 'static,
+    memory: ConversationMemory,
+) {
+    let runs = Arc::new(runs);
+    let mut interval = tokio::time::interval(WATCH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let windows = windows();
+        if !windows
+            .iter()
+            .any(|(_, _, foreground)| may_be_codex(foreground))
+        {
+            continue;
+        }
+        let memory = memory.clone();
+        let runs = Arc::clone(&runs);
+        let _ = tokio::task::spawn_blocking(move || {
+            look(
+                windows,
+                shared_table,
+                &claude_stores(),
+                &codex_homes(),
+                &memory,
+                &*runs,
+            );
+        })
+        .await;
+    }
+}
+
+/// One look: each window whose foreground may be Codex is inspected and its
+/// note brought up to date, against one reading of the process table,
+/// `table()`, taken only when there is such a window. A host whose
+/// `next dev` and `vite` windows all show `node` reads the table once a
+/// look, not once a window.
+///
+/// A window is looked at only while `runs` still gives the shell the list
+/// gave, checked under the lock a window's forgetting takes: a window whose
+/// worker exited since the list was taken — and that was forgotten for
+/// good — is not noted again from a table that still shows its Codex
+/// shutting down.
+fn look<T: ProcessTable>(
+    windows: Vec<(Uuid, u32, String)>,
+    table: impl FnOnce() -> T,
+    stores: &[PathBuf],
+    codex_homes: &[PathBuf],
+    memory: &ConversationMemory,
+    runs: &dyn Fn(Uuid) -> Option<u32>,
+) {
+    let candidates: Vec<(Uuid, u32)> = windows
+        .into_iter()
+        .filter(|(_, _, foreground)| may_be_codex(foreground))
+        .map(|(session_id, shell, _)| (session_id, shell))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let table = table();
+    for (session_id, shell) in candidates {
+        let _look = looking();
+        if runs(session_id) != Some(shell) {
+            continue;
+        }
+        memory.note(
+            session_id,
+            &inspect_with(shell, &table, stores, codex_homes),
+        );
+    }
+}
+
+/// The process table for one look at several windows: on Linux one walk of
+/// `/proc`, shared by all of them; on macOS the live table, which lists a
+/// window's own children directly and has no walk to share.
+#[cfg(target_os = "linux")]
+fn shared_table() -> system::Snapshot {
+    system::Snapshot::take()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shared_table() -> SystemProcesses {
+    SystemProcesses
 }
 
 /// This host's processes.
@@ -638,28 +1411,67 @@ mod system {
         })
     }
 
-    impl ProcessTable for SystemProcesses {
-        fn tree(&self, root: u32) -> Vec<Process> {
-            let Ok(entries) = std::fs::read_dir("/proc") else {
-                return Vec::new();
-            };
+    /// Every process's parent and terminal session, from one walk of
+    /// `/proc`: what a window's tree is read from. A look at several windows
+    /// shares one; everything else is read live.
+    pub(super) struct Snapshot {
+        children: HashMap<u32, Vec<u32>>,
+        sessions: HashMap<u32, u32>,
+    }
+
+    impl Snapshot {
+        pub(super) fn take() -> Self {
             let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
             let mut sessions: HashMap<u32, u32> = HashMap::new();
-            for entry in entries.take(MAX_PROC_ENTRIES).filter_map(Result::ok) {
-                let Some(pid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.parse::<u32>().ok())
-                else {
-                    continue;
-                };
-                let Some(stat) = stat(pid).filter(|stat| !stat.zombie) else {
-                    continue;
-                };
-                children.entry(stat.ppid).or_default().push(pid);
-                sessions.insert(pid, stat.session);
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.take(MAX_PROC_ENTRIES).filter_map(Result::ok) {
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(stat) = stat(pid).filter(|stat| !stat.zombie) else {
+                        continue;
+                    };
+                    children.entry(stat.ppid).or_default().push(pid);
+                    sessions.insert(pid, stat.session);
+                }
             }
-            walk(root, &children, &sessions)
+            Self { children, sessions }
+        }
+    }
+
+    impl ProcessTable for Snapshot {
+        fn tree(&self, root: u32) -> Vec<Process> {
+            walk(root, &self.children, &self.sessions)
+        }
+
+        fn alive(&self, pid: u32) -> bool {
+            SystemProcesses.alive(pid)
+        }
+
+        fn start_identity(&self, pid: u32) -> Option<String> {
+            SystemProcesses.start_identity(pid)
+        }
+
+        fn executable(&self, pid: u32) -> Option<PathBuf> {
+            SystemProcesses.executable(pid)
+        }
+
+        fn open_files(&self, pid: u32) -> Vec<PathBuf> {
+            SystemProcesses.open_files(pid)
+        }
+
+        fn pid_domain(&self) -> Option<String> {
+            SystemProcesses.pid_domain()
+        }
+    }
+
+    impl ProcessTable for SystemProcesses {
+        fn tree(&self, root: u32) -> Vec<Process> {
+            Snapshot::take().tree(root)
         }
 
         fn alive(&self, pid: u32) -> bool {
@@ -850,13 +1662,108 @@ mod system {
             Some(PathBuf::from(path))
         }
 
-        fn open_files(&self, _pid: u32) -> Vec<PathBuf> {
-            Vec::new()
+        /// Each vnode descriptor's path, from libproc: the descriptors
+        /// (`PROC_PIDLISTFDS`), then each file one's path
+        /// (`PROC_PIDFDVNODEPATHINFO`). Only a process of the same user
+        /// answers.
+        fn open_files(&self, pid: u32) -> Vec<PathBuf> {
+            let Ok(pid) = libc::c_int::try_from(pid) else {
+                return Vec::new();
+            };
+            let empty = libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            let mut descriptors = vec![empty; MAX_OPEN_FILES];
+            let size = std::mem::size_of::<libc::proc_fdinfo>();
+            let Ok(bytes) = libc::c_int::try_from(descriptors.len() * size) else {
+                return Vec::new();
+            };
+            // SAFETY: `descriptors` is writable for `bytes` and outlives the
+            // synchronous call.
+            let written = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    descriptors.as_mut_ptr().cast(),
+                    bytes,
+                )
+            };
+            let listed = usize::try_from(written).unwrap_or(0) / size;
+            descriptors
+                .iter()
+                .take(listed.min(MAX_OPEN_FILES))
+                .filter(|descriptor| {
+                    u32::try_from(libc::PROX_FDTYPE_VNODE).ok() == Some(descriptor.proc_fdtype)
+                })
+                .filter_map(|descriptor| vnode_path(pid, descriptor.proc_fd))
+                .collect()
         }
 
         fn pid_domain(&self) -> Option<String> {
             None
         }
+    }
+
+    /// Descriptors looked at to find a Codex thread.
+    const MAX_OPEN_FILES: usize = 1024;
+    /// `PROC_PIDFDVNODEPATHINFO`, from `<sys/proc_info.h>`.
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    /// `struct proc_fileinfo`, from `<sys/proc_info.h>`: laid out for the
+    /// kernel to fill, never read here.
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+
+    /// `struct vnode_fdinfowithpath`, `PROC_PIDFDVNODEPATHINFO_SIZE` bytes.
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+
+    const _: () = assert!(std::mem::size_of::<VnodeFdInfoWithPath>() == 1200);
+
+    fn vnode_path(pid: libc::c_int, fd: i32) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: both halves are plain C structs of integers and byte
+        // arrays, for which all-zero is a valid value.
+        let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).ok()?;
+        // SAFETY: `info` is writable for exactly `size` bytes and outlives
+        // the synchronous call.
+        let written = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd,
+                PROC_PIDFDVNODEPATHINFO,
+                (&mut info as *mut VnodeFdInfoWithPath).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: `vip_path` is `MAXPATHLEN` contiguous bytes inside `info`,
+        // which outlives the slice.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                info.pvip.vip_path.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&info.pvip.vip_path),
+            )
+        };
+        let end = bytes.iter().position(|byte| *byte == 0)?;
+        (end > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end])))
     }
 }
 
@@ -1032,7 +1939,10 @@ mod tests {
                 state: ConversationState::Running,
                 cli_version: Some("2.1.288".into()),
                 live_elsewhere: false,
+                fresh: false,
                 source: Source::Registry,
+                fresh_thread: None,
+                shared_server: false,
             }
         );
     }
@@ -1182,7 +2092,10 @@ mod tests {
                 state: ConversationState::Blocked,
                 cli_version: Some("2.1.288".into()),
                 live_elsewhere: true,
+                fresh: false,
                 source: Source::Parked,
+                fresh_thread: None,
+                shared_server: false,
             }
         );
     }
@@ -1233,7 +2146,10 @@ mod tests {
                 state: ConversationState::Unknown,
                 cli_version: None,
                 live_elsewhere: true,
+                fresh: false,
                 source: Source::Attach,
+                fresh_thread: None,
+                shared_server: false,
             }
         );
 
@@ -1261,53 +2177,905 @@ mod tests {
         );
     }
 
+    /// A Codex home on disk: rollouts and writer locks with the times Codex
+    /// would have left on them, and a window whose native Codex (under npm's
+    /// node launcher) holds whichever of them a test opens.
+    struct CodexHome {
+        dir: tempfile::TempDir,
+        table: FakeTable,
+    }
+
+    const CODEX_PID: u32 = 1002;
+    const THREAD_A: &str = "01a1851d-2f36-76d1-98ee-b27aeae4a30d";
+    const THREAD_B: &str = "01a1851d-dcf1-7852-a5e9-dfea6fc5f98a";
+    const THREAD_C: &str = "01a18522-1349-71d2-9b67-b3e81618a23e";
+
+    impl CodexHome {
+        fn new() -> Self {
+            let mut table = FakeTable::window();
+            table.spawn(1001, SHELL, Some(WINDOW_TTY), "/usr/bin/node", "77");
+            table.spawn(
+                CODEX_PID,
+                1001,
+                Some(WINDOW_TTY),
+                "/usr/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex/codex",
+                "78",
+            );
+            table
+                .open
+                .insert(CODEX_PID, vec![PathBuf::from("/dev/pts/3")]);
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("sessions/2026/10/29")).unwrap();
+            std::fs::create_dir_all(dir.path().join("thread-writer-locks")).unwrap();
+            Self { dir, table }
+        }
+
+        fn at(seconds: u64) -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + seconds)
+        }
+
+        fn hold(&mut self, path: PathBuf, written: u64, contents: &str) {
+            std::fs::write(&path, contents).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(Self::at(written))
+                .unwrap();
+            self.table.open.get_mut(&CODEX_PID).unwrap().push(path);
+        }
+
+        /// The thread's writer lock, as Codex holds it from the thread's start.
+        fn lock(&mut self, id: &str, written: u64) {
+            let path = self
+                .dir
+                .path()
+                .join("thread-writer-locks")
+                .join(format!("{id}.lock"));
+            self.hold(path, written, "");
+        }
+
+        /// The thread's rollout, its first line a `session_meta` from `source`.
+        fn rollout(&mut self, id: &str, written: u64, source: Value, thread_source: &str) {
+            let meta = serde_json::json!({
+                "timestamp": "2026-10-29T00:44:04.123Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "session_id": id,
+                    "cwd": "/home/me/proj",
+                    "originator": "codex-tui",
+                    "cli_version": "0.155.1",
+                    "source": source,
+                    "thread_source": thread_source,
+                    "base_instructions": {"text": "x".repeat(22_000)},
+                },
+            });
+            let path = self
+                .dir
+                .path()
+                .join("sessions/2026/10/29")
+                .join(format!("rollout-2026-10-29T00-44-04-{id}.jsonl"));
+            self.hold(
+                path,
+                written,
+                &format!("{meta}\n{{\"type\":\"event_msg\"}}\n"),
+            );
+        }
+
+        fn primary(&mut self, id: &str, written: u64) {
+            self.rollout(id, written, Value::from("cli"), "user");
+        }
+
+        fn subagent(&mut self, id: &str, parent: &str, written: u64) {
+            let source = serde_json::json!({
+                "subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1}}
+            });
+            self.rollout(id, written, source, "subagent");
+        }
+
+        fn inspect(&self) -> Inspection {
+            inspect(SHELL, &self.table, &[store_with(&[]).path().to_path_buf()])
+        }
+    }
+
+    fn started(id: &str) -> Inspection {
+        Inspection {
+            agent: Some("codex"),
+            conversation_id: Some(id.into()),
+            state: ConversationState::Unknown,
+            cli_version: None,
+            live_elsewhere: false,
+            fresh: false,
+            source: Source::OpenFile,
+            fresh_thread: None,
+            shared_server: false,
+        }
+    }
+
     #[test]
-    fn codex_is_named_by_the_rollout_it_holds_open() {
+    fn codex_is_named_by_the_thread_it_holds() {
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        assert_eq!(home.inspect(), started(THREAD_A));
+    }
+
+    #[test]
+    fn a_codex_thread_with_nothing_written_is_fresh_and_unnamed() {
+        // Launched, no message yet: the lock is held, the rollout is not.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        let inspection = home.inspect();
+        assert_eq!(inspection.agent, Some("codex"));
+        assert_eq!(inspection.conversation_id, None);
+        assert!(inspection.fresh);
+        assert_eq!(inspection.source, Source::OpenFile);
+        // `/new` after a conversation: the last one stays held, older.
+        home.primary(THREAD_A, 12);
+        home.lock(THREAD_B, 20);
+        let inspection = home.inspect();
+        assert_eq!(inspection.conversation_id, None);
+        assert!(inspection.fresh);
+    }
+
+    #[test]
+    fn codex_holding_several_threads_is_in_the_one_written_last() {
+        // `/new`, then a message: two threads held, the new one written last.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        home.lock(THREAD_B, 20);
+        home.primary(THREAD_B, 25);
+        assert_eq!(home.inspect(), started(THREAD_B));
+        // `/resume` of the first from inside Codex writes its lock and its
+        // rollout again, after the second's.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 30);
+        home.primary(THREAD_A, 31);
+        home.lock(THREAD_B, 20);
+        home.primary(THREAD_B, 25);
+        assert_eq!(home.inspect(), started(THREAD_A));
+    }
+
+    #[test]
+    fn a_subagents_thread_is_never_the_windows() {
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        home.lock(THREAD_B, 14);
+        home.subagent(THREAD_B, THREAD_A, 40);
+        home.lock(THREAD_C, 15);
+        home.subagent(THREAD_C, THREAD_A, 41);
+        assert_eq!(home.inspect(), started(THREAD_A));
+        // Subagents alone name nothing.
+        let mut home = CodexHome::new();
+        home.subagent(THREAD_B, THREAD_A, 40);
+        let inspection = home.inspect();
+        assert_eq!(inspection.conversation_id, None);
+        assert!(!inspection.fresh);
+        assert_eq!(inspection.source, Source::Process);
+    }
+
+    #[test]
+    fn codex_holding_many_threads_is_in_the_newest_wherever_it_holds_it() {
+        // Every `/new`, `/resume` and subagent stays held: a long-lived Codex
+        // can hold dozens, in whatever order its descriptors list them.
+        let ids: Vec<String> = (0..80)
+            .map(|n| format!("01a1851d-2f36-76d1-98ee-{n:012x}"))
+            .collect();
+        let mut home = CodexHome::new();
+        for (n, id) in ids.iter().enumerate().skip(1) {
+            home.lock(id, 10 * n as u64);
+            home.primary(id, 10 * n as u64 + 1);
+        }
+        // The thread in front of the person, opened last of all.
+        home.lock(&ids[0], 10_000);
+        home.primary(&ids[0], 10_001);
+        assert_eq!(home.inspect(), started(&ids[0]));
+    }
+
+    #[test]
+    fn a_rollout_codex_holds_without_its_lock_is_not_one_of_its_threads() {
+        // The rollout of another window's thread, open for a moment (the
+        // resume picker reading it): newer than this window's thread, but
+        // not loaded here, so no lock.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        home.primary(THREAD_B, 50);
+        assert_eq!(home.inspect(), started(THREAD_A));
+        // Nor does it make a thread just started here any less fresh.
+        home.lock(THREAD_C, 20);
+        let inspection = home.inspect();
+        assert_eq!(inspection.conversation_id, None);
+        assert!(inspection.fresh);
+        // A Codex that takes no writer locks is told by its rollouts alone.
+        let mut home = CodexHome::new();
+        home.primary(THREAD_A, 12);
+        home.primary(THREAD_B, 50);
+        assert_eq!(home.inspect(), started(THREAD_B));
+    }
+
+    #[test]
+    fn a_subagents_lock_before_its_first_write_reads_as_a_fresh_thread() {
+        // What the process holds cannot tell this from the person's `/new`:
+        // a lock newer than every rollout, and no rollout for it. Codex's
+        // lock files carry nothing to go on, so this pins today's answer
+        // rather than guessing: fresh, until the subagent's first write
+        // (its `session_meta` says subagent) puts the person's thread back.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        home.lock(THREAD_B, 30);
+        let inspection = home.inspect();
+        assert_eq!(inspection.conversation_id, None);
+        assert!(inspection.fresh);
+        home.subagent(THREAD_B, THREAD_A, 31);
+        assert_eq!(home.inspect(), started(THREAD_A));
+    }
+
+    /// A rollout held under a lock, with `contents` written to it at `at`.
+    fn rollout_with(home: &mut CodexHome, id: &str, at: u64, contents: &str) {
+        let path = home
+            .dir
+            .path()
+            .join("sessions/2026/10/29")
+            .join(format!("rollout-2026-10-29T00-50-00-{id}.jsonl"));
+        home.lock(id, at - 1);
+        home.hold(path, at, contents);
+    }
+
+    #[test]
+    fn a_resume_before_its_lock_is_told_by_its_rollout_alone() {
+        // `codex resume` (0.167.2): the picker holds nothing; once a thread is
+        // chosen, Codex reads its rollout for some 270 ms before taking its
+        // lock, and no other rollout is open meanwhile. With no lock held,
+        // the rollouts are what there is, and they name the thread being
+        // resumed. (Decided from strace, 2026-11-15: no answer of "unknown"
+        // for a Codex home that keeps locks but holds none.)
+        let mut home = CodexHome::new();
+        home.primary(THREAD_A, 12);
+        assert!(home.dir.path().join("thread-writer-locks").is_dir());
+        assert_eq!(home.inspect(), started(THREAD_A));
+    }
+
+    #[test]
+    fn a_rollout_whose_first_line_is_complete_but_unrecognised_is_the_persons() {
+        // A first line longer than is read, then one not JSON at all.
+        for contents in [
+            format!(
+                "{{\"type\":\"session_meta\",\"x\":\"{}\"}}\n",
+                "y".repeat(300_000)
+            ),
+            "not json\n".to_string(),
+        ] {
+            let mut home = CodexHome::new();
+            home.lock(THREAD_A, 10);
+            home.primary(THREAD_A, 12);
+            rollout_with(&mut home, THREAD_B, 20, &contents);
+            assert_eq!(home.inspect(), started(THREAD_B));
+        }
+    }
+
+    #[test]
+    fn a_rollout_whose_first_line_is_still_being_written_names_nothing() {
+        // Codex is writing a new thread's `session_meta` (about 22 KiB): it
+        // may be a subagent's or the person's, so neither it nor the thread
+        // before it is named, and nothing is noted.
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": THREAD_B, "source": {"subagent": {}}, "thread_source": "subagent"},
+        })
+        .to_string();
+        for contents in ["", &meta[..meta.len() / 2], &meta[..]] {
+            let mut home = CodexHome::new();
+            home.lock(THREAD_A, 10);
+            home.primary(THREAD_A, 12);
+            rollout_with(&mut home, THREAD_B, 20, contents);
+            let inspection = home.inspect();
+            assert_eq!(inspection.agent, Some("codex"), "{contents:?}");
+            assert_eq!(inspection.conversation_id, None, "{contents:?}");
+            assert!(!inspection.fresh, "{contents:?}");
+            assert_eq!(inspection.source, Source::Process, "{contents:?}");
+        }
+        // Once the line ends, it is told apart as ever.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        rollout_with(&mut home, THREAD_B, 20, &format!("{meta}\n"));
+        assert_eq!(home.inspect(), started(THREAD_A));
+    }
+
+    /// A Codex home whose shared background server, pid 5000, wrote its
+    /// record as Codex 0.169.0 does, and a table where `server` runs.
+    fn shared_server(home: &CodexHome, record: Value) -> FakeTable {
+        let dir = home.dir.path().join("app-server-daemon");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("daemon.pid"), record.to_string()).unwrap();
         let mut table = FakeTable::window();
-        // npm's launcher runs node, which runs the native binary.
         table.spawn(1001, SHELL, Some(WINDOW_TTY), "/usr/bin/node", "77");
         table.spawn(
-            1002,
+            CODEX_PID,
             1001,
             Some(WINDOW_TTY),
-            "/usr/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex/codex",
+            "/home/me/.codex/packages/standalone/releases/0.167.2-x86_64-unknown-linux-musl/bin/codex",
             "78",
         );
-        table.open.insert(
-            1002,
-            vec![
-                PathBuf::from("/dev/pts/3"),
-                PathBuf::from(
-                    "/home/me/.codex/sessions/2026/10/03/rollout-2026-10-03T10-12-44-0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09.jsonl",
-                ),
-            ],
+        table
+            .open
+            .insert(CODEX_PID, home.table.open[&CODEX_PID].clone());
+        table.spawn(
+            5000,
+            4999,
+            None,
+            "/home/me/.codex/packages/app-server-daemon/releases/0.169.0-x86_64-unknown-linux-musl/bin/codex",
+            "626900621",
         );
-        let store = store_with(&[]);
+        table
+    }
+
+    fn server_record() -> Value {
+        serde_json::json!({
+            "pid": 5000,
+            "processStartTime": "Fri Nov 13 09:23:24 2026",
+            "processIdentity": {"bootId": "4db4828d-e45b-41a3-a06e-2297648a1a9a", "startTicks": 626900621},
+        })
+    }
+
+    #[test]
+    fn a_codex_on_the_shared_server_is_said_to_be_there_and_names_nothing() {
+        // Codex 0.167.2 by default: the window's Codex holds no thread file,
+        // its shared `codex app-server` (another session) holds them all.
+        let home = CodexHome::new();
+        let table = shared_server(&home, server_record());
+        let homes = [home.dir.path().to_path_buf()];
+        let inspection = inspect_with(SHELL, &table, &[], &homes);
+        assert_eq!(inspection, Inspection::codex_on_shared_server());
+        assert_eq!(inspection.agent, Some("codex"));
+        assert_eq!(inspection.conversation_id, None);
+        assert!(!inspection.fresh);
+        assert!(inspection.shared_server);
+        // Nothing to note, and a note already there is not answered over it.
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        memory.note(window, &inspection);
+        assert_eq!(memory.recall(window), None);
+        memory.note(window, &started(THREAD_A));
         assert_eq!(
-            run(&table, &store),
-            Inspection {
-                agent: Some("codex"),
-                conversation_id: Some("0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a09".into()),
-                state: ConversationState::Unknown,
-                cli_version: None,
-                live_elsewhere: false,
-                source: Source::OpenFile,
-            }
+            answer(window, Some(inspection.clone()), Some(&memory)),
+            Some(inspection)
         );
-        // Seen on a real Codex 0.155.1: one process holding three rollouts.
-        // Which is the conversation cannot be told from names alone.
-        table.open.get_mut(&1002).unwrap().push(PathBuf::from(
-            "/home/me/.codex/sessions/2026/10/03/rollout-2026-10-03T11-00-00-0199a8b2-6c3e-7f10-9d2b-5a4e3c2b1a0a.jsonl",
-        ));
-        let inspection = run(&table, &store);
+    }
+
+    #[test]
+    fn a_codex_is_on_the_shared_server_only_while_that_server_runs_and_holds_its_threads() {
+        let homes = |home: &CodexHome| [home.dir.path().to_path_buf()];
+        // No record, a record naming nothing believable, a dead pid, a pid
+        // reused by another process, one that is not Codex.
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        std::fs::remove_file(home.dir.path().join("app-server-daemon/daemon.pid")).unwrap();
+        assert!(!inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        for record in [
+            serde_json::json!({"pid": "5000"}),
+            serde_json::json!({"pid": 1}),
+            serde_json::json!({"pid": 6000}),
+            serde_json::json!({"pid": 5000, "processIdentity": {"startTicks": 1}}),
+        ] {
+            let home = CodexHome::new();
+            let table = shared_server(&home, record.clone());
+            assert!(
+                !inspect_with(SHELL, &table, &[], &homes(&home)).shared_server,
+                "{record}"
+            );
+        }
+        let home = CodexHome::new();
+        table = shared_server(&home, server_record());
+        table
+            .executables
+            .insert(5000, PathBuf::from("/usr/bin/python3"));
+        assert!(!inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        // A start that cannot be compared (macOS): alive and Codex will do.
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        table.starts.remove(&5000);
+        assert!(inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        // A Codex that runs its own app server (`--no-daemon`) holds Codex's
+        // state database even with no thread open — at its resume picker,
+        // say — and is not on the shared one (Codex 0.167.2).
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        table.open.get_mut(&CODEX_PID).unwrap().extend([
+            home.dir.path().join("state_5.sqlite"),
+            home.dir.path().join("state_5.sqlite-wal"),
+            home.dir.path().join("logs_2.sqlite"),
+        ]);
+        let inspection = inspect_with(SHELL, &table, &[], &homes(&home));
+        assert!(!inspection.shared_server);
+        assert_eq!(inspection, Inspection::codex(CodexThread::Unknown));
+        // A client of the shared server holds only its logs.
+        let home = CodexHome::new();
+        let mut table = shared_server(&home, server_record());
+        table.open.get_mut(&CODEX_PID).unwrap().extend([
+            home.dir.path().join("logs_2.sqlite"),
+            home.dir.path().join(".sqlite-maintenance.lock"),
+        ]);
+        assert!(inspect_with(SHELL, &table, &[], &homes(&home)).shared_server);
+        // A Codex holding its own threads (`--no-daemon`, beside a running
+        // server) is read as ever.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        let table = shared_server(&home, server_record());
+        let inspection = inspect_with(SHELL, &table, &[], &homes(&home));
+        assert!(inspection.fresh);
+        assert!(!inspection.shared_server);
+        home.primary(THREAD_A, 12);
+        let table = shared_server(&home, server_record());
+        assert_eq!(
+            inspect_with(SHELL, &table, &[], &homes(&home)),
+            started(THREAD_A)
+        );
+    }
+
+    #[test]
+    fn codex_holding_nothing_of_its_threads_names_none() {
+        let home = CodexHome::new();
+        let inspection = home.inspect();
         assert_eq!(inspection.agent, Some("codex"));
         assert_eq!(inspection.source, Source::Process);
         assert_eq!(inspection.conversation_id, None);
-        table.open.clear();
-        let inspection = run(&table, &store);
-        assert_eq!(inspection.agent, Some("codex"));
+        assert!(!inspection.fresh);
+        // Paths that only look like Codex's are not its threads.
+        let mut table = home.table;
+        table.open.get_mut(&CODEX_PID).unwrap().extend([
+            PathBuf::from(format!("/tmp/{THREAD_A}.lock")),
+            PathBuf::from(format!("/tmp/thread-writer-locks/{THREAD_A}.lck")),
+            PathBuf::from("/tmp/thread-writer-locks/.coordination.lock"),
+        ]);
+        let inspection = inspect(SHELL, &table, &[store_with(&[]).path().to_path_buf()]);
         assert_eq!(inspection.source, Source::Process);
-        assert_eq!(inspection.conversation_id, None);
+    }
+
+    #[test]
+    fn a_codex_windows_thread_is_remembered_once_it_has_one() {
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        assert_eq!(memory.recall(window), None);
+        // Nothing to remember: no agent, a Claude Code window, a Codex whose
+        // threads cannot be told apart.
+        memory.note(window, &Inspection::nothing());
+        memory.note(
+            window,
+            &Inspection {
+                agent: Some(CLAUDE_CODE),
+                ..started(CONVERSATION)
+            },
+        );
+        memory.note(window, &Inspection::codex(CodexThread::Unknown));
+        assert_eq!(memory.recall(window), None);
+        memory.note(window, &started(THREAD_A));
+        let remembered = Inspection {
+            source: Source::Remembered,
+            ..started(THREAD_A)
+        };
+        assert_eq!(memory.recall(window), Some(remembered.clone()));
+        // Neither moves it on.
+        memory.note(window, &Inspection::nothing());
+        memory.note(window, &Inspection::codex(CodexThread::Unknown));
+        assert_eq!(memory.recall(window), Some(remembered));
+        memory.note(window, &started(THREAD_B));
+        assert_eq!(
+            memory.recall(window).unwrap().conversation_id.as_deref(),
+            Some(THREAD_B)
+        );
+        // One window's note is its own.
+        assert_eq!(memory.recall(Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn a_thread_letting_go_of_its_rollout_is_not_noted_fresh() {
+        // Codex 0.167.2 closes a thread's rollout before its lock — on quit,
+        // and when it unloads a thread the person left — 2 to 50 ms apart.
+        // A look in between sees the noted thread holding its lock alone.
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        assert_eq!(
+            answer(window, Some(home.inspect()), Some(&memory)),
+            Some(started(THREAD_A))
+        );
+        home.table
+            .open
+            .get_mut(&CODEX_PID)
+            .unwrap()
+            .retain(|path| codex_rollout_id(path).is_none());
+        let letting_go = answer(window, Some(home.inspect()), Some(&memory)).unwrap();
+        assert!(
+            letting_go.fresh,
+            "the live answer is what the process holds"
+        );
+        let remembered = Inspection {
+            source: Source::Remembered,
+            ..started(THREAD_A)
+        };
+        assert_eq!(memory.recall(window), Some(remembered));
+        // A thread that never had a rollout is noted fresh as ever.
+        home.lock(THREAD_B, 20);
+        answer(window, Some(home.inspect()), Some(&memory));
+        assert!(memory.recall(window).unwrap().fresh);
+    }
+
+    #[test]
+    fn a_fresh_thread_is_noted_in_place_of_the_one_before_it() {
+        // `/new`, then Codex quits before a message: there is nothing to
+        // resume, and the thread before it is one the person left.
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        memory.note(window, &started(THREAD_A));
+        memory.note(
+            window,
+            &Inspection::codex(CodexThread::Fresh(THREAD_B.into())),
+        );
+        let fresh = Inspection {
+            source: Source::Remembered,
+            ..Inspection::codex(CodexThread::Fresh(THREAD_B.into()))
+        };
+        assert_eq!(memory.recall(window), Some(fresh.clone()));
+        assert_eq!(answer(window, None, Some(&memory)), Some(fresh.clone()));
+        assert_eq!(
+            answer(window, Some(Inspection::nothing()), Some(&memory)),
+            Some(fresh)
+        );
+        // The first message in it gives it a thread to resume.
+        memory.note(window, &started(THREAD_B));
+        assert_eq!(
+            memory.recall(window),
+            Some(Inspection {
+                source: Source::Remembered,
+                ..started(THREAD_B)
+            })
+        );
+    }
+
+    #[test]
+    fn notes_keep_to_their_own_folder_one_file_per_window() {
+        // Not in a window's home: that is a skilled window's alone, and its
+        // agent's (`SPAWN_AGENT_CONFIG_DIR`).
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().join("conversations"));
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        memory.note(one, &started(THREAD_A));
+        memory.note(two, &started(THREAD_B));
+        memory.note(one, &started(THREAD_C));
+        let mut names: Vec<_> = std::fs::read_dir(notes.path().join("conversations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut expected = [format!("{one}.json"), format!("{two}.json")];
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(
+            std::fs::read_dir(notes.path()).unwrap().count(),
+            1,
+            "nothing beside the notes folder"
+        );
+        // This user's alone.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let folder = notes.path().join("conversations");
+        assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(&folder.join(format!("{one}.json"))), 0o600);
+    }
+
+    #[test]
+    fn a_forgotten_window_has_no_note() {
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let (gone, kept) = (Uuid::new_v4(), Uuid::new_v4());
+        memory.note(gone, &started(THREAD_A));
+        memory.note(kept, &started(THREAD_B));
+        memory.forget(gone);
+        assert_eq!(memory.recall(gone), None);
+        assert_eq!(
+            answer(gone, None, Some(&memory)),
+            None,
+            "a window not running here and forgotten is not found"
+        );
+        assert!(memory.recall(kept).is_some());
+        // Forgetting a window never noted, or twice, is nothing.
+        memory.forget(gone);
+        memory.forget(Uuid::new_v4());
+        assert_eq!(std::fs::read_dir(notes.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_note_is_believed_only_as_a_codex_uuid() {
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        let path = notes.path().join(format!("{window}.json"));
+        for bad in [
+            serde_json::json!({"agent": "claude-code", "conversation_id": THREAD_A}).to_string(),
+            serde_json::json!({"agent": "codex", "conversation_id": "--last"}).to_string(),
+            serde_json::json!({"agent": "codex", "conversation_id": THREAD_A.to_uppercase()})
+                .to_string(),
+            serde_json::json!({"agent": "codex"}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh": true}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh_thread": true}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh_thread": "--last"}).to_string(),
+            serde_json::json!({"agent": "codex", "fresh_thread": THREAD_A.to_uppercase()})
+                .to_string(),
+            serde_json::json!({"agent": "codex", "conversation_id": THREAD_A, "fresh_thread": THREAD_B})
+                .to_string(),
+            serde_json::json!({"agent": "claude-code", "fresh_thread": THREAD_A}).to_string(),
+            format!(
+                "{{\"agent\":\"codex\",\"conversation_id\":\"{THREAD_A}\",\"pad\":\"{}\"}}",
+                "x".repeat(2048)
+            ),
+            "not json".to_string(),
+        ] {
+            std::fs::write(&path, &bad).unwrap();
+            assert_eq!(memory.recall(window), None, "{bad}");
+        }
+        // A link is not followed.
+        let elsewhere = notes.path().join("elsewhere.json");
+        std::fs::write(
+            &elsewhere,
+            serde_json::json!({"agent": "codex", "conversation_id": THREAD_A}).to_string(),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        assert_eq!(memory.recall(window), None);
+    }
+
+    #[test]
+    fn a_window_without_its_agent_is_answered_from_its_note() {
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        // Never noted: a live answer stands, and a window not running here
+        // has none.
+        assert_eq!(
+            answer(window, Some(Inspection::nothing()), Some(&memory)),
+            Some(Inspection::nothing())
+        );
+        assert_eq!(answer(window, None, Some(&memory)), None);
+        assert_eq!(answer(window, None, None), None);
+        // A live answer is noted as it is given.
+        assert_eq!(
+            answer(window, Some(started(THREAD_A)), Some(&memory)),
+            Some(started(THREAD_A))
+        );
+        let remembered = Some(Inspection {
+            source: Source::Remembered,
+            ..started(THREAD_A)
+        });
+        // Codex has gone and the shell is back, or the window is not running.
+        assert_eq!(
+            answer(window, Some(Inspection::nothing()), Some(&memory)),
+            remembered
+        );
+        assert_eq!(answer(window, None, Some(&memory)), remembered);
+        // An agent running in the window is answered for live, whatever was
+        // noted: a Codex the host cannot read leaves the note as it was, a
+        // fresh Codex thread replaces it.
+        let unknown = Inspection::codex(CodexThread::Unknown);
+        assert_eq!(
+            answer(window, Some(unknown.clone()), Some(&memory)),
+            Some(unknown)
+        );
+        assert_eq!(answer(window, None, Some(&memory)), remembered);
+        let fresh = Inspection::codex(CodexThread::Fresh(THREAD_B.into()));
+        assert_eq!(
+            answer(window, Some(fresh.clone()), Some(&memory)),
+            Some(fresh.clone())
+        );
+        assert_eq!(
+            answer(window, None, Some(&memory)),
+            Some(Inspection {
+                source: Source::Remembered,
+                ..fresh
+            })
+        );
+    }
+
+    #[test]
+    fn a_codex_window_is_looked_at_every_five_seconds() {
+        // The longest a thread change can go unseen before Codex goes
+        // (docs/INTERFACE_MATRIX.md says so).
+        assert_eq!(WATCH_INTERVAL, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn one_look_reads_the_process_table_once_for_every_window() {
+        // Two Codex windows (one under npm's node launcher) and a shell.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        let other = 2000;
+        home.table.spawn(other, 1, Some(2000), "/bin/zsh", "20");
+        home.table
+            .spawn(other + 1, other, Some(2000), "/usr/local/bin/codex", "21");
+        let rollout = home
+            .dir
+            .path()
+            .join("sessions/2026/10/29")
+            .join(format!("rollout-2026-10-29T00-44-04-{THREAD_B}.jsonl"));
+        std::fs::write(&rollout, "{}\n").unwrap();
+        home.table.open.insert(other + 1, vec![rollout]);
+        home.table.spawn(3000, 1, Some(3000), "/bin/bash", "30");
+
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let (node, codex, shell) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let windows = vec![
+            (node, SHELL, "node".to_string()),
+            (codex, other, "codex".to_string()),
+            (shell, 3000, "bash".to_string()),
+        ];
+        let taken = std::cell::Cell::new(0);
+        let table = home.table;
+        let runs = |id: Uuid| windows.iter().find(|w| w.0 == id).map(|w| w.1);
+        look(
+            windows.clone(),
+            || {
+                taken.set(taken.get() + 1);
+                table
+            },
+            &[],
+            &[],
+            &memory,
+            &runs,
+        );
+        assert_eq!(taken.get(), 1);
+        let noted = |id| memory.recall(id).and_then(|answer| answer.conversation_id);
+        assert_eq!(noted(node).as_deref(), Some(THREAD_A));
+        assert_eq!(noted(codex).as_deref(), Some(THREAD_B));
+        assert_eq!(noted(shell), None);
+        // A look with no window that may be Codex reads no table at all.
+        look(
+            vec![(shell, 3000, "bash".to_string())],
+            || -> FakeTable {
+                taken.set(taken.get() + 1);
+                FakeTable::default()
+            },
+            &[],
+            &[],
+            &memory,
+            &runs,
+        );
+        assert_eq!(taken.get(), 1);
+    }
+
+    #[test]
+    fn a_look_does_not_note_a_window_that_left_this_host_meanwhile() {
+        // The look took its list of windows and its table; then the window's
+        // worker exited and the window was forgotten (`session.kill`), while
+        // its Codex was still shutting down and the table still showed it.
+        let codex_in_a_window = || {
+            let mut home = CodexHome::new();
+            home.lock(THREAD_A, 10);
+            home.primary(THREAD_A, 12);
+            home
+        };
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let window = Uuid::new_v4();
+        let windows = vec![(window, SHELL, "codex".to_string())];
+        let home = codex_in_a_window();
+        look(windows.clone(), || home.table, &[], &[], &memory, &|_| None);
+        assert_eq!(memory.recall(window), None, "gone from this host");
+        // Nor a window this host now runs from another shell: a later
+        // incarnation, not the one the look listed.
+        let home = codex_in_a_window();
+        look(windows.clone(), || home.table, &[], &[], &memory, &|_| {
+            Some(SHELL + 7)
+        });
+        assert_eq!(memory.recall(window), None, "restarted since");
+        // The window as listed is noted.
+        let home = codex_in_a_window();
+        look(windows, || home.table, &[], &[], &memory, &|_| Some(SHELL));
+        assert_eq!(
+            memory.recall(window).unwrap().conversation_id.as_deref(),
+            Some(THREAD_A)
+        );
+    }
+
+    #[test]
+    fn codex_shows_its_own_name_or_nodes_in_the_foreground() {
+        assert!(may_be_codex("codex"));
+        assert!(may_be_codex("node"));
+        assert!(!may_be_codex("bash"));
+        assert!(!may_be_codex("claude"));
+    }
+
+    /// Every name a Codex release binary goes by: `codex` from npm, or the
+    /// release target kept in the name by a standalone install.
+    const CODEX_RELEASE_NAMES: [&str; 8] = [
+        "codex-aarch64-apple-darwin",
+        "codex-x86_64-apple-darwin",
+        "codex-aarch64-unknown-linux-gnu",
+        "codex-x86_64-unknown-linux-gnu",
+        "codex-aarch64-unknown-linux-musl",
+        "codex-x86_64-unknown-linux-musl",
+        "codex-aarch64-pc-windows-msvc",
+        "codex-x86_64-pc-windows-msvc",
+    ];
+
+    const NOT_CODEX: [&str; 12] = [
+        "codex-wrapper",
+        "codex-foo",
+        "codexx",
+        "mycodex",
+        "codex-",
+        "codex-aarch64",
+        "codex-aarch64-apple-darwin-helper",
+        "codex-riscv64gc-unknown-linux-gnu",
+        "codex-x86_64-unknown-linux-gnux32",
+        "Codex-aarch64-apple-darwin",
+        "codex.exe.exe",
+        "node-codex",
+    ];
+
+    #[test]
+    fn codex_is_recognised_under_its_release_target_names() {
+        for name in CODEX_RELEASE_NAMES {
+            for path in [
+                format!("/opt/homebrew/Caskroom/codex/0.155.1/{name}"),
+                format!("/usr/local/bin/{name}"),
+                format!("/home/me/.local/bin/{name} (deleted)"),
+                format!("C:/Users/me/bin/{name}.exe"),
+            ] {
+                assert!(is_codex(Path::new(&path)), "{path}");
+            }
+            assert!(may_be_codex(name), "{name}");
+        }
+        assert!(is_codex(Path::new("/usr/local/bin/codex.exe")));
+        for name in NOT_CODEX {
+            let path = format!("/usr/local/bin/{name}");
+            assert!(!is_codex(Path::new(&path)), "{path}");
+            assert!(!may_be_codex(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn codex_cut_to_linuxs_fifteen_bytes_still_shows_in_the_foreground() {
+        // `/proc/<pid>/comm` keeps 15 bytes of the name.
+        for cut in [
+            "codex-aarch64-a",
+            "codex-aarch64-u",
+            "codex-aarch64-p",
+            "codex-x86_64-ap",
+            "codex-x86_64-un",
+            "codex-x86_64-pc",
+        ] {
+            assert_eq!(cut.len(), 15);
+            assert!(may_be_codex(cut), "{cut}");
+            // The cut name is the pre-filter's only: the inspector reads the
+            // whole executable path, never the cut name.
+            assert!(!is_codex(Path::new(cut)), "{cut}");
+        }
+        for name in CODEX_RELEASE_NAMES {
+            assert!(may_be_codex(&name[..15]), "{name}");
+        }
+        // Shorter or other cuts are not the kernel's cut of a Codex name.
+        for not in [
+            "codex-aarch64-",
+            "codex-x86_64-a",
+            "codex-aarch64-x",
+            "codex-x86_64-uX",
+        ] {
+            assert!(!may_be_codex(not), "{not}");
+        }
     }
 
     #[test]
@@ -1427,7 +3195,10 @@ mod tests {
             state: ConversationState::Blocked,
             cli_version: Some("x".repeat(32)),
             live_elsewhere: true,
+            fresh: false,
             source: Source::Registry,
+            fresh_thread: None,
+            shared_server: false,
         };
         let encoded = serde_json::to_string(&inspection).unwrap();
         assert!(encoded.len() < 512, "{encoded}");
@@ -1439,9 +3210,52 @@ mod tests {
                 "state": "blocked",
                 "cli_version": "x".repeat(32),
                 "live_elsewhere": true,
+                "fresh": false,
+                "shared_server": false,
                 "source": "registry",
             })
         );
+        let shared = serde_json::to_value(Inspection::codex_on_shared_server()).unwrap();
+        assert_eq!(shared["shared_server"], true);
+        assert_eq!(shared["conversation_id"], Value::Null);
+        assert_eq!(shared["fresh"], false);
+        let fresh =
+            serde_json::to_value(Inspection::codex(CodexThread::Fresh(THREAD_B.into()))).unwrap();
+        assert!(
+            !fresh.to_string().contains(THREAD_B),
+            "a fresh thread's id stays on the host"
+        );
+        assert_eq!(fresh["fresh"], true);
+        assert_eq!(fresh["conversation_id"], Value::Null);
+        assert_eq!(fresh["source"], "open_file");
+        let remembered = Inspection {
+            source: Source::Remembered,
+            ..Inspection::codex(CodexThread::Started(CONVERSATION.into()))
+        };
+        assert_eq!(
+            serde_json::to_value(remembered).unwrap()["source"],
+            "remembered"
+        );
+    }
+
+    #[test]
+    fn lock_ids_are_read_only_from_codexs_lock_folder() {
+        assert_eq!(
+            codex_lock_id(Path::new(
+                "/home/me/.codex/thread-writer-locks/01a1851d-2f36-76d1-98ee-b27aeae4a30d.lock"
+            ))
+            .as_deref(),
+            Some("01a1851d-2f36-76d1-98ee-b27aeae4a30d")
+        );
+        for bad in [
+            "/home/me/.codex/thread-writer-locks/.coordination.lock",
+            "/home/me/.codex/thread-writer-locks/01A1851D-2F36-76D1-98EE-B27AEAE4A30D.lock",
+            "/home/me/.codex/locks/01a1851d-2f36-76d1-98ee-b27aeae4a30d.lock",
+            "/home/me/.codex/thread-writer-locks/01a1851d-2f36-76d1-98ee-b27aeae4a30d",
+            "01a1851d-2f36-76d1-98ee-b27aeae4a30d.lock",
+        ] {
+            assert_eq!(codex_lock_id(Path::new(bad)), None, "{bad}");
+        }
     }
 
     #[test]
@@ -1509,5 +3323,49 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!SystemProcesses.alive(child.id()));
+    }
+
+    /// One reading of the table, shared by a look's windows, walks the
+    /// same tree as the live table does.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_shared_table_walks_a_real_tree() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let me = std::process::id();
+        let table = shared_table();
+        let tree = table.tree(me);
+        assert_eq!(tree.first().map(|process| process.pid), Some(me));
+        assert!(tree.iter().any(|process| process.pid == child.id()));
+        assert_eq!(tree.first(), SystemProcesses.tree(me).first());
+        assert!(table.alive(child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!table.alive(child.id()), "everything but the tree is live");
+    }
+
+    /// The files this very test holds open, as Codex's would be read: on
+    /// macOS through libproc, on Linux through `/proc/<pid>/fd`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_real_process_table_lists_a_processs_open_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-10-29T00-44-04-{THREAD_A}.jsonl"));
+        let _held = std::fs::File::create(&path).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let open = SystemProcesses.open_files(std::process::id());
+        assert!(
+            open.iter().any(
+                |file| std::fs::canonicalize(file).ok().as_deref() == Some(canonical.as_path())
+            ),
+            "{canonical:?} not in {open:?}"
+        );
+        assert!(open
+            .iter()
+            .any(|file| codex_rollout_id(file).as_deref() == Some(THREAD_A)));
     }
 }

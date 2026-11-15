@@ -78,7 +78,7 @@ import {
   workspaceFolder,
   workspaceLiveSessionCount,
 } from "@/lib/workspaces";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId, queuedLaunch } from "./agent-command";
 import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
@@ -973,7 +973,11 @@ export function WorkspaceTabs({
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
           if (agent)
-            pendingLaunch.set(copy.id, copy.host_id, agentLaunchCommand(agent, conversation));
+            pendingLaunch.set(
+              copy.id,
+              copy.host_id,
+              queuedLaunch((options) => agentLaunchCommand(agent, conversation, options)),
+            );
         }
         const next = duplicateTab(
           layout,

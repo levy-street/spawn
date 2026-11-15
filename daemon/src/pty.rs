@@ -490,6 +490,11 @@ impl ForwarderControl {
         }
     }
 
+    /// The basename the worker last reported in the foreground, if any.
+    pub(crate) fn foreground(&self) -> Option<String> {
+        self.foreground.lock().ok()?.observed.clone()
+    }
+
     /// Record a worker foreground report and relay it to the server as
     /// `session.foreground`: emitted only when the basename changes, at most
     /// once per `FOREGROUND_MIN_INTERVAL` per session. A change that lands

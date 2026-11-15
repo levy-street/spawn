@@ -46,10 +46,20 @@ src/
                  CODEX_HOME name, by Claude Code's exact folder rule — pinned
                  by proto/claude-project-folder.json; reading stays with
                  host_files.rs; host_conv.rs answers `conv.inspect` from a
-                 window's process tree and Claude Code's live-session
-                 registry, and executes nothing), codex_home.rs (a skilled
-                 window's own CODEX_HOME, reconciled against the user's — see
-                 "A skilled window's home"), upload.rs, sessions.rs,
+                 window's process tree, Claude Code's live-session
+                 registry and the thread files a Codex holds open (none,
+                 when Codex keeps its threads in its shared background
+                 server: then it names no thread), notes each Codex
+                 window's thread for restarts after Codex has gone —
+                 `<config>/conversations/<session id>.json`, dropped on the
+                 window's every `session.kill`, archiving included — and
+                 executes nothing), codex_launch.rs (whether a window's
+                 `codex` accepts `--no-daemon`, for `conv.launch`: `codex
+                 --no-daemon --version` with the environment its shell was
+                 started with, in its folder; nothing kept, no timer),
+                 codex_home.rs (a skilled window's own CODEX_HOME,
+                 reconciled against the user's — see "A skilled window's
+                 home"), upload.rs, sessions.rs,
                  service.rs + service/ (launchd/systemd dispatch, Windows Task
                  Scheduler/Run watchdog and control pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame

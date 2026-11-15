@@ -64,6 +64,12 @@ pub fn window_homes_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("sessions"))
 }
 
+/// Where spawnd notes the Codex thread it last saw each window in, one
+/// `<session id>.json` per window (`host_conv::ConversationMemory`).
+pub fn conversation_notes_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("conversations"))
+}
+
 /// Build the websocket URL for `/ws/daemon` from the server URL.
 pub fn ws_url(server: &Url) -> Result<Url> {
     let mut ws = server.clone();
