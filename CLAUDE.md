@@ -40,17 +40,21 @@ Windows runs on every master push so a later web-only commit can still release
 earlier undeployed daemon changes; pull-request Windows checks are path-filtered.
 To retry a partial deployment, `deploy-prod.sh --resume` retains the original
 acceptance evidence and accepts only the tested baseline/candidate identities;
-see `docs/RELEASE.md` for the exact-candidate retry procedure.
+see `docs/RELEASE.md` for the exact-candidate retry procedure. A deploy run by
+hand publishes no mobile OTA unless `SPAWN_DEPLOY_MOBILE=1`, which is right only
+when that candidate's release plan said `mobile_native_build=no`.
 A push never starts an EAS store build. `scripts/release-plan.sh` compares each
 platform's native fingerprint with its last production build; on a native
 change, or a check that cannot answer, the release withholds the mobile OTA,
 still deploys server/web/daemon, and fails at "require the owed store builds".
-A person then starts only the owed platforms' builds: dispatch
+A person then starts only the owed platforms' builds, after reading the
+runtime warning in `docs/RELEASE.md` ("The phone"): dispatch
 `mobile-store-recovery.yml` on master with that `release_run` and
-`operation=inspect` first, then `build-ios` or `build-android`. It retains the
-original plan and acceptance identity, uses the protected production Expo token,
-and refuses duplicate builds or submissions. `docs/RELEASE.md` documents the
-per-platform recovery operations.
+`operation=inspect` first, then `build-ios` or `build-android`, one at a time
+while no release run is queued. Never "Re-run all jobs" on such a release. It
+retains the original plan and acceptance identity, uses the protected
+production Expo token, and refuses duplicate builds or submissions.
+`docs/RELEASE.md` documents the per-platform recovery operations.
 Daemon publication stages a complete signed snapshot under prebuilt `releases/`;
 `scripts/activate-prebuilt.py` verifies it before atomically switching `current`.
 The API resolves that pointer once per request; interrupted uploads leave the

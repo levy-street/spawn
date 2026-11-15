@@ -90,6 +90,9 @@ jobs:
       mobile_native_ios: ${{ steps.plan.outputs.mobile_native_ios }}
       mobile_native_android: ${{ steps.plan.outputs.mobile_native_android }}
       mobile_native_reason: ${{ steps.plan.outputs.mobile_native_reason }}
+      mobile_runtime: ${{ steps.plan.outputs.mobile_runtime }}
+      mobile_native_ios_runtime: ${{ steps.plan.outputs.mobile_native_ios_runtime }}
+      mobile_native_android_runtime: ${{ steps.plan.outputs.mobile_native_android_runtime }}
       desktop_publish: ${{ steps.plan.outputs.desktop_publish }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -136,7 +139,8 @@ jobs:
           for key in ("deploy", "daemon_prebuilts", "mobile_ota", "desktop_publish"):
               print(f"{key}={str(plan[key]).lower()}")
           for key in ("mobile_native_build", "mobile_native_ios", "mobile_native_android",
-                      "mobile_native_reason"):
+                      "mobile_native_reason", "mobile_runtime", "mobile_native_ios_runtime",
+                      "mobile_native_android_runtime"):
               print(f"{key}={' '.join(str(plan[key]).split())}")
           PY
 
@@ -310,7 +314,11 @@ jobs:
           IOS: ${{ needs.plan.outputs.mobile_native_ios }}
           ANDROID: ${{ needs.plan.outputs.mobile_native_android }}
           REASON: ${{ needs.plan.outputs.mobile_native_reason }}
+          RUNTIME: ${{ needs.plan.outputs.mobile_runtime }}
+          IOS_RUNTIME: ${{ needs.plan.outputs.mobile_native_ios_runtime }}
+          ANDROID_RUNTIME: ${{ needs.plan.outputs.mobile_native_android_runtime }}
           BASELINE: ${{ needs.plan.outputs.baseline }}
+          CANDIDATE: ${{ github.sha }}
           RELEASE_RUN: ${{ github.run_id }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: |
@@ -318,6 +326,21 @@ jobs:
           owed=()
           [[ "$IOS" != yes ]] || owed+=(ios)
           [[ "$ANDROID" != yes ]] || owed+=(android)
+          # Does a build from this run keep the runtime the installed apps have?
+          # Then the next JavaScript-only release reaches them all.
+          # The strongest finding wins: same, then unsure, then new.
+          same=0; unsure=0; [[ ${#owed[@]} -gt 0 ]] || unsure=1
+          for platform in "${owed[@]}"; do
+            shell="$IOS_RUNTIME"; [[ "$platform" == ios ]] || shell="$ANDROID_RUNTIME"
+            if [[ -z "$RUNTIME" || "$RUNTIME" == unknown || -z "$shell" || "$shell" == unknown ]]; then
+              unsure=1
+            elif [[ "$shell" == "$RUNTIME" ]]; then
+              same=1
+            fi
+          done
+          runtime_check=new
+          [[ "$unsure" == 0 ]] || runtime_check=unsure
+          [[ "$same" == 0 ]] || runtime_check=same
           {
             if [[ "$VERDICT" == yes ]]; then
               echo "### Phones were not updated: a store build is owed (${owed[*]:-see the plan})"
@@ -328,8 +351,45 @@ jobs:
               echo
               echo "Deploy job: **$DEPLOY_RESULT**. It published no over-the-air update,"
               echo "because one would reach phones whose native shell cannot run it. A release"
-              echo "never starts a store build; if this native change is intended, start one"
-              echo "for each platform named above, once the deploy job here has succeeded:"
+              echo "never starts a store build."
+              echo
+              echo "#### Before building: the runtime version"
+              echo
+              echo "This commit's updates carry runtime \`${RUNTIME:-unknown}\`. The last iOS build has"
+              echo "\`${IOS_RUNTIME:-unknown}\`, the last Android build \`${ANDROID_RUNTIME:-unknown}\`."
+              case "$runtime_check" in
+                same)
+                  echo
+                  echo "**A build from this run keeps runtime \`$RUNTIME\`.** Store builds reach TestFlight"
+                  echo "and Play internal testing, not the public. The next release that changes"
+                  echo "only JavaScript will match that new build and publish an over-the-air update"
+                  echo "to every installed app on \`$RUNTIME\`, including the public ones without this"
+                  echo "native change. **If the new JavaScript cannot run on the app people already"
+                  echo "have, do not build from this run:** bump \`expo.version\` in \`mobile/app.json\`"
+                  echo "first, and build from the release of that commit."
+                  ;;
+                new)
+                  echo
+                  echo "The runtime differs, so installed apps on the old runtime will not receive"
+                  echo "updates published for this one; they keep their JavaScript until they"
+                  echo "install the new build."
+                  ;;
+                *)
+                  echo
+                  echo "The runtimes could not be compared. Before building, check \`expo.version\`"
+                  echo "in \`mobile/app.json\` against the apps people have installed: on an unchanged"
+                  echo "runtime, the next JavaScript-only release reaches all of them."
+                  ;;
+              esac
+              echo
+              echo "#### Building deliberately"
+              echo
+              echo "If this native change is meant to ship on that runtime, once the deploy job"
+              echo "here has succeeded, start a build for each platform named above and no"
+              echo "other. Run these **one at a time**, each after the previous run has finished"
+              echo "and while no release run is queued: they share the \`release\` concurrency"
+              echo "group, and a newly queued run cancels any run already waiting in it,"
+              echo "including a pending master release."
               echo
               echo '```'
               echo "gh workflow run mobile-store-recovery.yml --ref master -f release_run=$RELEASE_RUN -f operation=inspect"
@@ -338,8 +398,9 @@ jobs:
               done
               echo '```'
               echo
-              echo "Then run inspect until the builds and their submissions finish. See"
-              echo "\"Recover native store builds after deployment\" in docs/RELEASE.md."
+              echo "A platform left unbuilt stays at yes and stops every later release that"
+              echo "changes \`mobile/\`. Then run inspect until the builds and their submissions"
+              echo "finish. See \"Recover native store builds after deployment\" in docs/RELEASE.md."
             else
               echo "### Phones were not updated: the native shell check did not answer"
               echo
@@ -347,21 +408,33 @@ jobs:
               echo
               echo "Deploy job: **$DEPLOY_RESULT**; server, web and daemon do not wait on this"
               echo "check. Nothing was published to phones, because nothing proved this tree"
-              echo "still fits the shell they run, and no store build was started. On a clean,"
-              echo "up-to-date master checkout where Expo is signed in, ask again for the"
-              echo "commit you would publish:"
+              echo "still fits the shell they run, and no store build was started. Ask again for"
+              echo "exactly this commit, where Expo is signed in. \`npm ci\` matters: the"
+              echo "fingerprint finds native modules through \`mobile/node_modules\`, so a stale"
+              echo "install can miss a new native dependency."
               echo
               echo '```'
-              echo "scripts/release-plan.sh --from $BASELINE --to HEAD"
+              echo "git fetch origin && git checkout --detach $CANDIDATE"
+              echo "(cd mobile && npm ci)"
+              echo "scripts/release-plan.sh --from $BASELINE --to $CANDIDATE"
               echo '```'
               echo
-              echo "If its mobile store build is **no**, publish from that checkout with"
-              echo "\`scripts/update-mobile-prod.sh -m \"<summary>\"\`. If it is **yes**, a store"
-              echo "build is owed for the platforms it names; see \"The phone\" in"
-              echo "docs/RELEASE.md, and publish no update until that shell is out."
+              echo "If its mobile store build is **no**, publish exactly $CANDIDATE and nothing"
+              echo "newer: master may be ahead of the server this run deployed. Run"
+              echo "\`scripts/update-mobile-prod.sh -m \"<summary>\"\` on master only if master is"
+              echo "still at that commit; otherwise from an exact-candidate branch with"
+              echo "\`--allow-branch\` (\"The master pipeline\" in docs/RELEASE.md). If it is"
+              echo "**yes**, publish nothing: a store build is owed for the platforms it names;"
+              echo "read \"The phone\" in docs/RELEASE.md, runtime warning included, first."
             fi
+            echo
+            echo "Do not use **Re-run all jobs** on this release: it plans again from production,"
+            echo "where this commit is already deployed, turns the run green and leaves nothing"
+            echo "for store recovery to bind to. **Re-run failed jobs** is fine. Until an update"
+            echo "for this tree is published, \`scripts/verify-release.sh\` reports \`mobile.tree\`"
+            echo "as not matching; that is expected, and a store build alone does not change it."
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "::error title=Phones were not updated::mobile_native_build=$VERDICT (ios=${IOS:-?}, android=${ANDROID:-?}); no OTA was published and no store build was started. See this job's summary for the manual step."
+          echo "::error title=Phones were not updated::mobile_native_build=$VERDICT (ios=${IOS:-?}, android=${ANDROID:-?}, runtime=${RUNTIME:-?}); no OTA was published and no store build was started. See this job's summary for the manual step."
           exit 1
 
   # desktop.yml builds and signs the app on the same push. Promoting those

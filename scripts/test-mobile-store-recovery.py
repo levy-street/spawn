@@ -32,6 +32,13 @@ SHA = "a" * 40
 BASE = "b" * 40
 
 
+# Every key of release-plan.sh's JSON that release.yml passes on as a plan output.
+PLAN_KEYS = {"deploy", "daemon_prebuilts", "mobile_ota", "desktop_publish",
+             "mobile_native_build", "mobile_native_ios", "mobile_native_android",
+             "mobile_native_reason", "mobile_runtime", "mobile_native_ios_runtime",
+             "mobile_native_android_runtime"}
+
+
 def release_workflow():
     return yaml.load((ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader)
 
@@ -195,7 +202,9 @@ class ReleaseWorkflowStoreRule(unittest.TestCase):
         [step] = job["steps"]
         with tempfile.TemporaryDirectory() as directory:
             summary = Path(directory) / "summary.md"
-            values = {"BASELINE": BASE, "RELEASE_RUN": "123456", "DEPLOY_RESULT": "success",
+            values = {"BASELINE": BASE, "CANDIDATE": SHA, "RELEASE_RUN": "123456",
+                      "DEPLOY_RESULT": "success", "RUNTIME": "1.0.0", "IOS_RUNTIME": "1.0.0",
+                      "ANDROID_RUNTIME": "1.0.0",
                       "REASON": "the reason", "GITHUB_STEP_SUMMARY": str(summary),
                       "PATH": os.environ["PATH"], **env}
             result = subprocess.run(["bash", "-e", "-c", step["run"]], env=values,
@@ -214,14 +223,59 @@ class ReleaseWorkflowStoreRule(unittest.TestCase):
                 self.assertIn("mobile-store-recovery.yml --ref master -f release_run=123456 -f operation=inspect", summary)
                 for platform in ("ios", "android"):
                     self.assertEqual(f"operation=build-{platform}" in summary, platform in owed)
+                # Dispatches share the release concurrency group: one at a time.
+                self.assertIn("one at a time", summary)
+                self.assertIn("left unbuilt stays at yes", summary)
 
-    def test_unknown_withholds_and_asks_a_person_never_a_build(self):
+    def test_native_change_on_the_installed_runtime_warns_before_any_build(self):
+        same = "do not build from this run"
+        for runtimes, warned, phrase in (
+            ({"RUNTIME": "1.0.0", "IOS_RUNTIME": "1.0.0", "ANDROID_RUNTIME": "1.0.0"}, True, "keeps runtime `1.0.0`"),
+            # One owed platform on the installed runtime is enough to warn.
+            ({"RUNTIME": "1.0.0", "IOS_RUNTIME": "unknown", "ANDROID_RUNTIME": "1.0.0"}, True, "keeps runtime"),
+            ({"RUNTIME": "1.1.0", "IOS_RUNTIME": "1.0.0", "ANDROID_RUNTIME": "1.0.0"}, False, "runtime differs"),
+            ({"RUNTIME": "unknown", "IOS_RUNTIME": "1.0.0", "ANDROID_RUNTIME": "1.0.0"}, False, "could not be compared"),
+            ({"RUNTIME": "1.0.0", "IOS_RUNTIME": "", "ANDROID_RUNTIME": ""}, False, "could not be compared"),
+        ):
+            with self.subTest(**runtimes):
+                result, summary = self.stop(VERDICT="yes", IOS="yes", ANDROID="yes", **runtimes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(same in summary, warned)
+                self.assertEqual("bump `expo.version`" in summary, warned)
+                self.assertIn(phrase, summary)
+                self.assertIn(f"carry runtime `{runtimes['RUNTIME'] or 'unknown'}`", summary)
+
+    def test_unknown_withholds_and_asks_for_exactly_this_commit_never_a_build(self):
         result, summary = self.stop(VERDICT="unknown", IOS="unknown", ANDROID="no")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("did not answer", summary)
-        self.assertIn(f"scripts/release-plan.sh --from {BASE} --to HEAD", summary)
+        # Pinned to the run: master's tip may be newer than the deployed server,
+        # and a stale install can hide a new native module from the fingerprint.
+        self.assertIn(f"git fetch origin && git checkout --detach {SHA}", summary)
+        self.assertIn("(cd mobile && npm ci)", summary)
+        self.assertIn(f"scripts/release-plan.sh --from {BASE} --to {SHA}", summary)
+        self.assertNotIn("--to HEAD", summary)
         self.assertIn("scripts/update-mobile-prod.sh", summary)
         self.assertNotIn("operation=build-", summary)
+
+    def test_every_stop_warns_off_rerun_all_and_explains_verify_release(self):
+        for verdict in ("yes", "unknown"):
+            with self.subTest(verdict=verdict):
+                _, summary = self.stop(VERDICT=verdict, IOS="yes", ANDROID="unknown")
+                self.assertIn("Do not use **Re-run all jobs**", summary)
+                self.assertIn("**Re-run failed jobs** is fine", summary)
+                self.assertIn("`scripts/verify-release.sh` reports `mobile.tree`", summary)
+
+    def test_every_plan_output_the_release_reads_is_declared_and_produced(self):
+        text = (ROOT / ".github/workflows/release.yml").read_text()
+        read = set(re.findall(r"needs\.plan\.outputs\.(\w+)", text))
+        declared = set(self.workflow["jobs"]["plan"]["outputs"])
+        self.assertLessEqual(read, declared)
+        [step] = [step for step in self.workflow["jobs"]["plan"]["steps"] if step.get("id") == "plan"]
+        for name in declared - {"baseline"}:
+            with self.subTest(output=name):
+                self.assertIn(f'"{name}"', step["run"])
+        self.assertLessEqual(declared - {"baseline"}, PLAN_KEYS)
 
 
 # A stand-in for eas-cli that behaves like Expo where it matters: the
@@ -252,7 +306,7 @@ FAKE_EAS = textwrap.dedent("""\
         mode = os.environ.get("FAKE_EAS_LIST", "ok")
         if mode == "fail":
             sys.exit(1)
-        build = builds.get(option("--platform"))
+        build = builds.get(option("--platform"))  # carries runtime.version, as EAS does
         print(json.dumps([] if mode == "empty" or not build else [build]))
     elif args[0] == "fingerprint:compare":
         if os.environ.get("FAKE_EAS_COMPARE") == "fail":
@@ -298,6 +352,8 @@ class ReleasePlanTests(unittest.TestCase):
         self.git("init", "-q")
         for piece in ("server", "web", "daemon", "desktop"):
             self.write(f"{piece}/README", piece)
+        self.write("mobile/app.json", json.dumps({"expo": {
+            "version": "1.2.3", "runtimeVersion": {"policy": "appVersion"}}}))
         self.write("mobile/eas.json", json.dumps({"build": {
             "base": {"channel": "base"},
             "production": {"extends": "base", "env": {"EXPO_PUBLIC_API_URL": "https://example.invalid"}}}}))
@@ -305,8 +361,10 @@ class ReleasePlanTests(unittest.TestCase):
         self.write("mobile/native-android.txt", "android shell 1")
         self.write("mobile/app.ts", "export const screen = 1;")
         self.built = self.commit("the commit both production builds were made from")
-        self.builds = {"ios": {"id": "11111111-1111-4111-8111-111111111111", "gitCommitHash": self.built},
-                       "android": {"id": "22222222-2222-4222-8222-222222222222", "gitCommitHash": self.built}}
+        self.builds = {"ios": {"id": "11111111-1111-4111-8111-111111111111", "gitCommitHash": self.built,
+                               "runtime": {"version": "1.2.3"}},
+                       "android": {"id": "22222222-2222-4222-8222-222222222222", "gitCommitHash": self.built,
+                                   "runtime": {"version": "1.2.3"}}}
 
     def git(self, *args):
         return subprocess.check_output(["git", *args], cwd=self.repo, env=self.env, text=True).strip()
@@ -417,6 +475,57 @@ class ReleasePlanTests(unittest.TestCase):
         self.write("mobile/native-ios.txt", "uncommitted native change")
         plan, _ = self.plan("--from", self.built, "--to", candidate)
         self.assertEqual(plan["mobile_native_build"], "unknown")
+
+    def test_an_inherited_value_no_build_had_is_never_hashed(self):
+        # The build's profile set no API URL, so its config had none. A shell
+        # value would put one into this tree's config and read as native.
+        self.write("mobile/eas.json", json.dumps({"build": {"production": {"channel": "production"}}}))
+        built = self.commit("built from a profile without env")
+        self.builds = {platform: {**build, "gitCommitHash": built} for platform, build in self.builds.items()}
+        self.write("mobile/app.ts", "export const screen = 2;")
+        candidate = self.commit("JavaScript")
+        plan, _ = self.plan("--from", built, "--to", candidate, EXPO_PUBLIC_API_URL="http://localhost:3000")
+        self.assertEqual(plan["mobile_native_build"], "no", plan["mobile_native_reason"])
+
+    def test_a_check_that_falls_over_is_unknown_never_no(self):
+        # A build whose commit has no mobile/ tree makes the per-platform check
+        # die without a verdict; the plan must not read that silence as "no".
+        empty_tree = self.git("hash-object", "-t", "tree", "/dev/null")
+        rootless = self.git("commit-tree", empty_tree, "-m", "a commit without mobile/")
+        self.builds["ios"]["gitCommitHash"] = rootless
+        self.write("mobile/app.ts", "export const screen = 2;")
+        candidate = self.commit("JavaScript")
+        plan, _ = self.plan("--from", self.built, "--to", candidate)
+        self.assertEqual(plan["mobile_native_ios"], "unknown")
+        self.assertIn("ios fingerprint check failed", plan["mobile_native_ios_reason"])
+        self.assertEqual(plan["mobile_native_android"], "no")
+        self.assertEqual(plan["mobile_native_build"], "unknown")
+
+    def test_runtime_of_this_tree_and_of_each_last_build_is_reported(self):
+        self.write("mobile/native-ios.txt", "ios shell 2")
+        candidate = self.commit("native iOS change on the installed runtime")
+        plan, _ = self.plan("--from", self.built, "--to", candidate)
+        self.assertEqual((plan["mobile_runtime"], plan["mobile_native_ios_runtime"],
+                          plan["mobile_native_android_runtime"]), ("1.2.3", "1.2.3", "1.2.3"))
+        self.write("mobile/app.json", json.dumps({"expo": {
+            "version": "1.3.0", "runtimeVersion": {"policy": "appVersion"}}}))
+        bumped = self.commit("version bump")
+        plan, _ = self.plan("--from", self.built, "--to", bumped)
+        self.assertEqual((plan["mobile_runtime"], plan["mobile_native_ios_runtime"]), ("1.3.0", "1.2.3"))
+        self.write("mobile/app.json", json.dumps({"expo": {
+            "version": "1.3.0", "runtimeVersion": {"policy": "fingerprint"}}}))
+        other = self.commit("a runtime policy the plan does not compute")
+        plan, _ = self.plan("--from", self.built, "--to", other)
+        self.assertEqual(plan["mobile_runtime"], "unknown")
+        del self.builds["android"]["runtime"]
+        plan, _ = self.plan("--from", self.built, "--to", other)
+        self.assertEqual(plan["mobile_native_android_runtime"], "unknown")
+
+    def test_plan_reports_every_key_the_release_reads(self):
+        self.write("mobile/app.ts", "export const screen = 2;")
+        candidate = self.commit("JavaScript")
+        plan, _ = self.plan("--from", self.built, "--to", candidate)
+        self.assertLessEqual(PLAN_KEYS, set(plan))
 
     def test_plan_log_stays_readable_by_store_recovery(self):
         self.write("mobile/native-ios.txt", "ios shell 2")

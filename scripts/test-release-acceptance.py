@@ -619,6 +619,8 @@ else:
     def test_resume_retries_failed_ota_even_when_remote_checkout_already_is_candidate(
         self,
     ):
+        # release.yml sets this only when its plan said mobile_native_build=no.
+        self.env["SPAWN_DEPLOY_MOBILE"] = "1"
         first = self.deploy("--resume")
         self.assertNotEqual(first.returncode, 0)
         self.assertIn("mobile OTA failed", first.stderr, first.stdout + first.stderr)
@@ -628,6 +630,23 @@ else:
         self.assertEqual(
             (self.directory / "ota-attempts").read_text(), "publish\npublish\n"
         )
+
+    def test_a_deploy_publishes_no_ota_unless_the_plan_said_the_shell_fits(self):
+        # A hand-run --resume must not publish what the release withheld: only
+        # the plan knows whether the phones' native shell can run this tree.
+        for value in (None, "0", "true", "yes"):
+            with self.subTest(SPAWN_DEPLOY_MOBILE=value):
+                (self.directory / "ota-attempts").unlink(missing_ok=True)
+                self.env.pop("SPAWN_DEPLOY_MOBILE", None)
+                if value is not None:
+                    self.env["SPAWN_DEPLOY_MOBILE"] = value
+                result = self.deploy("--resume")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("deploy-prod: complete", result.stdout)
+                self.assertIn("NOT published", result.stdout)
+                self.assertIn("only if the original release plan", result.stdout)
+                self.assertIn("mobile_native_build=no", result.stdout)
+                self.assertFalse((self.directory / "ota-attempts").exists())
 
 
 class CITests(unittest.TestCase):

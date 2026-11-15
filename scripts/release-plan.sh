@@ -32,9 +32,19 @@ JavaScript that calls native code the shell does not have. That is when a
 store build is owed, and it is the only time it is owed.
 
 It is asked per platform, against the last finished production build of that
-platform, because a store build is per platform: an Android-only native change
-owes an Android build and nothing else. Each answer is yes/no/unknown, and
-mobile_native_build is "yes" if either is yes, else "unknown" if either is.
+platform, because a store build is per platform. The two fingerprints differ
+only in platform-specific native inputs: native module code and autolinking
+for that platform, and its own icon, splash and service files. Everything
+else is in both: the whole app config (ios and android sections alike), config
+plugin code, mobile/package.json scripts, mobile/.gitignore, eas.json and
+patches/. So only a native module or asset change can owe one platform alone;
+a config, eas.json or patch change owes both. Each answer is yes/no/unknown,
+and mobile_native_build is "yes" if either is yes, else "unknown" if either is.
+
+It also reports the runtime version this tree's OTA would carry and the one
+each platform's last build has. Every install on a runtime receives every OTA
+published for it, so a native change on an unchanged runtime reaches the
+phones that lack it with the next JavaScript-only release.
 Owing a store build never starts one; see "The phone" in docs/RELEASE.md.
 EOF
 }
@@ -88,8 +98,28 @@ except Exception:
     builds = []
 build = builds[0] if isinstance(builds, list) and builds and isinstance(builds[0], dict) else {}
 build_id, commit = str(build.get("id") or ""), str(build.get("gitCommitHash") or "")
+runtime = build.get("runtime")
+runtime = str((runtime.get("version") if isinstance(runtime, dict) else build.get("runtimeVersion")) or "")
 print(build_id if re.fullmatch(r"[0-9a-f-]{36}", build_id) else "-",
-      commit if re.fullmatch(r"[0-9a-f]{40}", commit) else "-")
+      commit if re.fullmatch(r"[0-9a-f]{40}", commit) else "-",
+      runtime if re.fullmatch(r"[A-Za-z0-9._+-]{1,64}", runtime) else "-")
+EOF
+)"
+# The runtime version an OTA of this tree would carry. app.json holds it and
+# app.config.ts sets neither version nor runtimeVersion; any policy other than
+# appVersion (or a literal) is reported as unknown rather than computed.
+runtime_py="$(cat <<'EOF'
+import json, re, sys
+try:
+    app = json.load(sys.stdin)
+    expo = app.get("expo", app)
+    policy = expo.get("runtimeVersion")
+    runtime = policy if isinstance(policy, str) else (
+        expo.get("version") if isinstance(policy, dict) and policy.get("policy") == "appVersion" else "")
+except Exception:
+    runtime = ""
+runtime = str(runtime or "")
+print(runtime if re.fullmatch(r"[A-Za-z0-9._+-]{1,64}", runtime) else "unknown")
 EOF
 )"
 profile_env_py="$(cat <<'EOF'
@@ -111,7 +141,7 @@ EOF
 )"
 compare_py="$(cat <<'EOF'
 import json, sys
-build_id = sys.argv[1]
+build_id, runtime = sys.argv[1], sys.argv[2]
 try:
     answer = json.load(sys.stdin)
 except Exception:
@@ -121,10 +151,10 @@ if not isinstance(answer, dict):
 first, second = answer.get("fingerprint1") or {}, answer.get("fingerprint2") or {}
 a, b = first.get("hash"), second.get("hash")
 if not (a and b):
-    print(f"unknown\tthe fingerprint comparison with build {build_id} did not answer")
+    print(f"unknown\t{runtime}\tthe fingerprint comparison with build {build_id} did not answer")
     raise SystemExit
 if a == b:
-    print(f"no\tthe native fingerprint still matches build {build_id}")
+    print(f"no\t{runtime}\tthe native fingerprint still matches build {build_id}")
     raise SystemExit
 
 # Name what differs (sources and config keys, never values) so whoever decides
@@ -155,12 +185,13 @@ for name in sorted(set(x) | set(y)):
     except Exception:
         changed.append(name)
 detail = ", ".join(changed[:6]) + (", ..." if len(changed) > 6 else "")
-print(f"yes\tthe native fingerprint no longer matches build {build_id}"
+print(f"yes\t{runtime}\tthe native fingerprint no longer matches build {build_id}"
       + (f": {detail}" if detail else ""))
 EOF
 )"
 
-# One platform's native verdict, printed as "<yes|no|unknown><TAB><reason>".
+# One platform's native verdict, printed as
+# "<yes|no|unknown><TAB><that build's runtime version><TAB><reason>".
 #
 # Expo's fingerprint hashes the whole evaluated app config, `extra` included,
 # and app.config.ts stamps two values there that are not native: the mobile
@@ -172,24 +203,26 @@ EOF
 # So the comparison evaluates this tree with the build's own stamp and the
 # build profile's env, and everything else is left for Expo to judge.
 native_verdict() { # platform
-  local platform="$1" listing build_id="-" build_commit="-" build_tree line
+  local platform="$1" listing build_id="-" build_commit="-" build_runtime="-" build_tree line
   listing="$(
     cd mobile && "${eas_bin[@]}" build:list \
       --platform "$platform" --buildProfile production --status finished \
       --limit 1 --non-interactive --json 2>/dev/null || true
   )"
-  read -r build_id build_commit < <(python3 -c "$latest_build_py" <<<"$listing") || true
+  read -r build_id build_commit build_runtime < <(python3 -c "$latest_build_py" <<<"$listing") || true
+  [[ "${build_runtime:--}" != "-" ]] || build_runtime="unknown"
   if [[ "${build_id:--}" == "-" ]]; then
-    printf 'unknown\tno finished production %s build to compare against\n' "$platform"
+    printf 'unknown\tunknown\tno finished production %s build to compare against\n' "$platform"
     return
   fi
   if [[ "${build_commit:--}" == "-" ]] || ! git cat-file -e "$build_commit^{commit}" 2>/dev/null; then
-    printf 'unknown\tbuild %s names no commit in this repository, so its config cannot be reproduced\n' "$build_id"
+    printf 'unknown\t%s\tbuild %s names no commit in this repository, so its config cannot be reproduced\n' \
+      "$build_runtime" "$build_id"
     return
   fi
   build_tree="$(git rev-parse "$build_commit:mobile")"
   if [[ "$build_tree" == "$(git rev-parse "$to:mobile")" ]]; then
-    printf 'no\tbuild %s was made from this mobile tree\n' "$build_id"
+    printf 'no\t%s\tbuild %s was made from this mobile tree\n' "$build_runtime" "$build_id"
     return
   fi
 
@@ -206,13 +239,16 @@ native_verdict() { # platform
   (
     cd mobile && env "${run_env[@]}" "${eas_bin[@]}" fingerprint:compare \
       --build-id "$build_id" --json --non-interactive 2>/dev/null || true
-  ) | python3 -c "$compare_py" "$build_id"
+  ) | python3 -c "$compare_py" "$build_id" "$build_runtime"
 }
 
 # The native shell question. Only asked when mobile changed at all: an
 # unchanged mobile tree cannot have changed its fingerprint.
 native_ios="no"; native_ios_reason="the mobile tree is unchanged"
 native_android="no"; native_android_reason="the mobile tree is unchanged"
+native_ios_runtime="unknown"; native_android_runtime="unknown"
+mobile_runtime="$(git show "$to:mobile/app.json" 2>/dev/null | python3 -c "$runtime_py" || true)"
+[[ -n "$mobile_runtime" ]] || mobile_runtime="unknown"
 if [[ "$mobile_changed" == true ]]; then
   skip=""
   if [[ "$do_fingerprint" != 1 ]]; then
@@ -229,13 +265,16 @@ if [[ "$mobile_changed" == true ]]; then
     # update-mobile-prod.sh.
     eas_bin=(eas)
     command -v eas >/dev/null 2>&1 || eas_bin=(npx --yes eas-cli)
-    IFS=$'\t' read -r native_ios native_ios_reason < <(native_verdict ios) || true
-    IFS=$'\t' read -r native_android native_android_reason < <(native_verdict android) || true
+    IFS=$'\t' read -r native_ios native_ios_runtime native_ios_reason < <(native_verdict ios) || true
+    IFS=$'\t' read -r native_android native_android_runtime native_android_reason \
+      < <(native_verdict android) || true
     # A check that fell over is a check that did not answer, never a "no".
     [[ "$native_ios" =~ ^(yes|no|unknown)$ ]] ||
       { native_ios="unknown"; native_ios_reason="the ios fingerprint check failed"; }
     [[ "$native_android" =~ ^(yes|no|unknown)$ ]] ||
       { native_android="unknown"; native_android_reason="the android fingerprint check failed"; }
+    [[ -n "$native_ios_runtime" ]] || native_ios_runtime="unknown"
+    [[ -n "$native_android_runtime" ]] || native_android_runtime="unknown"
   fi
 fi
 
@@ -257,10 +296,12 @@ if [[ "$as_json" == 1 ]]; then
     "$server_changed" "$daemon_changed" "$mobile_changed" \
     "$mobile_native" "$mobile_native_reason" \
     "$native_ios" "$native_ios_reason" "$native_android" "$native_android_reason" \
+    "$mobile_runtime" "$native_ios_runtime" "$native_android_runtime" \
     "$desktop_changed" <<'EOF'
 import json, sys
 (base, candidate, deploy, daemon, mobile, native, reason,
- ios, ios_reason, android, android_reason, desktop) = sys.argv[1:]
+ ios, ios_reason, android, android_reason,
+ runtime, ios_runtime, android_runtime, desktop) = sys.argv[1:]
 print(json.dumps({
     "from": base,
     "to": candidate,
@@ -273,6 +314,9 @@ print(json.dumps({
     "mobile_native_ios_reason": ios_reason,
     "mobile_native_android": android,
     "mobile_native_android_reason": android_reason,
+    "mobile_runtime": runtime,
+    "mobile_native_ios_runtime": ios_runtime,
+    "mobile_native_android_runtime": android_runtime,
     "desktop_publish": desktop == "true",
 }, indent=2))
 EOF
@@ -284,6 +328,9 @@ printf '  deploy server + web    %s\n' "$server_changed"
 printf '  daemon prebuilts       %s\n' "$daemon_changed"
 printf '  mobile OTA             %s\n' "$mobile_changed"
 printf '  mobile store build     %s\n' "$mobile_native"
-printf '    ios                  %s  (%s)\n' "$native_ios" "$native_ios_reason"
-printf '    android              %s  (%s)\n' "$native_android" "$native_android_reason"
+printf '    ios                  %s  (%s; build runtime %s)\n' \
+  "$native_ios" "$native_ios_reason" "$native_ios_runtime"
+printf '    android              %s  (%s; build runtime %s)\n' \
+  "$native_android" "$native_android_reason" "$native_android_runtime"
+printf '  mobile runtime         %s\n' "$mobile_runtime"
 printf '  desktop publish        %s\n' "$desktop_changed"

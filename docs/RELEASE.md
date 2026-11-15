@@ -508,11 +508,26 @@ calls native code their shell does not have. Most releases do not need one;
 this is how a release knows it is one of the ones that does.
 
 It is asked **per platform**, each against that platform's last finished
-production build, because a store build is per platform: an Android-only
-native change owes an Android build and nothing else. The plan reports
-`mobile_native_ios` and `mobile_native_android` (yes/no/unknown, each with a
-reason naming the build and, for a yes, the fingerprint sources that differ);
-`mobile_native_build` is yes if either is, else unknown if either is.
+production build, because a store build is per platform. The two fingerprints
+differ only in platform-specific native inputs: each native module's code and
+autolinking for that platform, and that platform's own icon, splash and
+service files. Everything else goes into both: the whole app config (its `ios`
+and `android` sections alike), config plugin code, `mobile/package.json`
+scripts, `mobile/.gitignore`, all of `eas.json` and `patches/`. So only a
+native module or asset change can owe one platform alone; a config, `eas.json`
+or patch change reads yes on both, and building only one leaves the other at
+yes, stopping every later release that changes `mobile/` until it is built.
+The plan reports `mobile_native_ios` and `mobile_native_android`
+(yes/no/unknown, each with a reason naming the build and, for a yes, the
+fingerprint sources that differ); `mobile_native_build` is yes if either is,
+else unknown if either is.
+
+It also reports `mobile_runtime`, the runtime version an update of this tree
+would carry (from `mobile/app.json`), and `mobile_native_ios_runtime` /
+`mobile_native_android_runtime`, the runtime of each platform's last build.
+Every build so far shares runtime `0.1.0`, because `runtimeVersion` follows an
+unchanged `version`, and every installed app on a runtime receives every update
+published for it. See the runtime warning in "The phone" before building.
 
 The fingerprint hashes the whole evaluated app config, `extra` included, and
 `app.config.ts` stamps two values there that are not native: `extra.mobileTree`
@@ -541,7 +556,12 @@ stores at all is a decision, so a person starts it: see "Recover native store
 builds after deployment" below. Unknown is never read as either answer: the
 update is held back because nothing proved it fits, and no build is started
 because nothing proved one is owed. The failing job's summary names the next
-step for both cases.
+step for both cases, with commands pinned to that run's commit and baseline.
+
+After a withheld update, `scripts/verify-release.sh` reports `mobile.tree` as
+not matching: u.expo.dev still serves the previous update. That is expected
+until an update for this tree is published; a store build alone does not change
+what it serves. Hand it off with `--skip-mobile` meanwhile.
 
 Three of those rows say "you", and that is not an omission to be automated
 away later. **The offline keys never enter CI** — the Ed25519 daemon release
@@ -609,11 +629,20 @@ candidate rather than inferring that all release steps completed.
 scripts/deploy-prod.sh <ssh-host> --resume --acceptance-evidence /path/to/original/acceptance.json
 ```
 
+A deploy run by hand, this retry included, publishes **no** mobile OTA: the
+update goes out only with `SPAWN_DEPLOY_MOBILE=1`. Set it only if the original
+release plan for this candidate said `mobile_native_build=no`; the workflow
+sets it from that plan. Otherwise the deploy prints the publish command and
+that condition, and publishes nothing.
+
 The release workflow passes `--resume` with its own acceptance artifact. Use
-**Re-run failed jobs** to retain that run's original plan and evidence. Starting
-a fresh workflow recalculates the plan from production and cannot reconstruct
-an earlier unfinished mobile release; use the explicit retry above when the
-original workflow is unavailable. Resume does not authorize a newer commit:
+**Re-run failed jobs** to retain that run's original plan and evidence. Never
+use **Re-run all jobs** on a release that has deployed: it plans again from
+production, where its candidate is now the baseline, so it reads the mobile
+tree as unchanged, turns green without the withheld update, and leaves nothing
+for store recovery to bind to. Starting a fresh workflow recalculates the plan
+from production and cannot reconstruct an earlier unfinished mobile release;
+use the explicit retry above when the original workflow is unavailable. Resume does not authorize a newer commit:
 if master has advanced, select and push an exact-candidate recovery branch and
 use the existing explicit `--allow-branch` procedure.
 
@@ -625,7 +654,16 @@ the OTA and the release fails at **require the owed store builds**, whose
 summary names the platforms whose fingerprint no longer matches and the exact
 commands below. That job uses an explicit `!cancelled()` condition, so it
 reports even when an optional ancestor was skipped or the deploy failed. Build
-only the platforms it names, and only if the native change is meant to ship.
+only the platforms it names, and only if the native change is meant to ship on
+the runtime shown there (see the runtime warning in "The phone": a build that
+keeps the installed apps' runtime lets the next JavaScript-only release reach
+every one of them). A platform left unbuilt stays at yes and stops every later
+release that changes `mobile/`.
+
+Dispatch one operation at a time, each after the previous run has finished,
+and only while no release run is queued. Recovery shares the `release`
+concurrency group, and a newly queued run cancels any run already waiting in
+it — a pending master release included.
 
 Once the server/web deployment of that run has succeeded, start from the
 original release run, not a freshly calculated release plan:
@@ -853,11 +891,15 @@ the harder failure to notice.
 The installed app keeps running whatever JavaScript it was built with, so a
 release that stops at the deploy leaves the two frontends on different versions
 of the same feature. `deploy-prod.sh` therefore publishes the matching update
-itself, last, when `mobile/` changed, through the script below. The release
-workflow lets it do so only when the plan proved the native shell still fits
-(`mobile_native_build=no`); otherwise it sets `SPAWN_DEPLOY_MOBILE=0`, and the
-deploy prints the command instead. Run it by hand only after that question
-has been answered no for the commit you publish:
+itself, last, when `mobile/` changed, through the script below — but only with
+`SPAWN_DEPLOY_MOBILE=1`, which the release workflow sets when its plan proved
+the native shell still fits (`mobile_native_build=no`). Unset, as in any
+deploy run by hand, it prints the command and that condition instead. Run it
+by hand only after that question has been answered no for the commit you
+publish, on a clean checkout of it after `npm ci` in `mobile/` (the
+fingerprint finds native modules through `node_modules`). The script publishes
+the checked-out branch, so publish from master only while master is still the
+deployed commit; never publish a newer master tip than the server runs:
 
 ```bash
 scripts/update-mobile-prod.sh -m "<same summary as the deploy>"
@@ -913,10 +955,20 @@ cd mobile && EXPO_NO_CAPABILITY_SYNC=1 \
   eas build -p ios -e production --non-interactive --auto-submit
 ```
 
-The plan compares only against the newest production build of each platform.
-While `runtimeVersion` follows an unchanged `version`, older installed shells
-share its runtime and receive every later OTA too, so a native change that must
-not reach them also needs the `version` bump above.
+**The runtime warning.** Every build so far has runtime `0.1.0`: `runtimeVersion`
+follows `version`, and `version` has never changed. Every installed app on a
+runtime receives every update published for it. Store builds go to TestFlight
+and Play internal testing, not to the public, and the plan compares only
+against the newest production build of each platform. So: a native module is
+added along with JavaScript that uses it; the release says yes; both platforms
+are built on `0.1.0`. The next release that changes only JavaScript matches
+those new builds, reads no, and publishes an update to every `0.1.0` app — the
+public ones without the module included — and they crash at launch. If the new
+JavaScript cannot run on the app people already have, do not build from that
+release: bump `expo.version` in `mobile/app.json` first and build from the
+release of that commit, which gives the new shell its own runtime. The plan
+reports `mobile_runtime` and each build's runtime, and the stop summary says
+which case applies.
 
 Credentials live on EAS — distribution certificate, provisioning profile, APNs
 key, and the App Store Connect key for submissions — so this needs no Apple
@@ -1709,11 +1761,17 @@ standard-user accounts.
    choices, direct WebRTC, the optional Private program rule, and TURN fallback.
 6. Run `scripts/deploy-prod.sh <ssh-host>`. Do not continue past a hard gate by
    habit; fix the release or record why the emergency prebuilt override is safe.
-7. If `mobile/` changed, ask `scripts/release-plan.sh` whether the native shell
-   still fits. Only when its mobile store build is `no`, run
-   `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"`. When it is
-   `yes`, publish no update; start a real store build for each platform it
-   names, per "The phone". When it is `unknown`, find out before doing either.
+   It publishes no mobile OTA unless `SPAWN_DEPLOY_MOBILE=1`; leave that unset
+   and let step 7 decide.
+7. If `mobile/` changed, ask whether the native shell still fits, for exactly
+   the commit you deployed: on a clean checkout of it, run `npm ci` in `mobile/`
+   (the fingerprint finds native modules through `node_modules`), then
+   `scripts/release-plan.sh --from <previous production commit> --to <that commit>`.
+   Only when its mobile store build is `no`, publish that commit with
+   `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"` (from master
+   only while master is still that commit). When it is `yes`, publish no update;
+   read the runtime warning in "The phone", then start a real store build for
+   each platform it names. When it is `unknown`, find out before doing either.
 8. Exercise the changed user flow. For network or signalling changes, also run
    `scripts/health-check.sh` with the production `SPAWN_TURN_URLS`; this checks
    the public WebSocket upgrade and the configured UDP TURN listener. Keep the
@@ -1730,4 +1788,7 @@ standard-user accounts.
    an intentional branch deploy and `--skip-mobile` only when this environment
    cannot reach Expo. It prints `PIECE / EXPECTED / ACTUAL / RESULT` and exits
    non-zero on any mismatch. A release is not finished until this final proof
-   passes or the skipped external dependency is explicitly handed off.
+   passes or the skipped external dependency is explicitly handed off. After a
+   withheld mobile update, `mobile.tree` cannot match until an update for that
+   tree is published (a store build alone does not change it); hand it off with
+   `--skip-mobile` and the reason.
