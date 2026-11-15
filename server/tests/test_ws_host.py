@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import Callable
@@ -205,23 +206,30 @@ def _metadata(host_id: str, version: int = HOST_CONTROL_VERSION) -> dict[str, ob
 
 
 async def _start_daemon(
-    user_id: str, host_id: str, *, shared: bool = True
+    user_id: str,
+    host_id: str,
+    *,
+    shared: bool = True,
+    keeps_peers: bool = False,
+    live_bindings: list[dict[str, object]] | None = None,
 ) -> tuple[FakeWebSocket, asyncio.Task[None]]:
     socket = FakeWebSocket(
         authorization=f"Bearer {auth.issue_daemon_token(host_id, user_id)}",
         subprotocols=["spawn.control.v3"],
     )
     task = asyncio.create_task(daemon_ws(socket))  # type: ignore[arg-type]
-    socket.queue_text(
-        {
-            "type": "register",
-            "host_name": "test-daemon",
-            "os": "linux",
-            "arch": "x86_64",
-            "version": "test",
-            "supports_device_connections": shared,
-        }
-    )
+    register: dict[str, object] = {
+        "type": "register",
+        "host_name": "test-daemon",
+        "os": "linux",
+        "arch": "x86_64",
+        "version": "test",
+        "supports_device_connections": shared,
+    }
+    if keeps_peers:
+        register["keeps_peers_across_reconnect"] = True
+        register["live_bindings"] = live_bindings or []
+    socket.queue_text(register)
     await _wait_until(
         lambda: any(message.get("type") == "registered" for message in _json_messages(socket))
     )
@@ -1028,3 +1036,90 @@ async def test_new_daemon_claim_actively_revokes_established_old_worker_session(
 
     browser_socket.queue_disconnect()
     await asyncio.gather(browser_task, _stop_daemon(new_socket, new_task))
+
+
+async def test_statuses_after_a_rebind_reach_the_browser_from_the_current_owner(
+    client, monkeypatch
+):
+    """A binding carried over to a re-registered daemon is that daemon's now.
+
+    The browser's signal pump accepts a status only from the binding's active
+    owner, which `rebound` moved to the new daemon. The statuses the server
+    derives when that daemon's socket goes — `signalling_lost`, then the
+    orphan expiry's `unavailable` — must carry its generation, not the one the
+    binding was first made under, or the browser drops both and keeps a dead
+    connection for good (#120).
+    """
+    from spawn_server.ws import daemon as daemon_mod
+
+    user_id, token = await _signup(client, "host-rtc-rebind-statuses@example.com")
+    host_id = await _create_host(user_id, "rebind-host")
+    first_socket, first_task = await _start_daemon(user_id, host_id, keeps_peers=True)
+    browser_socket = FakeWebSocket(authorization=f"Bearer {token}")
+    browser_task = asyncio.create_task(host_ws(browser_socket, host_id=host_id))  # type: ignore[arg-type]
+    session_id = "rebound-twice"
+
+    def statuses() -> list[str]:
+        return [
+            str(message.get("status"))
+            for message in _json_messages(browser_socket)
+            if message.get("type") == "rtc.status" and message.get("session_id") == session_id
+        ]
+
+    try:
+        await _wait_until(lambda: bool(browser_socket.sent_text))
+        browser_socket.queue_text(
+            {"type": "rtc.offer", "session_id": session_id, "sdp": "v=0\r\n", **_metadata(host_id)}
+        )
+        await _wait_until(
+            lambda: any(m.get("type") == "rtc.offer" for m in _json_messages(first_socket))
+        )
+        offer = [m for m in _json_messages(first_socket) if m.get("type") == "rtc.offer"][-1]
+        first_socket.queue_text(
+            {
+                "type": "rtc.status",
+                "session_id": session_id,
+                "binding_nonce": offer["binding_nonce"],
+                "status": "connected",
+                **_metadata(host_id),
+            }
+        )
+        await _wait_until(lambda: statuses() == ["connected"])
+
+        # The first daemon's socket drops; the peer it holds lives on.
+        await _stop_daemon(first_socket, first_task)
+        await _wait_until(lambda: statuses() == ["connected", "signalling_lost"])
+
+        # It comes back inside the orphan window and names the binding.
+        live = {
+            "session_id": session_id,
+            "binding_nonce": offer["binding_nonce"],
+            "binding_generation": offer["binding_generation"],
+            **_metadata(host_id),
+        }
+        second_socket, second_task = await _start_daemon(
+            user_id, host_id, keeps_peers=True, live_bindings=[live]
+        )
+        await _wait_until(lambda: statuses()[-1:] == ["rebound"])
+        binding = await get_broker().rtc_session_for(session_id)
+        assert binding is not None and binding.daemon.host_generation is not None
+        assert binding.daemon.host_generation > offer["binding_generation"]
+
+        # Its socket drops too, and this time it does not come back.
+        monkeypatch.setattr(daemon_mod, "RTC_BINDING_ORPHAN_GRACE_SECONDS", 0.05)
+        await _stop_daemon(second_socket, second_task)
+        with contextlib.suppress(AssertionError):
+            await _wait_until(lambda: len(statuses()) >= 5)
+        assert statuses() == [
+            "connected",
+            "signalling_lost",
+            "rebound",
+            "signalling_lost",
+            "unavailable",
+        ]
+        assert await get_broker().rtc_session_for(session_id) is None
+    finally:
+        browser_socket.queue_disconnect()
+        await asyncio.wait_for(browser_task, timeout=1)
+        for task in list(daemon_mod._daemon_orphan_expiry_tasks):
+            task.cancel()
