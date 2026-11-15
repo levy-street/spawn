@@ -73,8 +73,9 @@ use uuid::Uuid;
 
 /// The family capability `spawn.host.ctl` advertises for `conv.*`.
 pub(crate) const CAPABILITY: &str = "conv.v1";
-/// Read-only: which conversation a window is in, and whether it is held
-/// anywhere the window's restart would not reach.
+/// Which conversation a window is in, and whether it is held anywhere the
+/// window's restart would not reach. It changes nothing on the host but the
+/// window's Codex note.
 pub(crate) const INSPECT_OP: &str = "conv.inspect";
 /// Where a window's process tree can be walked. Elsewhere the family is
 /// neither advertised nor answered, so a client keeps its old behaviour.

@@ -216,7 +216,7 @@ impl SessionRegistry {
             .map(|entry| entry.handle.control.clone())
     }
 
-    /// The shell a window's processes hang from, for read-only inspection
+    /// The shell a window's processes hang from, for inspecting them
     /// (`host_conv`). `None` for an unknown session or a worker that never
     /// reported its shell.
     pub fn shell_pid(&self, id: Uuid) -> Option<u32> {
