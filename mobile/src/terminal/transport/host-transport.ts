@@ -1258,7 +1258,9 @@ class WebViewHostTransport implements StreamingHostTransport {
     console.warn(
       `SPAWN D: host ${this.hostId}: no new channel opens on its connection ` +
         `(one waited ${seconds(message.waitedMs)}, a probe ${seconds(message.probeMs)}, ` +
-        `while the root channel answered a ping in ${Math.round(message.pingMs)} ms); ` +
+        (message.rootAnswered === true
+          ? `while the root channel answered a ping in ${Math.round(message.rootMs)} ms); `
+          : `and the root channel did not answer a ping for ${seconds(message.rootMs)}); `) +
         `making a new connection (${message.rebuilds} in a row).`,
     );
     this.#emitError({

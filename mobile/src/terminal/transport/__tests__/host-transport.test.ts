@@ -517,7 +517,8 @@ describe("HostTransport signalling", () => {
         reason: "channels_unanswered",
         waitedMs: 10_000,
         probeMs: 10_000,
-        pingMs: 42,
+        rootAnswered: true,
+        rootMs: 42,
         rebuilds: 1,
       });
       // A fresh peer on the same signalling socket, closing the old binding.
@@ -545,8 +546,9 @@ describe("HostTransport signalling", () => {
         type: "rebuild",
         reason: "channels_unanswered",
         waitedMs: 10_000,
-        probeMs: 10_000,
-        pingMs: 42,
+        probeMs: 30_000,
+        rootAnswered: false,
+        rootMs: 20_000,
         rebuilds: 2,
       });
       expect(connects()).toHaveLength(2);

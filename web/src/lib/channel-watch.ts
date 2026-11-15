@@ -22,12 +22,20 @@
  *   session that is slow to start (a restart holding its transition) does not
  *   look like a peer that accepts nothing.
  * - Proof: a probe still silent after ten seconds is weighed against the root
- *   channel, with one ping. Only a ping answered within five seconds, the
- *   probe still silent, replaces the peer: the association, the daemon and
- *   both directions are working, and new channels are not being accepted. A
- *   host that is slow, or briefly unreachable, delays the ping as much as the
- *   probe — one association, one daemon send queue — and one that is gone
- *   takes the peer out of readiness, which resets the watch, first.
+ *   channel, with one ping, and the peer is replaced when either
+ *   - the root answers while the probe is still silent: the association, the
+ *     daemon and both directions work, and new channels are not accepted; or
+ *   - the root stays silent for twenty seconds as well. Thirty seconds without
+ *     a hello and twenty without a pong, on a peer ICE still calls connected,
+ *     is an association that carries nothing to the daemon: an old daemon's
+ *     stops acknowledging once channels pile up behind its dead acceptor
+ *     (sixteen are queued, then each new one is dropped unacknowledged), which
+ *     several views reattaching at once reach in moments.
+ *   Only an answer stands the watch down: the probe's hello or refusal, or any
+ *   watched channel answered meanwhile. A host that is merely slow answers the
+ *   probe within its thirty seconds; one briefly unreachable loses ICE
+ *   consent within seconds, which takes the peer out of readiness and resets
+ *   the watch.
  *
  * A refusal is an answer, never a timeout: a daemon closes a channel it
  * refuses at once (a session it does not run, a full pair), so a close counts
@@ -42,10 +50,10 @@ export interface ChannelWatchTiming {
   unansweredMs: number;
   /** A consumer that gave up on an unanswered channel after this long does too. */
   abandonedAfterMs: number;
-  /** How long the probe has to hear from the daemon. */
+  /** How long the probe has to hear from the daemon before the root is asked. */
   probeMs: number;
-  /** How long the root channel has to answer its ping. */
-  pingMs: number;
+  /** How long a silent root is waited on before the peer is replaced anyway. */
+  rootSilenceMs: number;
   /** The least time between two rebuilds; doubles per rebuild in a row. */
   rebuildBackoffMs: number;
   rebuildBackoffCapMs: number;
@@ -55,7 +63,7 @@ export const CHANNEL_WATCH_TIMING: Readonly<ChannelWatchTiming> = Object.freeze(
   unansweredMs: 10_000,
   abandonedAfterMs: 5_000,
   probeMs: 10_000,
-  pingMs: 5_000,
+  rootSilenceMs: 20_000,
   rebuildBackoffMs: 30_000,
   rebuildBackoffCapMs: 300_000,
 });
@@ -69,7 +77,8 @@ export const REBUILDING_MESSAGE =
 export interface WatchedPeer {
   /** Open a channel of the watch's own on the peer. Throws when it cannot. */
   openProbe(label: string): RTCDataChannel;
-  /** One round trip on the root channel; rejects when it is not answered in time. */
+  /** One round trip on the root channel; rejects when it is not answered in
+   *  time, or at once when it cannot be sent. */
   ping(timeoutMs: number): Promise<unknown>;
   /** Retire the peer and negotiate a fresh one. False when there is no ready peer. */
   rebuild(): boolean;
@@ -180,18 +189,21 @@ export class ChannelOpenWatch {
     if (this.probe !== probe) return;
     probe.timer = null;
     const pinged = Date.now();
+    let rootAnswered = true;
     try {
-      await this.peer.ping(this.timing.pingMs);
+      await this.peer.ping(this.timing.rootSilenceMs);
     } catch {
-      // The root is silent as well: the whole peer is slow or gone, which
-      // ICE, the signalling socket and the daemon's own retirement deal with.
-      this.endProbe(probe);
-      return;
+      rootAnswered = false;
     }
+    // Answered meanwhile (the probe, or any watched channel), or readiness
+    // ended: either way there is nothing to replace.
     if (this.probe !== probe || this.closed) return;
-    const pingMs = Date.now() - pinged;
+    const rootMs = Date.now() - pinged;
     const probeMs = Date.now() - probe.since;
     this.endProbe(probe);
+    // A ping that failed before its deadline was never sent; that is no
+    // evidence about the daemon.
+    if (!rootAnswered && rootMs < this.timing.rootSilenceMs * 0.9) return;
     if (Date.now() < this.notBefore || !this.peer.rebuild()) return;
     this.rebuilds += 1;
     this.notBefore =
@@ -205,7 +217,9 @@ export class ChannelOpenWatch {
     console.warn(
       `SPAWN D: host ${this.host}: no new channel opens on its connection ` +
         `(one waited ${seconds(probe.waitedMs)}, a probe ${seconds(probeMs)}, ` +
-        `while the root channel answered a ping in ${pingMs} ms); ` +
+        (rootAnswered
+          ? `while the root channel answered a ping in ${rootMs} ms); `
+          : `and the root channel did not answer a ping for ${seconds(rootMs)}); `) +
         `making a new connection (${this.rebuilds} in a row).`,
     );
   }

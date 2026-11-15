@@ -58,14 +58,19 @@ the daemon speaks on first, a terminal's `spawn.ctl/…` and a tool's
 `spawn.host.ctl/<id>`. One the daemon neither speaks on nor closes for ten
 seconds (in the browser, also one a view gave up on after five) makes the peer
 suspect, and the holder opens one host-control channel of its own as a probe,
-which the daemon greets without any session involved. If the probe is silent
-for ten seconds while a root `ping` is answered within five, the holder sends
-`rtc.close` for the old binding and offers a fresh peer on the same signalling
-socket; views and tools attach again as after any reconnect. A refusal never
-counts — the daemon closes a channel it refuses at once — and a host that is
-slow or unreachable delays the ping as much as the probe, or leaves readiness,
-which resets the watch. One probe at a time; such rebuilds are at least thirty
-seconds apart, doubling to five minutes while nothing is answered between them.
+which the daemon greets without any session involved. A probe silent for ten
+seconds is weighed against one root `ping`: the holder replaces the peer when
+the root answers while the probe is still silent (channels are not being
+accepted), or when the root stays silent for twenty seconds as well (an old
+daemon's association stops acknowledging anything once channels pile up behind
+its dead acceptor). It sends `rtc.close` for the old binding and offers a fresh
+peer on the same signalling socket; views and tools attach again as after any
+reconnect. Only an answer stands the watch down: a refusal is one — the daemon
+closes a channel it refuses at once — and a host that is merely slow answers
+the probe within its thirty seconds. One briefly unreachable loses ICE consent
+and leaves readiness, which resets the watch. One probe at a time; such
+rebuilds are at least thirty seconds apart, doubling to five minutes while
+nothing is answered between them.
 Each rebuild logs one line naming the host and how long each step waited, and
 nothing a terminal carries (the browser console; the phone's device log and
 the terminal's Diagnostics). Meanwhile a terminal that has drawn nothing yet

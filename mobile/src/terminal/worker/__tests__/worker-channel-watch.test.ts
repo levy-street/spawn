@@ -109,7 +109,8 @@ function hostWorker() {
           const channel = new Channel(label);
           channels.push(channel);
           const daemon = peer.daemon;
-          queueMicrotask(() => {
+          // A real microtask: jest's fake timers also hold queueMicrotask.
+          void Promise.resolve().then(() => {
             channel.open();
             daemon(channel);
           });
@@ -180,7 +181,8 @@ test("a peer that stops opening channels asks native to replace it, once", async
         reason: "channels_unanswered",
         waitedMs: 10_000,
         probeMs: 10_000,
-        pingMs: 0,
+        rootAnswered: true,
+        rootMs: 0,
         rebuilds: 1,
       },
     ]);
@@ -254,15 +256,39 @@ test("a slow session on a working peer is probed and left alone", async () => {
   }
 });
 
-test("a peer whose root is silent too is left to its own recovery", async () => {
+test("a peer whose root falls silent with its channels is replaced after the root's twenty seconds", async () => {
+  // An old daemon's association stops acknowledging anything once channels
+  // pile up behind its dead acceptor: the root goes quiet with them.
   const worker = hostWorker();
   worker.peer.rootAnswers = false;
   try {
     worker.attach(1);
-    await jest.advanceTimersByTimeAsync(25_000);
+    await jest.advanceTimersByTimeAsync(20_000);
+    expect(worker.peer.pings).toBe(1);
+    await jest.advanceTimersByTimeAsync(19_999);
+    expect(worker.rebuilds()).toHaveLength(0);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(worker.rebuilds()).toEqual([
+      expect.objectContaining({ rootAnswered: false, rootMs: 20_000, probeMs: 30_000 }),
+    ]);
+    expect(worker.probes()[0]?.readyState).toBe("closed");
+  } finally {
+    worker.close();
+  }
+});
+
+test("a host that answers the probe late, inside the root's window, is left alone", async () => {
+  const worker = hostWorker();
+  worker.peer.rootAnswers = false;
+  // The probe's hello arrives after its own ten seconds, before the root's twenty run out.
+  worker.peer.daemon = (channel) => {
+    if (channel.label.startsWith("spawn.host.ctl/")) setTimeout(() => speaks(channel), 25_000);
+  };
+  try {
+    worker.attach(1);
+    await jest.advanceTimersByTimeAsync(60_000);
     expect(worker.peer.pings).toBe(1);
     expect(worker.rebuilds()).toHaveLength(0);
-    expect(worker.probes()[0]?.readyState).toBe("closed");
   } finally {
     worker.close();
   }

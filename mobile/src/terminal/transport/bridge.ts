@@ -184,7 +184,9 @@ export type WorkerToNativeMessage =
       reason: "channels_unanswered";
       waitedMs: number;
       probeMs: number;
-      pingMs: number;
+      /** Whether the root answered the ping, and after how long (or how long it was silent). */
+      rootAnswered: boolean;
+      rootMs: number;
       rebuilds: number;
     })
   | (WorkerMessage & { type: "connection-info"; info: ConnectionInfo })

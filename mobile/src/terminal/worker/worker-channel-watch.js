@@ -17,10 +17,13 @@
   // deadline always comes first. A suspect peer gets one probe, a host-control
   // channel of the worker's own that the daemon greets without any session
   // involved. A probe silent for ten seconds is weighed against the root with
-  // one ping: only a ping answered within five seconds, the probe still
-  // silent, asks native to replace the peer. A host that is slow or briefly
-  // unreachable delays the ping as much as the probe; one that is gone takes
-  // the peer out of `connected`, which resets the watch.
+  // one ping, and native is asked to replace the peer when the root answers
+  // while the probe is still silent (channels are not being accepted), or when
+  // the root stays silent for twenty seconds too: an old daemon's association
+  // stops acknowledging anything once channels pile up behind its dead
+  // acceptor. Only an answer stands the watch down. A host that is merely slow
+  // answers the probe within its thirty seconds; one briefly unreachable loses
+  // ICE consent and leaves `connected`, which resets the watch.
   //
   // A refusal is an answer: the daemon closes a channel it refuses at once.
   // Any answer clears the suspicion and the run of rebuilds. One probe at a
@@ -30,7 +33,7 @@
   const state = api.state;
   const UNANSWERED_MS = 10_000;
   const PROBE_MS = 10_000;
-  const PING_MS = 5_000;
+  const ROOT_SILENCE_MS = 20_000;
   const REBUILD_BACKOFF_MS = 30_000;
   const REBUILD_BACKOFF_CAP_MS = 300_000;
   const DAEMON_SPEAKS_FIRST = /^spawn\.(?:ctl|host\.ctl)\//;
@@ -84,7 +87,7 @@
       };
       const timer = setTimeout(
         () => settle(new Error("The host did not answer its root channel.")),
-        PING_MS,
+        ROOT_SILENCE_MS,
       );
       pings.set(requestId, settle);
       try {
@@ -100,18 +103,20 @@
   async function confirm(current) {
     if (probe !== current) return;
     const pinged = Date.now();
+    let rootAnswered = true;
     try {
       await ping();
     } catch {
-      // The root is silent as well: the whole peer is slow or gone, which
-      // ICE, the signalling socket and the daemon's own retirement deal with.
-      endProbe(current);
-      return;
+      rootAnswered = false;
     }
+    // Answered meanwhile (the probe, or any watched channel), or the peer
+    // left readiness: either way there is nothing to replace.
     if (probe !== current) return;
-    const pingMs = Date.now() - pinged;
+    const rootMs = Date.now() - pinged;
     const probeMs = Date.now() - current.since;
     endProbe(current);
+    // A ping that failed before its deadline was never sent: no evidence.
+    if (!rootAnswered && rootMs < ROOT_SILENCE_MS * 0.9) return;
     if (Date.now() < notBefore || !peerReady()) return;
     rebuilds += 1;
     notBefore =
@@ -122,7 +127,8 @@
       reason: "channels_unanswered",
       waitedMs: current.waitedMs,
       probeMs,
-      pingMs,
+      rootAnswered,
+      rootMs,
       rebuilds,
     });
   }

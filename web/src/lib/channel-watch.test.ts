@@ -11,9 +11,9 @@ const TIMING: ChannelWatchTiming = {
   unansweredMs: 20,
   abandonedAfterMs: 10,
   probeMs: 20,
-  pingMs: 10,
-  rebuildBackoffMs: 60,
-  rebuildBackoffCapMs: 150,
+  rootSilenceMs: 40,
+  rebuildBackoffMs: 100,
+  rebuildBackoffCapMs: 250,
 };
 
 class Probe {
@@ -30,18 +30,19 @@ class Probe {
 class Peer implements WatchedPeer {
   probes: Probe[] = [];
   pings = 0;
-  rootAnswers = true;
   rebuiltAt: number[] = [];
   openProbe(label: string) {
     const probe = new Probe(label);
     this.probes.push(probe);
     return probe as unknown as RTCDataChannel;
   }
+  /** "fails" rejects at once, as a ping that could not be sent does. */
+  root: "answers" | "silent" | "fails" = "answers";
   ping(timeoutMs: number) {
     this.pings++;
-    return this.rootAnswers
-      ? Promise.resolve({ pong: true })
-      : new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), timeoutMs));
+    if (this.root === "answers") return Promise.resolve({ pong: true });
+    if (this.root === "fails") return Promise.reject(new Error("not ready"));
+    return new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), timeoutMs));
   }
   rebuild() {
     this.rebuiltAt.push(Date.now());
@@ -78,8 +79,10 @@ test("the production timings keep the order the trigger depends on", () => {
   // has to count, and the watch's own deadline must not come after it.
   expect(t.abandonedAfterMs).toBeLessThan(10_000);
   expect(t.unansweredMs).toBeLessThanOrEqual(10_000);
-  expect(t.pingMs).toBeLessThan(t.probeMs);
-  expect(t.rebuildBackoffMs).toBeGreaterThan(t.unansweredMs + t.probeMs + t.pingMs);
+  // A silent root gets longer than the probe did: that path is the one a
+  // merely slow host could reach, so it asks for the most evidence.
+  expect(t.rootSilenceMs).toBeGreaterThan(t.probeMs);
+  expect(t.rebuildBackoffMs).toBeGreaterThan(t.unansweredMs + t.probeMs);
   expect(t.rebuildBackoffCapMs).toBeGreaterThanOrEqual(t.rebuildBackoffMs);
 });
 
@@ -106,7 +109,7 @@ test("an answer anywhere while the probe waits ends it, and nothing is rebuilt",
   watch.opened("later", ctl());
   watch.answered("later");
   expect(peer.probes[0].closed).toBe(true);
-  await Bun.sleep(TIMING.probeMs + TIMING.pingMs + 10);
+  await Bun.sleep(TIMING.probeMs + TIMING.rootSilenceMs + 10);
   expect(peer.pings).toBe(0);
   expect(peer.rebuiltAt).toHaveLength(0);
 });
@@ -118,7 +121,7 @@ test("the probe's own hello or refusal is an answer", async () => {
     watch.opened(answer, ctl());
     await until(() => peer.probes.length === 1);
     peer.probes[0][answer]?.();
-    await Bun.sleep(TIMING.probeMs + TIMING.pingMs + 10);
+    await Bun.sleep(TIMING.probeMs + TIMING.rootSilenceMs + 10);
     expect(peer.pings).toBe(0);
     expect(peer.rebuiltAt).toHaveLength(0);
   }
@@ -135,7 +138,7 @@ test("readiness ending forgets what was pending without suspecting anything", as
   await until(() => peer.probes.length === 1);
   watch.reset();
   expect(peer.probes[0].closed).toBe(true);
-  await Bun.sleep(TIMING.probeMs + TIMING.pingMs + 10);
+  await Bun.sleep(TIMING.probeMs + TIMING.rootSilenceMs + 10);
   expect(peer.rebuiltAt).toHaveLength(0);
 });
 
@@ -168,4 +171,22 @@ test("rebuilds in a row back off, doubling to a cap; an answer starts the run ov
   await until(() => peer.rebuiltAt.length === 5);
   expect(String(warn.mock.calls[4]?.[0])).toContain("1 in a row");
   expect(String(warn.mock.calls[4]?.[0])).toContain("host host-under-test");
+});
+
+test("a root silent for its whole window is replaced too; a ping that never left is no evidence", async () => {
+  const silent = new Peer();
+  silent.root = "silent";
+  watching(silent).opened("stuck", ctl());
+  await until(() => silent.pings === 1);
+  expect(silent.rebuiltAt).toHaveLength(0);
+  await until(() => silent.rebuiltAt.length === 1);
+  expect(String(warn.mock.calls.at(-1)?.[0])).toContain("did not answer a ping for");
+
+  const unsent = new Peer();
+  unsent.root = "fails";
+  watching(unsent).opened("stuck", ctl());
+  await until(() => unsent.pings === 1);
+  await Bun.sleep(TIMING.rootSilenceMs + 20);
+  expect(unsent.rebuiltAt).toHaveLength(0);
+  expect(unsent.probes[0]?.closed).toBe(true);
 });

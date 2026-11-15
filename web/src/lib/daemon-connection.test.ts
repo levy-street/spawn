@@ -580,13 +580,13 @@ const WATCH: ChannelWatchTiming = {
   unansweredMs: 40,
   abandonedAfterMs: 20,
   probeMs: 40,
-  pingMs: 20,
+  rootSilenceMs: 80,
   rebuildBackoffMs: 300,
   rebuildBackoffCapMs: 1200,
 };
 const WATCHING = { heartbeatMs: 2_000, ownerSilenceMs: 10_000, watch: WATCH };
 /** Long enough for a suspicion, its probe and its ping to have run out. */
-const WATCH_ROUND = WATCH.unansweredMs + WATCH.probeMs + WATCH.pingMs + 40;
+const WATCH_ROUND = WATCH.unansweredMs + WATCH.probeMs + WATCH.rootSilenceMs + 40;
 
 function heardOn(channel: ReturnType<SharedDaemonConnection["createChannel"]>) {
   const heard: unknown[] = [];
@@ -676,16 +676,38 @@ test("a slow session on a working peer is probed, not rebuilt", async () => {
   expect(connection.getSnapshot().state).toBe("ready");
 });
 
-test("a peer whose root is silent too is left to its own recovery", async () => {
+test("a peer whose root falls silent with its channels is replaced once the root's window has passed", async () => {
+  // An old daemon's association stops acknowledging anything once channels
+  // pile up behind its dead acceptor: the root goes quiet with them.
   const connection = connect("account:host", undefined, undefined, WATCHING);
   await until(() => connection.getSnapshot().state === "ready");
   const root = roots[0];
   root.rootAnswers = false;
   connection.createChannel(label("ctl"));
   await until(() => root.pings === 1);
+  await Bun.sleep(WATCH.rootSilenceMs / 2);
+  expect(root.rebuilds).toBe(0);
+  await until(() => root.rebuilds === 1);
+  expect(root.probes().every((probe) => probe.readyState === "closed")).toBe(true);
+  expect(String(warn.mock.calls[0]?.[0])).toContain("did not answer a ping");
+});
+
+test("a host that answers the probe late, inside the root's window, is left alone", async () => {
+  const connection = connect("account:host", undefined, undefined, WATCHING);
+  await until(() => connection.getSnapshot().state === "ready");
+  const root = roots[0];
+  // Slow everywhere: the root is not answering yet, and the probe's hello
+  // comes after the probe's own window but before the root's runs out.
+  root.rootAnswers = false;
+  root.daemon = (dc) => {
+    if (dc.label.startsWith("spawn.host.ctl/"))
+      setTimeout(() => speaks(dc), WATCH.probeMs + WATCH.rootSilenceMs / 2);
+  };
+  connection.createChannel(label("ctl"));
+  await until(() => root.pings === 1);
   await Bun.sleep(WATCH_ROUND);
   expect(root.rebuilds).toBe(0);
-  expect(root.probes().every((probe) => probe.readyState === "closed")).toBe(true);
+  expect(warn).not.toHaveBeenCalled();
 });
 
 test("two tabs waiting on one dead peer rebuild it once", async () => {
