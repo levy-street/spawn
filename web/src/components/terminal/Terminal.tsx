@@ -1102,6 +1102,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           fitTerminalRef.current(true);
           return;
         }
+        // A follower draws the owner's grid whatever its own pane measures:
+        // a placeholder put up before the display state arrived comes down.
+        paneTooSmallRef.current = false;
+        setTooSmallPlaceholder(false);
         const buffer = term.buffer.active;
         const atBottom = buffer.viewportY >= buffer.baseY;
         const viewportY = buffer.viewportY;
@@ -2761,6 +2765,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           ? displayGeometryRef.current
           : null;
       if (followerGeometry) {
+        // A follower draws the owner's grid whatever its own pane measures,
+        // so it is never too small to show one.
+        paneTooSmallRef.current = false;
+        setTooSmallPlaceholder(false);
         const last = lastSizeRef.current;
         try {
           term.resize(followerGeometry.cols, followerGeometry.rows);
