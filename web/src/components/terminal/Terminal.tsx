@@ -56,6 +56,7 @@ import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
+import { daemonGrid } from "@/lib/terminal-grid";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import { viewportInset } from "@/lib/viewport";
 import type { DisplayControlState } from "@/lib/ws";
@@ -514,6 +515,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   }, []);
   const layoutTerminalSurfaceRef = useRef<(pinToBottom?: boolean) => void>(() => {});
   const viewerPanFrameActiveRef = useRef(false);
+  /**
+   * The pane is smaller than the smallest grid the daemon accepts (20×5, see
+   * `daemonGrid`): the terminal keeps that grid and the pane shows what fits of
+   * it, panned to keep the cursor in view, rather than asking for a size the
+   * daemon refuses and drawing nothing.
+   */
+  const gridClippedRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
   const lastSizeRef = useRef<TerminalGeometry>({ cols: 80, rows: 24 });
   const lastSentSizeRef = useRef<string | null>(null);
@@ -967,7 +975,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         surface.style.width = "100%";
         surface.style.height = "100%";
       }
-      size = fitRef.current?.proposeDimensions() ?? size;
+      // Held to the grid the daemon accepts, as every fit is: a pane too
+      // small for it takes control at the minimum it then clips.
+      const proposed = fitRef.current?.proposeDimensions();
+      if (proposed) size = daemonGrid(proposed);
     } finally {
       surfaces.forEach((surface, index) => {
         [surface.style.width, surface.style.height] = styles[index];
@@ -1824,6 +1835,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       setLiveEdge(buf.viewportY >= buf.baseY);
     };
     refreshLiveEdgeRef.current = refreshLiveEdge;
+    // Typing and output move the cursor; a clipped pane follows it.
+    const cursorMoveDisposable = term.onCursorMove(() => keepCursorInClippedFrame());
     const scrollDisposable = term.onScroll((ydisp) => {
       const t = termRef.current;
       const atBottom = t ? ydisp >= t.buffer.active.baseY : true;
@@ -1896,6 +1909,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       coarsePointerRef.current && readKeyboardInset() > KEYBOARD_MIN_INSET_PX;
 
     const usesViewerPanFrame = () => {
+      // A grid held at the daemon's minimum is bigger than its pane on any
+      // pointer: the same frame pans it.
+      if (gridClippedRef.current) return true;
       if (!coarsePointerRef.current) return false;
       if (displayOwnerRef.current === false && displayGeometryRef.current !== null) {
         return true;
@@ -1931,6 +1947,55 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           Math.ceil(useCanvas ? canvasRect.height + inset.y : elementRect.height),
         ),
       };
+    };
+
+    /**
+     * The grid's own size, for a grid held bigger than its pane. Read off the
+     * screen element, which xterm sizes to the grid under either renderer —
+     * the DOM renderer has no canvas to measure, and the element itself is
+     * still the pane's size until the surface around it grows.
+     */
+    const clippedGridPixelSize = () => {
+      const screen = terminalElement.querySelector<HTMLElement>(".xterm-screen");
+      const rect = screen?.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return getTerminalPixelSize();
+      const inset = terminalInset();
+      return {
+        width: Math.max(1, Math.ceil(rect.width + inset.x)),
+        height: Math.max(1, Math.ceil(rect.height + inset.y)),
+      };
+    };
+
+    /**
+     * In a pane too small for its grid, pan so the cursor's cell is on screen:
+     * the line being typed on is the part of a clipped terminal that has to be
+     * seen. Only the frame moves; the grid, and the size the daemon has, do
+     * not.
+     */
+    const keepCursorInClippedFrame = () => {
+      if (!gridClippedRef.current || term.rows <= 0 || term.cols <= 0) return;
+      const screen = terminalElement.querySelector<HTMLElement>(".xterm-screen");
+      if (!screen) return;
+      const screenRect = screen.getBoundingClientRect();
+      const surfaceRect = terminalSurface.getBoundingClientRect();
+      const cellHeight = screenRect.height / term.rows;
+      const cellWidth = screenRect.width / term.cols;
+      const buffer = term.buffer.active;
+      const row = buffer.baseY + buffer.cursorY - buffer.viewportY;
+      if (row < 0 || row >= term.rows || cellHeight <= 0 || cellWidth <= 0) return;
+      const top = screenRect.top - surfaceRect.top + row * cellHeight;
+      const left = screenRect.left - surfaceRect.left + buffer.cursorX * cellWidth;
+      const view = terminalViewport;
+      if (top + cellHeight > view.scrollTop + view.clientHeight) {
+        view.scrollTop = Math.ceil(top + cellHeight - view.clientHeight);
+      } else if (top < view.scrollTop) {
+        view.scrollTop = Math.floor(top);
+      }
+      if (left + cellWidth > view.scrollLeft + view.clientWidth) {
+        view.scrollLeft = Math.ceil(left + cellWidth - view.clientWidth);
+      } else if (left < view.scrollLeft) {
+        view.scrollLeft = Math.floor(left);
+      }
     };
 
     const maxFrameScrollLeft = () => {
@@ -1970,7 +2035,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const wasActive = viewerPanFrameActiveRef.current;
       const shouldPinToBottom = pinToBottom && (!wasActive || viewerPanFrameIsAtBottom());
       viewerPanFrameActiveRef.current = true;
-      const size = getTerminalPixelSize();
+      const size = gridClippedRef.current ? clippedGridPixelSize() : getTerminalPixelSize();
       terminalSurface.style.width = `${size.width}px`;
       terminalSurface.style.height = `${size.height}px`;
       terminalElement.style.width = `${size.width}px`;
@@ -2650,13 +2715,33 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
         return;
       }
+      // Measured at the pane's own size, never at a clipped grid's: the
+      // surface a clipped grid is drawn on is bigger than the pane, and a fit
+      // that measured it would never shrink back.
+      gridClippedRef.current = false;
       layoutTerminalSurface(false);
+      const proposed = fit.proposeDimensions();
+      const grid = proposed ? daemonGrid(proposed) : null;
       try {
-        fit.fit();
+        if (grid && proposed && (grid.cols !== proposed.cols || grid.rows !== proposed.rows)) {
+          // Outside the grid the daemon accepts: hold the terminal to it.
+          // Under the minimum the pane clips the grid; the size the daemon
+          // gets is the same however much of it the pane shows.
+          gridClippedRef.current = grid.clipped;
+          if (grid.cols !== term.cols || grid.rows !== term.rows) term.resize(grid.cols, grid.rows);
+        } else {
+          // Every pane the daemon can take as it is: exactly the fit it has
+          // always had.
+          fit.fit();
+        }
       } catch {
         return;
       }
       layoutTerminalSurface(false);
+      if (gridClippedRef.current) {
+        keepCursorInClippedFrame();
+        requestAnimationFrame(keepCursorInClippedFrame);
+      }
       if (anchor) {
         restoreScrollAnchor(anchor);
         requestAnimationFrame(() => restoreScrollAnchor(anchor));
@@ -2742,6 +2827,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     return () => {
       ro.disconnect();
       scrollDisposable.dispose();
+      cursorMoveDisposable.dispose();
       xtermViewportEl?.removeEventListener("scroll", refreshLiveEdge);
       vv?.removeEventListener("resize", onVisualViewport);
       vv?.removeEventListener("scroll", onVisualViewport);
@@ -3144,7 +3230,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         snapToLiveEdge();
         socket.sendBinary(data);
       },
-      resize: (cols, rows) => {
+      resize: (requestedCols, requestedRows) => {
+        // Never a size the daemon refuses.
+        const { cols, rows } = daemonGrid({ cols: requestedCols, rows: requestedRows });
         const last = lastSizeRef.current;
         lastSizeRef.current = { cols, rows };
         if (cols !== last.cols || rows !== last.rows) {
