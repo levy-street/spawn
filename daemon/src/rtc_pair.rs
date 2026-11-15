@@ -46,7 +46,7 @@ struct PendingChannel(Arc<PairContext>);
 impl PendingChannel {
     fn begin(pair: &Arc<PairContext>) -> Option<Self> {
         pair.pending_channels
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 (pending < MAX_PAIR_PENDING_CHANNELS).then_some(pending + 1)
             })
             .ok()
