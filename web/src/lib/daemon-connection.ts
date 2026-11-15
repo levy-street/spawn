@@ -23,6 +23,9 @@ export interface DaemonSnapshot {
   /** The owner is replacing a peer on which no new channel opened
    *  (`channel-watch.ts`); set until a fresh peer is ready. */
   rebuilding?: boolean;
+  /** When the server or daemon last answered the owner's offer with a
+   *  refusal (`HostControlClient.getOfferFailedAt`). */
+  offerFailedAt?: number;
 }
 export interface DaemonConnection {
   getSnapshot(): DaemonSnapshot;
@@ -50,8 +53,13 @@ const OWNER_SILENCE_MS = 10_000;
 // doubles the wait, up to the cap; a connection that becomes ready ends the row.
 export const STUCK_LEAD_MS = 30_000;
 export const STUCK_LEAD_CAP_MS = 600_000;
+// A row of take-overs this old belongs to an earlier episode: it reads as none.
+const TAKEOVER_ROW_MS = 2 * STUCK_LEAD_CAP_MS;
 // How recent the server's word that the host is online must be to count.
 const HOST_CONFIRMED_MS = 75_000;
+// An offer refused this recently (a device the host has not approved, say) is
+// the host's answer, which any tab of this browser would get: not stuck.
+const OFFER_REFUSED_MS = 15_000;
 const VIEW_LEASE_MS = 12_000;
 const MAX_CHANNELS = 256;
 const RECEIVE_WINDOW_BYTES = 2 * 1024 * 1024;
@@ -86,44 +94,25 @@ type OwnedChannel = {
 };
 
 /** The owner is trying with nothing to show for it: connecting, or signalling
- *  with no working peer, and no refusal or error that explains why. Only time
- *  spent like this counts towards a take-over; ready, or a verdict, resets it. */
-function trying(snapshot: DaemonSnapshot): boolean {
+ *  with no working peer, with no refusal or error that explains why, and no
+ *  offer refused lately. Only time spent like this counts towards a take-over;
+ *  ready, or a verdict, resets it. */
+function trying(snapshot: DaemonSnapshot, now: number): boolean {
   return (
     (snapshot.state === "open" || snapshot.state === "connecting") &&
     !snapshot.refusal &&
-    !snapshot.error
+    !snapshot.error &&
+    !(
+      snapshot.offerFailedAt !== undefined &&
+      now - snapshot.offerFailedAt >= 0 &&
+      now - snapshot.offerFailedAt < OFFER_REFUSED_MS
+    )
   );
 }
 
 /** How long a link must be stuck before the next take-over in a row. */
 export function stuckBound(takeovers: number): number {
   return Math.min(STUCK_LEAD_MS * 2 ** Math.min(takeovers, 16), STUCK_LEAD_CAP_MS);
-}
-
-/** Take-overs in the current row, and when the last one was, shared by every
- *  tab of this origin; an unreadable record reads as none. */
-function readTakeovers(key: string): { count: number; at: number } {
-  try {
-    const [count, at] = (localStorage.getItem(`spawn.daemon.takeover:${key}`) ?? "")
-      .split(":")
-      .map(Number);
-    return {
-      count: Number.isSafeInteger(count) && count > 0 ? count : 0,
-      at: Number.isFinite(at) ? at : 0,
-    };
-  } catch {
-    return { count: 0, at: 0 };
-  }
-}
-
-function clearTakeovers(key: string): void {
-  try {
-    if (localStorage.getItem(`spawn.daemon.takeover:${key}`) !== null)
-      localStorage.removeItem(`spawn.daemon.takeover:${key}`);
-  } catch {
-    // Nothing to clear in a store this tab cannot use.
-  }
 }
 
 /** One physical connection across same-origin tabs, with bounded per-view channels. */
@@ -148,6 +137,10 @@ export class SharedDaemonConnection implements DaemonConnection {
   // appears, after this tab's own timers stood still. `stuck` measures from here.
   private usableAt = Date.now();
   private takingOver = false;
+  // What this connection could not keep in local storage (storage disabled,
+  // quota spent): read back before local storage, so the term and the row of
+  // take-overs still hold for this tab when they cannot be shared.
+  private readonly unstored = new Map<string, string>();
   private lockAbort: AbortController | null = null;
   private releaseLock: (() => void) | null = null;
   private stopRoot: (() => void) | null = null;
@@ -196,7 +189,7 @@ export class SharedDaemonConnection implements DaemonConnection {
       this.lastBeat = now;
       // A machine that slept, or a tab frozen in the background, says nothing
       // about the owner's link: judge it afresh from now.
-      if (suspended || gap < 0 || !trying(this.snapshot)) this.usableAt = now;
+      if (suspended || gap < 0 || !trying(this.snapshot, now)) this.usableAt = now;
       if (!this.root && suspended) {
         // This tab was frozen or throttled, not the owner: ask it to announce
         // and measure its silence from now.
@@ -299,8 +292,8 @@ export class SharedDaemonConnection implements DaemonConnection {
   /**
    * Queue for the owner lock, or with `steal` take it from a silent or stuck
    * owner. A stolen owner's request rejects; it stands down and queues again
-   * (so does one that hears a newer owner's term first). Page code too old to
-   * do either keeps announcing under its old term, which every tab ignores.
+   * (so does one that hears a newer owner's term first). Page code from before
+   * #101 does neither: see the owner fence in `receive`.
    */
   private elect(steal = false): void {
     if (this.closed || (this.lockAbort && !steal)) return;
@@ -325,45 +318,26 @@ export class SharedDaemonConnection implements DaemonConnection {
         if (!this.isActive()) return;
         held = true;
         const termKey = `spawn.daemon.term:${this.key}`;
-        const saved = Number(localStorage.getItem(termKey)) || 0;
+        const saved = Number(this.readStored(termKey)) || 0;
         this.term = Math.max(Date.now(), saved + 1, this.term + 1);
-        localStorage.setItem(termKey, String(this.term));
+        this.writeStored(termKey, String(this.term));
         this.leader = `${this.tab}:${this.term}`;
-        this.usableAt = Date.now();
         this.epoch = 0;
         this.owner = null;
-        this.scheduler = new DaemonSendScheduler();
-        const root = this.createRoot();
-        this.root = root;
-        this.rebuilding = false;
-        this.watch = new ChannelOpenWatch(
-          {
-            openProbe: (label) => root.createDeviceChannel(label),
-            ping: (timeoutMs) => root.ping({ timeoutMs }),
-            rebuild: () => {
-              if (this.root !== root) return false;
-              // Set first: the peer's teardown announces synchronously.
-              this.rebuilding = true;
-              if (root.rebuildPeer()) return true;
-              this.rebuilding = false;
-              return false;
-            },
-          },
-          root.hostId,
-          this.timing.watch ?? CHANNEL_WATCH_TIMING,
-        );
-        this.stopRoot = root.subscribe(() => this.announce());
-        root.connect();
+        this.startRoot();
         await new Promise<void>((resolve) => {
           this.releaseLock = resolve;
         });
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (abort.signal.aborted || this.closed) return;
         if (held) {
-          // Another tab took the lock while this one looked hung.
           this.relinquish();
-          this.elect();
+          // Another tab took the lock while this one looked hung: follow it,
+          // and queue again at once. Anything else that went wrong while this
+          // tab held the lock waits for the next heartbeat to ask again, so a
+          // failure that repeats cannot spin.
+          if ((error as { name?: unknown } | null)?.name === "AbortError") this.elect();
           return;
         }
         this.publish({
@@ -377,6 +351,47 @@ export class SharedDaemonConnection implements DaemonConnection {
       });
   }
 
+  /** The owner's physical connection: a new client, its channel watch and a
+   *  fresh send queue, announced from its first state. */
+  private startRoot(): void {
+    this.usableAt = Date.now();
+    this.scheduler = new DaemonSendScheduler();
+    const root = this.createRoot();
+    this.root = root;
+    this.rebuilding = false;
+    this.watch = new ChannelOpenWatch(
+      {
+        openProbe: (label) => root.createDeviceChannel(label),
+        ping: (timeoutMs) => root.ping({ timeoutMs }),
+        rebuild: () => {
+          if (this.root !== root) return false;
+          // Set first: the peer's teardown announces synchronously.
+          this.rebuilding = true;
+          if (root.rebuildPeer()) return true;
+          this.rebuilding = false;
+          return false;
+        },
+      },
+      root.hostId,
+      this.timing.watch ?? CHANNEL_WATCH_TIMING,
+    );
+    this.stopRoot = root.subscribe(() => this.announce());
+    root.connect();
+  }
+
+  /** Close the owner's physical connection and every channel on it. */
+  private stopRootConnection(): void {
+    this.stopRoot?.();
+    this.stopRoot = null;
+    this.watch?.close();
+    this.watch = null;
+    this.rebuilding = false;
+    for (const id of [...this.owned.keys()]) this.closeOwned(id);
+    this.root?.close();
+    this.root = null;
+    this.scheduler.close();
+  }
+
   /**
    * Whether the link this tab sees has been stuck for the current bound: its
    * owner, whichever tab and page code that is, has had nothing usable while
@@ -387,23 +402,22 @@ export class SharedDaemonConnection implements DaemonConnection {
    * person is looking at is the one worth giving the next attempt to.
    */
   private stuck(now: number): boolean {
-    if (!trying(this.snapshot) || !this.owner || document.visibilityState !== "visible")
+    if (!trying(this.snapshot, now) || !this.owner || document.visibilityState !== "visible")
       return false;
     const confirmed = this.hostOnlineAt();
     if (confirmed <= this.usableAt || now - confirmed > HOST_CONFIRMED_MS) return false;
-    const { count, at } = readTakeovers(this.key);
+    const { count, at } = this.readTakeovers(now);
     const bound = stuckBound(count);
-    const since = now - at;
-    return now - this.usableAt >= bound && !(since >= 0 && since < bound);
+    return now - this.usableAt >= bound && now - at >= bound;
   }
 
   /**
-   * Give a stuck link a fresh attempt. A waiting tab takes the lock, as from a
-   * silent owner; an owner gives the lock up and queues again behind any tab
-   * that waits, or takes it straight back with a new connection when none
-   * does. One tab acts per bound, whatever code the others run: every tab
-   * reads the same record of take-overs in a row, and writes it holding a
-   * lock of its own.
+   * Give a stuck link a fresh attempt, from the tab a person is looking at. A
+   * waiting tab takes the lock, as from a silent owner. An owner keeps the
+   * lock and replaces its own connection: handing the lock on would give it to
+   * the tab that has waited longest, as likely as not a hidden one on older
+   * page code. One tab acts per bound, whatever code the others run: every tab
+   * reads the same row of take-overs, and writes it holding a lock of its own.
    */
   private takeOver(): void {
     if (this.takingOver || !navigator.locks) return;
@@ -413,24 +427,72 @@ export class SharedDaemonConnection implements DaemonConnection {
       .request(`spawn.daemon.takeover:${this.key}`, { ifAvailable: true }, async (lock) => {
         const now = Date.now();
         if (!lock || this.closed || this.owner !== owner || !this.stuck(now)) return;
-        const count = readTakeovers(this.key).count + 1;
-        try {
-          localStorage.setItem(`spawn.daemon.takeover:${this.key}`, `${count}:${now}`);
-        } catch {
-          return;
-        }
+        const count = this.readTakeovers(now).count + 1;
+        this.writeStored(`spawn.daemon.takeover:${this.key}`, `${count}:${now}`);
         console.warn(
-          `SPAWN D: host ${this.key.split(":").at(-1)} has had no usable connection for ${Math.round((now - this.usableAt) / 1000)} s; ${this.root ? "this tab hands it" : "this tab takes it"} over (${count} in a row).`,
+          `SPAWN D: host ${this.key.split(":").at(-1)} has had no usable connection for ${Math.round((now - this.usableAt) / 1000)} s; ${this.root ? "this tab starts a new one" : "this tab takes it over"} (${count} in a row).`,
         );
         if (this.root) {
-          this.relinquish();
-          this.elect();
+          // Same lock and term; the epoch moves on, so nothing a tab opened on
+          // the old connection can land on the new one.
+          try {
+            this.stopRootConnection();
+            this.epoch++;
+            this.startRoot();
+          } catch {
+            // Never hold the lock with no connection: the heartbeat asks again.
+            this.relinquish();
+          }
         } else this.elect(true);
       })
       .catch(() => {})
       .finally(() => {
         this.takingOver = false;
       });
+  }
+
+  /** Take-overs in the current row, and when the last one was. A row older
+   *  than `TAKEOVER_ROW_MS`, or from a clock that has since gone back, belongs
+   *  to an earlier episode and reads as none. */
+  private readTakeovers(now: number): { count: number; at: number } {
+    const [count, at] = (this.readStored(`spawn.daemon.takeover:${this.key}`) ?? "")
+      .split(":")
+      .map(Number);
+    if (
+      !Number.isSafeInteger(count) ||
+      count < 1 ||
+      !(now - at >= 0 && now - at <= TAKEOVER_ROW_MS)
+    )
+      return { count: 0, at: 0 };
+    return { count, at };
+  }
+
+  private readStored(key: string): string | null {
+    const kept = this.unstored.get(key);
+    if (kept !== undefined) return kept;
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  }
+
+  private writeStored(key: string, value: string): void {
+    try {
+      localStorage.setItem(key, value);
+      this.unstored.delete(key);
+    } catch {
+      this.unstored.set(key, value);
+    }
+  }
+
+  private removeStored(key: string): void {
+    this.unstored.delete(key);
+    try {
+      if (localStorage.getItem(key) !== null) localStorage.removeItem(key);
+    } catch {
+      // Nothing more to clear in a store this tab cannot use.
+    }
   }
 
   private relinquish(): void {
@@ -441,15 +503,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         term: this.term,
         snapshot: { ...INITIAL, state: "connecting" },
       });
-    this.stopRoot?.();
-    this.stopRoot = null;
-    this.watch?.close();
-    this.watch = null;
-    this.rebuilding = false;
-    for (const id of [...this.owned.keys()]) this.closeOwned(id);
-    this.root?.close();
-    this.root = null;
-    this.scheduler.close();
+    this.stopRootConnection();
     this.leader = null;
     this.releaseLock?.();
     this.releaseLock = null;
@@ -472,6 +526,7 @@ export class SharedDaemonConnection implements DaemonConnection {
     }
     if (this.rebuilding && (root.getState() === "ready" || root.getState() === "error"))
       this.rebuilding = false;
+    const offerFailedAt = root.getOfferFailedAt();
     this.post({
       type: "snapshot",
       owner: this.leader,
@@ -485,6 +540,7 @@ export class SharedDaemonConnection implements DaemonConnection {
         info: root.getConnectionInfo(),
         error: root.getConnectionError(),
         ...(this.rebuilding ? { rebuilding: true } : {}),
+        ...(offerFailedAt ? { offerFailedAt } : {}),
       },
     });
   }
@@ -495,12 +551,14 @@ export class SharedDaemonConnection implements DaemonConnection {
       retireChildren ||
       this.snapshot.generation !== snapshot.generation ||
       (this.snapshot.state === "ready" && snapshot.state !== "ready");
+    const now = Date.now();
     const wasReady = this.snapshot.state === "ready";
-    const wasTrying = trying(this.snapshot);
+    const wasTrying = trying(this.snapshot, now);
     this.snapshot = snapshot;
-    if (!wasTrying || !trying(snapshot)) this.usableAt = Date.now();
+    if (!wasTrying || !trying(snapshot, now)) this.usableAt = now;
     // A link that works ends a row of take-overs, whoever made it work.
-    if (!wasReady && snapshot.state === "ready") clearTakeovers(this.key);
+    if (!wasReady && snapshot.state === "ready")
+      this.removeStored(`spawn.daemon.takeover:${this.key}`);
     if (changed) {
       // Readiness can be lost without replacing the physical peer. Retire
       // every child at that boundary, including the owner's unsent queues;
@@ -530,6 +588,12 @@ export class SharedDaemonConnection implements DaemonConnection {
     if (message.type === "snapshot" && message.owner && message.snapshot) {
       if (!Number.isSafeInteger(message.term) || (message.term ?? 0) < this.term) return;
       if (!Number.isSafeInteger(message.epoch) || (message.epoch ?? -1) < 0) return;
+      // Every owner since the first shared connection names itself
+      // `<tab>:<term>` and announces under that term while it leads. A tab on
+      // page code from before #101 whose lock was taken copies the newer term
+      // it hears and goes on announcing its own name under it: no owner at
+      // all, though a tab that has followed no one yet would follow it.
+      if (typeof message.owner !== "string" || !message.owner.endsWith(`:${message.term}`)) return;
       if (this.leader && message.owner !== this.leader && message.term! > this.term) {
         // A newer owner took the lock from this tab: stand down before following it.
         this.relinquish();

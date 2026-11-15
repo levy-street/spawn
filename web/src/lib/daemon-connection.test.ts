@@ -167,6 +167,11 @@ class Root {
   getConnectionError() {
     return this.error;
   }
+  /** When the daemon last refused an offer (`HostControlClient.getOfferFailedAt`). */
+  failedAt = 0;
+  getOfferFailedAt() {
+    return this.failedAt;
+  }
   getSignalingTrust() {
     return "verified";
   }
@@ -820,52 +825,215 @@ function tab(hostOnlineAt: () => number = online) {
   return connect("account:host", undefined, undefined, undefined, hostOnlineAt);
 }
 
-/**
- * A tab on page code from before take-overs, holding the lock with a link that
- * never comes up: it announces every heartbeat, answers no open, and once its
- * lock is taken keeps right on talking under its old term.
- */
-function staleOwner(key = "account:host") {
-  const name = `spawn.daemon.v2:${key}`;
-  const term = Date.now() - 4 * 86_400_000;
-  const from = crypto.randomUUID();
-  const owner = `${from}:${term}`;
-  const bus = new Bus(name);
-  let deposed = false;
-  void navigator.locks
-    .request(name, {}, () => new Promise<void>(() => {}))
-    .catch(() => {
-      deposed = true;
-    });
-  const say = (message: Record<string, unknown>) =>
-    bus.postMessage({ v: 1, from, owner, term, epoch: 0, ...message });
-  const announce = (state: HostControlState = "open") =>
-    say({
-      type: "snapshot",
-      snapshot: {
-        state,
-        generation: state === "ready" ? "stale-peer" : null,
-        capabilities: [],
-        refusal: null,
-        trust: null,
-      },
-    });
-  announce();
-  const beat = setInterval(() => announce(), 2_000);
-  return {
-    say,
-    announce,
-    deposed: () => deposed,
-    stop: () => {
-      clearInterval(beat);
-      bus.close();
-    },
-  };
+type Said = {
+  type: string;
+  from: string;
+  owner?: string;
+  term?: number;
+  epoch?: number;
+  snapshot?: DaemonSnapshot;
+};
+/** The last snapshot announced for a given peer, by whichever tab. */
+function announcedFor(root: Root) {
+  return (Bus.messages as Said[]).findLast(
+    (message) => message.type === "snapshot" && message.snapshot?.generation === root.generation,
+  );
 }
 
-test("a waiting tab takes the lead from an owner on old page code whose link never comes up, then ignores it", async () => {
+/**
+ * FIXTURE, not product code: the parts of `SharedDaemonConnection` at
+ * 23e30e46 that decide who leads, copied as they were with the channel
+ * proxying left out (its link never becomes ready, so it opens none). That is
+ * the page code from before #101, still running in tabs left open since. What
+ * matters about it here: it never takes a lock; when its own is taken, the
+ * rejected request only publishes an error, and the tab keeps its peer and
+ * its name; it answers every hello with its snapshot; and it copies any newer
+ * term it hears while still announcing its old name, `<tab>:<old term>`.
+ */
+type Pre101Wire = Omit<Said, "from"> & { v: 1; from: string; to?: string };
+class Pre101Tab {
+  private snapshot: DaemonSnapshot = {
+    state: "idle",
+    generation: null,
+    capabilities: [],
+    refusal: null,
+    trust: null,
+  };
+  readonly tab = crypto.randomUUID();
+  private readonly bus: BroadcastChannel | null;
+  private root: HostControlClient | null = null;
+  private owner: string | null = null;
+  private leader: string | null = null;
+  private term = 0;
+  private epoch = 0;
+  private ownerSeen = 0;
+  private lockAbort: AbortController | null = null;
+  private releaseLock: (() => void) | null = null;
+  private stopRoot: (() => void) | null = null;
+  private readonly heartbeat: ReturnType<typeof setInterval>;
+  private closed = false;
+
+  constructor(
+    private readonly key: string,
+    private readonly createRoot: () => HostControlClient,
+  ) {
+    try {
+      this.bus = new BroadcastChannel(`spawn.daemon.v2:${key}`);
+      this.bus.onmessage = ({ data }) => this.receive(data);
+    } catch {
+      this.bus = null;
+    }
+    this.heartbeat = setInterval(() => {
+      if (!this.root && this.ownerSeen && Date.now() - this.ownerSeen > 6_000) {
+        this.publish({ ...this.snapshot, state: "connecting", generation: null });
+      }
+      this.post({ type: "heartbeat" });
+      if (this.root) this.announce();
+    }, 2_000);
+    this.post({ type: "hello" });
+    this.elect();
+  }
+
+  getSnapshot = (): DaemonSnapshot => this.snapshot;
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.post({ type: "depart" });
+    this.relinquish();
+    clearInterval(this.heartbeat);
+    this.bus?.close();
+  }
+
+  private elect(): void {
+    if (this.closed || this.lockAbort) return;
+    const abort = new AbortController();
+    this.lockAbort = abort;
+    void navigator.locks
+      .request(`spawn.daemon.v2:${this.key}`, { signal: abort.signal }, async () => {
+        if (this.closed || abort.signal.aborted) return;
+        const termKey = `spawn.daemon.term:${this.key}`;
+        const saved = Number(localStorage.getItem(termKey)) || 0;
+        this.term = Math.max(Date.now(), saved + 1, this.term + 1);
+        localStorage.setItem(termKey, String(this.term));
+        this.leader = `${this.tab}:${this.term}`;
+        this.epoch = 0;
+        this.owner = null;
+        this.root = this.createRoot();
+        this.stopRoot = this.root.subscribe(() => this.announce());
+        this.root.connect();
+        await new Promise<void>((resolve) => {
+          this.releaseLock = resolve;
+        });
+      })
+      .catch(() => {
+        if (!abort.signal.aborted && !this.closed)
+          this.publish({
+            ...this.snapshot,
+            state: "error",
+            error: "SPAWN D could not coordinate this browser's daemon connection.",
+          });
+      })
+      .finally(() => {
+        if (this.lockAbort === abort) this.lockAbort = null;
+      });
+  }
+
+  private relinquish(): void {
+    if (this.leader)
+      this.post({
+        type: "snapshot",
+        owner: this.leader,
+        term: this.term,
+        snapshot: { ...this.snapshot, state: "connecting" },
+      });
+    this.stopRoot?.();
+    this.stopRoot = null;
+    this.root?.close();
+    this.root = null;
+    this.leader = null;
+    this.releaseLock?.();
+    this.releaseLock = null;
+    this.lockAbort?.abort();
+    this.lockAbort = null;
+  }
+
+  private announce(): void {
+    const root = this.root;
+    if (!root || !this.leader) return;
+    if (
+      this.snapshot.generation !== root.getConnectionGeneration() ||
+      (this.snapshot.state === "ready" && root.getState() !== "ready")
+    )
+      this.epoch++;
+    this.post({
+      type: "snapshot",
+      owner: this.leader,
+      term: this.term,
+      snapshot: {
+        state: root.getState(),
+        generation: root.getConnectionGeneration(),
+        capabilities: [...root.getCapabilities()],
+        refusal: root.getSignedRtcRefusal(),
+        trust: root.getSignalingTrust(),
+        info: root.getConnectionInfo(),
+        error: root.getConnectionError(),
+      },
+    });
+  }
+
+  private publish(snapshot: DaemonSnapshot): void {
+    this.snapshot = snapshot;
+  }
+
+  private post(message: Omit<Pre101Wire, "v" | "from">): void {
+    const wire: Pre101Wire = { v: 1, from: this.tab, epoch: this.epoch, ...message };
+    this.bus?.postMessage(wire);
+    this.receive(wire);
+  }
+
+  private receive(raw: unknown): void {
+    if (!raw || typeof raw !== "object") return;
+    const message = raw as Pre101Wire;
+    if (message.v !== 1 || typeof message.from !== "string" || typeof message.type !== "string")
+      return;
+    if (message.to && message.to !== this.tab) return;
+    if (message.type === "snapshot" && message.owner && message.snapshot) {
+      if (!Number.isSafeInteger(message.term) || (message.term ?? 0) < this.term) return;
+      if (!Number.isSafeInteger(message.epoch) || (message.epoch ?? -1) < 0) return;
+      if (message.term === this.term && this.owner && this.owner !== message.owner) return;
+      if (message.term === this.term && (message.epoch ?? 0) < this.epoch) return;
+      this.term = message.term ?? 0;
+      this.ownerSeen = Date.now();
+      this.owner = message.owner;
+      this.epoch = message.epoch ?? 0;
+      this.publish(message.snapshot);
+      return;
+    }
+    if (!this.root || !this.leader) return;
+    if (message.type === "hello") this.announce();
+  }
+}
+const pre101Tabs: Pre101Tab[] = [];
+function pre101Tab() {
+  const old = new Pre101Tab("account:host", () => {
+    const root = new Root();
+    roots.push(root);
+    return root as unknown as HostControlClient;
+  });
+  pre101Tabs.push(old);
+  return old;
+}
+afterEach(() => {
+  for (const old of pre101Tabs.splice(0)) old.close();
+});
+
+test("a waiting tab takes the lead from an owner on page code from before #101; what that tab still says is ignored, by tabs opened later too", async () => {
   jest.useFakeTimers();
-  const stale = staleOwner();
+  Root.reaches = "open";
+  const old = pre101Tab();
+  await within(() => roots.length === 1, 1_000);
+  Root.reaches = "ready";
   const first = tab();
   const second = tab();
   await within(
@@ -873,47 +1041,47 @@ test("a waiting tab takes the lead from an owner on old page code whose link nev
     3_000,
   );
   await advance(STUCK_LEAD_MS - 2_000, 500);
-  expect(roots).toHaveLength(0);
-  const waited = performance.now();
-  await within(() => roots.length === 1, 5_000);
-  expect(stale.deposed()).toBe(true);
+  expect(roots).toHaveLength(1);
+  await within(() => roots.length === 2, 5_000);
+  const healthy = roots[1];
   await within(
     () => first.getSnapshot().state === "ready" && second.getSnapshot().state === "ready",
     1_000,
   );
-  const generation = roots[0].generation;
-  expect(performance.now() - waited).toBeLessThan(5_000);
 
-  // The deposed tab's code keeps announcing and answering under its old term.
-  const view = second.createChannel(label());
-  const heard = heardOn(view);
+  // Deposed, the old tab keeps its peer and follows the new owner for its own
+  // views; having copied that owner's term, it announces its own old name
+  // under it.
+  expect(roots[0].closed).toBe(false);
+  expect(old.getSnapshot().generation).toBe(healthy.generation);
+  await advance(4_000, 500);
+  const owner = announcedFor(healthy);
+  const zombie = (Bus.messages as Said[]).findLast(
+    (message) => message.type === "snapshot" && message.from === old.tab,
+  );
+  expect(zombie?.term).toBe(owner?.term);
+  expect(zombie?.owner).not.toBe(owner?.owner);
+
+  // A tab that opens now (a new tab, a reload, a rebuilt connection) has
+  // followed no one: it hears the old tab answer its hello too, and must
+  // still follow the healthy owner.
+  const fresh = tab();
+  await within(() => fresh.getSnapshot().state === "ready", 3_000);
+  expect(fresh.getSnapshot().generation).toBe(healthy.generation);
+  const view = fresh.createChannel(label());
   await within(() => view.readyState === "open", 1_000);
-  const open = Bus.messages.findLast(
-    (message) => (message as { type: string }).type === "channel-open",
-  ) as { channel: string };
-  stale.announce("ready");
-  stale.say({
-    type: "channel-data",
-    channel: open.channel,
-    data: "from the deposed tab",
-    sequence: 1,
-  });
-  stale.say({ type: "channel-closed", channel: open.channel });
-  await advance(10_000, 500);
-  expect(first.getSnapshot().generation).toBe(generation);
-  expect(second.getSnapshot().generation).toBe(generation);
-  expect(view.readyState).toBe("open");
-  expect(heard).toEqual([]);
   view.send("typed");
-  await within(() => roots[0].channels[0]?.sent.length === 1, 1_000);
+  await within(() => healthy.channels[0]?.sent.length === 1, 1_000);
 
-  // A ready owner is never taken over, by either tab.
+  // However long the old tab goes on, nobody takes a ready link over.
   await advance(10 * 60_000, 500);
-  expect(roots).toHaveLength(1);
-  stale.stop();
+  expect(roots).toHaveLength(2);
+  expect(healthy.closed).toBe(false);
+  for (const each of [first, second, fresh])
+    expect(each.getSnapshot().generation).toBe(healthy.generation);
 });
 
-test("an owner whose link never comes up hands the lead to a waiting tab once, then the wait doubles", async () => {
+test("an owner whose link never comes up starts a new one itself, keeping the lead; the next wait doubles", async () => {
   jest.useFakeTimers();
   Root.reaches = "open";
   const owner = tab();
@@ -922,20 +1090,24 @@ test("an owner whose link never comes up hands the lead to a waiting tab once, t
   // list is not polled): here only the owner can judge its own link.
   const waiting = tab(unheard);
   await within(() => waiting.getSnapshot().state === "open", 1_000);
+  const before = announcedFor(roots[0]);
   await advance(STUCK_LEAD_MS - 2_000, 500);
   expect(roots).toHaveLength(1);
   await within(() => roots.length === 2, 5_000);
-  // The owner gave the lock up, closing its peer; both tabs follow the new one.
   expect(roots[0].closed).toBe(true);
-  await within(() => owner.getSnapshot().generation === roots[1].generation, 1_000);
-  expect(waiting.getSnapshot().generation).toBe(roots[1].generation);
-  const handedAt = roots[1].createdAt;
+  // The same tab leads under the same term, past the old connection's epoch;
+  // the lock never moved, so the waiting tab is still waiting.
+  await within(() => waiting.getSnapshot().generation === roots[1].generation, 1_000);
+  const after = announcedFor(roots[1]);
+  expect(after?.owner).toBe(before?.owner);
+  expect(after?.term).toBe(before?.term);
+  expect(after?.epoch).toBeGreaterThan(before?.epoch ?? 0);
+  expect(owner.getSnapshot().generation).toBe(roots[1].generation);
 
-  // The tab that gave it up does not take it straight back.
   await advance(stuckBound(1) - 3_000, 500);
   expect(roots).toHaveLength(2);
   await within(() => roots.length === 3, 6_000);
-  expect(roots[2].createdAt - handedAt).toBeGreaterThanOrEqual(stuckBound(1));
+  expect(roots[2].createdAt - roots[1].createdAt).toBeGreaterThanOrEqual(stuckBound(1));
 });
 
 test("a lone tab whose link never comes up starts it afresh, at a falling rate", async () => {
@@ -1031,4 +1203,76 @@ test("a machine that slept does not count its sleep against the owner's link", a
   await advance(STUCK_LEAD_MS - 3_000, 500);
   expect(roots).toHaveLength(1);
   await within(() => roots.length === 2, 6_000);
+});
+
+test("a row of take-overs from an earlier episode does not hold up a new one", async () => {
+  jest.useFakeTimers();
+  // Five in a row, the last 25 minutes ago, never ended by a ready link: the
+  // ten-minute wait it would ask for belongs to another episode.
+  localStorage.setItem("spawn.daemon.takeover:account:host", `5:${Date.now() - 25 * 60_000}`);
+  Root.reaches = "open";
+  tab();
+  tab();
+  await within(() => roots.length === 1, 1_000);
+  await within(() => roots.length === 2, STUCK_LEAD_MS + 5_000);
+  expect(localStorage.getItem("spawn.daemon.takeover:account:host")).toStartWith("1:");
+});
+
+test("with local storage unusable a tab still leads, and backs off on its own", async () => {
+  jest.useFakeTimers();
+  const refuse = () => {
+    throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+  };
+  Object.defineProperty(globalThis, "localStorage", {
+    value: { getItem: refuse, setItem: refuse, removeItem: refuse },
+    configurable: true,
+  });
+  Root.reaches = "open";
+  const only = tab();
+  await within(() => roots.length === 1, 1_000);
+  await within(() => only.getSnapshot().state === "open", 1_000);
+  await advance(5_000, 500);
+  expect(roots).toHaveLength(1);
+  await within(() => roots.length === 2, STUCK_LEAD_MS + 5_000);
+  await advance(stuckBound(1) - 3_000, 500);
+  expect(roots).toHaveLength(2);
+});
+
+test("a tab that fails while holding the lock asks again on its next heartbeat, not in a spin", async () => {
+  jest.useFakeTimers();
+  let attempts = 0;
+  const connection = new SharedDaemonConnection("account:host", () => {
+    attempts++;
+    if (attempts <= 3) throw new Error("no client today");
+    const root = new Root();
+    roots.push(root);
+    return root as unknown as HostControlClient;
+  });
+  connections.push(connection);
+  await advance(1_000, 10);
+  expect(attempts).toBe(1);
+  await within(() => connection.getSnapshot().state === "ready", 10_000);
+  expect(attempts).toBe(4);
+  expect(roots).toHaveLength(1);
+});
+
+test("a link whose offers the host keeps refusing is not taken over; one gone quiet is", async () => {
+  jest.useFakeTimers();
+  Root.reaches = "open";
+  tab();
+  tab();
+  await within(() => roots.length === 1, 1_000);
+  // The daemon answers every offer `failed`, as it does a device it has not
+  // approved; the owner retries each time.
+  const refusing = setInterval(() => {
+    roots[0].failedAt = Date.now();
+    roots[0].setState("connecting");
+    roots[0].setState("open");
+  }, 2_000);
+  await advance(10 * 60_000, 500);
+  expect(roots).toHaveLength(1);
+  clearInterval(refusing);
+  const quiet = performance.now();
+  await within(() => roots.length === 2, 60_000);
+  expect(performance.now() - quiet).toBeGreaterThanOrEqual(STUCK_LEAD_MS);
 });

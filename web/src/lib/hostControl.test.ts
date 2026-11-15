@@ -826,6 +826,39 @@ describe("HostControlClient", () => {
     third.client.close();
   });
 
+  test("a refused offer is remembered; another offer's refusal and a lost host are not", async () => {
+    const first = await readyClient({ reconnectBaseDelayMs: 1_000 });
+    expect(first.client.getOfferFailedAt()).toBe(0);
+    first.ws.receive({
+      type: "rtc.status",
+      session_id: crypto.randomUUID(),
+      status: "failed",
+      ...metadata,
+    });
+    expect(first.client.getOfferFailedAt()).toBe(0);
+    const before = Date.now();
+    first.ws.receive({
+      type: "rtc.status",
+      session_id: first.offer.session_id,
+      status: "failed",
+      ...metadata,
+    });
+    expect(first.client.getOfferFailedAt()).toBeGreaterThanOrEqual(before);
+    first.client.close();
+
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const second = await readyClient({ reconnectBaseDelayMs: 1_000 });
+    second.ws.receive({
+      type: "rtc.status",
+      session_id: second.offer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    expect(second.client.getOfferFailedAt()).toBe(0);
+    second.client.close();
+  });
+
   test("a protocol-required close is terminal without becoming a trust refusal", async () => {
     const client = new HostControlClient(hostId, { reconnectBaseDelayMs: 1 });
     client.connect();
