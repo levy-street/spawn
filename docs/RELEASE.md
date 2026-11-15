@@ -478,7 +478,7 @@ question about **which tree changed**, because that is what the identities at
 | --- | --- | --- |
 | `daemon/` | signed prebuilts for every target | `prebuilt.yml` builds on a master push; **you** sign the manifest, via `deploy-prod.sh` |
 | `desktop/` | a signed, notarized app per platform | `desktop.yml` builds on a master push; **you** sign the payloads and write `latest.json` |
-| `mobile/` | an EAS OTA on the matching channel | `deploy-prod.sh`, during the deploy |
+| `mobile/` | an EAS OTA on the matching channel, when the native shell still fits; otherwise a store build for each platform that no longer fits | `deploy-prod.sh`, during the deploy; a store build only ever by a person, via `mobile-store-recovery.yml` |
 | `server/`, `web/` | a deploy | `deploy-prod.sh` |
 | a protocol name | all of the above, in the order below | see "The wire protocols" |
 
@@ -506,6 +506,42 @@ enough. Differing ones mean a store build is owed — and shipping the OTA alone
 would either be refused by every install or, worse, hand them JavaScript that
 calls native code their shell does not have. Most releases do not need one;
 this is how a release knows it is one of the ones that does.
+
+It is asked **per platform**, each against that platform's last finished
+production build, because a store build is per platform: an Android-only
+native change owes an Android build and nothing else. The plan reports
+`mobile_native_ios` and `mobile_native_android` (yes/no/unknown, each with a
+reason naming the build and, for a yes, the fingerprint sources that differ);
+`mobile_native_build` is yes if either is, else unknown if either is.
+
+The fingerprint hashes the whole evaluated app config, `extra` included, and
+`app.config.ts` stamps two values there that are not native: `extra.mobileTree`
+(the commit's mobile tree hash, which every change under `mobile/` moves) and
+`extra.apiUrl` (from the build profile's `env`). A build hashed both as they
+were for its own commit and profile, so the plan evaluates the candidate with
+that build's tree stamp and its production profile `env`, and ignores any
+`EXPO_PUBLIC_*` inherited from the shell. Comparing with any other values makes
+a test or doc change read as a new native shell — which is how, until
+2026-11-15, every release touching `mobile/` built and submitted both stores.
+A build made from the candidate's own mobile tree matches without asking EAS.
+An EAS environment variable added for `production` builds would need the same
+treatment, or every comparison reads yes.
+
+What the release does with the answer:
+
+| `mobile_native_build` | the phone OTA | store builds | the release |
+| --- | --- | --- | --- |
+| `no` | published by `deploy-prod.sh` | none | succeeds |
+| `yes` | withheld (`SPAWN_DEPLOY_MOBILE=0`) | none started; the platforms that no longer fit are named | deploys server/web/daemon, then fails at **require the owed store builds** |
+| `unknown` | withheld | none | deploys server/web/daemon, then fails at **require the owed store builds** |
+
+A store build is never started by a push. Each one costs EAS build credit and
+half an hour per platform, and whether a native change should ship to the
+stores at all is a decision, so a person starts it: see "Recover native store
+builds after deployment" below. Unknown is never read as either answer: the
+update is held back because nothing proved it fits, and no build is started
+because nothing proved one is owed. The failing job's summary names the next
+step for both cases.
 
 Three of those rows say "you", and that is not an omission to be automated
 away later. **The offline keys never enter CI** — the Ed25519 daemon release
@@ -583,14 +619,16 @@ use the existing explicit `--allow-branch` procedure.
 
 #### Recover native store builds after deployment
 
-Store jobs use an explicit status condition plus successful plan/deployment
-requirements. Otherwise GitHub's implicit `success()` can skip them when an
-optional ancestor, such as an unchanged daemon's prebuilt job, was skipped.
-A final store-result check fails a release that owed native builds but did not
-complete that job. This does not make a successful OTA proof of store delivery.
+This is the only way a store build starts from CI. `release.yml` has no store
+build job: when its plan says `mobile_native_build=yes`, the deploy withholds
+the OTA and the release fails at **require the owed store builds**, whose
+summary names the platforms whose fingerprint no longer matches and the exact
+commands below. That job uses an explicit `!cancelled()` condition, so it
+reports even when an optional ancestor was skipped or the deploy failed. Build
+only the platforms it names, and only if the native change is meant to ship.
 
-If the server/web/OTA deployment succeeded but store builds were skipped or
-failed, use the original release run, not a freshly calculated release plan:
+Once the server/web deployment of that run has succeeded, start from the
+original release run, not a freshly calculated release plan:
 
 ```bash
 gh workflow run mobile-store-recovery.yml --ref master \
@@ -812,11 +850,14 @@ the harder failure to notice.
 
 ## The phone
 
-The deploy script does not touch the phone. The installed app keeps running
-whatever JavaScript it was built with, so a release that stops at the deploy
-leaves the two frontends on different versions of the same feature.
-
-Push the matching update in the same release:
+The installed app keeps running whatever JavaScript it was built with, so a
+release that stops at the deploy leaves the two frontends on different versions
+of the same feature. `deploy-prod.sh` therefore publishes the matching update
+itself, last, when `mobile/` changed, through the script below. The release
+workflow lets it do so only when the plan proved the native shell still fits
+(`mobile_native_build=no`); otherwise it sets `SPAWN_DEPLOY_MOBILE=0`, and the
+deploy prints the command instead. Run it by hand only after that question
+has been answered no for the commit you publish:
 
 ```bash
 scripts/update-mobile-prod.sh -m "<same summary as the deploy>"
@@ -859,10 +900,23 @@ alters the native layer needs a real build instead:
 - bumping `version` in `app.json` — `runtimeVersion` follows `appVersion`, so a
   version bump orphans every install from further updates until they rebuild
 
+A real build is always started by a person, one platform at a time, and only
+for a platform whose fingerprint no longer matches its last production build:
+`release.yml` never starts one (see "The master pipeline" above). After a
+release that stopped at **require the owed store builds**, use
+`mobile-store-recovery.yml` with that run. Without such a run (for example
+after an `unknown` that you answered yes by hand), build from a clean checkout
+of the commit the release deployed:
+
 ```bash
 cd mobile && EXPO_NO_CAPABILITY_SYNC=1 \
   eas build -p ios -e production --non-interactive --auto-submit
 ```
+
+The plan compares only against the newest production build of each platform.
+While `runtimeVersion` follows an unchanged `version`, older installed shells
+share its runtime and receive every later OTA too, so a native change that must
+not reach them also needs the `version` bump above.
 
 Credentials live on EAS — distribution certificate, provisioning profile, APNs
 key, and the App Store Connect key for submissions — so this needs no Apple
@@ -1655,10 +1709,11 @@ standard-user accounts.
    choices, direct WebRTC, the optional Private program rule, and TURN fallback.
 6. Run `scripts/deploy-prod.sh <ssh-host>`. Do not continue past a hard gate by
    habit; fix the release or record why the emergency prebuilt override is safe.
-7. If `mobile/` changed, run
-   `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"`. If native
-   code, configuration, entitlements, or the runtime version changed, publish a
-   real store build as well.
+7. If `mobile/` changed, ask `scripts/release-plan.sh` whether the native shell
+   still fits. Only when its mobile store build is `no`, run
+   `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"`. When it is
+   `yes`, publish no update; start a real store build for each platform it
+   names, per "The phone". When it is `unknown`, find out before doing either.
 8. Exercise the changed user flow. For network or signalling changes, also run
    `scripts/health-check.sh` with the production `SPAWN_TURN_URLS`; this checks
    the public WebSocket upgrade and the configured UDP TURN listener. Keep the

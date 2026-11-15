@@ -87,6 +87,9 @@ jobs:
       daemon_prebuilts: ${{ steps.plan.outputs.daemon_prebuilts }}
       mobile_ota: ${{ steps.plan.outputs.mobile_ota }}
       mobile_native_build: ${{ steps.plan.outputs.mobile_native_build }}
+      mobile_native_ios: ${{ steps.plan.outputs.mobile_native_ios }}
+      mobile_native_android: ${{ steps.plan.outputs.mobile_native_android }}
+      mobile_native_reason: ${{ steps.plan.outputs.mobile_native_reason }}
       desktop_publish: ${{ steps.plan.outputs.desktop_publish }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -115,8 +118,8 @@ jobs:
         id: plan
         env:
           # The fingerprint comparison asks EAS what native shell the last
-          # production build had. Without it the mobile row is "unknown", and
-          # the store-build job below refuses to guess.
+          # production build of each platform had. Without it the mobile row
+          # is "unknown", and phones get nothing until a person looks.
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           FROM: ${{ github.event.inputs.from }}
           BASELINE: ${{ steps.baseline.outputs.commit }}
@@ -132,7 +135,9 @@ jobs:
           plan = json.load(open("/tmp/plan.json"))
           for key in ("deploy", "daemon_prebuilts", "mobile_ota", "desktop_publish"):
               print(f"{key}={str(plan[key]).lower()}")
-          print(f"mobile_native_build={plan['mobile_native_build']}")
+          for key in ("mobile_native_build", "mobile_native_ios", "mobile_native_android",
+                      "mobile_native_reason"):
+              print(f"{key}={' '.join(str(plan[key]).split())}")
           PY
 
       - name: Say it out loud
@@ -267,64 +272,97 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           # Inherited values are refused by the script, so name it explicitly.
           SPAWN_DEPLOY_MOBILE_CHANNEL: production
+          # The OTA goes out only when the plan proved this tree still fits the
+          # native shell of the last production build on both platforms.
+          # "yes" and "unknown" withhold it: it would reach every phone on the
+          # channel, including shells that cannot run it. The deploy prints
+          # the publish command instead, and the job below stops the release.
+          SPAWN_DEPLOY_MOBILE: ${{ needs.plan.outputs.mobile_native_build == 'no' && '1' || '0' }}
         run: |
           set -euo pipefail
           scripts/deploy-prod.sh spawnd-prod --api-proxy-target http://127.0.0.1:8001 \
             --resume \
             --acceptance-evidence "$RUNNER_TEMP/release-acceptance/acceptance.json"
 
-  # Only when the tree no longer fits the native shell already on phones.
-  # Most releases skip this; see the mobile note in docs/RELEASE.md.
-  mobile-store-build:
-    name: TestFlight and Play
+  # A push never starts a store build. Each one costs EAS credit and half an
+  # hour, and the only time one is owed is when the native fingerprint of this
+  # tree differs from the last production build of that platform; even then a
+  # person starts it, through mobile-store-recovery.yml. This job is the stop:
+  # whenever the phone update was withheld (a native change, or a check that
+  # could not answer), the release fails here and says what to do. Server, web
+  # and daemon never wait on it.
+  store-build-owed:
+    name: require the owed store builds
     needs: [plan, deploy]
-    # An optional prebuilt job may be skipped further up the dependency chain.
-    # Override implicit success(), but still require this deployment to succeed.
+    # !cancelled(), not success(): it must report when the deploy failed or an
+    # optional ancestor was skipped.
     if: >-
       !cancelled() &&
       needs.plan.result == 'success' &&
-      needs.deploy.result == 'success' &&
-      needs.plan.outputs.mobile_native_build == 'yes'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    environment: production
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: mobile/package-lock.json
-      - name: Install mobile dependencies
-        working-directory: mobile
-        run: npm ci
-      - name: Build and submit both stores
-        working-directory: mobile
-        env:
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-          # EAS otherwise tries to switch ASSOCIATED_DOMAINS off, Apple's API
-          # rejects the patch, and the build dies. Universal links want it on.
-          EXPO_NO_CAPABILITY_SYNC: "1"
-        run: |
-          set -euo pipefail
-          [ -n "${EXPO_TOKEN:-}" ] || { echo "::error::EXPO_TOKEN is not set" >&2; exit 1; }
-          # eas-cli is not one of mobile's devDependencies, so npx must be told
-          # to fetch it — a bare `npx eas` cannot determine an executable.
-          npx --yes eas-cli build --platform all --profile production --non-interactive --auto-submit
-
-  verify-mobile-store-build:
-    name: require the owed store builds
-    needs: [plan, mobile-store-build]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.mobile_native_build == 'yes'
+      needs.plan.outputs.mobile_ota == 'true' &&
+      needs.plan.outputs.mobile_native_build != 'no'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Refuse a successful release with missing store builds
+      - name: Stop the release; phones were not updated
         env:
-          STORE_RESULT: ${{ needs.mobile-store-build.result }}
-        run: test "$STORE_RESULT" = success
+          VERDICT: ${{ needs.plan.outputs.mobile_native_build }}
+          IOS: ${{ needs.plan.outputs.mobile_native_ios }}
+          ANDROID: ${{ needs.plan.outputs.mobile_native_android }}
+          REASON: ${{ needs.plan.outputs.mobile_native_reason }}
+          BASELINE: ${{ needs.plan.outputs.baseline }}
+          RELEASE_RUN: ${{ github.run_id }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          set -euo pipefail
+          owed=()
+          [[ "$IOS" != yes ]] || owed+=(ios)
+          [[ "$ANDROID" != yes ]] || owed+=(android)
+          {
+            if [[ "$VERDICT" == yes ]]; then
+              echo "### Phones were not updated: a store build is owed (${owed[*]:-see the plan})"
+              echo
+              echo "The native fingerprint of this commit no longer matches the last production"
+              echo "build for: **${owed[*]:-see the plan}**. ios: ${IOS:-?}, android: ${ANDROID:-?}."
+              echo "Why: ${REASON:-not recorded}"
+              echo
+              echo "Deploy job: **$DEPLOY_RESULT**. It published no over-the-air update,"
+              echo "because one would reach phones whose native shell cannot run it. A release"
+              echo "never starts a store build; if this native change is intended, start one"
+              echo "for each platform named above, once the deploy job here has succeeded:"
+              echo
+              echo '```'
+              echo "gh workflow run mobile-store-recovery.yml --ref master -f release_run=$RELEASE_RUN -f operation=inspect"
+              for platform in "${owed[@]}"; do
+                echo "gh workflow run mobile-store-recovery.yml --ref master -f release_run=$RELEASE_RUN -f operation=build-$platform"
+              done
+              echo '```'
+              echo
+              echo "Then run inspect until the builds and their submissions finish. See"
+              echo "\"Recover native store builds after deployment\" in docs/RELEASE.md."
+            else
+              echo "### Phones were not updated: the native shell check did not answer"
+              echo
+              echo "ios: ${IOS:-?}, android: ${ANDROID:-?}. Why: ${REASON:-not recorded}"
+              echo
+              echo "Deploy job: **$DEPLOY_RESULT**; server, web and daemon do not wait on this"
+              echo "check. Nothing was published to phones, because nothing proved this tree"
+              echo "still fits the shell they run, and no store build was started. On a clean,"
+              echo "up-to-date master checkout where Expo is signed in, ask again for the"
+              echo "commit you would publish:"
+              echo
+              echo '```'
+              echo "scripts/release-plan.sh --from $BASELINE --to HEAD"
+              echo '```'
+              echo
+              echo "If its mobile store build is **no**, publish from that checkout with"
+              echo "\`scripts/update-mobile-prod.sh -m \"<summary>\"\`. If it is **yes**, a store"
+              echo "build is owed for the platforms it names; see \"The phone\" in"
+              echo "docs/RELEASE.md, and publish no update until that shell is out."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Phones were not updated::mobile_native_build=$VERDICT (ios=${IOS:-?}, android=${ANDROID:-?}); no OTA was published and no store build was started. See this job's summary for the manual step."
+          exit 1
 
   # desktop.yml builds and signs the app on the same push. Promoting those
   # artifacts needs the offline Tauri updater key, which signs latest.json.

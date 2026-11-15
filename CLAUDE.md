@@ -41,11 +41,16 @@ earlier undeployed daemon changes; pull-request Windows checks are path-filtered
 To retry a partial deployment, `deploy-prod.sh --resume` retains the original
 acceptance evidence and accepts only the tested baseline/candidate identities;
 see `docs/RELEASE.md` for the exact-candidate retry procedure.
-For an unfinished native store release after deployment, dispatch
-`mobile-store-recovery.yml` on master with the original `release_run` and
-`operation=inspect` first. It retains the original plan and acceptance identity,
-uses the protected production Expo token, and refuses duplicate builds or
-submissions. `docs/RELEASE.md` documents the per-platform recovery operations.
+A push never starts an EAS store build. `scripts/release-plan.sh` compares each
+platform's native fingerprint with its last production build; on a native
+change, or a check that cannot answer, the release withholds the mobile OTA,
+still deploys server/web/daemon, and fails at "require the owed store builds".
+A person then starts only the owed platforms' builds: dispatch
+`mobile-store-recovery.yml` on master with that `release_run` and
+`operation=inspect` first, then `build-ios` or `build-android`. It retains the
+original plan and acceptance identity, uses the protected production Expo token,
+and refuses duplicate builds or submissions. `docs/RELEASE.md` documents the
+per-platform recovery operations.
 Daemon publication stages a complete signed snapshot under prebuilt `releases/`;
 `scripts/activate-prebuilt.py` verifies it before atomically switching `current`.
 The API resolves that pointer once per request; interrupted uploads leave the
