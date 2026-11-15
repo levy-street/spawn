@@ -304,7 +304,7 @@ test("Admin row is shown for administrators", async ({ page }) => {
   await expect(page.getByRole("link", { name: "Admin" })).toBeVisible();
 });
 
-test("removing the only passkey warns that browsers that got back in with it need approving again", async ({
+test("removing the only passkey warns that browsers that got in with it, and devices approved from them, need approving again", async ({
   page,
 }) => {
   await mockApp(page);
@@ -338,7 +338,10 @@ test("removing the only passkey warns that browsers that got back in with it nee
   await passkeys.getByTestId("revoke-passkey").click();
   await expect
     .poll(() => asked)
-    .toContain("Browsers that got back in with this passkey will need approving again.");
+    .toContain(
+      "Browsers that got in with this passkey, and devices approved from them, will need " +
+        "approving again.",
+    );
   expect(asked).not.toContain("keep working");
   // Cancelled: the passkey is still there.
   await expect(passkeys).toContainText("Laptop passkey");

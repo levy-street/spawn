@@ -622,7 +622,8 @@ export interface RemoveLastPasskeyOutcome {
   readonly skippedRootReason: string | null;
   /**
    * The root this passkey sealed was revoked. Everything that came in through
-   * the passkey (a browser that got back in with it) hangs off that root, so
+   * the passkey (every browser that got in with it, first time or returning,
+   * and any device approved only from those browsers) hangs off that root, so
    * it needs approving again (#130).
    */
   readonly rootRevoked: boolean;
@@ -634,8 +635,8 @@ export interface RemoveLastPasskeyOutcome {
  */
 export function describeLastPasskeyRemoval(outcome: RemoveLastPasskeyOutcome): string {
   return outcome.rootRevoked
-    ? "Passkey removed. Browsers that got back in with it will need approving again. If you " +
-        "lose every device, nothing brings this account's hosts back."
+    ? "Passkey removed. Browsers that got in with it, and devices approved from them, will " +
+        "need approving again. If you lose every device, nothing brings this account's hosts back."
     : "Passkey removed. Your devices keep working, but if you lose them all, nothing brings " +
         "this account's hosts back.";
 }

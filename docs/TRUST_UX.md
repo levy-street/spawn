@@ -278,12 +278,13 @@ result; a simultaneous update from another device is named as such. The blocked-
 card (§3) shows these failure lines too, so a failed passkey attempt is never a silent
 spinner.
 
-**Removing the only passkey** *(2026-11-15, #130)* revokes the root it sealed, and a
-browser that got back in with that passkey was approved through that root, so it is
-refused until it is approved again. The confirmation says so — *"Browsers that got
-back in with this passkey will need approving again."* — and so does the status line
-after (*"Passkey removed. Browsers that got back in with it will need approving
-again. …"*). Only when no root was revoked (the saved protection could not be read)
+**Removing the only passkey** *(2026-11-15, #130)* revokes the root it sealed. Every
+browser that got in with that passkey, first time or returning, was approved through
+that root, and so was any device approved only from those browsers; all of them are
+refused until they are approved again. The confirmation says so — *"Browsers that got
+in with this passkey, and devices approved from them, will need approving again."* —
+and so does the status line after (*"Passkey removed. Browsers that got in with it,
+and devices approved from them, will need approving again. …"*). Only when no root was revoked (the saved protection could not be read)
 does the status line still say the devices keep working. Removing one of several
 passkeys keeps its wording. Keeping those browsers approved through the removal is
 #130.

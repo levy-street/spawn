@@ -406,8 +406,8 @@ describe("removeLastPasskey", () => {
     expect(harness.revokedRows).toEqual([{ id: "root-row", public_key: rootPublicKey }]);
     expect(outcome.rootRevoked).toBe(true);
     expect(describeLastPasskeyRemoval(outcome)).toBe(
-      "Passkey removed. Browsers that got back in with it will need approving again. If you " +
-        "lose every device, nothing brings this account's hosts back.",
+      "Passkey removed. Browsers that got in with it, and devices approved from them, will " +
+        "need approving again. If you lose every device, nothing brings this account's hosts back.",
     );
   });
 
