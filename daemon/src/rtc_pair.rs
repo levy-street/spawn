@@ -490,13 +490,15 @@ impl RtcSessions {
         // every other device's channels and offers waited behind it.
         //
         // A label is the device's to choose, so a session this daemon is
-        // not running, and that no launch or restart is in the middle of,
-        // is refused before its transition is taken: otherwise every such
-        // label would be a lock of its own, made for it and waited on
-        // behind admission. Nothing is weakened: the session is checked
-        // again under both locks below, and a session with a transition in
-        // progress — a launch about to register it — is waited for as
-        // before.
+        // not running, and whose transition nobody holds, is refused before
+        // its transition is taken: otherwise every such label would be a
+        // lock of its own, made for it and waited on behind admission.
+        // Nothing is weakened: the session is checked again under both locks
+        // below, and one whose transition is held (`register_attached`
+        // inserting it, an exit removing it) is waited for as before. A
+        // launch holds the transition only around that insert, so an attach
+        // that arrives while the worker is still starting is refused at
+        // once, here — as it was below, before this check.
         anyhow::ensure!(
             pair.registry.binding_for(label.session).is_some()
                 || pair
@@ -1698,21 +1700,24 @@ mod tests {
         );
     }
 
-    /// The other side of the refusal above: a session that is not
-    /// registered yet but whose launch holds its transition is about to
-    /// exist, and an attach for it waits for the launch as it always has.
+    /// The other side of the refusal above: an attach for a session that is
+    /// not registered but whose transition someone holds waits for it, as it
+    /// always has, and attaches if the holder registers the session — what
+    /// `register_attached` does with the transition held around its insert.
+    /// (A launch holds it only there, so an attach while the worker is still
+    /// starting is refused at once, now as before.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_attach_for_a_session_being_launched_waits_for_the_launch() {
+    async fn an_attach_for_a_session_whose_transition_is_held_waits_for_it() {
         let sessions = RtcSessions::new();
         sessions.bind_registered_host_id(Uuid::new_v4()).await;
         let registry = SessionRegistry::new();
-        let launching = Uuid::new_v4();
+        let unregistered = Uuid::new_v4();
         let pc = connect_pair(&sessions, &registry, [21; 32]).await;
 
-        let launch = registry.lock_generation_transition(launching).await;
-        let waiting = begin_attach_that_waits(&registry, &pc, launching).await;
-        let worker = spawn_replay_worker(&registry, launching);
-        drop(launch);
+        let registering = registry.lock_generation_transition(unregistered).await;
+        let waiting = begin_attach_that_waits(&registry, &pc, unregistered).await;
+        let worker = spawn_replay_worker(&registry, unregistered);
+        drop(registering);
 
         let suffix = waiting
             .label()
@@ -1729,7 +1734,7 @@ mod tests {
         worker.abort();
         assert!(
             attached,
-            "an attach for a session being launched was refused"
+            "an attach waiting on a held transition was refused once the holder registered its session"
         );
     }
 

@@ -124,7 +124,7 @@ impl SessionRegistry {
     }
 
     /// Whether anyone holds or waits for `id`'s generation transition: a
-    /// launch, restart, exit or attach is in the middle of changing or
+    /// registration, restart, exit or attach is in the middle of changing or
     /// reading what runs under that id.
     pub fn generation_transition_in_progress(&self, id: Uuid) -> bool {
         self.generation_transitions
