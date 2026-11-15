@@ -4,13 +4,16 @@ import {
   type PendingLaunchStore,
 } from "@/components/launcher/pending-launch";
 import {
+  answerWithin,
+  CODEX_ANSWER_DEADLINE_MS,
+  chooseLaunchCommand,
   observePendingLaunchDelivery,
   type PendingLaunchDeliveryResult,
   type PendingLaunchTransport,
   type PendingSessionLife,
   pendingSessionLifeFromStatus,
 } from "@/components/launcher/pending-launch-delivery";
-import type { TransportState } from "@/terminal/transport/types";
+import type { AgentNotice, TransportState } from "@/terminal/transport/types";
 
 class MemoryStorage implements PendingLaunchStorage {
   readonly values = new Map<string, string>();
@@ -31,6 +34,7 @@ class MemoryStorage implements PendingLaunchStorage {
 const HOST = "dream";
 
 type DisplayListener = (display: { owner: boolean }) => void;
+type NoticeListener = (notice: AgentNotice | null) => void;
 
 class FakeTransport implements PendingLaunchTransport {
   state: TransportState = "idle";
@@ -38,6 +42,7 @@ class FakeTransport implements PendingLaunchTransport {
   readonly writes: Uint8Array[] = [];
   readonly listeners = new Set<(state: TransportState) => void>();
   readonly displayListeners = new Set<DisplayListener>();
+  readonly noticeListeners = new Set<NoticeListener>();
 
   constructor(
     readonly sessionId: string,
@@ -50,10 +55,16 @@ class FakeTransport implements PendingLaunchTransport {
 
   on(event: "state", listener: (state: TransportState) => void): () => void;
   on(event: "display", listener: DisplayListener): () => void;
+  on(event: "agent-notice", listener: NoticeListener): () => void;
   on(
-    event: "state" | "display",
-    listener: ((state: TransportState) => void) | DisplayListener,
+    event: "state" | "display" | "agent-notice",
+    listener: ((state: TransportState) => void) | DisplayListener | NoticeListener,
   ): () => void {
+    if (event === "agent-notice") {
+      const onNotice = listener as NoticeListener;
+      this.noticeListeners.add(onNotice);
+      return () => this.noticeListeners.delete(onNotice);
+    }
     if (event === "display") {
       const onDisplay = listener as DisplayListener;
       this.displayListeners.add(onDisplay);
@@ -72,6 +83,14 @@ class FakeTransport implements PendingLaunchTransport {
   emitDisplay(owner: boolean): void {
     this.displayOwner = owner;
     for (const listener of this.displayListeners) listener({ owner });
+  }
+
+  emitNotice(notice: AgentNotice | null): void {
+    for (const listener of this.noticeListeners) listener(notice);
+  }
+
+  typed(): string[] {
+    return this.writes.map((bytes) => new TextDecoder().decode(bytes));
   }
 }
 
@@ -97,6 +116,9 @@ function observe(
   options: {
     initialSessionLife?: PendingSessionLife;
     getSessionLife?: () => Promise<PendingSessionLife>;
+    askCodexNoDaemon?: () => Promise<boolean | null>;
+    foreground?: () => string | null | undefined;
+    agentRunning?: () => Promise<boolean | null>;
   } = {},
 ): () => void {
   return observePendingLaunchDelivery({
@@ -361,5 +383,200 @@ describe("pending launch delivery", () => {
     expect(transport.writes).toHaveLength(0);
     expect(results).toEqual([{ status: "abandoned", reason: "delivery_unconfirmed" }]);
     expect(pending.complete).toHaveBeenCalledWith("session-6");
+  });
+
+  describe("a Codex launch with a --no-daemon form", () => {
+    const SESSION = "session-codex";
+    const LAUNCH = {
+      command: "codex --profile work",
+      codexNoDaemon: "codex --no-daemon --profile work",
+    };
+    const FLAGGED = "codex --no-daemon --profile work\r";
+    const PLAIN = "codex --profile work\r";
+
+    test("is typed with the flag only on the host's explicit yes", () => {
+      expect(chooseLaunchCommand(LAUNCH, true)).toBe(LAUNCH.codexNoDaemon);
+      for (const answer of [false, null]) {
+        expect(chooseLaunchCommand(LAUNCH, answer)).toBe(LAUNCH.command);
+      }
+      expect(chooseLaunchCommand({ command: "claude", codexNoDaemon: null }, true)).toBe("claude");
+    });
+
+    test("a host that fails or is slow to answer is not waited on", async () => {
+      await expect(answerWithin(async () => true, 50)).resolves.toBe(true);
+      await expect(answerWithin(() => Promise.reject(new Error("offline")), 50)).resolves.toBe(
+        null,
+      );
+      await expect(answerWithin(() => new Promise<boolean>(() => undefined), 20)).resolves.toBe(
+        null,
+      );
+    });
+
+    async function queued() {
+      const storage = new MemoryStorage();
+      const pending = createPendingLaunchStore(storage);
+      await pending.persist(SESSION, HOST, LAUNCH);
+      return pending;
+    }
+
+    async function typedLaunch(
+      answer: boolean | null,
+      options: {
+        foreground?: () => string | null | undefined;
+        agentRunning?: () => Promise<boolean | null>;
+      } = {},
+    ) {
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
+      const results: PendingLaunchDeliveryResult[] = [];
+      const askCodexNoDaemon = jest.fn(() => Promise.resolve(answer));
+      const stop = observe(transport, pending, results, {
+        askCodexNoDaemon,
+        foreground: () => "zsh",
+        agentRunning: async () => false,
+        ...options,
+      });
+      transport.emit("ready");
+      await flushDelivery();
+      await flushDelivery();
+      return { transport, results, askCodexNoDaemon, stop };
+    }
+
+    test("asks the window's host before it claims the launch", async () => {
+      const { transport, results, askCodexNoDaemon } = await typedLaunch(true);
+      expect(askCodexNoDaemon).toHaveBeenCalledTimes(1);
+      expect(transport.typed()).toEqual([FLAGGED]);
+      expect(results).toEqual([{ status: "sent" }]);
+    });
+
+    test("is typed plain when the host has not answered by the deadline", async () => {
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
+      const results: PendingLaunchDeliveryResult[] = [];
+      observe(transport, pending, results, {
+        askCodexNoDaemon: () => new Promise<boolean>(() => undefined),
+      });
+      transport.emit("ready");
+      await new Promise((resolve) => setTimeout(resolve, CODEX_ANSWER_DEADLINE_MS + 200));
+      await flushDelivery();
+      expect(transport.typed()).toEqual([PLAIN]);
+      expect(results).toEqual([{ status: "sent" }]);
+    });
+
+    test("a view that cannot type once the host answers loses nothing: the launch waits", async () => {
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
+      const results: PendingLaunchDeliveryResult[] = [];
+      let answer: (accepts: boolean) => void = () => undefined;
+      observe(transport, pending, results, {
+        askCodexNoDaemon: () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      });
+      transport.emit("ready");
+      await flushDelivery();
+      // The connection blips while the host is asked.
+      transport.emit("reconnecting");
+      answer(true);
+      await flushDelivery();
+      expect(transport.typed()).toEqual([]);
+      expect(results).toEqual([]);
+      await expect(pending.hasNoDaemonForm?.(SESSION, HOST)).resolves.toBe(true);
+      // Back: asked again, and typed once.
+      transport.emit("ready");
+      await flushDelivery();
+      answer(true);
+      await flushDelivery();
+      await flushDelivery();
+      expect(transport.typed()).toEqual([FLAGGED]);
+      expect(results).toEqual([{ status: "sent" }]);
+    });
+
+    test("two views asking at once type it once between them", async () => {
+      const pending = await queued();
+      const first = new FakeTransport(SESSION);
+      const second = new FakeTransport(SESSION);
+      for (const transport of [first, second]) {
+        observe(transport, pending, [], { askCodexNoDaemon: async () => true });
+        transport.emit("ready");
+      }
+      await flushDelivery();
+      await flushDelivery();
+      await flushDelivery();
+      expect([...first.typed(), ...second.typed()]).toEqual([FLAGGED]);
+    });
+
+    test("a refusal of the flag soon after is answered once, without it", async () => {
+      // The host could not see an alias or a shell hook: the Codex that ran
+      // was older than the flag.
+      const { transport } = await typedLaunch(true);
+      transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      transport.emitNotice(null);
+      transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      expect(transport.typed()).toEqual([FLAGGED, PLAIN]);
+    });
+
+    test("a refusal is not answered after a plain launch, late, or after the view went", async () => {
+      const plain = await typedLaunch(null);
+      plain.transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      expect(plain.transport.typed()).toEqual([PLAIN]);
+
+      const now = Date.now();
+      const late = await typedLaunch(true);
+      const clock = jest.spyOn(Date, "now").mockReturnValue(now + 11_000);
+      try {
+        late.transport.emitNotice("codex_no_daemon_refused");
+      } finally {
+        clock.mockRestore();
+      }
+      await flushDelivery();
+      expect(late.transport.typed()).toEqual([FLAGGED]);
+
+      const gone = await typedLaunch(true);
+      gone.stop();
+      gone.transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      expect(gone.transport.typed()).toEqual([FLAGGED]);
+
+      const notOwner = await typedLaunch(true);
+      notOwner.transport.emitDisplay(false);
+      notOwner.transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      expect(notOwner.transport.typed()).toEqual([FLAGGED]);
+    });
+
+    test("a refusal is answered only while the window's shell is in the foreground", async () => {
+      // A Codex that took the flag and runs, showing a thread about the
+      // error; a foreground never reported; a host that says an agent runs
+      // there, cannot say, or does not answer.
+      for (const options of [
+        { foreground: () => "codex" },
+        { foreground: () => "node" },
+        { foreground: () => null },
+        { agentRunning: async () => true },
+        { agentRunning: async () => null },
+        { agentRunning: () => Promise.reject(new Error("offline")) },
+      ]) {
+        const { transport } = await typedLaunch(true, options);
+        transport.emitNotice("codex_no_daemon_refused");
+        await flushDelivery();
+        await flushDelivery();
+        expect(transport.typed()).toEqual([FLAGGED]);
+      }
+      // No way to ask at all: not known, not typed.
+      const pending = await queued();
+      const transport = new FakeTransport(SESSION);
+      observe(transport, pending, [], { askCodexNoDaemon: async () => true });
+      transport.emit("ready");
+      await flushDelivery();
+      await flushDelivery();
+      transport.emitNotice("codex_no_daemon_refused");
+      await flushDelivery();
+      expect(transport.typed()).toEqual([FLAGGED]);
+    });
   });
 });

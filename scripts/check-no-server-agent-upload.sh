@@ -229,7 +229,14 @@ if control.count(expected_control_imports) != 1:
 # in, read from the window's process tree and the agent's own live-session
 # registry. It is handed only a pid resolver for the device's windows, never
 # the session registry, and is pinned below to depend on nothing crate-local
-# and to execute nothing.
+# and to execute nothing. Since 2026-11-12 it also reads which Codex thread
+# files a window's Codex holds open (and each held rollout's first line), and
+# keeps one note per Codex window, the thread id it last named, in a folder
+# the caller hands it (spawnd's own <config>/conversations/), removing a
+# window's note when the server stops the window for good; it writes nothing
+# else. Since 2026-11-15 it also carries, for `conv.launch`, a handle that
+# asks whether a window's Codex accepts `--no-daemon`: handed in by rtc_pair
+# and answered by codex_launch (pinned below), run by nothing here.
 if set(re.findall(r"crate::(\w+)", control)) != {
     "host_conv",
     "host_desktop",
@@ -274,6 +281,104 @@ if re.search(
     conv_runtime,
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector may not execute anything")
+# The inspector's runtime is everything before its test module, and that
+# module must be the file's last item: anything placed after it is refused
+# rather than left unread.
+conv_test_marker = "#[cfg(all(test, unix))]\nmod tests {"
+
+
+def test_module_is_last(text):
+    """One test module, ending the file: its closing brace is the only line at
+    the top level after the marker and the last line with anything on it, so
+    nothing — indented or not — follows it."""
+    if text.count(conv_test_marker) != 1:
+        return False
+    lines = [line for line in text.split(conv_test_marker, 1)[1].splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == "}" and [
+        line for line in lines if not line[0].isspace()
+    ] == ["}"]
+
+
+if not test_module_is_last(conv):
+    raise SystemExit("no-server-agent-upload: conversation inspector code sits after its test module")
+# Every way the inspector's runtime changes a file, counted: the notes folder
+# (one DirBuilder, made 0700), one new file opened for writing, one rename
+# over the last note, and two removals (a failed note's temporary file, and
+# the note of a window that is forgotten). Enforced besides, as patterns:
+# no std write, copy, link, truncate, create_dir, removal or re-permission
+# beyond those counts; no `nix` module but `nix::libc`, no `extern` block,
+# and no libc name outside the read-only list below (nor a glob, group or
+# alias import of libc that would hide one); and every `custom_flags` is
+# O_NOFOLLOW, optionally with O_NONBLOCK.
+conv_mutations = {
+    r"\.write\(true\)": 1,
+    r"\.create_new\(true\)": 1,
+    r"\bDirBuilder::new\(": 1,
+    r"\bset_permissions\b": 1,
+    r"\brename\s*\(": 1,
+    r"\bremove_file\b": 2,
+}
+conv_libc_reads = {
+    "O_NOFOLLOW", "O_NONBLOCK", "PROC_PIDLISTFDS", "PROC_PIDTBSDINFO",
+    "PROX_FDTYPE_VNODE", "c_int", "c_void", "off_t", "pid_t", "proc_bsdinfo",
+    "proc_fdinfo", "proc_listchildpids", "proc_pidfdinfo", "proc_pidinfo",
+    "proc_pidpath", "vnode_info_path",
+}
+conv_flags = re.findall(r"custom_flags\(([^)]*)\)", conv_runtime)
+if (
+    any(
+        len(re.findall(pattern, conv_runtime)) != expected
+        for pattern, expected in conv_mutations.items()
+    )
+    or re.search(
+        r"\bfs::write\b|\bFile::create\b|\bFile::options\b|\.append\(|\.truncate\(|"
+        r"\.create\(true\)|\bcreate_dir(?:_all)?\b|\bcopy\s*\(|\bremove_dir|\bhard_link\b|"
+        r"\bsymlink\s*\(|\bset_len\b|\bset_modified\b|\bset_times\b|\b(?:f|l)?chown\b|"
+        r"\bfchmod\b|\bunlink(?:at)?\b|\bnix::(?!libc\b)\w+|\bextern\s+\"|"
+        r"\blibc\s*::\s*[{*]|\blibc\s+as\b",
+        conv_runtime,
+    )
+    or set(re.findall(r"\blibc::(\w+)", conv_runtime)) - conv_libc_reads
+    or not conv_flags
+    or any(
+        not re.fullmatch(
+            r"\s*nix::libc::O_NOFOLLOW(?:\s*\|\s*nix::libc::O_NONBLOCK)?\s*", flags
+        )
+        for flags in conv_flags
+    )
+):
+    raise SystemExit("no-server-agent-upload: conversation inspector writes more than its window notes")
+# codex_launch (2026-11-15) runs one program, when a pair-admitted device
+# asks `conv.launch` just before it types Codex into a window: `codex
+# --no-daemon --version`, by the path the window's own launch environment
+# finds, in the window's folder, with a timeout. A device that can do that can
+# already type into the window; nothing else triggers it and nothing is kept.
+# Pinned to that one invocation, to the two run helpers it uses, to no
+# transport and no write, with its test module last.
+launch_path = os.path.join(root, "daemon/src/codex_launch.rs")
+with open(launch_path, encoding="utf-8") as source:
+    launch = source.read()
+if not test_module_is_last(launch):
+    raise SystemExit("no-server-agent-upload: codex launch probe code sits after its test module")
+launch_runtime = launch.split(conv_test_marker)[0]
+if set(re.findall(r"crate::(\w+)", launch)) != {"run"} or set(
+    re.findall(r"crate::run::(\w+)", launch)
+) != {"resolve_program_in_env", "run_program_capture_in"}:
+    raise SystemExit("no-server-agent-upload: codex launch probe gained a crate dependency")
+if re.search(r"\b(?:WsOutbound|SessionSink|out_tx|reqwest|TcpStream|UdpSocket|mpsc)\b", launch):
+    raise SystemExit("no-server-agent-upload: codex launch probe gained a transport")
+if (
+    launch_runtime.count("run_program_capture_in(") != 1
+    or launch_runtime.count('const PROGRAM: &str = "codex";') != 1
+    or launch_runtime.count('const PROBE_ARGS: [&str; 2] = ["--no-daemon", "--version"];') != 1
+    or re.search(
+        r"process::Command|\bCommand::new\b|\b(?:posix_spawnp?|execv[pe]*|execl[pe]*|fexecve|v?fork|system)\s*\(|"
+        r"\bfs::write\b|\bFile::create\b|\bOpenOptions\b|\bremove_(?:file|dir)|\brename\b|"
+        r"\bset_permissions\b|\bcreate_dir|\bnix::|\blibc::",
+        launch_runtime,
+    )
+):
+    raise SystemExit("no-server-agent-upload: codex launch probe runs or writes more than its one version check")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
@@ -710,6 +815,7 @@ self_test() {
   cp "$source_root/daemon/src/host_transcripts.rs" "$fixture/daemon/src/host_transcripts.rs"
   cp "$source_root/daemon/src/config.rs" "$fixture/daemon/src/config.rs"
   cp "$source_root/daemon/src/host_conv.rs" "$fixture/daemon/src/host_conv.rs"
+  cp "$source_root/daemon/src/codex_launch.rs" "$fixture/daemon/src/codex_launch.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
   printf '%s\n' \
@@ -846,6 +952,69 @@ self_test() {
     return 1
   fi
   printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  # The conversation inspector changes nothing but its window notes.
+  local conv_original conv_runtime_part conv_tests_part conv_case
+  conv_original="$(<"$fixture/daemon/src/host_conv.rs")"
+  conv_runtime_part="${conv_original%%'#[cfg(all(test, unix))]'*}"
+  conv_tests_part="${conv_original#"$conv_runtime_part"}"
+  for conv_case in \
+    'fn sneaky(path: &Path) { let _ = std::fs::copy(path, "/tmp/x"); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::OpenOptions::new().write(true).open(path); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::remove_file(path); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::remove_dir_all(path); }' \
+    'fn sneaky(path: &Path) { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::write(path, b"x"); }' \
+    'fn sneaky(path: &Path) { let _ = std::os::unix::fs::symlink(path, "/tmp/x"); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::create_dir_all(path); }' \
+    'fn sneaky(path: &Path) { let _ = nix::unistd::truncate(path, 0); }' \
+    'fn sneaky(path: &Path) { let _ = nix::unistd::mkdir(path, nix::sys::stat::Mode::S_IRWXU); }' \
+    'fn sneaky(path: &Path) { let _ = nix::fcntl::renameat(None, path, None, "/tmp/x"); }' \
+    'fn sneaky(path: &Path) { let _ = nix::sys::stat::fchmodat(None, path, nix::sys::stat::Mode::S_IRWXU, nix::sys::stat::FchmodatFlags::FollowSymlink); }' \
+    'fn sneaky(path: &Path) { use std::os::unix::fs::OpenOptionsExt; let _ = std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_TRUNC).open(path); }' \
+    'fn sneaky(path: &Path) { use std::os::unix::fs::OpenOptionsExt; let _ = std::fs::OpenOptions::new().read(true).custom_flags(0o1000).open(path); }' \
+    'use nix::libc::*;' \
+    'extern "C" { fn unlink(path: *const u8) -> i32; }'; do
+    printf '%s\n%s\n%s' "$conv_runtime_part" "$conv_case" "$conv_tests_part" \
+      >"$fixture/daemon/src/host_conv.rs"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: inspector write passed: %s\n' "$conv_case" >&2
+      return 1
+    fi
+  done
+  for after_tests in \
+    'fn after_tests(path: &Path) { let _ = std::fs::write(path, b"x"); }' \
+    '    fn indented_after_tests(path: &Path) { let _ = std::fs::write(path, b"x"); }'; do
+    printf '%s\n%s\n' "$conv_original" "$after_tests" >"$fixture/daemon/src/host_conv.rs"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: inspector code after its test module passed: %s\n' "$after_tests" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$conv_original" >"$fixture/daemon/src/host_conv.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  local launch_original
+  launch_original="$(<"$fixture/daemon/src/codex_launch.rs")"
+  for launch_case in \
+    'fn sneaky() { let _ = std::process::Command::new("sh").spawn(); }' \
+    'async fn sneaky(env: &BTreeMap<String, String>) { let _ = crate::run::run_program_capture_in("codex", &["update"], PROBE_TIMEOUT, 1, Some(env), None).await; }' \
+    'fn sneaky() { crate::run::resolved_command_env(); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::write(path, b"x"); }'; do
+    printf '%s\n%s\n' "$launch_case" "$launch_original" >"$fixture/daemon/src/codex_launch.rs"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: codex launch probe change passed: %s\n' "$launch_case" >&2
+      return 1
+    fi
+  done
+  printf '%s\n%s\n' "$launch_original" 'fn after_tests() { let _ = std::process::Command::new("sh").spawn(); }' \
+    >"$fixture/daemon/src/codex_launch.rs"
+  if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    printf '%s\n' "no-server-agent-upload self-test: codex launch code after its test module passed" >&2
+    return 1
+  fi
+  printf '%s\n' "$launch_original" >"$fixture/daemon/src/codex_launch.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   local config_original

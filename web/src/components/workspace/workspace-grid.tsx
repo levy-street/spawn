@@ -56,7 +56,7 @@ import {
   withTabTiles,
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId, queuedLaunch } from "./agent-command";
 import { moveWindow, moveWindowConfirmation, moveWindowError } from "./move-window";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
 import { queryInPane, usePaneScope } from "./pane-scope";
@@ -674,7 +674,11 @@ export function WorkspaceGrid({
           ...(skillIds.length > 0 && { skill_ids: skillIds }),
         });
         if (agent)
-          pendingLaunch.set(created.id, created.host_id, agentLaunchCommand(agent, conversation));
+          pendingLaunch.set(
+            created.id,
+            created.host_id,
+            queuedLaunch((options) => agentLaunchCommand(agent, conversation, options)),
+          );
         if (!land(created.id)) {
           await sessionsApi.remove(created.id).catch(() => {});
           throw new Error("This tab is full — close a window before duplicating another.");

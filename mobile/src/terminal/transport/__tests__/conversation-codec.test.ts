@@ -1,4 +1,5 @@
 import {
+  agentRunning,
   type ConversationInspection,
   parseConversationInspection,
 } from "@/terminal/transport/conversation-codec";
@@ -9,6 +10,8 @@ const answer: ConversationInspection = {
   state: "blocked",
   cli_version: "2.1.288",
   live_elsewhere: false,
+  fresh: false,
+  shared_server: false,
   source: "registry",
 };
 
@@ -21,9 +24,36 @@ describe("parseConversationInspection", () => {
       state: "unknown",
       cli_version: null,
       live_elsewhere: false,
+      fresh: false,
+      shared_server: false,
       source: "none",
     };
     expect(parseConversationInspection(nothing)).toEqual(nothing);
+    const fresh: ConversationInspection = {
+      ...nothing,
+      agent: "codex",
+      fresh: true,
+      source: "open_file",
+    };
+    expect(parseConversationInspection(fresh)).toEqual(fresh);
+    const shared: ConversationInspection = {
+      ...nothing,
+      agent: "codex",
+      shared_server: true,
+      source: "process",
+    };
+    expect(parseConversationInspection(shared)).toEqual(shared);
+  });
+
+  test("an answer from a daemon that predates `shared_server` is not on it", () => {
+    const { shared_server: _, ...older } = answer;
+    expect(parseConversationInspection(older)).toEqual({ ...answer, shared_server: false });
+    expect(() => parseConversationInspection({ ...answer, shared_server: "yes" })).toThrow();
+  });
+
+  test("an answer from a daemon that predates `fresh` is not fresh", () => {
+    const { fresh: _, ...older } = answer;
+    expect(parseConversationInspection(older)).toEqual({ ...answer, fresh: false });
   });
 
   test("an id from the host in upper case is read lower-case", () => {
@@ -45,6 +75,8 @@ describe("parseConversationInspection", () => {
       [],
       "registry",
       { ...answer, live_elsewhere: "no" },
+      { ...answer, fresh: "yes" },
+      { ...answer, fresh: null },
       { ...answer, source: 7 },
       { ...answer, conversation_id: "../../etc/passwd" },
       { ...answer, conversation_id: "x".repeat(65) },
@@ -59,5 +91,15 @@ describe("parseConversationInspection", () => {
         "Host returned an invalid conversation report.",
       );
     }
+  });
+});
+
+describe("agentRunning", () => {
+  test("is an agent the host found in the window now, not one it remembers or none", () => {
+    for (const source of ["registry", "parked", "attach", "open_file", "process"]) {
+      expect(agentRunning({ source })).toBe(true);
+    }
+    expect(agentRunning({ source: "remembered" })).toBe(false);
+    expect(agentRunning({ source: "none" })).toBe(false);
   });
 });

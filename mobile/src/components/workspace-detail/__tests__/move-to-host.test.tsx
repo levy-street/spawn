@@ -107,11 +107,10 @@ describe("moving a window to another host", () => {
     expect(body.agent_session_id).toBe("0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102");
     expect(body.agent_id).toBe(claude.id);
     // For the window as it runs over there: typed into nothing else.
-    expect(pendingLaunches.persist).toHaveBeenCalledWith(
-      "session-1",
-      host.id,
-      "claude --session-id 0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102",
-    );
+    expect(pendingLaunches.persist).toHaveBeenCalledWith("session-1", host.id, {
+      command: "claude --session-id 0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102",
+      codexNoDaemon: null,
+    });
   });
 
   test("a record holding a flag is not carried: the agent starts there under a new UUID", async () => {
@@ -135,11 +134,10 @@ describe("moving a window to another host", () => {
 
     const body = (moveSession as jest.Mock).mock.calls[0]?.[1];
     expect(body.agent_session_id).toBe("0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102");
-    expect(pendingLaunches.persist).toHaveBeenCalledWith(
-      "session-1",
-      host.id,
-      "claude --session-id 0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102",
-    );
+    expect(pendingLaunches.persist).toHaveBeenCalledWith("session-1", host.id, {
+      command: "claude --session-id 0b0e7c1e-1111-4a2a-9c3c-5d6e7f809102",
+      codexNoDaemon: null,
+    });
   });
 
   test("relaunches an agent that names no conversation as itself", async () => {
@@ -153,7 +151,11 @@ describe("moving a window to another host", () => {
     );
 
     expect((moveSession as jest.Mock).mock.calls[0]?.[1].agent_session_id).toBeNull();
-    expect(pendingLaunches.persist).toHaveBeenCalledWith("session-1", host.id, "codex");
+    // Both forms: the destination host is asked which to type, just before.
+    expect(pendingLaunches.persist).toHaveBeenCalledWith("session-1", host.id, {
+      command: "codex",
+      codexNoDaemon: "codex --no-daemon",
+    });
   });
 
   test("says why a refused move left the window where it was, and queues nothing", async () => {

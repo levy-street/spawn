@@ -570,9 +570,26 @@ mod tests {
             LockAttempt::Busy
         ));
         drop(first);
-        assert!(matches!(
-            try_reserve_path(&socket).unwrap(),
-            LockAttempt::Acquired(_)
-        ));
+        // The reservation is an flock on the open file description, so it is
+        // free once every descriptor for that description is closed — not
+        // necessarily the moment `first` is. A process another test thread
+        // spawns while `first` is open gets a copy of the descriptor at fork,
+        // which lives until the child's exec closes it (O_CLOEXEC); for that
+        // moment, longer on a loaded runner, the reservation is still held.
+        // So the test waits for the owner's last copy to close, within a
+        // bound, instead of assuming no thread in this binary forked.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match try_reserve_path(&socket).unwrap() {
+                LockAttempt::Acquired(_) => break,
+                LockAttempt::Busy => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the reservation stayed held after its owner closed"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
     }
 }

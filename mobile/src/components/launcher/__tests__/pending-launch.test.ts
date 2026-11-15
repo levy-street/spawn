@@ -36,6 +36,7 @@ describe("pending agent launches", () => {
         sessionId: "session-1",
         hostId: HOST,
         command,
+        codexNoDaemon: null,
         createdAt: 1_000,
         expiresAt: 1_000 + PENDING_LAUNCH_TTL_MS,
       },
@@ -43,6 +44,42 @@ describe("pending agent launches", () => {
     await restartedProcess.complete?.("session-1");
     await expect(restartedProcess.take("session-1", HOST)).resolves.toEqual({ status: "missing" });
     expect(storage.values.size).toBe(0);
+  });
+
+  test("keeps a Codex launch's --no-daemon form across a restart, and only that form", async () => {
+    const storage = new MemoryStorage();
+    const store = createPendingLaunchStore(storage, { now: () => 1_000 });
+    const launch = {
+      command: "codex --profile work resume",
+      codexNoDaemon: "codex --no-daemon --profile work resume",
+    };
+    await expect(store.persist("session-codex", HOST, launch)).resolves.toMatchObject(launch);
+    // Stored as where the flag goes, so the bytes are kept once.
+    expect([...storage.values.values()].join("")).not.toContain("--no-daemon");
+    const restarted = createPendingLaunchStore(storage, { now: () => 2_000 });
+    await expect(restarted.take("session-codex", HOST)).resolves.toMatchObject({
+      status: "ready",
+      record: launch,
+    });
+
+    // Asking whether it has the form claims nothing.
+    await store.persist("session-codex", HOST, launch);
+    await expect(store.hasNoDaemonForm?.("session-codex", HOST)).resolves.toBe(true);
+    await expect(store.hasNoDaemonForm?.("session-codex", "mac")).resolves.toBe(false);
+    await expect(store.take("session-codex", HOST)).resolves.toMatchObject({ status: "ready" });
+    await expect(store.hasNoDaemonForm?.("session-codex", HOST)).resolves.toBe(false);
+    await store.persist("session-plain", HOST, "codex");
+    await expect(store.hasNoDaemonForm?.("session-plain", HOST)).resolves.toBe(false);
+
+    // Anything that is not the command with the flag added once is dropped.
+    await store.persist("session-other", HOST, {
+      command: "codex",
+      codexNoDaemon: "rm -rf ~ && codex --no-daemon",
+    });
+    await expect(store.take("session-other", HOST)).resolves.toMatchObject({
+      status: "ready",
+      record: { command: "codex", codexNoDaemon: null },
+    });
   });
 
   test("does not expose a command again after a restart between claim and completion", async () => {

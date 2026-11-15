@@ -6,7 +6,9 @@ import {
   agentLaunchCommand,
   agentResumeCommand,
   agentRunCommand,
+  type LaunchOptions,
   newAgentConversationId,
+  PLAIN_LAUNCH,
   sessionAgent,
 } from "@/data/selectors/agent";
 import type { AgentDef, Session } from "@/data/types/domain";
@@ -43,7 +45,13 @@ import type { AgentTranscriptQuery, AgentTranscriptReport } from "@/terminal/tra
  * an id with no transcript behind it, and `--resume` of it stops at "No
  * conversation found". Where the host can look (`agent.transcripts`) and
  * finds no record of the id, the agent starts afresh under that same id
- * instead (`--session-id`); where it cannot say, the restart resumes.
+ * instead (`--session-id`); where it cannot say, the restart resumes. A
+ * Codex the host sees in a thread with nothing written yet (`fresh`: just
+ * launched, or just after `/new`) is started afresh too. A Codex whose thread
+ * no one can name opens Codex's own picker (`codex resume`), never "the latest
+ * one here" (`resume --last`): that is whichever thread in the folder was
+ * written last, from any window, and with Codex's shared background server it
+ * would attach this window to a thread another window is live in.
  *
  * What goes on the command line: only a UUID (`canonicalConversationId`).
  * The recorded id is the server's to hand back, and the server is not
@@ -59,20 +67,23 @@ export type AgentRestartPlan =
 export type AgentRestartResult = { plan: AgentRestartPlan };
 
 /**
- * The conversation a restart brings the agent back into, or null for "the
- * latest one here".
+ * The conversation a restart brings the agent back into, or null for none to
+ * name (Claude Code then continues the latest one here; Codex shows its
+ * picker).
  *
  * An answer from the host about this window's agent decides it: the id the
- * host names, or none when it deliberately names none (a Codex holding several
- * conversations open, a parked window whose background job has gone, an
+ * host names, or none when it deliberately names none (a Codex whose threads
+ * it cannot tell apart, a parked window whose background job has gone, an
  * attach client). The recorded id is never offered in its place: in each of
- * those cases it can be a thread the window has already left.
+ * those cases it can be a thread the window has already left. For Codex the
+ * host answers from the threads the process holds, or, once Codex has gone,
+ * from the thread it last saw the window in (`source: "remembered"`).
  *
  * Without such an answer — a daemon without `conv.v1`, no connection to the
  * host, a timeout, an answer about another program — the recorded id stands,
  * but only for a CLI that SPAWN D launches under an id it chose (Claude
  * Code). A CLI that names its own conversations (Codex) has no recorded id
- * worth trusting and reopens the latest one here, as it always has.
+ * worth trusting, and opens its own picker.
  *
  * A conversation that something outside the window also holds is resumed all
  * the same: on the same host `claude --resume <id>` of a running background
@@ -156,32 +167,49 @@ export function conversationOnRecord(
  * conversation under the same one, since there is nothing to resume. A record
  * that is not a UUID (`recordRefused`) starts a fresh conversation too; the
  * restart itself replaces it with a new id first, so the planner sees it here
- * only when called alone, and then launches with no id at all.
+ * only when called alone, and then launches with no id at all. `options` say
+ * how the command may be typed (`LaunchOptions`).
  */
 export function planAgentRestart(
   session: Pick<Session, "foreground_command" | "agent_id" | "agent_session_id">,
   agents: readonly AgentDef[],
   live: ConversationInspection | null = null,
   onRecord: boolean | null = null,
+  options: LaunchOptions = PLAIN_LAUNCH,
 ): AgentRestartPlan {
   const agent = sessionAgent(session, agents);
   if (!agent) return { kind: "shell" };
   if (recordRefused(agent, session, live)) {
-    return { kind: "agent", agent, command: agentLaunchCommand(agent, null), resumes: false };
+    return {
+      kind: "agent",
+      agent,
+      command: agentLaunchCommand(agent, null, options),
+      resumes: false,
+    };
   }
   const conversationId = restartConversation(agent, session, live);
+  // The host sees the agent in a conversation with nothing in it yet: there
+  // is nothing to resume.
+  if (answersFor(agent, live) && live.fresh) {
+    return {
+      kind: "agent",
+      agent,
+      command: agentLaunchCommand(agent, conversationId, options),
+      resumes: false,
+    };
+  }
   if (conversationId && onRecord === false && launchesUnderId(agent)) {
     return {
       kind: "agent",
       agent,
-      command: agentLaunchCommand(agent, conversationId),
+      command: agentLaunchCommand(agent, conversationId, options),
       resumes: false,
     };
   }
-  const resume = agentResumeCommand(agent, conversationId);
+  const resume = agentResumeCommand(agent, conversationId, options);
   return resume
     ? { kind: "agent", agent, command: resume, resumes: true }
-    : { kind: "agent", agent, command: agentRunCommand(agent), resumes: false };
+    : { kind: "agent", agent, command: agentRunCommand(agent, options), resumes: false };
 }
 
 export async function restartSessionAgent({
@@ -243,7 +271,14 @@ export async function restartSessionAgent({
     // A conversation with no transcript yet cannot be resumed. Only the id
     // about to be resumed is looked for, and only where the agent can be
     // started afresh under it.
-    if (agent && conversationId && onRecord === null && transcripts && launchesUnderId(agent)) {
+    if (
+      agent &&
+      conversationId &&
+      onRecord === null &&
+      !(answersFor(agent, live) && live.fresh) &&
+      transcripts &&
+      launchesUnderId(agent)
+    ) {
       const report = await transcripts({
         agentKind: agent.kind,
         conversationId,
@@ -271,7 +306,14 @@ export async function restartSessionAgent({
   // command — for the window as it runs here, so a move that lands first
   // drops it rather than resuming the conversation over there; forgotten
   // again if the restart never happened.
-  if (plan.kind === "agent") await pending.persist(session.id, session.host_id, plan.command);
+  // A plain Codex is queued with its `--no-daemon` form too, typed if the
+  // new shell's host says so.
+  if (plan.kind === "agent") {
+    const flagged = planAgentRestart(record, agents, live, onRecord, { codexNoDaemon: true });
+    const codexNoDaemon =
+      flagged.kind === "agent" && flagged.command !== plan.command ? flagged.command : null;
+    await pending.persist(session.id, session.host_id, { command: plan.command, codexNoDaemon });
+  }
   try {
     await restart(session.id);
   } catch (error) {

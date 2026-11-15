@@ -880,6 +880,8 @@ describe("HostTransport conversation inspection", () => {
       state: "running",
       cli_version: "2.1.288",
       live_elsewhere: false,
+      fresh: false,
+      shared_server: false,
       source: "registry",
     };
     respond(bridge, request, result);
@@ -892,7 +894,32 @@ describe("HostTransport conversation inspection", () => {
     await expect(transport.inspectConversation(sessionId)).rejects.toMatchObject({
       code: "unsupported_operation",
     });
+    await expect(transport.codexNoDaemon(sessionId)).rejects.toMatchObject({
+      code: "unsupported_operation",
+    });
     expect(hostRequests(bridge, "conv.inspect")).toHaveLength(0);
+    expect(hostRequests(bridge, "conv.launch")).toHaveLength(0);
+    transport.close();
+  });
+
+  test("asks whether the window's Codex accepts --no-daemon, and reads only a yes, no or unknown", async () => {
+    const { bridge, transport } = await readyTransport({ capabilities: ["fs.list", "conv.v1"] });
+    const asked = async (count: number) => {
+      while (hostRequests(bridge, "conv.launch").length < count) await flush();
+      return hostRequests(bridge, "conv.launch")[count - 1];
+    };
+    let count = 0;
+    for (const answer of [true, false, null]) {
+      const pending = transport.codexNoDaemon(sessionId);
+      const request = await asked(++count);
+      expect(request?.payload).toEqual({ session_id: sessionId });
+      if (request) respond(bridge, request, { codex_no_daemon: answer });
+      await expect(pending).resolves.toBe(answer);
+    }
+    const malformed = transport.codexNoDaemon(sessionId);
+    const request = await asked(++count);
+    if (request) respond(bridge, request, { codex_no_daemon: "yes" });
+    await expect(malformed).rejects.toMatchObject({ code: "invalid_response" });
     transport.close();
   });
 });

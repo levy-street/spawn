@@ -32,7 +32,12 @@ import {
   useWorkspaceReorder,
 } from "@/data/queries/workspace-detail";
 import { qk } from "@/data/queryKeys";
-import { agentLaunchCommand, newAgentConversationId, sessionAgent } from "@/data/selectors/agent";
+import {
+  agentLaunchCommand,
+  newAgentConversationId,
+  queuedLaunch,
+  sessionAgent,
+} from "@/data/selectors/agent";
 import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import type { PaneId, TabId, Tile, WorkspaceLayoutV3 } from "@/data/types/layout";
 
@@ -199,7 +204,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
           await pendingLaunches.persist(
             moved.id,
             moved.host_id,
-            agentLaunchCommand(agent, conversation),
+            queuedLaunch((options) => agentLaunchCommand(agent, conversation, options)),
           );
         } catch {
           launchError = new Error(
@@ -289,7 +294,7 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
           await pendingLaunches.persist(
             duplicate.id,
             duplicate.host_id,
-            agentLaunchCommand(agent, conversation),
+            queuedLaunch((options) => agentLaunchCommand(agent, conversation, options)),
           );
         } catch {
           await invalidateSessions();

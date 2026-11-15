@@ -27,6 +27,9 @@ export interface WindowHostQuestions {
   inspect: () => Promise<ConversationInspection | null>;
   /** The host's records of one conversation (`agent.transcripts`). */
   transcripts: (query: AgentTranscriptQuery) => Promise<AgentTranscriptReport | null>;
+  /** Whether the Codex the window is about to run accepts `--no-daemon`
+   *  (`conv.launch`). */
+  codexNoDaemon: () => Promise<boolean | null>;
   /** Lets the channel and the connection go; nothing is asked after it. */
   doneAsking: () => void;
 }
@@ -113,6 +116,10 @@ export function askWindowHost(host: InspectedHost, sessionId: string): WindowHos
     transcripts: (query) =>
       ask(AGENT_TRANSCRIPTS_OP, (transport, timeoutMs) =>
         transport.agentTranscripts?.(query, { timeoutMs }),
+      ),
+    codexNoDaemon: () =>
+      ask(CONVERSATION_CAPABILITY, (transport, timeoutMs) =>
+        transport.codexNoDaemon?.(sessionId, { timeoutMs }),
       ),
     doneAsking: () => {
       done = true;

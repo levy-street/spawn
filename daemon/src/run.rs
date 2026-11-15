@@ -31,7 +31,7 @@ use crate::proto::{
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
-use crate::sessions::SessionRegistry;
+use crate::sessions::{SessionLifecycleSnapshot, SessionRegistry};
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
 use spawnd::acct_endorsement::{signature_from_wire, AcctEndorsementTranscript};
@@ -611,6 +611,17 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             );
         }
     });
+    // What each Codex window is in, kept on this host so a restart after
+    // Codex has gone still names its thread (`host_conv`).
+    if let Some(memory) = conversation_notes() {
+        let windows = registry.clone();
+        let runs = registry.clone();
+        tokio::spawn(crate::host_conv::watch(
+            move || windows.foregrounds(),
+            move |id| runs.shell_pid(id),
+            memory,
+        ));
+    }
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
     // reset it: a key revoked on one control connection stays revoked on every
@@ -2670,7 +2681,7 @@ fn env_insert_ci(env: &mut BTreeMap<String, String>, name: &str, value: String) 
     env.insert(key, value);
 }
 
-fn resolve_program_in_env(
+pub(crate) fn resolve_program_in_env(
     path: &Path,
     env: &BTreeMap<String, String>,
 ) -> Option<crate::platform::ResolvedProgram> {
@@ -2943,17 +2954,42 @@ fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
 }
 
 #[derive(Debug)]
-struct CommandCapture {
-    success: bool,
-    output: String,
+pub(crate) struct CommandCapture {
+    pub(crate) success: bool,
+    pub(crate) output: String,
+    /// The program ran and exited on its own: not missing, not refused by
+    /// the system, not stopped at the timeout.
+    pub(crate) exited: bool,
 }
 
-async fn run_program_capture(
+impl CommandCapture {
+    fn failed() -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            exited: false,
+        }
+    }
+}
+
+pub(crate) async fn run_program_capture(
     program: &str,
     args: &[&str],
     timeout: Duration,
     output_limit: usize,
     env: Option<&BTreeMap<String, String>>,
+) -> CommandCapture {
+    run_program_capture_in(program, args, timeout, output_limit, env, None).await
+}
+
+/// `run_program_capture`, run in `cwd` where one is given.
+pub(crate) async fn run_program_capture_in(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    output_limit: usize,
+    env: Option<&BTreeMap<String, String>>,
+    cwd: Option<&Path>,
 ) -> CommandCapture {
     let process_env;
     let resolution_env = match env {
@@ -2964,19 +3000,13 @@ async fn run_program_capture(
         }
     };
     let Some(resolved) = resolve_program_in_env(Path::new(program), resolution_env) else {
-        return CommandCapture {
-            success: false,
-            output: String::new(),
-        };
+        return CommandCapture::failed();
     };
     #[cfg(windows)]
     if resolved.kind == crate::platform::ProgramKind::CmdShim
         && cmd_shim_command_line(args).is_none()
     {
-        return CommandCapture {
-            success: false,
-            output: String::new(),
-        };
+        return CommandCapture::failed();
     }
     #[cfg(unix)]
     let mut command = {
@@ -3020,30 +3050,53 @@ async fn run_program_capture(
     if let Some(env) = env {
         command.envs(env);
     }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    // A group of its own, so a timeout stops everything the program started
+    // (an npm launcher's native binary, a shell's children), not only it.
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            return CommandCapture {
-                success: false,
-                output: String::new(),
-            };
+    // `exec` of a file something still has open for writing — one just
+    // updated, or written by a test while another thread forks — fails with
+    // ETXTBSY for a moment (as `install::spawn_probe` knows): retried briefly.
+    let mut busy = 0;
+    let child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 40 => {
+                busy += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(_) => return CommandCapture::failed(),
         }
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    #[cfg(unix)]
+    let group = child.id();
+    // Kept alive past a timeout, so the program is not reaped before its
+    // group is killed; while anything in the group lives, its id is not
+    // handed to another process.
+    let waiting = child.wait_with_output();
+    tokio::pin!(waiting);
+    match tokio::time::timeout(timeout, &mut waiting).await {
         Ok(Ok(output)) => CommandCapture {
             success: output.status.success(),
             output: combined_output(&output.stdout, &output.stderr, output_limit),
+            exited: true,
         },
-        Ok(Err(_)) => CommandCapture {
-            success: false,
-            output: String::new(),
-        },
-        Err(_) => CommandCapture {
-            success: false,
-            output: String::new(),
-        },
+        Ok(Err(_)) => CommandCapture::failed(),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            CommandCapture::failed()
+        }
     }
 }
 
@@ -3248,7 +3301,18 @@ async fn handle_session_create(
         }
     };
 
-    register_attached(session_id, launched, registry, rtc_sessions, out_tx, true).await;
+    // Kept with the window: what a device asks this window's Codex with
+    // before typing it (`codex_launch`) is the environment its shell has.
+    register_attached(
+        session_id,
+        launched,
+        registry,
+        rtc_sessions,
+        out_tx,
+        true,
+        Some(Arc::new(env)),
+    )
+    .await;
 }
 
 /// Ask macOS for the folders this daemon reads — once, here, and never again.
@@ -3384,7 +3448,7 @@ fn login_shell_argv(shell: String) -> Vec<String> {
     }
 }
 
-async fn resolved_command_env() -> BTreeMap<String, String> {
+pub(crate) async fn resolved_command_env() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     normalize_session_env(&mut env).await;
     env
@@ -3765,6 +3829,124 @@ mod tests {
     use futures_util::SinkExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+
+    /// A program that hangs past a capture's timeout is stopped with
+    /// everything it started: its process group goes whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_capture_that_times_out_takes_what_it_started_with_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let program = dir.path().join("hangs");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nPATH=/bin:/usr/bin\nsleep 30 &\necho $! > '{}'\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Generous, for a loaded runner: the grandchild's id is read as soon
+        // as it is written, while the capture waits out its timeout.
+        let timeout = Duration::from_secs(2);
+        let written = async {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return Some(pid);
+                }
+                if std::time::Instant::now() > deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let (capture, grandchild) = tokio::join!(
+            run_program_capture_in(
+                program.to_str().unwrap(),
+                &[],
+                timeout,
+                4096,
+                None,
+                Some(dir.path()),
+            ),
+            written,
+        );
+        assert!(!capture.exited);
+        let grandchild = grandchild.expect("the program never started its grandchild");
+        // Gone, or a zombie its new parent has yet to reap.
+        let running = |pid: i32| {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map_or(true, |stat| !stat.contains(") Z "))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(grandchild) {
+            if std::time::Instant::now() > deadline {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(grandchild),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                panic!("the capture's grandchild {grandchild} outlived its timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A deleted, archived or moved window leaves no note of its Codex
+    /// thread on this host: not the one it had, and not one a last look
+    /// wrote while its worker was stopping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_window_leaves_no_codex_note_behind() {
+        use crate::host_conv::{ConversationMemory, ConversationState, Inspection, Source};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().join("conversations"));
+        let window = Uuid::new_v4();
+        let codex = Inspection {
+            agent: Some("codex"),
+            conversation_id: Some("01a1851d-2f36-76d1-98ee-b27aeae4a30d".into()),
+            state: ConversationState::Unknown,
+            cli_version: None,
+            live_elsewhere: false,
+            fresh: false,
+            source: Source::OpenFile,
+            fresh_thread: None,
+            shared_server: false,
+        };
+        memory.note(window, &codex);
+        assert!(memory.recall(window).is_some());
+
+        let running = Arc::new(AtomicBool::new(true));
+        let stopping = tokio::spawn(forget_stopped_window(memory.clone(), window, {
+            let running = Arc::clone(&running);
+            move || running.load(Ordering::SeqCst)
+        }));
+        // Forgotten at once, while its worker is still stopping.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while memory.recall(window).is_some() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(memory.recall(window), None);
+        // A look that read the window's Codex before it stopped writes late.
+        memory.note(window, &codex);
+        running.store(false, Ordering::SeqCst);
+        stopping.await.unwrap();
+        assert_eq!(memory.recall(window), None);
+
+        // A window that does not run here is forgotten all the same.
+        memory.note(window, &codex);
+        forget_stopped_window(memory.clone(), window, || false).await;
+        assert_eq!(memory.recall(window), None);
+    }
 
     #[derive(Clone, Copy)]
     struct SelectDaemonSubprotocol;
@@ -6660,6 +6842,43 @@ async fn handle_session_restart(
     }
 }
 
+/// Where this daemon notes each Codex window's thread (`host_conv`), on a
+/// platform where it inspects windows at all.
+fn conversation_notes() -> Option<crate::host_conv::ConversationMemory> {
+    if !crate::host_conv::SUPPORTED {
+        return None;
+    }
+    config::conversation_notes_dir()
+        .ok()
+        .map(crate::host_conv::ConversationMemory::new)
+}
+
+/// How long a stopped window's worker is waited for before its note is
+/// forgotten a second time regardless.
+const STOPPED_WINDOW_WAIT: Duration = Duration::from_secs(10);
+
+/// A window stopped here for good — deleted, archived, or moved to another
+/// host; `session.kill` is only ever sent for those — forgets the Codex
+/// thread noted for it: at once, which is all a window that does not run
+/// here needs, and again once `running` says its worker has gone, so that a
+/// look that read the window's Codex just before it stopped cannot leave
+/// its note behind.
+async fn forget_stopped_window(
+    notes: crate::host_conv::ConversationMemory,
+    session_id: Uuid,
+    running: impl Fn() -> bool,
+) {
+    let forget = |notes: crate::host_conv::ConversationMemory| async move {
+        let _ = tokio::task::spawn_blocking(move || notes.forget(session_id)).await;
+    };
+    forget(notes.clone()).await;
+    let deadline = tokio::time::Instant::now() + STOPPED_WINDOW_WAIT;
+    while running() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    forget(notes).await;
+}
+
 async fn handle_session_kill(
     session_id: Uuid,
     signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
@@ -6672,7 +6891,15 @@ async fn handle_session_kill(
     if !registry.contains(session_id) {
         let _ = ensure_session_attached(session_id, registry, rtc_sessions, out_tx).await;
     }
-    let Some(snapshot) = registry.lifecycle_snapshot(session_id) else {
+    let stopping = registry.lifecycle_snapshot(session_id);
+    if let Some(notes) = conversation_notes() {
+        let registry = registry.clone();
+        let worker = stopping.as_ref().map(SessionLifecycleSnapshot::binding);
+        tokio::spawn(forget_stopped_window(notes, session_id, move || {
+            worker.is_some_and(|worker| registry.is_current(worker))
+        }));
+    }
+    let Some(snapshot) = stopping else {
         send_error(
             out_tx,
             Some(session_id),
@@ -6829,6 +7056,7 @@ async fn adopt_worker_session(
         rtc_sessions,
         out_tx,
         notify_started,
+        None,
     )
     .await;
     Ok(true)
@@ -6843,6 +7071,7 @@ async fn register_attached(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
+    launch_env: Option<crate::sessions::LaunchEnv>,
 ) {
     let pid = launched.pid;
     let exit_rx = launched.exit_rx;
@@ -6858,7 +7087,7 @@ async fn register_attached(
                 .await,
         );
     }
-    let generation = registry.insert(launched.handle);
+    let generation = registry.insert_launched(launched.handle, launch_env);
     drop(transition);
     crate::state::active_heartbeat(registry.ids().len());
 

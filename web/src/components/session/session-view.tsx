@@ -157,7 +157,15 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   // A command a restart queued for the fresh shell is typed the moment that
   // shell's transport opens — the same drain, behind the same gate, the
   // workspace pane runs, so a restart from this page lands the agent back too.
-  usePendingLaunchDrain({ sessionId, session, connInfo, displayState, getHandle });
+  usePendingLaunchDrain({
+    sessionId,
+    session,
+    connInfo,
+    displayState,
+    getHandle,
+    connection: daemonConnection,
+    agentNotice,
+  });
   const removeFromWorkspaceM = useMutation({
     mutationFn: (workspace: Workspace) =>
       workspaces.update(workspace.id, {
