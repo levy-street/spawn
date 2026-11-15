@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ImagePlus,
   PanelLeftClose,
+  PanelLeftRightDashed,
   PanelRightClose,
   Pencil,
   Trash2,
@@ -18,12 +19,20 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import type { SplitSide } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
 
+/** Where a column sits in its window: against the left edge, the right one, or between. */
+export type ColumnEdge = "first" | "middle" | "last";
+
+export function columnEdge(column: number, columns: number): ColumnEdge {
+  if (column <= 0) return "first";
+  return column >= columns - 1 ? "last" : "middle";
+}
+
 /**
- * The two ends a tab strip grows when its window holds two workspaces: which
- * workspace this strip is showing, and the way back to one.
+ * The two ends a tab strip grows when its window holds more than one
+ * workspace: which workspace this strip is showing, and the ways back to
+ * fewer.
  *
  * Passed as a single optional prop rather than a handful of them so that the
  * ordinary window — the overwhelmingly common one — says nothing about split
@@ -32,15 +41,18 @@ import { cn } from "@/lib/utils";
 export interface SplitChrome {
   workspaceName: string;
   workspaceIcon: string | null;
-  side: SplitSide;
-  /** Back to one workspace, keeping the half this strip belongs to. */
+  edge: ColumnEdge;
+  /** Back to one workspace, keeping the column this strip belongs to. */
   onUnsplit: () => void;
-  /** Back to one workspace, keeping the *other* half — this one steps out. */
+  /**
+   * This column steps out and the others stay — split, if there are still two
+   * of them, or the one that is left filling the window.
+   */
   onRemoveFromSplit: () => void;
   /**
-   * Pick this workspace up off its own name and carry it to a half of the
-   * window — the sidebar's carry gesture, started from here, so rearranging a
-   * split is the same act wherever a workspace is grabbed from.
+   * Pick this workspace up off its own name and carry it to another column of
+   * the window — the sidebar's carry gesture, started from here, so
+   * rearranging a split is the same act wherever a workspace is grabbed from.
    */
   onCarry: (event: ReactPointerEvent<HTMLElement>) => void;
 }
@@ -70,14 +82,14 @@ const PINNED = "sticky z-20 shrink-0 bg-shell";
 export const PINNED_RIGHT = "right-0";
 
 /**
- * Which workspace this half is, and everything you can do to it from here.
+ * Which workspace this column is, and everything you can do to it from here.
  *
- * Two strips side by side carry tab names that say nothing about whose tabs
- * they are, and this is the only thing on screen that answers that — so it
+ * Strips side by side carry tab names that say nothing about whose tabs they
+ * are, and this is the only thing on screen that answers that — so it
  * introduces the strip rather than competing with it, and truncates rather
  * than crowding the tabs out. It is also the workspace's own handle in this
  * window: a menu on click, and a grip on drag, which carries the workspace to
- * either half exactly as dragging its row out of the rail does.
+ * another column exactly as dragging its row out of the rail does.
  */
 export function SplitWorkspaceMenu({
   chrome,
@@ -103,7 +115,7 @@ export function SplitWorkspaceMenu({
     <DropdownMenu
       align="start"
       // Inset from the panel's left edge, so the mark is not sitting on the
-      // seam of the window it belongs to.
+      // seam it shares with the column to its left.
       className={cn(PINNED, "left-0 flex h-8 items-center pl-2")}
       menuClassName="w-56"
       renderTrigger={(props) => (
@@ -162,23 +174,25 @@ export function SplitWorkspaceMenu({
 }
 
 /**
- * Collapse back to one workspace, keeping this half. Both halves carry one;
- * what each of them does about it is the caller's business.
+ * Collapse back to one workspace, keeping this column. Every column carries
+ * one; what each of them does about it is the caller's business.
  */
 export function UnsplitButton({
   workspaceName,
-  side,
+  edge,
   onUnsplit,
 }: {
   workspaceName: string;
-  side: SplitSide;
+  edge: ColumnEdge;
   onUnsplit: () => void;
 }) {
-  // The icon draws the half that goes, not the half that stays: "keep this
-  // one" and "close the other one" are the same act, and only the second has
-  // a direction a picture can point in. So the left strip folds the right
-  // panel away and the right strip folds the left one.
-  const Icon = side === "primary" ? PanelRightClose : PanelLeftClose;
+  // The icon draws what goes, not what stays: "keep this one" and "close the
+  // others" are the same act, and only the second has a direction a picture
+  // can point in. So the leftmost strip folds everything to its right away,
+  // the rightmost everything to its left, and a column in the middle shows
+  // both of its sides going.
+  const Icon =
+    edge === "first" ? PanelRightClose : edge === "last" ? PanelLeftClose : PanelLeftRightDashed;
   const label = `Keep only ${workspaceName}`;
   return (
     <Button
@@ -186,7 +200,7 @@ export function UnsplitButton({
       variant="ghost"
       size="icon"
       aria-label={label}
-      // A plain title rather than the rail's tooltip plate: on the right-hand
+      // A plain title rather than the rail's tooltip plate: on the rightmost
       // strip this button sits against the window's edge, which is exactly
       // where that plate — placed to the right of what it labels — has nowhere
       // to go.

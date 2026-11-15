@@ -1,16 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
+  type DropZone,
   dragModeAt,
   dropZones,
+  groupRows,
+  layoutColumns,
   type PaneTarget,
-  pairRows,
   pointInRect,
   type Rect,
   reorderShift,
   reorderTargetIndex,
   reorderWrites,
-  sideOf,
-  splitDrop,
+  type ShownWindow,
   zoneAt,
 } from "./workspace-drag";
 
@@ -121,136 +122,208 @@ describe("reorderShift", () => {
   });
 });
 
-describe("dropZones", () => {
-  const whole: PaneTarget = { side: "primary", rect: rect(268, 56, 1432, 892) };
+/** The workspaces a zone's release would leave on screen, left to right. */
+function drawnAfter(zone: DropZone | undefined): string[] {
+  return (zone?.columns ?? []).map((column) => column.workspaceId);
+}
 
-  test("one workspace on screen offers its root as two halves", () => {
-    expect(dropZones([whole], 0.5)).toEqual([
-      { side: "primary", rect: rect(268, 56, 850, 892) },
-      { side: "secondary", rect: rect(850, 56, 1432, 892) },
+/** The canvas of a 1440 window beside an expanded sidebar: 1164px, room for four. */
+const CANVAS = rect(268, 56, 1432, 892);
+
+/** Columns laid across `CANVAS` at these shares, as panes the carry would measure. */
+function panesAt(members: readonly string[], sizes: readonly number[], canvas = CANVAS) {
+  return layoutColumns(canvas, { members, sizes }, 4, 0, null);
+}
+
+/** The window a drop sees when these columns are all on screen. */
+function shown(members: string[], sizes: number[]): ShownWindow {
+  return { members, sizes, drawn: members };
+}
+
+describe("dropZones: one workspace on screen", () => {
+  const alone = shown(["a"], [1]);
+  const panes = panesAt(["a"], [1]);
+
+  test("offers its canvas as two halves: take the front, or open beside", () => {
+    const zones = dropZones("b", alone, panes);
+    expect(zones.map((zone) => zone.rect)).toEqual([
+      rect(268, 56, 850, 892),
+      rect(850, 56, 1432, 892),
+    ]);
+    expect(zones.map((zone) => zone.next?.members)).toEqual([
+      ["b", "a"],
+      ["a", "b"],
+    ]);
+    expect(zones[1]?.next?.sizes).toEqual([0.5, 0.5]);
+  });
+
+  test("the halves are cut where the seam will land, so the preview is the hit region", () => {
+    const zones = dropZones("b", alone, panes);
+    for (const zone of zones) {
+      const placed = zone.columns.find((column) => column.workspaceId === "b");
+      expect(placed?.rect).toEqual(zone.rect);
+    }
+  });
+
+  test("dropping the workspace already on screen changes nothing", () => {
+    const zones = dropZones("a", alone, panes);
+    expect(zones).toHaveLength(1);
+    expect(zones[0]?.next).toBeNull();
+    expect(drawnAfter(zones[0])).toEqual(["a"]);
+  });
+
+  test("a narrow window still splits: two always fit", () => {
+    const narrow = panesAt(["a"], [1], rect(320, 56, 900, 792));
+    expect(dropZones("b", alone, narrow).map((zone) => zone.next?.members)).toEqual([
+      ["b", "a"],
+      ["a", "b"],
+    ]);
+  });
+});
+
+describe("dropZones: a split with room for another column", () => {
+  const two = shown(["a", "b"], [0.5, 0.5]);
+  const panes = panesAt(two.members, two.sizes);
+
+  test("a workspace from outside is added, before, between or after", () => {
+    const zones = dropZones("c", two, panes);
+    expect(zones.map((zone) => zone.next?.members)).toEqual([
+      ["c", "a", "b"],
+      ["a", "c", "b"],
+      ["a", "b", "c"],
+    ]);
+    expect(zones.map((zone) => drawnAfter(zone))).toEqual([
+      ["c", "a", "b"],
+      ["a", "c", "b"],
+      ["a", "b", "c"],
     ]);
   });
 
-  test("the halves are cut where the seam will land, not down the middle", () => {
-    // The preview is drawn in these rectangles, so an off-centre seam has to
-    // move the boundary the pointer flips at along with it.
-    expect(dropZones([whole], 0.25)).toEqual([
-      { side: "primary", rect: rect(268, 56, 559, 892) },
-      { side: "secondary", rect: rect(559, 56, 1432, 892) },
+  test("the cuts are at the middle of each column on screen, and tile the canvas", () => {
+    const zones = dropZones("c", two, panes);
+    expect(zones.map((zone) => [zone.rect.left, zone.rect.right])).toEqual([
+      [268, 559],
+      [559, 1141],
+      [1141, 1432],
     ]);
   });
 
-  test("a ratio outside the seam's bounds is clamped, not obeyed", () => {
-    expect(dropZones([whole], 0)[0]?.rect.right).toBe(559);
-    expect(dropZones([whole], 5)[0]?.rect.right).toBe(1141);
+  test("an off-centre seam moves the cuts with the columns it divides", () => {
+    const uneven = shown(["a", "b"], [0.25, 0.75]);
+    const zones = dropZones("c", uneven, panesAt(uneven.members, uneven.sizes));
+    expect(zones.map((zone) => [zone.rect.left, zone.rect.right])).toEqual([
+      [268, 413.5],
+      [413.5, 995.5],
+      [995.5, 1432],
+    ]);
   });
 
-  test("two workspaces get one zone each, whole", () => {
-    const panes: PaneTarget[] = [
-      { side: "primary", rect: rect(268, 56, 850, 892) },
-      { side: "secondary", rect: rect(858, 56, 1432, 892) },
-    ];
-    expect(dropZones(panes, 0.5)).toEqual(
-      panes.map((pane) => ({ side: pane.side, rect: pane.rect })),
-    );
+  test("three become four the same way", () => {
+    const three = shown(["a", "b", "c"], [1 / 3, 1 / 3, 1 / 3]);
+    const zones = dropZones("d", three, panesAt(three.members, three.sizes));
+    expect(zones).toHaveLength(4);
+    expect(zones[3]?.next?.members).toEqual(["a", "b", "c", "d"]);
+    expect(zones[3]?.columns.map((column) => column.rect.right - column.rect.left)).toEqual([
+      291, 291, 291, 291,
+    ]);
   });
 
-  test("two workspaces keep their own widths whatever the stored ratio says", () => {
-    const panes: PaneTarget[] = [
-      { side: "primary", rect: rect(268, 56, 850, 892) },
-      { side: "secondary", rect: rect(858, 56, 1432, 892) },
-    ];
-    expect(dropZones(panes, 0.3)).toEqual(dropZones(panes, 0.7));
+  test("a member dropped on another column moves there; on its own, nothing happens", () => {
+    const three = shown(["a", "b", "c"], [0.5, 0.25, 0.25]);
+    const zones = dropZones("a", three, panesAt(three.members, three.sizes));
+    expect(zones).toHaveLength(3);
+    expect(zones[0]?.next).toBeNull();
+    expect(zones[2]?.next).toEqual({ members: ["b", "c", "a"], sizes: [0.5, 0.25, 0.25] });
   });
 
-  test("no workspace on screen offers nothing to drop onto", () => {
-    expect(dropZones([], 0.5)).toEqual([]);
+  test("with two columns, moving a member is the pair trading sides", () => {
+    const zones = dropZones("b", two, panes);
+    expect(zones.map((zone) => zone.next?.members ?? null)).toEqual([["b", "a"], null]);
+  });
+});
+
+describe("dropZones: a full window", () => {
+  test("four columns: a workspace from outside displaces the one it is dropped on", () => {
+    const four = shown(["a", "b", "c", "d"], [0.25, 0.25, 0.25, 0.25]);
+    const zones = dropZones("e", four, panesAt(four.members, four.sizes));
+    expect(zones).toHaveLength(4);
+    expect(zones.map((zone) => zone.next?.members)).toEqual([
+      ["e", "b", "c", "d"],
+      ["a", "e", "c", "d"],
+      ["a", "b", "e", "d"],
+      ["a", "b", "c", "e"],
+    ]);
+    // Each zone is the column itself, so the half you aim at is the one that goes.
+    expect(zones[1]?.rect).toEqual(rect(559, 56, 850, 892));
+  });
+
+  test("a window too narrow for another column replaces rather than squeezing one in", () => {
+    // 580px holds two columns of the minimum width, not three.
+    const two = shown(["a", "b"], [0.5, 0.5]);
+    const narrow = panesAt(two.members, two.sizes, rect(320, 56, 900, 792));
+    expect(dropZones("c", two, narrow).map((zone) => zone.next?.members)).toEqual([
+      ["c", "b"],
+      ["a", "c"],
+    ]);
+  });
+
+  test("the columns keep their widths when their occupants change", () => {
+    const four = shown(["a", "b", "c", "d"], [0.5, 0.25, 0.125, 0.125]);
+    const zones = dropZones("e", four, panesAt(four.members, four.sizes));
+    expect(zones[2]?.next?.sizes).toEqual([0.5, 0.25, 0.125, 0.125]);
+  });
+});
+
+describe("dropZones: a group folded on a narrow window", () => {
+  // Four in the group, two drawn: b and c.
+  const folded: ShownWindow = {
+    members: ["a", "b", "c", "d"],
+    sizes: [0.25, 0.25, 0.25, 0.25],
+    drawn: ["b", "c"],
+  };
+  const canvas = rect(320, 56, 900, 792);
+  const panes = layoutColumns(canvas, { members: ["b", "c"], sizes: [0.5, 0.5] }, 2, 0, null);
+
+  test("only the drawn columns are zones", () => {
+    expect(dropZones("z", folded, panes).map((zone) => zone.next?.members)).toEqual([
+      ["a", "z", "c", "d"],
+      ["a", "b", "z", "d"],
+    ]);
+  });
+
+  test("a member that is not drawn moves to where it is dropped, and the window follows it", () => {
+    const zones = dropZones("d", folded, panes);
+    expect(zones[0]?.next?.members).toEqual(["a", "d", "b", "c"]);
+    expect(drawnAfter(zones[0])).toEqual(["d", "b"]);
+  });
+});
+
+describe("dropZones: nothing to drop onto", () => {
+  test("no workspace on screen, or no workspace in hand, offers nothing", () => {
+    expect(dropZones("b", shown(["a"], [1]), [])).toEqual([]);
+    expect(dropZones("", shown(["a"], [1]), panesAt(["a"], [1]))).toEqual([]);
   });
 });
 
 describe("zoneAt", () => {
-  const zones = dropZones([{ side: "primary", rect: rect(268, 56, 1432, 892) }], 0.5);
+  const zones = dropZones("b", shown(["a"], [1]), panesAt(["a"], [1]));
 
-  test("picks the half the pointer is in", () => {
-    expect(zoneAt(400, 400, zones)?.side).toBe("primary");
-    expect(zoneAt(1200, 400, zones)?.side).toBe("secondary");
+  test("picks the zone the pointer is in", () => {
+    expect(zoneAt(400, 400, zones)?.next?.members).toEqual(["b", "a"]);
+    expect(zoneAt(1200, 400, zones)?.next?.members).toEqual(["a", "b"]);
   });
 
-  test("the seam between the halves belongs to the left one", () => {
-    // The two halves share the midpoint and both claim it; taking the first
-    // keeps the boundary from being a dead pixel neither zone answers for.
-    expect(zoneAt(850, 400, zones)?.side).toBe("primary");
-    expect(zoneAt(850.5, 400, zones)?.side).toBe("secondary");
+  test("a cut between two zones belongs to the left one", () => {
+    // The two zones share the cut and both claim it; taking the first keeps
+    // the boundary from being a dead pixel neither zone answers for.
+    expect(zoneAt(850, 400, zones)).toBe(zones[0] ?? null);
+    expect(zoneAt(850.5, 400, zones)).toBe(zones[1] ?? null);
   });
 
   test("a pointer outside every zone is over nothing", () => {
     expect(zoneAt(120, 400, zones)).toBeNull();
     expect(zoneAt(700, 20, zones)).toBeNull();
     expect(zoneAt(700, 1000, zones)).toBeNull();
-  });
-});
-
-describe("splitDrop", () => {
-  /** One workspace on the canvas, and two, as `splitDrop` is handed them. */
-  const alone = { primary: "a", secondary: null };
-  const split = { primary: "a", secondary: "b" };
-
-  test("one workspace, dropped left: the dragged one takes the front and it moves across", () => {
-    expect(splitDrop("primary", "b", alone)).toEqual({ primary: "b", secondary: "a" });
-  });
-
-  test("one workspace, dropped right: the split opens beside the one already up", () => {
-    expect(splitDrop("secondary", "b", alone)).toEqual({ primary: "a", secondary: "b" });
-  });
-
-  test("one workspace, dropping the workspace already on screen changes nothing", () => {
-    expect(splitDrop("primary", "a", alone)).toBeNull();
-    expect(splitDrop("secondary", "a", alone)).toBeNull();
-  });
-
-  test("split, dropped left: the left occupant is displaced and the right holds", () => {
-    expect(splitDrop("primary", "c", split)).toEqual({ primary: "c", secondary: "b" });
-  });
-
-  test("split, dropped right: the right occupant is displaced and the left holds", () => {
-    expect(splitDrop("secondary", "c", split)).toEqual({ primary: "a", secondary: "c" });
-  });
-
-  test("split, dropped on the half it is already in: nothing to do", () => {
-    expect(splitDrop("primary", "a", split)).toBeNull();
-    expect(splitDrop("secondary", "b", split)).toBeNull();
-  });
-
-  test("split, dropped on the other half: the two swap and nobody is displaced", () => {
-    expect(splitDrop("primary", "b", split)).toEqual({ primary: "b", secondary: "a" });
-    expect(splitDrop("secondary", "a", split)).toEqual({ primary: "b", secondary: "a" });
-  });
-
-  test("the arrangement is read off the canvas, not off the route", () => {
-    // A pair whose right-hand workspace is the one the URL is about: the drop
-    // still lands where it was aimed, and the left half is still the left one.
-    expect(splitDrop("secondary", "c", { primary: "a", secondary: "b" })).toEqual({
-      primary: "a",
-      secondary: "c",
-    });
-  });
-
-  test("nothing on screen means there is nothing to split against", () => {
-    expect(splitDrop("primary", "b", { primary: null, secondary: null })).toBeNull();
-    expect(splitDrop("secondary", "b", { primary: null, secondary: null })).toBeNull();
-    expect(splitDrop("primary", "", alone)).toBeNull();
-  });
-});
-
-describe("sideOf", () => {
-  test("names the half a workspace occupies", () => {
-    expect(sideOf("a", { primary: "a", secondary: "b" })).toBe("primary");
-    expect(sideOf("b", { primary: "a", secondary: "b" })).toBe("secondary");
-  });
-
-  test("a workspace that is in neither half is displaced, not defaulted to one", () => {
-    expect(sideOf("c", { primary: "a", secondary: "b" })).toBeNull();
-    expect(sideOf("b", { primary: "a", secondary: null })).toBeNull();
   });
 });
 
@@ -282,53 +355,107 @@ describe("dropZones against a live DOMRect", () => {
     }
   }
 
+  const live: PaneTarget[] = [
+    { workspaceId: "a", rect: new ProtoRect(200, 0, 600, 600) },
+    { workspaceId: "b", rect: new ProtoRect(600, 0, 1400, 600) },
+  ];
+
   test("a rect whose edges are prototype getters still yields real zones", () => {
     // The trap itself: spreading such a rect carries none of the four edges
     // the zone maths reads, so every comparison against the result is
     // `x >= undefined` and no point is ever inside anything.
     expect({ ...new ProtoRect(0, 0, 800, 600) }).not.toHaveProperty("left");
 
-    const zones = dropZones([{ side: "primary", rect: new ProtoRect(200, 0, 1000, 600) }], 0.5);
-
-    expect(zones).toEqual([
-      { side: "primary", rect: { left: 200, top: 0, right: 600, bottom: 600 } },
-      { side: "secondary", rect: { left: 600, top: 0, right: 1000, bottom: 600 } },
+    const zones = dropZones("c", shown(["a", "b"], [1 / 3, 2 / 3]), live);
+    expect(zones.map((zone) => zone.rect)).toEqual([
+      { left: 200, top: 0, right: 400, bottom: 600 },
+      { left: 400, top: 0, right: 1000, bottom: 600 },
+      { left: 1000, top: 0, right: 1400, bottom: 600 },
     ]);
+    // And a full window's zones are the columns' own boxes, copied out.
+    const full = dropZones(
+      "e",
+      shown(["a", "b"], [1 / 3, 2 / 3]),
+      live.map((pane) => ({
+        ...pane,
+        rect: new ProtoRect(pane.rect.left, 0, pane.rect.left + 140, 600),
+      })),
+    );
+    expect(full[0]?.rect).toEqual({ left: 200, top: 0, right: 340, bottom: 600 });
   });
 
-  test("a point over the pane always finds a zone, either side of the seam", () => {
-    const zones = dropZones([{ side: "primary", rect: new ProtoRect(200, 0, 1000, 600) }], 0.5);
-    expect(zoneAt(300, 300, zones)?.side).toBe("primary");
-    expect(zoneAt(900, 300, zones)?.side).toBe("secondary");
-    // The seam itself belongs to a half rather than to neither.
-    expect(zoneAt(600, 300, zones)).not.toBeNull();
+  test("a point over the canvas always finds a zone, either side of a cut", () => {
+    const zones = dropZones("c", shown(["a", "b"], [1 / 3, 2 / 3]), live);
+    expect(zoneAt(300, 300, zones)?.next?.members).toEqual(["c", "a", "b"]);
+    expect(zoneAt(900, 300, zones)?.next?.members).toEqual(["a", "c", "b"]);
+    expect(zoneAt(1300, 300, zones)?.next?.members).toEqual(["a", "b", "c"]);
+    // The cut itself belongs to a zone rather than to neither.
+    expect(zoneAt(400, 300, zones)).not.toBeNull();
   });
 });
 
-describe("pairRows", () => {
-  const ids = ["a", "b", "c", "d"];
+describe("layoutColumns", () => {
+  test("lays the columns edge to edge at their shares, the last one closing on the canvas edge", () => {
+    expect(
+      layoutColumns(
+        rect(0, 0, 1000, 500),
+        { members: ["a", "b", "c"], sizes: [0.5, 0.3, 0.2] },
+        4,
+        0,
+        null,
+      ),
+    ).toEqual([
+      { workspaceId: "a", rect: rect(0, 0, 500, 500) },
+      { workspaceId: "b", rect: rect(500, 0, 800, 500) },
+      { workspaceId: "c", rect: rect(800, 0, 1000, 500) },
+    ]);
+  });
+
+  test("a canvas too narrow for them all draws the run around the focused column", () => {
+    const laid = layoutColumns(
+      rect(0, 0, 600, 500),
+      { members: ["a", "b", "c", "d"], sizes: [0.25, 0.25, 0.25, 0.25] },
+      2,
+      0,
+      "d",
+    );
+    expect(laid).toEqual([
+      { workspaceId: "c", rect: rect(0, 0, 300, 500) },
+      { workspaceId: "d", rect: rect(300, 0, 600, 500) },
+    ]);
+  });
+});
+
+describe("groupRows", () => {
+  const ids = ["a", "b", "c", "d", "e"];
 
   test("no split leaves every workspace in a row of its own", () => {
-    expect(pairRows(ids, "b", null)).toEqual([["a"], ["b"], ["c"], ["d"]]);
-    expect(pairRows(ids, null, null)).toEqual([["a"], ["b"], ["c"], ["d"]]);
+    expect(groupRows(ids, null)).toEqual([["a"], ["b"], ["c"], ["d"], ["e"]]);
+    expect(groupRows(ids, ["b"])).toEqual([["a"], ["b"], ["c"], ["d"], ["e"]]);
   });
 
-  test("a split collapses to one row where the upper of the two was", () => {
-    expect(pairRows(ids, "b", "d")).toEqual([["a"], ["b", "d"], ["c"]]);
+  test("a pair collapses to one row where the upper of the two was", () => {
+    expect(groupRows(ids, ["b", "d"])).toEqual([["a"], ["b", "d"], ["c"], ["e"]]);
   });
 
-  test("the row sits at the upper slot even when the secondary is the upper one", () => {
-    // Anchored at b's slot, but still listed primary-then-secondary: the two
-    // containers are drawn left to right to match the halves on screen.
-    expect(pairRows(ids, "d", "b")).toEqual([["a"], ["d", "b"], ["c"]]);
+  test("the row sits at the upper slot even when a later column is the upper one", () => {
+    // Anchored at b's slot, but listed in the group's own order: the row is
+    // drawn to match the columns on screen.
+    expect(groupRows(ids, ["d", "b"])).toEqual([["a"], ["d", "b"], ["c"], ["e"]]);
   });
 
-  test("adjacent workspaces pair without disturbing anything around them", () => {
-    expect(pairRows(ids, "b", "c")).toEqual([["a"], ["b", "c"], ["d"]]);
+  test("three and four collapse the same way, wherever they are in the list", () => {
+    expect(groupRows(ids, ["e", "a", "c"])).toEqual([["e", "a", "c"], ["b"], ["d"]]);
+    expect(groupRows(ids, ["b", "c", "d", "e"])).toEqual([["a"], ["b", "c", "d", "e"]]);
   });
 
-  test("a workspace the list cannot see leaves both of them as ordinary rows", () => {
-    expect(pairRows(ids, "b", "zz")).toEqual([["a"], ["b"], ["c"], ["d"]]);
+  test("adjacent workspaces group without disturbing anything around them", () => {
+    expect(groupRows(ids, ["b", "c"])).toEqual([["a"], ["b", "c"], ["d"], ["e"]]);
+  });
+
+  test("a member the list cannot see leaves all of them as ordinary rows", () => {
+    expect(groupRows(ids, ["b", "zz"])).toEqual([["a"], ["b"], ["c"], ["d"], ["e"]]);
+    expect(groupRows(ids, ["a", "b", "zz"])).toEqual([["a"], ["b"], ["c"], ["d"], ["e"]]);
   });
 });
 
@@ -336,21 +463,21 @@ describe("reorderWrites", () => {
   const singles = (...ids: string[]) => ids.map((id) => [id]);
 
   test("a row of one workspace writes exactly the one position it always did", () => {
-    // The guarantee the existing gesture rests on: with no pair on screen this
+    // The guarantee the existing gesture rests on: with no split in the rail this
     // is the single `{id, position: targetRowIndex}` write it has always made.
     expect(reorderWrites(singles("a", "b", "c"), 0, 2)).toEqual([{ id: "a", position: 2 }]);
     expect(reorderWrites(singles("a", "b", "c"), 2, 0)).toEqual([{ id: "c", position: 0 }]);
     expect(reorderWrites(singles("a", "b", "c"), 1, 1)).toEqual([{ id: "b", position: 1 }]);
   });
 
-  test("rows above a pair count the workspaces it holds, not the row", () => {
+  test("rows above a split count the workspaces it holds, not the row", () => {
     // [a,b] is one row but two positions, so dropping d below it is position 3.
     const rows = [["a", "b"], ["c"], ["d"]];
     expect(reorderWrites(rows, 2, 1)).toEqual([{ id: "d", position: 2 }]);
     expect(reorderWrites(rows, 2, 0)).toEqual([{ id: "d", position: 0 }]);
   });
 
-  test("a pair dragged to the front lands both, in order", () => {
+  test("a split dragged to the front lands every member, in order", () => {
     const rows = [["x"], ["a", "b"], ["y"]];
     expect(reorderWrites(rows, 1, 0)).toEqual([
       { id: "a", position: 0 },
@@ -358,7 +485,7 @@ describe("reorderWrites", () => {
     ]);
   });
 
-  test("a pair dragged to the end lands both, in order", () => {
+  test("a split dragged to the end lands every member, in order", () => {
     const rows = [["a", "b"], ["x"]];
     expect(reorderWrites(rows, 0, 1)).toEqual([
       { id: "a", position: 2 },
@@ -380,6 +507,9 @@ describe("reorderWrites", () => {
       [[["x"], ["a", "b"], ["y"]], 1, 2, ["x", "y", "a", "b"]],
       [[["x"], ["y"], ["a", "b"]], 2, 1, ["x", "a", "b", "y"]],
       [[["a", "b"], ["x"], ["y"]], 0, 2, ["x", "y", "a", "b"]],
+      // A group of four carried as one row, either way through the list.
+      [[["x"], ["a", "b", "c", "d"], ["y"]], 1, 2, ["x", "y", "a", "b", "c", "d"]],
+      [[["x"], ["y"], ["a", "b", "c"]], 2, 0, ["a", "b", "c", "x", "y"]],
     ];
     for (const [rows, from, target, expected] of cases) {
       expect(replay(rows.flat(), reorderWrites(rows, from, target))).toEqual(expected);
