@@ -109,18 +109,58 @@ pub fn validate_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reserve a session's endpoint. The reservation file is created only when
+/// no endpoint exists for the session: a missing file beside a socket is not
+/// a released lock. The OS temp cleaner deletes a reservation file nothing
+/// has touched for days (`/tmp` on macOS) while its worker still holds the
+/// lock on the deleted inode, and a file created in its place would be
+/// unlocked — so taking it would read a live worker as a crashed one.
 fn try_reserve_path(socket: &Path) -> Result<LockAttempt> {
     let path = lock_path(socket);
-    let file = OpenOptions::new()
+    match open_reservation(&path, false)? {
+        Some(file) => lock_reservation(file),
+        None if endpoint_paths_exist(socket) => Ok(LockAttempt::Busy),
+        None => create_and_lock_reservation(&path),
+    }
+}
+
+/// Create the reservation file exclusively and lock it. When another
+/// reserver created it first, its lock decides, as for any existing file.
+fn create_and_lock_reservation(path: &Path) -> Result<LockAttempt> {
+    if let Some(file) = open_reservation(path, true)? {
+        return lock_reservation(file);
+    }
+    match open_reservation(path, false)? {
+        Some(file) => lock_reservation(file),
+        None => Ok(LockAttempt::Busy),
+    }
+}
+
+/// Open the reservation file without following a link: the existing file,
+/// or (`create`) a new one, exclusively. `None` when it does not exist, or,
+/// creating, when someone else created it first.
+fn open_reservation(path: &Path, create: bool) -> Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
         .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&path)
-        .context("opening worker endpoint reservation")?;
-    secure_regular_file(&file)?;
+        .custom_flags(nix::libc::O_NOFOLLOW);
+    if create {
+        options.create_new(true);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            secure_regular_file(&file)?;
+            Ok(Some(file))
+        }
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if create && error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(error).context("opening worker endpoint reservation"),
+    }
+}
+
+fn lock_reservation(file: File) -> Result<LockAttempt> {
     match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
         Ok(()) => Ok(LockAttempt::Acquired(WorkerLock { file })),
         Err(nix::errno::Errno::EWOULDBLOCK) => Ok(LockAttempt::Busy),
@@ -128,8 +168,55 @@ fn try_reserve_path(socket: &Path) -> Result<LockAttempt> {
     }
 }
 
+/// Whether either of the session's sockets is on disk, whatever its state.
+fn endpoint_paths_exist(socket: &Path) -> bool {
+    let lifecycle = socket.with_extension("lifecycle.sock");
+    [socket, lifecycle.as_path()]
+        .iter()
+        .any(|path| std::fs::symlink_metadata(path).is_ok())
+}
+
 pub(super) fn try_reserve(endpoint: &Endpoint) -> Result<LockAttempt> {
     try_reserve_path(&endpoint.inner.socket)
+}
+
+/// Reserve a session's endpoint to clear what a crashed worker left. Called
+/// only after connecting to the worker has failed. A reservation file that
+/// exists and can be locked proves the worker is gone, as always. When the
+/// file is missing, the lock proves nothing either way, and the worker is
+/// taken to be gone only if nothing is bound to its lifecycle socket any
+/// more — a live worker keeps that datagram socket bound for its life, and
+/// connecting a datagram socket delivers nothing to it — in which case the
+/// reservation is created here, exclusively, and held for the cleanup.
+pub(super) fn try_reserve_stale(endpoint: &Endpoint) -> Result<LockAttempt> {
+    let path = lock_path(&endpoint.inner.socket);
+    let attempt = try_reserve(endpoint)?;
+    if matches!(attempt, LockAttempt::Acquired(_))
+        || std::fs::symlink_metadata(&path).is_ok()
+        || !nothing_bound_at(&endpoint.inner.lifecycle)
+    {
+        return Ok(attempt);
+    }
+    create_and_lock_reservation(&path)
+}
+
+/// True only when `path` is a socket this user owns and connecting a datagram
+/// socket to it is refused: no process has a socket bound there.
+fn nothing_bound_at(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_socket() || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+    {
+        return false;
+    }
+    let Ok(probe) = std::os::unix::net::UnixDatagram::unbound() else {
+        return false;
+    };
+    matches!(
+        probe.connect(path),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ECONNREFUSED)
+    )
 }
 
 /// # Safety
@@ -554,6 +641,87 @@ mod tests {
         drop(old);
         drop(replacement);
         assert!(replacement_identity.cleanup().unwrap());
+    }
+
+    /// The OS temp cleaner deletes a reservation file its live worker still
+    /// holds locked. That must never read as a crash: no reservation for a
+    /// second worker, no cleanup of the live one's sockets, and no new file
+    /// that a later reserver would take as a released lock. Once the worker
+    /// really is gone, its endpoint is recovered as before.
+    #[test]
+    fn a_deleted_reservation_file_is_not_proof_that_its_worker_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_private_dir(root.path()).unwrap();
+        let endpoint = super::super::endpoint_for(root.path(), "", Uuid::new_v4()).unwrap();
+        let socket = endpoint.inner.socket.clone();
+        let lifecycle = endpoint.inner.lifecycle.clone();
+        let lock = lock_path(&socket);
+
+        // A live worker: both listeners bound, the reservation locked, and
+        // then its file deleted from under the lock.
+        let worker_lock = match try_reserve(&endpoint).unwrap() {
+            LockAttempt::Acquired(lock) => lock,
+            LockAttempt::Busy => panic!("fresh reservation was busy"),
+        };
+        let main = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let datagram = std::os::unix::net::UnixDatagram::bind(&lifecycle).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+
+        assert!(matches!(try_reserve(&endpoint).unwrap(), LockAttempt::Busy));
+        assert!(matches!(
+            try_reserve_stale(&endpoint).unwrap(),
+            LockAttempt::Busy
+        ));
+        assert!(
+            !lock.exists(),
+            "a reservation file was created beside a live worker"
+        );
+        assert!(socket.exists() && lifecycle.exists());
+
+        // The worker dies: its listeners close, nothing is bound, and the
+        // lock it held on the deleted file goes with it.
+        drop(main);
+        drop(datagram);
+        drop(worker_lock);
+        assert!(matches!(try_reserve(&endpoint).unwrap(), LockAttempt::Busy));
+        let recovered = match try_reserve_stale(&endpoint).unwrap() {
+            LockAttempt::Acquired(lock) => lock,
+            LockAttempt::Busy => panic!("a dead worker's endpoint was not recovered"),
+        };
+        assert!(lock.exists());
+        remove_stale(&endpoint, &recovered).unwrap();
+        assert!(!socket.exists() && !lifecycle.exists());
+        drop(recovered);
+
+        // A crash with its reservation file intact recovers exactly as before.
+        let worker_lock = match try_reserve(&endpoint).unwrap() {
+            LockAttempt::Acquired(lock) => lock,
+            LockAttempt::Busy => panic!("reservation of a cleared endpoint was busy"),
+        };
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        drop(std::os::unix::net::UnixDatagram::bind(&lifecycle).unwrap());
+        assert!(matches!(
+            try_reserve_stale(&endpoint).unwrap(),
+            LockAttempt::Busy
+        ));
+        drop(worker_lock);
+        // A process another test thread forks may hold a copy of the locked
+        // descriptor until its exec (see the test below).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let recovered = loop {
+            match try_reserve_stale(&endpoint).unwrap() {
+                LockAttempt::Acquired(lock) => break lock,
+                LockAttempt::Busy => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a crashed worker's endpoint was not recovered"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
+        remove_stale(&endpoint, &recovered).unwrap();
+        assert!(!socket.exists() && !lifecycle.exists());
     }
 
     #[test]

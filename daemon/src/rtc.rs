@@ -3581,7 +3581,7 @@ fn session_data_channel_handler(
                     }
                     let mut replay_rx = None;
                     registry.with_bound_handle(session, |handle| {
-                        replay_rx = handle.replay(64 * 1024);
+                        replay_rx = handle.viewer_replay(64 * 1024);
                     });
                     let Some(replay_rx) = replay_rx else {
                         let _ = sessions
@@ -3607,7 +3607,7 @@ fn session_data_channel_handler(
                         );
                         return;
                     };
-                    let Ok(Ok(Ok(replay))) =
+                    let Ok(Some(Ok(replay))) =
                         tokio::time::timeout(Duration::from_secs(10), replay_rx).await
                     else {
                         let _ = sessions
@@ -4775,20 +4775,20 @@ async fn capture_session_replay(
     };
     let mut replay_rx = None;
     registry.with_bound_handle(session, |handle| {
-        replay_rx = handle.replay(max_bytes);
+        replay_rx = handle.viewer_replay(max_bytes);
     });
     match replay_rx {
         Some(receiver) => match receiver.await {
-            Ok(Ok(replay)) => {
+            Some(Ok(replay)) => {
                 control.wait_source_offset(replay.watermark()).await;
                 Ok(replay)
             }
-            Ok(Err(error)) => Err(ProtocolError::new(
+            Some(Err(error)) => Err(ProtocolError::new(
                 None,
                 "replay_failed",
                 &format!("worker replay failed: {error:#}"),
             )),
-            Err(_) => Err(ProtocolError::new(
+            None => Err(ProtocolError::new(
                 None,
                 "replay_unavailable",
                 "worker replay channel closed",
@@ -9576,6 +9576,219 @@ mod tests {
         drop(exited_handle);
         ws_drain.abort();
         adopted_ws_drain.abort();
+    }
+
+    /// Send a `history` request and return its JSON reply, whatever it says.
+    #[cfg(unix)]
+    async fn history_reply(client: &mut RtcTestClient) -> serde_json::Value {
+        let request_id = Uuid::new_v4().to_string();
+        client
+            .ctl
+            .send_text(format!(
+                r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"history","lines":400,"plain":false}}"#
+            ))
+            .await
+            .expect("history request");
+        loop {
+            let value = next_ctl_json(&mut client.ctl_messages).await;
+            if value["request_id"] == request_id.as_str() {
+                return value;
+            }
+        }
+    }
+
+    /// A session days old on a Mac: the OS temp cleaner has deleted the
+    /// oldest scrollback segment its worker still lists. Every attach used to
+    /// fail at the replay barrier ("worker replay barrier failed") and the
+    /// terminal never opened. It now opens with the newest history that can
+    /// still be read; a tampered segment still fails closed; and with no
+    /// readable history left at all it opens on the live stream. The worker
+    /// is the real, unchanged `spawn-worker`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_whose_old_scrollback_was_deleted_still_opens() {
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let env = WorkerTestEnv::install();
+        let session_id = Uuid::new_v4();
+        let argv = ["/bin/sh", "-c", "printf 'worker-ready\\n'; exec cat"]
+            .map(String::from)
+            .to_vec();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        );
+        vars.insert("TERM".to_string(), "xterm-256color".to_string());
+        let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
+            session_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &vars,
+        })
+        .await
+        .expect("launch real worker");
+        let handle = launched.handle;
+        let _worker_cleanup = WorkerCleanupGuard::new(session_id, &handle);
+        let control = handle.control.clone();
+        let (ws_tx, mut ws_rx) = mpsc::channel(1024);
+        control.set_sink(ws_tx).await;
+        let ws_drain = tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
+
+        // Fill the first segment until the worker rotates to a second one.
+        let scrollback = env.path().join(format!("{session_id}.scrollback"));
+        let oldest = scrollback.join("seg-00000001.log");
+        let newest = scrollback.join("seg-00000002.log");
+        let type_and_wait = |text: String| {
+            let expected = control.source_offset() + text.len() as u64;
+            handle.write_stdin(text.as_bytes()).expect("worker input");
+            let control = control.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    control.wait_source_offset(expected),
+                )
+                .await
+                .expect("worker echo never arrived");
+            }
+        };
+        let mut line = 0;
+        while !newest.exists() {
+            assert!(line < 50_000, "the worker never rotated its scrollback");
+            let mut batch = String::new();
+            for _ in 0..40 {
+                batch.push_str(&format!("early-{line:05} {}\n", "x".repeat(60)));
+                line += 1;
+            }
+            type_and_wait(batch).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Then a little more, into the second segment only.
+        let mut late = String::new();
+        for index in 0..40 {
+            late.push_str(&format!("late-{index:02}\n"));
+        }
+        late.push_str("newest-marker\n");
+        type_and_wait(late).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::metadata(&newest).map(|m| m.len()).unwrap_or(0) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "nothing committed after rotation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The temp cleaner takes the full segment nobody writes any more.
+        std::fs::remove_file(&oldest).expect("delete the oldest segment");
+        // The worker's own words for it, which the daemon reads.
+        let refusal = handle
+            .replay(64 * 1024)
+            .expect("replay request")
+            .await
+            .expect("replay response")
+            .expect_err("the barrier's walk reaches the deleted segment");
+        let refusal = format!("{refusal:#}");
+        assert!(
+            refusal.contains("seg-00000001.log: No such file or directory (os error 2)"),
+            "{refusal}"
+        );
+
+        let registry = SessionRegistry::new();
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(session_id).await;
+        registry.insert(handle);
+        drop(transition);
+
+        // The attach that never completed.
+        let mut viewer =
+            connect_rtc_session(&sessions, &registry, session_id, "reaped-first", "g").await;
+        let history = request_history(&mut viewer).await;
+        let has = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            has(&history, b"newest-marker"),
+            "the live screen is missing"
+        );
+        assert!(
+            has(&history, b"\x1b_sp:h1\x1b\\"),
+            "not the worker's own replay"
+        );
+        assert!(
+            !has(&history, b"early-00000 "),
+            "history from the deleted segment"
+        );
+        viewer
+            .pty
+            .send(&Bytes::from_static(b"typed-after-open\n"))
+            .await
+            .expect("input");
+        collect_pty_until(&mut viewer.pty_messages, b"typed-after-open").await;
+
+        // Tampering is still refused: flip a byte of the remaining segment's
+        // first record, in place.
+        {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&newest)
+                .expect("open the newest segment");
+            let mut byte = [0u8; 1];
+            file.read_exact_at(&mut byte, 20)
+                .expect("read a ciphertext byte");
+            byte[0] ^= 0xff;
+            file.write_all_at(&byte, 20).expect("tamper");
+        }
+        let reply = history_reply(&mut viewer).await;
+        assert_eq!(reply["ok"], false, "tampered history was replayed: {reply}");
+        assert_eq!(reply["error"]["code"], "replay_failed", "{reply}");
+        assert!(
+            reply["error"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("failed authentication")),
+            "{reply}"
+        );
+
+        // Nothing left to read: the segment the worker appends to is gone
+        // too. The next output disables the worker's log altogether.
+        std::fs::remove_file(&newest).expect("delete the newest segment");
+        viewer
+            .pty
+            .send(&Bytes::from_static(b"after-the-last-segment\n"))
+            .await
+            .expect("input");
+        collect_pty_until(&mut viewer.pty_messages, b"after-the-last-segment").await;
+        let mut raw = None;
+        registry.with_handle(session_id, |handle| raw = handle.replay(1));
+        let refusal = raw
+            .expect("replay request")
+            .await
+            .expect("replay response")
+            .expect_err("a log with no segment replayed");
+        let refusal = format!("{refusal:#}");
+        assert!(
+            refusal.contains("worker replay is unavailable for this session")
+                || refusal.contains("seg-00000002.log: No such file or directory (os error 2)"),
+            "{refusal}"
+        );
+
+        let mut late_viewer =
+            connect_rtc_session(&sessions, &registry, session_id, "reaped-second", "g").await;
+        let reply = history_reply(&mut late_viewer).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["total_bytes"], 0, "{reply}");
+        // The first viewer holds input; the session's output reaches both.
+        assert!(registry.with_handle(session_id, |handle| {
+            handle.write_stdin(b"still-a-terminal\n").expect("input");
+        }));
+        collect_pty_until(&mut late_viewer.pty_messages, b"still-a-terminal").await;
+
+        sessions.close("reaped-second", "g", session_id).await;
+        close_test_peer(&late_viewer.pc).await;
+        sessions.close("reaped-first", "g", session_id).await;
+        close_test_peer(&viewer.pc).await;
+        ws_drain.abort();
     }
 
     #[tokio::test]

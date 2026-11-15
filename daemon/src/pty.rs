@@ -995,6 +995,127 @@ impl Drop for WorkerReplay {
 pub type WorkerReplayResult = Result<WorkerReplay>;
 pub type WorkerReplayReceiver = oneshot::Receiver<WorkerReplayResult>;
 
+/// A replay the worker refused (`T_ERROR`), in the worker's own words, so a
+/// viewer replay can tell history the worker can no longer read from a
+/// failure that must stay a failure.
+#[derive(Debug)]
+pub struct WorkerReplayRefused {
+    message: String,
+}
+
+impl WorkerReplayRefused {
+    pub(crate) fn new(message: String) -> Self {
+        Self { message }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for WorkerReplayRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "worker replay failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for WorkerReplayRefused {}
+
+/// Why a worker could not replay history that was not tampered with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnreadableHistory {
+    /// A segment file is gone from disk (the OS temp cleaner deletes one
+    /// nothing has touched for days). Replay walks segments newest-first and
+    /// stops once the budget is full, so a smaller budget can stop before it.
+    MissingSegment,
+    /// Nothing can be read: the worker has disabled its log (an append found
+    /// its newest segment gone, say), or even the smallest budget reached a
+    /// missing segment.
+    NoneReadable,
+}
+
+/// Classify a worker's refusal by the words every deployed `spawn-worker`
+/// uses (`sessiond::scrollback` reading a segment by path, and
+/// `sessiond::worker` without a log). Running workers keep the binary they
+/// started with, so their words are the contract. Anything else — failed
+/// authentication, a sequence gap or overlap, a malformed record, any other
+/// read error — is `None`, and the replay fails closed as it always has.
+pub(crate) fn unreadable_history(message: &str) -> Option<UnreadableHistory> {
+    if message == "worker replay is unavailable for this session" {
+        return Some(UnreadableHistory::NoneReadable);
+    }
+    let missing_segment = message
+        .strip_prefix("reading ")
+        .and_then(|rest| rest.strip_suffix("(os error 2)"))
+        .and_then(|rest| rest.split_once(".log: "))
+        .is_some_and(|(path, _)| {
+            path.rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|leaf| leaf.starts_with("seg-"))
+        });
+    missing_segment.then_some(UnreadableHistory::MissingSegment)
+}
+
+/// A viewer replay that is still resolving; `None` when the worker
+/// connection went away before it answered.
+pub type ViewerReplay =
+    Pin<Box<dyn future::Future<Output = Option<WorkerReplayResult>> + Send + 'static>>;
+
+/// Budget sentinel: no replay of this worker's can read any history.
+const NO_READABLE_HISTORY: u32 = 0;
+
+/// How far one worker connection's viewer replays have had to shrink.
+struct ViewerHistory {
+    /// The most a viewer replay asks the worker for: unlimited until a
+    /// request found a segment gone, then the largest budget known to stop
+    /// short of it; [`NO_READABLE_HISTORY`] once no budget could.
+    ceiling: std::sync::atomic::AtomicU32,
+    warned_truncated: AtomicBool,
+    warned_unreadable: AtomicBool,
+}
+
+impl Default for ViewerHistory {
+    fn default() -> Self {
+        Self {
+            ceiling: std::sync::atomic::AtomicU32::new(u32::MAX),
+            warned_truncated: AtomicBool::new(false),
+            warned_unreadable: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ViewerHistory {
+    /// Say once per worker connection that its history is truncated, and once
+    /// that it is gone; later viewers of the same session say it at debug.
+    fn report(&self, session_id: Uuid, unreadable: UnreadableHistory, error: &anyhow::Error) {
+        let flag = match unreadable {
+            UnreadableHistory::MissingSegment => &self.warned_truncated,
+            UnreadableHistory::NoneReadable => &self.warned_unreadable,
+        };
+        let first = !flag.swap(true, Ordering::AcqRel);
+        match (first, unreadable) {
+            (true, UnreadableHistory::MissingSegment) => tracing::warn!(
+                %session_id,
+                reason = %error,
+                "session history truncated: older scrollback is gone from disk; viewers get the newest history still readable"
+            ),
+            (true, UnreadableHistory::NoneReadable) => tracing::warn!(
+                %session_id,
+                reason = %error,
+                "session history unreadable: viewers open on the live terminal with no history"
+            ),
+            (false, _) => {
+                tracing::debug!(%session_id, reason = %error, ?unreadable, "session history still degraded")
+            }
+        }
+    }
+}
+
+/// The next, smaller budget after one that reached a missing segment.
+fn smaller_replay_budget(budget: u32) -> u32 {
+    (budget / 4).max(1)
+}
+
 #[derive(Debug)]
 pub enum WorkerCmd {
     Input(DirectPayload),
@@ -1159,6 +1280,7 @@ pub struct SessionHandle {
     cmd_tx: mpsc::Sender<WorkerCmd>,
     lifecycle: SessionLifecycle,
     alive: Arc<AtomicBool>,
+    history: Arc<ViewerHistory>,
     #[cfg(test)]
     input_copies: Arc<AtomicU64>,
 }
@@ -1188,6 +1310,7 @@ impl SessionHandle {
             cmd_tx: parts.cmd_tx,
             lifecycle: parts.lifecycle,
             alive: parts.alive,
+            history: Arc::default(),
             #[cfg(test)]
             input_copies: Arc::new(AtomicU64::new(0)),
         }
@@ -1287,6 +1410,75 @@ impl SessionHandle {
             .try_send(WorkerCmd::Replay { max_bytes, resp })
             .ok()?;
         Some(rx)
+    }
+
+    /// Replay for a viewer: the attach barrier and the `spawn.ctl` history and
+    /// snapshot requests. Like [`Self::replay`], except that history the
+    /// worker can no longer read does not keep the terminal from opening.
+    ///
+    /// A replay that reached a segment file gone from disk is asked again
+    /// with a quarter of the budget, down to one byte, until the walk stops
+    /// short of it: the viewer gets the live screen and the newest contiguous
+    /// run of history, never history with a hole in it. The budget that
+    /// worked is kept for this worker connection's later viewers. When even
+    /// one byte reaches a missing segment, or the worker has disabled its
+    /// log, there is no history to give, and the viewer gets an empty replay
+    /// at the current live-stream offset — the terminal opens on what the
+    /// session prints next. Every other refusal (failed authentication, a
+    /// sequence gap, a malformed record) fails, exactly as [`Self::replay`].
+    pub fn viewer_replay(&self, max_bytes: u32) -> Option<ViewerReplay> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        let ceiling = self.history.ceiling.load(Ordering::Acquire);
+        let mut budget = max_bytes.min(ceiling);
+        let first = if ceiling == NO_READABLE_HISTORY {
+            None
+        } else {
+            Some(self.replay(budget)?)
+        };
+        let cmd_tx = self.cmd_tx.clone();
+        let control = self.control.clone();
+        let history = Arc::clone(&self.history);
+        let session_id = self.session_id;
+        Some(Box::pin(async move {
+            let Some(mut receiver) = first else {
+                return Some(Ok(WorkerReplay::new(control.source_offset(), Vec::new())));
+            };
+            loop {
+                let error = match receiver.await {
+                    Ok(Err(error)) => error,
+                    answered => return answered.ok(),
+                };
+                let unreadable = error
+                    .downcast_ref::<WorkerReplayRefused>()
+                    .and_then(|refused| unreadable_history(refused.message()));
+                match unreadable {
+                    None => return Some(Err(error)),
+                    Some(UnreadableHistory::MissingSegment) if budget > 1 => {
+                        history.report(session_id, UnreadableHistory::MissingSegment, &error);
+                        budget = smaller_replay_budget(budget);
+                        history.ceiling.fetch_min(budget, Ordering::AcqRel);
+                        let (resp, next) = oneshot::channel();
+                        cmd_tx
+                            .send(WorkerCmd::Replay {
+                                max_bytes: budget,
+                                resp,
+                            })
+                            .await
+                            .ok()?;
+                        receiver = next;
+                    }
+                    Some(_) => {
+                        history.report(session_id, UnreadableHistory::NoneReadable, &error);
+                        history
+                            .ceiling
+                            .store(NO_READABLE_HISTORY, Ordering::Release);
+                        return Some(Ok(WorkerReplay::new(control.source_offset(), Vec::new())));
+                    }
+                }
+            }
+        }))
     }
 }
 
@@ -1497,6 +1689,216 @@ mod tests {
 
     fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
         OutputChunk::classify(bytes.to_vec(), control)
+    }
+
+    /// Answer the viewer replay's worker requests from `answer` until it
+    /// resolves; returns its result and every budget it asked for.
+    async fn drive_viewer_replay(
+        replay: ViewerReplay,
+        cmd_rx: &mut mpsc::Receiver<WorkerCmd>,
+        answer: impl Fn(u32) -> WorkerReplayResult,
+    ) -> (Option<WorkerReplayResult>, Vec<u32>) {
+        let mut asked = Vec::new();
+        tokio::pin!(replay);
+        loop {
+            tokio::select! {
+                result = &mut replay => return (result, asked),
+                command = cmd_rx.recv() => match command.expect("handle dropped") {
+                    WorkerCmd::Replay { max_bytes, resp } => {
+                        asked.push(max_bytes);
+                        let _ = resp.send(answer(max_bytes));
+                    }
+                    other => panic!("unexpected worker command {other:?}"),
+                },
+            }
+        }
+    }
+
+    fn refused(message: &str) -> WorkerReplayResult {
+        Err(anyhow::Error::new(WorkerReplayRefused::new(
+            message.to_string(),
+        )))
+    }
+
+    const MISSING_OLDEST: &str = "reading /tmp/spawn-501/workers/7c9e6679-7425-40de-944b-e07fc1f90ae7.scrollback/seg-00000001.log: No such file or directory (os error 2)";
+
+    /// The rescue for a session whose oldest scrollback the OS deleted: the
+    /// replay shrinks until it stops short of the hole, the budget that
+    /// worked is kept, and a tampered segment still fails closed.
+    #[tokio::test]
+    async fn viewer_replay_stops_short_of_a_missing_segment_and_fails_closed_on_tampering() {
+        let control = ForwarderControl::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+        // A worker whose newest readable history holds 5,000 bytes: a walk
+        // with more budget than that goes on to the deleted segment.
+        let truncated = |budget: u32| {
+            if budget > 5_000 {
+                refused(MISSING_OLDEST)
+            } else {
+                Ok(WorkerReplay::new(
+                    9,
+                    b"newest history + live screen".to_vec(),
+                ))
+            }
+        };
+
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            truncated,
+        )
+        .await;
+        let replay = result.expect("answered").expect("truncated replay");
+        assert_eq!(replay.bytes(), b"newest history + live screen");
+        assert_eq!(replay.watermark(), 9);
+        assert_eq!(asked, [65_536, 16_384, 4_096]);
+
+        // A later viewer starts at the budget that worked: no worker refusal
+        // (and no worker log line) per attach.
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(8 << 20).unwrap(),
+            &mut cmd_rx,
+            truncated,
+        )
+        .await;
+        assert!(result.expect("answered").is_ok());
+        assert_eq!(asked, [4_096]);
+
+        // Tampering is not truncation: failed authentication is returned as
+        // it always was, and never retried with a smaller budget.
+        let tampered = |_| {
+            refused("scrollback record failed authentication in /tmp/spawn-501/workers/x.scrollback/seg-00000002.log")
+        };
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            tampered,
+        )
+        .await;
+        let error = result
+            .expect("answered")
+            .expect_err("tampered history replayed");
+        assert!(
+            error.to_string().contains("failed authentication"),
+            "{error}"
+        );
+        assert_eq!(asked, [4_096]);
+        for message in [
+            "parsing /tmp/w/x.scrollback/seg-00000002.log: truncated record header",
+            "scrollback sequence gap in /tmp/w/x.scrollback/seg-00000002.log (expected Some(4), got 9)",
+            "reading /tmp/w/x.scrollback/seg-00000002.log: Permission denied (os error 13)",
+            "reading /tmp/w/x.scrollback/notes.txt: No such file or directory (os error 2)",
+            "replay budget must be non-zero",
+        ] {
+            let (result, asked) = drive_viewer_replay(
+                handle.viewer_replay(64 * 1024).unwrap(),
+                &mut cmd_rx,
+                |_| refused(message),
+            )
+            .await;
+            assert!(result.expect("answered").is_err(), "{message}");
+            assert_eq!(asked.len(), 1, "{message} was retried");
+        }
+    }
+
+    /// When nothing can be read — the newest segment is gone too, or the
+    /// worker disabled its log — the viewer still gets a replay: empty, at
+    /// the live stream's current offset, so the terminal opens on what the
+    /// session prints next. The worker is not asked again.
+    #[tokio::test]
+    async fn viewer_replay_opens_on_the_live_stream_when_no_history_is_readable() {
+        for (case, refusal) in [
+            ("every segment gone", MISSING_OLDEST),
+            (
+                "log disabled",
+                "worker replay is unavailable for this session",
+            ),
+        ] {
+            let control = ForwarderControl::new();
+            control.route_direct_for_test(b"already streamed").await;
+            let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+            let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+            let (result, asked) = drive_viewer_replay(
+                handle.viewer_replay(64 * 1024).unwrap(),
+                &mut cmd_rx,
+                |_| refused(refusal),
+            )
+            .await;
+            let replay = result.expect("answered").expect(case);
+            assert!(replay.bytes().is_empty(), "{case}");
+            assert_eq!(replay.watermark(), control.source_offset(), "{case}");
+            assert_eq!(replay.history_anchor(), None, "{case}");
+            match case {
+                "every segment gone" => {
+                    assert_eq!(asked, [65_536, 16_384, 4_096, 1_024, 256, 64, 16, 4, 1])
+                }
+                _ => assert_eq!(asked, [65_536]),
+            }
+
+            let replay = handle
+                .viewer_replay(64 * 1024)
+                .unwrap()
+                .await
+                .expect("answered")
+                .expect(case);
+            assert!(replay.bytes().is_empty());
+            assert!(cmd_rx.try_recv().is_err(), "{case}: worker asked again");
+        }
+
+        // A handle whose worker is gone still has no replay to offer.
+        let (cmd_tx, _cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let gone = test_handle(
+            ForwarderControl::new(),
+            cmd_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(gone.viewer_replay(64 * 1024).is_none());
+    }
+
+    /// The classifier reads the words the scrollback log itself produces:
+    /// a deleted segment is unreadable history; a tampered or truncated one
+    /// is not.
+    #[test]
+    fn unreadable_history_matches_what_the_scrollback_log_says() {
+        use spawnd::sessiond::scrollback::ScrollbackLog;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("session.scrollback");
+        let key = spawnd::sessiond::secret::SecretBytes::random(32).unwrap();
+        let mut log = ScrollbackLog::with_limits(&dir, &key, 4 * 1024, 64 * 1024).unwrap();
+        let line = "\x1b[0mcommitted line of terminal history\r\n".repeat(16);
+        while log.segment_count() < 3 {
+            log.append_history(line.as_bytes()).unwrap();
+        }
+        let oldest = dir.join("seg-00000001.log");
+        assert!(oldest.exists());
+        let refusal =
+            |log: &mut ScrollbackLog| format!("{:#}", log.replay(u32::MAX as u64).unwrap_err());
+
+        std::fs::remove_file(&oldest).unwrap();
+        let missing = refusal(&mut log);
+        assert_eq!(
+            unreadable_history(&missing),
+            Some(UnreadableHistory::MissingSegment),
+            "{missing}"
+        );
+
+        // Rotation leaves the newest segment empty; the one before it is
+        // read first and holds records.
+        let full = dir.join("seg-00000002.log");
+        let mut bytes = std::fs::read(&full).unwrap();
+        assert!(bytes.len() > 20);
+        bytes[20] ^= 0xff;
+        std::fs::write(&full, &bytes).unwrap();
+        let tampered = refusal(&mut log);
+        assert!(tampered.contains("failed authentication"), "{tampered}");
+        assert_eq!(unreadable_history(&tampered), None);
+
+        std::fs::write(&full, &bytes[..5]).unwrap();
+        let truncated = refusal(&mut log);
+        assert!(truncated.contains("truncated record"), "{truncated}");
+        assert_eq!(unreadable_history(&truncated), None);
     }
 
     fn test_handle(
