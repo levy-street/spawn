@@ -15,6 +15,8 @@ use data::data_channel::DataChannel;
 use data::message::message_channel_open::ChannelType;
 use portable_atomic::{AtomicBool, AtomicU32, AtomicU8};
 use sctp::association::Association;
+use sctp::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+use sctp::stream::Stream;
 use sctp_transport_state::RTCSctpTransportState;
 use tokio::sync::{Mutex, Notify};
 use util::Conn;
@@ -32,6 +34,28 @@ use crate::stats::StatsReportType::{PeerConnection, SCTPTransport};
 use crate::stats::{ICETransportStats, PeerConnectionStats};
 
 const SCTP_MAX_CHANNELS: u16 = u16::MAX;
+
+/// Streams that may fail to become data channels on one association before
+/// the acceptor stops it. A peer abandons an open only when the open took
+/// longer than it would wait, and anything else (a first message that is not
+/// an OPEN, a label that is not UTF-8) is a peer not speaking DCEP: a
+/// connection that has lost this many is better replaced than served. The
+/// stop ends the acceptor as any closed association does, and its `on_error`
+/// handler hears of it.
+pub const MAX_FAILED_DATA_CHANNEL_STREAMS: u32 = 64;
+
+/// Failed streams on one association that are logged one by one; the rest
+/// are counted, and the stop at `MAX_FAILED_DATA_CHANNEL_STREAMS` is logged.
+const LOGGED_FAILED_DATA_CHANNEL_STREAMS: u32 = 3;
+
+/// What became of one stream the association handed the acceptor.
+enum AcceptedStream {
+    Channel(DataChannel),
+    /// The stream never became a channel; the error says why.
+    Failed(data::Error, Arc<Stream>),
+    /// The association has no more streams to give: it closed.
+    Ended,
+}
 
 pub type OnDataChannelHdlrFn = Box<
     dyn (FnMut(Arc<RTCDataChannel>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>)
@@ -249,6 +273,30 @@ impl RTCSctpTransport {
         Ok(())
     }
 
+    /// `DataChannel::accept`, keeping hold of a stream that fails to become a
+    /// channel so that the caller can reset it: the same steps, in the same
+    /// order, with the same result for every stream that does.
+    async fn accept_stream(
+        association: &Arc<Association>,
+        config: data::data_channel::Config,
+        existing_channels: &[Arc<DataChannel>],
+    ) -> AcceptedStream {
+        let Some(stream) = association.accept_stream().await else {
+            return AcceptedStream::Ended;
+        };
+        stream.set_default_payload_type(PayloadProtocolIdentifier::Binary);
+        if let Some(existing) = existing_channels
+            .iter()
+            .find(|channel| channel.stream_identifier() == stream.stream_identifier())
+        {
+            return AcceptedStream::Channel(DataChannel::clone(existing));
+        }
+        match DataChannel::server(Arc::clone(&stream), config).await {
+            Ok(dc) => AcceptedStream::Channel(dc),
+            Err(err) => AcceptedStream::Failed(err, stream),
+        }
+    }
+
     async fn accept_data_channels(param: AcceptDataChannelParams) {
         let dcs = param.data_channels.lock().await;
         let mut existing_data_channels = Vec::new();
@@ -259,10 +307,11 @@ impl RTCSctpTransport {
         }
         drop(dcs);
 
+        let mut failed_streams = 0u32;
         loop {
             let dc = tokio::select! {
                 _ = param.notify_rx.notified() => break,
-                result = DataChannel::accept(
+                accepted = Self::accept_stream(
                     &param.sctp_association,
                     data::data_channel::Config {
                         max_message_size: param.sctp_association.max_message_size(),
@@ -270,14 +319,15 @@ impl RTCSctpTransport {
                     },
                     &existing_data_channels,
                 ) => {
-                    match result {
-                        Ok(dc) => dc,
+                    match accepted {
+                        AcceptedStream::Channel(dc) => dc,
                         // The association has no more streams to give:
                         // it closed. That is how every peer connection
                         // ends, so it is not logged as an error here;
                         // `on_error` hears of it, and whoever installed a
                         // handler knows whether the close was its own.
-                        Err(err @ data::Error::ErrStreamClosed) => {
+                        AcceptedStream::Ended => {
+                            let err = data::Error::ErrStreamClosed;
                             log::debug!("Data channel acceptor ended: {err}");
                             if let Some(handler) = &*param.on_error_handler.load() {
                                 let mut f = handler.lock().await;
@@ -291,8 +341,37 @@ impl RTCSctpTransport {
                         // is the end of that stream, not of the acceptor:
                         // upstream broke out here, without a word, and the
                         // connection accepted nothing ever again.
-                        Err(err) => {
-                            log::warn!("Failed to accept one data channel; still accepting: {err}");
+                        AcceptedStream::Failed(err, stream) => {
+                            failed_streams += 1;
+                            if failed_streams <= LOGGED_FAILED_DATA_CHANNEL_STREAMS {
+                                log::warn!(
+                                    "Failed to accept one data channel; still accepting: {err}"
+                                );
+                                if failed_streams == LOGGED_FAILED_DATA_CHANNEL_STREAMS {
+                                    log::warn!(
+                                        "Further streams that fail to become data channels on this association are counted, not logged"
+                                    );
+                                }
+                            }
+                            // Reset, so the peer learns the stream is gone
+                            // and both associations forget it; upstream left
+                            // it registered with nobody reading it. A stream
+                            // the peer reset already is unregistered, and
+                            // this is a no-op for it. In a task of its own:
+                            // the reset queues behind a writer waiting for
+                            // room, as an ACK does, and must not hold the
+                            // acceptor there.
+                            tokio::spawn(async move {
+                                let _ = stream.shutdown(std::net::Shutdown::Both).await;
+                            });
+                            if failed_streams == MAX_FAILED_DATA_CHANNEL_STREAMS {
+                                log::warn!(
+                                    "{failed_streams} streams failed to become data channels on this association; stopping it"
+                                );
+                                // What is still queued drains as failures,
+                                // and then the acceptor ends as above.
+                                let _ = param.sctp_association.close().await;
+                            }
                             continue;
                         }
                     }

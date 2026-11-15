@@ -86,9 +86,10 @@ vendor/          exact upstream crate sources for narrowly documented patches;
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
                  with closed-channel registry pruning and a channel acceptor
-                 that outlives a stream that never became a channel, admits
-                 each channel in its own task, and reports its own end
-                 (webrtc/PATCHES.md).
+                 that outlives a stream that never became a channel (and
+                 resets it, stopping the association once 64 have failed),
+                 admits each channel in its own task, and reports its own
+                 end (webrtc/PATCHES.md).
                  SCTP and ICE also allow clippy::double_must_use at the
                  crate root: Rust 1.99 Clippy flags the #[must_use] that
                  async_trait puts on every boxed future it generates.
@@ -472,7 +473,9 @@ an association can end under a transport that stays connected (the device's
 SCTP went away; the write loop closed it over a send error ICE recovered
 from): nothing opens on that peer again and the reaper, which watches the
 connection state, never hears of it, so `install_host_acceptor_watch`
-retires it from the SCTP transport's `on_error`. A peer the daemon is
+retires it from the SCTP transport's `on_error`. The acceptor also stops
+the association itself once `MAX_FAILED_DATA_CHANNEL_STREAMS` streams have
+failed to become channels, and that peer is retired the same way. A peer the daemon is
 already closing left the host map before its association stopped, and the
 watch does nothing for it; a device's own close ends the association too
 when word of it arrives (a DTLS close_notify, an SCTP ABORT), and that peer

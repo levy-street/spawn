@@ -62,19 +62,36 @@ open takes longer than its timeout, which is whenever the acceptor is held up
 
 The patch separates the two cases. `ErrStreamClosed` — the association has no
 more streams to give — still ends the loop and still reaches `on_error`. Any
-other error is the end of that one stream: it is logged at warning level and
-the loop goes on to the next. Each iteration consumes one stream from the
+other error is the end of that one stream: it is reset, logged at warning
+level (the first few), and the loop goes on to the next. Each iteration consumes one stream from the
 association's accept queue, so a failing stream cannot spin the loop.
 
-A stream that failed for a reason other than its own reset (a first message
-that is not an OPEN, a label that is not UTF-8) stays registered in the
-association with nobody reading it, as it did upstream; this patch does not
-reset it.
+A stream that fails is reset. The loop calls its own copy of
+`DataChannel::accept` (`accept_stream`: the same steps in the same order),
+which keeps hold of the stream, and resets one that did not become a channel
+with `Stream::shutdown(Both)`: the peer learns the stream is gone and
+neither association keeps it, where upstream left it registered with nobody
+reading it. A stream the peer reset itself is unregistered already, and the
+shutdown does nothing for it. The reset runs in a task of its own, because
+it queues behind a writer waiting for room exactly as the DCEP ACK does.
+
+Failures are counted for the life of the acceptor. The first three are
+logged at warning level and the rest only counted, and the
+`MAX_FAILED_DATA_CHANNEL_STREAMS`th (64; public, for the daemon's
+regression) makes the acceptor close the association. A peer reaches that
+either by not speaking DCEP or by abandoning opens on a connection that does
+not serve them in time, and a new connection is the remedy for both. Streams
+still queued then drain as failures, and the acceptor ends the way it does
+for any closed association (see below), so a daemon host peer is retired
+and announced.
 
 The native daemon regression
 `a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting` in
 `rtc_pair.rs` sends a first message that is not an OPEN on a new stream and
 requires the next channel on the same connection to open.
+`failed_streams_are_reset_and_a_connection_full_of_them_is_retired` sends 63
+such streams, requires each to be reset and the pair still to serve, then
+sends one more and requires the pair retired with `unavailable`.
 `a_channel_abandoned_while_admission_is_busy_leaves_the_pair_accepting`
 opens and closes a channel while admission is held; that reproduced the
 reset-before-OPEN failure for as long as admission ran inside the accept

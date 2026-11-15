@@ -1099,6 +1099,112 @@ mod tests {
         );
     }
 
+    /// A stream that never becomes a channel is reset: the device learns it
+    /// is gone and neither association keeps it, where upstream left it
+    /// registered with nobody reading it. And a connection on which they
+    /// keep failing is not served for ever, one warning each: once
+    /// `MAX_FAILED_DATA_CHANNEL_STREAMS` have failed the acceptor stops the
+    /// association, and the pair is retired and announced like any other
+    /// whose acceptor ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_streams_are_reset_and_a_connection_full_of_them_is_retired() {
+        use webrtc::sctp_transport::MAX_FAILED_DATA_CHANNEL_STREAMS;
+        let sessions = RtcSessions::new();
+        sessions.bind_registered_host_id(Uuid::new_v4()).await;
+        let registry = SessionRegistry::new();
+        let pc = connect_pair(&sessions, &registry, [22; 32]).await;
+        let (signal_tx, mut signal_rx) = mpsc::channel(64);
+        sessions.signaling.install(signal_tx);
+        sessions.deferred_pruned.store(true, Ordering::Release);
+        let signal_id = sessions
+            .host_peers
+            .lock()
+            .await
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        let (probe, mut probe_rx) = open_host_consumer(&pc).await;
+        assert!(
+            consumer_answers(&probe, &mut probe_rx, Duration::from_secs(5)).await,
+            "a channel opens on a fresh pair"
+        );
+
+        // A stream the daemon never heard of, whose first message is text:
+        // see `a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting`.
+        let stray = |n: u32| {
+            let pc = Arc::clone(&pc);
+            async move {
+                let channel = pc
+                    .create_data_channel(
+                        "stray",
+                        Some(
+                            webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                                negotiated: Some(40_000 + n as u16),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                channel.send_text("not an open").await.unwrap();
+                channel
+            }
+        };
+        let reset = |channel: Arc<RTCDataChannel>| async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while channel.ready_state() != RTCDataChannelState::Closed {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+
+        let mut not_reset = None;
+        for n in 0..MAX_FAILED_DATA_CHANNEL_STREAMS - 1 {
+            if !reset(stray(n).await).await {
+                not_reset = Some(n);
+                break;
+            }
+        }
+        let in_service_below_the_limit =
+            consumer_answers(&probe, &mut probe_rx, Duration::from_secs(5)).await
+                && sessions.host_peers.lock().await.contains_key(&signal_id);
+
+        let _last = stray(MAX_FAILED_DATA_CHANNEL_STREAMS - 1).await;
+        let goodbye = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = signal_rx.recv().await {
+                let value: Value = serde_json::from_str(frame.as_str()).unwrap();
+                if value["type"] == "rtc.status"
+                    && value["session_id"] == signal_id.as_str()
+                    && value["status"] != "connected"
+                {
+                    return value["status"].as_str().unwrap_or_default().to_owned();
+                }
+            }
+            String::new()
+        })
+        .await;
+        let resident = sessions.host_peers.lock().await.len();
+        sessions.close_all().await;
+        let _ = pc.close().await;
+        assert_eq!(
+            not_reset, None,
+            "a stream that never became a channel was not reset"
+        );
+        assert!(
+            in_service_below_the_limit,
+            "the pair stopped serving before {MAX_FAILED_DATA_CHANNEL_STREAMS} streams failed"
+        );
+        assert_eq!(
+            goodbye.ok().as_deref(),
+            Some("unavailable"),
+            "a connection whose streams kept failing was not retired and announced"
+        );
+        assert_eq!(resident, 0, "the pair left the host map");
+    }
+
     /// A device opens a channel, gives up on it, and closes it — the web
     /// client does exactly that when an open takes longer than ten seconds —
     /// while admission is busy. That is one channel lost; it must not be
