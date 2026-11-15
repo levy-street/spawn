@@ -629,6 +629,8 @@ fn read_small_file(_path: &Path, _cap: u64) -> Option<Vec<u8>> {
 }
 
 /// The start of a file of any length, up to its first line ending.
+// Only the Unix read finds lines; elsewhere every file is unreadable.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum FirstLine {
     /// The first line, without its newline.
