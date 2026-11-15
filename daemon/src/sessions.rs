@@ -123,6 +123,29 @@ impl SessionRegistry {
         transition.lock_owned().await
     }
 
+    /// Whether anyone holds or waits for `id`'s generation transition: a
+    /// registration, restart, exit or attach is in the middle of changing or
+    /// reading what runs under that id.
+    pub fn generation_transition_in_progress(&self, id: Uuid) -> bool {
+        self.generation_transitions
+            .lock()
+            .expect("session generation transitions lock")
+            .get(&id)
+            .is_some_and(|transition| transition.strong_count() > 0)
+    }
+
+    /// How many hold or wait for `id`'s generation transition right now. A
+    /// test that holds the transition itself reads two once something else
+    /// has reached the lock and is parked on it.
+    #[cfg(test)]
+    pub(crate) fn generation_transition_holders(&self, id: Uuid) -> usize {
+        self.generation_transitions
+            .lock()
+            .expect("session generation transitions lock")
+            .get(&id)
+            .map_or(0, Weak::strong_count)
+    }
+
     pub fn contains(&self, id: Uuid) -> bool {
         self.inner.lock().expect("sessions lock").contains_key(&id)
     }

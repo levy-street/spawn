@@ -1083,6 +1083,19 @@ impl RtcSessions {
         sender.try_send(WsOutbound::json(text)).is_ok()
     }
 
+    /// The control connection a frame may go out on now: the live one, once
+    /// its registration is acknowledged (the same two conditions as
+    /// `send_now`). A peer outlives the control connection its offer
+    /// arrived on, so nothing a peer says later may go through a sender
+    /// captured at admission — after a reconnect that is a socket nobody
+    /// reads.
+    fn registered_sender(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
+        if !self.deferred_pruned.load(Ordering::Acquire) {
+            return None;
+        }
+        self.signaling.load()
+    }
+
     /// Send a status, or hold it for the next chance. Synchronous: a status
     /// is on its way or held by the time this returns, so nothing that sends
     /// one can be dropped part-way.
@@ -1195,7 +1208,6 @@ impl RtcSessions {
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) {
-        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(session) = registry.binding_for(binding.session_id) else {
             send_status(
@@ -1350,18 +1362,24 @@ impl RtcSessions {
         // used to invalidate the registry entry and scan old peers.
         #[cfg(test)]
         self.peer_insert_attempted.notify_waiters();
-        let _admission = self.admission.lock().await;
-        if !self.trust_epoch_is_current(binding.trust_epoch) {
-            drop(_admission);
-            let _ = pc.close().await;
-            anyhow::bail!("credential trust changed during RTC negotiation");
-        }
+        // The transition before the admission lock, as in
+        // `attach_pair_channel` and for its reason: a restart holds the
+        // transition for seconds, and nothing waits that long holding the
+        // lock every offer on the daemon serializes on. One order in both
+        // places, or the two deadlock against each other.
         let transition = registry
             .lock_generation_transition(binding.signaling.session_id)
             .await;
-        if !registry.is_current(binding.session) {
-            drop(transition);
+        let _admission = self.admission.lock().await;
+        if !self.trust_epoch_is_current(binding.trust_epoch) {
             drop(_admission);
+            drop(transition);
+            let _ = pc.close().await;
+            anyhow::bail!("credential trust changed during RTC negotiation");
+        }
+        if !registry.is_current(binding.session) {
+            drop(_admission);
+            drop(transition);
             let _ = pc.close().await;
             anyhow::bail!("session backend was replaced during RTC negotiation");
         }
@@ -1406,8 +1424,8 @@ impl RtcSessions {
                 false
             }
         };
-        drop(transition);
         drop(_admission);
+        drop(transition);
         if collision_or_capacity {
             let _ = pc.close().await;
             anyhow::bail!("rtc session admission rejected");
@@ -1516,7 +1534,6 @@ impl RtcSessions {
         if signal.protocol_version != Some(1) {
             return;
         }
-        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
             tracing::warn!(signal_id = %signal.signal_id, "rejecting invalid host rtc offer binding");
@@ -1718,6 +1735,7 @@ impl RtcSessions {
             );
         }
         self.install_host_reaper(&pc, signal_id.clone());
+        self.install_host_acceptor_watch(&pc, signal_id.clone());
 
         let local_sdp = match negotiate(&pc, sdp).await {
             Ok(sdp) => sdp,
@@ -1804,6 +1822,51 @@ impl RtcSessions {
                             .await;
                     }
                 });
+            })
+        }));
+    }
+
+    /// Retire a host peer whose data channel acceptor has ended. The
+    /// acceptor ends when the SCTP association does, and an association can
+    /// end under a transport that stays connected: the device's SCTP went
+    /// away, or this side's write loop closed it over a send error ICE
+    /// itself recovers from. Nothing opens on such a peer again, and the
+    /// reaper, which watches the connection state, never hears of it — the
+    /// device goes on retrying channels on a connection it believes healthy.
+    /// So the peer leaves the host map here and the server hears
+    /// `unavailable`, which a device answers with a new connection. A peer
+    /// this daemon is closing has, as a rule, left the map before its
+    /// association stopped, and for it this does nothing. The exception is
+    /// a protocol-1 host peer whose handler refuses a channel
+    /// (`install_host_data_channel_handler`): it closes the connection with
+    /// the peer still in the map, and this can then be what retires it and
+    /// says `unavailable`, which is true of a connection that is gone and
+    /// which the reaper, ignoring a closed connection, would not say. Whether
+    /// it runs depends on whether the acceptor sees its association close
+    /// before the transport's stop wakes it. A device's own close ends the
+    /// association too when word of it arrives — a DTLS close_notify, an
+    /// SCTP ABORT — so this is also what retires such a peer, ahead of the
+    /// reaper's grace; it is logged at info, and the vendored SCTP's own
+    /// warning beside it says which it was.
+    fn install_host_acceptor_watch(&self, pc: &Arc<RTCPeerConnection>, signal_id: String) {
+        let sessions = self.clone();
+        let weak = Arc::downgrade(pc);
+        pc.sctp().on_error(Box::new(move |error| {
+            let sessions = sessions.clone();
+            let signal_id = signal_id.clone();
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(pc) = weak.upgrade() else { return };
+                if sessions
+                    .retire_host_if_same(&signal_id, &pc, Some("data channel acceptor ended"))
+                    .await
+                {
+                    tracing::info!(
+                        signal_id = %signal_id,
+                        %error,
+                        "host rtc peer retired: its data channel acceptor ended while the peer was in service"
+                    );
+                }
             })
         }));
     }
@@ -1906,20 +1969,21 @@ impl RtcSessions {
     /// never sends `rtc.close` for it at all. Not `failed`: to the device
     /// that is a refusal of its offer and it drops its trust verdict;
     /// `unavailable` is a connection that is gone, which it answers by
-    /// building a new one.
+    /// building a new one. Returns whether this call was the one that took
+    /// the peer out of the map.
     async fn retire_host_if_same(
         &self,
         signal_id: &str,
         pc: &Arc<RTCPeerConnection>,
         reason: Option<&str>,
-    ) {
+    ) -> bool {
         let Some(retired) = self.take_host_if_same(signal_id, pc).await else {
             tracing::debug!(
                 signal_id,
                 reason = ?reason,
                 "host rtc peer already left the map; its teardown is owned elsewhere"
             );
-            return;
+            return false;
         };
         if let Some(reason) = reason {
             tracing::debug!(signal_id, reason, "host rtc peer reaped");
@@ -1931,6 +1995,7 @@ impl RtcSessions {
             ));
         }
         self.spawn_host_closes(vec![retired]).await;
+        true
     }
 
     /// The whole of a retired host peer's teardown, in order: its
@@ -3374,7 +3439,7 @@ fn session_data_channel_handler(
             let session_id = session.session_id();
 
             let input_registry = registry.clone();
-            let input_out_tx = out_tx.clone();
+            let input_live = sessions.clone();
             let input_active = Arc::clone(&active);
             let input_fence = Arc::clone(&fence);
             let input_channels = Arc::clone(&channels);
@@ -3387,7 +3452,7 @@ fn session_data_channel_handler(
             let input_session_id = binding.signaling.signal_id.clone();
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
-                let out_tx = input_out_tx.clone();
+                let live = input_live.clone();
                 let active = Arc::clone(&input_active);
                 let fence = Arc::clone(&input_fence);
                 let channels = Arc::clone(&input_channels);
@@ -3421,12 +3486,19 @@ fn session_data_channel_handler(
                         {
                             return None;
                         }
+                        // Reported on the control connection that is
+                        // live at this keystroke. The sender this handler
+                        // was built with is the offer's, and the peer
+                        // outlives it: after a control reconnect every
+                        // activity ping from a surviving peer went to a
+                        // socket nobody read.
+                        let out_tx = live.registered_sender();
                         forward_bound_data_channel_input(
                             session,
                             msg.is_string,
                             &msg.data,
                             &registry,
-                            &out_tx,
+                            out_tx.as_deref(),
                         )
                     };
                     let result = if require_owner {
@@ -4781,7 +4853,7 @@ fn forward_bound_data_channel_input(
     is_string: bool,
     data: &[u8],
     registry: &SessionRegistry,
-    out_tx: &mpsc::Sender<WsOutbound>,
+    out_tx: Option<&mpsc::Sender<WsOutbound>>,
 ) -> Option<Result<bool>> {
     let mut result = None;
     registry.with_bound_handle(session, |handle| {
@@ -4806,7 +4878,7 @@ fn forward_data_channel_input<W>(
     is_string: bool,
     data: &[u8],
     control: &crate::pty::ForwarderControl,
-    out_tx: &mpsc::Sender<WsOutbound>,
+    out_tx: Option<&mpsc::Sender<WsOutbound>>,
     write_stdin: W,
 ) -> Result<bool>
 where
@@ -4819,8 +4891,12 @@ where
     // Focus-weighted scheduling: the session being typed into gets its CPU
     // scope boosted so its response wins the scheduler under host load.
     crate::cpu_scopes::note_input(session_id);
+    // The classifier sees every byte whether or not there is a control
+    // connection to report on; without one the ping has nowhere to go.
     if control.note_input(data) {
-        crate::pty::try_emit_activity(out_tx, session_id, crate::pty::ActivityKind::Input);
+        if let Some(out_tx) = out_tx {
+            crate::pty::try_emit_activity(out_tx, session_id, crate::pty::ActivityKind::Input);
+        }
     }
     Ok(true)
 }
@@ -6592,14 +6668,6 @@ mod tests {
         .expect("RTC resident session count did not converge");
     }
 
-    fn built_worker_bin() -> std::path::PathBuf {
-        let exe = std::env::current_exe().expect("current_exe");
-        exe.parent()
-            .and_then(|deps| deps.parent())
-            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
-            .expect("worker bin path")
-    }
-
     struct WorkerTestEnv {
         old_dir: Option<std::ffi::OsString>,
         old_bin: Option<std::ffi::OsString>,
@@ -6631,7 +6699,10 @@ mod tests {
             #[cfg(not(windows))]
             let worker_dir = dir.path();
             std::env::set_var("SPAWND_WORKER_DIR", worker_dir);
-            std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
+            std::env::set_var(
+                "SPAWND_WORKER_BIN",
+                crate::worker_backend::built_worker_bin(),
+            );
             Self {
                 old_dir,
                 old_bin,
@@ -9516,10 +9587,14 @@ mod tests {
         assert_ne!(old, current);
 
         let (out_tx, _out_rx) = mpsc::channel(4);
-        assert!(
-            forward_bound_data_channel_input(old, false, b"stale input", &registry, &out_tx)
-                .is_none()
-        );
+        assert!(forward_bound_data_channel_input(
+            old,
+            false,
+            b"stale input",
+            &registry,
+            Some(&out_tx)
+        )
+        .is_none());
         assert!(current_commands.try_recv().is_err());
 
         assert!(forward_bound_data_channel_input(
@@ -9527,7 +9602,7 @@ mod tests {
             false,
             b"current input",
             &registry,
-            &out_tx,
+            Some(&out_tx),
         )
         .expect("current binding")
         .expect("current input write"));
@@ -9684,6 +9759,85 @@ mod tests {
         assert_eq!(status["status"], "failed");
         assert_eq!(sessions.resident_session_count().await, 0);
         offer_pc.close().await.unwrap();
+    }
+
+    /// The offer half of the one lock order: a session-scope offer waiting
+    /// on its session's transition — held for a whole restart — does not
+    /// hold the admission lock while it waits. Taken the other way round,
+    /// it holds admission for the length of the restart, and with an attach
+    /// for the same session (transition, then admission) the two deadlock
+    /// and every offer and attach on the daemon with them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_offer_waiting_on_a_session_transition_does_not_hold_admission() {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offer_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        offer_pc
+            .create_data_channel(PTY_DATA_CHANNEL_LABEL, None)
+            .await
+            .unwrap();
+        let offer = offer_pc.create_offer(None).await.unwrap();
+        let mut gathered = offer_pc.gathering_complete_promise().await;
+        offer_pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer_sdp = offer_pc.local_description().await.unwrap().sdp;
+
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (_binding, _commands) = insert_test_worker(&registry, session_id);
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(session_id).await;
+        let (out_tx, _out_rx) = mpsc::channel(16);
+        let offer_sessions = sessions.clone();
+        let offer_registry = registry.clone();
+        let offer_task = tokio::spawn(async move {
+            offer_sessions
+                .handle_offer(
+                    RtcSignalBinding::new(
+                        "waiting-offer".to_string(),
+                        "offer-generation".to_string(),
+                        session_id,
+                    ),
+                    offer_sdp,
+                    Vec::new(),
+                    None,
+                    false,
+                    None,
+                    offer_registry,
+                    out_tx,
+                    None,
+                )
+                .await;
+        });
+        // Whatever the offer holds while it waits on the transition, it
+        // holds once the lock has a second holder: its own wait.
+        let parked = tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.generation_transition_holders(session_id) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let admission_free = sessions.admission.try_lock().is_ok();
+        drop(transition);
+        tokio::time::timeout(Duration::from_secs(10), offer_task)
+            .await
+            .expect("the offer finished once the transition was free")
+            .unwrap();
+        sessions.close_all().await;
+        offer_pc.close().await.unwrap();
+        assert!(
+            parked.is_ok(),
+            "the offer never reached its session's transition"
+        );
+        assert!(
+            admission_free,
+            "an offer waiting on a session's transition holds the admission lock"
+        );
     }
 
     #[tokio::test]
@@ -9874,7 +10028,7 @@ mod tests {
                 false,
                 data,
                 &control,
-                &out_tx,
+                Some(&out_tx),
                 |bytes| {
                     writes.lock().unwrap().push(bytes.to_vec());
                     Ok(())
@@ -9904,26 +10058,36 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let write_calls = std::sync::atomic::AtomicUsize::new(0);
 
-        assert!(
-            !forward_data_channel_input(session_id, true, b"text", &control, &out_tx, |_| {
+        assert!(!forward_data_channel_input(
+            session_id,
+            true,
+            b"text",
+            &control,
+            Some(&out_tx),
+            |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
-            },)
-            .unwrap()
-        );
-        assert!(
-            !forward_data_channel_input(session_id, false, b"", &control, &out_tx, |_| {
+            },
+        )
+        .unwrap());
+        assert!(!forward_data_channel_input(
+            session_id,
+            false,
+            b"",
+            &control,
+            Some(&out_tx),
+            |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
-            },)
-            .unwrap()
-        );
+            },
+        )
+        .unwrap());
         assert!(forward_data_channel_input(
             session_id,
             false,
             b"failed secret",
             &control,
-            &out_tx,
+            Some(&out_tx),
             |_| anyhow::bail!("write failed"),
         )
         .is_err());
@@ -9960,7 +10124,7 @@ mod tests {
             false,
             &oversized,
             &control,
-            &activity_tx,
+            Some(&activity_tx),
             |bytes| handle.write_stdin(bytes),
         )
         .is_err());
