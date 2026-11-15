@@ -707,7 +707,31 @@ fn is_claude(path: &Path) -> bool {
 
 /// Codex's native binary, whether started directly or by its npm launcher.
 fn is_codex(path: &Path) -> bool {
-    executable_name(path).is_some_and(|name| name == "codex" || name == "codex.exe")
+    executable_name(path).is_some_and(is_codex_name)
+}
+
+/// The release targets Codex publishes a native binary for. npm's package
+/// installs each as `codex`; a standalone install (a release download, the
+/// Homebrew cask) keeps the target in the name: `codex-aarch64-apple-darwin`.
+const CODEX_TARGETS: [&str; 8] = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+];
+
+/// `codex`, or `codex-<target>` for a target in `CODEX_TARGETS`, either with
+/// `.exe`; exactly, so `codex-wrapper` or `mycodex` is not Codex.
+fn is_codex_name(name: &str) -> bool {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    name == "codex"
+        || name
+            .strip_prefix("codex-")
+            .is_some_and(|target| CODEX_TARGETS.contains(&target))
 }
 
 /// The id at the end of a rollout Codex holds open:
@@ -1017,10 +1041,32 @@ fn answer(
     }
 }
 
-/// Foreground names a Codex window shows: Codex's own binary, or node for
-/// npm's launcher.
+/// The bytes of a process's name Linux reports (`/proc/<pid>/comm`,
+/// `TASK_COMM_LEN` less its NUL).
+const LINUX_NAME_BYTES: usize = 15;
+
+/// Foreground names a Codex window shows: Codex's own binary under any of its
+/// names (`is_codex_name`), or `node` for npm's launcher.
+///
+/// On Linux the worker reports the name cut to 15 bytes, so a standalone
+/// Codex shows as one of exactly six cuts: `codex-aarch64-a` (Apple),
+/// `codex-aarch64-u` (Linux gnu and musl), `codex-aarch64-p` (Windows),
+/// `codex-x86_64-ap`, `codex-x86_64-un` and `codex-x86_64-pc`. A name is
+/// taken for such a cut only when it is exactly 15 bytes and begins a longer
+/// Codex name. Any other program whose name happens to begin with one of
+/// those six is looked at too, which costs a look and nothing more: `node`
+/// already admits every Node.js program a window runs (`next dev`, `vite`).
+/// This only picks the windows the watch looks at; whether a process is
+/// Codex is still `is_codex`, on its whole executable path, which is never
+/// cut.
 fn may_be_codex(foreground: &str) -> bool {
-    matches!(foreground, "codex" | "node")
+    foreground == "node"
+        || is_codex_name(foreground)
+        || (foreground.len() == LINUX_NAME_BYTES
+            && CODEX_TARGETS.iter().any(|target| {
+                let name = format!("codex-{target}");
+                name.len() > LINUX_NAME_BYTES && name.starts_with(foreground)
+            }))
 }
 
 /// Keep each Codex window's note current. Every `WATCH_INTERVAL`, `windows`
@@ -2485,6 +2531,86 @@ mod tests {
         assert!(may_be_codex("node"));
         assert!(!may_be_codex("bash"));
         assert!(!may_be_codex("claude"));
+    }
+
+    /// Every name a Codex release binary goes by: `codex` from npm, or the
+    /// release target kept in the name by a standalone install.
+    const CODEX_RELEASE_NAMES: [&str; 8] = [
+        "codex-aarch64-apple-darwin",
+        "codex-x86_64-apple-darwin",
+        "codex-aarch64-unknown-linux-gnu",
+        "codex-x86_64-unknown-linux-gnu",
+        "codex-aarch64-unknown-linux-musl",
+        "codex-x86_64-unknown-linux-musl",
+        "codex-aarch64-pc-windows-msvc",
+        "codex-x86_64-pc-windows-msvc",
+    ];
+
+    const NOT_CODEX: [&str; 12] = [
+        "codex-wrapper",
+        "codex-foo",
+        "codexx",
+        "mycodex",
+        "codex-",
+        "codex-aarch64",
+        "codex-aarch64-apple-darwin-helper",
+        "codex-riscv64gc-unknown-linux-gnu",
+        "codex-x86_64-unknown-linux-gnux32",
+        "Codex-aarch64-apple-darwin",
+        "codex.exe.exe",
+        "node-codex",
+    ];
+
+    #[test]
+    fn codex_is_recognised_under_its_release_target_names() {
+        for name in CODEX_RELEASE_NAMES {
+            for path in [
+                format!("/opt/homebrew/Caskroom/codex/0.155.1/{name}"),
+                format!("/usr/local/bin/{name}"),
+                format!("/home/me/.local/bin/{name} (deleted)"),
+                format!("C:/Users/me/bin/{name}.exe"),
+            ] {
+                assert!(is_codex(Path::new(&path)), "{path}");
+            }
+            assert!(may_be_codex(name), "{name}");
+        }
+        assert!(is_codex(Path::new("/usr/local/bin/codex.exe")));
+        for name in NOT_CODEX {
+            let path = format!("/usr/local/bin/{name}");
+            assert!(!is_codex(Path::new(&path)), "{path}");
+            assert!(!may_be_codex(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn codex_cut_to_linuxs_fifteen_bytes_still_shows_in_the_foreground() {
+        // `/proc/<pid>/comm` keeps 15 bytes of the name.
+        for cut in [
+            "codex-aarch64-a",
+            "codex-aarch64-u",
+            "codex-aarch64-p",
+            "codex-x86_64-ap",
+            "codex-x86_64-un",
+            "codex-x86_64-pc",
+        ] {
+            assert_eq!(cut.len(), 15);
+            assert!(may_be_codex(cut), "{cut}");
+            // The cut name is the pre-filter's only: the inspector reads the
+            // whole executable path, never the cut name.
+            assert!(!is_codex(Path::new(cut)), "{cut}");
+        }
+        for name in CODEX_RELEASE_NAMES {
+            assert!(may_be_codex(&name[..15]), "{name}");
+        }
+        // Shorter or other cuts are not the kernel's cut of a Codex name.
+        for not in [
+            "codex-aarch64-",
+            "codex-x86_64-a",
+            "codex-aarch64-x",
+            "codex-x86_64-uX",
+        ] {
+            assert!(!may_be_codex(not), "{not}");
+        }
     }
 
     #[test]

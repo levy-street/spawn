@@ -50,7 +50,8 @@ src/
                  registry and the thread files a Codex holds open, notes
                  each Codex window's thread for restarts after Codex has
                  gone — `<config>/conversations/<session id>.json`, dropped
-                 on the window's `session.kill` — and executes nothing),
+                 on the window's every `session.kill`, archiving included —
+                 and executes nothing),
                  codex_home.rs (a skilled window's own CODEX_HOME,
                  reconciled against the user's — see "A skilled window's
                  home"), upload.rs, sessions.rs,

@@ -1334,21 +1334,27 @@ by its rollouts alone. The thread in front of the person is the one written
 last (the later of its lock's and its rollout's modification times) that is
 not a subagent's: a rollout's first line, `session_meta`, says whether it is.
 A thread whose newest mark is its lock alone is `fresh`; a rollout whose
-first line has not ended yet names nothing, since it may be either. Nothing is
-executed, no process's arguments or environment are read, every registry file
-and rollout is read bounded and without following links, and the answer
-carries no paths and fits one control frame.
+first line has not ended yet names nothing, since it may be either. A Codex
+process is known by its executable's name: `codex` (npm), or `codex-<target>`
+for a release target Codex publishes (`codex-aarch64-apple-darwin` from a
+standalone install), either with `.exe`. Nothing is executed, no process's
+arguments or environment are read, every registry file and rollout is read
+bounded and without following links, and the answer carries no paths and
+fits one control frame.
 
 The daemon also notes, per window, the Codex thread a live answer found it in
 (or that it was on a fresh one), from every answer and from a look every 5 s
-at the windows whose foreground may be Codex, in a folder of its own
+at the windows whose foreground may be Codex (one of those names, its
+15-byte cut on Linux, or `node` for npm's launcher), in a folder of its own
 (`<config>/conversations/<session id>.json`). When no agent runs in the
 window, or the window does not run there, the answer comes from that note:
 `agent` `codex`, `state` `unknown`, `source` `remembered`, and either the
 noted id or `fresh`. A thread changed less than 5 s before Codex went can be
 missed, and the note then names the thread before it. A window the server
 stops for good (`session.kill`: deleted, archived, or moved to another host)
-is forgotten there.
+is forgotten there, archiving included: a Codex window restored from an
+archived workspace restarts with `codex resume --last`, as before the note
+existed.
 
 A restart asks first where `conv.v1` is advertised. When the answer is about
 the window's agent, its `conversation_id` is resumed (`claude --resume <id>`,
