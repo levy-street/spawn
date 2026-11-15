@@ -31,7 +31,7 @@ use crate::proto::{
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
-use crate::sessions::SessionRegistry;
+use crate::sessions::{SessionLifecycleSnapshot, SessionRegistry};
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
 use spawnd::acct_endorsement::{signature_from_wire, AcctEndorsementTranscript};
@@ -613,15 +613,12 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     });
     // What each Codex window is in, kept on this host so a restart after
     // Codex has gone still names its thread (`host_conv`).
-    if crate::host_conv::SUPPORTED {
-        if let Ok(homes) = config::window_homes_dir() {
-            let memory = crate::host_conv::ConversationMemory::new(homes);
-            let windows = registry.clone();
-            tokio::spawn(crate::host_conv::watch(
-                move || windows.foregrounds(),
-                memory,
-            ));
-        }
+    if let Some(memory) = conversation_notes() {
+        let windows = registry.clone();
+        tokio::spawn(crate::host_conv::watch(
+            move || windows.foregrounds(),
+            memory,
+        ));
     }
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
@@ -3778,6 +3775,53 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
 
+    /// A deleted, archived or moved window leaves no note of its Codex
+    /// thread on this host: not the one it had, and not one a last look
+    /// wrote while its worker was stopping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_window_leaves_no_codex_note_behind() {
+        use crate::host_conv::{ConversationMemory, ConversationState, Inspection, Source};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().join("conversations"));
+        let window = Uuid::new_v4();
+        let codex = Inspection {
+            agent: Some("codex"),
+            conversation_id: Some("01a1851d-2f36-76d1-98ee-b27aeae4a30d".into()),
+            state: ConversationState::Unknown,
+            cli_version: None,
+            live_elsewhere: false,
+            fresh: false,
+            source: Source::OpenFile,
+        };
+        memory.note(window, &codex);
+        assert!(memory.recall(window).is_some());
+
+        let running = Arc::new(AtomicBool::new(true));
+        let stopping = tokio::spawn(forget_stopped_window(memory.clone(), window, {
+            let running = Arc::clone(&running);
+            move || running.load(Ordering::SeqCst)
+        }));
+        // Forgotten at once, while its worker is still stopping.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while memory.recall(window).is_some() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(memory.recall(window), None);
+        // A look that read the window's Codex before it stopped writes late.
+        memory.note(window, &codex);
+        running.store(false, Ordering::SeqCst);
+        stopping.await.unwrap();
+        assert_eq!(memory.recall(window), None);
+
+        // A window that does not run here is forgotten all the same.
+        memory.note(window, &codex);
+        forget_stopped_window(memory.clone(), window, || false).await;
+        assert_eq!(memory.recall(window), None);
+    }
+
     #[derive(Clone, Copy)]
     struct SelectDaemonSubprotocol;
 
@@ -6672,6 +6716,43 @@ async fn handle_session_restart(
     }
 }
 
+/// Where this daemon notes each Codex window's thread (`host_conv`), on a
+/// platform where it inspects windows at all.
+fn conversation_notes() -> Option<crate::host_conv::ConversationMemory> {
+    if !crate::host_conv::SUPPORTED {
+        return None;
+    }
+    config::conversation_notes_dir()
+        .ok()
+        .map(crate::host_conv::ConversationMemory::new)
+}
+
+/// How long a stopped window's worker is waited for before its note is
+/// forgotten a second time regardless.
+const STOPPED_WINDOW_WAIT: Duration = Duration::from_secs(10);
+
+/// A window stopped here for good — deleted, archived, or moved to another
+/// host; `session.kill` is only ever sent for those — forgets the Codex
+/// thread noted for it: at once, which is all a window that does not run
+/// here needs, and again once `running` says its worker has gone, so that a
+/// look that read the window's Codex just before it stopped cannot leave
+/// its note behind.
+async fn forget_stopped_window(
+    notes: crate::host_conv::ConversationMemory,
+    session_id: Uuid,
+    running: impl Fn() -> bool,
+) {
+    let forget = |notes: crate::host_conv::ConversationMemory| async move {
+        let _ = tokio::task::spawn_blocking(move || notes.forget(session_id)).await;
+    };
+    forget(notes.clone()).await;
+    let deadline = tokio::time::Instant::now() + STOPPED_WINDOW_WAIT;
+    while running() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    forget(notes).await;
+}
+
 async fn handle_session_kill(
     session_id: Uuid,
     signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
@@ -6684,7 +6765,15 @@ async fn handle_session_kill(
     if !registry.contains(session_id) {
         let _ = ensure_session_attached(session_id, registry, rtc_sessions, out_tx).await;
     }
-    let Some(snapshot) = registry.lifecycle_snapshot(session_id) else {
+    let stopping = registry.lifecycle_snapshot(session_id);
+    if let Some(notes) = conversation_notes() {
+        let registry = registry.clone();
+        let worker = stopping.as_ref().map(SessionLifecycleSnapshot::binding);
+        tokio::spawn(forget_stopped_window(notes, session_id, move || {
+            worker.is_some_and(|worker| registry.is_current(worker))
+        }));
+    }
+    let Some(snapshot) = stopping else {
         send_error(
             out_tx,
             Some(session_id),

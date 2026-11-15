@@ -388,7 +388,7 @@ impl RtcSessions {
                     let windows =
                         crate::host_conv::WindowShells::new(move |id| registry.shell_pid(id))
                             .with_memory(
-                                crate::config::window_homes_dir()
+                                crate::config::conversation_notes_dir()
                                     .ok()
                                     .map(crate::host_conv::ConversationMemory::new),
                             );

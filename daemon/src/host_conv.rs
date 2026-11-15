@@ -44,13 +44,14 @@
 //! subagent's thread is never that thread, and its rollout's first line
 //! (`session_meta`) says so.
 //!
-//! A Codex window's thread is also remembered on this host,
-//! `<window homes>/<session id>/conversation.json`. It is noted from every
-//! answer and from a look every `WATCH_INTERVAL` at each window whose
-//! foreground may be Codex. Then a restart after Codex has gone — it quit,
-//! crashed, or the host restarted — still names the thread. A guess at "the
-//! latest one in this folder" would pick whichever of the folder's windows
-//! wrote last.
+//! A Codex window's thread is also remembered on this host, one note per
+//! window in a folder of spawnd's own (`<config>/conversations/<session
+//! id>.json`). It is noted from every answer and from a look every
+//! `WATCH_INTERVAL` at each window whose foreground may be Codex. Then a
+//! restart after Codex has gone — it quit, crashed, or the host restarted —
+//! still names the thread. A guess at "the latest one in this folder" would
+//! pick whichever of the folder's windows wrote last. A window stopped here
+//! for good (deleted, archived, moved to another host) is forgotten.
 //!
 //! Read-only and inert toward everything but that note. Nothing is executed,
 //! and no process's arguments or environment are read. Every registry file
@@ -97,7 +98,6 @@ const MAX_SESSION_META_READS: usize = 16;
 const MAX_SESSION_META_BYTES: u64 = 256 * 1024;
 /// A window's remembered thread: one small JSON object.
 const MAX_MEMORY_BYTES: u64 = 1024;
-const MEMORY_FILE: &str = "conversation.json";
 /// How often each window whose foreground may be Codex is looked at, so its
 /// remembered thread follows `/new` and `/resume`.
 pub(crate) const WATCH_INTERVAL: Duration = Duration::from_secs(30);
@@ -795,26 +795,53 @@ fn is_subagent_rollout(path: &Path) -> bool {
             .is_some_and(|source| source.contains_key("subagent"))
 }
 
-/// What this host last saw each Codex window in: `<homes>/<session
-/// id>/conversation.json`, beside whatever else spawnd keeps for the window
-/// (its skills, its own Codex home). Noted from live answers only and never
-/// trusted further than a canonical UUID; a note that cannot be written is
-/// a restart that falls back to what it did before.
+/// What this host last saw each Codex window in: one note per window,
+/// `<notes>/<session id>.json`, in a folder of spawnd's own — not the
+/// window's home, which only a skilled window has and its agent may write
+/// to. Noted from live answers only and never trusted further than a
+/// canonical UUID; a note that cannot be written is a restart that falls
+/// back to what it did before.
 #[derive(Clone, Debug)]
 pub(crate) struct ConversationMemory {
-    homes: PathBuf,
+    notes: PathBuf,
+}
+
+/// Held across each look at a window and the note it leaves, and across a
+/// window being forgotten, by every `ConversationMemory` in this process: a
+/// look that read a window's Codex before the window stopped cannot write
+/// its note after the window was forgotten.
+static LOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn looking() -> std::sync::MutexGuard<'static, ()> {
+    LOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl ConversationMemory {
-    /// `homes` is the daemon instance's window homes folder, handed in by
+    /// `notes` is the daemon instance's folder for them, handed in by
     /// whoever builds the inspector: this module reaches nothing else of
     /// spawnd's.
-    pub(crate) fn new(homes: PathBuf) -> Self {
-        Self { homes }
+    pub(crate) fn new(notes: PathBuf) -> Self {
+        Self { notes }
     }
 
     fn path(&self, session_id: Uuid) -> PathBuf {
-        self.homes.join(session_id.to_string()).join(MEMORY_FILE)
+        self.notes.join(format!("{session_id}.json"))
+    }
+
+    /// Drop a window's note: the window is stopped here for good (deleted,
+    /// archived, or moved to another host), and a thread noted for it would
+    /// be a stranger's by the time anything asked again.
+    pub(crate) fn forget(&self, session_id: Uuid) {
+        let _look = looking();
+        match std::fs::remove_file(self.path(session_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::debug!(%session_id, %error, "could not forget the window's Codex thread");
+            }
+        }
     }
 
     /// Note the Codex thread a live answer names, when it is not the one
@@ -867,13 +894,13 @@ impl ConversationMemory {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
         let path = self.path(session_id);
-        let folder = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+        let folder = &self.notes;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(folder)?;
         std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
-        let temporary = folder.join(format!("{MEMORY_FILE}.{}.tmp", Uuid::new_v4()));
+        let temporary = folder.join(format!(".{session_id}.{}.tmp", Uuid::new_v4()));
         let written = (|| {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -905,6 +932,7 @@ pub(crate) fn answer_for_window(
     shell_pid: Option<u32>,
     memory: Option<&ConversationMemory>,
 ) -> Option<Inspection> {
+    let _look = looking();
     answer(session_id, shell_pid.map(inspect_window), memory)
 }
 
@@ -951,6 +979,7 @@ pub(crate) async fn watch(
         let memory = memory.clone();
         let _ = tokio::task::spawn_blocking(move || {
             for (session_id, shell) in candidates {
+                let _look = looking();
                 memory.note(session_id, &inspect_window(shell));
             }
         })
@@ -1951,8 +1980,8 @@ mod tests {
 
     #[test]
     fn a_codex_windows_thread_is_remembered_once_it_has_one() {
-        let homes = tempfile::tempdir().unwrap();
-        let memory = ConversationMemory::new(homes.path().to_path_buf());
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
         let window = Uuid::new_v4();
         assert_eq!(memory.recall(window), None);
         // Nothing to remember: no agent, a Claude Code window, a fresh thread.
@@ -1979,21 +2008,66 @@ mod tests {
         );
         // One window's note is its own.
         assert_eq!(memory.recall(Uuid::new_v4()), None);
-        // Nothing is left behind but the note.
-        let names: Vec<_> = std::fs::read_dir(homes.path().join(window.to_string()))
+    }
+
+    #[test]
+    fn notes_keep_to_their_own_folder_one_file_per_window() {
+        // Not in a window's home: that is a skilled window's alone, and its
+        // agent's (`SPAWN_AGENT_CONFIG_DIR`).
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().join("conversations"));
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        memory.note(one, &started(THREAD_A));
+        memory.note(two, &started(THREAD_B));
+        memory.note(one, &started(THREAD_C));
+        let mut names: Vec<_> = std::fs::read_dir(notes.path().join("conversations"))
             .unwrap()
-            .map(|entry| entry.unwrap().file_name())
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(names, [std::ffi::OsString::from(MEMORY_FILE)]);
+        names.sort();
+        let mut expected = [format!("{one}.json"), format!("{two}.json")];
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(
+            std::fs::read_dir(notes.path()).unwrap().count(),
+            1,
+            "nothing beside the notes folder"
+        );
+        // This user's alone.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let folder = notes.path().join("conversations");
+        assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(&folder.join(format!("{one}.json"))), 0o600);
+    }
+
+    #[test]
+    fn a_forgotten_window_has_no_note() {
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
+        let (gone, kept) = (Uuid::new_v4(), Uuid::new_v4());
+        memory.note(gone, &started(THREAD_A));
+        memory.note(kept, &started(THREAD_B));
+        memory.forget(gone);
+        assert_eq!(memory.recall(gone), None);
+        assert_eq!(
+            answer(gone, None, Some(&memory)),
+            None,
+            "a window not running here and forgotten is not found"
+        );
+        assert!(memory.recall(kept).is_some());
+        // Forgetting a window never noted, or twice, is nothing.
+        memory.forget(gone);
+        memory.forget(Uuid::new_v4());
+        assert_eq!(std::fs::read_dir(notes.path()).unwrap().count(), 1);
     }
 
     #[test]
     fn a_note_is_believed_only_as_a_codex_uuid() {
-        let homes = tempfile::tempdir().unwrap();
-        let memory = ConversationMemory::new(homes.path().to_path_buf());
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
         let window = Uuid::new_v4();
-        let path = homes.path().join(window.to_string()).join(MEMORY_FILE);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = notes.path().join(format!("{window}.json"));
         for bad in [
             serde_json::json!({"agent": "claude-code", "conversation_id": THREAD_A}).to_string(),
             serde_json::json!({"agent": "codex", "conversation_id": "--last"}).to_string(),
@@ -2010,7 +2084,7 @@ mod tests {
             assert_eq!(memory.recall(window), None, "{bad}");
         }
         // A link is not followed.
-        let elsewhere = homes.path().join("elsewhere.json");
+        let elsewhere = notes.path().join("elsewhere.json");
         std::fs::write(
             &elsewhere,
             serde_json::json!({"agent": "codex", "conversation_id": THREAD_A}).to_string(),
@@ -2023,8 +2097,8 @@ mod tests {
 
     #[test]
     fn a_window_without_its_agent_is_answered_from_its_note() {
-        let homes = tempfile::tempdir().unwrap();
-        let memory = ConversationMemory::new(homes.path().to_path_buf());
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().to_path_buf());
         let window = Uuid::new_v4();
         // Never noted: a live answer stands, and a window not running here
         // has none.

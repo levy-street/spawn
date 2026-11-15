@@ -907,8 +907,10 @@ impl Context {
     }
 
     /// Which conversation a window is in, read from its own processes and
-    /// the agent's live-session registry (`host_conv`). Read-only; the walk
-    /// runs off the control loop, under this channel's operation accounting.
+    /// the agent's live-session registry (`host_conv`). It changes nothing on
+    /// the host but the window's own Codex note in spawnd's folder for them;
+    /// the walk runs off the control loop, under this channel's operation
+    /// accounting.
     async fn inspect_conversation(
         &self,
         request_id: &str,

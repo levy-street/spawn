@@ -232,7 +232,9 @@ if control.count(expected_control_imports) != 1:
 # and to execute nothing. Since 2026-11-12 it also reads which Codex thread
 # files a window's Codex holds open (and each held rollout's first line), and
 # keeps one note per Codex window, the thread id it last named, in a folder
-# the caller hands it (spawnd's own window homes); it writes nothing else.
+# the caller hands it (spawnd's own <config>/conversations/), removing a
+# window's note when the server stops the window for good; it writes nothing
+# else.
 if set(re.findall(r"crate::(\w+)", control)) != {
     "host_conv",
     "host_desktop",
