@@ -1102,9 +1102,12 @@ mod tests {
     /// is gone and neither association keeps it, where upstream left it
     /// registered with nobody reading it. And a connection on which they
     /// keep failing is not served for ever, one warning each: once
-    /// `MAX_FAILED_DATA_CHANNEL_STREAMS` have failed the acceptor stops the
-    /// association, and the pair is retired and announced like any other
-    /// whose acceptor ended.
+    /// `MAX_FAILED_DATA_CHANNEL_STREAMS` have failed with no channel opened
+    /// between them the acceptor stops the association, and the pair is
+    /// retired and announced like any other whose acceptor ended. A channel
+    /// that does open starts the count again, so a device that lives for
+    /// days through stalls, abandoning an open in each, is not cut off by
+    /// their sum.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_streams_are_reset_and_a_connection_full_of_them_is_retired() {
         use webrtc::sctp_transport::MAX_FAILED_DATA_CHANNEL_STREAMS;
@@ -1131,6 +1134,7 @@ mod tests {
 
         // A stream the daemon never heard of, whose first message is text:
         // see `a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting`.
+        // `None` once the connection no longer takes one.
         let stray = |n: u32| {
             let pc = Arc::clone(&pc);
             async move {
@@ -1145,12 +1149,15 @@ mod tests {
                         ),
                     )
                     .await
-                    .unwrap();
-                channel.send_text("not an open").await.unwrap();
-                channel
+                    .ok()?;
+                channel.send_text("not an open").await.ok()?;
+                Some(channel)
             }
         };
-        let reset = |channel: Arc<RTCDataChannel>| async move {
+        let reset = |channel: Option<Arc<RTCDataChannel>>| async move {
+            let Some(channel) = channel else {
+                return false;
+            };
             tokio::time::timeout(Duration::from_secs(5), async {
                 while channel.ready_state() != RTCDataChannelState::Closed {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1159,19 +1166,32 @@ mod tests {
             .await
             .is_ok()
         };
-
+        // Some failures; a channel that opens; then one short of the limit
+        // in a row. More than the limit in all, and the pair still serves.
+        const EARLY: u32 = 10;
+        let mut sent = 0;
         let mut not_reset = None;
-        for n in 0..MAX_FAILED_DATA_CHANNEL_STREAMS - 1 {
-            if !reset(stray(n).await).await {
-                not_reset = Some(n);
-                break;
+        while sent < EARLY && not_reset.is_none() {
+            if !reset(stray(sent).await).await {
+                not_reset = Some(sent);
             }
+            sent += 1;
+        }
+        let (opened, mut opened_rx) = open_host_consumer(&pc).await;
+        let a_channel_opened =
+            consumer_answers(&opened, &mut opened_rx, Duration::from_secs(5)).await;
+        while sent < EARLY + MAX_FAILED_DATA_CHANNEL_STREAMS - 1 && not_reset.is_none() {
+            if !reset(stray(sent).await).await {
+                not_reset = Some(sent);
+            }
+            sent += 1;
         }
         let in_service_below_the_limit =
             consumer_answers(&probe, &mut probe_rx, Duration::from_secs(5)).await
                 && sessions.host_peers.lock().await.contains_key(&signal_id);
 
-        let _last = stray(MAX_FAILED_DATA_CHANNEL_STREAMS - 1).await;
+        // The limit in a row, no channel between: stopped.
+        let _last = stray(sent).await;
         let goodbye = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(frame) = signal_rx.recv().await {
                 let value: Value = serde_json::from_str(frame.as_str()).unwrap();
@@ -1188,13 +1208,15 @@ mod tests {
         let resident = sessions.host_peers.lock().await.len();
         sessions.close_all().await;
         let _ = pc.close().await;
+        assert!(a_channel_opened, "a channel opens between the failures");
         assert_eq!(
             not_reset, None,
-            "a stream that never became a channel was not reset"
+            "a stream that never became a channel was not reset (or the pair had stopped taking them)"
         );
         assert!(
             in_service_below_the_limit,
-            "the pair stopped serving before {MAX_FAILED_DATA_CHANNEL_STREAMS} streams failed"
+            "the pair stopped serving: {} streams failed in all, but a channel opened after the first {EARLY}",
+            EARLY + MAX_FAILED_DATA_CHANNEL_STREAMS - 1
         );
         assert_eq!(
             goodbye.ok().as_deref(),

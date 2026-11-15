@@ -35,17 +35,20 @@ use crate::stats::{ICETransportStats, PeerConnectionStats};
 
 const SCTP_MAX_CHANNELS: u16 = u16::MAX;
 
-/// Streams that may fail to become data channels on one association before
-/// the acceptor stops it. A peer abandons an open only when the open took
-/// longer than it would wait, and anything else (a first message that is not
-/// an OPEN, a label that is not UTF-8) is a peer not speaking DCEP: a
-/// connection that has lost this many is better replaced than served. The
-/// stop ends the acceptor as any closed association does, and its `on_error`
-/// handler hears of it.
+/// Streams that may fail to become data channels on one association, with
+/// none becoming one in between, before the acceptor stops it. A peer
+/// abandons an open only when the open took longer than it would wait, and
+/// anything else (a first message that is not an OPEN, a label that is not
+/// UTF-8) is a peer not speaking DCEP: a connection that has lost this many
+/// in a row is better replaced than served. A stream that does become a
+/// channel starts the count again, so the opens a long-lived peer abandons
+/// across separate stalls are never added up. The stop ends the acceptor as
+/// any closed association does, and its `on_error` handler hears of it.
 pub const MAX_FAILED_DATA_CHANNEL_STREAMS: u32 = 64;
 
-/// Failed streams on one association that are logged one by one; the rest
-/// are counted, and the stop at `MAX_FAILED_DATA_CHANNEL_STREAMS` is logged.
+/// Failed streams over the acceptor's life that are logged one by one; the
+/// rest are counted, and the stop at `MAX_FAILED_DATA_CHANNEL_STREAMS` is
+/// logged.
 const LOGGED_FAILED_DATA_CHANNEL_STREAMS: u32 = 3;
 
 /// What became of one stream the association handed the acceptor.
@@ -307,7 +310,10 @@ impl RTCSctpTransport {
         }
         drop(dcs);
 
+        // Over the acceptor's life, for the log cap; and since a stream last
+        // became a channel, for the stop.
         let mut failed_streams = 0u32;
+        let mut failed_in_a_row = 0u32;
         loop {
             let dc = tokio::select! {
                 _ = param.notify_rx.notified() => break,
@@ -320,7 +326,10 @@ impl RTCSctpTransport {
                     &existing_data_channels,
                 ) => {
                     match accepted {
-                        AcceptedStream::Channel(dc) => dc,
+                        AcceptedStream::Channel(dc) => {
+                            failed_in_a_row = 0;
+                            dc
+                        }
                         // The association has no more streams to give:
                         // it closed. That is how every peer connection
                         // ends, so it is not logged as an error here;
@@ -342,7 +351,8 @@ impl RTCSctpTransport {
                         // upstream broke out here, without a word, and the
                         // connection accepted nothing ever again.
                         AcceptedStream::Failed(err, stream) => {
-                            failed_streams += 1;
+                            failed_streams = failed_streams.saturating_add(1);
+                            failed_in_a_row += 1;
                             if failed_streams <= LOGGED_FAILED_DATA_CHANNEL_STREAMS {
                                 log::warn!(
                                     "Failed to accept one data channel; still accepting: {err}"
@@ -364,9 +374,9 @@ impl RTCSctpTransport {
                             tokio::spawn(async move {
                                 let _ = stream.shutdown(std::net::Shutdown::Both).await;
                             });
-                            if failed_streams == MAX_FAILED_DATA_CHANNEL_STREAMS {
+                            if failed_in_a_row == MAX_FAILED_DATA_CHANNEL_STREAMS {
                                 log::warn!(
-                                    "{failed_streams} streams failed to become data channels on this association; stopping it"
+                                    "{failed_in_a_row} streams in a row failed to become data channels on this association; stopping it"
                                 );
                                 // What is still queued drains as failures,
                                 // and then the acceptor ends as above.

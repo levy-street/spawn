@@ -75,23 +75,29 @@ reading it. A stream the peer reset itself is unregistered already, and the
 shutdown does nothing for it. The reset runs in a task of its own, because
 it queues behind a writer waiting for room exactly as the DCEP ACK does.
 
-Failures are counted for the life of the acceptor. The first three are
-logged at warning level and the rest only counted, and the
-`MAX_FAILED_DATA_CHANNEL_STREAMS`th (64; public, for the daemon's
-regression) makes the acceptor close the association. A peer reaches that
-either by not speaking DCEP or by abandoning opens on a connection that does
-not serve them in time, and a new connection is the remedy for both. Streams
-still queued then drain as failures, and the acceptor ends the way it does
-for any closed association (see below), so a daemon host peer is retired
-and announced.
+Failures are counted twice. Over the acceptor's life, for the log: the
+first three are logged at warning level and the rest only counted. And
+since a stream last became a channel, for the stop: the
+`MAX_FAILED_DATA_CHANNEL_STREAMS`th failure in a row (64; public, for the
+daemon's regression) makes the acceptor close the association, and any
+stream that does become a channel starts that count again. A peer reaches it
+either by not speaking DCEP or by abandoning every open on a connection that
+serves none of them in time, and a new connection is the remedy for both.
+A peer that lives for days and gives up one open in each passing stall
+never adds up to it: the association lasts across ICE restarts, and a
+lifetime count would close it, with every terminal on it, for a sum of
+unrelated stalls. Streams still queued after the stop drain as failures,
+and the acceptor ends the way it does for any closed association (see
+below), so a daemon host peer is retired and announced.
 
 The native daemon regression
 `a_stream_that_never_becomes_a_channel_leaves_the_pair_accepting` in
 `rtc_pair.rs` sends a first message that is not an OPEN on a new stream and
 requires the next channel on the same connection to open.
-`failed_streams_are_reset_and_a_connection_full_of_them_is_retired` sends 63
-such streams, requires each to be reset and the pair still to serve, then
-sends one more and requires the pair retired with `unavailable`.
+`failed_streams_are_reset_and_a_connection_full_of_them_is_retired` sends
+ten such streams, opens a channel, sends 63 more, and requires each to be
+reset and the pair still to serve; then it sends one more, the 64th in a row,
+and requires the pair retired with `unavailable`.
 `a_channel_abandoned_while_admission_is_busy_leaves_the_pair_accepting`
 opens and closes a channel while admission is held; that reproduced the
 reset-before-OPEN failure for as long as admission ran inside the accept

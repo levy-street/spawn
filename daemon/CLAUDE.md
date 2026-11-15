@@ -87,7 +87,8 @@ vendor/          exact upstream crate sources for narrowly documented patches;
                  (ice/PATCHES.md), and webrtc 0.17.2
                  with closed-channel registry pruning and a channel acceptor
                  that outlives a stream that never became a channel (and
-                 resets it, stopping the association once 64 have failed),
+                 resets it, stopping the association once 64 in a row have
+                 failed with no channel opened between),
                  admits each channel in its own task, and reports its own
                  end (webrtc/PATCHES.md).
                  SCTP and ICE also allow clippy::double_must_use at the
@@ -479,8 +480,9 @@ SCTP went away; the write loop closed it over a send error ICE recovered
 from): nothing opens on that peer again and the reaper, which watches the
 connection state, never hears of it, so `install_host_acceptor_watch`
 retires it from the SCTP transport's `on_error`. The acceptor also stops
-the association itself once `MAX_FAILED_DATA_CHANNEL_STREAMS` streams have
-failed to become channels, and that peer is retired the same way. A peer the daemon is
+the association itself once `MAX_FAILED_DATA_CHANNEL_STREAMS` streams in a
+row have failed to become channels (a channel that opens starts the count
+again), and that peer is retired the same way. A peer the daemon is
 already closing has, as a rule, left the host map before its association
 stopped, and the watch does nothing for it. The exception is a protocol-1
 host peer whose handler refuses a channel: the handler closes the
