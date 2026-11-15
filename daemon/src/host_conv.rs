@@ -371,8 +371,10 @@ fn codex_homes() -> Vec<PathBuf> {
     homes
 }
 
-/// `inspect_with`, for a host where Codex keeps no shared server.
-#[cfg(test)]
+/// `inspect_with`, for a host where Codex keeps no shared server. Only the
+/// Unix tests call it, so it exists only there (Windows Clippy refuses an
+/// unused function).
+#[cfg(all(test, unix))]
 pub(crate) fn inspect(shell_pid: u32, table: &dyn ProcessTable, stores: &[PathBuf]) -> Inspection {
     inspect_with(shell_pid, table, stores, &[])
 }
