@@ -1,7 +1,9 @@
 import {
   CONVERSATION_INSPECT_OP,
+  CONVERSATION_LAUNCH_OP,
   type ConversationInspection,
   canonicalConversationId,
+  parseCodexNoDaemon,
   parseConversationInspection,
 } from "@/lib/conversation";
 import { parseCapabilities } from "@/lib/preview/capabilities";
@@ -1316,6 +1318,28 @@ export class HostControlClient {
       );
     }
     return inspection;
+  }
+
+  /**
+   * Whether the Codex this window is about to run accepts `--no-daemon`: the
+   * daemon runs `codex --no-daemon --version` with the environment and in the
+   * folder the window's shell was started with. Null when it cannot tell.
+   * Gated on `conv.v1`; an older daemon answers `unsupported_operation`.
+   */
+  async codexNoDaemon(
+    sessionId: string,
+    options?: HostControlRequestOptions,
+  ): Promise<boolean | null> {
+    const result = await this.request<unknown>(
+      CONVERSATION_LAUNCH_OP,
+      { session_id: sessionId },
+      options,
+    );
+    const answer = parseCodexNoDaemon(result);
+    if (answer === undefined) {
+      throw new HostControlError("invalid_response", "Host returned an invalid launch report");
+    }
+    return answer;
   }
 
   /**

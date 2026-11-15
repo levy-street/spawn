@@ -225,7 +225,10 @@ describe("workspace lifecycle operations", () => {
       1,
       expect.objectContaining({ workspace_id: "workspace-new", tile: { x: 8, y: 0, w: 8, h: 24 } }),
     );
-    expect(harness.pending.persist).toHaveBeenCalledWith("session-1", "host-1", "codex");
+    expect(harness.pending.persist).toHaveBeenCalledWith("session-1", "host-1", {
+      command: "codex",
+      codexNoDaemon: "codex --no-daemon",
+    });
     expect(result.agentLaunchesSkipped).toBe(0);
     expect(result.workspace.layout.active_tab).toBe("tab-new");
   });
@@ -280,7 +283,10 @@ describe("workspace lifecycle operations", () => {
         tile: { x: 8, y: 0, w: 16, h: 24 },
       }),
     );
-    expect(harness.pending.persist).toHaveBeenCalledWith("session-1", "host-1", "codex");
+    expect(harness.pending.persist).toHaveBeenCalledWith("session-1", "host-1", {
+      command: "codex",
+      codexNoDaemon: "codex --no-daemon",
+    });
     expect(result.agentLaunchesSkipped).toBe(0);
   });
 

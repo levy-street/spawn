@@ -51,7 +51,12 @@ import {
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { type AgentNotice, detectAgentNotice } from "@/lib/agent-notice";
+import {
+  type AgentNotice,
+  detectAgentNotice,
+  type ScreenRow,
+  screenLines,
+} from "@/lib/agent-notice";
 import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { cachedListItem } from "@/lib/cached-list-item";
 import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
@@ -1248,11 +1253,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return;
     }
     const end = buffer.baseY + term.rows;
-    const rows: string[] = [];
-    for (let y = buffer.baseY; y < end; y += 1) {
-      rows.push(buffer.getLine(y)?.translateToString(true) ?? "");
+    // From the start of the line the top row belongs to, so a line wrapped
+    // across rows is read whole (`screenLines`).
+    let start = buffer.baseY;
+    while (start > 0 && buffer.getLine(start)?.isWrapped) start -= 1;
+    const rows: ScreenRow[] = [];
+    for (let y = start; y < end; y += 1) {
+      const line = buffer.getLine(y);
+      rows.push({ text: line?.translateToString(false) ?? "", wrapped: line?.isWrapped ?? false });
     }
-    reportAgentNotice(detectAgentNotice(rows));
+    reportAgentNotice(detectAgentNotice(screenLines(rows)));
   }, [reportAgentNotice]);
   const scheduleAgentNoticeScan = useCallback(() => {
     if (!onAgentNoticeRef.current || agentNoticeTimerRef.current !== null) return;

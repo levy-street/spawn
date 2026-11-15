@@ -18,6 +18,22 @@ import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 /** The `conv.*` family, one versioned capability for every operation in it. */
 export const CONVERSATION_CAPABILITY = "conv.v1";
 export const CONVERSATION_INSPECT_OP = "conv.inspect";
+/** Whether the Codex a window is about to run accepts `--no-daemon`, asked
+ *  just before the app types it (proto/README.md). */
+export const CONVERSATION_LAUNCH_OP = "conv.launch";
+
+/** `conv.launch`'s answer: true or false when the host could tell, null when
+ *  it could not. Anything else is malformed. */
+export function parseCodexNoDaemon(value: unknown): boolean | null {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const answer = (value as Record<string, unknown>)["codex_no_daemon"];
+    if (answer === null || typeof answer === "boolean") return answer;
+  }
+  throw new HostControlTransportError(
+    "invalid_response",
+    "Host returned an invalid launch report.",
+  );
+}
 
 export type ConversationState = "running" | "blocked" | "idle" | "unknown";
 
@@ -32,8 +48,19 @@ export interface ConversationInspection {
    *  background session, an attach target, another window. Restart resumes
    *  it all the same: resuming a running background session attaches to it. */
   readonly live_elsewhere: boolean;
+  /** The agent's conversation has nothing written to it yet (a Codex just
+   *  launched, or just after `/new`): there is nothing to resume, and a
+   *  restart starts a new one. Its id is not named. False where the host
+   *  cannot tell, and from a daemon that predates the field. */
+  readonly fresh: boolean;
+  /** The window's Codex keeps its threads in Codex's shared background
+   *  server, outside the window, so which one it is on cannot be named. False
+   *  otherwise, and from a daemon that predates the field. */
+  readonly shared_server: boolean;
   /** What the daemon read: `registry`, `parked`, `attach`, `open_file`,
-   *  `process`, `none`. A hint for diagnostics, never for gating. */
+   *  `process`, `remembered` (the Codex thread the host last saw a window
+   *  in, once Codex has gone), `none`. A hint for diagnostics, never for
+   *  gating. */
   readonly source: string;
 }
 
@@ -71,12 +98,16 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   const conversationId = nullableConversationId(record["conversation_id"]);
   const cliVersion = nullableText(record["cli_version"], SHORT_TEXT);
   const liveElsewhere = record["live_elsewhere"];
+  const fresh = record["fresh"];
+  const sharedServer = record["shared_server"];
   const source = record["source"];
   const state = record["state"];
   if (agent === undefined || conversationId === undefined || cliVersion === undefined) {
     throw invalid();
   }
   if (typeof liveElsewhere !== "boolean" || typeof source !== "string") throw invalid();
+  if (fresh !== undefined && typeof fresh !== "boolean") throw invalid();
+  if (sharedServer !== undefined && typeof sharedServer !== "boolean") throw invalid();
   return {
     agent,
     conversation_id: conversationId,
@@ -84,6 +115,14 @@ export function parseConversationInspection(value: unknown): ConversationInspect
       typeof state === "string" && STATES.has(state) ? (state as ConversationState) : "unknown",
     cli_version: cliVersion,
     live_elsewhere: liveElsewhere,
+    fresh: fresh === true,
+    shared_server: sharedServer === true,
     source,
   };
+}
+
+/** Whether an inspection found an agent running in the window now, rather
+ *  than answering from the host's note of it (`remembered`) or finding none. */
+export function agentRunning(inspection: Pick<ConversationInspection, "source">): boolean {
+  return inspection.source !== "none" && inspection.source !== "remembered";
 }

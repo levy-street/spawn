@@ -19,7 +19,9 @@ import {
 import {
   CONVERSATION_CAPABILITY,
   CONVERSATION_INSPECT_OP,
+  CONVERSATION_LAUNCH_OP,
   type ConversationInspection,
+  parseCodexNoDaemon,
   parseConversationInspection,
 } from "@/terminal/transport/conversation-codec";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
@@ -668,6 +670,22 @@ class WebViewHostTransport implements StreamingHostTransport {
       options,
     );
     return parseConversationInspection(response);
+  }
+
+  /**
+   * Whether the Codex this window is about to run accepts `--no-daemon`: the
+   * daemon runs `codex --no-daemon --version` with the environment and in the
+   * folder the window's shell was started with. Null when it cannot tell.
+   * Gated on `conv.v1`; an older daemon answers `unsupported_operation`.
+   */
+  async codexNoDaemon(sessionId: string, options?: HostRequestOptions): Promise<boolean | null> {
+    this.#requireCapability(CONVERSATION_CAPABILITY);
+    const response = await this.request<unknown>(
+      CONVERSATION_LAUNCH_OP,
+      { session_id: sessionId },
+      options,
+    );
+    return parseCodexNoDaemon(response);
   }
 
   async readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile> {

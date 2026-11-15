@@ -4,18 +4,25 @@ import {
   type LauncherError,
   launchAvailability,
 } from "@/components/launcher/launch-orchestrator";
-import type { PendingLaunchStore } from "@/components/launcher/pending-launch";
+import type {
+  PendingLaunchCommand,
+  PendingLaunchRecord,
+  PendingLaunchStore,
+} from "@/components/launcher/pending-launch";
 import { fullTab, makeAgent, makeHost, makeSession, makeWorkspace } from "./fixtures";
+
+function savedRecord(
+  sessionId: string,
+  hostId: string,
+  command: string | PendingLaunchCommand,
+): PendingLaunchRecord {
+  const launch = typeof command === "string" ? { command, codexNoDaemon: null } : command;
+  return { sessionId, hostId, ...launch, createdAt: 1, expiresAt: 2 };
+}
 
 function makePending(overrides: Partial<PendingLaunchStore> = {}): PendingLaunchStore {
   return {
-    persist: async (sessionId, hostId, command) => ({
-      sessionId,
-      hostId,
-      command,
-      createdAt: 1,
-      expiresAt: 2,
-    }),
+    persist: async (sessionId, hostId, command) => savedRecord(sessionId, hostId, command),
     take: async () => ({ status: "missing" }),
     complete: async () => undefined,
     abandon: async () => undefined,
@@ -40,13 +47,13 @@ function makeDependencies(overrides: Partial<LaunchDependencies> = {}): LaunchDe
 describe("two-stage launch orchestration", () => {
   test("patches the target tab, creates a shell, then persists the constructed agent command", async () => {
     const events: string[] = [];
-    let savedCommand: string | null = null;
+    let savedCommand: string | PendingLaunchCommand | null = null;
     const session = makeSession();
     const pending = makePending({
       persist: async (sessionId, hostId, command) => {
         events.push(`persist:${sessionId}@${hostId}`);
         savedCommand = command;
-        return { sessionId, hostId, command, createdAt: 1, expiresAt: 2 };
+        return savedRecord(sessionId, hostId, command);
       },
     });
     const patchWorkspace = jest.fn<
@@ -96,7 +103,11 @@ describe("two-stage launch orchestration", () => {
         tile: expect.objectContaining({ x: 0, y: 0 }),
       }),
     );
-    expect(savedCommand).toBe("codex --dangerously-bypass-approvals-and-sandbox");
+    // Both forms: the host is asked which to type just before typing.
+    expect(savedCommand).toEqual({
+      command: "codex --dangerously-bypass-approvals-and-sandbox",
+      codexNoDaemon: "codex --no-daemon --dangerously-bypass-approvals-and-sandbox",
+    });
   });
 
   test("reports an honest recoverable state when persistence fails after creation", async () => {

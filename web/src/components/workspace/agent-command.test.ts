@@ -8,6 +8,7 @@ import {
   agentYoloAvailable,
   envPrefix,
   newAgentConversationId,
+  queuedLaunch,
   shellQuote,
 } from "@/components/workspace/agent-command";
 
@@ -157,17 +158,54 @@ describe("conversation grammar", () => {
     );
   });
 
-  test("Codex names its own sessions: resumed by an id the host named, else the latest one", () => {
+  test("Codex names its own sessions: resumed by an id the host named, else its own picker", () => {
     expect(newAgentConversationId("codex")).toBeNull();
     expect(agentLaunchCommand(codex, id)).toBe("codex");
     expect(agentResumeCommand(codex, id)).toBe(`codex resume ${id}`);
-    expect(agentResumeCommand(codex, null)).toBe("codex resume --last");
+    expect(agentResumeCommand(codex, null)).toBe("codex resume");
     expect(
       agentResumeCommand(
         { ...codex, yolo: true, yolo_args: "--dangerously-bypass-approvals-and-sandbox" },
         null,
       ),
-    ).toBe("codex --dangerously-bypass-approvals-and-sandbox resume --last");
+    ).toBe("codex --dangerously-bypass-approvals-and-sandbox resume");
+  });
+
+  test("Codex can be built with --no-daemon, for the drain to type where the host allows it", () => {
+    const facts = { codexNoDaemon: true };
+    expect(agentLaunchCommand(codex, null, facts)).toBe("codex --no-daemon");
+    expect(agentResumeCommand(codex, id, facts)).toBe(`codex --no-daemon resume ${id}`);
+    expect(agentResumeCommand(codex, null, facts)).toBe("codex --no-daemon resume");
+    const yolo = { ...codex, yolo: true, yolo_args: "--dangerously-bypass-approvals-and-sandbox" };
+    expect(agentResumeCommand(yolo, id, facts)).toBe(
+      `codex --no-daemon --dangerously-bypass-approvals-and-sandbox resume ${id}`,
+    );
+    expect(
+      agentInstallAndRunCommand({ ...codex, install: "npm i -g @openai/codex" }, null, facts),
+    ).toBe("npm i -g @openai/codex && codex --no-daemon");
+    // Without the option: Codex as it always was.
+    for (const said of [undefined, { codexNoDaemon: false }]) {
+      expect(agentLaunchCommand(codex, null, said)).toBe("codex");
+      expect(agentResumeCommand(codex, id, said)).toBe(`codex resume ${id}`);
+    }
+    // Only the plain `codex` the host asks about, with the window's PATH;
+    // never another agent.
+    expect(agentLaunchCommand({ ...codex, command: "npx @openai/codex" }, null, facts)).toBe(
+      "npx @openai/codex",
+    );
+    expect(agentLaunchCommand({ ...codex, env: { PATH: "/opt/old/bin" } }, null, facts)).toBe(
+      "PATH=/opt/old/bin codex",
+    );
+    expect(agentLaunchCommand(claude, id, facts)).toBe(`claude --session-id ${id}`);
+    // Queued: both forms for a plain Codex, one for anything else.
+    expect(queuedLaunch((options) => agentLaunchCommand(codex, null, options))).toEqual({
+      command: "codex",
+      codexNoDaemon: "codex --no-daemon",
+    });
+    expect(queuedLaunch((options) => agentLaunchCommand(claude, id, options))).toEqual({
+      command: `claude --session-id ${id}`,
+      codexNoDaemon: null,
+    });
   });
 
   test("an agent with no grammar launches plainly and cannot be resumed", () => {
@@ -196,7 +234,7 @@ describe("conversation grammar", () => {
     ]) {
       expect(agentLaunchCommand(yolo, bad)).toBe("claude");
       expect(agentResumeCommand(yolo, bad)).toBe("claude --continue");
-      expect(agentResumeCommand(codex, bad)).toBe("codex resume --last");
+      expect(agentResumeCommand(codex, bad)).toBe("codex resume");
       expect(agentInstallAndRunCommand({ ...claude, install: "npm i -g x" }, bad)).toBe(
         "npm i -g x && claude",
       );
