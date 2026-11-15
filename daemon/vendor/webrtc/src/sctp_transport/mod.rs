@@ -425,15 +425,20 @@ impl RTCSctpTransport {
                 Arc::clone(&param.setting_engine),
             ));
 
-            // The handler is called here, in the order channels arrive, but
-            // what it returns runs in a task of the channel's own. Upstream
-            // awaited it in this loop, so one channel whose admission waited
-            // — on a lock, on anything — held up every channel behind it on
-            // the connection, and a peer that gave up on those and reset
-            // them was resetting streams nobody had read yet. Each channel
-            // still sees its own steps in upstream's order: the handler's
-            // future completes, the channel is registered, and only then is
-            // it opened and read.
+            // This transport's handler is called here, in the order channels
+            // arrive, and what it returns runs in a task of the channel's
+            // own. In a peer connection that handler is a wrapper that only
+            // builds a future: the application's `on_data_channel` handler
+            // is first called inside it, in the channel's task, so in
+            // whatever order the scheduler runs those tasks, not strictly
+            // in arrival order (PATCHES.md). Upstream awaited the future in
+            // this loop, so one channel whose admission waited — on a lock,
+            // on anything — held up every channel behind it on the
+            // connection, and a peer that gave up on those and reset them
+            // was resetting streams nobody had read yet. Each channel still
+            // sees its own steps in upstream's order: the handler's future
+            // completes, the channel is registered, and only then is it
+            // opened and read.
             let admission = match &*param.on_data_channel_handler.load() {
                 Some(handler) => {
                     let mut f = handler.lock().await;
