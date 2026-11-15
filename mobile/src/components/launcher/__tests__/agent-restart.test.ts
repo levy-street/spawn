@@ -267,16 +267,6 @@ describe("planAgentRestart with the host's answer", () => {
         ),
       ),
     ).toBe(`codex resume ${liveCodex}`);
-    // Codex has gone: the thread the host last saw the window in.
-    expect(
-      command(
-        planAgentRestart(
-          codexSession(),
-          [codex],
-          live({ agent: "codex", conversation_id: liveCodex, source: "remembered" }),
-        ),
-      ),
-    ).toBe(`codex resume ${liveCodex}`);
   });
 
   test("a Codex thread with nothing written yet starts afresh, never the latest one here", () => {
@@ -454,8 +444,8 @@ describe("restartSessionAgent with the host's answer", () => {
     expect(recordConversation).not.toHaveBeenCalled();
   });
 
-  test("a fresh Codex thread is relaunched without asking for transcripts", async () => {
-    const transcripts = jest.fn(async () => null);
+  test("a conversation the host calls fresh starts afresh, with no transcripts to look up", async () => {
+    const transcripts = jest.fn(async () => records([]));
     const pending = pendingStore();
     const result = await restartSessionAgent({
       session: codexSession(),
@@ -467,8 +457,26 @@ describe("restartSessionAgent with the host's answer", () => {
       transcripts,
     });
     expect(result.plan).toEqual({ kind: "agent", agent: codex, command: "codex", resumes: false });
-    expect(transcripts).not.toHaveBeenCalled();
     expect(pending.queued.get(session().id)).toBe("codex");
+    // Were a host to call a Claude Code conversation fresh, it would start
+    // under the id named, and there would be no record of it to ask after.
+    const claudePending = pendingStore();
+    const claudeResult = await restartSessionAgent({
+      session: session(),
+      agents: [claude],
+      restart: async () => session({ status: "starting" }),
+      pending: claudePending,
+      inspect: async () => live({ fresh: true }),
+      transcripts,
+    });
+    expect(claudeResult.plan).toEqual({
+      kind: "agent",
+      agent: claude,
+      command: `claude --session-id ${moved}`,
+      resumes: false,
+    });
+    expect(transcripts).not.toHaveBeenCalled();
+    expect(claudePending.queued.get(session().id)).toBe(`claude --session-id ${moved}`);
   });
 
   test("a shell window never asks the host", async () => {
