@@ -209,7 +209,6 @@ impl RtcSessions {
         if *self.registered_host_id.lock().await != Some(binding.host_id) {
             return;
         }
-        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(ufrag) = ice_ufrag(&sdp) else { return };
         let pair = Arc::new(PairContext {
@@ -1709,6 +1708,88 @@ mod tests {
         assert!(
             attached,
             "an attach for a session being launched was refused"
+        );
+    }
+
+    /// Offer jobs outlive the dispatch loop that queued them, so one queued
+    /// on a control connection that has since dropped can start after the
+    /// daemon has reconnected. It must not put that connection's sender in
+    /// place of the live one `run.rs` installed at connect: every
+    /// candidate, status and input-activity ping after it would go to a
+    /// socket nobody reads, until some later offer put the live one back.
+    #[tokio::test]
+    async fn a_late_offer_from_a_dropped_control_connection_leaves_the_live_one_installed() {
+        let sessions = RtcSessions::new();
+        let host_id = Uuid::new_v4();
+        sessions.bind_registered_host_id(host_id).await;
+        let registry = SessionRegistry::new();
+        let (live_tx, _live_rx) = mpsc::channel(16);
+        sessions.install_ws_sender(live_tx.clone());
+        sessions.deferred_pruned.store(true, Ordering::Release);
+        let (stale_tx, _stale_rx) = mpsc::channel(16);
+        let live_after = |sessions: &RtcSessions| {
+            sessions
+                .registered_sender()
+                .is_some_and(|sender| sender.same_channel(&live_tx))
+        };
+
+        // Each is refused once it has looked at the offer: a session this
+        // daemon does not run, another daemon's host, an offer with no ICE
+        // credentials.
+        sessions
+            .handle_offer(
+                RtcSignalBinding::new("late-session".into(), "late".into(), Uuid::new_v4()),
+                String::new(),
+                Vec::new(),
+                None,
+                false,
+                None,
+                registry.clone(),
+                stale_tx.clone(),
+                None,
+            )
+            .await;
+        let after_session_offer = live_after(&sessions);
+        sessions.install_ws_sender(live_tx.clone());
+        let host_signal = |protocol_version, scope_id| HostRtcSignal {
+            signal_id: "late-host".into(),
+            binding_nonce: Some("a".repeat(32)),
+            binding_generation: Some(1),
+            scope_type: Some("host".into()),
+            scope_id: Some(scope_id),
+            protocol: Some(HOST_CONTROL_LABEL.into()),
+            protocol_version: Some(protocol_version),
+        };
+        sessions
+            .handle_host_offer(
+                host_signal(1, Uuid::new_v4()),
+                String::new(),
+                Vec::new(),
+                None,
+                stale_tx.clone(),
+                None,
+            )
+            .await;
+        let after_host_offer = live_after(&sessions);
+        sessions.install_ws_sender(live_tx.clone());
+        sessions
+            .handle_device_offer(
+                host_signal(2, host_id),
+                String::new(),
+                Vec::new(),
+                None,
+                false,
+                [23; 32],
+                registry.clone(),
+                stale_tx.clone(),
+                Arc::new(|sdp| Ok(sdp.to_owned())),
+            )
+            .await;
+        let after_device_offer = live_after(&sessions);
+        assert_eq!(
+            (after_session_offer, after_host_offer, after_device_offer),
+            (true, true, true),
+            "a late offer (session, host, device) put a dropped connection's sender in place of the live one"
         );
     }
 

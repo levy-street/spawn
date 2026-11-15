@@ -1208,7 +1208,6 @@ impl RtcSessions {
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) {
-        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(session) = registry.binding_for(binding.session_id) else {
             send_status(
@@ -1535,7 +1534,6 @@ impl RtcSessions {
         if signal.protocol_version != Some(1) {
             return;
         }
-        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
             tracing::warn!(signal_id = %signal.signal_id, "rejecting invalid host rtc offer binding");

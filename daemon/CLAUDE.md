@@ -504,7 +504,11 @@ captured at admission — after a reconnect that is a socket nobody reads,
 which is where every input-activity ping from a surviving peer went. The
 ping goes out on `registered_sender`, the live connection once registered;
 `PairContext.out_tx` and the `out_tx` a session handler is built with are
-the offer's; nothing sends through them once the peer is admitted. A status deferred for that, or for
+the offer's; nothing sends through them once the peer is admitted. Nor
+does an offer handler install its `out_tx` as the signalling sender:
+`run.rs` installs each control connection's at connect, and an offer job,
+which outlives the dispatch loop that queued it, can start after the next
+connect and would put a dead sender back. A status deferred for that, or for
 want of channel room, is retried from the control connection's heartbeat
 once registration's replay has run; at reconnect a deferred terminal
 status is replayed only for a binding the register frame carried (the
