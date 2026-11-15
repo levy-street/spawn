@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, expect, type Mock, spyOn, test } from "bun:test";
-import type { ChannelWatchTiming } from "./channel-watch";
+import { afterEach, beforeEach, expect, jest, type Mock, spyOn, test } from "bun:test";
+import { CHANNEL_WATCH_TIMING, type ChannelWatchTiming } from "./channel-watch";
 import { DaemonSendScheduler, RemoteDaemonChannel } from "./daemon-channel";
 import { type DaemonSnapshot, SharedDaemonConnection } from "./daemon-connection";
 import type { HostControlClient, HostControlState } from "./hostControl";
@@ -180,12 +180,14 @@ class Root {
   }
   /** A fresh peer on the same client, as `HostControlClient.rebuildPeer`: the
    *  old one's readiness ends at once, the new one is ready a moment later. */
+  /** False holds the replacement peer short of ready. */
+  readyAfterRebuild = true;
   rebuildPeer() {
     if (this.state !== "ready") return false;
     this.rebuilds++;
     this.generation = crypto.randomUUID();
     this.setState("open");
-    setTimeout(() => this.setState("ready"), 5);
+    if (this.readyAfterRebuild) setTimeout(() => this.setState("ready"), 5);
     return true;
   }
   /** Channels the watch opened itself: consumers in these tests use `spawn.ctl`. */
@@ -249,6 +251,7 @@ beforeEach(() => {
   warn = spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(async () => {
+  jest.useRealTimers();
   for (const connection of connections.splice(0)) connection.close();
   await Bun.sleep(2);
   Bus.instances.clear();
@@ -575,47 +578,57 @@ test("a connection that retires itself says so, so its provider can rebuild it",
   expect(connection.getSnapshot().state).toBe("closed");
 });
 
-// Short enough to run, in the same proportions as CHANNEL_WATCH_TIMING.
-const WATCH: ChannelWatchTiming = {
-  unansweredMs: 40,
-  abandonedAfterMs: 20,
-  probeMs: 40,
-  rootSilenceMs: 80,
-  rebuildBackoffMs: 300,
-  rebuildBackoffCapMs: 1200,
-};
-const WATCHING = { heartbeatMs: 2_000, ownerSilenceMs: 10_000, watch: WATCH };
-/** Long enough for a suspicion, its probe and its ping to have run out. */
-const WATCH_ROUND = WATCH.unansweredMs + WATCH.probeMs + WATCH.rootSilenceMs + 40;
+// The channel watch at the owner, on fake timers and the production timings.
+const T = CHANNEL_WATCH_TIMING;
+/** From a channel's open to the rebuild, when the root still answers. */
+const WEDGE_TO_REBUILD = T.unansweredMs + 2 * T.probeMs;
 
+/** Move the fake clock, letting the tabs' promise and microtask hops run. */
+async function advance(ms: number, step = 50) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    jest.advanceTimersByTime(Math.min(step, end - performance.now()));
+    for (let turn = 0; turn < 8; turn++) await Promise.resolve();
+  }
+}
+async function within(predicate: () => boolean, maxMs = 60_000) {
+  const end = performance.now() + maxMs;
+  while (!predicate() && performance.now() < end) await advance(10, 10);
+  expect(predicate()).toBe(true);
+}
 function heardOn(channel: ReturnType<SharedDaemonConnection["createChannel"]>) {
   const heard: unknown[] = [];
   channel.onmessage = ({ data }) => heard.push(data);
   return heard;
 }
+async function readyPair() {
+  jest.useFakeTimers();
+  const owner = connect();
+  const follower = connect();
+  await within(() => follower.getSnapshot().state === "ready", 1_000);
+  return { owner, follower, root: roots[0] };
+}
 
 test("a peer that stops opening channels is rebuilt once, and its views open again on the new one", async () => {
-  connect("account:host", undefined, undefined, WATCHING);
-  const follower = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => follower.getSnapshot().state === "ready");
-  const root = roots[0];
+  const { follower, root } = await readyPair();
   const seen: DaemonSnapshot[] = [];
   follower.subscribe(() => seen.push(follower.getSnapshot()));
-
   root.daemon = speaks;
   const live = follower.createChannel(label("ctl"));
   const liveHeard = heardOn(live);
-  await until(() => liveHeard.length === 1);
+  await within(() => liveHeard.length === 1, 1_000);
   const before = follower.getSnapshot().generation;
   const firstPeer = root.channels[0].generation;
 
   // The daemon stops accepting channels. The peer and its root carry on.
   root.daemon = silent;
+  const opened = performance.now();
   const stuck = follower.createChannel(label("ctl"));
-  await until(() => root.rebuilds === 1);
-  expect(root.probes()).toHaveLength(1);
+  await within(() => root.rebuilds === 1);
+  expect(performance.now() - opened).toBeGreaterThanOrEqual(WEDGE_TO_REBUILD);
+  expect(root.probes()).toHaveLength(2);
   expect(root.pings).toBe(1);
-  await until(
+  await within(
     () => follower.getSnapshot().state === "ready" && follower.getSnapshot().generation !== before,
   );
   // Every view on the old peer was retired with it ...
@@ -629,11 +642,11 @@ test("a peer that stops opening channels is rebuilt once, and its views open aga
   root.daemon = speaks;
   const reopened = follower.createChannel(label("ctl"));
   const reopenedHeard = heardOn(reopened);
-  await until(() => reopenedHeard.length === 1);
+  await within(() => reopenedHeard.length === 1, 1_000);
   expect(root.channels.at(-1)?.generation).toBe(root.generation);
   expect(root.channels.at(-1)?.generation).not.toBe(firstPeer);
 
-  await Bun.sleep(WATCH_ROUND);
+  await advance(10 * 60_000, 500);
   expect(root.rebuilds).toBe(1);
   expect(roots).toHaveLength(1);
   expect(warn).toHaveBeenCalledTimes(1);
@@ -641,15 +654,14 @@ test("a peer that stops opening channels is rebuilt once, and its views open aga
 });
 
 test("a refused channel is an answer: refusals never probe or rebuild", async () => {
-  const connection = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => connection.getSnapshot().state === "ready");
-  const root = roots[0];
+  const { follower, root } = await readyPair();
   root.daemon = refuses;
   for (let attempt = 0; attempt < 4; attempt++) {
-    const refused = connection.createChannel(label("ctl"));
-    await until(() => refused.readyState === "closed");
+    const refused = follower.createChannel(label("ctl"));
+    await within(() => refused.readyState === "closed", 1_000);
+    await advance(T.unansweredMs / 2);
   }
-  await Bun.sleep(WATCH_ROUND);
+  await advance(2 * WEDGE_TO_REBUILD);
   expect(root.probes()).toHaveLength(0);
   expect(root.pings).toBe(0);
   expect(root.rebuilds).toBe(0);
@@ -657,118 +669,127 @@ test("a refused channel is an answer: refusals never probe or rebuild", async ()
 });
 
 test("a slow session on a working peer is probed, not rebuilt", async () => {
-  const connection = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => connection.getSnapshot().state === "ready");
-  const root = roots[0];
+  const { follower, root } = await readyPair();
   // The session's channel waits on its worker; anything else is accepted.
   root.daemon = (dc) => {
     if (dc.label.startsWith("spawn.host.ctl/")) speaks(dc);
   };
-  const slow = connection.createChannel(label("ctl"));
-  await until(() => root.probes().length === 1);
-  await until(() => root.probes()[0].readyState === "closed");
-  await Bun.sleep(WATCH_ROUND);
+  const slow = follower.createChannel(label("ctl"));
+  await within(() => root.probes().length === 1);
+  await within(() => root.probes()[0].readyState === "closed", 1_000);
+  await advance(2 * WEDGE_TO_REBUILD);
   expect(root.rebuilds).toBe(0);
   expect(root.pings).toBe(0);
   expect(slow.readyState).toBe("open");
-  // The session answering late is still an answer.
-  root.channels[0].onmessage?.({ data: '{"event":"ready"}' });
-  expect(connection.getSnapshot().state).toBe("ready");
 });
 
-test("a peer whose root falls silent with its channels is replaced once the root's window has passed", async () => {
-  // An old daemon's association stops acknowledging anything once channels
-  // pile up behind its dead acceptor: the root goes quiet with them.
-  const connection = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => connection.getSnapshot().state === "ready");
-  const root = roots[0];
-  root.rootAnswers = false;
-  connection.createChannel(label("ctl"));
-  await until(() => root.pings === 1);
-  await Bun.sleep(WATCH.rootSilenceMs / 2);
-  expect(root.rebuilds).toBe(0);
-  await until(() => root.rebuilds === 1);
-  expect(root.probes().every((probe) => probe.readyState === "closed")).toBe(true);
-  expect(String(warn.mock.calls[0]?.[0])).toContain("did not answer a ping");
-});
-
-test("a host that answers the probe late, inside the root's window, is left alone", async () => {
-  const connection = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => connection.getSnapshot().state === "ready");
-  const root = roots[0];
-  // Slow everywhere: the root is not answering yet, and the probe's hello
-  // comes after the probe's own window but before the root's runs out.
-  root.rootAnswers = false;
+test("a probe's hello slower than the root's pong leaves a working peer alone", async () => {
+  const { follower, root } = await readyPair();
+  // The root answers at once; the first probe's hello comes five seconds
+  // after the second probe opens (a busy admission lock, a slow home mount).
   root.daemon = (dc) => {
-    if (dc.label.startsWith("spawn.host.ctl/"))
-      setTimeout(() => speaks(dc), WATCH.probeMs + WATCH.rootSilenceMs / 2);
+    if (dc.label.startsWith("spawn.host.ctl/") && root.probes()[0] === dc)
+      setTimeout(() => speaks(dc), T.probeMs + 5_000);
   };
-  connection.createChannel(label("ctl"));
-  await until(() => root.pings === 1);
-  await Bun.sleep(WATCH_ROUND);
+  follower.createChannel(label("ctl"));
+  await within(() => root.pings === 1);
+  await advance(2 * WEDGE_TO_REBUILD);
+  expect(root.probes()).toHaveLength(2);
   expect(root.rebuilds).toBe(0);
   expect(warn).not.toHaveBeenCalled();
 });
 
+test("a peer whose root falls silent with its channels is replaced after two silent pings", async () => {
+  // An old daemon's association stops acknowledging anything once channels
+  // pile up behind its dead acceptor: the root goes quiet with them.
+  const { follower, root } = await readyPair();
+  root.rootAnswers = false;
+  const opened = performance.now();
+  follower.createChannel(label("ctl"));
+  await within(() => root.pings === 2);
+  expect(root.rebuilds).toBe(0);
+  await within(() => root.rebuilds === 1);
+  expect(performance.now() - opened).toBeGreaterThanOrEqual(
+    T.unansweredMs + T.probeMs + 2 * T.rootSilenceMs,
+  );
+  expect(root.probes().every((probe) => probe.readyState === "closed")).toBe(true);
+  expect(String(warn.mock.calls[0]?.[0])).toContain("did not answer two pings");
+});
+
 test("two tabs waiting on one dead peer rebuild it once", async () => {
-  const owner = connect("account:host", undefined, undefined, WATCHING);
-  const follower = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => follower.getSnapshot().state === "ready");
-  const root = roots[0];
+  const { owner, follower, root } = await readyPair();
   for (let view = 0; view < 3; view++) {
     owner.createChannel(label("ctl"));
     follower.createChannel(label("ctl"));
   }
-  await until(() => root.rebuilds === 1);
-  await Bun.sleep(WATCH_ROUND);
-  expect(root.probes()).toHaveLength(1);
+  await within(() => root.rebuilds === 1);
+  await advance(2 * WEDGE_TO_REBUILD);
+  expect(root.probes()).toHaveLength(2);
   expect(root.rebuilds).toBe(1);
   expect(roots).toHaveLength(1);
 });
 
-test("a peer that keeps failing is rebuilt at most once per backoff, which doubles", async () => {
-  const connection = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => connection.getSnapshot().state === "ready");
-  const root = roots[0];
-  const rebuiltAt: number[] = [];
-  const rebuild = root.rebuildPeer.bind(root);
-  root.rebuildPeer = () => {
-    rebuiltAt.push(Date.now());
-    return rebuild();
+test("an owner tab closed mid-rebuild hands over a fresh connection, not a stuck notice", async () => {
+  const { owner, follower, root } = await readyPair();
+  root.readyAfterRebuild = false;
+  follower.createChannel(label("ctl"));
+  await within(() => root.rebuilds === 1);
+  await within(() => follower.getSnapshot().rebuilding === true, 1_000);
+  owner.close();
+  await within(() => roots.length === 2 && follower.getSnapshot().state === "ready");
+  expect(root.closed).toBe(true);
+  expect(follower.getSnapshot().generation).toBe(roots[1].generation);
+  expect(follower.getSnapshot().rebuilding).toBeUndefined();
+  roots[1].daemon = speaks;
+  const reopened = follower.createChannel(label("ctl"));
+  const heard = heardOn(reopened);
+  await within(() => heard.length === 1, 1_000);
+  await advance(2 * WEDGE_TO_REBUILD);
+  expect(roots[1].rebuilds).toBe(0);
+});
+
+test("a reattach burst bigger than an old daemon's accept queue is slow, not a wedge", async () => {
+  const { follower, root } = await readyPair();
+  follower.createChannel(label("ctl"));
+  await within(() => root.rebuilds === 1);
+  await within(() => follower.getSnapshot().state === "ready");
+  // The replacement's acceptor is alive, but the old SCTP queues only sixteen
+  // streams; the rest wait for a retransmission once it drains, here longer
+  // than a channel's ten seconds.
+  let accepted = 0;
+  root.daemon = (dc) => {
+    if (dc.label.startsWith("spawn.host.ctl/") || ++accepted % 20 <= 16) speaks(dc);
+    else setTimeout(() => speaks(dc), T.unansweredMs + 2_000);
   };
-  // A view that keeps retrying, as a terminal does, on peers that never accept.
-  let stop = false;
-  const retrying = (async () => {
-    while (!stop) {
-      if (connection.getSnapshot().state === "ready") {
-        const channel = connection.createChannel(label("ctl"));
-        await Bun.sleep(WATCH.unansweredMs + 5);
-        channel.close();
-      } else await Bun.sleep(2);
-    }
-  })();
-  await until(() => rebuiltAt.length === 3, 3_000);
-  stop = true;
-  await retrying;
-  expect(rebuiltAt[1] - rebuiltAt[0]).toBeGreaterThanOrEqual(WATCH.rebuildBackoffMs);
-  expect(rebuiltAt[2] - rebuiltAt[1]).toBeGreaterThanOrEqual(2 * WATCH.rebuildBackoffMs);
-  expect(warn).toHaveBeenCalledTimes(3);
-  expect(String(warn.mock.calls[2]?.[0])).toContain("3 in a row");
+  const burst = () =>
+    Array.from({ length: 20 }, () => heardOn(follower.createChannel(label("ctl"))));
+  // Right after the rebuild the backoff holds any suspicion ...
+  const reattached = burst();
+  await within(() => reattached.every((heard) => heard.length === 1));
+  expect(root.probes()).toHaveLength(2);
+  // ... and once it has passed, the probes find the acceptor alive.
+  await advance(T.rebuildBackoffMs);
+  const later = burst();
+  await within(() => later.every((heard) => heard.length === 1));
+  await advance(2 * WEDGE_TO_REBUILD);
+  expect(root.probes().length).toBeGreaterThanOrEqual(3);
+  expect(root.probes().every((probe) => probe.readyState === "closed")).toBe(true);
+  expect(root.rebuilds).toBe(1);
+  expect(warn).toHaveBeenCalledTimes(1);
 });
 
 test("a view given up on after the abandon threshold raises suspicion; one closed sooner does not", async () => {
-  const connection = connect("account:host", undefined, undefined, WATCHING);
-  await until(() => connection.getSnapshot().state === "ready");
-  const root = roots[0];
-  const early = connection.createChannel(label("ctl"));
-  await until(() => root.channels.length === 1);
+  const { follower, root } = await readyPair();
+  const early = follower.createChannel(label("ctl"));
+  await within(() => root.channels.length === 1, 1_000);
+  await advance(T.abandonedAfterMs - 1_000);
   early.close();
-  await Bun.sleep(WATCH.unansweredMs + 10);
+  await advance(2 * T.unansweredMs);
   expect(root.probes()).toHaveLength(0);
 
-  const late = connection.createChannel(label("ctl"));
-  await until(() => root.channels.length === 2);
-  await Bun.sleep(WATCH.abandonedAfterMs + 5);
+  const late = follower.createChannel(label("ctl"));
+  await within(() => root.channels.length === 2, 1_000);
+  await advance(T.abandonedAfterMs);
   late.close();
-  await until(() => root.probes().length === 1);
+  await within(() => root.probes().length === 1, 1_000);
 });

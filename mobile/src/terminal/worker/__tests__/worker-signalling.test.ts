@@ -33,6 +33,8 @@ function moduleSource(marker: string): string {
 
 const TRANSPORT_SOURCE = moduleSource("const CHANNEL_OPTIONS = Object.freeze({ ordered: true })");
 const HOST_SOURCE = moduleSource("const host = { binding: false, channel: false, hello: false }");
+const WATCH_SOURCE = moduleSource("const DAEMON_SPEAKS_FIRST = ");
+const PAIR_SOURCE = moduleSource("const MAX_RECEIVE = 2 * 1024 * 1024");
 
 interface FakeChannel {
   label: string;
@@ -386,6 +388,58 @@ describe("host-scoped signalling", () => {
     });
 
     expect(FakePeerConnection.last?.remoteDescription).toBeNull();
+  });
+});
+
+describe("the channel watch on the worker's real peer", () => {
+  test("a peer that leaves `connected` and comes back forgets what it was waiting on; one that stays probes", async () => {
+    jest.useFakeTimers();
+    try {
+      for (const leaves of [true, false]) {
+        const harness = createHarness("host");
+        new Function(WATCH_SOURCE)();
+        new Function(PAIR_SOURCE)();
+        const pairs = harness as unknown as {
+          handlePairMessage(message: Record<string, unknown>): boolean;
+          closePairChannels(): void;
+        };
+        await connect(harness);
+        await signOffer(harness);
+        await harness.handleTransportMessage?.({ type: "signal-frame", frame: answerFrame() });
+        const pc = FakePeerConnection.last;
+        if (!pc) throw new Error("no peer");
+        pc.connectionState = "connected";
+        const root = pc.channels[0];
+        if (root) root.readyState = "open";
+        pairs.handlePairMessage({
+          type: "pair-attach",
+          attachmentId: "00000000-0000-4000-8000-000000000001",
+          sessionId: SESSION_ID,
+          viewId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        });
+        expect(pc.channels.map((channel) => channel.label.split("/")[0])).toEqual([
+          "spawn.host.ctl",
+          "spawn.pty",
+          "spawn.ctl",
+        ]);
+        await jest.advanceTimersByTimeAsync(5_000);
+        if (leaves) {
+          // A short blip: ICE recovers the same peer before its restart.
+          pc.connectionState = "disconnected";
+          pc.onconnectionstatechange?.();
+          await jest.advanceTimersByTimeAsync(1_000);
+          pc.connectionState = "connected";
+          pc.onconnectionstatechange?.();
+        }
+        await jest.advanceTimersByTimeAsync(9_000);
+        const probes = pc.channels.filter((channel) => channel.label.startsWith("spawn.host.ctl/"));
+        expect(probes).toHaveLength(leaves ? 0 : 1);
+        pairs.closePairChannels();
+        await harness.handleTransportMessage?.({ type: "close" });
+      }
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 

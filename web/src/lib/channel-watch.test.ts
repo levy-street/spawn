@@ -1,20 +1,17 @@
-import { afterEach, beforeEach, expect, type Mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, jest, type Mock, spyOn, test } from "bun:test";
 import {
   CHANNEL_WATCH_TIMING,
   ChannelOpenWatch,
-  type ChannelWatchTiming,
   REBUILDING_MESSAGE,
   type WatchedPeer,
 } from "./channel-watch";
 
-const TIMING: ChannelWatchTiming = {
-  unansweredMs: 20,
-  abandonedAfterMs: 10,
-  probeMs: 20,
-  rootSilenceMs: 40,
-  rebuildBackoffMs: 100,
-  rebuildBackoffCapMs: 250,
-};
+// Every test runs on fake timers with the production timings: what is
+// asserted is exactly what a person's browser would do, without wall-clock
+// sleeps that a loaded runner could stretch.
+const T = CHANNEL_WATCH_TIMING;
+const SUSPECT = T.unansweredMs;
+const PROOF = 2 * T.probeMs;
 
 class Probe {
   closed = false;
@@ -30,101 +27,181 @@ class Probe {
 class Peer implements WatchedPeer {
   probes: Probe[] = [];
   pings = 0;
+  /** How the root answers a ping: at once, after a delay, never, or not sent at all. */
+  root: "answers" | "silent" | "fails" | number = "answers";
+  /** After how long the n-th probe hears a hello; null, never. */
+  hello: (index: number) => number | null = () => null;
   rebuiltAt: number[] = [];
+  onRebuild: () => void = () => {};
   openProbe(label: string) {
     const probe = new Probe(label);
+    const delay = this.hello(this.probes.length);
     this.probes.push(probe);
+    if (delay !== null) setTimeout(() => probe.onmessage?.(), delay);
     return probe as unknown as RTCDataChannel;
   }
-  /** "fails" rejects at once, as a ping that could not be sent does. */
-  root: "answers" | "silent" | "fails" = "answers";
   ping(timeoutMs: number) {
     this.pings++;
-    if (this.root === "answers") return Promise.resolve({ pong: true });
-    if (this.root === "fails") return Promise.reject(new Error("not ready"));
-    return new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), timeoutMs));
+    const root = this.root;
+    if (root === "answers") return Promise.resolve({ pong: true });
+    if (root === "fails") return Promise.reject(new Error("not ready"));
+    return new Promise((resolve, reject) => {
+      if (typeof root === "number" && root < timeoutMs) setTimeout(() => resolve({}), root);
+      else setTimeout(() => reject(new Error("timed out")), timeoutMs);
+    });
   }
   rebuild() {
-    this.rebuiltAt.push(Date.now());
+    this.rebuiltAt.push(performance.now());
+    this.onRebuild();
     return true;
   }
 }
 
 const ctl = () => `spawn.ctl/${crypto.randomUUID()}/${crypto.randomUUID()}/${crypto.randomUUID()}`;
 const pty = () => `spawn.pty/${crypto.randomUUID()}/${crypto.randomUUID()}/${crypto.randomUUID()}`;
-async function until(predicate: () => boolean, timeoutMs = 1000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate() && Date.now() < deadline) await Bun.sleep(2);
-  expect(predicate()).toBe(true);
+
+/** Move the fake clock, letting promise callbacks run between timers. */
+async function advance(ms: number, step = 50) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    jest.advanceTimersByTime(Math.min(step, end - performance.now()));
+    for (let turn = 0; turn < 6; turn++) await Promise.resolve();
+  }
 }
 
 let warn: Mock<typeof console.warn>;
 const watches: ChannelOpenWatch[] = [];
 function watching(peer: Peer) {
-  const watch = new ChannelOpenWatch(peer, "host-under-test", TIMING);
+  const watch = new ChannelOpenWatch(peer, "host-under-test", T);
   watches.push(watch);
   return watch;
 }
 beforeEach(() => {
+  jest.useFakeTimers();
   warn = spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(() => {
   for (const watch of watches.splice(0)) watch.close();
+  jest.useRealTimers();
   warn.mockRestore();
 });
 
 test("the production timings keep the order the trigger depends on", () => {
-  const t = CHANNEL_WATCH_TIMING;
   // A terminal gives up on an open after ten seconds; a give-up that late
   // has to count, and the watch's own deadline must not come after it.
-  expect(t.abandonedAfterMs).toBeLessThan(10_000);
-  expect(t.unansweredMs).toBeLessThanOrEqual(10_000);
-  // A silent root gets longer than the probe did: that path is the one a
-  // merely slow host could reach, so it asks for the most evidence.
-  expect(t.rootSilenceMs).toBeGreaterThan(t.probeMs);
-  expect(t.rebuildBackoffMs).toBeGreaterThan(t.unansweredMs + t.probeMs);
-  expect(t.rebuildBackoffCapMs).toBeGreaterThanOrEqual(t.rebuildBackoffMs);
+  expect(T.abandonedAfterMs).toBeLessThan(10_000);
+  expect(T.unansweredMs).toBeLessThanOrEqual(10_000);
+  // A silent root, the path a merely slow host could reach, asks for the most.
+  expect(T.rootSilenceMs).toBeGreaterThan(T.probeMs);
+  expect(T.rebuildBackoffCapMs).toBeGreaterThanOrEqual(T.rebuildBackoffMs);
+  // A run ends no sooner than the longest the watch ever waits between rebuilds.
+  expect(T.runQuietMs).toBeGreaterThanOrEqual(T.rebuildBackoffCapMs);
 });
 
 test("the notice says the same as the phone's, word for word", () => {
   expect(REBUILDING_MESSAGE).toBe(
-    "The connection stopped opening terminals. SPAWN D is making a new one.",
+    "The connection stopped opening new terminals and tools. SPAWN D is making a new one.",
   );
+});
+
+test("a real wedge: two silent probes while the root answers rebuild, thirty seconds after the open", async () => {
+  const peer = new Peer();
+  watching(peer).opened("stuck", ctl());
+  const opened = performance.now();
+  await advance(SUSPECT);
+  expect(peer.probes).toHaveLength(1);
+  await advance(T.probeMs);
+  expect(peer.probes).toHaveLength(2);
+  expect(peer.pings).toBe(1);
+  // The root answered at once; the second probe still gets its full window.
+  await advance(T.probeMs - 100);
+  expect(peer.rebuiltAt).toHaveLength(0);
+  await advance(100);
+  expect(peer.rebuiltAt).toEqual([opened + SUSPECT + PROOF]);
+  expect(peer.probes.every((probe) => probe.closed)).toBe(true);
+  expect(String(warn.mock.calls[0]?.[0])).toBe(
+    "SPAWN D: host host-under-test: no new channel opens on its connection (one waited 10.0 s, " +
+      "two probes 20.0 s, while the root channel answered a ping in 0 ms); " +
+      "making a new connection (1 in a row).",
+  );
+});
+
+test("a hello slower than the pong on a working peer stands the watch down", async () => {
+  // The first probe's hello comes five seconds after the root's pong; or only
+  // the second probe is answered, late in its window.
+  for (const hello of [
+    (index: number) => (index === 0 ? T.probeMs + 5_000 : null),
+    (index: number) => (index === 1 ? T.probeMs - 2_000 : null),
+  ]) {
+    const peer = new Peer();
+    peer.hello = hello;
+    watching(peer).opened("slow", ctl());
+    await advance(SUSPECT + PROOF + 2 * T.rootSilenceMs);
+    expect(peer.pings).toBe(1);
+    expect(peer.rebuiltAt).toHaveLength(0);
+    expect(peer.probes.every((probe) => probe.closed)).toBe(true);
+  }
+  // A hello slower than both windows is what patience cannot tell from a
+  // wedge: that one host is rebuilt.
+  const slowest = new Peer();
+  slowest.hello = (index) => (index === 0 ? PROOF + 1_000 : null);
+  watching(slowest).opened("slowest", ctl());
+  await advance(SUSPECT + PROOF + 2_000);
+  expect(slowest.rebuiltAt).toHaveLength(1);
 });
 
 test("a pty channel's silence is not a symptom", async () => {
   const peer = new Peer();
-  const watch = watching(peer);
-  watch.opened("quiet-shell", pty());
-  await Bun.sleep(TIMING.unansweredMs * 2);
+  watching(peer).opened("quiet-shell", pty());
+  await advance(5 * SUSPECT);
   expect(peer.probes).toHaveLength(0);
 });
 
-test("an answer anywhere while the probe waits ends it, and nothing is rebuilt", async () => {
+test("an answer on any watched channel while the probes wait ends them", async () => {
   const peer = new Peer();
   const watch = watching(peer);
   watch.opened("stuck", ctl());
-  await until(() => peer.probes.length === 1);
-  // Another view's channel, opened while the probe waits, is answered.
+  await advance(SUSPECT + T.probeMs + 1_000);
+  expect(peer.probes).toHaveLength(2);
   watch.opened("later", ctl());
   watch.answered("later");
-  expect(peer.probes[0].closed).toBe(true);
-  await Bun.sleep(TIMING.probeMs + TIMING.rootSilenceMs + 10);
-  expect(peer.pings).toBe(0);
+  expect(peer.probes.every((probe) => probe.closed)).toBe(true);
+  await advance(PROOF + 2 * T.rootSilenceMs);
   expect(peer.rebuiltAt).toHaveLength(0);
 });
 
-test("the probe's own hello or refusal is an answer", async () => {
-  for (const answer of ["onmessage", "onclose"] as const) {
-    const peer = new Peer();
-    const watch = watching(peer);
-    watch.opened(answer, ctl());
-    await until(() => peer.probes.length === 1);
-    peer.probes[0][answer]?.();
-    await Bun.sleep(TIMING.probeMs + TIMING.rootSilenceMs + 10);
-    expect(peer.pings).toBe(0);
-    expect(peer.rebuiltAt).toHaveLength(0);
-  }
+test("a silent root gets two pings before the peer is replaced; one that never left is no evidence", async () => {
+  const silent = new Peer();
+  silent.root = "silent";
+  watching(silent).opened("stuck", ctl());
+  const opened = performance.now();
+  await advance(SUSPECT + T.probeMs + T.rootSilenceMs);
+  expect(silent.pings).toBe(2);
+  expect(silent.rebuiltAt).toHaveLength(0);
+  await advance(T.rootSilenceMs);
+  expect(silent.rebuiltAt).toEqual([opened + SUSPECT + T.probeMs + 2 * T.rootSilenceMs]);
+  expect(String(warn.mock.calls.at(-1)?.[0])).toContain(
+    "and the root channel did not answer two pings in 40.0 s",
+  );
+
+  // A root that answers its second ping late, the probes still silent: rebuilt then.
+  const late = new Peer();
+  late.ping = (timeoutMs) =>
+    ++late.pings === 1
+      ? new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), timeoutMs))
+      : new Promise((resolve) => setTimeout(() => resolve({}), 3_000));
+  watching(late).opened("stuck", ctl());
+  const lateOpened = performance.now();
+  await advance(SUSPECT + T.probeMs + T.rootSilenceMs + 3_000 + 100);
+  expect(late.rebuiltAt).toEqual([lateOpened + SUSPECT + T.probeMs + T.rootSilenceMs + 3_000]);
+
+  const unsent = new Peer();
+  unsent.root = "fails";
+  watching(unsent).opened("stuck", ctl());
+  await advance(SUSPECT + PROOF + 2 * T.rootSilenceMs);
+  expect(unsent.pings).toBe(1);
+  expect(unsent.rebuiltAt).toHaveLength(0);
+  expect(unsent.probes.every((probe) => probe.closed)).toBe(true);
 });
 
 test("readiness ending forgets what was pending without suspecting anything", async () => {
@@ -132,61 +209,85 @@ test("readiness ending forgets what was pending without suspecting anything", as
   const watch = watching(peer);
   watch.opened("pending", ctl());
   watch.reset();
-  await Bun.sleep(TIMING.unansweredMs * 2);
+  await advance(2 * SUSPECT);
   expect(peer.probes).toHaveLength(0);
   watch.opened("probed", ctl());
-  await until(() => peer.probes.length === 1);
+  await advance(SUSPECT + T.probeMs + 1_000);
   watch.reset();
-  expect(peer.probes[0].closed).toBe(true);
-  await Bun.sleep(TIMING.probeMs + TIMING.rootSilenceMs + 10);
+  expect(peer.probes.map((probe) => probe.closed)).toEqual([true, true]);
+  await advance(PROOF + 2 * T.rootSilenceMs);
   expect(peer.rebuiltAt).toHaveLength(0);
 });
 
-test("rebuilds in a row back off, doubling to a cap; an answer starts the run over", async () => {
+test("a fault a new peer does not fix: rebuilds back off 30 s, 60 s, 120 s, 240 s, then 5 min, though views reattach and are answered each time", async () => {
   const peer = new Peer();
   const watch = watching(peer);
-  let stop = false;
-  const failing = (async () => {
-    for (let n = 0; !stop; n++) {
-      watch.opened(`attempt-${n}`, ctl());
-      await Bun.sleep(TIMING.unansweredMs + 2);
-    }
-  })();
-  await until(() => peer.rebuiltAt.length === 4, 3_000);
-  stop = true;
-  await failing;
+  let views = 0;
+  // As the owner does: readiness ends, then views reattach on the new peer
+  // and the daemon answers them before the fault comes back.
+  peer.onRebuild = () => {
+    queueMicrotask(() => {
+      watch.reset();
+      for (let view = 0; view < 3; view++) {
+        const id = `reattached-${++views}`;
+        watch.opened(id, ctl());
+        watch.answered(id);
+      }
+    });
+  };
+  // A terminal that keeps retrying, as one does, and is never answered.
+  let attempt = 0;
+  const retry = () => {
+    watch.opened(`stuck-${++attempt}`, ctl());
+    setTimeout(retry, SUSPECT + 500);
+  };
+  retry();
+  await advance(30 * 60_000, 250);
   const gaps = peer.rebuiltAt.slice(1).map((at, index) => at - peer.rebuiltAt[index]);
-  expect(gaps[0]).toBeGreaterThanOrEqual(TIMING.rebuildBackoffMs);
-  expect(gaps[1]).toBeGreaterThanOrEqual(2 * TIMING.rebuildBackoffMs);
-  expect(gaps[2]).toBeGreaterThanOrEqual(TIMING.rebuildBackoffCapMs);
-  expect(gaps[2]).toBeLessThan(TIMING.rebuildBackoffCapMs + 4 * TIMING.unansweredMs);
-  expect(String(warn.mock.calls[3]?.[0])).toContain("4 in a row");
-
-  // A channel answered after that resets the run, though not the gap the
-  // last rebuild set.
-  watch.opened("answered", ctl());
-  watch.answered("answered");
-  await Bun.sleep(TIMING.rebuildBackoffCapMs);
-  watch.opened("after", ctl());
-  await until(() => peer.rebuiltAt.length === 5);
-  expect(String(warn.mock.calls[4]?.[0])).toContain("1 in a row");
-  expect(String(warn.mock.calls[4]?.[0])).toContain("host host-under-test");
+  expect(gaps.length).toBeGreaterThanOrEqual(6);
+  expect(gaps[0]).toBeGreaterThanOrEqual(T.rebuildBackoffMs);
+  expect(gaps[1]).toBeGreaterThanOrEqual(2 * T.rebuildBackoffMs);
+  expect(gaps[2]).toBeGreaterThanOrEqual(4 * T.rebuildBackoffMs);
+  expect(gaps[3]).toBeGreaterThanOrEqual(8 * T.rebuildBackoffMs);
+  // Capped: never more than five minutes plus one detection round apart.
+  for (const gap of gaps.slice(4)) {
+    expect(gap).toBeGreaterThanOrEqual(T.rebuildBackoffCapMs);
+    expect(gap).toBeLessThan(T.rebuildBackoffCapMs + SUSPECT + 500 + PROOF + 1_000);
+  }
+  expect(String(warn.mock.calls.at(-1)?.[0])).toContain(`(${peer.rebuiltAt.length} in a row)`);
 });
 
-test("a root silent for its whole window is replaced too; a ping that never left is no evidence", async () => {
-  const silent = new Peer();
-  silent.root = "silent";
-  watching(silent).opened("stuck", ctl());
-  await until(() => silent.pings === 1);
-  expect(silent.rebuiltAt).toHaveLength(0);
-  await until(() => silent.rebuiltAt.length === 1);
-  expect(String(warn.mock.calls.at(-1)?.[0])).toContain("did not answer a ping for");
+test("a replacement that stays healthy for five minutes ends the run", async () => {
+  const peer = new Peer();
+  const watch = watching(peer);
+  peer.onRebuild = () => queueMicrotask(() => watch.reset());
+  // A fault that keeps coming back, until three rebuilds in a row.
+  for (let attempt = 0; peer.rebuiltAt.length < 3; attempt++) {
+    watch.opened(`stuck-${attempt}`, ctl());
+    await advance(SUSPECT + 500);
+  }
+  await advance(PROOF);
+  expect(String(warn.mock.calls.at(-1)?.[0])).toContain("(3 in a row)");
+  // Five healthy minutes, then the fault again: back to the first rung.
+  await advance(T.runQuietMs);
+  const before = performance.now();
+  watch.opened("again", ctl());
+  await advance(SUSPECT + PROOF + 100);
+  expect(peer.rebuiltAt).toHaveLength(4);
+  expect(peer.rebuiltAt[3]).toBe(before + SUSPECT + PROOF);
+  expect(String(warn.mock.calls.at(-1)?.[0])).toContain("(1 in a row)");
+});
 
-  const unsent = new Peer();
-  unsent.root = "fails";
-  watching(unsent).opened("stuck", ctl());
-  await until(() => unsent.pings === 1);
-  await Bun.sleep(TIMING.rootSilenceMs + 20);
-  expect(unsent.rebuiltAt).toHaveLength(0);
-  expect(unsent.probes[0]?.closed).toBe(true);
+test("a view given up on after the abandon threshold raises suspicion; one closed sooner does not", async () => {
+  const peer = new Peer();
+  const watch = watching(peer);
+  watch.opened("early", ctl());
+  await advance(T.abandonedAfterMs - 1_000);
+  watch.abandoned("early");
+  await advance(2 * SUSPECT);
+  expect(peer.probes).toHaveLength(0);
+  watch.opened("late", ctl());
+  await advance(T.abandonedAfterMs);
+  watch.abandoned("late");
+  expect(peer.probes).toHaveLength(1);
 });

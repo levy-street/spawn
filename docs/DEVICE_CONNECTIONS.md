@@ -57,32 +57,51 @@ tab (`web/src/lib/channel-watch.ts`), the phone's host worker
 the daemon speaks on first, a terminal's `spawn.ctl/…` and a tool's
 `spawn.host.ctl/<id>`. One the daemon neither speaks on nor closes for ten
 seconds (in the browser, also one a view gave up on after five) makes the peer
-suspect, and the holder opens one host-control channel of its own as a probe,
-which the daemon greets without any session involved. A probe silent for ten
-seconds is weighed against one root `ping`: the holder replaces the peer when
-the root answers while the probe is still silent (channels are not being
-accepted), or when the root stays silent for twenty seconds as well (an old
-daemon's association stops acknowledging anything once channels pile up behind
-its dead acceptor). It sends `rtc.close` for the old binding and offers a fresh
-peer on the same signalling socket; views and tools attach again as after any
-reconnect. Only an answer stands the watch down: a refusal is one — the daemon
-closes a channel it refuses at once — and a host that is merely slow answers
-the probe within its thirty seconds. One briefly unreachable loses ICE consent
-and leaves readiness, which resets the watch. One probe at a time; such
-rebuilds are at least thirty seconds apart, doubling to five minutes while
-nothing is answered between them.
+suspect. The holder then opens a host-control channel of its own as a probe,
+which the daemon greets on accept without any session involved, and ten
+seconds later, still silent, a second one beside it, pinging the root as it
+does; both probes keep listening, and a hello from either stands the watch
+down however late it comes. One silent probe is not proof: a hello waits on
+work a ping does not (the daemon-wide admission lock, a filesystem lookup), so
+on a starved host it can trail the pong by more than ten seconds. Once both
+probes have been silent for their full ten seconds, the holder replaces the
+peer if the root answered (channels are not being accepted), or if the root
+stayed silent through two pings of twenty seconds each (an old daemon's
+association stops acknowledging anything once channels pile up behind its
+dead acceptor; two pings because a starved host can be slow on the root too).
+It sends `rtc.close` for the old binding and offers a fresh peer on the same
+signalling socket; views and tools attach again as after any reconnect. Only
+an answer stands the watch down: a refusal is one — the daemon closes a
+channel it refuses at once. A host briefly unreachable loses ICE consent and
+leaves readiness, which resets the watch. A real wedge is replaced about
+thirty seconds after the first unanswered open (ten to suspect, twenty for the
+two probes), or about sixty when the root has gone silent too. One proof at a
+time; rebuilds for this reason are at least thirty seconds apart, each one in a
+run doubling that to at most five minutes, and a run ends only when the
+replacement has gone five minutes without a suspicion: views reattaching and
+being answered after a rebuild say nothing about whether the fault returns.
 Each rebuild logs one line naming the host and how long each step waited, and
-nothing a terminal carries (the browser console; the phone's device log and
-the terminal's Diagnostics). Meanwhile a terminal that has drawn nothing yet
-says "The connection stopped opening terminals. SPAWN D is making a new one."
-in both clients, and the phone's host card carries the same reason.
+nothing a terminal carries: the browser console, the phone's device log. The
+phone's terminal Diagnostics sheet shows the reason's code and message, not
+those timings. Meanwhile a terminal that has drawn nothing yet, the browser's
+Hosts row for that host and the phone's host card all say "The connection
+stopped opening new terminals and tools. SPAWN D is making a new one." A probe
+is an ordinary host-control channel to a daemon that accepts it, so on a
+current daemon its hello also makes the daemon publish one content-free
+`rtc.status connected` for the device's binding through the server; nothing
+else about the watch reaches the server beyond the rebuild's `rtc.close` and
+offer.
 
 `signalling_lost` and `rebound` describe the daemon's control socket to the
 server, not the peer, which survives both by design; clients do not act on
 them. They act on the `unavailable` that ends a binding whose daemon did not
 come back within the orphan window, and the server sends that, like
 `signalling_lost`, as the binding's current owner, so it still arrives after a
-rebind. Unsupported
+rebind. A binding that was rebound once therefore ends at orphan expiry like
+any other: when its daemon then stays off the server for more than the sixty
+seconds of the orphan window, the device is told `unavailable` and builds a
+fresh peer, even if the direct path was still carrying data. Before, such a
+binding's expiry went unheard and the device kept that peer. Unsupported
 coordination APIs produce an explicit error. Each account, registered device key,
 and host has its own lock and connection. Registration finishes before
 connection admission; replacing a

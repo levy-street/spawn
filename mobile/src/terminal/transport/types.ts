@@ -553,6 +553,7 @@ export const LOST_CONNECTION_MESSAGE =
  *  is being replaced (`worker/worker-channel-watch.js`). */
 export const CHANNELS_UNANSWERED_CODE = "channels_unanswered";
 /** What a terminal and the host's card say meanwhile. The browser says the
- *  same (web `REBUILDING_MESSAGE`, `lib/channel-watch.ts`). */
+ *  same, in a terminal and in the host's row (web `REBUILDING_MESSAGE`,
+ *  `lib/channel-watch.ts`). */
 export const CHANNELS_UNANSWERED_MESSAGE =
-  "The connection stopped opening terminals. SPAWN D is making a new one.";
+  "The connection stopped opening new terminals and tools. SPAWN D is making a new one.";

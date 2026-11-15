@@ -182,6 +182,8 @@ export type WorkerToNativeMessage =
        *  root still answers (`worker-channel-watch.js`); native replaces it. */
       type: "rebuild";
       reason: "channels_unanswered";
+      /** The peer it is about: native acts only while that peer is still the active one. */
+      rtcSessionId: string;
       waitedMs: number;
       probeMs: number;
       /** Whether the root answered the ping, and after how long (or how long it was silent). */

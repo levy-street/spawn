@@ -1251,16 +1251,19 @@ class WebViewHostTransport implements StreamingHostTransport {
    * reconnect, and say why meanwhile.
    */
   #rebuildPeer(message: Extract<WorkerToNativeMessage, { type: "rebuild" }>): void {
+    // About a peer native has already replaced: the one it has now may be
+    // perfectly healthy.
+    if (message.rtcSessionId !== this.#activeRtcSessionId) return;
     if (this.parent || this.#state !== "ready" || !this.#cachedConfig || !this.#workerStarted)
       return;
     // The daemon side of #120 stays visible from here: the host and how long
     // each step waited, nothing a terminal carries.
     console.warn(
       `SPAWN D: host ${this.hostId}: no new channel opens on its connection ` +
-        `(one waited ${seconds(message.waitedMs)}, a probe ${seconds(message.probeMs)}, ` +
+        `(one waited ${seconds(message.waitedMs)}, two probes ${seconds(message.probeMs)}, ` +
         (message.rootAnswered === true
           ? `while the root channel answered a ping in ${Math.round(message.rootMs)} ms); `
-          : `and the root channel did not answer a ping for ${seconds(message.rootMs)}); `) +
+          : `and the root channel did not answer two pings in ${seconds(message.rootMs)}); `) +
         `making a new connection (${message.rebuilds} in a row).`,
     );
     this.#emitError({
