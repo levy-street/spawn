@@ -88,8 +88,6 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 /// Attach-journal entries read from one store.
 const MAX_JOURNAL_ENTRIES: usize = 64;
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
-/// Threads of one Codex process considered.
-const MAX_CODEX_THREADS: usize = 64;
 /// Rollouts whose first line is read to tell a subagent's thread from the
 /// person's, newest first.
 const MAX_SESSION_META_READS: usize = 16;
@@ -736,18 +734,24 @@ impl HeldThread<'_> {
 /// The thread a Codex process is in, from the files it holds open: the
 /// primary thread written last (see the module notes). A thread whose newest
 /// mark is its lock alone has had nothing written to it.
+///
+/// Every thread held is weighed, however many: the open files are already
+/// bounded, and a cut taken in descriptor order could drop the newest. A
+/// Codex that takes writer locks holds one for each thread it has loaded, so
+/// there a rollout held without its lock — another thread's, open for a
+/// moment — is not one of its threads; a Codex that takes none is told by
+/// its rollouts alone.
 fn codex_thread(open: &[PathBuf]) -> CodexThread {
     let mut held: BTreeMap<String, HeldThread> = BTreeMap::new();
     for path in open {
         if let Some(id) = codex_rollout_id(path) {
-            if held.len() < MAX_CODEX_THREADS || held.contains_key(&id) {
-                held.entry(id).or_default().rollout = Some(path);
-            }
+            held.entry(id).or_default().rollout = Some(path);
         } else if let Some(id) = codex_lock_id(path) {
-            if held.len() < MAX_CODEX_THREADS || held.contains_key(&id) {
-                held.entry(id).or_default().lock = Some(path);
-            }
+            held.entry(id).or_default().lock = Some(path);
         }
+    }
+    if held.values().any(|thread| thread.lock.is_some()) {
+        held.retain(|_, thread| thread.lock.is_some());
     }
     let mut threads: Vec<(Option<SystemTime>, String, HeldThread)> = held
         .into_iter()
@@ -1933,10 +1937,51 @@ mod tests {
     }
 
     #[test]
+    fn codex_holding_many_threads_is_in_the_newest_wherever_it_holds_it() {
+        // Every `/new`, `/resume` and subagent stays held: a long-lived Codex
+        // can hold dozens, in whatever order its descriptors list them.
+        let ids: Vec<String> = (0..80)
+            .map(|n| format!("01a1851d-2f36-76d1-98ee-{n:012x}"))
+            .collect();
+        let mut home = CodexHome::new();
+        for (n, id) in ids.iter().enumerate().skip(1) {
+            home.lock(id, 10 * n as u64);
+            home.primary(id, 10 * n as u64 + 1);
+        }
+        // The thread in front of the person, opened last of all.
+        home.lock(&ids[0], 10_000);
+        home.primary(&ids[0], 10_001);
+        assert_eq!(home.inspect(), started(&ids[0]));
+    }
+
+    #[test]
+    fn a_rollout_codex_holds_without_its_lock_is_not_one_of_its_threads() {
+        // The rollout of another window's thread, open for a moment (the
+        // resume picker reading it): newer than this window's thread, but
+        // not loaded here, so no lock.
+        let mut home = CodexHome::new();
+        home.lock(THREAD_A, 10);
+        home.primary(THREAD_A, 12);
+        home.primary(THREAD_B, 50);
+        assert_eq!(home.inspect(), started(THREAD_A));
+        // Nor does it make a thread just started here any less fresh.
+        home.lock(THREAD_C, 20);
+        let inspection = home.inspect();
+        assert_eq!(inspection.conversation_id, None);
+        assert!(inspection.fresh);
+        // A Codex that takes no writer locks is told by its rollouts alone.
+        let mut home = CodexHome::new();
+        home.primary(THREAD_A, 12);
+        home.primary(THREAD_B, 50);
+        assert_eq!(home.inspect(), started(THREAD_B));
+    }
+
+    #[test]
     fn a_rollout_whose_first_line_cannot_be_read_is_the_persons() {
         let mut home = CodexHome::new();
         home.lock(THREAD_A, 10);
         home.primary(THREAD_A, 12);
+        home.lock(THREAD_B, 19);
         let path = home
             .dir
             .path()
