@@ -279,10 +279,31 @@ if re.search(
     conv_runtime,
 ):
     raise SystemExit("no-server-agent-upload: conversation inspector may not execute anything")
-if len(re.findall(r"\.create_new\(true\)", conv_runtime)) != 1 or re.search(
-    r"\bfs::write\b|\bFile::create\b|\.append\(true\)|\.truncate\(true\)", conv_runtime
+# Every way the inspector changes a file, counted: the notes folder (one
+# DirBuilder, made 0700), one new file opened for writing, one rename over
+# the last note, and two removals (a failed note's temporary file, and the
+# note of a window that is forgotten). Anything else that writes, copies,
+# links, truncates, removes or re-permissions is refused outright.
+conv_mutations = {
+    r"\.write\(true\)": 1,
+    r"\.create_new\(true\)": 1,
+    r"\bDirBuilder::new\(": 1,
+    r"\bset_permissions\b": 1,
+    r"\brename\s*\(": 1,
+    r"\bremove_file\b": 2,
+}
+if any(
+    len(re.findall(pattern, conv_runtime)) != expected
+    for pattern, expected in conv_mutations.items()
+) or re.search(
+    r"\bfs::write\b|\bFile::create\b|\bFile::options\b|\.append\(|\.truncate\(|"
+    r"\.create\(true\)|\bcopy\s*\(|\bremove_dir|\bhard_link\b|\bsymlink\s*\(|"
+    r"\bset_len\b|\bset_modified\b|\bset_times\b|\b(?:f|l)?chown\b|\bfchmod\b|"
+    r"\bunlink(?:at)?\b|libc::(?:open|openat|creat|write|pwrite|rename|renameat|mkdir|chmod|"
+    r"truncate|ftruncate|link|symlink)\s*\(",
+    conv_runtime,
 ):
-    raise SystemExit("no-server-agent-upload: conversation inspector writes more than its window note")
+    raise SystemExit("no-server-agent-upload: conversation inspector writes more than its window notes")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
 sender_types = set(re.findall(r"mpsc::Sender<([^>]+)>", control))
@@ -855,6 +876,29 @@ self_test() {
     return 1
   fi
   printf '%s\n' "$host_control_original" >"$fixture/daemon/src/host_control.rs"
+  NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
+
+  # The conversation inspector changes nothing but its window notes.
+  local conv_original conv_runtime_part conv_tests_part conv_case
+  conv_original="$(<"$fixture/daemon/src/host_conv.rs")"
+  conv_runtime_part="${conv_original%%'#[cfg(all(test, unix))]'*}"
+  conv_tests_part="${conv_original#"$conv_runtime_part"}"
+  for conv_case in \
+    'fn sneaky(path: &Path) { let _ = std::fs::copy(path, "/tmp/x"); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::OpenOptions::new().write(true).open(path); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::remove_file(path); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::remove_dir_all(path); }' \
+    'fn sneaky(path: &Path) { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)); }' \
+    'fn sneaky(path: &Path) { let _ = std::fs::write(path, b"x"); }' \
+    'fn sneaky(path: &Path) { let _ = std::os::unix::fs::symlink(path, "/tmp/x"); }'; do
+    printf '%s\n%s\n%s' "$conv_runtime_part" "$conv_case" "$conv_tests_part" \
+      >"$fixture/daemon/src/host_conv.rs"
+    if NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+      printf 'no-server-agent-upload self-test: inspector write passed: %s\n' "$conv_case" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$conv_original" >"$fixture/daemon/src/host_conv.rs"
   NO_SERVER_AGENT_UPLOAD_ROOT="$fixture" "$script_path" >/dev/null
 
   local config_original
