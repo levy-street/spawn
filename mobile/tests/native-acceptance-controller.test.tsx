@@ -5,6 +5,7 @@ import { authToken } from "@/data/api/auth-token";
 import { NativeAcceptanceController, NativeAcceptanceUploadSource } from "../e2e/native-controller";
 import { renderWithProviders } from "./render";
 
+// Fixture ids for this file's fake account, server device and local key.
 const ACCOUNT_ID = "11111111-1111-4111-8111-111111111111";
 const SERVER_DEVICE_ID = "22222222-2222-4222-8222-222222222222";
 const LOCAL_KEY_ID = "33333333-3333-4333-8333-333333333333";
