@@ -622,8 +622,8 @@ of the history readable at that moment.
 
 When even one byte reaches a missing segment, that viewer gets an empty
 replay at the live stream's current offset and the terminal opens on what
-the session prints next. Nothing is remembered: the next request asks the
-worker again, because a line committed into an empty newest segment, or a
+the session prints next, which spawnd asks it to print (below). Nothing is
+remembered: the next request asks the worker again, because a line committed into an empty newest segment, or a
 `clear` that starts a fresh one, makes history readable again. Only a worker
 that says its log is disabled ("worker replay is unavailable for this …") is
 not asked again for the life of that connection, since a worker never
@@ -633,6 +633,101 @@ as constants (`scrollback::SEGMENT_READ_CONTEXT`, `worker::REPLAY_UNAVAILABLE`)
 and pinned by a test, because running workers keep the binary they started
 with. Authentication, sequence, and framing failures are returned unchanged:
 tampered history still fails the replay closed.
+
+An empty replay carries no screen either (`WorkerReplay::has_screen`), so a
+program that is not printing — a full-screen one waiting for a key, or Claude
+Code at its prompt — would leave that viewer's pane blank until something
+made it draw. Once such a replay has been sent for a `history` or `snapshot`
+request, spawnd on Unix asks the program to repaint
+(`SessionHandle::repaint_after_empty_replay`). Workers already running ignore
+`T_REDRAW`, and spawnd never types on a person's behalf, so the lever is the
+PTY size. Windows is left out: ConPTY reflows and repaints by itself on any
+resize, nothing there deletes a session's scrollback under it, and no test
+runs the nudge there. The steps:
+
+1. The nudge waits 150 ms after the empty replay that asked for it, so the
+   viewer's live stream is flowing and its own size message has arrived.
+   Empty replays handed out meanwhile join it.
+2. If a viewer changed the width after the latest of those replays (its
+   `take_control` or `resize`), the program repaints anyway, past the
+   anchor, and the nudge stops there. A height change alone does not count
+   (see step 3). The size in the `history` request itself is applied before
+   the replay is captured; a width change there counts only if nothing
+   reached spawnd between that change and the replay's anchor, so the
+   program's repaint for it is certain to lie past the anchor
+   (`replay_needs_repaint` in `rtc.rs`). Otherwise that repaint may land
+   before the anchor, where the client drops it, and the nudge goes ahead.
+3. Otherwise the PTY goes one column narrower. The kernel signals
+   `SIGWINCH` only for a real change. Width is what every renderer lays out
+   against, so inline programs redraw as well as full-screen ones; a height
+   change alone can leave an inline program's output unchanged, and it then
+   draws nothing.
+4. The narrower size stands until the program's first output after it, no
+   less than 50 ms and no more than 300 ms. Then it is put back; a restore
+   the worker's full command queue refuses is retried, from 10 ms doubling
+   to once a second, while the worker connection lives. An empty replay
+   handed out while the narrower size stands joins the nudge, because the
+   restore's repaint comes after its anchor.
+
+The timing is best-effort. The output that ends the hold may be unrelated to
+the nudge, and a program that has not read the first `SIGWINCH` by the time
+the size is put back may see no change and draw nothing; that only leaves
+the pane as it would have been without the nudge. The program redraws
+150 ms after the replay while the session's budget lasts (below), up to a
+minute after it when a viewer has been reattaching in a loop, and not at
+all when the nudge is skipped.
+
+A viewer's own size always wins. Only the controlling viewer's size reaches
+the PTY, and any resize applied meanwhile, even to the narrower size itself,
+takes the size over from the nudge, and the restore stands down. The nudge
+never touches display control: followers keep the controller's geometry.
+
+The bounds:
+- every empty `history` reply asks, because a client loads `history` to
+  fill its pane and loads it again on the same channel after a gap in its
+  live stream, clearing the pane first. A `snapshot` asks only on an attach
+  no empty replay has asked for yet (a flag on its `spawn.ctl` channel):
+  web sends a `snapshot` shortly after every `history` and ignores an empty
+  one, and mobile sends one to recover from overflowing its own write
+  queue, while the program is printing anyway. One case nudges needlessly:
+  a `snapshot` that comes back empty on an attach whose `history` had a
+  screen (the history became unreadable mid-attach) nudges once although
+  the pane is already full;
+- a session has a budget of four nudges, one given back every 75 seconds,
+  and its nudges come at least two seconds apart while the budget lasts.
+  Once it is spent they come at least a minute apart. A nudge made then
+  still counts, but the count is capped at one beyond the budget, so no
+  debt builds up: a viewer reattaching in a loop (every 16 s, say) of
+  any length gets four prompt nudges and then about one a minute, with
+  every viewer's two repaints and the activity detection the nudge
+  suppresses around each step, and within about 150 s of its last nudge
+  the session is back to the two-second spacing. While the budget lasts,
+  a viewer waits 150 ms, or until two seconds after the session's previous
+  nudge if that is later: a second device opening one second after the
+  first device's nudge started gets its own two seconds after that one,
+  about a second after it asked. Once the budget is spent
+  a viewer waits up to a minute, never more. A viewer whose empty
+  replay comes after a nudge was restored gets its own, at the earliest
+  the budget allows; a nudge checks that again when it wakes, so two can
+  never run closer than that. A nudge that was skipped (a width change
+  came first, or the worker's command queue was full) does not count;
+- never for a replay with a screen, and never once the worker connection is
+  gone.
+
+The nudge does not depend on the viewer that asked, so it still restores
+when that viewer leaves first. It holds the worker connection only for each
+send. If spawnd itself goes in the fraction of a second between the two
+steps, the program is left one column narrower, but the daemon that adopts
+the worker reads the PTY's real size from its hello, so the next viewer's
+size message (every client sends one on opening a session) is a real change
+and puts it right.
+
+What else it changes, all only on sessions whose history was already
+unreadable: other viewers see the program redraw twice. Only the worker's
+emulator reflows to the narrower width; viewers' terminals do not resize,
+so the emulator can commit full-width rows to history while they are still
+on screen. A shell editing a long command line can leave a stray prompt
+line behind, and a tmux inside the session resizes twice.
 
 Replay correctness (PTY in → bytes out → reattach replays both the initial
 output and mid-session stdin echo) is asserted end-to-end in
