@@ -180,7 +180,7 @@ class WorkflowRouting(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         counts = [guard.validate_workflow(path.read_text()) for path in (root / ".github/workflows").glob("*.yml")]
         self.assertEqual(len(counts), 8)  # Includes protected mobile-store recovery.
-        self.assertEqual(sum(counts), 24)  # Recovery and owed-store completion jobs.
+        self.assertEqual(sum(counts), 23)  # Recovery and the owed-store stop; no store build job.
 
     def test_windows_runs_for_master_even_when_the_latest_push_is_web_only(self):
         root = Path(__file__).resolve().parents[2]

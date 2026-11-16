@@ -619,6 +619,8 @@ else:
     def test_resume_retries_failed_ota_even_when_remote_checkout_already_is_candidate(
         self,
     ):
+        # release.yml sets this only when its plan said mobile_native_build=no.
+        self.env["SPAWN_DEPLOY_MOBILE"] = "1"
         first = self.deploy("--resume")
         self.assertNotEqual(first.returncode, 0)
         self.assertIn("mobile OTA failed", first.stderr, first.stdout + first.stderr)
@@ -628,6 +630,37 @@ else:
         self.assertEqual(
             (self.directory / "ota-attempts").read_text(), "publish\npublish\n"
         )
+
+    def test_a_deploy_publishes_no_ota_unless_the_plan_said_the_shell_fits(self):
+        # A hand-run --resume must not publish what the release withheld: only
+        # the plan knows whether the phones' native shell can run this tree.
+        for value in (None, "0", "true", "yes"):
+            with self.subTest(SPAWN_DEPLOY_MOBILE=value):
+                (self.directory / "ota-attempts").unlink(missing_ok=True)
+                self.env.pop("SPAWN_DEPLOY_MOBILE", None)
+                if value is not None:
+                    self.env["SPAWN_DEPLOY_MOBILE"] = value
+                result = self.deploy("--resume")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("deploy-prod: complete", result.stdout)
+                self.assertIn("NOT published", result.stdout)
+                self.assertFalse((self.directory / "ota-attempts").exists())
+                # The three plan answers get three distinct lines, and the
+                # publish command is offered under "no" and nowhere else.
+                lines = result.stdout.splitlines()
+                answers = {
+                    answer: [line for line in lines if line.startswith(f"  - {answer}: ")]
+                    for answer in ("no", "yes", "unknown")
+                }
+                for answer, found in answers.items():
+                    self.assertEqual(len(found), 1, (answer, result.stdout))
+                offered = [line for line in lines if "update-mobile-prod.sh" in line]
+                self.assertEqual(offered, answers["no"], result.stdout)
+                self.assertIn("publish it with: scripts/update-mobile-prod.sh -m ", offered[0])
+                for answer in ("yes", "unknown"):
+                    self.assertIn("publish nothing", answers[answer][0])
+                self.assertIn("runtime warning", answers["yes"][0])
+                self.assertIn("ask the plan again", answers["unknown"][0])
 
 
 class CITests(unittest.TestCase):
