@@ -80,6 +80,20 @@ export function keystrokeBelongsToText(target: EventTarget | null): boolean {
 }
 
 /**
+ * Marks a surface whose keystrokes are all its own — the tab group panel,
+ * with a name field, a radiogroup and two sliders that each want the arrows.
+ * The grid listens in the capture phase, ahead of anything such a surface can
+ * do to stop it, so the surface says so on itself and the grid stands aside.
+ */
+export const OWN_KEYS_ATTRIBUTE = "data-own-keys";
+
+/** Did this keystroke start inside a surface marked with OWN_KEYS_ATTRIBUTE? */
+export function keystrokeHeldBySurface(target: EventTarget | null): boolean {
+  if (typeof Element === "undefined" || !(target instanceof Element)) return false;
+  return target.closest(`[${OWN_KEYS_ATTRIBUTE}]`) !== null;
+}
+
+/**
  * What the workspace grid should do with a press, or null to leave it alone.
  *
  * `textHasKey` is [`keystrokeBelongsToText`] of the event's target. It only

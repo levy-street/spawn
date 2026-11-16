@@ -1,3 +1,4 @@
+import { layoutGroups, normalizeGroups, regroup } from "@/data/layout/tab-groups";
 import { autoPlace, canAddTile, orderedTiles, removeTile } from "@/data/layout/tiles";
 import type { PaneId, TabId, Tile, WorkspaceLayoutV3, WorkspaceTab } from "@/data/types/layout";
 
@@ -75,7 +76,19 @@ export function reorderTab(
   const [tab] = tabs.splice(fromIndex, 1);
   if (!tab) return layout;
   tabs.splice(target, 0, tab);
-  return { ...layout, tabs };
+  // Where it lands decides its group: between two tabs of one it joins them,
+  // dragged clear of its own it leaves (`regroup`).
+  return layout.groups === undefined
+    ? { ...layout, tabs }
+    : {
+        ...layout,
+        tabs,
+        groups: regroup(
+          tabs.map((candidate) => candidate.id),
+          layoutGroups(layout),
+          tabId,
+        ),
+      };
 }
 
 export function canRemoveTab(layout: WorkspaceLayoutV3, tabId: TabId): boolean {
@@ -90,7 +103,18 @@ export function removeTab(layout: WorkspaceLayoutV3, tabId: TabId): WorkspaceLay
     layout.active_tab === tabId
       ? (tabs[Math.max(0, index - 1)]?.id ?? tabs[0]?.id ?? null)
       : layout.active_tab;
-  return { ...layout, active_tab, tabs };
+  // A closed tab leaves its group; a group it was the last of goes with it.
+  return layout.groups === undefined
+    ? { ...layout, active_tab, tabs }
+    : {
+        ...layout,
+        active_tab,
+        tabs,
+        groups: normalizeGroups(
+          tabs.map((tab) => tab.id),
+          layout.groups,
+        ),
+      };
 }
 
 export function allTiles(layout: WorkspaceLayoutV3): Tile[] {

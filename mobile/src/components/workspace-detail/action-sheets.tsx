@@ -1,14 +1,19 @@
+import { StyleSheet, View } from "react-native";
+
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
 import { UNSUPPORTED_PANE_TITLE } from "@/components/workspace-detail/pane-list";
+import { groupLabel, layoutGroups, resolveGroupColor } from "@/data/layout/tab-groups";
 import { canMovePaneToTab, canRemoveTab } from "@/data/layout/tabs";
 import { canAddTile, orderedTiles } from "@/data/layout/tiles";
 import { restartDetail } from "@/data/selectors/agent";
 import { displayPath, placeReasonLabel, suggestPlaces } from "@/data/selectors/places";
 import { sessionTitle } from "@/data/selectors/session";
 import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
-import { isFilesWidget, type Tile, type WorkspaceTab } from "@/data/types/layout";
+import { isFilesWidget, type TabGroup, type Tile, type WorkspaceTab } from "@/data/types/layout";
+import { useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface PaneActionTarget {
   tabId: string;
@@ -286,6 +291,22 @@ export function MovePaneHostSheet({
   );
 }
 
+/** A group's colour as a leading glyph in a drawer row. */
+function GroupSwatch({ color }: { color: string }) {
+  const theme = useTheme();
+  return (
+    <View
+      style={[
+        styles.groupSwatch,
+        {
+          backgroundColor: resolveGroupColor(color, theme.colors.tabGroup),
+          borderRadius: theme.radii.pill,
+        },
+      ]}
+    />
+  );
+}
+
 export interface TabActionsSheetProps {
   visible: boolean;
   tab: WorkspaceTab | null;
@@ -294,6 +315,11 @@ export interface TabActionsSheetProps {
   onRename: (tab: WorkspaceTab) => void;
   onReorder: (tab: WorkspaceTab, offset: -1 | 1) => void;
   onDelete: (tab: WorkspaceTab) => void;
+  /** "Add tab to new group" / "Move tab to new group". */
+  onNewGroup: (tab: WorkspaceTab) => void;
+  /** "Add tab to group…" / "Move tab to group…": raises `TabGroupPickerSheet`. */
+  onPickGroup: (tab: WorkspaceTab) => void;
+  onRemoveFromGroup: (tab: WorkspaceTab) => void;
 }
 
 export function TabActionsSheet({
@@ -304,8 +330,48 @@ export function TabActionsSheet({
   onRename,
   onReorder,
   onDelete,
+  onNewGroup,
+  onPickGroup,
+  onRemoveFromGroup,
 }: TabActionsSheetProps) {
   const index = tab ? workspace.layout.tabs.findIndex((candidate) => candidate.id === tab.id) : -1;
+  const groups = layoutGroups(workspace.layout);
+  const group = tab
+    ? (groups.find((candidate) => candidate.tab_ids.includes(tab.id)) ?? null)
+    : null;
+  // A grouped tab is offered the other groups; there is no picking its own.
+  const otherGroups = groups.filter((candidate) => candidate.id !== group?.id);
+  const groupActions: ActionSheetAction[] = tab
+    ? [
+        {
+          id: "new-group",
+          label: group ? "Move tab to new group" : "Add tab to new group",
+          icon: <Icon name="FolderPlus" />,
+          onPress: () => onNewGroup(tab),
+        },
+        ...(otherGroups.length > 0
+          ? [
+              {
+                id: "pick-group",
+                label: group ? "Move tab to group…" : "Add tab to group…",
+                icon: <Icon name="FolderOpen" />,
+                onPress: () => onPickGroup(tab),
+              },
+            ]
+          : []),
+        ...(group
+          ? [
+              {
+                id: "remove-from-group",
+                label: "Remove from group",
+                detail: groupLabel(group),
+                icon: <Icon name="Unlink" />,
+                onPress: () => onRemoveFromGroup(tab),
+              },
+            ]
+          : []),
+      ]
+    : [];
   const actions: ActionSheetAction[] = tab
     ? [
         {
@@ -314,6 +380,7 @@ export function TabActionsSheet({
           icon: <Icon name="Pencil" />,
           onPress: () => onRename(tab),
         },
+        ...groupActions,
         {
           id: "move-left",
           label: "Move left",
@@ -353,6 +420,56 @@ export function TabActionsSheet({
       onDismiss={onDismiss}
       visible={visible && tab !== null}
       {...(tab === null ? {} : { title: tab.name })}
+    />
+  );
+}
+
+export interface TabGroupPickerSheetProps {
+  visible: boolean;
+  tab: WorkspaceTab | null;
+  workspace: Workspace;
+  onDismiss: () => void;
+  onNewGroup: (tab: WorkspaceTab) => void;
+  onPick: (tab: WorkspaceTab, group: TabGroup) => void;
+}
+
+/** Which group a tab goes to: a new one, or any group it is not already in. */
+export function TabGroupPickerSheet({
+  visible,
+  tab,
+  workspace,
+  onDismiss,
+  onNewGroup,
+  onPick,
+}: TabGroupPickerSheetProps) {
+  const groups = layoutGroups(workspace.layout);
+  const grouped = tab ? groups.some((group) => group.tab_ids.includes(tab.id)) : false;
+  const actions: ActionSheetAction[] = tab
+    ? [
+        {
+          id: "new-group",
+          label: "New group",
+          icon: <Icon name="Plus" />,
+          onPress: () => onNewGroup(tab),
+        },
+        ...groups
+          .filter((group) => !group.tab_ids.includes(tab.id))
+          .map(
+            (group): ActionSheetAction => ({
+              id: group.id,
+              label: groupLabel(group),
+              icon: <GroupSwatch color={group.color} />,
+              onPress: () => onPick(tab, group),
+            }),
+          ),
+      ]
+    : [];
+  return (
+    <ActionSheet
+      actions={actions}
+      onDismiss={onDismiss}
+      title={grouped ? "Move tab to group" : "Add tab to group"}
+      visible={visible && tab !== null}
     />
   );
 }
@@ -398,3 +515,10 @@ export function WorkspaceActionsSheet({
     />
   );
 }
+
+const styles = StyleSheet.create({
+  groupSwatch: {
+    height: sizing.actionSheet.icon,
+    width: sizing.actionSheet.icon,
+  },
+});

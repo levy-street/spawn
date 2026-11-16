@@ -205,6 +205,26 @@ export const sizing = {
     connectionOverlap: 6,
     horizontalPadding: 12,
     labelGap: 6,
+    /** A tab group's label in the strip: a fixed slot, so drag geometry stays arithmetic. */
+    groupLabelWidth: 88,
+    /** An unnamed group's label holds no name, only its colour (and `+N` when collapsed). */
+    groupLabelCompactWidth: 36,
+    groupLabelHeight: 28,
+    groupLabelPadding: 8,
+    /** The rule drawn above a group's tabs, and how far above them it sits. */
+    groupLineHeight: 3,
+    groupLineOffset: 4,
+    /** The dot a collapsed label wears while one of its hidden tabs needs attention. */
+    groupAttentionDot: 8,
+  },
+  /** The tab group sheet's colour choices and the custom colour picker. */
+  colorPicker: {
+    swatch: 32,
+    /** Height of the saturation/brightness square; it spans the sheet's width. */
+    squareHeight: 160,
+    hueHeight: 24,
+    thumb: 24,
+    thumbBorder: 3,
   },
   type: {
     micro: { fontSize: 11, lineHeight: 16 },

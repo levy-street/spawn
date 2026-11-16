@@ -170,6 +170,9 @@ export function envelope(layout: GridLayout, home?: { host_id: string; cwd: stri
         layout,
       },
     ],
+    // What the wire carries now, and what every write sends back: a client
+    // always names its groups, `[]` when it has none.
+    groups: [],
   };
 }
 
