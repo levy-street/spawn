@@ -345,6 +345,40 @@ pub fn open_url(url: &str) -> io::Result<()> {
     }
 }
 
+/// Child `pid`'s exit, if it has exited, observed without reaping it. Until
+/// its parent waits for it, its id — and so the id of a process group it
+/// leads — is not handed to any other process.
+pub fn exited_unreaped(pid: u32) -> io::Result<Option<std::process::ExitStatus>> {
+    use nix::libc;
+    use std::os::unix::process::ExitStatusExt;
+
+    // SAFETY: an all-zero `siginfo_t` is a valid value of it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    // SAFETY: `info` is a live, writable `siginfo_t` for the whole call, and
+    // `waitid` writes nothing else.
+    if unsafe { libc::waitid(libc::P_PID, pid, &mut info, options) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `info` is what `waitid` wrote for a child's exit, or the zeroes
+    // it was given when that child has not exited.
+    #[cfg(target_os = "linux")]
+    let (from, code, status) = unsafe { (info.si_pid(), info.si_code, info.si_status()) };
+    #[cfg(not(target_os = "linux"))]
+    let (from, code, status) = (info.si_pid, info.si_code, info.si_status);
+    if from == 0 {
+        return Ok(None);
+    }
+    // The status `wait` would report: the exit code in the second byte, or
+    // the signal, with the core flag when it dumped one.
+    let raw = match code {
+        libc::CLD_EXITED => (status & 0xff) << 8,
+        libc::CLD_DUMPED => status | 0x80,
+        _ => status,
+    };
+    Ok(Some(std::process::ExitStatus::from_raw(raw)))
+}
+
 pub fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
