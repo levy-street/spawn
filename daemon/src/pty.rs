@@ -1360,8 +1360,10 @@ struct PtySize {
     /// The repaint nudge that set this size and will put the size it
     /// replaced back, if one did. A viewer's resize clears it.
     nudge: Option<u64>,
-    /// Sizes viewers have applied on this connection.
-    changes: u64,
+    /// Widths viewers have applied on this connection. Only a width change
+    /// makes every program repaint: an inline renderer lays out against the
+    /// width and may draw nothing when only the height changes.
+    width_changes: u64,
 }
 
 /// One worker connection's repaint nudges.
@@ -1369,24 +1371,51 @@ struct PtySize {
 struct RepaintSchedule {
     /// A nudge is waiting to start; empty replays handed out meanwhile join it.
     scheduled: bool,
-    last_started: Option<tokio::time::Instant>,
-    /// `PtySize::changes` when the latest empty replay that joined was handed
-    /// out. A viewer's resize after it makes the program repaint anyway.
-    changes_at_request: u64,
+    /// When the last nudge narrowed the PTY, and the least time from then
+    /// until the next may (see [`REPAINT_MIN_INTERVAL`]).
+    last_started: Option<(tokio::time::Instant, Duration)>,
+    /// `PtySize::width_changes` when the latest empty replay that joined was
+    /// handed out. A viewer's width change after it makes the program
+    /// repaint anyway.
+    width_changes_at_request: u64,
+}
+
+impl RepaintSchedule {
+    /// The last nudge's start and the interval it set, unless the session
+    /// has gone [`REPAINT_QUIET`] without one and starts over.
+    fn recent(&self, now: tokio::time::Instant) -> Option<(tokio::time::Instant, Duration)> {
+        self.last_started
+            .filter(|(started, _)| now.duration_since(*started) < REPAINT_QUIET)
+    }
 }
 
 /// How long a nudge waits after the empty replay that asked for it: the
 /// viewer's own size message (`take_control`, `resize`) follows its seed
-/// within this, and a size that changes after the seed repaints by itself.
+/// within this, and a width that changes after the seed repaints by itself.
 pub(crate) const REPAINT_SETTLE: Duration = Duration::from_millis(150);
-/// The least time between two nudges of one session.
+/// The least time between two nudges of one session. Each nudge that comes
+/// within [`REPAINT_QUIET`] of the one before doubles it, up to
+/// [`REPAINT_MAX_INTERVAL`], so a viewer that reattaches in a loop does not
+/// make every viewer watch two repaints each time, nor keep activity
+/// detection suppressed. A session that has gone [`REPAINT_QUIET`] without a
+/// nudge starts over.
 pub(crate) const REPAINT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const REPAINT_MAX_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const REPAINT_QUIET: Duration = Duration::from_secs(5 * 60);
 /// How long the narrower size stands: until the program's first output after
-/// it (its repaint beginning), but no less than the first figure, so the
-/// program has read the new size, and no more than the second, for a program
-/// that does not repaint (a shell at its prompt).
+/// it (its repaint beginning, at best), but no less than the first figure, so
+/// the program has read the new size, and no more than the second, for a
+/// program that does not repaint (a shell at its prompt).
 pub(crate) const REPAINT_HOLD_MIN: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
 pub(crate) const REPAINT_HOLD_MAX: Duration = Duration::from_millis(300);
+/// Tests wait for the program's own output, never for a timer.
+#[cfg(test)]
+pub(crate) const REPAINT_HOLD_MAX: Duration = Duration::from_secs(10);
+/// A restore the worker's full command queue refused is retried after the
+/// first figure, doubling up to the second.
+pub(crate) const REPAINT_RESTORE_RETRY_MIN: Duration = Duration::from_millis(10);
+pub(crate) const REPAINT_RESTORE_RETRY_MAX: Duration = Duration::from_secs(1);
 
 static NEXT_REPAINT_NUDGE: AtomicU64 = AtomicU64::new(1);
 
@@ -1403,15 +1432,16 @@ struct RepaintNudge {
 }
 
 impl RepaintNudge {
-    /// Wait until `due`; then, unless a viewer resized after the last empty
-    /// replay (a repaint is coming anyway) or the session has gone, set the
-    /// PTY one column narrower, hold it while the program reads it, and put
-    /// the size back. The restore is retried for as long as the worker
-    /// connection lives, and is skipped only when a viewer's resize has
-    /// replaced the narrower size meanwhile: that size stands.
+    /// Wait until `due`; then, unless a viewer changed the width after the
+    /// last empty replay (a repaint is coming anyway) or the session has
+    /// gone, set the PTY one column narrower, hold it while the program reads
+    /// it, and put the size back. The restore is retried, backing off, for as
+    /// long as the worker connection lives, and is skipped only when a
+    /// viewer's resize has replaced the narrower size meanwhile: that size
+    /// stands.
     async fn run(self, due: tokio::time::Instant) {
         tokio::time::sleep_until(due).await;
-        let Ok(changes) = self.size.lock().map(|size| size.changes) else {
+        let Ok(width_changes) = self.size.lock().map(|size| size.width_changes) else {
             return;
         };
         let resized_since = {
@@ -1419,8 +1449,7 @@ impl RepaintNudge {
                 return;
             };
             schedule.scheduled = false;
-            schedule.last_started = Some(tokio::time::Instant::now());
-            changes != schedule.changes_at_request
+            width_changes != schedule.width_changes_at_request
         };
         let session_id = self.session_id;
         if resized_since || !self.alive.load(Ordering::Acquire) {
@@ -1431,6 +1460,9 @@ impl RepaintNudge {
             return;
         };
         let nudge = NEXT_REPAINT_NUDGE.fetch_add(1, Ordering::Relaxed);
+        // Taken before the narrower size is sent, so the program's answer to
+        // it can never be counted as earlier output.
+        let output = self.control.source_offset();
         let original = {
             let Ok(mut size) = self.size.lock() else {
                 return;
@@ -1451,6 +1483,7 @@ impl RepaintNudge {
                 })
                 .is_err()
             {
+                tracing::debug!(%session_id, "repaint nudge: worker command queue full");
                 return;
             }
             size.cols = cols;
@@ -1458,12 +1491,21 @@ impl RepaintNudge {
             original
         };
         drop(cmd_tx);
+        let held = tokio::time::Instant::now();
+        // Only a nudge that narrowed the PTY counts toward the interval, so
+        // one that was skipped never delays the next viewer's.
+        if let Ok(mut schedule) = self.schedule.lock() {
+            let interval = schedule
+                .recent(held)
+                .map_or(REPAINT_MIN_INTERVAL, |(_, interval)| {
+                    (interval * 2).min(REPAINT_MAX_INTERVAL)
+                });
+            schedule.last_started = Some((held, interval));
+        }
         self.control
             .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
         tracing::debug!(%session_id, cols = original.0, rows = original.1, "repaint nudge: one column narrower");
 
-        let held = tokio::time::Instant::now();
-        let output = self.control.source_offset();
         let _ = tokio::time::timeout(
             REPAINT_HOLD_MAX,
             self.control.wait_source_offset(output.saturating_add(1)),
@@ -1471,6 +1513,7 @@ impl RepaintNudge {
         .await;
         tokio::time::sleep_until(held + REPAINT_HOLD_MIN).await;
 
+        let mut retry = REPAINT_RESTORE_RETRY_MIN;
         loop {
             {
                 let Ok(mut size) = self.size.lock() else {
@@ -1504,7 +1547,8 @@ impl RepaintNudge {
             if !self.alive.load(Ordering::Acquire) {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(REPAINT_RESTORE_RETRY_MAX);
         }
     }
 }
@@ -1558,7 +1602,7 @@ impl SessionHandle {
                 cols: parts.cols,
                 rows: parts.rows,
                 nudge: None,
-                changes: 0,
+                width_changes: 0,
             })),
             repaint: Arc::default(),
             outbox_tx: parts.outbox_tx,
@@ -1618,6 +1662,9 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Apply a viewer's size. True when it changed the width, which is what
+    /// makes every program repaint; a height change alone is applied but
+    /// returns false.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
         let mut size = self
             .size
@@ -1638,17 +1685,18 @@ impl SessionHandle {
                 mpsc::error::TrySendError::Full(_) => anyhow::anyhow!("worker command queue full"),
                 mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("worker connection gone"),
             })?;
+        let width_changed = size.cols != cols;
         // A viewer's size always wins over a nudge in progress.
         *size = PtySize {
             cols,
             rows,
             nudge: None,
-            changes: size.changes.wrapping_add(1),
+            width_changes: size.width_changes.wrapping_add(u64::from(width_changed)),
         };
         // Only an admitted resize can trigger a repaint.
         self.control
             .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
-        Ok(true)
+        Ok(width_changed)
     }
 
     /// Make the session's program repaint, for a viewer that was handed a
@@ -1662,17 +1710,17 @@ impl SessionHandle {
     /// program redraws on one; the width is what any renderer lays out
     /// against, so inline ones re-layout too. See [`RepaintNudge`] for the
     /// steps and their bounds. Empty replays handed out before a scheduled
-    /// nudge starts, or while it holds the narrower size, join it; the next
-    /// one waits out [`REPAINT_MIN_INTERVAL`] after the last started, so
-    /// viewers attaching together share one.
+    /// nudge starts, or while it holds the narrower size, join it, so viewers
+    /// attaching together share one; the next one waits out the interval the
+    /// last set ([`REPAINT_MIN_INTERVAL`]).
     pub fn repaint_after_empty_replay(&self) {
         if !self.alive.load(Ordering::Acquire) {
             return;
         }
-        let Ok((changes, holding)) = self
+        let Ok((width_changes, holding)) = self
             .size
             .lock()
-            .map(|size| (size.changes, size.nudge.is_some()))
+            .map(|size| (size.width_changes, size.nudge.is_some()))
         else {
             return;
         };
@@ -1686,15 +1734,15 @@ impl SessionHandle {
             let Ok(mut schedule) = self.repaint.lock() else {
                 return;
             };
-            schedule.changes_at_request = changes;
+            schedule.width_changes_at_request = width_changes;
             if schedule.scheduled {
                 return;
             }
             schedule.scheduled = true;
             let now = tokio::time::Instant::now();
             let earliest = schedule
-                .last_started
-                .map_or(now, |started| started + REPAINT_MIN_INTERVAL);
+                .recent(now)
+                .map_or(now, |(started, interval)| started + interval);
             (now + REPAINT_SETTLE).max(earliest)
         };
         let nudge = RepaintNudge {
@@ -2448,12 +2496,13 @@ mod tests {
     }
 
     /// The next resize the handle sends its worker, and when, or `None` if
-    /// none comes within ten (paused, auto-advancing) seconds.
+    /// none comes within two (paused, auto-advancing) minutes: longer than
+    /// any interval, settle or hold.
     async fn next_resize(
         cmd_rx: &mut mpsc::Receiver<WorkerCmd>,
     ) -> Option<((u16, u16), tokio::time::Instant)> {
         loop {
-            match tokio::time::timeout(Duration::from_secs(10), cmd_rx.recv()).await {
+            match tokio::time::timeout(Duration::from_secs(120), cmd_rx.recv()).await {
                 Ok(Some(WorkerCmd::Resize { cols, rows })) => {
                     return Some(((cols, rows), tokio::time::Instant::now()))
                 }
@@ -2463,14 +2512,19 @@ mod tests {
         }
     }
 
+    fn nudge_test_handle() -> (ForwarderControl, mpsc::Receiver<WorkerCmd>, SessionHandle) {
+        let control = ForwarderControl::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+        (control, cmd_rx, handle)
+    }
+
     /// An empty replay makes the program repaint: after the settle, one
     /// column narrower, held until the program's output and no less than the
     /// minimum, then back where it was — once, and never again by itself.
     #[tokio::test(start_paused = true)]
     async fn an_empty_replay_nudges_the_size_once_and_puts_it_back() {
-        let control = ForwarderControl::new();
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
-        let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
         let asked = tokio::time::Instant::now();
         handle.repaint_after_empty_replay();
 
@@ -2490,7 +2544,6 @@ mod tests {
 
         // A program that does not repaint (a shell at its prompt) is given
         // the longest hold, then the size comes back all the same.
-        tokio::time::advance(REPAINT_MIN_INTERVAL).await;
         handle.repaint_after_empty_replay();
         let (_, at) = next_resize(&mut cmd_rx).await.expect("nudge");
         let (restored, back) = next_resize(&mut cmd_rx).await.expect("restore");
@@ -2498,13 +2551,12 @@ mod tests {
         assert_eq!(back - at, REPAINT_HOLD_MAX);
     }
 
-    /// Viewers attaching together share one nudge; one that comes after a
-    /// nudge has started gets its own, no sooner than the interval allows.
+    /// Viewers attaching together share one nudge, including one handed its
+    /// replay while the narrower size stands; one that comes after the
+    /// restore gets its own, no sooner than the interval allows.
     #[tokio::test(start_paused = true)]
     async fn viewers_attaching_together_share_one_nudge() {
-        let control = ForwarderControl::new();
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
-        let handle = test_handle(control, cmd_tx, Arc::new(AtomicBool::new(true)));
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
         handle.repaint_after_empty_replay();
         tokio::time::advance(REPAINT_SETTLE / 2).await;
         handle.repaint_after_empty_replay();
@@ -2513,12 +2565,10 @@ mod tests {
         // One handed out while the narrower size stands: the restore's
         // repaint reaches it.
         handle.repaint_after_empty_replay();
+        control.route_direct_for_test(b"repaint").await;
         let (restored, _) = next_resize(&mut cmd_rx).await.expect("restore");
         assert_eq!(restored, (80, 24));
 
-        // A viewer after that one started: its own nudge, once the interval
-        // since the last has passed — and the joined viewer made none of its
-        // own, or a narrower size would come sooner.
         handle.repaint_after_empty_replay();
         handle.repaint_after_empty_replay();
         let (narrow, second) = next_resize(&mut cmd_rx).await.expect("second nudge");
@@ -2534,15 +2584,48 @@ mod tests {
         );
     }
 
+    /// Each nudge soon after another doubles the wait before the next, up to
+    /// the cap; a session left alone for long enough starts over.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_nudges_back_off_and_start_over_after_a_quiet_spell() {
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
+        let mut starts = Vec::new();
+        for _ in 0..7 {
+            handle.repaint_after_empty_replay();
+            let (narrow, at) = next_resize(&mut cmd_rx).await.expect("nudge");
+            assert_eq!(narrow, (79, 24));
+            starts.push(at);
+            control.route_direct_for_test(b"repaint").await;
+            assert_eq!(
+                next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+                Some((80, 24))
+            );
+        }
+        let gaps: Vec<u64> = starts
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).as_secs())
+            .collect();
+        assert_eq!(gaps, [2, 4, 8, 16, 32, 60]);
+
+        tokio::time::advance(REPAINT_QUIET).await;
+        let asked = tokio::time::Instant::now();
+        handle.repaint_after_empty_replay();
+        let (_, fresh) = next_resize(&mut cmd_rx).await.expect("nudge after quiet");
+        assert_eq!(fresh - asked, REPAINT_SETTLE);
+        control.route_direct_for_test(b"repaint").await;
+        next_resize(&mut cmd_rx).await.expect("restore");
+        handle.repaint_after_empty_replay();
+        let (_, next) = next_resize(&mut cmd_rx).await.expect("next nudge");
+        assert_eq!(next - fresh, REPAINT_MIN_INTERVAL);
+    }
+
     /// A viewer's resize while the narrower size stands is never undone:
     /// the restore stands down, whether the viewer chose another size or
     /// the very size the nudge was passing through.
     #[tokio::test(start_paused = true)]
     async fn a_viewer_resize_during_a_nudge_wins() {
         for wanted in [(100, 30), (79, 24)] {
-            let control = ForwarderControl::new();
-            let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
-            let handle = test_handle(control, cmd_tx, Arc::new(AtomicBool::new(true)));
+            let (_control, mut cmd_rx, handle) = nudge_test_handle();
             handle.repaint_after_empty_replay();
             assert_eq!(
                 next_resize(&mut cmd_rx).await.map(|(size, _)| size),
@@ -2563,14 +2646,12 @@ mod tests {
         }
     }
 
-    /// The viewer's own size message after its seed makes the program
+    /// The viewer's own width change after its seed makes the program
     /// repaint, past the seed's anchor: no nudge then. One applied before
-    /// the seed (the history request's own size) does not count.
+    /// the seed (the history request's own size) does not count here.
     #[tokio::test(start_paused = true)]
-    async fn a_size_change_after_the_empty_replay_makes_the_nudge_unneeded() {
-        let control = ForwarderControl::new();
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
-        let handle = test_handle(control, cmd_tx, Arc::new(AtomicBool::new(true)));
+    async fn a_width_change_after_the_empty_replay_makes_the_nudge_unneeded() {
+        let (_control, mut cmd_rx, handle) = nudge_test_handle();
         assert!(handle.resize(90, 24).unwrap());
         assert_eq!(
             next_resize(&mut cmd_rx).await.map(|(size, _)| size),
@@ -2586,7 +2667,6 @@ mod tests {
             Some((90, 24))
         );
 
-        tokio::time::advance(REPAINT_MIN_INTERVAL).await;
         handle.repaint_after_empty_replay();
         assert!(handle.resize(100, 30).unwrap());
         assert_eq!(
@@ -2598,6 +2678,23 @@ mod tests {
             "nudged after a real resize"
         );
         assert_eq!(handle.applied_size(), (100, 30));
+    }
+
+    /// A height change alone (a phone's keyboard opening) is applied, but an
+    /// inline program may draw nothing for it: the nudge still comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_height_change_alone_does_not_make_the_nudge_unneeded() {
+        let (_control, mut cmd_rx, handle) = nudge_test_handle();
+        handle.repaint_after_empty_replay();
+        assert!(!handle.resize(80, 30).unwrap(), "only the height changed");
+        let sizes = [
+            next_resize(&mut cmd_rx).await,
+            next_resize(&mut cmd_rx).await,
+            next_resize(&mut cmd_rx).await,
+        ]
+        .map(|resize| resize.map(|(size, _)| size));
+        assert_eq!(sizes, [Some((80, 30)), Some((79, 30)), Some((80, 30))]);
+        assert_eq!(handle.applied_size(), (80, 30));
     }
 
     /// No nudge for a session that is not running, nor once it stops
@@ -2618,8 +2715,78 @@ mod tests {
         assert!(next_resize(&mut cmd_rx).await.is_none());
     }
 
+    /// The nudge does not depend on the viewer that asked: with its
+    /// `spawn.pty` gone, the size still comes back.
+    #[tokio::test(start_paused = true)]
+    async fn the_restore_does_not_wait_for_the_viewer_that_asked() {
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
+        let viewer = control.add_direct_sink("leaving".into()).await;
+        handle.repaint_after_empty_replay();
+        control.remove_direct_sink("leaving").await;
+        drop(viewer);
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((79, 24))
+        );
+        control.route_direct_for_test(b"repaint").await;
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((80, 24))
+        );
+        assert_eq!(handle.applied_size(), (80, 24));
+    }
+
+    /// A handle let go of while the narrower size stands: the nudge holds
+    /// none of its connection open and sends nothing more. The daemon that
+    /// adopts the worker next reads its real size from the hello.
+    #[tokio::test(start_paused = true)]
+    async fn a_handle_dropped_mid_hold_is_not_kept_open() {
+        let (_control, mut cmd_rx, handle) = nudge_test_handle();
+        handle.repaint_after_empty_replay();
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((79, 24))
+        );
+        drop(handle);
+        let closed = tokio::time::timeout(REPAINT_HOLD_MAX * 3, cmd_rx.recv()).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "the connection stayed open or was sent more"
+        );
+    }
+
+    /// A narrowing the full command queue refuses is a nudge skipped: the
+    /// size is untouched, and the next viewer's nudge is not delayed by it.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_narrowing_skips_the_nudge_without_delaying_the_next() {
+        let control = ForwarderControl::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let filler = cmd_tx.clone();
+        let handle = test_handle(control, cmd_tx, Arc::new(AtomicBool::new(true)));
+        while filler
+            .try_send(WorkerCmd::Input(DirectPayload::new(b"x".to_vec())))
+            .is_ok()
+        {}
+        handle.repaint_after_empty_replay();
+        tokio::time::sleep(REPAINT_SETTLE * 2).await;
+        while let Ok(command) = cmd_rx.try_recv() {
+            assert!(
+                !matches!(command, WorkerCmd::Resize { .. }),
+                "resized through a full queue"
+            );
+        }
+        assert_eq!(handle.applied_size(), (80, 24));
+
+        let asked = tokio::time::Instant::now();
+        handle.repaint_after_empty_replay();
+        let (narrow, at) = next_resize(&mut cmd_rx).await.expect("nudge");
+        assert_eq!(narrow, (79, 24));
+        assert_eq!(at - asked, REPAINT_SETTLE);
+    }
+
     /// The restore waits for room in a full command queue rather than give
-    /// up and leave the session narrower.
+    /// up and leave the session narrower, and backs off while it waits
+    /// rather than spin.
     #[tokio::test(start_paused = true)]
     async fn the_restore_waits_for_room_in_a_full_queue() {
         let control = ForwarderControl::new();
@@ -2641,10 +2808,13 @@ mod tests {
             (79, 24),
             "restored without room to send it"
         );
-        assert_eq!(
-            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
-            Some((80, 24))
-        );
+        // Room now: the restore lands on its next retry, which by now is
+        // spaced well beyond the first and no further than the last.
+        let room = tokio::time::Instant::now();
+        let (restored, at) = next_resize(&mut cmd_rx).await.expect("restore");
+        assert_eq!(restored, (80, 24));
+        assert!(at - room > REPAINT_RESTORE_RETRY_MIN, "{:?}", at - room);
+        assert!(at - room <= REPAINT_RESTORE_RETRY_MAX, "{:?}", at - room);
         assert_eq!(handle.applied_size(), (80, 24));
     }
 
