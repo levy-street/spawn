@@ -689,17 +689,24 @@ The bounds:
   no empty replay has asked for yet (a flag on its `spawn.ctl` channel):
   web sends a `snapshot` shortly after every `history` and ignores an empty
   one, and mobile sends one to recover from overflowing its own write
-  queue, while the program is printing anyway;
+  queue, while the program is printing anyway. One case nudges needlessly:
+  a `snapshot` that comes back empty on an attach whose `history` had a
+  screen (the history became unreadable mid-attach) nudges once although
+  the pane is already full;
 - a session has a budget of four nudges, one given back every 75 seconds,
   and its nudges come at least two seconds apart while the budget lasts.
-  Once it is spent they come at least a minute apart, and each still counts
-  one beyond the budget, so a viewer reattaching in a loop (every 16 s,
-  say) gets four prompt nudges and then about one a minute, with every
-  viewer's two repaints and the activity detection the nudge suppresses
-  around each step, until it stops for a few minutes. People opening a
-  session at a human pace (up to four at once, then no more often than
-  about every 75 seconds on average) never wait past the 150 ms; nobody
-  waits more than a minute. A viewer whose empty
+  Once it is spent they come at least a minute apart. A nudge made then
+  still counts, but the count is capped at one beyond the budget, so no
+  debt builds up: a viewer reattaching in a loop (every 16 s, say) of
+  any length gets four prompt nudges and then about one a minute, with
+  every viewer's two repaints and the activity detection the nudge
+  suppresses around each step, and within about 150 s of its last nudge
+  the session is back to the two-second spacing. While the budget lasts,
+  a viewer waits 150 ms, or until two seconds after the session's previous
+  nudge if that is later: a second device opening one second after the
+  first device's nudge started gets its own two seconds after that one,
+  about a second after it asked. Once the budget is spent
+  a viewer waits up to a minute, never more. A viewer whose empty
   replay comes after a nudge was restored gets its own, at the earliest
   the budget allows; a nudge checks that again when it wakes, so two can
   never run closer than that. A nudge that was skipped (a width change
