@@ -719,10 +719,13 @@ pub struct SessionControlHub {
     /// viewer that waits on a held transaction names the holder in its
     /// warning, which is the one fact a silent attach failure needs.
     holders: Arc<std::sync::Mutex<HashMap<Uuid, TransactionHolder>>>,
-    /// Who is waiting for each session's transaction: a test's barrier for
-    /// "that call has reached the lock and is parked on it".
+    /// Who is waiting for each session's transaction, and word of each new
+    /// waiter: a test's barrier for "that call has reached the lock and is
+    /// parked on it".
     #[cfg(test)]
     waiting: Arc<std::sync::Mutex<Vec<(Uuid, String)>>>,
+    #[cfg(test)]
+    waiting_changed: Arc<tokio::sync::Notify>,
 }
 
 /// One waiter's entry in `SessionControlHub::waiting`, removed on drop.
@@ -736,11 +739,13 @@ struct WaitingRecord {
 impl WaitingRecord {
     fn enter(
         waiting: &Arc<std::sync::Mutex<Vec<(Uuid, String)>>>,
+        changed: &tokio::sync::Notify,
         session_id: Uuid,
         label: &str,
     ) -> Self {
         let entry = (session_id, label.to_string());
         waiting.lock().unwrap().push(entry.clone());
+        changed.notify_waiters();
         Self {
             waiting: Arc::clone(waiting),
             entry,
@@ -789,8 +794,11 @@ impl Drop for TransactionGuard {
 
 /// A wait longer than this is reported, naming the holder; the report repeats
 /// at the second interval while the wait continues. A healthy transaction is
-/// held for milliseconds; the longest legitimate hold is a replay waiting on
-/// its worker, up to `WORKER_REPLAY_DEADLINE` (`rtc.rs`).
+/// held for milliseconds. A `history` or `snapshot` request holds it longest:
+/// up to 3 s for the viewer's `spawn.pty` channel, up to
+/// `WORKER_REPLAY_DEADLINE` (`rtc.rs`) for the worker, then while its reply is
+/// queued — up to 2 s for each of as many as 512 chunks, which is minutes for
+/// a viewer that drains just slowly enough.
 const TRANSACTION_WAIT_WARN_AFTER: Duration = Duration::from_secs(2);
 const TRANSACTION_WAIT_WARN_EVERY: Duration = Duration::from_secs(10);
 static TRANSACTION_TOKENS: AtomicU64 = AtomicU64::new(1);
@@ -853,7 +861,8 @@ impl SessionControlHub {
         let started = Instant::now();
         let mut next_warning = TRANSACTION_WAIT_WARN_AFTER;
         #[cfg(test)]
-        let _waiting = WaitingRecord::enter(&self.waiting, session_id, &label);
+        let _waiting =
+            WaitingRecord::enter(&self.waiting, &self.waiting_changed, session_id, &label);
         let lock = transaction.lock_owned();
         tokio::pin!(lock);
         let guard = loop {
@@ -898,17 +907,24 @@ impl SessionControlHub {
 
     /// Wait until a call labelled `label` is parked on `session_id`'s
     /// transaction: it has decided everything it decides before the lock.
+    /// Woken by each new waiter rather than polling, so a test on paused
+    /// time is not kept busy here while the clock waits for it to idle.
     #[cfg(test)]
     pub(crate) async fn until_waiting(&self, session_id: Uuid, label: &str) {
-        let parked = || {
-            self.waiting
+        loop {
+            let changed = self.waiting_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .waiting
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|(id, waiting)| *id == session_id && waiting == label)
-        };
-        while !parked() {
-            tokio::task::yield_now().await;
+            {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -1018,10 +1034,11 @@ impl SessionControlHub {
     /// that registers is either seen by it or registers after the state is
     /// gone, never wiped with it. Returns whether the state was removed.
     ///
-    /// The wait for the transaction is as long as its holder's, and a viewer
-    /// request holds it while it waits on the session's worker — up to that
-    /// wait's own deadline. Call this holding nothing every offer or attach
-    /// needs: they would wait as long.
+    /// The wait for the transaction is as long as its holder holds it, and a
+    /// viewer's replay request holds it through its wait on the session's
+    /// worker and the queueing of its reply (`TRANSACTION_WAIT_WARN_AFTER`).
+    /// Call this holding nothing every offer or attach needs: they would wait
+    /// as long.
     pub async fn remove_session_unless(
         &self,
         session_id: Uuid,

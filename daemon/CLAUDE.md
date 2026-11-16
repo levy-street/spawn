@@ -467,10 +467,14 @@ price, bounded and without a cycle: an attach holds its session's
 transition while it queues on admission, and trust invalidation holds
 admission for up to the teardown deadline (`invalidate_trust_and_close_all`),
 so that session's restart or exit can wait that long behind them. Nothing
-that holds admission waits on a transition. Nor does anything that holds
-the peer map or admission wait on a session's control transaction
-(`session_ctl.rs`): a `history` or `snapshot` request holds it while it
-waits on the session's worker, up to `WORKER_REPLAY_DEADLINE`, and every
+that holds admission waits on a transition. Nothing that holds the peer
+map waits on a session's control transaction (`session_ctl.rs`), and what
+holds admission waits on one only under the teardown deadline (trust
+invalidation's `close_all`, through each peer's `settle_detached_peer` →
+`unregister_viewer`): a `history` or `snapshot` request holds the
+transaction through up to 3 s for its `spawn.pty` channel, up to
+`WORKER_REPLAY_DEADLINE` on the session's worker and then while its reply is
+queued, which a slowly draining viewer stretches to minutes; and every
 offer and attach takes the peer map under admission. So
 `close_for_session` decides under the map whether the session's control
 state goes, lets the map go, and decides again holding the transaction
@@ -719,6 +723,25 @@ the units (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`) —
 never a hard limit, which every shell in a terminal would inherit. For
 temporary SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
+
+`host.agents.check` runs off the dispatch loop (`AgentCheckFlights`): the
+loop reads every frame on the socket, and a check runs programs — the
+user's shell for its PATH, each agent's version flags one after another,
+`npm view` or `pip index` beside them — that took up to half a minute
+inline, while every offer waited behind it and was answered after the
+browser had given up. A request for targets already being checked joins
+that check rather than starting another (clients ask every minute, and
+again after a 504). The whole check answers within
+`HOST_AGENTS_CHECK_DEADLINE` (10 s, inside the server's 15 s), the shell
+getting at most `HOST_AGENTS_ENV_SHARE` of it; a probe still running then
+is stopped with its process group and its agent's version reported unknown
+(`version: null`, installed by the PATH lookup — both clients show that as
+installed), with a warning per agent and probe at most every ten minutes.
+Every capture reads a program's output until the program exits, plus
+`EXITED_PROGRAM_DRAIN`, never until its pipes close: a background server a
+CLI starts with the stdout it inherited holds that pipe for as long as it
+lives. Session create, restart and kill are still awaited on the loop:
+they need a per-session lifecycle queue to leave it in order.
 
 `host.agents.install` is a refusal-only compatibility frame: server identity
 does not authorize running an installer or self-updater. Never restore its

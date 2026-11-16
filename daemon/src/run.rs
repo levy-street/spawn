@@ -50,6 +50,22 @@ const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
 const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The whole of a host agents check, from the request to the reply. The
+/// server stops waiting at 15 s and answers its caller 504; inside this the
+/// daemon answers with what it has found, and a probe still running then is
+/// stopped.
+const HOST_AGENTS_CHECK_DEADLINE: Duration = Duration::from_secs(10);
+/// The part of that deadline the user's shell gets to say which PATH the
+/// agents are looked up on: one shell, both modes, at their own timeout.
+const HOST_AGENTS_ENV_SHARE: Duration = Duration::from_secs(4);
+/// A probe that ran out of time is logged once per this interval for each
+/// agent and probe: the clients ask every minute.
+const PROBE_DEADLINE_WARN_EVERY: Duration = Duration::from_secs(600);
+/// How long a program's output is read after it exits. Its own output is in
+/// the pipe by then; what can hold a pipe open past this is something it
+/// started and left running with the output it inherited, and nothing waits
+/// for that.
+const EXITED_PROGRAM_DRAIN: Duration = Duration::from_millis(200);
 const DEFAULT_SESSION_COLS: u16 = 120;
 const DEFAULT_SESSION_ROWS: u16 = 32;
 /// Credential storage has no portable cross-process notification primitive.
@@ -2074,7 +2090,21 @@ async fn dispatch_loop(
                     request_id,
                     targets,
                 } => {
-                    handle_host_agents_check(request_id, targets, out_tx).await;
+                    // Off the loop, like an update: a check runs programs
+                    // for seconds, and this loop is how every other frame
+                    // on the socket — offers, pings, session frames — is
+                    // read. The reply is matched by its request id.
+                    AgentCheckFlights::global().request(
+                        request_id,
+                        targets,
+                        out_tx.clone(),
+                        |targets| {
+                            check_host_agents(
+                                targets,
+                                tokio::time::Instant::now() + HOST_AGENTS_CHECK_DEADLINE,
+                            )
+                        },
+                    );
                 }
                 Inbound::HostAgentsInstall { request_id, target } => {
                     handle_host_agents_install(request_id, target, out_tx).await;
@@ -2548,15 +2578,133 @@ async fn dispatch_loop(
     Ok(())
 }
 
-async fn handle_host_agents_check(
-    request_id: String,
+/// The requests waiting for one check: each id, and the connection it came
+/// in on.
+type AgentCheckWaiters = Vec<(String, mpsc::Sender<WsOutbound>)>;
+
+/// Host agents checks in flight, by the targets they check. A request for
+/// targets already being checked is answered with that check's result
+/// instead of starting another: every client on a host page asks once a
+/// minute, and a request that comes in while a slow check runs must not
+/// stack a second set of probes on the first.
+#[derive(Clone, Default)]
+struct AgentCheckFlights {
+    flights: Arc<StdMutex<HashMap<String, AgentCheckWaiters>>>,
+}
+
+impl AgentCheckFlights {
+    fn global() -> &'static Self {
+        static FLIGHTS: std::sync::OnceLock<AgentCheckFlights> = std::sync::OnceLock::new();
+        FLIGHTS.get_or_init(Self::default)
+    }
+
+    /// Answer `request_id` on `out_tx` with a check of `targets`: the one
+    /// in flight for the same targets, or a new one, which `check` makes and
+    /// a task of its own runs. Returns that task if this request started it.
+    fn request<F, Fut>(
+        &self,
+        request_id: String,
+        targets: Vec<HostAgentTarget>,
+        out_tx: mpsc::Sender<WsOutbound>,
+        check: F,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        F: FnOnce(Vec<HostAgentTarget>) -> Fut,
+        Fut: Future<Output = Vec<HostAgentStatus>> + Send + 'static,
+    {
+        let key = format!("{targets:?}");
+        {
+            let mut flights = self.lock();
+            if let Some(waiters) = flights.get_mut(&key) {
+                waiters.push((request_id, out_tx));
+                return None;
+            }
+            flights.insert(key.clone(), vec![(request_id, out_tx)]);
+        }
+        let mut landing = FlightLanding {
+            flights: self.clone(),
+            key,
+            landed: false,
+        };
+        let checking = check(targets);
+        Some(tokio::spawn(async move {
+            let agents = checking.await;
+            let waiters = landing.land();
+            futures_util::future::join_all(waiters.into_iter().map(|(request_id, out_tx)| {
+                let frame = Outbound::HostAgentsCheckResult {
+                    request_id,
+                    agents: agents.clone(),
+                };
+                async move {
+                    if let Ok(text) = serde_json::to_string(&frame) {
+                        let _ = out_tx.send(WsOutbound::json(text)).await;
+                    }
+                }
+            }))
+            .await;
+        }))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, AgentCheckWaiters>> {
+        self.flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A flight's end: it takes the waiters when the check is done, and frees
+/// the targets if the check never finishes (a panic, a runtime shutting
+/// down), so the next request starts a check of its own.
+struct FlightLanding {
+    flights: AgentCheckFlights,
+    key: String,
+    landed: bool,
+}
+
+impl FlightLanding {
+    fn land(&mut self) -> AgentCheckWaiters {
+        self.landed = true;
+        self.flights.lock().remove(&self.key).unwrap_or_default()
+    }
+}
+
+impl Drop for FlightLanding {
+    fn drop(&mut self) {
+        if !self.landed {
+            self.flights.lock().remove(&self.key);
+        }
+    }
+}
+
+/// Check `targets` and answer by `deadline`, whatever the programs do.
+async fn check_host_agents(
     targets: Vec<HostAgentTarget>,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
+    deadline: tokio::time::Instant,
+) -> Vec<HostAgentStatus> {
+    // One environment for every agent, from the user's shell, for at most
+    // its share of the deadline.
+    let env = if targets
+        .iter()
+        .any(|target| !target.command.trim().is_empty())
+    {
+        let asked_until = deadline.min(tokio::time::Instant::now() + HOST_AGENTS_ENV_SHARE);
+        resolved_command_env_until(asked_until).await
+    } else {
+        BTreeMap::new()
+    };
+    check_host_agents_in(targets, &env, deadline).await
+}
+
+/// `check_host_agents` in `env`: the agents at once, in the order asked.
+async fn check_host_agents_in(
+    targets: Vec<HostAgentTarget>,
+    env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
+) -> Vec<HostAgentStatus> {
     let mut checks = FuturesUnordered::new();
     let target_count = targets.len();
     for (index, target) in targets.into_iter().enumerate() {
-        checks.push(async move { (index, check_host_agent(target).await) });
+        checks.push(async move { (index, check_host_agent(target, env, deadline).await) });
     }
 
     let mut indexed_agents: Vec<Option<HostAgentStatus>> =
@@ -2566,12 +2714,65 @@ async fn handle_host_agents_check(
             *slot = Some(agent);
         }
     }
-    let agents = indexed_agents.into_iter().flatten().collect();
+    indexed_agents.into_iter().flatten().collect()
+}
 
-    let frame = Outbound::HostAgentsCheckResult { request_id, agents };
-    if let Ok(s) = serde_json::to_string(&frame) {
-        let _ = out_tx.send(WsOutbound::json(s)).await;
+/// Run one of an agent's probes, for at most `TOOL_VERSION_TIMEOUT` and not
+/// past the check's `deadline`; None once the deadline has passed. A probe
+/// that runs out of time is logged, at most once per agent and probe per
+/// `PROBE_DEADLINE_WARN_EVERY`.
+async fn run_agent_probe(
+    target: &HostAgentTarget,
+    program: &str,
+    args: &[&str],
+    env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
+) -> Option<CommandCapture> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
     }
+    let timeout = TOOL_VERSION_TIMEOUT.min(remaining);
+    let capture = run_program_capture(program, args, timeout, 4096, Some(env)).await;
+    if capture.timed_out {
+        let probe = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if probe_deadline_warning_due(format!("{}\0{probe}", target.agent_id)) {
+            tracing::warn!(
+                agent_id = %target.agent_id,
+                agent = %target.agent_name,
+                probe = %probe,
+                timeout_ms = timeout.as_millis() as u64,
+                limit = if timeout < TOOL_VERSION_TIMEOUT {
+                    "the check's deadline"
+                } else {
+                    "the probe's own timeout"
+                },
+                "a host agents check probe ran out of time and was stopped; the agent's version is reported unknown"
+            );
+        }
+    }
+    Some(capture)
+}
+
+/// Whether a probe that ran out of time, named by `key`, is logged now: the
+/// first time, then once per `PROBE_DEADLINE_WARN_EVERY`.
+fn probe_deadline_warning_due(key: String) -> bool {
+    static WARNED: std::sync::OnceLock<StdMutex<HashMap<String, tokio::time::Instant>>> =
+        std::sync::OnceLock::new();
+    let now = tokio::time::Instant::now();
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    warned.retain(|_, at| now.duration_since(*at) < PROBE_DEADLINE_WARN_EVERY);
+    if warned.contains_key(&key) {
+        return false;
+    }
+    warned.insert(key, now);
+    true
 }
 
 async fn handle_host_agents_install(
@@ -2600,7 +2801,11 @@ async fn handle_host_agents_install(
     }
 }
 
-async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
+async fn check_host_agent(
+    target: HostAgentTarget,
+    env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
+) -> HostAgentStatus {
     let command = target.command.trim().to_string();
     if command.is_empty() {
         return HostAgentStatus {
@@ -2618,8 +2823,7 @@ async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
         };
     }
 
-    let env = resolved_command_env().await;
-    let path = binary_path(&command, &env).await;
+    let path = binary_path(&command, env).await;
     let Some(path) = path else {
         return HostAgentStatus {
             agent_id: target.agent_id,
@@ -2636,11 +2840,17 @@ async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
         };
     };
 
-    let (version, error) = match read_tool_version(&command, &env).await {
+    // Independent programs, so at once. A version neither finds in time is
+    // reported unknown (`None`) — what both clients show as installed with
+    // no version — never as missing: `installed` is the lookup above.
+    let (version, latest_version) = tokio::join!(
+        read_tool_version(&target, &command, env, deadline),
+        latest_tool_version(&target, env, deadline),
+    );
+    let (version, error) = match version {
         Ok(version) => (version, None),
         Err(e) => (None, Some(format!("version check failed: {e:#}"))),
     };
-    let latest_version = latest_tool_version(target.install.as_deref(), &env).await;
     let update_available = match (version.as_deref(), latest_version.as_deref()) {
         (Some(installed), Some(latest)) => version_suggests_update(installed, latest),
         _ => None,
@@ -2756,17 +2966,22 @@ pub(crate) fn resolve_program_in_env(
 }
 
 async fn read_tool_version(
+    target: &HostAgentTarget,
     command: &str,
     env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
 ) -> Result<Option<String>> {
+    // One after another: each flag is the fallback for the one before, and
+    // a tool can take one of them to mean something else.
     for args in [
         &["--version"][..],
         &["version"][..],
         &["-V"][..],
         &["-v"][..],
     ] {
-        let capture =
-            run_program_capture(command, args, TOOL_VERSION_TIMEOUT, 4096, Some(env)).await;
+        let Some(capture) = run_agent_probe(target, command, args, env, deadline).await else {
+            break;
+        };
         if capture.success {
             if let Some(version) = first_meaningful_line(&capture.output) {
                 return Ok(Some(version));
@@ -2777,10 +2992,11 @@ async fn read_tool_version(
 }
 
 async fn latest_tool_version(
-    install: Option<&str>,
+    target: &HostAgentTarget,
     env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
 ) -> Option<String> {
-    let install = install?.trim();
+    let install = target.install.as_deref()?.trim();
     if install.is_empty() {
         return None;
     }
@@ -2789,28 +3005,22 @@ async fn latest_tool_version(
         .map(str::to_string)
         .or_else(|| npm_package_from_install_command(install))
     {
-        let capture = run_program_capture(
-            "npm",
-            &["view", &package, "version"],
-            TOOL_VERSION_TIMEOUT,
-            4096,
-            Some(env),
-        )
-        .await;
+        let capture =
+            run_agent_probe(target, "npm", &["view", &package, "version"], env, deadline).await?;
         if capture.success {
             return first_meaningful_line(&capture.output);
         }
     }
 
     if let Some(package) = python_package_from_install_command(install) {
-        let capture = run_program_capture(
+        let capture = run_agent_probe(
+            target,
             "python3",
             &["-m", "pip", "index", "versions", &package],
-            TOOL_VERSION_TIMEOUT,
-            4096,
-            Some(env),
+            env,
+            deadline,
         )
-        .await;
+        .await?;
         if capture.success {
             return parse_pip_latest_version(&package, &capture.output);
         }
@@ -2973,6 +3183,8 @@ pub(crate) struct CommandCapture {
     /// The program ran and exited on its own: not missing, not refused by
     /// the system, not stopped at the timeout.
     pub(crate) exited: bool,
+    /// The program was still running at the timeout and was stopped.
+    pub(crate) timed_out: bool,
 }
 
 impl CommandCapture {
@@ -2981,7 +3193,77 @@ impl CommandCapture {
             success: false,
             output: String::new(),
             exited: false,
+            timed_out: false,
         }
+    }
+}
+
+/// How a program ended and what it wrote, read until it exited — not until
+/// its output pipes closed (`EXITED_PROGRAM_DRAIN`).
+struct ProgramRun {
+    /// None: still running at the deadline.
+    status: Option<std::io::Result<std::process::ExitStatus>>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// It exited, and something it started still held its output open.
+    left_running: bool,
+}
+
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, into: &mut Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return;
+    };
+    let mut chunk = [0u8; 8192];
+    while let Ok(read @ 1..) = pipe.read(&mut chunk).await {
+        into.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Wait for `child` to exit, by `deadline`, reading what it writes. Once it
+/// has exited its pipes are read for `EXITED_PROGRAM_DRAIN` more and no
+/// longer: a server a CLI starts in the background with the stdout it
+/// inherited holds that pipe for as long as it lives, and a probe that
+/// waited for the pipe to close (`wait_with_output`) ran to its timeout
+/// every time and counted as failed.
+async fn run_until_exit(
+    child: &mut tokio::process::Child,
+    deadline: tokio::time::Instant,
+) -> ProgramRun {
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (status, left_running) = {
+        let reading = async {
+            tokio::join!(
+                read_pipe(stdout_pipe, &mut stdout),
+                read_pipe(stderr_pipe, &mut stderr)
+            );
+        };
+        tokio::pin!(reading);
+        let exiting = child.wait();
+        tokio::pin!(exiting);
+        let run = async {
+            tokio::select! {
+                status = &mut exiting => {
+                    let drained = tokio::time::timeout(EXITED_PROGRAM_DRAIN, &mut reading)
+                        .await
+                        .is_ok();
+                    (Some(status), !drained)
+                }
+                () = &mut reading => (Some(exiting.await), false),
+            }
+        };
+        tokio::time::timeout_at(deadline, run)
+            .await
+            .unwrap_or((None, false))
+    };
+    ProgramRun {
+        status,
+        stdout,
+        stderr,
+        left_running,
     }
 }
 
@@ -3075,7 +3357,7 @@ pub(crate) async fn run_program_capture_in(
     // updated, or written by a test while another thread forks — fails with
     // ETXTBSY for a moment (as `install::spawn_probe` knows): retried briefly.
     let mut busy = 0;
-    let child = loop {
+    let mut child = loop {
         match command.spawn() {
             Ok(child) => break child,
             Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 40 => {
@@ -3088,28 +3370,34 @@ pub(crate) async fn run_program_capture_in(
 
     #[cfg(unix)]
     let group = child.id();
-    // Kept alive past a timeout, so the program is not reaped before its
-    // group is killed; while anything in the group lives, its id is not
-    // handed to another process.
-    let waiting = child.wait_with_output();
-    tokio::pin!(waiting);
-    match tokio::time::timeout(timeout, &mut waiting).await {
-        Ok(Ok(output)) => CommandCapture {
-            success: output.status.success(),
-            output: combined_output(&output.stdout, &output.stderr, output_limit),
-            exited: true,
-        },
-        Ok(Err(_)) => CommandCapture::failed(),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(group),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            CommandCapture::failed()
+    let run = run_until_exit(&mut child, tokio::time::Instant::now() + timeout).await;
+    // The group goes when the program is still running at the timeout — it
+    // is not reaped yet, so its id is still its group's — and when it exited
+    // leaving something that holds its output open, as before only at the
+    // timeout. That holder is normally in the group and keeps the group, and
+    // its id, alive; one that left the group (`setsid`) is out of reach, as
+    // it always was.
+    #[cfg(unix)]
+    if run.status.is_none() || run.left_running {
+        if let Some(group) = group.and_then(|id| i32::try_from(id).ok()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(group),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
+    }
+    match run.status {
+        Some(Ok(status)) => CommandCapture {
+            success: status.success(),
+            output: combined_output(&run.stdout, &run.stderr, output_limit),
+            exited: true,
+            timed_out: false,
+        },
+        Some(Err(_)) => CommandCapture::failed(),
+        None => CommandCapture {
+            timed_out: true,
+            ..CommandCapture::failed()
+        },
     }
 }
 
@@ -3461,40 +3749,68 @@ fn login_shell_argv(shell: String) -> Vec<String> {
     }
 }
 
-pub(crate) async fn resolved_command_env() -> BTreeMap<String, String> {
+/// The environment agents run in, the user's shell asked for its PATH until
+/// `deadline` at the latest.
+async fn resolved_command_env_until(deadline: tokio::time::Instant) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
-    normalize_session_env(&mut env).await;
+    normalize_session_env_until(&mut env, Some(deadline)).await;
     env
 }
 
 async fn normalize_session_env(env: &mut BTreeMap<String, String>) {
+    normalize_session_env_until(env, None).await;
+}
+
+async fn normalize_session_env_until(
+    env: &mut BTreeMap<String, String>,
+    deadline: Option<tokio::time::Instant>,
+) {
     env_remove_ci(env, "NO_COLOR");
     env_insert_ci(env, "TERM", "xterm-256color".into());
     env_insert_ci(env, "COLORTERM", "truecolor".into());
     if env_get_ci(env, "CLICOLOR").is_none() {
         env_insert_ci(env, "CLICOLOR", "1".into());
     }
-    enrich_path_from_user_shell(env).await;
+    enrich_path_from_user_shell(env, deadline).await;
 }
 
-async fn enrich_path_from_user_shell(env: &mut BTreeMap<String, String>) {
-    let mut preferred = shell_path_entries(env).await;
+async fn enrich_path_from_user_shell(
+    env: &mut BTreeMap<String, String>,
+    deadline: Option<tokio::time::Instant>,
+) {
+    let mut preferred = shell_path_entries(env, deadline).await;
     preferred.extend(common_user_bin_entries(env));
     prepend_path_entries(env, preferred);
 }
 
 #[cfg(windows)]
-async fn shell_path_entries(_env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+async fn shell_path_entries(
+    _env: &BTreeMap<String, String>,
+    _deadline: Option<tokio::time::Instant>,
+) -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// The PATH the user's shell gives, asked of each candidate shell in both
+/// modes until one answers — and, with a `deadline`, not past it.
 #[cfg(not(windows))]
-async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+async fn shell_path_entries(
+    env: &BTreeMap<String, String>,
+    deadline: Option<tokio::time::Instant>,
+) -> Vec<PathBuf> {
     #[cfg(unix)]
     for shell in candidate_shells(env) {
         let mut entries = Vec::new();
         for mode in ["-ic", "-lc"] {
-            if let Some(path) = probe_shell_path(&shell, mode, env).await {
+            let now = tokio::time::Instant::now();
+            let mut asked_until = now + SHELL_PATH_PROBE_TIMEOUT;
+            if let Some(deadline) = deadline {
+                if deadline <= now {
+                    return entries;
+                }
+                asked_until = asked_until.min(deadline);
+            }
+            if let Some(path) = probe_shell_path(&shell, mode, env, asked_until).await {
                 entries.extend(std::env::split_paths(&path));
             }
         }
@@ -3503,7 +3819,7 @@ async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
         }
     }
     #[cfg(not(unix))]
-    let _ = env;
+    let _ = (env, deadline);
     Vec::new()
 }
 
@@ -3512,6 +3828,7 @@ async fn probe_shell_path(
     shell: &Path,
     mode: &str,
     env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
 ) -> Option<String> {
     let mut command = Command::new(shell);
     command
@@ -3523,14 +3840,26 @@ async fn probe_shell_path(
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(SHELL_PATH_PROBE_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
+    // Read until the shell exits, not until its output closes: a job an rc
+    // file starts in the background holds that output for as long as it
+    // runs. The shell is in spawnd's own process group, so no group is
+    // signalled here; one still running at the deadline is killed on drop.
+    let mut child = command.spawn().ok()?;
+    let run = run_until_exit(&mut child, deadline).await;
+    if run.status.is_none() {
+        if probe_deadline_warning_due(format!("{}\0{mode}", shell.display())) {
+            tracing::warn!(
+                shell = %shell.display(),
+                mode,
+                "the user's shell did not say its PATH in time and was stopped; what it would have added is not used"
+            );
+        }
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
+    if !run.status?.ok()?.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&run.stdout)
         .lines()
         .rev()
         .map(str::trim)
@@ -3910,6 +4239,346 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// A program that prints and exits, leaving something it started
+    /// holding its output — a background server a CLI starts with the
+    /// stdout it inherited — is a program that answered: the capture
+    /// returns when it exits, with what it said, rather than waiting for
+    /// the pipe to close until its timeout and calling it a failure. What
+    /// it left holding the pipe goes, as it went at the timeout before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_capture_returns_when_the_program_exits_though_its_output_is_held_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("server.pid");
+        let program = dir.path().join("cli");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nPATH=/bin:/usr/bin\necho 'fixture-cli 2.0.0'\nsleep 30 &\necho $! > '{}'\nexit 0\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let capture = run_program_capture(
+            program.to_str().unwrap(),
+            &["--version"],
+            Duration::from_secs(20),
+            4096,
+            None,
+        )
+        .await;
+        assert!(
+            capture.exited && capture.success && !capture.timed_out,
+            "a program that exited 0 was not taken at its word: {capture:?}"
+        );
+        assert_eq!(capture.output, "fixture-cli 2.0.0");
+
+        let held_open = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        // Gone, or a zombie its new parent has yet to reap.
+        let running = |pid: i32| {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map_or(true, |stat| !stat.contains(") Z "))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(held_open) {
+            if std::time::Instant::now() > deadline {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(held_open),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                panic!("what held the program's output, {held_open}, outlived the capture");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn agent_fixture(dir: &Path, name: &str, script: &str) -> HostAgentTarget {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join(name);
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nPATH=/bin:/usr/bin\n{script}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        HostAgentTarget {
+            agent_id: format!("{name}-{}", Uuid::new_v4()),
+            agent_name: name.to_string(),
+            agent_kind: "cli".to_string(),
+            command: program.to_string_lossy().into_owned(),
+            install: None,
+        }
+    }
+
+    fn check_result(frame: WsOutbound) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_str(frame.as_str()).unwrap();
+        assert_eq!(value["type"], "host.agents.check_result");
+        value
+    }
+
+    /// A check whose agent never answers still answers its request, by the
+    /// check's deadline: the probe is stopped there and the agent is
+    /// reported installed with its version unknown — never missing — so
+    /// the server has a reply to give instead of a 504.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_whose_agent_never_answers_replies_by_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = agent_fixture(dir.path(), "silent-agent", "exec sleep 60");
+        let env = BTreeMap::from([("PATH".to_string(), "/bin:/usr/bin".to_string())]);
+        let flights = AgentCheckFlights::default();
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        flights
+            .request(
+                "silent".into(),
+                vec![target],
+                out_tx,
+                move |targets| async move { check_host_agents_in(targets, &env, deadline).await },
+            )
+            .expect("the first request starts the check");
+
+        let reply = tokio::time::timeout(Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("a check whose agent never answers replied by its deadline")
+            .unwrap();
+        let reply = check_result(reply);
+        assert_eq!(reply["request_id"], "silent");
+        let agent = &reply["agents"][0];
+        assert_eq!(agent["installed"], true);
+        assert!(agent["version"].is_null(), "{agent}");
+        assert!(agent["error"].is_null(), "{agent}");
+    }
+
+    /// Requests for targets already being checked join that check: one set
+    /// of probes, every request answered by its own id on its own
+    /// connection. A check that never lands frees its targets.
+    #[tokio::test]
+    async fn overlapping_requests_for_the_same_agents_share_one_check() {
+        let flights = AgentCheckFlights::default();
+        let target = HostAgentTarget {
+            agent_id: "shared".into(),
+            agent_name: "Shared".into(),
+            agent_kind: "cli".into(),
+            command: "shared-agent".into(),
+            install: None,
+        };
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, released) = oneshot::channel::<()>();
+        let check = |runs: Arc<std::sync::atomic::AtomicUsize>, released: oneshot::Receiver<()>| {
+            move |targets: Vec<HostAgentTarget>| async move {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = released.await;
+                targets
+                    .into_iter()
+                    .map(|target| HostAgentStatus {
+                        agent_id: target.agent_id,
+                        agent_name: target.agent_name,
+                        agent_kind: target.agent_kind,
+                        command: target.command,
+                        install: target.install,
+                        installed: true,
+                        path: None,
+                        version: Some("shared 1.0".into()),
+                        latest_version: None,
+                        update_available: None,
+                        error: None,
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        let flight = flights
+            .request(
+                "first".into(),
+                vec![target.clone()],
+                first_tx,
+                check(Arc::clone(&runs), released),
+            )
+            .expect("the first request starts the check");
+        let (_unused_release, unused) = oneshot::channel::<()>();
+        assert!(
+            flights
+                .request(
+                    "second".into(),
+                    vec![target.clone()],
+                    second_tx,
+                    check(Arc::clone(&runs), unused),
+                )
+                .is_none(),
+            "a request for targets being checked started a check of its own"
+        );
+        release.send(()).unwrap();
+        flight.await.unwrap();
+        for (rx, id) in [(&mut first_rx, "first"), (&mut second_rx, "second")] {
+            let reply = check_result(rx.try_recv().expect("every waiting request is answered"));
+            assert_eq!(reply["request_id"], id);
+            assert_eq!(reply["agents"][0]["version"], "shared 1.0");
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Landed: the next request is a check of its own. One that never
+        // lands (aborted here) frees its targets all the same.
+        let (third_tx, _third_rx) = mpsc::channel(4);
+        let (_hold, held) = oneshot::channel::<()>();
+        let aborted = flights
+            .request(
+                "third".into(),
+                vec![target.clone()],
+                third_tx,
+                check(Arc::clone(&runs), held),
+            )
+            .expect("a check that landed is not joined");
+        aborted.abort();
+        let _ = aborted.await;
+        let (fourth_tx, _fourth_rx) = mpsc::channel(4);
+        let (_hold, held) = oneshot::channel::<()>();
+        let fourth = flights
+            .request("fourth".into(), vec![target], fourth_tx, check(runs, held))
+            .expect("a check that never landed freed its targets");
+        fourth.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_that_runs_out_of_time_is_logged_once_per_interval() {
+        let key = format!("rate-limit-{}", Uuid::new_v4());
+        assert!(probe_deadline_warning_due(key.clone()));
+        assert!(!probe_deadline_warning_due(key.clone()));
+        tokio::time::advance(PROBE_DEADLINE_WARN_EVERY - Duration::from_millis(1)).await;
+        assert!(!probe_deadline_warning_due(key.clone()));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(probe_deadline_warning_due(key));
+    }
+
+    /// The agents check that made a host answer offers half a minute late:
+    /// run on the dispatch loop, it held every frame on the socket for as
+    /// long as its programs took. An agent here waits on a FIFO the test
+    /// opens only at the end, so the check is in progress for the whole
+    /// exchange; an offer and a ping sent meanwhile must be answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_agents_check_does_not_hold_up_offers_or_pings() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("release");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let target = agent_fixture(
+            dir.path(),
+            "waiting-agent",
+            &format!(
+                "read line < '{}'\necho 'waiting-agent 3.1.4'",
+                fifo.display()
+            ),
+        );
+        let host_id = Uuid::from_u128(43);
+        let record = credential_record(
+            1,
+            1,
+            "test-token",
+            host_id,
+            "https://spawn.example/control",
+            7,
+            &[],
+        );
+        let live = live_snapshot(record);
+        let registry = SessionRegistry::new();
+        let rtc_sessions = RtcSessions::new();
+        let mut revoked = RevocationSet::new();
+        let (in_tx, mut in_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+
+        let dispatch = dispatch_loop(
+            &mut in_rx,
+            &registry,
+            &rtc_sessions,
+            &out_tx,
+            &live,
+            &mut revoked,
+            Arc::new(StdMutex::new(None)),
+            std::collections::HashSet::new(),
+        );
+        let exercise = async move {
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::HostAgentsCheck {
+                    request_id: "slow-check".into(),
+                    targets: vec![target],
+                })))
+                .await
+                .unwrap();
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::RtcOffer {
+                    session_id: "offer-during-check".into(),
+                    binding_nonce: Some("n".repeat(32)),
+                    binding_generation: Some(1),
+                    scope_type: Some("host".into()),
+                    scope_id: Some(host_id),
+                    protocol: Some("spawn.host.ctl".into()),
+                    protocol_version: Some(2),
+                    sdp: None,
+                    signed_envelope: Some("{}".into()),
+                    carried_endorsements: Vec::new(),
+                    ice_servers: Vec::new(),
+                    ice_transport_policy: None,
+                    ice_restart: false,
+                })))
+                .await
+                .unwrap();
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::HostPing {
+                    request_id: "ping-during-check".into(),
+                })))
+                .await
+                .unwrap();
+            for expected in ["rtc.status", "host.pong"] {
+                let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("{expected} waited on a host agents check still in progress")
+                    })
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(frame.as_str()).unwrap();
+                assert_eq!(value["type"], expected, "{value}");
+            }
+
+            // Now let the agent answer: the check finishes and replies.
+            let release = fifo.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(release)
+                    .unwrap();
+                writer.write_all(b"go\n").unwrap();
+            });
+            let reply = tokio::time::timeout(Duration::from_secs(20), out_rx.recv())
+                .await
+                .expect("the check replied once its agent answered")
+                .unwrap();
+            let reply = check_result(reply);
+            assert_eq!(reply["request_id"], "slow-check");
+            assert_eq!(reply["agents"][0]["version"], "waiting-agent 3.1.4");
+            drop(in_tx);
+        };
+
+        let (_, dispatch_result) = tokio::time::timeout(Duration::from_secs(40), async {
+            tokio::join!(exercise, dispatch)
+        })
+        .await
+        .expect("dispatch agents check test timeout");
+        dispatch_result.unwrap();
     }
 
     /// A deleted, archived or moved window leaves no note of its Codex

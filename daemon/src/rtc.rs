@@ -2665,10 +2665,11 @@ impl RtcSessions {
         // or registers only after it. Decided twice: here, so a session with
         // a peer never waits for its transaction at all, and again by
         // `remove_session_unless` once it holds the transaction, which every
-        // registration takes. Never while holding the peer map: the
-        // transaction can be held by a viewer request waiting on the
-        // session's worker (up to `WORKER_REPLAY_DEADLINE`), and every offer
-        // and attach on the daemon takes the peer map, under admission.
+        // registration takes. Never while holding the peer map: a viewer
+        // request holds the transaction through its replay — on the
+        // session's worker up to `WORKER_REPLAY_DEADLINE`, then while its
+        // reply is queued — and every offer and attach on the daemon takes
+        // the peer map, under admission.
         if !self.session_has_peers(session_id).await {
             self.controls
                 .remove_session_unless(session_id, self.session_has_peers(session_id))
@@ -4956,7 +4957,7 @@ fn worker_replay_timed_out(
             deadline_secs = WORKER_REPLAY_DEADLINE.as_secs(),
             held_back,
             "a viewer's replay waited its deadline on the session's worker and gave up; \
-             the session's control transaction is free again"
+             the viewer is told request_timeout"
         );
     }
     ProtocolError::new(

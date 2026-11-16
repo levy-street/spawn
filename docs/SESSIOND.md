@@ -640,8 +640,9 @@ deadline, `WORKER_REPLAY_DEADLINE` (10 s, `rtc.rs`). A worker that is alive
 answers in milliseconds; one that has stopped answering costs a viewer that
 long and no longer. A `history` or `snapshot` request waits holding its
 session's control transaction, which the session's other requests and a
-restart's removal of its control state queue behind, so the deadline is what
-bounds them. At the deadline the request answers `request_timeout`, as it
+restart's removal of its control state queue behind; the deadline bounds the
+worker's part of that hold, and the viewer the rest (3 s for its `spawn.pty`
+channel, then the reply's queueing). At the deadline the request answers `request_timeout`, as it
 always did at this bound (web then opens the pane on the live stream), and
 spawnd logs at warning level which wait ran out — `worker_reply` or
 `live_stream` — once per worker connection per minute, counting the ones it
