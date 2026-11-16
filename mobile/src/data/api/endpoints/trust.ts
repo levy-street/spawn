@@ -134,15 +134,13 @@ export function denyDeviceApproval(requestId: string): Promise<DeviceApprovalReq
   });
 }
 
+/**
+ * Every live pin a host holds on record, each with its delivery state. Whether
+ * a pin counts as the account's approval, as what the host admits today, or as
+ * nothing is `pinStanding`'s call (data/trust/chain-reach.ts, #138).
+ */
 export function getHostPins(hostId: string): Promise<HostPinsOut> {
   return api(`/api/trust/hosts/${pathPart(hostId)}/pins`, { schema: HostPinsOutSchema });
-}
-
-export async function listHostPins(hostId: string): Promise<string[]> {
-  const response = await getHostPins(hostId);
-  // A server row the daemon did not adopt is not admission authority. Keep it
-  // for the host-detail warning, but never let trust probes count it as live.
-  return response.pins.filter((pin) => pin.delivered).map((pin) => pin.browser_device_id);
 }
 
 // ----- add-device SAS ceremony relay (mesh §4, Appendix A) -----

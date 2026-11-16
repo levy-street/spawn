@@ -181,6 +181,22 @@ terminal state precisely so the residual is a chosen, contained trade.
   in without another one."* The phone's waiting sheet does not: the app cannot use a
   passkey (below, §6), so the line would be untrue there. Nor does the desktop app,
   where passkeys are unproven in its webview.
+- **approved is the account's word, not one host's** *(2026-11-16, #138)*: the card,
+  the phone's waiting sheet, and the ask they send go up only when the account's own
+  records approve no way to the device (nothing approved it, or it was removed). Whether
+  a particular host has taken an approval in is that host's state, not the device's. A
+  host that could not take it in for a reason that says nothing against it (it could not
+  run its check, or it is full) shows *Not delivered* against that device on the host's
+  page, and the device itself sees only the terminal's own connection states
+  (connecting, taking longer than usual, the host offline — the same ones any slow or
+  unreachable host gets, in each app's existing words), never the waiting card:
+  approving again would change nothing, since the approval is already recorded. No new
+  copy was added for this. A host that checked an approval and could not verify it
+  has confirmed nothing, and that approval counts for nothing anywhere. The screens
+  decide only what they say: the host still checks every connection against what it
+  holds, so this admits no one. Before this, one host failing to take in one device's
+  approval put every device approved through it back on the card at once, and
+  approving them again from the phone did nothing.
 - existing device: the request arrives as a prompt (`ApproveRequest`) → NumberCheck
   (enter side). The roster's waiting row is the pull path to the same place. *(The
   desktop corner toast that offered "Enter its number" for every unapproved sign-in
@@ -325,8 +341,10 @@ build that would not help.
   ceremony. The disaster flow is the ordinary flow.
 - **not approved yet** — "One step left — approve from a device you already use, or sign
   in with your passkey." → *Use passkey*. As built, this state materializes where the
-  refusal actually bites: the `SessionApprovalGate` card over an agent session (§3),
-  which carries the same sentence and both escapes.
+  refusal would bite: the `SessionApprovalGate` card over an agent session (§3), which
+  carries the same sentence and both escapes. It is decided from the account's records,
+  not from a host's answer, so a host that has not taken an approval in never raises it
+  (§3, #138).
 
 ### 8. History — `TrustHistory`
 - Plain sentences, newest first: "MacBook Pro approved iPhone", "Your passkey approved

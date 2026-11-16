@@ -1,5 +1,14 @@
+import type { Page } from "@playwright/test";
 import { expect, test } from "@playwright/test";
-import { BROWSER_DEVICE_ID, HOST_ID, host, mockApp, SESSION_ID, session } from "./app-mocks";
+import {
+  BROWSER_DEVICE_ID,
+  CREATED_AT,
+  HOST_ID,
+  host,
+  mockApp,
+  SESSION_ID,
+  session,
+} from "./app-mocks";
 
 // Opening an agent session on an unapproved device cannot connect — the daemon
 // refuses the offer. The session approval gate (docs/TRUST_UX.md §3, §7) turns
@@ -110,4 +119,150 @@ test("the card yields to the number check when an approver starts", async ({ pag
   const ceremony = page.getByTestId("approve-ceremony");
   await expect(ceremony).toBeVisible();
   await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
+});
+
+// #138: the account's approval and one host's confirmation of it are different
+// states. An approved browser whose host nacked a pin for a reason that says
+// nothing against the approval (a reconcile that could not run, a full host)
+// is not asked to be approved again — approving again would change nothing —
+// while a pin the host could not verify, or a removed approver, still leaves
+// the browser unapproved.
+
+const APPROVER_ID = "00000000-0000-4000-8000-000000000077";
+const approver = (revokedAt: string | null = null) => ({
+  id: APPROVER_ID,
+  key_algorithm: "ed25519",
+  // Any key but this browser's own (which the page generates).
+  public_key: "q3Z8V7mT2xQ9bN4cR6sW1yE5uI0oP8aS3dF7gH2jK4l",
+  fingerprint: "SHA256:approverapprover",
+  label: "Chrome on Mac",
+  created_at: CREATED_AT,
+  revoked_at: revokedAt,
+});
+
+/** Every request that asks other devices for approval: the roster stamp and the knock. */
+function watchAsks(page: Page): string[] {
+  const asks: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return;
+    const url = request.url();
+    if (url.endsWith("/request-approval") || url.endsWith("/api/trust/device-approvals")) {
+      asks.push(url);
+    }
+  });
+  return asks;
+}
+
+/**
+ * Opens the session as a browser that was registered before this page load,
+ * as an approved browser always is: the mock registers it on its first load,
+ * so a single load could read the device list before this browser's own row
+ * exists. Resolves once the gate has had everything it decides from.
+ */
+async function openSessionAsRegisteredBrowser(page: Page) {
+  const registered = page.waitForResponse((response) =>
+    response.url().endsWith("/api/browser-devices/register"),
+  );
+  await page.goto("/app");
+  await registered;
+  const answered = Promise.all([
+    page.waitForResponse((response) => response.url().endsWith(`/api/trust/hosts/${HOST_ID}/pins`)),
+    page.waitForResponse((response) => response.url().endsWith("/api/trust/account-endorsements")),
+  ]);
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await answered;
+}
+
+for (const reason of ["other", "pin_limit"] as const) {
+  test(`an approved device is not asked again when its host has not confirmed an approval (${reason})`, async ({
+    page,
+  }) => {
+    const asks = watchAsks(page);
+    await mockApp(page, {
+      hosts: [KEYED_HOST],
+      sessions: [session()],
+      extraBrowserDevices: [approver()],
+      // The only pinned device's pin was nacked; this browser was approved by it.
+      hostPinRecords: {
+        [HOST_ID]: [
+          { browser_device_id: APPROVER_ID, delivered: false, undelivered_reason: reason },
+        ],
+      },
+      accountEndorsements: [
+        { endorser_device_id: APPROVER_ID, endorsed_device_id: BROWSER_DEVICE_ID },
+      ],
+    });
+    await openSessionAsRegisteredBrowser(page);
+
+    await expect(page.getByText("palette").first()).toBeVisible();
+    await page.waitForTimeout(1200);
+    await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
+    expect(asks).toEqual([]);
+  });
+}
+
+test("a device whose own pin its host has not confirmed is not asked again", async ({ page }) => {
+  const asks = watchAsks(page);
+  await mockApp(page, {
+    hosts: [KEYED_HOST],
+    sessions: [session()],
+    hostPinRecords: {
+      [HOST_ID]: [
+        { browser_device_id: BROWSER_DEVICE_ID, delivered: false, undelivered_reason: "other" },
+      ],
+    },
+  });
+  await openSessionAsRegisteredBrowser(page);
+
+  await expect(page.getByText("palette").first()).toBeVisible();
+  await page.waitForTimeout(1200);
+  await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
+  expect(asks).toEqual([]);
+});
+
+test("an approval the host could not verify still leaves the device waiting", async ({ page }) => {
+  await mockApp(page, {
+    hosts: [KEYED_HOST],
+    sessions: [session()],
+    extraBrowserDevices: [approver()],
+    hostPinRecords: {
+      [HOST_ID]: [
+        { browser_device_id: APPROVER_ID, delivered: false, undelivered_reason: "invalid_chain" },
+      ],
+    },
+    accountEndorsements: [
+      { endorser_device_id: APPROVER_ID, endorsed_device_id: BROWSER_DEVICE_ID },
+    ],
+  });
+  const knocked = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/api/trust/device-approvals") && request.method() === "POST",
+  );
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByTestId("session-approval-gate")).toBeVisible();
+  await knocked;
+});
+
+test("a device approved only by a removed device still gets the card", async ({ page }) => {
+  await mockApp(page, {
+    hosts: [KEYED_HOST],
+    sessions: [session()],
+    extraBrowserDevices: [approver("2026-11-15T00:00:00Z")],
+    // A stale row for the removed approver: it seeds nothing.
+    hostPinRecords: {
+      [HOST_ID]: [
+        { browser_device_id: APPROVER_ID, delivered: false, undelivered_reason: "other" },
+      ],
+    },
+    accountEndorsements: [
+      { endorser_device_id: APPROVER_ID, endorsed_device_id: BROWSER_DEVICE_ID },
+    ],
+  });
+  const knocked = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/api/trust/device-approvals") && request.method() === "POST",
+  );
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByTestId("session-approval-gate")).toBeVisible();
+  await knocked;
 });

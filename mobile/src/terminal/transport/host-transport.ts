@@ -1658,9 +1658,9 @@ class WebViewHostTransport implements StreamingHostTransport {
         : this.options.probeTrust
           ? this.options
               .probeTrust(this.hostId)
-              .then((status) => ({ status, directlyPinned: false }))
+              .then((status) => ({ status, directlyPinned: false, confirmed: false }))
           : probeDeviceHostTrustResult(this.hostId)
-    ).catch(() => ({ status: "unknown" as const, directlyPinned: false }));
+    ).catch(() => ({ status: "unknown" as const, directlyPinned: false, confirmed: false }));
     void result.then(({ status }) => {
       if (epoch !== this.#prepareEpoch) return;
       if (status !== "untrusted") return;

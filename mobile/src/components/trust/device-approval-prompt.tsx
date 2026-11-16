@@ -62,8 +62,11 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
   const target = (devices.data ?? []).find(
     (device) => device.id === request?.browser_device_id && device.revoked_at === null,
   );
-  // Hosts that trust this device are exactly the ones it can vouch for.
-  const endorsableHosts = approvals.approved.filter((entry) => entry.host.host_public_key !== null);
+  // Hosts that trust this device are exactly the ones it can vouch for — the
+  // ones that have confirmed the way here, as on the web (#138).
+  const endorsableHosts = approvals.approved.filter(
+    (entry) => entry.confirmed && entry.host.host_public_key !== null,
+  );
   // The relay is polled only while there is something to answer.
   const ceremony = useDeviceCeremony({
     accountId,

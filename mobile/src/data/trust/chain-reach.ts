@@ -11,8 +11,70 @@
  * the walk is bounded like the daemon's chain length cap.
  */
 
+import type { HostPinUndeliveredReason } from "@/data/api/schemas/trust";
+
 /** Matches `DEFAULT_MAX_CHAIN_EDGES` in daemon/src/endorsement_chain.rs. */
 export const MAX_CHAIN_EDGES = 8;
+
+/**
+ * Where one host stands on one recorded approval (a pin). This is a property
+ * of the HOST, kept apart from whether the account approved the device at all
+ * (#138): a host that has not taken an approval in is a host with a problem,
+ * shown where that host is shown ("Not delivered" on its page), never a reason
+ * to ask the device to be approved again. Same rule as the web's
+ * `pinStanding` (web/src/lib/trust-roster.ts).
+ *
+ * - `confirmed` — the host acknowledged the pin, or has not answered yet (the
+ *   server reports a pin no host has nacked as delivered).
+ * - `unconfirmed` — the host nacked it for a reason that says nothing against
+ *   the approval itself. `other`: a local failure on the host — a reconcile
+ *   that could not run nacks every pin it was sent, including ones the host
+ *   already holds and still admits — or the same key already held under
+ *   another id. `pin_limit`: the host verified the approval and had no room.
+ * - `rejected` — `invalid_chain`: the host checked the approval and could not
+ *   verify it. Such a record proves nothing, so it counts as absent.
+ */
+export type PinStanding = "confirmed" | "unconfirmed" | "rejected";
+
+export interface PinDeliveryRecord {
+  readonly browser_device_id: string;
+  readonly delivered: boolean;
+  readonly undelivered_reason: HostPinUndeliveredReason | null;
+}
+
+export function pinStanding(pin: Omit<PinDeliveryRecord, "browser_device_id">): PinStanding {
+  // Every reason the server can record, each decided on its own; a new one
+  // fails to compile here rather than falling into either bucket by default.
+  switch (pin.undelivered_reason) {
+    case "invalid_chain":
+      return "rejected";
+    case "pin_limit":
+    case "other":
+      return "unconfirmed";
+    case null:
+      return pin.delivered ? "confirmed" : "unconfirmed";
+  }
+}
+
+/**
+ * One host's pins split into the two questions they answer: which devices the
+ * account has approved toward it (`recorded`: every pin it did not reject) and
+ * which it admits today (`confirmed`).
+ */
+export function pinIdsByStanding(pins: readonly PinDeliveryRecord[]): {
+  recorded: string[];
+  confirmed: string[];
+} {
+  const recorded: string[] = [];
+  const confirmed: string[] = [];
+  for (const pin of pins) {
+    const standing = pinStanding(pin);
+    if (standing === "rejected") continue;
+    recorded.push(pin.browser_device_id);
+    if (standing === "confirmed") confirmed.push(pin.browser_device_id);
+  }
+  return { recorded, confirmed };
+}
 
 export interface ChainDevice {
   readonly id: string;
@@ -29,7 +91,11 @@ function liveEdges<E extends ChainEdge>(devices: readonly ChainDevice[], edges: 
   return edges.filter((e) => live.has(e.endorser_device_id) && live.has(e.endorsed_device_id));
 }
 
-/** Device ids reachable from `anchorIds` over live edges, within the length cap. */
+/**
+ * Device ids reachable from `anchorIds` over live edges, within the length cap.
+ * Only live anchors seed the walk, as on the web: a removed device's pin
+ * grants nothing, whatever its delivery state.
+ */
 export function chainReachableFrom(
   anchorIds: Iterable<string>,
   devices: readonly ChainDevice[],
@@ -43,7 +109,8 @@ export function chainReachableFrom(
       edge.endorsed_device_id,
     ]);
   }
-  const reachable = new Set<string>(anchorIds);
+  const live = new Set(devices.filter((d) => d.revoked_at === null).map((d) => d.id));
+  const reachable = new Set<string>([...anchorIds].filter((id) => live.has(id)));
   let frontier = [...reachable];
   for (let depth = 0; depth < maxEdges && frontier.length > 0; depth += 1) {
     const next: string[] = [];

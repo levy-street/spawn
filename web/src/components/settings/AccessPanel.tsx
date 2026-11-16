@@ -137,7 +137,7 @@ export function AccessPanel() {
   const roster = computeTrustRoster(
     devices.data ?? [],
     accountEdges.data ?? [],
-    trustMap.pinnedDeviceIds,
+    trustMap.anchorDeviceIds,
   );
 
   // The list is the single source of rows; when the current device is known

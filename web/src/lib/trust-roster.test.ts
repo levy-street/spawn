@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import type { HostPinUndeliveredReason } from "./api";
 import {
   chainReachableFrom,
+  computeTrustRoster,
+  hostPinMap,
   hostsSolelyTrustedBy,
   hostsTrustingDevice,
+  pinStanding,
   unprotectedOrphanHostIds,
 } from "./trust-roster";
 
@@ -119,5 +123,102 @@ describe("chainReachableFrom / hostsTrustingDevice (mesh §3 coverage)", () => {
     expect(hostsTrustingDevice(DEVICE_Y, [chainHost, legacyHost], pinsByHost, devices, [])).toEqual(
       [legacyHost],
     );
+  });
+});
+
+// #138: the account's approval and one host's confirmation of it are two
+// different states. A host that nacked a pin for a reason that says nothing
+// against the approval must not turn every device chained through it into a
+// "waiting for approval" device; a host that could not VERIFY the approval
+// must not be counted as approving anything.
+describe("pinStanding / hostPinMap / computeTrustRoster (#138)", () => {
+  const BROWSER = "00000000-0000-4000-8000-000000000301";
+  const live = (id: string) => ({ id, revoked_at: null, is_root: false });
+  const removed = (id: string) => ({ id, revoked_at: "2026-11-15T00:00:00Z", is_root: false });
+  const edge = (from: string, to: string) => ({ endorser_device_id: from, endorsed_device_id: to });
+  const pin = (
+    id: string,
+    undelivered_reason: HostPinUndeliveredReason | null,
+    delivered = undelivered_reason === null,
+  ) => ({ browser_device_id: id, delivered, undelivered_reason });
+
+  test("every reason the server can record is decided on its own", () => {
+    expect(pinStanding(pin(DEVICE_X, null))).toBe("confirmed");
+    // A host that could not run its reconcile nacks every pin it was sent,
+    // the ones it already holds and still admits included.
+    expect(pinStanding(pin(DEVICE_X, "other"))).toBe("unconfirmed");
+    // Verified, then no room: the approval stands, the host is full.
+    expect(pinStanding(pin(DEVICE_X, "pin_limit"))).toBe("unconfirmed");
+    // The host checked the approval and could not verify it.
+    expect(pinStanding(pin(DEVICE_X, "invalid_chain"))).toBe("rejected");
+    // A rejection is never softened by a contradictory delivered flag.
+    expect(pinStanding(pin(DEVICE_X, "invalid_chain", true))).toBe("rejected");
+    // Not delivered with no reason: not confirmed, not refused.
+    expect(pinStanding(pin(DEVICE_X, null, false))).toBe("unconfirmed");
+  });
+
+  test("an unconfirmed pin anchors the account's approval but is not host admission", () => {
+    const map = hostPinMap([
+      [HOST, [pin(DEVICE_X, "other"), pin(DEVICE_Y, null)]],
+      [OTHER_HOST, [pin(ROOT_DEVICE, "pin_limit"), pin(BROWSER, "invalid_chain")]],
+    ]);
+    expect([...map.anchorDeviceIds].sort()).toEqual([DEVICE_X, DEVICE_Y, ROOT_DEVICE].sort());
+    // Per host: only what the host confirmed.
+    expect(map.byHost.get(HOST)).toEqual([DEVICE_Y]);
+    expect(map.byHost.get(OTHER_HOST)).toEqual([]);
+    expect(map.byDevice.get(DEVICE_X)).toBeUndefined();
+    expect(map.byDevice.get(DEVICE_Y)).toEqual([HOST]);
+    // A rejected pin is neither.
+    expect(map.anchorDeviceIds.has(BROWSER)).toBe(false);
+  });
+
+  test("REGRESSION: a browser whose only chain runs through an unconfirmed pin is approved", () => {
+    // The production shape: one pinned device X, a browser approved by X,
+    // and X's pin nacked with `other` by a host whose reconcile could not run.
+    const devices = [live(DEVICE_X), live(BROWSER)];
+    const map = hostPinMap([[HOST, [pin(DEVICE_X, "other")]]]);
+    const roster = computeTrustRoster(devices, [edge(DEVICE_X, BROWSER)], map.anchorDeviceIds);
+    expect(roster.get(BROWSER)?.chainTrusted).toBe(true);
+    expect(roster.get(DEVICE_X)?.chainTrusted).toBe(true);
+    // The same holds when the host is full rather than failing.
+    const full = hostPinMap([[HOST, [pin(DEVICE_X, "pin_limit")]]]);
+    expect(
+      computeTrustRoster(devices, [edge(DEVICE_X, BROWSER)], full.anchorDeviceIds).get(BROWSER)
+        ?.chainTrusted,
+    ).toBe(true);
+  });
+
+  test("a browser nobody approved is still not approved", () => {
+    const devices = [live(DEVICE_X), live(BROWSER)];
+    const map = hostPinMap([[HOST, [pin(DEVICE_X, "other")]]]);
+    expect(computeTrustRoster(devices, [], map.anchorDeviceIds).get(BROWSER)?.chainTrusted).toBe(
+      false,
+    );
+  });
+
+  test("a pin the host could not verify approves nothing", () => {
+    const devices = [live(DEVICE_X), live(BROWSER)];
+    const map = hostPinMap([[HOST, [pin(DEVICE_X, "invalid_chain")]]]);
+    const roster = computeTrustRoster(devices, [edge(DEVICE_X, BROWSER)], map.anchorDeviceIds);
+    expect(roster.get(DEVICE_X)?.chainTrusted).toBe(false);
+    expect(roster.get(BROWSER)?.chainTrusted).toBe(false);
+  });
+
+  test("removal still ends approval, whatever a pin's delivery state says", () => {
+    // A removed device keeps nothing, even with a pin row still listed.
+    const map = hostPinMap([[HOST, [pin(DEVICE_X, "other"), pin(BROWSER, "other")]]]);
+    expect(
+      computeTrustRoster([live(DEVICE_X), removed(BROWSER)], [], map.anchorDeviceIds).get(BROWSER)
+        ?.chainTrusted,
+    ).toBe(false);
+    // And a removed approver's pin seeds nothing below it.
+    const viaRemoved = hostPinMap([[HOST, [pin(DEVICE_X, "other")]]]);
+    expect(
+      computeTrustRoster(
+        [removed(DEVICE_X), live(BROWSER)],
+        [edge(DEVICE_X, BROWSER)],
+        viaRemoved.anchorDeviceIds,
+      ).get(BROWSER)?.chainTrusted,
+    ).toBe(false);
   });
 });

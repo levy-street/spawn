@@ -16,7 +16,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { logOut } from "@/data/api/endpoints/auth";
-import { listHostPins } from "@/data/api/endpoints/trust";
+import { getHostPins } from "@/data/api/endpoints/trust";
 import type { BrowserDeviceOut } from "@/data/api/schemas/devices";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import {
@@ -27,6 +27,7 @@ import {
 } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { useConnectionStore } from "@/data/stores/connection";
+import { pinIdsByStanding } from "@/data/trust/chain-reach";
 import { createDeviceEndorsement } from "@/data/trust/endorsement";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { removeLocalTrustAccount } from "@/data/trust/local-account";
@@ -39,7 +40,11 @@ import { spacing, useTheme } from "@/theme";
 
 interface HostDeviceTrust {
   host: HostOut;
+  /** Devices the account approved toward this host, whether or not the host
+   * has confirmed taking the approval in (#138): what "approved" means. */
   deviceIds: readonly string[];
+  /** Devices whose approval this host has confirmed: what it admits today. */
+  confirmedIds: readonly string[];
 }
 
 function derivedDeviceFingerprint(device: BrowserDeviceOut): string {
@@ -94,7 +99,10 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     let active = true;
     const hostList = hosts.data ?? [];
     void Promise.all(
-      hostList.map(async (host) => ({ host, deviceIds: await listHostPins(host.id) })),
+      hostList.map(async (host) => {
+        const { recorded, confirmed } = pinIdsByStanding((await getHostPins(host.id)).pins);
+        return { host, deviceIds: recorded, confirmedIds: confirmed };
+      }),
     ).then(
       (records) => {
         if (active) {
@@ -122,10 +130,12 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     hostTrust.filter((record) => record.deviceIds.includes(deviceId)).length;
   const endorsableHosts = useMemo(() => {
     if (!currentDevice || !approveTarget) return [];
+    // This phone vouches only toward hosts that have confirmed its own
+    // approval; one that already records the target needs nothing more.
     return hostTrust.filter(
-      ({ host, deviceIds }) =>
+      ({ host, deviceIds, confirmedIds }) =>
         host.host_public_key !== null &&
-        deviceIds.includes(currentDevice.id) &&
+        confirmedIds.includes(currentDevice.id) &&
         !deviceIds.includes(approveTarget.id),
     );
   }, [approveTarget, currentDevice, hostTrust]);
@@ -323,7 +333,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
                   currentDevice &&
                     hostTrust.some(
                       (record) =>
-                        record.deviceIds.includes(currentDevice.id) &&
+                        record.confirmedIds.includes(currentDevice.id) &&
                         !record.deviceIds.includes(device.id),
                     ),
                 )

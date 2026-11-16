@@ -22,15 +22,25 @@ export const GATE_POLL_UP_MS = 4_000;
 export const GATE_POLL_DOWN_MS = 30_000;
 
 /**
- * The approval card over a dead terminal (docs/TRUST_UX.md §3, §7).
+ * The approval card over an agent session (docs/TRUST_UX.md §3, §7).
  *
- * An unapproved device that opens an agent session cannot connect — the daemon
- * refuses its offer (no chain to an anchor) and nothing here changes that.
- * What this gate does is turn the refusal into the flow: it covers the session
- * with the "one step left" card, stamps the device's approval request so every
- * other device's toast surfaces (or re-surfaces) right now, and offers the two
- * escapes that need no other device — the passkey and possessing a host from
- * its terminal.
+ * The card goes up when the ACCOUNT's records approve no way to this device
+ * (`useCurrentDeviceApproval`): no anchor reaches it over live approvals, or
+ * it was removed. It never reads the daemon's answer to an offer. The daemon
+ * is the enforcer either way — it verifies every signed offer against its own
+ * pins and chains, so this card grants nothing and its absence admits nothing.
+ * What it does is turn the refusal an unapproved device is going to get into
+ * the flow: it covers the session with the "one step left" card, stamps the
+ * device's approval request so every other device's toast surfaces (or
+ * re-surfaces) right now, and offers the two escapes that need no other
+ * device — the passkey and possessing a host from its terminal.
+ *
+ * A host that has not confirmed an approval is not a reason for this card
+ * (#138). Approving the device again would change nothing — the approval is
+ * already recorded — so an approved device whose host is slow, offline or
+ * still taking the approval in sees the terminal's own connection states
+ * ("Connecting to …", "taking longer than usual", "… is offline"), and the
+ * host's page says "Not delivered".
  *
  * The number itself is NOT shown here: when an approver starts the ceremony,
  * the app-level ceremony host's dialog (which sits above this card) takes over

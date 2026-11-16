@@ -1,13 +1,13 @@
 import { listBrowserDevices } from "@/data/api/endpoints/devices";
 import { getHost } from "@/data/api/endpoints/hosts";
-import { listAccountEndorsements, listHostPins } from "@/data/api/endpoints/trust";
+import { getHostPins, listAccountEndorsements } from "@/data/api/endpoints/trust";
 import { invalidateCarriedEndorsements } from "@/data/trust/carried-endorsements";
-import { chainReachableFrom } from "@/data/trust/chain-reach";
+import { chainReachableFrom, pinIdsByStanding } from "@/data/trust/chain-reach";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
 import { deviceIdentity } from "@/lib/crypto/identity";
 
 /**
- * Whether a host will accept a signed RTC offer from this device.
+ * Whether the account has approved this device toward a host.
  *
  * A daemon answers offers signed by a browser key it has pinned locally, or —
  * on a host that validates account chains (mesh §3) — by a key that reaches
@@ -17,6 +17,15 @@ import { deviceIdentity } from "@/lib/crypto/identity";
  * the launcher all sit on "Connecting" until the user gives up. "unknown"
  * means the probe itself could not answer — never block on it.
  *
+ * "untrusted" means the account's records give this device no way to the
+ * host: no pin of its own and no chain from one of the host's pins. It is the
+ * one verdict that puts up the approval sheet and knocks. A pin the host has
+ * not confirmed still counts (#138, `pinStanding`): approving again would
+ * change nothing, so an approved device whose host has not taken the approval
+ * in yet is "trusted" with `confirmed` false, connects as usual, and shows the
+ * terminal's own connection states; the host's page says "Not delivered". A
+ * pin the host REJECTED as unverifiable counts for nothing.
+ *
  * Advisory: the daemon decides admission by re-verifying signatures against
  * its own anchors. This mirrors its search over server-claimed rows so the
  * app can say the true thing and reconnect the moment an approval lands.
@@ -25,8 +34,12 @@ export type DeviceHostTrust = "trusted" | "untrusted" | "unknown";
 
 export interface DeviceHostTrustResult {
   status: DeviceHostTrust;
-  /** True only when this device itself appears in the host's durable pin set. */
+  /** True only when the host has confirmed this device's own pin. */
   directlyPinned: boolean;
+  /** True when the way to this host runs only through pins the host has
+   * confirmed: what it admits today, for per-host questions (which hosts an
+   * approval signed on this phone can reach). */
+  confirmed: boolean;
 }
 
 export const DEVICE_NOT_TRUSTED_CODE = "device_not_trusted";
@@ -37,7 +50,7 @@ const TRUST_TTL_MS = 30_000;
 
 export interface DeviceTrustProbeApi {
   listBrowserDevices: typeof listBrowserDevices;
-  listHostPins: typeof listHostPins;
+  getHostPins: typeof getHostPins;
   listAccountEndorsements: typeof listAccountEndorsements;
   getHost: typeof getHost;
   publicKey: () => Promise<Uint8Array | null>;
@@ -46,7 +59,7 @@ export interface DeviceTrustProbeApi {
 
 const defaultApi: DeviceTrustProbeApi = {
   listBrowserDevices,
-  listHostPins,
+  getHostPins,
   listAccountEndorsements,
   getHost,
   publicKey: () => deviceIdentity.publicKey(),
@@ -99,13 +112,18 @@ async function resolveTrust(
   api: DeviceTrustProbeApi,
   nowMs: number,
 ): Promise<DeviceHostTrustResult> {
+  const untrusted: DeviceHostTrustResult = {
+    status: "untrusted",
+    directlyPinned: false,
+    confirmed: false,
+  };
   const publicKeyBytes = await api.publicKey();
-  if (publicKeyBytes === null) return { status: "unknown", directlyPinned: false };
+  if (publicKeyBytes === null) return { ...untrusted, status: "unknown" };
   const publicKey = encodeBase64Url(publicKeyBytes);
   publicKeyBytes.fill(0);
-  const [devices, pinnedDeviceIds, host] = await Promise.all([
+  const [devices, hostPins, host] = await Promise.all([
     sharedRead(api.listBrowserDevices, nowMs),
-    api.listHostPins(hostId),
+    api.getHostPins(hostId),
     api.getHost(hostId),
   ]);
   const thisDevice = devices.find(
@@ -113,19 +131,27 @@ async function resolveTrust(
   );
   // An unregistered identity cannot be pinned, so the host will drop its
   // offers for exactly the same reason a registered-but-unapproved one does.
-  if (thisDevice === undefined) return { status: "untrusted", directlyPinned: false };
-  if (pinnedDeviceIds.includes(thisDevice.id)) {
-    return { status: "trusted", directlyPinned: true };
+  if (thisDevice === undefined) return untrusted;
+  // What the account recorded (every pin the host did not reject) and what
+  // the host has confirmed taking in, kept apart.
+  const { recorded, confirmed: confirmedPins } = pinIdsByStanding(hostPins.pins);
+  if (confirmedPins.includes(thisDevice.id)) {
+    return { status: "trusted", directlyPinned: true, confirmed: true };
   }
   // The chain path only exists on a host whose daemon validates it; toward an
   // older one a carried chain is ignored and the pin is the whole story.
-  if (!host.supports_account_chains) return { status: "untrusted", directlyPinned: false };
+  if (!host.supports_account_chains) {
+    return recorded.includes(thisDevice.id)
+      ? { status: "trusted", directlyPinned: false, confirmed: false }
+      : untrusted;
+  }
   const edges = await sharedRead(api.listAccountEndorsements, nowMs);
+  // This device's own recorded pin seeds the walk too, so it reaches itself.
+  if (!chainReachableFrom(recorded, devices, edges).has(thisDevice.id)) return untrusted;
   return {
-    status: chainReachableFrom(pinnedDeviceIds, devices, edges).has(thisDevice.id)
-      ? "trusted"
-      : "untrusted",
+    status: "trusted",
     directlyPinned: false,
+    confirmed: chainReachableFrom(confirmedPins, devices, edges).has(thisDevice.id),
   };
 }
 
@@ -137,7 +163,11 @@ export async function probeDeviceHostTrustResult(
   const cached = cache.get(hostId);
   const now = api.nowMs();
   if (cached !== undefined && now - cached.atMs < TRUST_TTL_MS) {
-    return { status: cached.status, directlyPinned: cached.directlyPinned };
+    return {
+      status: cached.status,
+      directlyPinned: cached.directlyPinned,
+      confirmed: cached.confirmed,
+    };
   }
   let result: DeviceHostTrustResult;
   try {
@@ -145,7 +175,7 @@ export async function probeDeviceHostTrustResult(
   } catch {
     // A probe failure is not evidence of distrust; let the dial proceed and
     // let the connect watchdog report whatever actually goes wrong.
-    result = { status: "unknown", directlyPinned: false };
+    result = { status: "unknown", directlyPinned: false, confirmed: false };
   }
   if (result.status !== "unknown") cache.set(hostId, { ...result, atMs: now });
   return result;
