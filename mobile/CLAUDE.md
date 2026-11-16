@@ -141,7 +141,11 @@ at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
   browser's `channel-watch.ts` rule for the host worker's peer; when it finds
   one on which no channel opens, native `host-transport.ts` replaces the peer.
   Rebuild `worker.html` and `worker-html.ts` with
-  `node src/terminal/worker/build-worker.mjs` after worker source edits.
+  `node src/terminal/worker/build-worker.mjs` after worker source edits, and after
+  edits to a web module the worker shares: `sharedModules` in that script lists
+  them (today `web/src/components/terminal/ritual-spinner.mjs`, the ritual
+  spinner of `docs/RITUAL_SPINNER.md`), inlined as plain JS behind one global, and
+  a worker test fails while the generated copy trails the web source.
   Terminal preparation opens session channels while its renderer loads; a bounded
   native queue holds attachment-scoped events until the renderer can consume them.
   It never grants readiness or input control before replay and daemon confirmation.
