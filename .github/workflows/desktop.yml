@@ -29,7 +29,7 @@ permissions:
 jobs:
   macos:
     name: macOS · ${{ matrix.target }}
-    runs-on: macos-14
+    runs-on: macos-15
     # This job holds the whole Apple release identity — the exportable
     # Developer ID .p12, its password, and the App Store Connect key. Both
     # gates are load-bearing: `environment` scopes those secrets to a

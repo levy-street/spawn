@@ -26,11 +26,19 @@ function phone(overrides: Partial<BrowserDeviceOut> = {}): BrowserDeviceOut {
 
 const LAPTOP_ID = "b6b3d3d0-4d8b-4f53-9b1f-3a0d9b6f1e21";
 
+/** The pins route's answer: every pin delivered (confirmed by its host). */
+function pins(...ids: string[]) {
+  return {
+    pins: ids.map((id) => ({ browser_device_id: id, delivered: true, undelivered_reason: null })),
+    capacity: null,
+  };
+}
+
 function probeApi(overrides: Partial<DeviceTrustProbeApi> = {}): Partial<DeviceTrustProbeApi> {
   return {
     publicKey: async () => new Uint8Array(32),
     listBrowserDevices: async () => [phone()],
-    listHostPins: async () => [PHONE_ID],
+    getHostPins: async () => pins(PHONE_ID),
     listAccountEndorsements: async () => [],
     getHost: async () => ({ id: HOST_ID, supports_account_chains: true }) as never,
     nowMs: () => 1_000,
@@ -45,7 +53,7 @@ function chainApi(overrides: Partial<DeviceTrustProbeApi> = {}): Partial<DeviceT
       phone(),
       phone({ id: LAPTOP_ID, label: "Chrome on Mac", public_key: "laptop-key" }),
     ],
-    listHostPins: async () => [LAPTOP_ID],
+    getHostPins: async () => pins(LAPTOP_ID),
     listAccountEndorsements: async () => [
       {
         endorser_device_id: LAPTOP_ID,
@@ -71,17 +79,19 @@ describe("probeDeviceHostTrust", () => {
     await expect(probeDeviceHostTrustResult(HOST_ID, probeApi())).resolves.toEqual({
       status: "trusted",
       directlyPinned: true,
+      confirmed: true,
     });
     invalidateDeviceHostTrust();
     await expect(probeDeviceHostTrustResult(HOST_ID, chainApi())).resolves.toEqual({
       status: "trusted",
       directlyPinned: false,
+      confirmed: true,
     });
   });
 
   it("distrusts a registered device the host has not pinned", async () => {
     await expect(
-      probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins: async () => [] })),
+      probeDeviceHostTrust(HOST_ID, probeApi({ getHostPins: async () => pins() })),
     ).resolves.toBe("untrusted");
   });
 
@@ -102,7 +112,7 @@ describe("probeDeviceHostTrust", () => {
 
   it("distrusts a chain whose anchor the host does not pin", async () => {
     await expect(
-      probeDeviceHostTrust(HOST_ID, chainApi({ listHostPins: async () => [] })),
+      probeDeviceHostTrust(HOST_ID, chainApi({ getHostPins: async () => pins() })),
     ).resolves.toBe("untrusted");
   });
 
@@ -112,7 +122,7 @@ describe("probeDeviceHostTrust", () => {
     const api = probeApi({
       listBrowserDevices,
       listAccountEndorsements,
-      listHostPins: async () => [],
+      getHostPins: async () => pins(),
     });
     await Promise.all([
       probeDeviceHostTrust(HOST_ID, api),
@@ -145,37 +155,33 @@ describe("probeDeviceHostTrust", () => {
       probeDeviceHostTrust(
         HOST_ID,
         probeApi({
-          listHostPins: () => Promise.reject(new Error("offline")),
+          getHostPins: () => Promise.reject(new Error("offline")),
         }),
       ),
     ).resolves.toBe("unknown");
   });
 
   it("memoizes a verdict briefly and drops it on invalidation", async () => {
-    const listHostPins = jest.fn(async () => [PHONE_ID]);
-    await probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins }));
-    await probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins }));
-    expect(listHostPins).toHaveBeenCalledTimes(1);
+    const getHostPins = jest.fn(async () => pins(PHONE_ID));
+    await probeDeviceHostTrust(HOST_ID, probeApi({ getHostPins }));
+    await probeDeviceHostTrust(HOST_ID, probeApi({ getHostPins }));
+    expect(getHostPins).toHaveBeenCalledTimes(1);
 
     invalidateDeviceHostTrust(HOST_ID);
-    await probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins }));
-    expect(listHostPins).toHaveBeenCalledTimes(2);
+    await probeDeviceHostTrust(HOST_ID, probeApi({ getHostPins }));
+    expect(getHostPins).toHaveBeenCalledTimes(2);
 
     // A verdict older than the TTL is re-derived rather than trusted forever.
-    await probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins, nowMs: () => 1_000_000 }));
-    expect(listHostPins).toHaveBeenCalledTimes(3);
+    await probeDeviceHostTrust(HOST_ID, probeApi({ getHostPins, nowMs: () => 1_000_000 }));
+    expect(getHostPins).toHaveBeenCalledTimes(3);
   });
 
   it("never memoizes an unknown verdict", async () => {
-    const listHostPins = jest
-      .fn<Promise<string[]>, [string]>()
+    const getHostPins = jest
+      .fn<ReturnType<DeviceTrustProbeApi["getHostPins"]>, [string]>()
       .mockRejectedValueOnce(new Error("offline"))
-      .mockResolvedValue([PHONE_ID]);
-    await expect(probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins }))).resolves.toBe(
-      "unknown",
-    );
-    await expect(probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins }))).resolves.toBe(
-      "trusted",
-    );
+      .mockResolvedValue(pins(PHONE_ID));
+    await expect(probeDeviceHostTrust(HOST_ID, probeApi({ getHostPins }))).resolves.toBe("unknown");
+    await expect(probeDeviceHostTrust(HOST_ID, probeApi({ getHostPins }))).resolves.toBe("trusted");
   });
 });

@@ -22,6 +22,7 @@ import {
   vibrateAlert,
 } from "@/lib/notify-channels";
 import { useNotifyPrefs } from "@/lib/notify-prefs";
+import { askToKeepDeviceStorage } from "@/lib/persistent-storage";
 
 /**
  * Settings ▸ Notifications.
@@ -82,6 +83,10 @@ export function NotificationsPanel() {
         return;
       }
       setPref("system", true);
+      // Chrome keeps the storage of a site that may notify, and this is the
+      // moment a refusal can become a grant: ask again, so the device key is
+      // kept and the storage notice can stand down (#121).
+      void askToKeepDeviceStorage();
     },
     [setPref],
   );

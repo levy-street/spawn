@@ -18,7 +18,11 @@ import { HostsStrip } from "@/components/hosts/hosts-strip";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { DownloadMenu } from "@/components/nav/download-menu";
 import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
-import { SidebarWorkspacePair, SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
+import {
+  type GroupMemberState,
+  SidebarWorkspaceGroup,
+  SidebarWorkspaceRow,
+} from "@/components/nav/SidebarWorkspaceRow";
 import {
   SidebarIconSlot,
   SidebarNoMatches,
@@ -26,11 +30,15 @@ import {
   SidebarSearch,
   sidebarRowClass,
 } from "@/components/nav/sidebar-parts";
-import { createWorkspaceCarry, type WorkspaceCarry } from "@/components/nav/workspace-carry";
+import {
+  createWorkspaceCarry,
+  ghostOrigin,
+  type WorkspaceCarry,
+} from "@/components/nav/workspace-carry";
 import {
   type DragMode,
   dragModeAt,
-  pairRows,
+  groupRows,
   reorderShift,
   reorderTargetIndex,
   reorderWrites,
@@ -51,7 +59,7 @@ import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
 import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
-import { memberSide, splitStore, useSplit } from "@/lib/split-store";
+import { splitStore, useSplit } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
 import {
   filterWorkspacesByName,
@@ -131,26 +139,34 @@ export function Sidebar({
   );
   const onlineHosts = (hostsQ.data ?? []).filter((host) => host.status === "online");
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
-  // The arrangement, and whether it is the window in front of you. The pair
-  // outlives the route — opening a third workspace parks a split rather than
-  // eating half of it — so the rail keeps listing it as a pair either way,
-  // and `renderedSecondaryId` is only what decides how lit its halves are.
-  const { pair, renderedSecondaryId, activeSide } = useSplit();
-  const splitOnScreen = renderedSecondaryId !== null;
+  // The arrangement, and whether it is the window in front of you. The group
+  // outlives the route — opening another workspace parks a split rather than
+  // eating part of it — so the rail keeps listing it as a split either way,
+  // and `rendered` is only what decides how lit its members are.
+  const { group, rendered, activeId } = useSplit();
+  const groupKey = group ? group.members.join(" ") : "";
+  const groupOnScreen = Boolean(group?.members.some((id) => rendered.includes(id)));
   // What the tree draws, row by row: normally one workspace each, but a split
-  // draws as a single paired row so the rail is a picture of the window
-  // rather than a list that happens to contain it. The collapsed rail opts
-  // out — two containers and a control between them do not survive a 56px
-  // column, so there the pair stays two separately ringed tiles.
+  // draws as a single grouped row so the rail is a picture of the window
+  // rather than a list that happens to contain it — side by side on the
+  // expanded rail, stacked one beneath the other on the collapsed one.
   const rowModel = useMemo(
     () =>
-      pairRows(
+      groupRows(
         visibleWorkspaces.map((workspace) => workspace.id),
-        collapsed ? null : (pair?.primaryId ?? null),
-        collapsed ? null : (pair?.secondaryId ?? null),
+        groupKey ? groupKey.split(" ") : null,
       ),
-    [collapsed, pair, visibleWorkspaces],
+    [groupKey, visibleWorkspaces],
   );
+  /**
+   * How much of the window one member of the split is. On screen, the one
+   * whose column has the keyboard is the one you are working in — or the one
+   * the URL is about, until a column has claimed it.
+   */
+  const memberState = (workspaceId: string): GroupMemberState => {
+    if (!rendered.includes(workspaceId)) return "parked";
+    return (activeId ?? currentWorkspaceId) === workspaceId ? "active" : "shown";
+  };
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
@@ -179,8 +195,8 @@ export function Sidebar({
   });
   const reorderWorkspaceM = useMutation({
     // The server reorders by removal + reinsertion, so a single position
-    // write is a proper insert-at-index for the drag drop. A row can hold two
-    // workspaces — a split draws as one paired row — so this takes a sequence
+    // write is a proper insert-at-index for the drag drop. A row can hold a
+    // whole split — it draws as one grouped row — so this takes a sequence
     // and applies it strictly in order: the second write's index is only
     // correct against the list the first one leaves behind.
     mutationFn: async (writes: { id: string; position: number }[]) => {
@@ -213,14 +229,17 @@ export function Sidebar({
     onSuccess: (_result, id) => {
       setActionError(null);
       refresh();
-      // A deleted workspace takes the whole arrangement with it: half a pair
-      // is not a split. The stored pair, not the rendered one — a workspace
-      // that no longer exists must not be left queued up to reappear the next
-      // time one of its neighbours is opened.
-      if (memberSide(splitStore.get().pair, id)) splitStore.clear();
-      // Only the page you are on has to go somewhere. A half you were not
-      // routed at closing is not a reason to move the address bar.
-      if (currentWorkspaceId === id) router.push("/app");
+      // A deleted workspace leaves the arrangement it was in: the others stay
+      // split if there are still two of them, and a pair is one workspace
+      // again. The stored group, not the rendered one — a workspace that no
+      // longer exists must not be left queued up to reappear the next time
+      // one of its neighbours is opened.
+      const successor = splitStore.remove(id, currentWorkspaceId);
+      // Only the page you are on has to go somewhere: to the column that took
+      // its place, while there was one, so the window carries on. A column
+      // you were not routed at closing is not a reason to move the address
+      // bar.
+      if (currentWorkspaceId === id) router.push(successor ? `/w/${successor}` : "/app");
     },
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
@@ -233,16 +252,18 @@ export function Sidebar({
       // Said out loud, because the row leaves the list under your cursor and
       // the only other evidence is a drawer that is probably closed.
       toast(`Archived ${name}`);
-      // Archived out of a split: the arrangement goes with it and the window
-      // comes back to one workspace. The stored pair again — an archived
-      // workspace must not come back the next time its neighbour is opened.
-      if (memberSide(splitStore.get().pair, id)) splitStore.clear();
+      // Archived out of a split: it leaves the arrangement, which stays
+      // split if two of it are left. The stored group again — an archived
+      // workspace must not come back the next time a neighbour is opened.
+      const successor = splitStore.remove(id, currentWorkspaceId);
       // And carry on next door: the workspace you were looking at is stopped
-      // now, so the useful place to be is the one that took its slot. A half
-      // you were not routed at is not the page you are on, so it moves
+      // now, so the useful place to be is the one that took its slot — its
+      // column's successor in a split, the next row of the rail otherwise. A
+      // column you were not routed at is not the page you are on, so it moves
       // nothing.
       if (currentWorkspaceId === id) {
-        router.push(nextId ? `/w/${nextId}` : "/app");
+        const next = successor ?? nextId;
+        router.push(next ? `/w/${next}` : "/app");
         onNavigate?.();
       }
     },
@@ -284,12 +305,22 @@ export function Sidebar({
    */
   const startWorkspaceDrag = (workspace: Workspace, event: ReactPointerEvent<HTMLLIElement>) => {
     if (event.button !== 0 || event.pointerType === "touch") return;
-    // A paired row's halves are real buttons, so the usual "pressed a control,
-    // not the row" guard would refuse to start a drag on one. They are the row
-    // for dragging purposes; everything else that is a button still blocks.
+    // A split row's members are real buttons, so the usual "pressed a
+    // control, not the row" guard would refuse to start a drag on one. They
+    // are the row for dragging purposes; everything else that is a button —
+    // the joins between them included — still blocks.
     const pressedControl = (event.target as Element).closest?.("button, input, [role='menu']");
-    if (pressedControl && !pressedControl.hasAttribute("data-pair-half")) return;
+    if (pressedControl && !pressedControl.hasAttribute("data-split-member")) return;
     const rowElement = event.currentTarget;
+    // On the collapsed rail the ghost is cut from the tile that was pressed,
+    // not the row: a split's row there is a column of tiles, and a ghost the
+    // height of all of them would not read as the one workspace in hand. The
+    // same tile is the one that dims while it is carried, not the whole group.
+    const pressedTileElement = collapsed
+      ? ((pressedControl ?? (event.target as Element).closest?.("a")) as HTMLElement | null)
+      : null;
+    const pressedTile = pressedTileElement?.getBoundingClientRect() ?? null;
+    const carriedElement = pressedTileElement ?? rowElement;
     const startY = event.clientY;
     const startX = event.clientX;
     let dragging = false;
@@ -301,7 +332,7 @@ export function Sidebar({
     // both the target index and the shift math must use the resting rects.
     const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-workspace-row]"));
     const restingRects = rows.map((row) => row.getBoundingClientRect());
-    // What each row actually holds. A paired row is one row and two
+    // What each row actually holds. A split's row is one row and several
     // workspaces, so the index counted over rows is not the position the
     // server stores and this is what closes that gap.
     // Falling back to the row's own id rather than to nothing: an empty entry
@@ -313,6 +344,8 @@ export function Sidebar({
     });
     const from = rows.indexOf(rowElement);
     const fromRect = restingRects[from];
+    // The dragged row's own height: on the collapsed rail a split's row is a
+    // stack of tiles, taller than the rows it passes.
     const rowStride = (fromRect?.height ?? 36) + 8; // + the list's space-y-2
     // The box the pointer has to leave for this to stop being a reorder. Read
     // once, because the rail does not resize under a drag it is hosting.
@@ -339,17 +372,22 @@ export function Sidebar({
       // The row itself stays in the rail, dimmed, and a ghost is what follows
       // the pointer: pulling the element out of flow would close the list up
       // under it and invalidate the very rects the reorder half measures from.
-      rowElement.style.opacity = "0.4";
+      carriedElement.style.opacity = "0.4";
+      const cutFrom = pressedTile ?? fromRect;
+      const box = {
+        left: cutFrom?.left ?? 0,
+        top: cutFrom?.top ?? 0,
+        width: cutFrom?.width ?? 0,
+        height: cutFrom?.height ?? 0,
+      };
       carry ??= createWorkspaceCarry({
         workspace,
         routedId: currentWorkspaceId,
         lookup: (id) => workspaceById.get(id),
-        origin: {
-          left: fromRect?.left ?? 0,
-          top: fromRect?.top ?? 0,
-          width: fromRect?.width ?? 0,
-          height: fromRect?.height ?? 0,
-        },
+        // A collapsed rail's tile is narrower than the row the ghost is
+        // dressed as, and grows rightwards, out over the canvas, from where
+        // it was picked up.
+        origin: collapsed ? ghostOrigin(box, "right") : box,
         start: { x: startX, y: startY },
         navigate: (id) => {
           router.push(`/w/${id}`);
@@ -361,7 +399,7 @@ export function Sidebar({
 
     const enterReorder = () => {
       rowElement.style.transition = "";
-      rowElement.style.opacity = "";
+      carriedElement.style.opacity = "";
       lift(true);
       carry?.hide();
     };
@@ -426,7 +464,7 @@ export function Sidebar({
         row.style.transition = "";
       }
       lift(false);
-      rowElement.style.opacity = "";
+      carriedElement.style.opacity = "";
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       if (!dragging) return;
@@ -688,50 +726,52 @@ export function Sidebar({
         )}
         <ul className="space-y-2">
           {rowModel.map((ids) => {
-            const [firstId, secondId] = ids;
-            const workspace = firstId ? workspaceById.get(firstId) : undefined;
+            const rowMembers = ids
+              .map((id) => workspaceById.get(id))
+              .filter((member): member is Workspace => Boolean(member));
+            const [workspace] = rowMembers;
             if (!workspace) return null;
-            const partner = secondId ? workspaceById.get(secondId) : undefined;
-            if (partner) {
+            if (rowMembers.length > 1) {
               return (
-                <SidebarWorkspacePair
+                <SidebarWorkspaceGroup
                   key={ids.join("+")}
-                  primary={workspace}
-                  secondary={partner}
-                  // Null while the arrangement is parked behind some other
-                  // workspace: the row still says these two are a split, but
-                  // neither half is the window you are looking at, so neither
-                  // wears the selection.
-                  activeSide={splitOnScreen ? activeSide : null}
-                  primaryAttention={workspaceAttentionCount(workspace, sessionsById)}
-                  secondaryAttention={workspaceAttentionCount(partner, sessionsById)}
-                  onOpen={(side, id) => {
-                    // Already in this window: pressing a half is a request to
-                    // work in it, not to go anywhere. Otherwise it is exactly
-                    // a navigation — arriving at either member is what puts
-                    // the pair back on screen.
-                    splitStore.setActiveSide(side);
+                  members={rowMembers}
+                  collapsed={collapsed}
+                  // Off while the arrangement is parked behind some other
+                  // workspace: the row still says these are a split, but none
+                  // of it is the window you are looking at.
+                  onScreen={groupOnScreen}
+                  memberState={memberState}
+                  attentionCount={(member) => workspaceAttentionCount(member, sessionsById)}
+                  attentionLevel={(member) => workspaceAttentionLevel(member, sessionsById)}
+                  onOpen={(id) => {
+                    // Already in this window: pressing a member is a request
+                    // to work in it, not to go anywhere. Otherwise it is
+                    // exactly a navigation — arriving at any member is what
+                    // puts the split back on screen.
+                    splitStore.setActive(id);
                     if (id === currentWorkspaceId) return;
                     router.push(`/w/${id}`);
                     onNavigate?.();
                   }}
-                  onUnsplit={() => {
-                    const destination = splitStore.unsplit(workspace.id, currentWorkspaceId);
+                  onRelease={(id) => {
+                    const destination = splitStore.remove(id, currentWorkspaceId);
                     if (destination) router.push(`/w/${destination}`);
                   }}
                   onRowPointerDown={
                     searching
                       ? undefined
                       : (event) => {
-                          // Which half was pressed decides what gets carried
+                          // Which member was pressed decides what gets carried
                           // out to the canvas; the row as a whole is still
                           // what reorders.
-                          const half = (event.target as Element).closest?.("[data-pair-half]");
-                          const pressed = half?.getAttribute("data-pair-half");
-                          startWorkspaceDrag(
-                            (pressed ? workspaceById.get(pressed) : null) ?? workspace,
-                            event,
-                          );
+                          const pressed = (event.target as Element)
+                            .closest?.("[data-split-member]")
+                            ?.getAttribute("data-split-member");
+                          const member = pressed ? workspaceById.get(pressed) : null;
+                          // The plate around the tiles is not any one of
+                          // them: pressing it is not picking a workspace up.
+                          if (member) startWorkspaceDrag(member, event);
                         }
                   }
                 />
@@ -742,11 +782,7 @@ export function Sidebar({
                 key={workspace.id}
                 workspace={workspace}
                 active={currentWorkspaceId === workspace.id}
-                beside={
-                  splitOnScreen &&
-                  currentWorkspaceId !== workspace.id &&
-                  memberSide(pair, workspace.id) !== null
-                }
+                beside={currentWorkspaceId !== workspace.id && rendered.includes(workspace.id)}
                 collapsed={collapsed}
                 attentionCount={workspaceAttentionCount(workspace, sessionsById)}
                 attentionLevel={workspaceAttentionLevel(workspace, sessionsById)}

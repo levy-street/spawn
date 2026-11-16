@@ -826,6 +826,39 @@ describe("HostControlClient", () => {
     third.client.close();
   });
 
+  test("a refused offer is remembered; another offer's refusal and a lost host are not", async () => {
+    const first = await readyClient({ reconnectBaseDelayMs: 1_000 });
+    expect(first.client.getOfferFailedAt()).toBe(0);
+    first.ws.receive({
+      type: "rtc.status",
+      session_id: crypto.randomUUID(),
+      status: "failed",
+      ...metadata,
+    });
+    expect(first.client.getOfferFailedAt()).toBe(0);
+    const before = Date.now();
+    first.ws.receive({
+      type: "rtc.status",
+      session_id: first.offer.session_id,
+      status: "failed",
+      ...metadata,
+    });
+    expect(first.client.getOfferFailedAt()).toBeGreaterThanOrEqual(before);
+    first.client.close();
+
+    FakeWebSocket.instances = [];
+    FakePeerConnection.instances = [];
+    const second = await readyClient({ reconnectBaseDelayMs: 1_000 });
+    second.ws.receive({
+      type: "rtc.status",
+      session_id: second.offer.session_id,
+      status: "unavailable",
+      ...metadata,
+    });
+    expect(second.client.getOfferFailedAt()).toBe(0);
+    second.client.close();
+  });
+
   test("a protocol-required close is terminal without becoming a trust refusal", async () => {
     const client = new HostControlClient(hostId, { reconnectBaseDelayMs: 1 });
     client.connect();
@@ -975,6 +1008,62 @@ describe("HostControlClient", () => {
     const freshOffer = await waitForSentFrame(resumedWs, "rtc.offer");
     expect(freshOffer.session_id).not.toBe(first.offer.session_id);
     first.client.close();
+  });
+
+  test("rebuildPeer retires the old binding and offers a fresh peer on the same socket", async () => {
+    const endpoint = await readyClient();
+    const binding = { binding_nonce: "e".repeat(32), binding_generation: 11 };
+    endpoint.ws.receive({
+      type: "rtc.status",
+      session_id: endpoint.offer.session_id,
+      status: "connected",
+      ...binding,
+      ...metadata,
+    });
+    expect(endpoint.client.getState()).toBe("ready");
+    const states: string[] = [];
+    endpoint.client.subscribe((state) => states.push(state));
+
+    expect(endpoint.client.rebuildPeer()).toBe(true);
+    // Readiness ends at once, so every view on the old peer is retired ...
+    expect(states).toContain("open");
+    expect(endpoint.client.getState()).not.toBe("ready");
+    // ... the server and daemon hear the old binding close ...
+    const close = await waitForSentFrame(endpoint.ws, "rtc.close");
+    expect(close).toMatchObject({ session_id: endpoint.offer.session_id, ...binding });
+    // ... and a fresh peer is offered on the signalling socket already open.
+    const offers = () => framesOf(endpoint.ws, "rtc.offer");
+    await waitFor(() => offers().length === 2);
+    const fresh = offers()[1];
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(fresh.session_id).not.toBe(endpoint.offer.session_id);
+    expect(fresh).not.toHaveProperty("ice_restart");
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(endpoint.client.getConnectionGeneration()).toBe(fresh.session_id);
+
+    // Not ready: nothing to replace, and a second call does not stack a peer.
+    expect(endpoint.client.rebuildPeer()).toBe(false);
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    endpoint.client.close();
+  });
+
+  test("rebuildPeer belongs to the connection's owner, never to a consumer of it", async () => {
+    const shared = {
+      getSnapshot: () => ({
+        state: "ready",
+        generation: "g",
+        capabilities: [],
+        refusal: null,
+        trust: null,
+      }),
+      subscribe: () => () => {},
+      createChannel: (label: string) => new FakeDataChannel(label),
+      retry: () => {},
+    };
+    const consumer = new HostControlClient(hostId, { sharedConnection: shared });
+    consumer.connect();
+    expect(consumer.rebuildPeer()).toBe(false);
+    consumer.close();
   });
 
   test("wake redials a silent socket instead of signalling into a corpse", async () => {
@@ -2712,6 +2801,8 @@ describe("HostControlClient conversation inspection", () => {
       state: "idle",
       cli_version: "2.1.288",
       live_elsewhere: true,
+      fresh: false,
+      shared_server: false,
       source: "parked",
     };
     pc.channel.receive(
@@ -2724,6 +2815,47 @@ describe("HostControlClient conversation inspection", () => {
       }),
     );
     expect(await pending).toEqual(result);
+    client.close();
+  });
+
+  test("asks whether the window's Codex takes --no-daemon, and reads only the answer", async () => {
+    for (const [result, expected] of [
+      [{ codex_no_daemon: true }, true],
+      [{ codex_no_daemon: false }, false],
+      [{ codex_no_daemon: null }, null],
+    ] as const) {
+      const { client, pc } = await readyClient({}, hostId, WITH_CONV);
+      const pending = client.codexNoDaemon(sessionId);
+      await Promise.resolve();
+      const request = framesOf(pc.channel, "request").at(-1);
+      expect(request.operation).toBe("conv.launch");
+      expect(request.payload).toEqual({ session_id: sessionId });
+      pc.channel.receive(
+        JSON.stringify({
+          version: 1,
+          type: "response",
+          request_id: request.request_id,
+          ok: true,
+          result,
+        }),
+      );
+      expect(await pending).toBe(expected);
+      client.close();
+    }
+    const { client, pc } = await readyClient({}, hostId, WITH_CONV);
+    const pending = client.codexNoDaemon(sessionId);
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: { codex_no_daemon: "yes" },
+      }),
+    );
+    await expect(pending).rejects.toThrow("invalid launch report");
     client.close();
   });
 

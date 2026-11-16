@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { REBUILDING_MESSAGE } from "./channel-watch";
 import { hostLiveStatus } from "./host-live-status";
 
 const dream = { name: "dream", status: "online" };
@@ -29,4 +30,18 @@ test("an online host this device has lost reads as reconnecting, and an error sa
     problem: "Key mismatch",
     reconnecting: true,
   });
+});
+
+test("a host whose connection is being replaced says why, as the phone's card does", () => {
+  expect(hostLiveStatus(dream, { state: "connecting", rebuilding: true })).toEqual({
+    tone: "warning",
+    label: REBUILDING_MESSAGE,
+    problem: REBUILDING_MESSAGE,
+    reconnecting: true,
+  });
+  // A real error still wins, and a ready host is simply connected.
+  expect(
+    hostLiveStatus(dream, { state: "error", error: "Key mismatch", rebuilding: true }).problem,
+  ).toBe("Key mismatch");
+  expect(hostLiveStatus(dream, { state: "ready", rebuilding: true }).tone).toBe("active");
 });

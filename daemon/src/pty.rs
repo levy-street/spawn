@@ -443,6 +443,9 @@ pub struct ForwarderControl {
     history_sinks: Arc<AsyncMutex<HashMap<String, mpsc::Sender<HistoryUpdate>>>>,
     source_offset: Arc<AtomicU64>,
     source_notify: Arc<Notify>,
+    /// How many times the worker has reported wiping its history
+    /// (`T_HISTORY_WIPE`). A replay budget learned before a wipe is void.
+    history_wipes: Arc<AtomicU64>,
     /// Monotonic activity state. Input/output pings have independent throttle
     /// clocks; injected input/resize/redraw extend the output suppression
     /// deadline so their echoes and repaints do not count as session work.
@@ -451,6 +454,20 @@ pub struct ForwarderControl {
     /// change-only, rate-limited emission bookkeeping behind
     /// `session.foreground`.
     foreground: Arc<Mutex<ForegroundState>>,
+    /// When a viewer's wait on this worker last ran out and was logged, and
+    /// how many have run out since without a line of their own
+    /// (`worker_stall_report`).
+    worker_stalls: Arc<Mutex<WorkerStallReports>>,
+}
+
+/// A worker that has stopped answering is reported once per this interval
+/// per worker connection, however many viewers' waits on it run out.
+pub(crate) const WORKER_STALL_REPORT_EVERY: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct WorkerStallReports {
+    last: Option<tokio::time::Instant>,
+    held_back: u64,
 }
 
 #[derive(Debug, Default)]
@@ -485,9 +502,37 @@ impl ForwarderControl {
             history_sinks: Arc::new(AsyncMutex::new(HashMap::new())),
             source_offset: Arc::new(AtomicU64::new(0)),
             source_notify: Arc::new(Notify::new()),
+            history_wipes: Arc::new(AtomicU64::new(0)),
             activity: Arc::new(Mutex::new(ActivityState::default())),
             foreground: Arc::new(Mutex::new(ForegroundState::default())),
+            worker_stalls: Arc::new(Mutex::new(WorkerStallReports::default())),
         }
+    }
+
+    /// Whether a viewer's wait on this worker that just ran out should be
+    /// logged: the first does, then at most one per
+    /// [`WORKER_STALL_REPORT_EVERY`]. `Some` carries how many ran out
+    /// unlogged since the last line.
+    pub(crate) fn worker_stall_report(&self) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        let mut reports = self
+            .worker_stalls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reports
+            .last
+            .is_some_and(|last| now.duration_since(last) < WORKER_STALL_REPORT_EVERY)
+        {
+            reports.held_back += 1;
+            return None;
+        }
+        reports.last = Some(now);
+        Some(std::mem::take(&mut reports.held_back))
+    }
+
+    /// The basename the worker last reported in the foreground, if any.
+    pub(crate) fn foreground(&self) -> Option<String> {
+        self.foreground.lock().ok()?.observed.clone()
     }
 
     /// Record a worker foreground report and relay it to the server as
@@ -791,6 +836,9 @@ impl ForwarderControl {
     /// drops that subscriber (closing its receiver), which the consumer
     /// surfaces to its client as a gap to heal via replay.
     pub async fn route_history(&self, epoch: u64, offset: Option<u64>, bytes: &[u8]) {
+        if offset.is_none() {
+            self.history_wipes.fetch_add(1, Ordering::AcqRel);
+        }
         let mut sinks = self.history_sinks.lock().await;
         sinks.retain(|_, sink| {
             let update = match offset {
@@ -839,6 +887,11 @@ impl ForwarderControl {
 
     pub fn source_offset(&self) -> u64 {
         self.source_offset.load(Ordering::Acquire)
+    }
+
+    /// History wipes the worker has reported on this connection.
+    pub(crate) fn history_wipes(&self) -> u64 {
+        self.history_wipes.load(Ordering::Acquire)
     }
 
     pub async fn wait_source_offset(&self, target: u64) {
@@ -914,6 +967,9 @@ pub struct WorkerReplay {
     /// worker streams history deltas. The offset ends on a batch boundary, so
     /// a delta with exactly this start offset appends seamlessly.
     history_anchor: Option<(u64, u64)>,
+    /// False for a replay spawnd made itself because the worker could read no
+    /// history: it carries no screen either, so the viewer starts blank.
+    screen: bool,
     #[cfg(all(test, unix))]
     wipe_probe: Option<ReplayWipeProbe>,
 }
@@ -924,9 +980,29 @@ impl WorkerReplay {
             watermark,
             bytes,
             history_anchor: None,
+            screen: true,
             #[cfg(all(test, unix))]
             wipe_probe: None,
         }
+    }
+
+    /// An empty replay at the live stream's `watermark`: no history and no
+    /// screen, only the promise that what follows is live.
+    pub(crate) fn live_only(watermark: u64) -> Self {
+        Self {
+            watermark,
+            bytes: Vec::new(),
+            history_anchor: None,
+            screen: false,
+            #[cfg(all(test, unix))]
+            wipe_probe: None,
+        }
+    }
+
+    /// Whether the replay carries the live screen. Every replay a worker
+    /// makes does; one spawnd made in its place does not.
+    pub fn has_screen(&self) -> bool {
+        self.screen
     }
 
     pub(crate) fn new_with_history(watermark: u64, bytes: Vec<u8>, anchor: (u64, u64)) -> Self {
@@ -934,6 +1010,7 @@ impl WorkerReplay {
             watermark,
             bytes,
             history_anchor: Some(anchor),
+            screen: true,
             #[cfg(all(test, unix))]
             wipe_probe: None,
         }
@@ -961,6 +1038,7 @@ impl WorkerReplay {
             watermark,
             bytes,
             history_anchor: None,
+            screen: true,
             wipe_probe: Some(wipe_probe),
         }
     }
@@ -989,6 +1067,182 @@ impl Drop for WorkerReplay {
 /// Commands routed from spawnd to a session worker's socket writer.
 pub type WorkerReplayResult = Result<WorkerReplay>;
 pub type WorkerReplayReceiver = oneshot::Receiver<WorkerReplayResult>;
+
+/// A replay the worker refused (`T_ERROR`), in the worker's own words, so a
+/// viewer replay can tell history the worker can no longer read from a
+/// failure that must stay a failure.
+#[derive(Debug)]
+pub struct WorkerReplayRefused {
+    message: String,
+}
+
+impl WorkerReplayRefused {
+    pub(crate) fn new(message: String) -> Self {
+        Self { message }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for WorkerReplayRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "worker replay failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for WorkerReplayRefused {}
+
+/// Why a worker could not replay history that was not tampered with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnreadableHistory {
+    /// A segment file is gone from disk (the OS temp cleaner deletes one
+    /// nothing has touched for days). Replay walks segments newest-first and
+    /// stops once the budget is full, so a smaller budget can stop before it.
+    MissingSegment,
+    /// The worker has disabled its log (an append found its newest segment
+    /// gone, say). A worker never re-enables it, so nothing will replay again.
+    LogDisabled,
+}
+
+/// The start of a worker's refusal once its log is disabled. Workers say
+/// [`spawnd::sessiond::worker::REPLAY_UNAVAILABLE`] ("… for this session");
+/// those started from 2026-07-16 to 2026-08-19 run the same protocol and say
+/// "… for this agent".
+const REPLAY_UNAVAILABLE_PREFIX: &str = "worker replay is unavailable for this ";
+
+/// The end of a failed read's message when the file does not exist: the
+/// standard library's text for ENOENT (`ERROR_FILE_NOT_FOUND` on Windows).
+const NOT_FOUND_SUFFIX: &str = "(os error 2)";
+
+/// Classify a worker's refusal by the words deployed `spawn-worker`s use
+/// (`sessiond::scrollback` reading a segment by path, and `sessiond::worker`
+/// without a log). Running workers keep the binary they started with, so
+/// their words are the contract. Anything else — failed authentication, a
+/// sequence gap or overlap, a malformed record, any other read error — is
+/// `None`, and the replay fails closed as it always has.
+pub(crate) fn unreadable_history(message: &str) -> Option<UnreadableHistory> {
+    use spawnd::sessiond::scrollback::{SEGMENT_PREFIX, SEGMENT_READ_CONTEXT, SEGMENT_SUFFIX};
+
+    if message.starts_with(REPLAY_UNAVAILABLE_PREFIX) {
+        return Some(UnreadableHistory::LogDisabled);
+    }
+    let missing_segment = message
+        .strip_prefix(SEGMENT_READ_CONTEXT)
+        .and_then(|rest| rest.strip_suffix(NOT_FOUND_SUFFIX))
+        .and_then(|rest| rest.split_once(&format!("{SEGMENT_SUFFIX}: ")))
+        .is_some_and(|(path, _)| {
+            path.rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|leaf| leaf.starts_with(SEGMENT_PREFIX))
+        });
+    missing_segment.then_some(UnreadableHistory::MissingSegment)
+}
+
+/// A viewer replay that is still resolving; `None` when the worker
+/// connection went away before it answered.
+pub type ViewerReplay =
+    Pin<Box<dyn future::Future<Output = Option<WorkerReplayResult>> + Send + 'static>>;
+
+/// How long a budget learned by shrinking past a missing segment is reused.
+/// One attach asks for a replay two or three times within seconds (the
+/// barrier, the first history request, a snapshot), and a second device or a
+/// reconnect follows within a minute or two: five minutes spares those the
+/// old worker's refusals. After it, a request asks for its full budget again,
+/// so a session whose readable history has grown, or whose gap the worker
+/// has since evicted, is never held at the old figure for longer.
+pub(crate) const REPLAY_HINT_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// A budget that replayed after a larger one in the same request reached a
+/// missing segment, and when that was learned.
+#[derive(Clone, Copy)]
+struct ReplayHint {
+    budget: u32,
+    learned: tokio::time::Instant,
+    /// The connection's history-wipe count when the request began: a wipe
+    /// unlinks every segment, the gap with them, so the hint no longer applies.
+    wipes: u64,
+}
+
+/// What one worker connection's viewer replays have learned about its log.
+#[derive(Default)]
+struct ViewerHistory {
+    hint: Mutex<Option<ReplayHint>>,
+    /// The worker said its log is disabled. Nothing will replay again, so
+    /// viewers get the live stream without the worker being asked.
+    disabled: AtomicBool,
+    warned_truncated: AtomicBool,
+    warned_unreadable: AtomicBool,
+}
+
+impl ViewerHistory {
+    /// The budget to ask the worker for first: the request's own, unless a
+    /// fresh hint from this connection says less is what can be read.
+    fn first_budget(&self, max_bytes: u32, wipes: u64) -> u32 {
+        let Ok(mut hint) = self.hint.lock() else {
+            return max_bytes;
+        };
+        match *hint {
+            Some(known) if known.wipes == wipes && known.learned.elapsed() < REPLAY_HINT_TTL => {
+                max_bytes.min(known.budget)
+            }
+            Some(_) => {
+                *hint = None;
+                max_bytes
+            }
+            None => max_bytes,
+        }
+    }
+
+    /// Remember a budget only once it has replayed. Its age runs from now
+    /// and is not renewed by use.
+    fn learn(&self, budget: u32, wipes: u64) {
+        if let Ok(mut hint) = self.hint.lock() {
+            *hint = Some(ReplayHint {
+                budget,
+                learned: tokio::time::Instant::now(),
+                wipes,
+            });
+        }
+    }
+
+    fn forget(&self) {
+        if let Ok(mut hint) = self.hint.lock() {
+            *hint = None;
+        }
+    }
+
+    /// Say once per worker connection that its history is truncated, and once
+    /// that none of it could be read; later viewers say it at debug.
+    fn report(&self, session_id: Uuid, truncated: bool, error: &anyhow::Error) {
+        let flag = if truncated {
+            &self.warned_truncated
+        } else {
+            &self.warned_unreadable
+        };
+        match (!flag.swap(true, Ordering::AcqRel), truncated) {
+            (true, true) => tracing::warn!(
+                %session_id,
+                reason = %error,
+                "session history truncated: older scrollback is gone from disk; viewers get the newest history still readable"
+            ),
+            (true, false) => tracing::warn!(
+                %session_id,
+                reason = %error,
+                "session history unreadable: viewers open on the live terminal with no history"
+            ),
+            (false, _) => {
+                tracing::debug!(%session_id, reason = %error, truncated, "session history still degraded")
+            }
+        }
+    }
+}
+
+/// The next, smaller budget after one that reached a missing segment.
+fn smaller_replay_budget(budget: u32) -> u32 {
+    (budget / 4).max(1)
+}
 
 #[derive(Debug)]
 pub enum WorkerCmd {
@@ -1134,6 +1388,246 @@ async fn send_lifecycle_legacy(
     anyhow::bail!("legacy lifecycle paths are unavailable on Windows")
 }
 
+/// The PTY size the worker was last told, through this handle.
+#[derive(Clone, Copy, Debug)]
+struct PtySize {
+    cols: u16,
+    rows: u16,
+    /// The repaint nudge that set this size and will put the size it
+    /// replaced back, if one did. A viewer's resize clears it.
+    nudge: Option<u64>,
+    /// Widths viewers have applied on this connection. Only a width change
+    /// makes every program repaint: an inline renderer lays out against the
+    /// width and may draw nothing when only the height changes.
+    width_changes: u64,
+}
+
+/// One worker connection's repaint nudges, and the budget that bounds them.
+#[derive(Default)]
+struct RepaintSchedule {
+    /// A nudge is waiting to start; empty replays handed out meanwhile join it.
+    scheduled: bool,
+    /// When the last nudge narrowed the PTY.
+    last_started: Option<tokio::time::Instant>,
+    /// Nudges counted against [`REPAINT_BUDGET`], at most one beyond it; one
+    /// is given back every [`REPAINT_REFILL`] after `refilled_at`.
+    spent: u32,
+    refilled_at: Option<tokio::time::Instant>,
+    /// `PtySize::width_changes` when the latest empty replay that joined was
+    /// handed out. A viewer's width change after it makes the program
+    /// repaint anyway.
+    width_changes_at_request: u64,
+}
+
+impl RepaintSchedule {
+    /// Give back what [`REPAINT_REFILL`] has earned since `refilled_at`.
+    fn refill(&mut self, now: tokio::time::Instant) {
+        let Some(since) = self.refilled_at else {
+            return;
+        };
+        let earned = now.duration_since(since).as_millis() / REPAINT_REFILL.as_millis();
+        let back = u32::try_from(earned).unwrap_or(u32::MAX).min(self.spent);
+        if back == 0 {
+            return;
+        }
+        self.spent -= back;
+        self.refilled_at = (self.spent > 0).then(|| since + REPAINT_REFILL * back);
+    }
+
+    /// The earliest a nudge may start, as of `now`.
+    fn earliest(&mut self, now: tokio::time::Instant) -> tokio::time::Instant {
+        self.refill(now);
+        let Some(last) = self.last_started else {
+            return now;
+        };
+        let interval = if self.spent < REPAINT_BUDGET {
+            REPAINT_MIN_INTERVAL
+        } else {
+            REPAINT_MAX_INTERVAL
+        };
+        (last + interval).max(now)
+    }
+
+    /// Count a nudge that narrowed the PTY at `now`. Once the budget is
+    /// spent, each nudge still counts one beyond it, so a viewer that keeps
+    /// reattaching stays at the slower pace until it stops for a while.
+    fn started(&mut self, now: tokio::time::Instant) {
+        self.refill(now);
+        if self.spent == 0 {
+            self.refilled_at = Some(now);
+        }
+        self.spent = (self.spent + 1).min(REPAINT_BUDGET + 1);
+        self.last_started = Some(now);
+    }
+}
+
+/// How long a nudge waits after the empty replay that asked for it: the
+/// viewer's own size message (`take_control`, `resize`) follows its seed
+/// within this, and a width that changes after the seed repaints by itself.
+pub(crate) const REPAINT_SETTLE: Duration = Duration::from_millis(150);
+/// A session's nudges come at least [`REPAINT_MIN_INTERVAL`] apart while its
+/// budget lasts: [`REPAINT_BUDGET`] nudges, one given back every
+/// [`REPAINT_REFILL`] (four per five minutes). Once it is spent they come at
+/// least [`REPAINT_MAX_INTERVAL`] apart, so a viewer that reattaches in a
+/// loop costs every viewer two repaints, and activity detection the
+/// suppression around them, about once a minute, while people opening a
+/// session at a human pace are never kept waiting.
+pub(crate) const REPAINT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const REPAINT_MAX_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const REPAINT_BUDGET: u32 = 4;
+pub(crate) const REPAINT_REFILL: Duration = Duration::from_secs(75);
+/// How long the narrower size stands: until the program's first output after
+/// it (its repaint beginning, at best), but no less than the first figure, so
+/// the program has read the new size, and no more than the second, for a
+/// program that does not repaint (a shell at its prompt).
+pub(crate) const REPAINT_HOLD_MIN: Duration = Duration::from_millis(50);
+pub(crate) const REPAINT_HOLD_MAX: Duration = Duration::from_millis(300);
+/// A restore the worker's full command queue refused is retried after the
+/// first figure, doubling up to the second.
+pub(crate) const REPAINT_RESTORE_RETRY_MIN: Duration = Duration::from_millis(10);
+pub(crate) const REPAINT_RESTORE_RETRY_MAX: Duration = Duration::from_secs(1);
+
+static NEXT_REPAINT_NUDGE: AtomicU64 = AtomicU64::new(1);
+
+/// One scheduled repaint nudge (`SessionHandle::repaint_after_empty_replay`).
+struct RepaintNudge {
+    session_id: Uuid,
+    /// Weak, upgraded only for each send, so a nudge never keeps a worker
+    /// connection open that its handle has let go of.
+    cmd_tx: mpsc::WeakSender<WorkerCmd>,
+    size: Arc<Mutex<PtySize>>,
+    schedule: Arc<Mutex<RepaintSchedule>>,
+    alive: Arc<AtomicBool>,
+    control: ForwarderControl,
+    /// [`REPAINT_HOLD_MAX`], unless a test waits for the program instead.
+    hold_max: Duration,
+}
+
+impl RepaintNudge {
+    /// Wait until `due`; then, unless a viewer changed the width after the
+    /// last empty replay (a repaint is coming anyway) or the session has
+    /// gone, set the PTY one column narrower, hold it while the program reads
+    /// it, and put the size back. The restore is retried, backing off, for as
+    /// long as the worker connection lives, and is skipped only when a
+    /// viewer's resize has replaced the narrower size meanwhile: that size
+    /// stands.
+    async fn run(self, mut due: tokio::time::Instant) {
+        // Checked again on waking: a nudge that started after this one was
+        // scheduled moves the earliest start on.
+        let width_changes_at_request = loop {
+            tokio::time::sleep_until(due).await;
+            let now = tokio::time::Instant::now();
+            let Ok(mut schedule) = self.schedule.lock() else {
+                return;
+            };
+            let earliest = schedule.earliest(now);
+            if earliest <= now {
+                schedule.scheduled = false;
+                break schedule.width_changes_at_request;
+            }
+            due = earliest;
+        };
+        let Ok(width_changes) = self.size.lock().map(|size| size.width_changes) else {
+            return;
+        };
+        let resized_since = width_changes != width_changes_at_request;
+        let session_id = self.session_id;
+        if resized_since || !self.alive.load(Ordering::Acquire) {
+            tracing::debug!(%session_id, resized_since, "repaint nudge not needed");
+            return;
+        }
+        let Some(cmd_tx) = self.cmd_tx.upgrade() else {
+            return;
+        };
+        let nudge = NEXT_REPAINT_NUDGE.fetch_add(1, Ordering::Relaxed);
+        // Taken before the narrower size is sent, so the program's answer to
+        // it can never be counted as earlier output.
+        let output = self.control.source_offset();
+        let original = {
+            let Ok(mut size) = self.size.lock() else {
+                return;
+            };
+            if size.nudge.is_some() {
+                return;
+            }
+            let original = (size.cols, size.rows);
+            let cols = if original.0 > 1 {
+                original.0 - 1
+            } else {
+                original.0 + 1
+            };
+            if cmd_tx
+                .try_send(WorkerCmd::Resize {
+                    cols,
+                    rows: original.1,
+                })
+                .is_err()
+            {
+                tracing::debug!(%session_id, "repaint nudge: worker command queue full");
+                return;
+            }
+            size.cols = cols;
+            size.nudge = Some(nudge);
+            original
+        };
+        drop(cmd_tx);
+        let held = tokio::time::Instant::now();
+        // Only a nudge that narrowed the PTY counts, so one that was skipped
+        // never delays the next viewer's.
+        if let Ok(mut schedule) = self.schedule.lock() {
+            schedule.started(held);
+        }
+        self.control
+            .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
+        tracing::debug!(%session_id, cols = original.0, rows = original.1, "repaint nudge: one column narrower");
+
+        let _ = tokio::time::timeout(
+            self.hold_max,
+            self.control.wait_source_offset(output.saturating_add(1)),
+        )
+        .await;
+        tokio::time::sleep_until(held + REPAINT_HOLD_MIN).await;
+
+        let mut retry = REPAINT_RESTORE_RETRY_MIN;
+        loop {
+            {
+                let Ok(mut size) = self.size.lock() else {
+                    return;
+                };
+                if size.nudge != Some(nudge) {
+                    tracing::debug!(%session_id, "repaint nudge: a viewer's size replaced it");
+                    return;
+                }
+                // The handle gone means its connection is closing; a daemon
+                // that adopts the worker again reads the PTY's real size from
+                // its hello, so the next viewer's size message puts it right.
+                let Some(cmd_tx) = self.cmd_tx.upgrade() else {
+                    return;
+                };
+                match cmd_tx.try_send(WorkerCmd::Resize {
+                    cols: original.0,
+                    rows: original.1,
+                }) {
+                    Ok(()) => {
+                        (size.cols, size.rows) = original;
+                        size.nudge = None;
+                        self.control
+                            .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
+                        return;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
+            }
+            if !self.alive.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(REPAINT_RESTORE_RETRY_MAX);
+        }
+    }
+}
+
 /// Per-session runtime handle.
 pub struct SessionHandle {
     pub session_id: Uuid,
@@ -1143,8 +1637,11 @@ pub struct SessionHandle {
     /// The session's shell, as its worker reported it; 0 when the worker did
     /// not say. Read only to find the window's own processes (`host_conv`).
     shell_pid: u32,
-    /// Last size applied through this handle.
-    size: Arc<Mutex<(u16, u16)>>,
+    /// Last size applied through this handle, and any repaint nudge holding it.
+    size: Arc<Mutex<PtySize>>,
+    repaint: Arc<Mutex<RepaintSchedule>>,
+    /// How long a repaint nudge holds the narrower size at most.
+    repaint_hold_max: Duration,
     /// Held alive while the session is alive; when dropped, the per-session
     /// forwarder task exits after the worker connection closes.
     #[allow(dead_code)]
@@ -1154,6 +1651,7 @@ pub struct SessionHandle {
     cmd_tx: mpsc::Sender<WorkerCmd>,
     lifecycle: SessionLifecycle,
     alive: Arc<AtomicBool>,
+    history: Arc<ViewerHistory>,
     #[cfg(test)]
     input_copies: Arc<AtomicU64>,
 }
@@ -1177,12 +1675,20 @@ impl SessionHandle {
             session_id: parts.session_id,
             cwd: Arc::from(parts.cwd),
             shell_pid: 0,
-            size: Arc::new(Mutex::new((parts.cols, parts.rows))),
+            size: Arc::new(Mutex::new(PtySize {
+                cols: parts.cols,
+                rows: parts.rows,
+                nudge: None,
+                width_changes: 0,
+            })),
+            repaint: Arc::default(),
+            repaint_hold_max: REPAINT_HOLD_MAX,
             outbox_tx: parts.outbox_tx,
             control: parts.control,
             cmd_tx: parts.cmd_tx,
             lifecycle: parts.lifecycle,
             alive: parts.alive,
+            history: Arc::default(),
             #[cfg(test)]
             input_copies: Arc::new(AtomicU64::new(0)),
         }
@@ -1234,12 +1740,18 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Apply a viewer's size. True when it changed the width, which is what
+    /// makes every program repaint; a height change alone is applied but
+    /// returns false.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
         let mut size = self
             .size
             .lock()
             .map_err(|_| anyhow::anyhow!("pty size lock poisoned"))?;
-        if *size == (cols, rows) {
+        if (size.cols, size.rows) == (cols, rows) {
+            // A viewer asking for the size a repaint nudge is passing through
+            // makes it theirs: the nudge no longer restores over it.
+            size.nudge = None;
             return Ok(false);
         }
         if !self.alive.load(Ordering::Acquire) {
@@ -1251,11 +1763,87 @@ impl SessionHandle {
                 mpsc::error::TrySendError::Full(_) => anyhow::anyhow!("worker command queue full"),
                 mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("worker connection gone"),
             })?;
-        *size = (cols, rows);
+        let width_changed = size.cols != cols;
+        // A viewer's size always wins over a nudge in progress.
+        *size = PtySize {
+            cols,
+            rows,
+            nudge: None,
+            width_changes: size.width_changes.wrapping_add(u64::from(width_changed)),
+        };
         // Only an admitted resize can trigger a repaint.
         self.control
             .suppress_activity(activity::REDRAW_SUPPRESS_WINDOW);
-        Ok(true)
+        Ok(width_changed)
+    }
+
+    /// Make the session's program repaint, for a viewer that was handed a
+    /// replay with no screen ([`WorkerReplay::has_screen`]) and would
+    /// otherwise look at a blank pane until the program next draws.
+    ///
+    /// Workers already running take no repaint command (`T_REDRAW` is
+    /// ignored) and must never be sent keystrokes on a person's behalf, so
+    /// the lever is the PTY size: one column narrower, then back. The kernel
+    /// signals `SIGWINCH` only for a real change, and every full-screen
+    /// program redraws on one; the width is what any renderer lays out
+    /// against, so inline ones re-layout too. See [`RepaintNudge`] for the
+    /// steps and their bounds. Empty replays handed out before a scheduled
+    /// nudge starts, or while it holds the narrower size, join it, so viewers
+    /// attaching together share one; the next one waits for the session's
+    /// budget to allow it ([`REPAINT_MIN_INTERVAL`]).
+    pub fn repaint_after_empty_replay(&self) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok((width_changes, holding)) = self
+            .size
+            .lock()
+            .map(|size| (size.width_changes, size.nudge.is_some()))
+        else {
+            return;
+        };
+        if holding {
+            // A nudge holds the narrower size: its restore is sent after this
+            // replay's anchor, or a viewer's resize replaces it, and either
+            // way the program repaints where this viewer sees it.
+            return;
+        }
+        let due = {
+            let Ok(mut schedule) = self.repaint.lock() else {
+                return;
+            };
+            schedule.width_changes_at_request = width_changes;
+            if schedule.scheduled {
+                return;
+            }
+            schedule.scheduled = true;
+            let now = tokio::time::Instant::now();
+            (now + REPAINT_SETTLE).max(schedule.earliest(now))
+        };
+        let nudge = RepaintNudge {
+            session_id: self.session_id,
+            cmd_tx: self.cmd_tx.downgrade(),
+            size: Arc::clone(&self.size),
+            schedule: Arc::clone(&self.repaint),
+            alive: Arc::clone(&self.alive),
+            control: self.control.clone(),
+            hold_max: self.repaint_hold_max,
+        };
+        tokio::spawn(nudge.run(due));
+    }
+
+    /// Hold a repaint nudge's narrower size until the program's own output
+    /// arrives, however long that takes, so a test against a real program
+    /// follows the program rather than a timer.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hold_repaint_until_output_for_test(&mut self) {
+        self.repaint_hold_max = Duration::from_secs(3600);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn applied_size(&self) -> (u16, u16) {
+        let size = self.size.lock().expect("pty size lock");
+        (size.cols, size.rows)
     }
 
     pub fn lifecycle(&self) -> SessionLifecycle {
@@ -1282,6 +1870,86 @@ impl SessionHandle {
             .try_send(WorkerCmd::Replay { max_bytes, resp })
             .ok()?;
         Some(rx)
+    }
+
+    /// Replay for a viewer: the attach barrier and the `spawn.ctl` history and
+    /// snapshot requests. Like [`Self::replay`], except that history the
+    /// worker can no longer read does not keep the terminal from opening.
+    ///
+    /// A replay that reached a segment file gone from disk is asked again
+    /// with a quarter of the budget, down to one byte, until the walk stops
+    /// short of it: the viewer gets the live screen and the newest contiguous
+    /// run of history, never history with a hole in it. A budget that
+    /// replayed this way is a hint for this connection's next requests, which
+    /// start there instead of being refused again — for
+    /// [`REPLAY_HINT_TTL`] from when it was learned, and only until the worker
+    /// reports wiping its history. When even one byte reaches a missing
+    /// segment, this viewer gets an empty replay at the current live-stream
+    /// offset and the terminal opens on what the session prints next; the
+    /// next request asks the worker again, since a line committed meanwhile
+    /// or a `clear` can make history readable. Only a worker that says its
+    /// log is disabled is not asked again. Every other refusal (failed
+    /// authentication, a sequence gap, a malformed record) fails, exactly as
+    /// [`Self::replay`].
+    pub fn viewer_replay(&self, max_bytes: u32) -> Option<ViewerReplay> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        let control = self.control.clone();
+        let history = Arc::clone(&self.history);
+        if history.disabled.load(Ordering::Acquire) {
+            return Some(Box::pin(async move {
+                Some(Ok(WorkerReplay::live_only(control.source_offset())))
+            }));
+        }
+        let wipes = control.history_wipes();
+        let mut budget = history.first_budget(max_bytes, wipes);
+        let mut receiver = self.replay(budget)?;
+        let cmd_tx = self.cmd_tx.clone();
+        let session_id = self.session_id;
+        Some(Box::pin(async move {
+            let mut shrunk = false;
+            loop {
+                let error = match receiver.await {
+                    Ok(Ok(replay)) => {
+                        if shrunk {
+                            history.learn(budget, wipes);
+                        }
+                        return Some(Ok(replay));
+                    }
+                    Ok(Err(error)) => error,
+                    Err(_) => return None,
+                };
+                let unreadable = error
+                    .downcast_ref::<WorkerReplayRefused>()
+                    .and_then(|refused| unreadable_history(refused.message()));
+                match unreadable {
+                    None => return Some(Err(error)),
+                    Some(UnreadableHistory::MissingSegment) if budget > 1 => {
+                        history.report(session_id, true, &error);
+                        budget = smaller_replay_budget(budget);
+                        shrunk = true;
+                        let (resp, next) = oneshot::channel();
+                        cmd_tx
+                            .send(WorkerCmd::Replay {
+                                max_bytes: budget,
+                                resp,
+                            })
+                            .await
+                            .ok()?;
+                        receiver = next;
+                    }
+                    Some(unreadable) => {
+                        history.report(session_id, false, &error);
+                        history.forget();
+                        if unreadable == UnreadableHistory::LogDisabled {
+                            history.disabled.store(true, Ordering::Release);
+                        }
+                        return Some(Ok(WorkerReplay::live_only(control.source_offset())));
+                    }
+                }
+            }
+        }))
     }
 }
 
@@ -1492,6 +2160,781 @@ mod tests {
 
     fn source_output(control: &ForwarderControl, bytes: &[u8]) -> OutputChunk {
         OutputChunk::classify(bytes.to_vec(), control)
+    }
+
+    /// Answer the viewer replay's worker requests from `answer` until it
+    /// resolves; returns its result and every budget it asked for.
+    async fn drive_viewer_replay(
+        replay: ViewerReplay,
+        cmd_rx: &mut mpsc::Receiver<WorkerCmd>,
+        answer: impl Fn(u32) -> WorkerReplayResult,
+    ) -> (Option<WorkerReplayResult>, Vec<u32>) {
+        let mut asked = Vec::new();
+        tokio::pin!(replay);
+        loop {
+            tokio::select! {
+                result = &mut replay => return (result, asked),
+                command = cmd_rx.recv() => match command.expect("handle dropped") {
+                    WorkerCmd::Replay { max_bytes, resp } => {
+                        asked.push(max_bytes);
+                        let _ = resp.send(answer(max_bytes));
+                    }
+                    other => panic!("unexpected worker command {other:?}"),
+                },
+            }
+        }
+    }
+
+    fn refused(message: &str) -> WorkerReplayResult {
+        Err(anyhow::Error::new(WorkerReplayRefused::new(
+            message.to_string(),
+        )))
+    }
+
+    const MISSING_OLDEST: &str = "reading /tmp/spawn-501/workers/7c9e6679-7425-40de-944b-e07fc1f90ae7.scrollback/seg-00000001.log: No such file or directory (os error 2)";
+
+    /// The rescue for a session whose oldest scrollback the OS deleted: the
+    /// replay shrinks until it stops short of the hole, the budget that
+    /// worked is kept, and a tampered segment still fails closed.
+    #[tokio::test]
+    async fn viewer_replay_stops_short_of_a_missing_segment_and_fails_closed_on_tampering() {
+        let control = ForwarderControl::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+        // A worker whose newest readable history holds 5,000 bytes: a walk
+        // with more budget than that goes on to the deleted segment.
+        let truncated = |budget: u32| {
+            if budget > 5_000 {
+                refused(MISSING_OLDEST)
+            } else {
+                Ok(WorkerReplay::new(
+                    9,
+                    b"newest history + live screen".to_vec(),
+                ))
+            }
+        };
+
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            truncated,
+        )
+        .await;
+        let replay = result.expect("answered").expect("truncated replay");
+        assert_eq!(replay.bytes(), b"newest history + live screen");
+        assert_eq!(replay.watermark(), 9);
+        assert_eq!(asked, [65_536, 16_384, 4_096]);
+
+        // A later viewer starts at the budget that worked: no worker refusal
+        // (and no worker log line) per attach.
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(8 << 20).unwrap(),
+            &mut cmd_rx,
+            truncated,
+        )
+        .await;
+        assert!(result.expect("answered").is_ok());
+        assert_eq!(asked, [4_096]);
+
+        // Tampering is not truncation: failed authentication is returned as
+        // it always was, and never retried with a smaller budget.
+        let tampered = |_| {
+            refused("scrollback record failed authentication in /tmp/spawn-501/workers/x.scrollback/seg-00000002.log")
+        };
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            tampered,
+        )
+        .await;
+        let error = result
+            .expect("answered")
+            .expect_err("tampered history replayed");
+        assert!(
+            error.to_string().contains("failed authentication"),
+            "{error}"
+        );
+        assert_eq!(asked, [4_096]);
+        for message in [
+            "parsing /tmp/w/x.scrollback/seg-00000002.log: truncated record header",
+            "scrollback sequence gap in /tmp/w/x.scrollback/seg-00000002.log (expected Some(4), got 9)",
+            "reading /tmp/w/x.scrollback/seg-00000002.log: Permission denied (os error 13)",
+            "reading /tmp/w/x.scrollback/notes.txt: No such file or directory (os error 2)",
+            "replay budget must be non-zero",
+        ] {
+            let (result, asked) = drive_viewer_replay(
+                handle.viewer_replay(64 * 1024).unwrap(),
+                &mut cmd_rx,
+                |_| refused(message),
+            )
+            .await;
+            assert!(result.expect("answered").is_err(), "{message}");
+            assert_eq!(asked.len(), 1, "{message} was retried");
+        }
+    }
+
+    /// When nothing can be read, the viewer still gets a replay: empty, at
+    /// the live stream's current offset, so the terminal opens on what the
+    /// session prints next. Only a worker that says its log is disabled is
+    /// never asked again — in either wording deployed workers use; a log that
+    /// merely could not be read this time is asked again by the next viewer.
+    #[tokio::test(start_paused = true)]
+    async fn viewer_replay_opens_on_the_live_stream_when_no_history_is_readable() {
+        const LADDER: [u32; 9] = [65_536, 16_384, 4_096, 1_024, 256, 64, 16, 4, 1];
+        for (case, refusal) in [
+            ("every segment gone", MISSING_OLDEST),
+            (
+                "log disabled",
+                "worker replay is unavailable for this session",
+            ),
+            (
+                "log disabled, older worker",
+                "worker replay is unavailable for this agent",
+            ),
+        ] {
+            let control = ForwarderControl::new();
+            control.route_direct_for_test(b"already streamed").await;
+            let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+            let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+            let (result, asked) = drive_viewer_replay(
+                handle.viewer_replay(64 * 1024).unwrap(),
+                &mut cmd_rx,
+                |_| refused(refusal),
+            )
+            .await;
+            let replay = result.expect("answered").expect(case);
+            assert!(replay.bytes().is_empty(), "{case}");
+            assert_eq!(replay.watermark(), control.source_offset(), "{case}");
+            assert_eq!(replay.history_anchor(), None, "{case}");
+            let disabled = case.starts_with("log disabled");
+            if disabled {
+                assert_eq!(asked, [65_536], "{case}");
+            } else {
+                assert_eq!(asked, LADDER, "{case}");
+            }
+
+            // Later, past any hint's life: a disabled log is still not asked;
+            // an unreadable one is asked again, from the full budget.
+            tokio::time::advance(REPLAY_HINT_TTL * 2).await;
+            let (result, asked) = drive_viewer_replay(
+                handle.viewer_replay(64 * 1024).unwrap(),
+                &mut cmd_rx,
+                |_| refused(refusal),
+            )
+            .await;
+            assert!(result.expect("answered").expect(case).bytes().is_empty());
+            if disabled {
+                assert!(asked.is_empty(), "{case}: a disabled log was asked again");
+            } else {
+                assert_eq!(asked, LADDER, "{case}: an unreadable log was given up on");
+            }
+        }
+
+        // A handle whose worker is gone still has no replay to offer.
+        let (cmd_tx, _cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let gone = test_handle(
+            ForwarderControl::new(),
+            cmd_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(gone.viewer_replay(64 * 1024).is_none());
+    }
+
+    /// A budget learned by shrinking is a hint, not a cap: it is learned only
+    /// from a replay that succeeded, it is not renewed by use, it lapses after
+    /// `REPLAY_HINT_TTL`, and a history wipe voids it. Each time, the full
+    /// budget is asked for again.
+    #[tokio::test(start_paused = true)]
+    async fn a_learned_replay_budget_lapses_and_a_wipe_voids_it() {
+        let control = ForwarderControl::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+        let truncated = |budget: u32| {
+            if budget > 5_000 {
+                refused(MISSING_OLDEST)
+            } else {
+                Ok(WorkerReplay::new(0, b"newest".to_vec()))
+            }
+        };
+        let healed = |_| Ok(WorkerReplay::new(0, b"all of it".to_vec()));
+        let ask = |max_bytes: u32| handle.viewer_replay(max_bytes).unwrap();
+
+        // Nothing is learned from refusals alone: a request whose every
+        // budget was refused leaves the next one starting at its own.
+        let (_, asked) =
+            drive_viewer_replay(ask(64 * 1024), &mut cmd_rx, |_| refused(MISSING_OLDEST)).await;
+        assert_eq!(asked.last(), Some(&1));
+        let (_, asked) = drive_viewer_replay(ask(8 << 20), &mut cmd_rx, truncated).await;
+        assert_eq!(
+            asked,
+            [
+                8 << 20,
+                2 << 20,
+                512 << 10,
+                128 << 10,
+                32 << 10,
+                8 << 10,
+                2 << 10
+            ]
+        );
+
+        // While fresh, the hint is where requests start.
+        let (_, asked) = drive_viewer_replay(ask(8 << 20), &mut cmd_rx, truncated).await;
+        assert_eq!(asked, [2 << 10]);
+
+        // (a) The worker wipes its history: every segment, and the gap with
+        // them, is gone. The full budget is asked for at once.
+        control.route_history(1, None, &[]).await;
+        let (result, asked) = drive_viewer_replay(ask(8 << 20), &mut cmd_rx, healed).await;
+        assert_eq!(asked, [8 << 20]);
+        assert_eq!(result.unwrap().unwrap().bytes(), b"all of it");
+
+        // (b) Learned again, then left to lapse: using it does not renew it.
+        let (_, asked) = drive_viewer_replay(ask(8 << 20), &mut cmd_rx, truncated).await;
+        assert_eq!(asked.last(), Some(&(2 << 10)));
+        tokio::time::advance(REPLAY_HINT_TTL / 2).await;
+        let (_, asked) = drive_viewer_replay(ask(8 << 20), &mut cmd_rx, truncated).await;
+        assert_eq!(asked, [2 << 10]);
+        tokio::time::advance(REPLAY_HINT_TTL / 2 + Duration::from_secs(1)).await;
+        let (result, asked) = drive_viewer_replay(ask(8 << 20), &mut cmd_rx, healed).await;
+        assert_eq!(asked, [8 << 20]);
+        assert_eq!(result.unwrap().unwrap().bytes(), b"all of it");
+    }
+
+    /// The cases a remembered "nothing readable" used to leave blank for good,
+    /// against a real scrollback log: the full segment gone while the empty
+    /// one rotation left survives (an empty segment has no records, so even
+    /// one byte walks on to the gap), and the newest segment gone before a
+    /// `clear`. Each viewer opens; once history is readable again, the next
+    /// one gets it from the worker.
+    #[tokio::test]
+    async fn a_log_that_becomes_readable_again_is_read_again() {
+        use spawnd::sessiond::scrollback::ScrollbackLog;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("session.scrollback");
+        let key = spawnd::sessiond::secret::SecretBytes::random(32).unwrap();
+        let log = std::cell::RefCell::new(
+            ScrollbackLog::with_limits(&dir, &key, 4 * 1024, 64 * 1024).unwrap(),
+        );
+        let line = "\x1b[0mcommitted line of terminal history\r\n".repeat(16);
+        while log.borrow().segment_count() < 2 {
+            log.borrow_mut().append_history(line.as_bytes()).unwrap();
+        }
+        // Rotation left seg-2 empty; the cleaner takes the full seg-1.
+        assert_eq!(
+            std::fs::metadata(dir.join("seg-00000002.log"))
+                .unwrap()
+                .len(),
+            0
+        );
+        std::fs::remove_file(dir.join("seg-00000001.log")).unwrap();
+        let worker = |budget: u32| match log.borrow_mut().replay(u64::from(budget)) {
+            Ok(history) => Ok(WorkerReplay::new(
+                0,
+                [b"worker:".as_slice(), &history].concat(),
+            )),
+            Err(error) => refused(&format!("{error:#}")),
+        };
+
+        let control = ForwarderControl::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let handle = test_handle(control, cmd_tx, Arc::new(AtomicBool::new(true)));
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            worker,
+        )
+        .await;
+        assert!(result.unwrap().unwrap().bytes().is_empty());
+        assert_eq!(asked.last(), Some(&1));
+
+        // Lines commit into the empty segment: it is readable now (enough of
+        // them that a quarter-step budget holds some).
+        for _ in 0..4 {
+            log.borrow_mut()
+                .append_history(b"\x1b[0mthe newest line\r\n")
+                .unwrap();
+        }
+        let (result, _) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            worker,
+        )
+        .await;
+        let replay = result.unwrap().unwrap();
+        assert!(replay.bytes().starts_with(b"worker:"));
+        assert!(String::from_utf8_lossy(replay.bytes()).contains("the newest line"));
+
+        // The newest segment goes too, then the app clears its scrollback:
+        // the worker starts a fresh segment and replays again.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            worker,
+        )
+        .await;
+        assert!(result.unwrap().unwrap().bytes().is_empty());
+        assert_eq!(asked.last(), Some(&1));
+        log.borrow_mut().truncate_all().unwrap();
+        let (result, asked) = drive_viewer_replay(
+            handle.viewer_replay(64 * 1024).unwrap(),
+            &mut cmd_rx,
+            worker,
+        )
+        .await;
+        assert_eq!(result.unwrap().unwrap().bytes(), b"worker:");
+        assert_eq!(asked, [65_536]);
+    }
+
+    /// The words spawnd reads are the words deployed workers say. Running
+    /// workers keep their binary, so changing a constant here or in the
+    /// worker does not change what they say: these literals are the contract.
+    #[test]
+    fn the_refusal_words_spawnd_reads_are_the_ones_workers_say() {
+        use spawnd::sessiond::scrollback::{SEGMENT_PREFIX, SEGMENT_READ_CONTEXT, SEGMENT_SUFFIX};
+        use spawnd::sessiond::worker::REPLAY_UNAVAILABLE;
+
+        assert_eq!(
+            REPLAY_UNAVAILABLE,
+            "worker replay is unavailable for this session"
+        );
+        assert_eq!(SEGMENT_READ_CONTEXT, "reading ");
+        assert_eq!(SEGMENT_PREFIX, "seg-");
+        assert_eq!(SEGMENT_SUFFIX, ".log");
+        for disabled in [
+            REPLAY_UNAVAILABLE,
+            // Workers started from 2026-08-19 (control protocol v3).
+            "worker replay is unavailable for this session",
+            // Workers started from 2026-07-16 to 2026-08-19: same protocol.
+            "worker replay is unavailable for this agent",
+        ] {
+            assert_eq!(
+                unreadable_history(disabled),
+                Some(UnreadableHistory::LogDisabled),
+                "{disabled}"
+            );
+        }
+        assert_eq!(
+            unreadable_history("worker replay is unavailable before start"),
+            None
+        );
+        for missing in [
+            MISSING_OLDEST,
+            "reading C:\\Users\\u\\AppData\\Local\\spawn\\logs\\x\\workers\\s.scrollback\\history\\seg-00000007.log: The system cannot find the file specified. (os error 2)",
+        ] {
+            assert_eq!(
+                unreadable_history(missing),
+                Some(UnreadableHistory::MissingSegment),
+                "{missing}"
+            );
+        }
+    }
+
+    /// The classifier reads the words the scrollback log itself produces:
+    /// a deleted segment is unreadable history; a tampered or truncated one
+    /// is not.
+    #[test]
+    fn unreadable_history_matches_what_the_scrollback_log_says() {
+        use spawnd::sessiond::scrollback::ScrollbackLog;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("session.scrollback");
+        let key = spawnd::sessiond::secret::SecretBytes::random(32).unwrap();
+        let mut log = ScrollbackLog::with_limits(&dir, &key, 4 * 1024, 64 * 1024).unwrap();
+        let line = "\x1b[0mcommitted line of terminal history\r\n".repeat(16);
+        while log.segment_count() < 3 {
+            log.append_history(line.as_bytes()).unwrap();
+        }
+        let oldest = dir.join("seg-00000001.log");
+        assert!(oldest.exists());
+        let refusal =
+            |log: &mut ScrollbackLog| format!("{:#}", log.replay(u32::MAX as u64).unwrap_err());
+
+        std::fs::remove_file(&oldest).unwrap();
+        let missing = refusal(&mut log);
+        assert_eq!(
+            unreadable_history(&missing),
+            Some(UnreadableHistory::MissingSegment),
+            "{missing}"
+        );
+
+        // Rotation leaves the newest segment empty; the one before it is
+        // read first and holds records.
+        let full = dir.join("seg-00000002.log");
+        let mut bytes = std::fs::read(&full).unwrap();
+        assert!(bytes.len() > 20);
+        bytes[20] ^= 0xff;
+        std::fs::write(&full, &bytes).unwrap();
+        let tampered = refusal(&mut log);
+        assert!(tampered.contains("failed authentication"), "{tampered}");
+        assert_eq!(unreadable_history(&tampered), None);
+
+        std::fs::write(&full, &bytes[..5]).unwrap();
+        let truncated = refusal(&mut log);
+        assert!(truncated.contains("truncated record"), "{truncated}");
+        assert_eq!(unreadable_history(&truncated), None);
+    }
+
+    /// The next resize the handle sends its worker, and when, or `None` if
+    /// none comes within two (paused, auto-advancing) minutes: longer than
+    /// any interval, settle or hold.
+    async fn next_resize(
+        cmd_rx: &mut mpsc::Receiver<WorkerCmd>,
+    ) -> Option<((u16, u16), tokio::time::Instant)> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(120), cmd_rx.recv()).await {
+                Ok(Some(WorkerCmd::Resize { cols, rows })) => {
+                    return Some(((cols, rows), tokio::time::Instant::now()))
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    fn nudge_test_handle() -> (ForwarderControl, mpsc::Receiver<WorkerCmd>, SessionHandle) {
+        let control = ForwarderControl::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let handle = test_handle(control.clone(), cmd_tx, Arc::new(AtomicBool::new(true)));
+        (control, cmd_rx, handle)
+    }
+
+    /// An empty replay makes the program repaint: after the settle, one
+    /// column narrower, held until the program's output and no less than the
+    /// minimum, then back where it was — once, and never again by itself.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_replay_nudges_the_size_once_and_puts_it_back() {
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
+        let asked = tokio::time::Instant::now();
+        handle.repaint_after_empty_replay();
+
+        let (narrow, at) = next_resize(&mut cmd_rx).await.expect("nudge");
+        assert_eq!(narrow, (79, 24));
+        assert_eq!(at - asked, REPAINT_SETTLE);
+        assert_eq!(handle.applied_size(), (79, 24));
+        // The program repaints at once; the size still stands the minimum.
+        control
+            .route_direct_for_test(b"repaint at 79 columns")
+            .await;
+        let (restored, back) = next_resize(&mut cmd_rx).await.expect("restore");
+        assert_eq!(restored, (80, 24));
+        assert_eq!(back - at, REPAINT_HOLD_MIN);
+        assert_eq!(handle.applied_size(), (80, 24));
+        assert!(next_resize(&mut cmd_rx).await.is_none(), "nudged again");
+
+        // A program that does not repaint (a shell at its prompt) is given
+        // the longest hold, then the size comes back all the same.
+        handle.repaint_after_empty_replay();
+        let (_, at) = next_resize(&mut cmd_rx).await.expect("nudge");
+        let (restored, back) = next_resize(&mut cmd_rx).await.expect("restore");
+        assert_eq!(restored, (80, 24));
+        assert_eq!(back - at, REPAINT_HOLD_MAX);
+    }
+
+    /// Viewers attaching together share one nudge, including one handed its
+    /// replay while the narrower size stands; one that comes after the
+    /// restore gets its own, no sooner than the interval allows.
+    #[tokio::test(start_paused = true)]
+    async fn viewers_attaching_together_share_one_nudge() {
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
+        handle.repaint_after_empty_replay();
+        tokio::time::advance(REPAINT_SETTLE / 2).await;
+        handle.repaint_after_empty_replay();
+        let (narrow, first) = next_resize(&mut cmd_rx).await.expect("nudge");
+        assert_eq!(narrow, (79, 24));
+        // One handed out while the narrower size stands: the restore's
+        // repaint reaches it.
+        handle.repaint_after_empty_replay();
+        control.route_direct_for_test(b"repaint").await;
+        let (restored, _) = next_resize(&mut cmd_rx).await.expect("restore");
+        assert_eq!(restored, (80, 24));
+
+        handle.repaint_after_empty_replay();
+        handle.repaint_after_empty_replay();
+        let (narrow, second) = next_resize(&mut cmd_rx).await.expect("second nudge");
+        assert_eq!(narrow, (79, 24));
+        assert_eq!(second, first + REPAINT_MIN_INTERVAL);
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((80, 24))
+        );
+        assert!(
+            next_resize(&mut cmd_rx).await.is_none(),
+            "more nudges than asked for"
+        );
+    }
+
+    /// Ask for a repaint at each of `asks` (offsets from the start), with a
+    /// program that answers every narrowing at once; when each nudge
+    /// narrowed the PTY, as offsets from the start.
+    async fn nudge_starts(asks: &[Duration]) -> Vec<Duration> {
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
+        let begin = tokio::time::Instant::now();
+        let program = tokio::spawn(async move {
+            let mut starts = Vec::new();
+            while let Some(command) = cmd_rx.recv().await {
+                if let WorkerCmd::Resize { cols: 79, .. } = command {
+                    starts.push(tokio::time::Instant::now() - begin);
+                    control.route_direct_for_test(b"repaint").await;
+                }
+            }
+            starts
+        });
+        for ask in asks {
+            tokio::time::sleep_until(begin + *ask).await;
+            handle.repaint_after_empty_replay();
+        }
+        tokio::time::sleep(REPAINT_MAX_INTERVAL * 2).await;
+        drop(handle);
+        program.await.expect("program")
+    }
+
+    /// A viewer reattaching every 16 s: the budget's four nudges come at
+    /// once, then about one a minute for as long as it keeps on; once it
+    /// stops for a few minutes, the next viewer is prompt again.
+    #[tokio::test(start_paused = true)]
+    async fn a_reattach_loop_is_held_to_about_one_nudge_a_minute() {
+        let secs = Duration::from_secs;
+        let mut asks: Vec<Duration> = (0..40).map(|n| secs(16 * n)).collect();
+        let after = secs(16 * 39) + secs(300);
+        asks.push(after);
+        let starts = nudge_starts(&asks).await;
+        for n in 0..4 {
+            assert_eq!(starts[n], asks[n] + REPAINT_SETTLE, "{starts:?}");
+        }
+        let storm = &starts[..starts.len() - 1];
+        for pair in storm[3..].windows(2) {
+            assert!(pair[1] - pair[0] >= REPAINT_MAX_INTERVAL, "{starts:?}");
+        }
+        // 4 at once, then one a minute over the remaining ten minutes.
+        assert!(storm.len() <= 4 + 11, "{} nudges: {starts:?}", storm.len());
+        assert_eq!(starts.last(), Some(&(after + REPAINT_SETTLE)), "{starts:?}");
+    }
+
+    /// People opening a session at a human pace — a few at once (a reload,
+    /// a second device), then every couple of minutes — are never kept
+    /// waiting: every nudge comes at the settle.
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_use_is_never_kept_waiting() {
+        let secs = Duration::from_secs;
+        let mut asks = vec![secs(0), secs(10), secs(20), secs(30)];
+        asks.extend((1..15).map(|n| secs(30 + 120 * n)));
+        let starts = nudge_starts(&asks).await;
+        let expected: Vec<Duration> = asks.iter().map(|ask| *ask + REPAINT_SETTLE).collect();
+        assert_eq!(starts, expected);
+    }
+
+    /// A viewer's resize while the narrower size stands is never undone:
+    /// the restore stands down, whether the viewer chose another size or
+    /// the very size the nudge was passing through.
+    #[tokio::test(start_paused = true)]
+    async fn a_viewer_resize_during_a_nudge_wins() {
+        for wanted in [(100, 30), (79, 24)] {
+            let (_control, mut cmd_rx, handle) = nudge_test_handle();
+            handle.repaint_after_empty_replay();
+            assert_eq!(
+                next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+                Some((79, 24))
+            );
+            // (100, 30) differs from the narrower size and is sent; (79, 24)
+            // is the narrower size itself, so nothing is sent, but it is
+            // the viewer's now.
+            handle.resize(wanted.0, wanted.1).expect("viewer resize");
+            if wanted != (79, 24) {
+                assert_eq!(
+                    next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+                    Some(wanted)
+                );
+            }
+            assert!(
+                next_resize(&mut cmd_rx).await.is_none(),
+                "{wanted:?} was undone"
+            );
+            assert_eq!(handle.applied_size(), wanted);
+        }
+    }
+
+    /// The viewer's own width change after its seed makes the program
+    /// repaint, past the seed's anchor: no nudge then. One applied before
+    /// the seed (the history request's own size) does not count here.
+    #[tokio::test(start_paused = true)]
+    async fn a_width_change_after_the_empty_replay_makes_the_nudge_unneeded() {
+        let (_control, mut cmd_rx, handle) = nudge_test_handle();
+        assert!(handle.resize(90, 24).unwrap());
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((90, 24))
+        );
+        handle.repaint_after_empty_replay();
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((89, 24))
+        );
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((90, 24))
+        );
+
+        handle.repaint_after_empty_replay();
+        assert!(handle.resize(100, 30).unwrap());
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((100, 30))
+        );
+        assert!(
+            next_resize(&mut cmd_rx).await.is_none(),
+            "nudged after a real resize"
+        );
+        assert_eq!(handle.applied_size(), (100, 30));
+    }
+
+    /// A height change alone (a phone's keyboard opening) is applied, but an
+    /// inline program may draw nothing for it: the nudge still comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_height_change_alone_does_not_make_the_nudge_unneeded() {
+        let (_control, mut cmd_rx, handle) = nudge_test_handle();
+        handle.repaint_after_empty_replay();
+        assert!(!handle.resize(80, 30).unwrap(), "only the height changed");
+        let sizes = [
+            next_resize(&mut cmd_rx).await,
+            next_resize(&mut cmd_rx).await,
+            next_resize(&mut cmd_rx).await,
+        ]
+        .map(|resize| resize.map(|(size, _)| size));
+        assert_eq!(sizes, [Some((80, 30)), Some((79, 30)), Some((80, 30))]);
+        assert_eq!(handle.applied_size(), (80, 30));
+    }
+
+    /// No nudge for a session that is not running, nor once it stops
+    /// before the nudge starts.
+    #[tokio::test(start_paused = true)]
+    async fn no_nudge_when_the_session_is_not_running() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let alive = Arc::new(AtomicBool::new(false));
+        let stopped = test_handle(ForwarderControl::new(), cmd_tx, Arc::clone(&alive));
+        stopped.repaint_after_empty_replay();
+        assert!(next_resize(&mut cmd_rx).await.is_none());
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let alive = Arc::new(AtomicBool::new(true));
+        let stopping = test_handle(ForwarderControl::new(), cmd_tx, Arc::clone(&alive));
+        stopping.repaint_after_empty_replay();
+        alive.store(false, Ordering::Release);
+        assert!(next_resize(&mut cmd_rx).await.is_none());
+    }
+
+    /// The nudge does not depend on the viewer that asked: with its
+    /// `spawn.pty` gone, the size still comes back.
+    #[tokio::test(start_paused = true)]
+    async fn the_restore_does_not_wait_for_the_viewer_that_asked() {
+        let (control, mut cmd_rx, handle) = nudge_test_handle();
+        let viewer = control.add_direct_sink("leaving".into()).await;
+        handle.repaint_after_empty_replay();
+        control.remove_direct_sink("leaving").await;
+        drop(viewer);
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((79, 24))
+        );
+        control.route_direct_for_test(b"repaint").await;
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((80, 24))
+        );
+        assert_eq!(handle.applied_size(), (80, 24));
+    }
+
+    /// A handle let go of while the narrower size stands: the nudge holds
+    /// none of its connection open and sends nothing more. The daemon that
+    /// adopts the worker next reads its real size from the hello.
+    #[tokio::test(start_paused = true)]
+    async fn a_handle_dropped_mid_hold_is_not_kept_open() {
+        let (_control, mut cmd_rx, handle) = nudge_test_handle();
+        handle.repaint_after_empty_replay();
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((79, 24))
+        );
+        drop(handle);
+        let closed = tokio::time::timeout(REPAINT_HOLD_MAX * 3, cmd_rx.recv()).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "the connection stayed open or was sent more"
+        );
+    }
+
+    /// A narrowing the full command queue refuses is a nudge skipped: the
+    /// size is untouched, and the next viewer's nudge is not delayed by it.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_narrowing_skips_the_nudge_without_delaying_the_next() {
+        let control = ForwarderControl::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let filler = cmd_tx.clone();
+        let handle = test_handle(control, cmd_tx, Arc::new(AtomicBool::new(true)));
+        while filler
+            .try_send(WorkerCmd::Input(DirectPayload::new(b"x".to_vec())))
+            .is_ok()
+        {}
+        handle.repaint_after_empty_replay();
+        tokio::time::sleep(REPAINT_SETTLE * 2).await;
+        while let Ok(command) = cmd_rx.try_recv() {
+            assert!(
+                !matches!(command, WorkerCmd::Resize { .. }),
+                "resized through a full queue"
+            );
+        }
+        assert_eq!(handle.applied_size(), (80, 24));
+
+        let asked = tokio::time::Instant::now();
+        handle.repaint_after_empty_replay();
+        let (narrow, at) = next_resize(&mut cmd_rx).await.expect("nudge");
+        assert_eq!(narrow, (79, 24));
+        assert_eq!(at - asked, REPAINT_SETTLE);
+    }
+
+    /// The restore waits for room in a full command queue rather than give
+    /// up and leave the session narrower, and backs off while it waits
+    /// rather than spin.
+    #[tokio::test(start_paused = true)]
+    async fn the_restore_waits_for_room_in_a_full_queue() {
+        let control = ForwarderControl::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(WORKER_COMMAND_QUEUE_DEPTH);
+        let filler = cmd_tx.clone();
+        let handle = test_handle(control, cmd_tx, Arc::new(AtomicBool::new(true)));
+        handle.repaint_after_empty_replay();
+        assert_eq!(
+            next_resize(&mut cmd_rx).await.map(|(size, _)| size),
+            Some((79, 24))
+        );
+        while filler
+            .try_send(WorkerCmd::Input(DirectPayload::new(b"x".to_vec())))
+            .is_ok()
+        {}
+        tokio::time::sleep(REPAINT_HOLD_MAX * 3).await;
+        assert_eq!(
+            handle.applied_size(),
+            (79, 24),
+            "restored without room to send it"
+        );
+        // Room now: the restore lands on its next retry, which by now is
+        // spaced well beyond the first and no further than the last.
+        let room = tokio::time::Instant::now();
+        let (restored, at) = next_resize(&mut cmd_rx).await.expect("restore");
+        assert_eq!(restored, (80, 24));
+        assert!(at - room > REPAINT_RESTORE_RETRY_MIN, "{:?}", at - room);
+        assert!(at - room <= REPAINT_RESTORE_RETRY_MAX, "{:?}", at - room);
+        assert_eq!(handle.applied_size(), (80, 24));
+    }
+
+    #[test]
+    fn only_a_replay_spawnd_made_has_no_screen() {
+        assert!(WorkerReplay::new(1, b"screen".to_vec()).has_screen());
+        assert!(WorkerReplay::new_with_history(1, b"screen".to_vec(), (0, 0)).has_screen());
+        assert!(!WorkerReplay::live_only(1).has_screen());
     }
 
     fn test_handle(

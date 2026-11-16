@@ -9,11 +9,12 @@ import { toast } from "@/components/ui/toast";
 import { useWorkspaceIconAutoFill } from "@/hooks/useWorkspaceIconAutoFill";
 import { ApiError, sessions, workspaces } from "@/lib/api";
 import { readingOrder, type Tile } from "@/lib/grid";
-import type { SplitSide } from "@/lib/split-store";
+import { splitStore } from "@/lib/split-store";
 import { activeTab, tabById, tabOfSession, tabTiles } from "@/lib/tabs";
 import { ArchivedBanner } from "./archived-banner";
 import { LauncherFab } from "./launcher-fab";
 import { PaneScopeProvider } from "./pane-scope";
+import { columnEdge } from "./split-chrome";
 import { WorkspaceGrid } from "./workspace-grid";
 import { WorkspaceTabs } from "./workspace-tabs";
 
@@ -22,18 +23,19 @@ const TAB_STORAGE_PREFIX = "spawn.workspace.tab.";
 /**
  * One workspace: its tab strip, its canvas and its launcher.
  *
- * Two of these can be up at once, so nothing here may reach for "the" route,
- * "the" canvas or "the" last-opened workspace. Anything that is a fact about
- * the window rather than about this workspace arrives as a prop and is acted
- * on by the primary alone.
+ * Up to four of these can be up at once, so nothing here may reach for "the"
+ * route, "the" canvas or "the" last-opened workspace. Anything that is a fact
+ * about the window rather than about this workspace arrives as a prop, and
+ * anything that moves the address bar is done by the routed column alone.
  *
  * Memoised because the seam drag lives a level up: a pointer move that only
- * changes the split's ratio has nothing to say to either grid, and re-running
- * both of them at pointer rate is what would make the drag stutter.
+ * changes the columns' widths has nothing to say to any grid, and re-running
+ * all of them at pointer rate is what would make the drag stutter.
  */
 export const WorkspaceView = memo(function WorkspaceView({
   workspaceId,
-  side,
+  column,
+  columns,
   split,
   routedId,
   active,
@@ -44,30 +46,34 @@ export const WorkspaceView = memo(function WorkspaceView({
   onRemoveFromSplit,
 }: {
   workspaceId: string;
-  side: SplitSide;
-  /** True only when the window actually holds two workspaces. */
+  /** Which column this is, counted from the left, and how many are mounted. */
+  column: number;
+  columns: number;
+  /** True only when the window actually holds more than one workspace. */
   split: boolean;
   /**
-   * The workspace the address bar is about. Either half of a split can be it
-   * — the URL names a workspace and the pair decides the order, so the routed
-   * half is not always the left one — and a carry started from this half's
-   * own name needs to know which, to tell whether a drop displaces the route.
+   * The workspace the address bar is about. Any column of a split can be it
+   * — the URL names a workspace and the group decides the order, so the
+   * routed column is not always the left one — and a carry started from this
+   * column's own name needs to know which, to tell whether a drop displaces
+   * the route.
    */
   routedId: string;
-  /** Whether this half owns the document-level gestures. */
+  /** Whether this column owns the document-level gestures. */
   active: boolean;
   /**
-   * `?focus=` and `?tab=`, which the container hands to the routed half only.
-   * The address bar names one workspace, and honouring its session in both
-   * halves would drag the other one's view somewhere its URL never asked for.
+   * `?focus=` and `?tab=`, which the container hands to the routed column
+   * only. The address bar names one workspace, and honouring its session in
+   * every column would drag the others' views somewhere their URL never asked
+   * for.
    */
   focusParam: string | null;
   tabParam: string | null;
-  /** A pointer or focus landed anywhere in this half. */
+  /** A pointer or focus landed anywhere in this column. */
   onActivate: () => void;
-  /** "Keep this half", from this half's own strip. Null when not split. */
+  /** "Keep only this one", from this column's own strip. Null when not split. */
   onUnsplit: (() => void) | null;
-  /** "This half steps out", from its own menu. Null when not split. */
+  /** "This one steps out", from its own menu. Null when not split. */
   onRemoveFromSplit: (() => void) | null;
 }) {
   const routed = routedId === workspaceId;
@@ -101,6 +107,8 @@ export const WorkspaceView = memo(function WorkspaceView({
     queryFn: () => workspaces.list(),
     staleTime: 10_000,
   });
+  /** Where a vanished routed workspace sent the address bar, once it has. */
+  const leavingToRef = useRef<string | null>(null);
   // Only the carry needs this, and only to name the workspaces its drop
   // preview draws — the one being carried is already in hand.
   const workspaceById = useMemo(
@@ -114,9 +122,9 @@ export const WorkspaceView = memo(function WorkspaceView({
   });
 
   useEffect(() => {
-    // Only the routed half records where the user was. A cold start opens one
-    // workspace, so if both halves wrote this the next one would be whichever
-    // of the two happened to mount last rather than the one being worked in.
+    // Only the routed column records where the user was. A cold start opens
+    // one workspace, so if every column wrote this the next one would be
+    // whichever happened to mount last rather than the one being worked in.
     if (!routed) return;
     window.localStorage.setItem("spawn.workspaces.last", workspaceId);
   }, [routed, workspaceId]);
@@ -133,10 +141,21 @@ export const WorkspaceView = memo(function WorkspaceView({
     if (!(workspaceQ.error instanceof ApiError) || workspaceQ.error.status !== 404) return;
     if (workspacesQ.isLoading) return;
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
-    // A vanished second workspace leaves the arrangement instead: the refresh
-    // above is what reaches `splitStore.reconcile`. Letting it navigate as
-    // well would send the half the user is still working in somewhere else.
+    // A vanished column that is not the routed one just leaves the
+    // arrangement: the refresh above is what reaches `splitStore.reconcile`.
+    // Letting it navigate as well would send the column the user is still
+    // working in somewhere else.
     if (!routed) return;
+    // The routed one leaves its split and the address bar moves to the column
+    // that took its place, so a group that is still standing stays on screen.
+    // Held once worked out: this effect can run again before the route has
+    // moved, and by then the workspace is no longer in the group to ask about.
+    leavingToRef.current ??= splitStore.remove(workspaceId, workspaceId);
+    const successor = leavingToRef.current;
+    if (successor) {
+      router.replace(`/w/${successor}`);
+      return;
+    }
     const remaining = [...(workspacesQ.data ?? [])]
       .filter((workspace) => workspace.id !== workspaceId)
       .sort((a, b) => a.position - b.position);
@@ -203,15 +222,15 @@ export const WorkspaceView = memo(function WorkspaceView({
 
   /*
    * The root carries the scope even while the workspace is still loading:
-   * `paneRootAt` hit-tests a pointer against these attributes, and a half that
-   * only became findable once its data arrived would swallow the first drag
-   * that crossed it. The unsplit window provides the scope too, so the
+   * `paneRootAt` hit-tests a pointer against these attributes, and a column
+   * that only became findable once its data arrived would swallow the first
+   * drag that crossed it. The unsplit window provides the scope too, so the
    * surfaces below have one way of finding their canvas rather than two.
    */
   return (
     <PaneScopeProvider
       workspaceId={workspaceId}
-      side={side}
+      column={column}
       split={split}
       routed={routed}
       active={active}
@@ -220,13 +239,13 @@ export const WorkspaceView = memo(function WorkspaceView({
       <div
         ref={rootRef}
         data-workspace-pane={workspaceId}
-        data-split-side={side}
-        // Capture, not bubble: a half has to claim the keyboard even when the
-        // thing that was clicked stops the event on its way up.
+        data-split-column={column}
+        // Capture, not bubble: a column has to claim the keyboard even when
+        // the thing that was clicked stops the event on its way up.
         onPointerDownCapture={onActivate}
         onFocusCapture={onActivate}
-        // Positioned so the launcher can hang off this half rather than off
-        // the viewport once there are two of them. Without it an `absolute`
+        // Positioned so the launcher can hang off this column rather than off
+        // the viewport once there are several. Without it an `absolute`
         // launcher escapes to the initial containing block, which on a page
         // that does not scroll lands close enough to the right answer to look
         // like it worked.
@@ -246,19 +265,19 @@ export const WorkspaceView = memo(function WorkspaceView({
               // company for the length of a close, and the affordance belongs
               // to the arrangement, not to the geometry. It goes on the click,
               // instead of standing on a window the user has dismissed while
-              // the halves finish moving.
+              // the columns finish moving.
               splitChrome={
                 onUnsplit && onRemoveFromSplit
                   ? {
                       workspaceName: workspace.name,
                       workspaceIcon: workspace.icon,
-                      side,
+                      edge: columnEdge(column, columns),
                       onUnsplit,
                       onRemoveFromSplit,
                       // The rail's gesture, started from the strip: a
                       // workspace is picked up by its name and dropped into
-                      // whichever half it should occupy, which is how a split
-                      // is rearranged without going near the sidebar.
+                      // whichever column it should occupy, which is how a
+                      // split is rearranged without going near the sidebar.
                       onCarry: (event) =>
                         startCarryDrag({
                           event,
@@ -296,10 +315,10 @@ export const WorkspaceView = memo(function WorkspaceView({
                 paneDragging={draggingPane}
                 onPreviewTiles={setPreviewTiles}
                 onCreated={({ sessionId }) => {
-                  // Routing is how the routed half focuses a fresh session.
-                  // The same push from the other half would move the address
-                  // bar to a workspace the user did not ask to go to, so that
-                  // half lets the pane arrive where the grid places it.
+                  // Routing is how the routed column focuses a fresh session.
+                  // The same push from another column would move the address
+                  // bar to a workspace the user did not ask to go to, so those
+                  // columns let the pane arrive where the grid places it.
                   if (sessionId && routed) {
                     router.push(`/w/${workspace.id}?focus=${sessionId}`);
                   }

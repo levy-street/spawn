@@ -719,6 +719,48 @@ pub struct SessionControlHub {
     /// viewer that waits on a held transaction names the holder in its
     /// warning, which is the one fact a silent attach failure needs.
     holders: Arc<std::sync::Mutex<HashMap<Uuid, TransactionHolder>>>,
+    /// Who is waiting for each session's transaction, and word of each new
+    /// waiter: a test's barrier for "that call has reached the lock and is
+    /// parked on it".
+    #[cfg(test)]
+    waiting: Arc<std::sync::Mutex<Vec<(Uuid, String)>>>,
+    #[cfg(test)]
+    waiting_changed: Arc<tokio::sync::Notify>,
+}
+
+/// One waiter's entry in `SessionControlHub::waiting`, removed on drop.
+#[cfg(test)]
+struct WaitingRecord {
+    waiting: Arc<std::sync::Mutex<Vec<(Uuid, String)>>>,
+    entry: (Uuid, String),
+}
+
+#[cfg(test)]
+impl WaitingRecord {
+    fn enter(
+        waiting: &Arc<std::sync::Mutex<Vec<(Uuid, String)>>>,
+        changed: &tokio::sync::Notify,
+        session_id: Uuid,
+        label: &str,
+    ) -> Self {
+        let entry = (session_id, label.to_string());
+        waiting.lock().unwrap().push(entry.clone());
+        changed.notify_waiters();
+        Self {
+            waiting: Arc::clone(waiting),
+            entry,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WaitingRecord {
+    fn drop(&mut self) {
+        let mut waiting = self.waiting.lock().unwrap();
+        if let Some(index) = waiting.iter().position(|entry| *entry == self.entry) {
+            waiting.remove(index);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -752,7 +794,11 @@ impl Drop for TransactionGuard {
 
 /// A wait longer than this is reported, naming the holder; the report repeats
 /// at the second interval while the wait continues. A healthy transaction is
-/// held for milliseconds; the longest legitimate hold is a replay's 10 s cap.
+/// held for milliseconds. A `history` or `snapshot` request holds it longest:
+/// up to 3 s for the viewer's `spawn.pty` channel, up to
+/// `WORKER_REPLAY_DEADLINE` (`rtc.rs`) for the worker, then while its reply is
+/// queued — up to 2 s for each of as many as 512 chunks, which is minutes for
+/// a viewer that drains just slowly enough.
 const TRANSACTION_WAIT_WARN_AFTER: Duration = Duration::from_secs(2);
 const TRANSACTION_WAIT_WARN_EVERY: Duration = Duration::from_secs(10);
 static TRANSACTION_TOKENS: AtomicU64 = AtomicU64::new(1);
@@ -814,6 +860,9 @@ impl SessionControlHub {
     ) -> TransactionGuard {
         let started = Instant::now();
         let mut next_warning = TRANSACTION_WAIT_WARN_AFTER;
+        #[cfg(test)]
+        let _waiting =
+            WaitingRecord::enter(&self.waiting, &self.waiting_changed, session_id, &label);
         let lock = transaction.lock_owned();
         tokio::pin!(lock);
         let guard = loop {
@@ -853,6 +902,29 @@ impl SessionControlHub {
             holders: Arc::clone(&self.holders),
             session_id,
             token,
+        }
+    }
+
+    /// Wait until a call labelled `label` is parked on `session_id`'s
+    /// transaction: it has decided everything it decides before the lock.
+    /// Woken by each new waiter rather than polling, so a test on paused
+    /// time is not kept busy here while the clock waits for it to idle.
+    #[cfg(test)]
+    pub(crate) async fn until_waiting(&self, session_id: Uuid, label: &str) {
+        loop {
+            let changed = self.waiting_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .waiting
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, waiting)| *id == session_id && waiting == label)
+            {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -950,9 +1022,30 @@ impl SessionControlHub {
     }
 
     /// Remove all display/lifecycle state when a session backend is removed.
+    #[cfg(test)]
     pub async fn remove_session(&self, session_id: Uuid) {
+        self.remove_session_unless(session_id, async { false })
+            .await;
+    }
+
+    /// Remove all display/lifecycle state when a session backend is removed,
+    /// unless `in_use` says the session has a viewer again. `in_use` is
+    /// asked once this removal holds the session's transaction, so a viewer
+    /// that registers is either seen by it or registers after the state is
+    /// gone, never wiped with it. Returns whether the state was removed.
+    ///
+    /// The wait for the transaction is as long as its holder holds it, and a
+    /// viewer's replay request holds it through its wait on the session's
+    /// worker and the queueing of its reply (`TRANSACTION_WAIT_WARN_AFTER`).
+    /// Call this holding nothing every offer or attach needs: they would wait
+    /// as long.
+    pub async fn remove_session_unless(
+        &self,
+        session_id: Uuid,
+        in_use: impl std::future::Future<Output = bool>,
+    ) -> bool {
         let transaction = self.transaction(session_id).await;
-        {
+        let removed = {
             let _guard = self
                 .lock_existing(
                     session_id,
@@ -960,10 +1053,15 @@ impl SessionControlHub {
                     Arc::clone(&transaction),
                 )
                 .await;
-            self.inner.lock().await.remove(&session_id);
-        }
+            let removed = !in_use.await;
+            if removed {
+                self.inner.lock().await.remove(&session_id);
+            }
+            removed
+        };
         self.evict_transaction_if_idle(session_id, &transaction)
             .await;
+        removed
     }
 
     async fn evict_transaction_if_idle(&self, session_id: Uuid, transaction: &Arc<Mutex<()>>) {

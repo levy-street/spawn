@@ -359,12 +359,34 @@ export interface AppMockOptions {
   fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
   extraBrowserDevices?: Array<Record<string, unknown>>;
   hostPins?: Record<string, string[]>;
+  /**
+   * Per host, the pins in the server's record form, with their delivery
+   * state (`delivered`, `undelivered_reason`). Replaces `hostPins` for the
+   * hosts it names; the pins route then answers `{ pins, capacity }`.
+   */
+  hostPinRecords?: Record<
+    string,
+    Array<{
+      browser_device_id: string;
+      delivered: boolean;
+      undelivered_reason: "pin_limit" | "invalid_chain" | "other" | null;
+    }>
+  >;
+  /** Account-scoped endorsement edges (mesh §3), served as recorded. */
+  accountEndorsements?: Array<{ endorser_device_id: string; endorsed_device_id: string }>;
   endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
   /** Seeded add-device pairing relay rows (served by GET, mutated by the
    * introductions endpoint). Shape: DevicePairingState JSON. */
   pairings?: Array<Record<string, unknown>>;
   /** Seeded durable host-introduction rows (continuous gossip store). */
   hostIntroductions?: Array<Record<string, unknown>>;
+  /**
+   * Let the "This browser may forget its approval" notice (#121) appear. Off
+   * by default, as if answered Not now earlier: headless Chromium refuses to
+   * keep storage on its own, so on every approved mock browser without a
+   * passkey the notice would sit over the top right of whatever a spec clicks.
+   */
+  storageNotice?: boolean;
 }
 
 export async function mockApp(page: Page, options: AppMockOptions = {}): Promise<AppMockStore> {
@@ -438,6 +460,17 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
   const hostIntroductionRows: Array<Record<string, unknown>> = (
     options.hostIntroductions ?? []
   ).map((row) => ({ ...row }));
+
+  const accountId = (store.user as { id?: unknown } | null)?.id;
+  if (options.storageNotice !== true && typeof accountId === "string") {
+    await page.addInitScript((key) => {
+      try {
+        window.localStorage.setItem(key, "1");
+      } catch {
+        // about:blank and opaque origins have no storage; nothing shows there.
+      }
+    }, `spawn:access:storage-notice:${accountId}`);
+  }
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
@@ -1183,12 +1216,20 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     }
     const hostPinsMatch = path.match(/^\/api\/trust\/hosts\/([^/]+)\/pins$/);
     if (hostPinsMatch && method === "GET") {
+      const records = options.hostPinRecords?.[hostPinsMatch[1]];
+      if (records !== undefined) {
+        await json(route, { pins: records, capacity: { used: records.length, max: 32 } });
+        return;
+      }
       await json(route, hostPinMap[hostPinsMatch[1]] ?? []);
       return;
     }
     const hostPinDetailsMatch = path.match(/^\/api\/trust\/hosts\/([^/]+)\/pin-details$/);
     if (hostPinDetailsMatch && method === "GET") {
-      const pinned = hostPinMap[hostPinDetailsMatch[1]] ?? [];
+      const pinned =
+        options.hostPinRecords?.[hostPinDetailsMatch[1]]?.map((pin) => pin.browser_device_id) ??
+        hostPinMap[hostPinDetailsMatch[1]] ??
+        [];
       await json(
         route,
         pinned.map((deviceId) => {
@@ -1205,7 +1246,21 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       return;
     }
     if (path === "/api/trust/account-endorsements" && method === "GET") {
-      await json(route, []);
+      await json(
+        route,
+        (options.accountEndorsements ?? []).map((edge) => {
+          const keyOf = (id: string) =>
+            (browserDeviceList.find((item) => item.id === id)?.public_key as string | undefined) ??
+            "";
+          return {
+            ...edge,
+            endorser_public_key: keyOf(edge.endorser_device_id),
+            endorsed_public_key: keyOf(edge.endorsed_device_id),
+            signature: "A".repeat(86),
+            created_at: CREATED_AT,
+          };
+        }),
+      );
       return;
     }
     if (path === "/api/trust/pairing" && method === "POST") {

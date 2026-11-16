@@ -228,6 +228,11 @@ fn discard_events(events: Vec<HistoryEvent>) {
     }
 }
 
+/// A worker's refusal to replay once its log is disabled, which it never
+/// re-enables. spawnd recognises it by its start, and running workers say it:
+/// workers started from 2026-07-16 to 2026-08-19 end it "for this agent".
+pub const REPLAY_UNAVAILABLE: &str = "worker replay is unavailable for this session";
+
 /// How long a worker with no session command yet waits for `Start` before giving up.
 const AWAIT_START_TIMEOUT: Duration = Duration::from_secs(120);
 /// After the session exits, how long the worker lingers to deliver `Exit` to a
@@ -954,9 +959,7 @@ async fn handle_frame(
         }
         wire::T_REPLAY_REQ => {
             let max_bytes = wire::decode_replay_req(&payload)?;
-            let active_log = log
-                .as_mut()
-                .context("worker replay is unavailable for this session")?;
+            let active_log = log.as_mut().context(REPLAY_UNAVAILABLE)?;
             let emu = emulator
                 .as_mut()
                 .context("worker replay is unavailable before start")?;
@@ -1888,16 +1891,51 @@ mod tests {
     async fn lifecycle_datagrams_remain_fair_under_replenished_partial_flood() {
         use std::os::unix::process::CommandExt;
 
+        use std::io::{BufRead, Write};
+
         let dir = tempfile::tempdir().unwrap();
         let server_path = dir.path().join("session.lifecycle.sock");
         let listener = UnixDatagram::bind(&server_path).unwrap();
-        let child = std::process::Command::new("/bin/sh")
+        // It says `ready` only once it ignores TERM, then answers every line
+        // it is sent: whether it outlived a TERM is asked of it, not guessed
+        // from how long a death would take to show.
+        let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
+            .arg("trap '' TERM; echo ready; while read line; do echo alive; done")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .process_group(0)
             .spawn()
             .expect("signal-resistant child");
+        let mut asking = child.stdin.take().unwrap();
+        let answers = std::io::BufReader::new(child.stdout.take().unwrap());
         let pid = child.id();
+        // Each answer is waited for this long at most. A child that gives
+        // none (stopped, say) is killed, which ends the read waiting on it,
+        // and the test fails saying so instead of hanging.
+        const ANSWER_WITHIN: Duration = Duration::from_secs(30);
+        let stop_child = move || {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        };
+        // However long the shell takes to start, nothing is sent before it
+        // ignores TERM.
+        let ready = tokio::task::spawn_blocking(move || {
+            let mut answers = answers;
+            let mut line = String::new();
+            let _ = answers.read_line(&mut line);
+            (answers, line)
+        });
+        let (mut answers, line) = match tokio::time::timeout(ANSWER_WITHIN, ready).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                stop_child();
+                panic!("the child never said it was ready");
+            }
+        };
+        assert_eq!(line, "ready\n", "the child did not start");
         let child_state = Arc::new(Mutex::new(ChildState::Running {
             child: Box::new(child),
             pid,
@@ -1914,10 +1952,16 @@ mod tests {
         let attacker_path = dir.path().join("attacker.sock");
         let attacker = UnixDatagram::bind(&attacker_path).unwrap();
         let attack_server = server_path.clone();
+        let (flooding_tx, flooding) = tokio::sync::oneshot::channel::<()>();
         let flood = tokio::spawn(async move {
+            let mut flooding_tx = Some(flooding_tx);
             let until = tokio::time::Instant::now() + Duration::from_millis(750);
             while tokio::time::Instant::now() < until {
-                let _ = attacker.try_send_to(&[0xAA], &attack_server);
+                if attacker.try_send_to(&[0xAA], &attack_server).is_ok() {
+                    if let Some(flooding_tx) = flooding_tx.take() {
+                        let _ = flooding_tx.send(());
+                    }
+                }
                 tokio::task::yield_now().await;
             }
         });
@@ -1925,7 +1969,8 @@ mod tests {
         let client_path = dir.path().join("legitimate.sock");
         let client = UnixDatagram::bind(&client_path).unwrap();
         client.connect(&server_path).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The lifecycle requests below compete with a flood under way.
+        let _ = flooding.await;
 
         async fn deliver(client: &UnixDatagram, request: &[u8; wire::LIFECYCLE_REQUEST_LEN]) -> u8 {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -1952,7 +1997,24 @@ mod tests {
             .await,
             wire::LIFECYCLE_ACK_DELIVERED
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The TERM was signalled before it was acknowledged. A child that did
+        // not ignore it is gone before it can answer: its answer is the end
+        // of its output, not `alive`.
+        let asked = tokio::task::spawn_blocking(move || {
+            let _ = writeln!(asking, "still there?");
+            let _ = asking.flush();
+            let mut answer = String::new();
+            let _ = answers.read_line(&mut answer);
+            (asking, answers, answer)
+        });
+        let (asking, answers, answer) = match tokio::time::timeout(ANSWER_WITHIN, asked).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                stop_child();
+                panic!("the child neither answered nor ended after the TERM");
+            }
+        };
+        assert_eq!(answer, "alive\n", "TERM was not ignored");
         {
             let mut state = child_state.lock().unwrap();
             let ChildState::Running { child, .. } = &mut *state else {
@@ -1975,6 +2037,7 @@ mod tests {
                 _ => panic!("missing stable child after KILL"),
             };
         owned.wait().expect("reap killed child");
+        drop((asking, answers));
         flood.await.unwrap();
         server.abort();
     }

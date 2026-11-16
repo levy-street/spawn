@@ -46,7 +46,99 @@ its freeze event) loses it: a visible tab that hears nothing for ten seconds
 steals the lock, and the silent owner stands down and follows when it resumes.
 A tab whose own timers were suspended does not count that gap as the owner's
 silence. A connection that retires itself is rebuilt by the provider rather
-than left closed until a reload. Unsupported
+than left closed until a reload.
+
+An owner can also keep announcing while it holds nothing usable — page code
+from before a fix, or a client that lost track of its own peer — and every
+other tab used to wait behind it for as long as it stayed open (one did for
+four days). A link is stuck when its owner has spent thirty seconds trying
+(connecting, or signalling with no working peer) with nothing to show for it:
+no refusal or error, and no offer answered `failed` in the last fifteen
+seconds, which is how a host that has not approved this device answers every
+one (an owner on page code from before this rule does not report that, so its
+refused link counts as trying). The host list this tab polls must also have
+said since then, within the last 75 seconds, that the host is online. Only a
+visible tab judges: hidden tabs do not poll the host list, and the tab a
+person is looking at is the one worth the next attempt. A waiting tab that
+sees a stuck link takes the lock, as from a silent owner, whatever page code
+the owner runs. An owner that sees its own keeps the lock and replaces its
+connection, under the same term with the epoch moved on; giving the lock up
+would hand it to the tab that has waited longest, as likely as not a hidden
+one on older page code. Each take-over in a row doubles the wait, to at most
+ten minutes. Every tab reads the row from local storage and writes it under a
+lock of its own, so one tab acts per wait; it ends when the link becomes
+ready, and a row twenty minutes old counts as none. Where local storage cannot
+be used, the term and the row stay with the tab, and each tab backs off on its
+own. A host the server calls offline, a network down for everyone (the host
+list stops refreshing) and a machine that slept (the sleep is not counted)
+cause no take-over, and a ready owner is never taken over. Each take-over logs
+one line naming the host and the wait. A tab that fails while it holds the
+lock, other than by losing it, asks for it again on its next heartbeat.
+
+A deposed owner stands down when its lock request rejects or when it hears
+the newer term, and follows. Page code from before #101 does neither: it
+copies the newer term it hears and goes on announcing its own old name under
+it, answering every new tab's hello, and it keeps its own peer — the daemon
+keeps only a device's newest offer, so that tab's next offer displaces the new
+owner's peer until it closes. Every owner since the first shared connection
+names itself `<tab>:<term>` and announces under that term while it leads, so
+a snapshot whose owner's name does not end in its term is no owner's: no tab
+follows it, including one that has followed no one yet.
+
+A connection is ready only while a child channel can open on it. A peer can
+stay connected, its root channel answering, while no new channel opens: a
+daemon built before #122 lost its channel acceptor to one reset stream and
+never noticed (#120). Whoever holds the physical peer — the browser's owner
+tab (`web/src/lib/channel-watch.ts`), the phone's host worker
+(`mobile/src/terminal/worker/worker-channel-watch.js`) — watches the channels
+the daemon speaks on first, a terminal's `spawn.ctl/…` and a tool's
+`spawn.host.ctl/<id>`. One the daemon neither speaks on nor closes for ten
+seconds (in the browser, also one a view gave up on after five) makes the peer
+suspect. The holder then opens a host-control channel of its own as a probe,
+which the daemon greets on accept without any session involved, and ten
+seconds later, still silent, a second one beside it, pinging the root as it
+does; both probes keep listening, and a hello from either stands the watch
+down however late it comes. One silent probe is not proof: a hello waits on
+work a ping does not (the daemon-wide admission lock, a filesystem lookup), so
+on a starved host it can trail the pong by more than ten seconds. Once both
+probes have been silent for their full ten seconds, the holder replaces the
+peer if the root answered (channels are not being accepted), or if the root
+stayed silent through two pings of twenty seconds each (an old daemon's
+association stops acknowledging anything once channels pile up behind its
+dead acceptor; two pings because a starved host can be slow on the root too).
+It sends `rtc.close` for the old binding and offers a fresh peer on the same
+signalling socket; views and tools attach again as after any reconnect. Only
+an answer stands the watch down: a refusal is one — the daemon closes a
+channel it refuses at once. A host briefly unreachable loses ICE consent and
+leaves readiness, which resets the watch. A real wedge is replaced about
+thirty seconds after the first unanswered open (ten to suspect, twenty for the
+two probes), or about sixty when the root has gone silent too. One proof at a
+time; rebuilds for this reason are at least thirty seconds apart, each one in a
+run doubling that to at most five minutes, and a run ends only when the
+replacement has gone five minutes without a suspicion: views reattaching and
+being answered after a rebuild say nothing about whether the fault returns.
+Each rebuild logs one line naming the host and how long each step waited, and
+nothing a terminal carries: the browser console, the phone's device log. The
+phone's terminal Diagnostics sheet shows the reason's code and message, not
+those timings. Meanwhile a terminal that has drawn nothing yet, the browser's
+Hosts row for that host and the phone's host card all say "The connection
+stopped opening new terminals and tools. SPAWN D is making a new one." A probe
+is an ordinary host-control channel to a daemon that accepts it, so on a
+current daemon its hello also makes the daemon publish one content-free
+`rtc.status connected` for the device's binding through the server; nothing
+else about the watch reaches the server beyond the rebuild's `rtc.close` and
+offer.
+
+`signalling_lost` and `rebound` describe the daemon's control socket to the
+server, not the peer, which survives both by design; clients do not act on
+them. They act on the `unavailable` that ends a binding whose daemon did not
+come back within the orphan window, and the server sends that, like
+`signalling_lost`, as the binding's current owner, so it still arrives after a
+rebind. A binding that was rebound once therefore ends at orphan expiry like
+any other: when its daemon then stays off the server for more than the sixty
+seconds of the orphan window, the device is told `unavailable` and builds a
+fresh peer, even if the direct path was still carrying data. Before, such a
+binding's expiry went unheard and the device kept that peer. Unsupported
 coordination APIs produce an explicit error. Each account, registered device key,
 and host has its own lock and connection. Registration finishes before
 connection admission; replacing a

@@ -10,7 +10,12 @@ import {
 /** The part of a host-control client a restart's questions need. */
 export type InspectingClient = Pick<
   HostControlClient,
-  "waitUntilReady" | "hasCapability" | "inspectConversation" | "agentTranscripts" | "close"
+  | "waitUntilReady"
+  | "hasCapability"
+  | "inspectConversation"
+  | "agentTranscripts"
+  | "codexNoDaemon"
+  | "close"
 >;
 
 /** How long a restart waits on the host before carrying on without it: so
@@ -24,6 +29,9 @@ export interface WindowHostQuestions {
   inspect: () => Promise<ConversationInspection | null>;
   /** The host's records of one conversation (`agent.transcripts`). */
   transcripts: (query: AgentTranscriptQuery) => Promise<AgentTranscriptReport | null>;
+  /** Whether the Codex the window is about to run accepts `--no-daemon`
+   *  (`conv.launch`). */
+  codexNoDaemon: () => Promise<boolean | null>;
   /** Lets the channel go; nothing is asked after it. */
   doneAsking: () => void;
 }
@@ -95,6 +103,10 @@ export function askWindowHost(
       ),
     transcripts: (query) =>
       ask(AGENT_TRANSCRIPTS_OP, (asked, timeoutMs) => asked.agentTranscripts(query, { timeoutMs })),
+    codexNoDaemon: () =>
+      ask(CONVERSATION_CAPABILITY, (asked, timeoutMs) =>
+        asked.codexNoDaemon(sessionId, { timeoutMs }),
+      ),
     doneAsking: () => {
       done = true;
       client?.close();

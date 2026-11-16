@@ -54,7 +54,11 @@ Environment:
                           Probes before the smoke check gives up (2s apart).
                           Default: 20.
   SPAWN_DEPLOY_MOBILE     Publish the mobile OTA when mobile/ changed.
-                          Default: 1. Set to 0 to print the command instead.
+                          Default: 0, which prints the command instead. Set
+                          to 1 only when this candidate's release plan said
+                          mobile_native_build=no; release.yml sets it from
+                          that plan. An OTA reaches every installed app on
+                          the channel, including shells it cannot run on.
   SPAWN_DEPLOY_MOBILE_CHANNEL
                           EAS channel for that OTA. Inferred as `production`
                           only for master deploys of https://spawnd.dev; any
@@ -109,10 +113,27 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=release-lib.sh
 source "$script_dir/release-lib.sh"
 
+# The phone update is opt-in. Only the release plan knows whether this tree
+# still fits the native shell on people's phones, so a deploy run by hand —
+# a --resume retry included — publishes nothing unless told to.
+mobile_publish_requested() { [[ "${SPAWN_DEPLOY_MOBILE:-0}" == "1" ]]; }
+
+mobile_publish_self_test() (
+  unset SPAWN_DEPLOY_MOBILE
+  ! mobile_publish_requested || return 1
+  for value in "" 0 true yes on; do
+    SPAWN_DEPLOY_MOBILE="$value"
+    ! mobile_publish_requested || return 1
+  done
+  SPAWN_DEPLOY_MOBILE=1
+  mobile_publish_requested
+)
+
 if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$#" -eq 1 ]] || die "--self-test takes no other arguments"
   command -v python3 >/dev/null 2>&1 || die "python3 is required for --self-test"
   command -v uv >/dev/null 2>&1 || die "uv is required for --self-test"
+  mobile_publish_self_test || die "the mobile OTA must be published only when SPAWN_DEPLOY_MOBILE=1"
   release_contract_self_test || die "release contract self-test failed"
   "$script_dir/health-check.sh" --self-test || die "connection probe self-test failed"
   printf 'deploy-prod: self-test ok\n'
@@ -743,6 +764,11 @@ printf '\n'
 # The channel is never guessed. Publishing a dev build to the production
 # channel would push it to every phone in the field, so an origin this script
 # does not recognise prints the command instead of running it.
+#
+# Nor is the native shell. An OTA reaches every installed app on its runtime,
+# so it is published only with SPAWN_DEPLOY_MOBILE=1, which release.yml sets
+# when its plan proved this tree still fits the last production builds
+# (mobile_native_build=no). Unset, it prints the command and the condition.
 # A failed attempt may already have advanced the remote checkout. The accepted
 # baseline records what the entire release owes, including an unfinished OTA.
 if ! git diff --quiet "$accepted_baseline" "$target_commit" -- mobile; then
@@ -754,9 +780,17 @@ if ! git diff --quiet "$accepted_baseline" "$target_commit" -- mobile; then
   mobile_args=(-m "$mobile_message" --api-url "$public_origin" --branch "$mobile_channel")
   [[ "$branch" == "master" ]] || mobile_args+=(--allow-branch)
 
-  if [[ "${SPAWN_DEPLOY_MOBILE:-1}" == "0" ]]; then
-    printf 'deploy-prod: mobile/ changed; publishing skipped (SPAWN_DEPLOY_MOBILE=0)\n'
-    printf "  scripts/update-mobile-prod.sh %s\n" "${mobile_args[*]}"
+  if ! mobile_publish_requested; then
+    # Three answers, three different next steps. The publish command belongs
+    # to "no" alone: after a "yes", publishing — even once store builds exist
+    # on an unchanged runtime — reaches installed apps that cannot run it.
+    printf 'deploy-prod: mobile/ changed; the phone update was NOT published (SPAWN_DEPLOY_MOBILE is not 1).\n'
+    printf '  What to do depends on mobile_native_build in the original release plan for %s:\n' \
+      "$(git rev-parse --short "$target_commit")"
+    printf '  - no: publish it with: scripts/update-mobile-prod.sh%s\n' "$(printf ' %q' "${mobile_args[@]}")"
+    printf '  - yes: publish nothing for this tree; follow "The phone" in docs/RELEASE.md, runtime warning first.\n'
+    printf '  - unknown: publish nothing yet; ask the plan again for exactly %s (docs/RELEASE.md, release checklist step 7).\n' \
+      "$(git rev-parse --short "$target_commit")"
   elif [[ -z "$mobile_channel" ]]; then
     printf 'deploy-prod: mobile/ changed, but no EAS channel is known for %s.\n' "$public_origin" >&2
     printf '  Set SPAWN_DEPLOY_MOBILE_CHANNEL, or publish it yourself:\n' >&2

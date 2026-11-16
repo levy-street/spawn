@@ -40,12 +40,21 @@ Windows runs on every master push so a later web-only commit can still release
 earlier undeployed daemon changes; pull-request Windows checks are path-filtered.
 To retry a partial deployment, `deploy-prod.sh --resume` retains the original
 acceptance evidence and accepts only the tested baseline/candidate identities;
-see `docs/RELEASE.md` for the exact-candidate retry procedure.
-For an unfinished native store release after deployment, dispatch
-`mobile-store-recovery.yml` on master with the original `release_run` and
-`operation=inspect` first. It retains the original plan and acceptance identity,
-uses the protected production Expo token, and refuses duplicate builds or
-submissions. `docs/RELEASE.md` documents the per-platform recovery operations.
+see `docs/RELEASE.md` for the exact-candidate retry procedure. A deploy run by
+hand publishes no mobile OTA unless `SPAWN_DEPLOY_MOBILE=1`, which is right only
+when that candidate's release plan said `mobile_native_build=no`.
+A push never starts an EAS store build. `scripts/release-plan.sh` compares each
+platform's native fingerprint with its last production build; on a native
+change, or a check that cannot answer, the release withholds the mobile OTA,
+still deploys server/web/daemon, and fails at "require the owed store builds".
+A person then starts only the owed platforms' builds, after reading the
+runtime warning in `docs/RELEASE.md` ("The phone"): dispatch
+`mobile-store-recovery.yml` on master with that `release_run` and
+`operation=inspect` first, then `build-ios` or `build-android`, one at a time
+while no release run is queued. Never "Re-run all jobs" on such a release. It
+retains the original plan and acceptance identity, uses the protected
+production Expo token, and refuses duplicate builds or submissions.
+`docs/RELEASE.md` documents the per-platform recovery operations.
 Daemon publication stages a complete signed snapshot under prebuilt `releases/`;
 `scripts/activate-prebuilt.py` verifies it before atomically switching `current`.
 The API resolves that pointer once per request; interrupted uploads leave the
@@ -129,8 +138,17 @@ permanently fail acceptance; they are not silently restarted. The fixture
 daemon has 180 seconds to register: on the macOS runner it spends half a
 minute hashing the unoptimized pair into its release store before its first
 log line, and the lifecycle log records how long it took.
-After fixture readiness, native app boot has a separate 180-second budget;
-local startup diagnostics and scoped device captures preserve setup failures.
+After fixture readiness, native app boot has a separate 180-second budget.
+The app retries an unanswered first bootstrap request (a refusal still fails
+at once); the last attempt is scheduled to start within 60 seconds of the
+first, and each attempt can wait out its 15-second request timeout, so
+retrying can take about 75 seconds. That fits inside the 180-second budget of
+the first launch only; after the relaunch in the `process_restart` case the
+suite waits 60 seconds for the new boot, less than retrying can take.
+Local startup diagnostics and scoped device captures preserve setup failures.
+A short-background cycle measured at three seconds or longer is repeated,
+three cycles at most, before the case fails; the suite cannot tell OS latency
+from app latency. `mobile/e2e/NATIVE_ACCEPTANCE.md` has the rules.
 Fixture shutdown defers cancellation until worker/API cleanup and its evidence
 write finish; the workflow still enforces a bounded cleanup deadline.
 

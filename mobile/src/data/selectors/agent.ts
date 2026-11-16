@@ -130,16 +130,62 @@ function envPrefix(env: Readonly<Record<string, string>>): string {
   return assignments.length > 0 ? `${assignments.join(" ")} ` : "";
 }
 
-export function agentRunCommand(agent: AgentDef): string {
+/**
+ * How a launch may be typed. `codexNoDaemon`: Codex with `--no-daemon`, which
+ * keeps the window's threads in the window's own process, where the host can
+ * tell which one it is on, instead of Codex's shared background server. A
+ * Codex that does not know the flag refuses to start, so it is typed only
+ * where the window's host said, just before typing, that the window's Codex
+ * accepts it (`conv.launch`, `observePendingLaunchDelivery`). The web app
+ * spells the same options.
+ */
+export interface LaunchOptions {
+  readonly codexNoDaemon: boolean;
+}
+export const PLAIN_LAUNCH: LaunchOptions = Object.freeze({ codexNoDaemon: false });
+
+/**
+ * Flags the launch options ask for, after the agent's own command. Only the
+ * plain `codex` the host asks about gets `--no-daemon`, and not when the
+ * definition sets its own PATH (the host asked with the window's PATH): a
+ * definition that runs something else under the name is left alone.
+ */
+function launchFlags(agent: AgentDef, options: LaunchOptions): string {
+  const env =
+    agent.yolo && agentYoloAvailable(agent) ? { ...agent.env, ...agent.yolo_env } : agent.env;
+  const ownPath = Object.keys(env).some((key) => key.toUpperCase() === "PATH");
+  const codex = agent.kind?.trim().toLowerCase() === "codex" && agent.command.trim() === "codex";
+  return codex && !ownPath && options.codexNoDaemon ? " --no-daemon" : "";
+}
+
+/**
+ * A launch as it is queued: the command, and — where the agent is a plain
+ * Codex — the same command with `--no-daemon`, to be typed instead if the
+ * window's host says so when the moment comes. `build` is any of the command
+ * builders here with its options applied.
+ */
+export function queuedLaunch(build: (options: LaunchOptions) => string): {
+  command: string;
+  codexNoDaemon: string | null;
+} {
+  const command = build(PLAIN_LAUNCH);
+  const flagged = build({ codexNoDaemon: true });
+  return { command, codexNoDaemon: flagged === command ? null : flagged };
+}
+
+export function agentRunCommand(agent: AgentDef, options: LaunchOptions = PLAIN_LAUNCH): string {
   const useYolo = agent.yolo && agentYoloAvailable(agent);
   const env = useYolo ? { ...agent.env, ...agent.yolo_env } : agent.env;
   const args = useYolo ? agent.yolo_args?.trim() : "";
-  return `${envPrefix(env)}${agent.command}${args ? ` ${args}` : ""}`;
+  return `${envPrefix(env)}${agent.command}${launchFlags(agent, options)}${args ? ` ${args}` : ""}`;
 }
 
-export function agentInstallAndRunCommand(agent: AgentDef): string | null {
+export function agentInstallAndRunCommand(
+  agent: AgentDef,
+  options: LaunchOptions = PLAIN_LAUNCH,
+): string | null {
   const install = agent.install?.trim();
-  return install ? `${install} && ${agentRunCommand(agent)}` : null;
+  return install ? `${install} && ${agentRunCommand(agent, options)}` : null;
 }
 
 export interface RunningAgentGroup {
@@ -189,26 +235,31 @@ export interface AgentConversationGrammar {
   launch: ((conversationId: string) => string) | null;
   /** Flags that reopen a known conversation. Null when the CLI cannot. */
   resume: ((conversationId: string) => string) | null;
-  /** Flags that reopen the most recent conversation in this folder, for a
-   *  window whose conversation cannot be named. Null when it cannot. */
-  continueLatest: string | null;
+  /** Flags for a window whose conversation cannot be named: Claude Code
+   *  continues the folder's latest; Codex opens its own picker. Null when the
+   *  CLI has neither. */
+  withoutId: string | null;
 }
 
 const CONVERSATION_GRAMMARS: Readonly<Record<string, AgentConversationGrammar>> = {
   "claude-code": {
     launch: (id) => `--session-id ${id}`,
     resume: (id) => `--resume ${id}`,
-    continueLatest: "--continue",
+    withoutId: "--continue",
   },
   // Codex names its own sessions, so it cannot be launched under an id, and a
   // restart never trusts a recorded one; it takes `resume` as a subcommand
   // after the global flags. A conversation the host names for the window
-  // (`conv.inspect`) is resumed by that id, and "the latest one here" stands
-  // in wherever the host names none.
+  // (`conv.inspect`) is resumed by that id, and one the host says has nothing
+  // in it yet is started afresh. Where the host can name none, Codex shows its
+  // own picker (`resume` alone) and the person chooses. Never `resume --last`:
+  // that is whichever thread in the folder was written last, from any window,
+  // and with Codex's shared background server it attaches this window to a
+  // thread another window is live in.
   codex: {
     launch: null,
     resume: (id) => `resume ${id}`,
-    continueLatest: "resume --last",
+    withoutId: "resume",
   },
 };
 
@@ -223,7 +274,7 @@ export function agentConversationGrammar(
 /** Whether a window of this kind can be brought back to its conversation at all. */
 export function agentCanResume(kind: string | null | undefined): boolean {
   const grammar = agentConversationGrammar(kind);
-  return Boolean(grammar && (grammar.resume || grammar.continueLatest));
+  return Boolean(grammar && (grammar.resume || grammar.withoutId));
 }
 
 /**
@@ -245,8 +296,12 @@ export function newAgentConversationId(
  * UUID is an id here (`canonicalConversationId`): anything else is typed as
  * no id at all, never as a word after the agent's flags.
  */
-export function agentLaunchCommand(agent: AgentDef, conversationId: string | null): string {
-  const run = agentRunCommand(agent);
+export function agentLaunchCommand(
+  agent: AgentDef,
+  conversationId: string | null,
+  options: LaunchOptions = PLAIN_LAUNCH,
+): string {
+  const run = agentRunCommand(agent, options);
   const launch = agentConversationGrammar(agent.kind)?.launch;
   const id = canonicalConversationId(conversationId);
   return launch && id ? `${run} ${launch(id)}` : run;
@@ -256,25 +311,31 @@ export function agentLaunchCommand(agent: AgentDef, conversationId: string | nul
 export function agentInstallAndLaunchCommand(
   agent: AgentDef,
   conversationId: string | null,
+  options: LaunchOptions = PLAIN_LAUNCH,
 ): string | null {
   const install = agent.install?.trim();
-  return install ? `${install} && ${agentLaunchCommand(agent, conversationId)}` : null;
+  return install ? `${install} && ${agentLaunchCommand(agent, conversationId, options)}` : null;
 }
 
 /**
  * What a restart types to bring the agent back where it was: resume the
- * conversation it names (`restartConversation` decides which), or the latest
- * one in this folder when there is none to name. Null when this kind of agent
+ * conversation it names (`restartConversation` decides which), or, when there
+ * is none to name, what the CLI does without one (`withoutId`: Claude Code's
+ * latest here, Codex's picker). Null when this kind of agent
  * cannot be resumed at all, so the caller falls back to a plain relaunch and
  * says so. An id that is not a UUID names nothing (`canonicalConversationId`).
  */
-export function agentResumeCommand(agent: AgentDef, conversationId: string | null): string | null {
+export function agentResumeCommand(
+  agent: AgentDef,
+  conversationId: string | null,
+  options: LaunchOptions = PLAIN_LAUNCH,
+): string | null {
   const grammar = agentConversationGrammar(agent.kind);
   if (!grammar) return null;
-  const run = agentRunCommand(agent);
+  const run = agentRunCommand(agent, options);
   const id = canonicalConversationId(conversationId);
   if (id && grammar.resume) return `${run} ${grammar.resume(id)}`;
-  if (grammar.continueLatest) return `${run} ${grammar.continueLatest}`;
+  if (grammar.withoutId) return `${run} ${grammar.withoutId}`;
   return null;
 }
 

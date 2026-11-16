@@ -30,7 +30,8 @@ test("signed in, / stays on the lander and swaps the CTAs for Enter", async ({ p
   await expect(masthead(page).getByRole("link", { name: "Log in" })).toHaveCount(0);
   await expect(masthead(page).getByRole("link", { name: /Sign up/ })).toHaveCount(0);
   await enter.click();
-  await expect(page).toHaveURL(new RegExp(`/w/${WORKSPACE_ID}$`, "u"));
+  // Two page changes ("/" → "/app" → "/w/<id>") on a dev server that may compile both on first use.
+  await expect(page).toHaveURL(new RegExp(`/w/${WORKSPACE_ID}$`, "u"), { timeout: 30_000 });
 });
 
 test("the brand mark in the app chrome goes back to the lander", async ({ page }) => {

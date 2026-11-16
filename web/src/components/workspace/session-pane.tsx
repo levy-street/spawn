@@ -161,7 +161,15 @@ export function SessionPane({
   // An agent picked from the "+" menu, or queued by a restart or a move for
   // the shell that replaces this one, is typed into the shell once this pane
   // holds the window as it runs now (`usePendingLaunchDrain`).
-  usePendingLaunchDrain({ sessionId, session, connInfo, displayState, getHandle });
+  usePendingLaunchDrain({
+    sessionId,
+    session,
+    connInfo,
+    displayState,
+    getHandle,
+    connection: daemonConnection,
+    agentNotice,
+  });
 
   const renameM = useMutation({
     mutationFn: (name: string | null) => sessions.update(sessionId, { name }),

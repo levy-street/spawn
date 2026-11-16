@@ -14,6 +14,18 @@
 /** The `conv.*` family, one versioned capability for every operation in it. */
 export const CONVERSATION_CAPABILITY = "conv.v1";
 export const CONVERSATION_INSPECT_OP = "conv.inspect";
+/** Whether the Codex a window is about to run accepts `--no-daemon`, asked
+ *  just before a client types it (proto/README.md). */
+export const CONVERSATION_LAUNCH_OP = "conv.launch";
+
+/** `conv.launch`'s answer: true or false when the host could tell, null when
+ *  it could not, undefined when the answer is malformed. */
+export function parseCodexNoDaemon(value: unknown): boolean | null | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const answer = (value as Record<string, unknown>).codex_no_daemon;
+  if (answer === null || typeof answer === "boolean") return answer;
+  return undefined;
+}
 
 export type ConversationState = "running" | "blocked" | "idle" | "unknown";
 
@@ -28,8 +40,19 @@ export interface ConversationInspection {
    *  background session, an attach target, another window. Restart resumes
    *  it all the same: resuming a running background session attaches to it. */
   live_elsewhere: boolean;
+  /** The agent's conversation has nothing written to it yet (a Codex just
+   *  launched, or just after `/new`): there is nothing to resume, and a
+   *  restart starts a new one. Its id is not named. False where the host
+   *  cannot tell, and from a daemon that predates the field. */
+  fresh: boolean;
+  /** The window's Codex keeps its threads in Codex's shared background
+   *  server, outside the window, so which one it is on cannot be named. False
+   *  otherwise, and from a daemon that predates the field. */
+  shared_server: boolean;
   /** What the daemon read: `registry`, `parked`, `attach`, `open_file`,
-   *  `process`, `none`. A hint for diagnostics, never for gating. */
+   *  `process`, `remembered` (the Codex thread the host last saw a window
+   *  in, once Codex has gone), `none`. A hint for diagnostics, never for
+   *  gating. */
   source: string;
 }
 
@@ -81,6 +104,8 @@ export function parseConversationInspection(value: unknown): ConversationInspect
   const cliVersion = nullableText(record.cli_version, SHORT_TEXT);
   if (agent === undefined || conversationId === undefined || cliVersion === undefined) return null;
   if (typeof record.live_elsewhere !== "boolean" || typeof record.source !== "string") return null;
+  if (record.fresh !== undefined && typeof record.fresh !== "boolean") return null;
+  if (record.shared_server !== undefined && typeof record.shared_server !== "boolean") return null;
   const state = typeof record.state === "string" && STATES.has(record.state) ? record.state : null;
   return {
     agent,
@@ -88,6 +113,14 @@ export function parseConversationInspection(value: unknown): ConversationInspect
     state: (state ?? "unknown") as ConversationState,
     cli_version: cliVersion,
     live_elsewhere: record.live_elsewhere,
+    fresh: record.fresh === true,
+    shared_server: record.shared_server === true,
     source: record.source,
   };
+}
+
+/** Whether an inspection found an agent running in the window now, rather
+ *  than answering from the host's note of it (`remembered`) or finding none. */
+export function agentRunning(inspection: Pick<ConversationInspection, "source">): boolean {
+  return inspection.source !== "none" && inspection.source !== "remembered";
 }

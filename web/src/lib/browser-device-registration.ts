@@ -12,7 +12,7 @@ import {
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
 import { takeDesktopDeviceHandover } from "./desktop-device-handover";
-import { keepDeviceStorage } from "./persistent-storage";
+import { askToKeepDeviceStorage } from "./persistent-storage";
 import { CryptoUnavailableError } from "./signed-signal";
 
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
@@ -219,7 +219,9 @@ async function registerBrowserDevice(
     void retireSupersededDevice(adopted.replacedPublicKeyWire, device.id);
   }
   // The key is this device: keep the browser from clearing it to free disk.
-  void keepDeviceStorage();
+  // The answer is recorded for the UI — a refusal on an account without a
+  // passkey is what the storage notice tells the person about.
+  void askToKeepDeviceStorage();
   return { status: "ready", device, publicKey: identity.publicKeyWire };
 }
 

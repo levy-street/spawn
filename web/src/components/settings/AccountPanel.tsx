@@ -36,9 +36,9 @@ function PasskeysSection() {
     if (count === 1) {
       if (
         !confirm(
-          "Remove your only passkey?\n\nYour devices keep working, but the " +
-            "protection it provides ends: if you ever lose every device, nothing " +
-            "will bring this account's hosts back.",
+          "Remove your only passkey?\n\nBrowsers that got in with this passkey, and devices " +
+            "approved from them, will need approving again. The protection it provides ends too: if you ever lose " +
+            "every device, nothing will bring this account's hosts back.",
         )
       ) {
         return;
@@ -84,6 +84,9 @@ function PasskeysSection() {
         <p className="text-sm text-muted-foreground">
           A passkey signs in and approves a device in one step — and if you lose every device, it
           brings everything back.
+        </p>
+        <p className="mt-1 text-sm text-muted-foreground" data-testid="passkey-way-back">
+          A passkey lets a browser that has lost its approval get back in on its own.
         </p>
       </div>
       {!passkey.supported && (

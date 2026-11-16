@@ -140,6 +140,16 @@ const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// five seconds, so the cost of a miss is bounded either way, and the peer
 /// connection has [`RTC_CONNECT_TIMEOUT`] to spare.
 const MDNS_CANDIDATE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a viewer's replay waits on the session's worker: for the worker's
+/// answer (every step of the `viewer_replay` ladder included), then for the
+/// live stream to reach the answer's watermark. A worker that is alive
+/// answers in milliseconds. A `history` or `snapshot` request waits holding
+/// its session's control transaction, which a restart's removal of the
+/// session waits for, so a worker that has stopped answering costs a request
+/// this long and no longer; the viewer is told `request_timeout`, as it
+/// always was at this bound. The attach barrier waits this long for each of
+/// the same two things.
+const WORKER_REPLAY_DEADLINE: Duration = Duration::from_secs(10);
 const DATA_CHANNEL_MESSAGE_BYTES: usize = 16 * 1024;
 const DATA_CHANNEL_BUFFER_LOW: usize = 64 * 1024;
 const DATA_CHANNEL_BUFFER_HIGH: usize = 512 * 1024;
@@ -1083,6 +1093,19 @@ impl RtcSessions {
         sender.try_send(WsOutbound::json(text)).is_ok()
     }
 
+    /// The control connection a frame may go out on now: the live one, once
+    /// its registration is acknowledged (the same two conditions as
+    /// `send_now`). A peer outlives the control connection its offer
+    /// arrived on, so nothing a peer says later may go through a sender
+    /// captured at admission — after a reconnect that is a socket nobody
+    /// reads.
+    fn registered_sender(&self) -> Option<Arc<mpsc::Sender<WsOutbound>>> {
+        if !self.deferred_pruned.load(Ordering::Acquire) {
+            return None;
+        }
+        self.signaling.load()
+    }
+
     /// Send a status, or hold it for the next chance. Synchronous: a status
     /// is on its way or held by the time this returns, so nothing that sends
     /// one can be dropped part-way.
@@ -1195,7 +1218,6 @@ impl RtcSessions {
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) {
-        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(session) = registry.binding_for(binding.session_id) else {
             send_status(
@@ -1280,13 +1302,16 @@ impl RtcSessions {
         answer_signer: Option<RtcAnswerSigner>,
     ) -> Result<()> {
         let remote_ufrag = ice_ufrag(&sdp).context("offer SDP has no ICE ufrag")?;
-        if let Some(existing) = self
+        // Its own statement: a guard made in an `if let` scrutinee lives to
+        // the end of the block (edition 2021), and this one would hold the
+        // peer map across a renegotiation and the answer's send.
+        let existing = self
             .peers
             .lock()
             .await
             .get(&binding.signaling.signal_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(existing) = existing {
             let _restart = existing.restart_lock.lock().await;
             let ufrags = existing.remote_ufrags.lock().await;
             if !restart_offer_is_acceptable(
@@ -1350,18 +1375,24 @@ impl RtcSessions {
         // used to invalidate the registry entry and scan old peers.
         #[cfg(test)]
         self.peer_insert_attempted.notify_waiters();
-        let _admission = self.admission.lock().await;
-        if !self.trust_epoch_is_current(binding.trust_epoch) {
-            drop(_admission);
-            let _ = pc.close().await;
-            anyhow::bail!("credential trust changed during RTC negotiation");
-        }
+        // The transition before the admission lock, as in
+        // `attach_pair_channel` and for its reason: a restart holds the
+        // transition for seconds, and nothing waits that long holding the
+        // lock every offer on the daemon serializes on. One order in both
+        // places, or the two deadlock against each other.
         let transition = registry
             .lock_generation_transition(binding.signaling.session_id)
             .await;
-        if !registry.is_current(binding.session) {
-            drop(transition);
+        let _admission = self.admission.lock().await;
+        if !self.trust_epoch_is_current(binding.trust_epoch) {
             drop(_admission);
+            drop(transition);
+            let _ = pc.close().await;
+            anyhow::bail!("credential trust changed during RTC negotiation");
+        }
+        if !registry.is_current(binding.session) {
+            drop(_admission);
+            drop(transition);
             let _ = pc.close().await;
             anyhow::bail!("session backend was replaced during RTC negotiation");
         }
@@ -1406,8 +1437,8 @@ impl RtcSessions {
                 false
             }
         };
-        drop(transition);
         drop(_admission);
+        drop(transition);
         if collision_or_capacity {
             let _ = pc.close().await;
             anyhow::bail!("rtc session admission rejected");
@@ -1516,7 +1547,6 @@ impl RtcSessions {
         if signal.protocol_version != Some(1) {
             return;
         }
-        self.signaling.install(out_tx.clone());
         let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
             tracing::warn!(signal_id = %signal.signal_id, "rejecting invalid host rtc offer binding");
@@ -1718,6 +1748,7 @@ impl RtcSessions {
             );
         }
         self.install_host_reaper(&pc, signal_id.clone());
+        self.install_host_acceptor_watch(&pc, signal_id.clone());
 
         let local_sdp = match negotiate(&pc, sdp).await {
             Ok(sdp) => sdp,
@@ -1804,6 +1835,51 @@ impl RtcSessions {
                             .await;
                     }
                 });
+            })
+        }));
+    }
+
+    /// Retire a host peer whose data channel acceptor has ended. The
+    /// acceptor ends when the SCTP association does, and an association can
+    /// end under a transport that stays connected: the device's SCTP went
+    /// away, or this side's write loop closed it over a send error ICE
+    /// itself recovers from. Nothing opens on such a peer again, and the
+    /// reaper, which watches the connection state, never hears of it — the
+    /// device goes on retrying channels on a connection it believes healthy.
+    /// So the peer leaves the host map here and the server hears
+    /// `unavailable`, which a device answers with a new connection. A peer
+    /// this daemon is closing has, as a rule, left the map before its
+    /// association stopped, and for it this does nothing. The exception is
+    /// a protocol-1 host peer whose handler refuses a channel
+    /// (`install_host_data_channel_handler`): it closes the connection with
+    /// the peer still in the map, and this can then be what retires it and
+    /// says `unavailable`, which is true of a connection that is gone and
+    /// which the reaper, ignoring a closed connection, would not say. Whether
+    /// it runs depends on whether the acceptor sees its association close
+    /// before the transport's stop wakes it. A device's own close ends the
+    /// association too when word of it arrives — a DTLS close_notify, an
+    /// SCTP ABORT — so this is also what retires such a peer, ahead of the
+    /// reaper's grace; it is logged at info, and the vendored SCTP's own
+    /// warning beside it says which it was.
+    fn install_host_acceptor_watch(&self, pc: &Arc<RTCPeerConnection>, signal_id: String) {
+        let sessions = self.clone();
+        let weak = Arc::downgrade(pc);
+        pc.sctp().on_error(Box::new(move |error| {
+            let sessions = sessions.clone();
+            let signal_id = signal_id.clone();
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(pc) = weak.upgrade() else { return };
+                if sessions
+                    .retire_host_if_same(&signal_id, &pc, Some("data channel acceptor ended"))
+                    .await
+                {
+                    tracing::info!(
+                        signal_id = %signal_id,
+                        %error,
+                        "host rtc peer retired: its data channel acceptor ended while the peer was in service"
+                    );
+                }
             })
         }));
     }
@@ -1906,20 +1982,21 @@ impl RtcSessions {
     /// never sends `rtc.close` for it at all. Not `failed`: to the device
     /// that is a refusal of its offer and it drops its trust verdict;
     /// `unavailable` is a connection that is gone, which it answers by
-    /// building a new one.
+    /// building a new one. Returns whether this call was the one that took
+    /// the peer out of the map.
     async fn retire_host_if_same(
         &self,
         signal_id: &str,
         pc: &Arc<RTCPeerConnection>,
         reason: Option<&str>,
-    ) {
+    ) -> bool {
         let Some(retired) = self.take_host_if_same(signal_id, pc).await else {
             tracing::debug!(
                 signal_id,
                 reason = ?reason,
                 "host rtc peer already left the map; its teardown is owned elsewhere"
             );
-            return;
+            return false;
         };
         if let Some(reason) = reason {
             tracing::debug!(signal_id, reason, "host rtc peer reaped");
@@ -1931,6 +2008,7 @@ impl RtcSessions {
             ));
         }
         self.spawn_host_closes(vec![retired]).await;
+        true
     }
 
     /// The whole of a retired host peer's teardown, in order: its
@@ -2577,18 +2655,26 @@ impl RtcSessions {
             }
             self.remove_if_same(&signal_id, &close).await;
         }
-        // An old exit task can race a replacement using the same UUID. Keep
-        // the peer map locked while deciding and clearing backend-wide hub
-        // state so a new generation either prevents cleanup or registers only
-        // after cleanup has completed.
-        let peers = self.peers.lock().await;
-        if !peers
-            .values()
-            .any(|peer| peer.session.session_id() == session_id)
-        {
-            self.controls.remove_session(session_id).await;
+        // The peers are settled; what is left is session-wide, and nothing
+        // here needs this generation's closer any more. Release it before the
+        // wait below, so no close of the session's peers — trust
+        // invalidation's, which holds the admission lock — waits that long.
+        drop(_closing);
+        // An old exit task can race a replacement using the same UUID: a new
+        // generation either prevents the cleanup of the session's hub state
+        // or registers only after it. Decided twice: here, so a session with
+        // a peer never waits for its transaction at all, and again by
+        // `remove_session_unless` once it holds the transaction, which every
+        // registration takes. Never while holding the peer map: a viewer
+        // request holds the transaction through its replay — on the
+        // session's worker up to `WORKER_REPLAY_DEADLINE`, then while its
+        // reply is queued — and every offer and attach on the daemon takes
+        // the peer map, under admission.
+        if !self.session_has_peers(session_id).await {
+            self.controls
+                .remove_session_unless(session_id, self.session_has_peers(session_id))
+                .await;
         }
-        drop(peers);
         self.uploads
             .remove_generation_until(session, upload_deadline)
             .await;
@@ -2596,6 +2682,16 @@ impl RtcSessions {
             frames: announcements.into(),
             sessions: self.clone(),
         }
+    }
+
+    /// Whether any peer of any generation of `session_id` is in the peer
+    /// map. The lock is held for the look and nothing else.
+    async fn session_has_peers(&self, session_id: Uuid) -> bool {
+        self.peers
+            .lock()
+            .await
+            .values()
+            .any(|peer| peer.session.session_id() == session_id)
     }
 
     /// Send statuses a caller held back until the moment was right.
@@ -3374,7 +3470,7 @@ fn session_data_channel_handler(
             let session_id = session.session_id();
 
             let input_registry = registry.clone();
-            let input_out_tx = out_tx.clone();
+            let input_live = sessions.clone();
             let input_active = Arc::clone(&active);
             let input_fence = Arc::clone(&fence);
             let input_channels = Arc::clone(&channels);
@@ -3387,7 +3483,7 @@ fn session_data_channel_handler(
             let input_session_id = binding.signaling.signal_id.clone();
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
-                let out_tx = input_out_tx.clone();
+                let live = input_live.clone();
                 let active = Arc::clone(&input_active);
                 let fence = Arc::clone(&input_fence);
                 let channels = Arc::clone(&input_channels);
@@ -3421,12 +3517,19 @@ fn session_data_channel_handler(
                         {
                             return None;
                         }
+                        // Reported on the control connection that is
+                        // live at this keystroke. The sender this handler
+                        // was built with is the offer's, and the peer
+                        // outlives it: after a control reconnect every
+                        // activity ping from a surviving peer went to a
+                        // socket nobody read.
+                        let out_tx = live.registered_sender();
                         forward_bound_data_channel_input(
                             session,
                             msg.is_string,
                             &msg.data,
                             &registry,
-                            &out_tx,
+                            out_tx.as_deref(),
                         )
                     };
                     let result = if require_owner {
@@ -3509,7 +3612,7 @@ fn session_data_channel_handler(
                     }
                     let mut replay_rx = None;
                     registry.with_bound_handle(session, |handle| {
-                        replay_rx = handle.replay(64 * 1024);
+                        replay_rx = handle.viewer_replay(64 * 1024);
                     });
                     let Some(replay_rx) = replay_rx else {
                         let _ = sessions
@@ -3535,8 +3638,8 @@ fn session_data_channel_handler(
                         );
                         return;
                     };
-                    let Ok(Ok(Ok(replay))) =
-                        tokio::time::timeout(Duration::from_secs(10), replay_rx).await
+                    let Ok(Some(Ok(replay))) =
+                        tokio::time::timeout(WORKER_REPLAY_DEADLINE, replay_rx).await
                     else {
                         let _ = sessions
                             .send_session_peer_status(
@@ -3585,7 +3688,7 @@ fn session_data_channel_handler(
                         return;
                     }
                     if tokio::time::timeout(
-                        Duration::from_secs(10),
+                        WORKER_REPLAY_DEADLINE,
                         control.wait_source_offset(watermark),
                     )
                     .await
@@ -3913,6 +4016,9 @@ fn install_control_data_channel(
     let message_active = Arc::clone(&active);
     let message_fence = Arc::clone(&fence);
     let message_channels = Arc::clone(&channels);
+    // Whether this attach has been handed an empty replay that asked for a
+    // repaint (`asks_for_repaint`).
+    let message_repaint_asked = Arc::new(AtomicBool::new(false));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let registry = message_registry.clone();
         let controls = message_controls.clone();
@@ -3924,6 +4030,7 @@ fn install_control_data_channel(
         let active = Arc::clone(&message_active);
         let fence = Arc::clone(&message_fence);
         let channels = Arc::clone(&message_channels);
+        let repaint_asked = Arc::clone(&message_repaint_asked);
         #[cfg(test)]
         let sessions = message_sessions.clone();
         #[cfg(test)]
@@ -4041,6 +4148,7 @@ fn install_control_data_channel(
                             effect: &effect,
                             uploads: &uploads,
                             upload_capability,
+                            repaint_asked: &repaint_asked,
                         },
                         request,
                     )
@@ -4185,6 +4293,9 @@ struct ControlRequestContext<'a> {
     effect: &'a SessionEffectPermit,
     uploads: &'a UploadHub,
     upload_capability: Uuid,
+    /// Set once this attach has been handed an empty replay
+    /// (`asks_for_repaint`).
+    repaint_asked: &'a AtomicBool,
 }
 
 async fn handle_control_request(context: ControlRequestContext<'_>, request: ControlRequest) {
@@ -4234,6 +4345,7 @@ async fn execute_control_request(
         effect,
         uploads,
         upload_capability,
+        repaint_asked,
     } = context;
     let session_id = session.session_id();
     if !effect.valid() || !registry.is_current(session) {
@@ -4252,12 +4364,20 @@ async fn execute_control_request(
             cols,
             rows,
         } => {
+            // The output offset just before this request's own size changed
+            // the PTY's width, if it did.
+            let mut resized_at = None;
             if let Some((cols, rows)) = cols.zip(rows) {
                 if controls.is_owner(session_id, viewer_id).await {
                     if !effect.valid() {
                         return Ok(());
                     }
-                    resize_session(session, cols, rows, registry).await?;
+                    let output = registry
+                        .control_for_binding(session)
+                        .map(|control| control.source_offset());
+                    if resize_session(session, cols, rows, registry).await? {
+                        resized_at = output;
+                    }
                     if !effect.valid() {
                         return Ok(());
                     }
@@ -4277,6 +4397,9 @@ async fn execute_control_request(
                     operation: operation_name,
                     lines,
                     plain,
+                    resized_at,
+                    repaint: RepaintAsk::Always,
+                    repaint_asked,
                 },
                 registry,
                 sender,
@@ -4295,6 +4418,9 @@ async fn execute_control_request(
                     operation: operation_name,
                     lines,
                     plain,
+                    resized_at: None,
+                    repaint: RepaintAsk::UnlessAsked,
+                    repaint_asked,
                 },
                 registry,
                 sender,
@@ -4507,6 +4633,59 @@ struct ReplaySpec<'a> {
     operation: &'a str,
     lines: u16,
     plain: bool,
+    /// The output offset just before the request's own size changed the
+    /// PTY's width, if it did (`replay_needs_repaint`).
+    resized_at: Option<u64>,
+    /// When an empty replay for this request asks for a repaint.
+    repaint: RepaintAsk,
+    /// Set once this attach has been handed an empty replay.
+    repaint_asked: &'a AtomicBool,
+}
+
+/// When an empty replay asks the session for a repaint (`asks_for_repaint`).
+#[derive(Clone, Copy, Debug)]
+enum RepaintAsk {
+    /// `history`: every time. A client loads it to fill its pane, and loads
+    /// it again on the same channel after a gap in its live stream, clearing
+    /// the pane first.
+    Always,
+    /// `snapshot`: only on an attach no empty replay has asked for yet. Web
+    /// sends one shortly after every `history` and ignores it when empty;
+    /// mobile sends one to recover from overflowing its own write queue,
+    /// with the program printing.
+    UnlessAsked,
+}
+
+/// Whether a viewer handed `replay` looks at a blank pane until the session's
+/// program next draws. A replay with a screen fills the pane. One without
+/// (the empty replay at the live position) does not — unless the request's
+/// own size changed the PTY's width and nothing reached spawnd between that
+/// change and the replay's anchor (`resized_at`): the program's repaint for
+/// the new width then lies past the anchor, and the viewer shows it.
+fn replay_needs_repaint(replay: &crate::pty::WorkerReplay, resized_at: Option<u64>) -> bool {
+    !replay.has_screen() && resized_at != Some(replay.watermark())
+}
+
+/// Whether sending `replay` asks the session for a repaint: when it leaves
+/// the pane blank and `ask` allows it. Every empty replay marks the attach in
+/// `asked`, including one whose own width change brings a repaint, so the
+/// `snapshot` that follows a `history` does not ask again. The session's
+/// budget bounds the rest (`SessionHandle::repaint_after_empty_replay`).
+fn asks_for_repaint(
+    replay: &crate::pty::WorkerReplay,
+    resized_at: Option<u64>,
+    ask: RepaintAsk,
+    asked: &AtomicBool,
+) -> bool {
+    if replay.has_screen() {
+        return false;
+    }
+    let already = asked.swap(true, Ordering::AcqRel);
+    let allowed = match ask {
+        RepaintAsk::Always => true,
+        RepaintAsk::UnlessAsked => !already,
+    };
+    allowed && replay_needs_repaint(replay, resized_at)
 }
 
 /// Relay committed-history deltas from the session's forwarder to one control
@@ -4619,7 +4798,9 @@ async fn send_session_replay(
             "spawn.pty did not become ready for this control session",
         ));
     }
-    let capture = capture_session_replay(session, spec.lines, spec.plain, registry, &control);
+    // Bounded by `WORKER_REPLAY_DEADLINE` inside: this request holds its
+    // session's control transaction for as long as the capture waits.
+    let capture = capture_session_replay(session, spec.viewer_id, spec.lines, registry, &control);
     tokio::pin!(capture);
     let replay = tokio::select! {
         result = &mut capture => result?,
@@ -4628,13 +4809,6 @@ async fn send_session_replay(
                 Some(spec.request_id),
                 "request_cancelled",
                 "control channel closed while replay was in progress",
-            ));
-        }
-        _ = tokio::time::sleep(Duration::from_secs(10)) => {
-            return Err(ProtocolError::new(
-                Some(spec.request_id),
-                "request_timeout",
-                "replay did not complete within 10 seconds",
             ));
         }
     };
@@ -4684,13 +4858,24 @@ async fn send_session_replay(
         Some(pty_offset),
         &replay,
     )
-    .await
+    .await?;
+    // A replay with no screen leaves this viewer's pane blank until the
+    // program draws again; make it. Everything it draws from here on lies
+    // past this replay's anchor, so the viewer shows it. Unix only: ConPTY
+    // repaints by itself on any resize, and nothing there deletes a
+    // session's scrollback under it.
+    if cfg!(unix) && asks_for_repaint(&replay, spec.resized_at, spec.repaint, spec.repaint_asked) {
+        registry.with_bound_handle(session, |handle| handle.repaint_after_empty_replay());
+    }
+    Ok(())
 }
 
+/// Capture a viewer's replay from the session's worker, waiting on it for at
+/// most [`WORKER_REPLAY_DEADLINE`] in all.
 async fn capture_session_replay(
     session: SessionBinding,
+    viewer_id: &str,
     lines: u16,
-    _plain: bool,
     registry: &SessionRegistry,
     control: &crate::pty::ForwarderControl,
 ) -> Result<crate::pty::WorkerReplay, ProtocolError> {
@@ -4703,39 +4888,96 @@ async fn capture_session_replay(
     };
     let mut replay_rx = None;
     registry.with_bound_handle(session, |handle| {
-        replay_rx = handle.replay(max_bytes);
+        replay_rx = handle.viewer_replay(max_bytes);
     });
-    match replay_rx {
-        Some(receiver) => match receiver.await {
-            Ok(Ok(replay)) => {
-                control.wait_source_offset(replay.watermark()).await;
-                Ok(replay)
-            }
-            Ok(Err(error)) => Err(ProtocolError::new(
-                None,
-                "replay_failed",
-                &format!("worker replay failed: {error:#}"),
-            )),
-            Err(_) => Err(ProtocolError::new(
-                None,
-                "replay_unavailable",
-                "worker replay channel closed",
-            )),
-        },
-        None => Err(ProtocolError::new(
+    let Some(receiver) = replay_rx else {
+        return Err(ProtocolError::new(
             None,
             "replay_unavailable",
             "worker replay is unavailable",
-        )),
+        ));
+    };
+    let deadline = tokio::time::Instant::now() + WORKER_REPLAY_DEADLINE;
+    let replay = match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Some(Ok(replay))) => replay,
+        Ok(Some(Err(error))) => {
+            return Err(ProtocolError::new(
+                None,
+                "replay_failed",
+                &format!("worker replay failed: {error:#}"),
+            ))
+        }
+        Ok(None) => {
+            return Err(ProtocolError::new(
+                None,
+                "replay_unavailable",
+                "worker replay channel closed",
+            ))
+        }
+        Err(_elapsed) => {
+            return Err(worker_replay_timed_out(
+                session,
+                viewer_id,
+                control,
+                "worker_reply",
+            ))
+        }
+    };
+    if tokio::time::timeout_at(deadline, control.wait_source_offset(replay.watermark()))
+        .await
+        .is_err()
+    {
+        return Err(worker_replay_timed_out(
+            session,
+            viewer_id,
+            control,
+            "live_stream",
+        ));
     }
+    Ok(replay)
 }
 
+/// A viewer's replay that ran out of [`WORKER_REPLAY_DEADLINE`] waiting on
+/// `wait`: the worker's answer (`worker_reply`), or the live stream reaching
+/// its watermark (`live_stream`). Logged at warning level, at most once per
+/// worker connection per [`crate::pty::WORKER_STALL_REPORT_EVERY`]: a hung
+/// worker meets every viewer that asks, and one line names it. The viewer is
+/// told what it was told at this bound before: `request_timeout`.
+fn worker_replay_timed_out(
+    session: SessionBinding,
+    viewer_id: &str,
+    control: &crate::pty::ForwarderControl,
+    wait: &'static str,
+) -> ProtocolError {
+    if let Some(held_back) = control.worker_stall_report() {
+        tracing::warn!(
+            session_id = %session.session_id(),
+            viewer_id,
+            wait,
+            deadline_secs = WORKER_REPLAY_DEADLINE.as_secs(),
+            held_back,
+            "a viewer's replay waited its deadline on the session's worker and gave up; \
+             the viewer is told request_timeout"
+        );
+    }
+    ProtocolError::new(
+        None,
+        "request_timeout",
+        &format!(
+            "replay did not complete within {} seconds",
+            WORKER_REPLAY_DEADLINE.as_secs()
+        ),
+    )
+}
+
+/// Apply a viewer's size to the session's PTY; true when it changed the
+/// width (`SessionHandle::resize`).
 async fn resize_session(
     session: SessionBinding,
     cols: u16,
     rows: u16,
     registry: &SessionRegistry,
-) -> Result<(), ProtocolError> {
+) -> Result<bool, ProtocolError> {
     let mut result = None;
     let found = registry.with_bound_handle(session, |handle| {
         result = Some(handle.resize(cols, rows));
@@ -4749,8 +4991,7 @@ async fn resize_session(
     }
     result
         .expect("found handle sets result")
-        .map_err(|error| ProtocolError::new(None, "resize_failed", &format!("{error:#}")))?;
-    Ok(())
+        .map_err(|error| ProtocolError::new(None, "resize_failed", &format!("{error:#}")))
 }
 
 async fn scroll_session(
@@ -4781,7 +5022,7 @@ fn forward_bound_data_channel_input(
     is_string: bool,
     data: &[u8],
     registry: &SessionRegistry,
-    out_tx: &mpsc::Sender<WsOutbound>,
+    out_tx: Option<&mpsc::Sender<WsOutbound>>,
 ) -> Option<Result<bool>> {
     let mut result = None;
     registry.with_bound_handle(session, |handle| {
@@ -4806,7 +5047,7 @@ fn forward_data_channel_input<W>(
     is_string: bool,
     data: &[u8],
     control: &crate::pty::ForwarderControl,
-    out_tx: &mpsc::Sender<WsOutbound>,
+    out_tx: Option<&mpsc::Sender<WsOutbound>>,
     write_stdin: W,
 ) -> Result<bool>
 where
@@ -4819,8 +5060,12 @@ where
     // Focus-weighted scheduling: the session being typed into gets its CPU
     // scope boosted so its response wins the scheduler under host load.
     crate::cpu_scopes::note_input(session_id);
+    // The classifier sees every byte whether or not there is a control
+    // connection to report on; without one the ping has nowhere to go.
     if control.note_input(data) {
-        crate::pty::try_emit_activity(out_tx, session_id, crate::pty::ActivityKind::Input);
+        if let Some(out_tx) = out_tx {
+            crate::pty::try_emit_activity(out_tx, session_id, crate::pty::ActivityKind::Input);
+        }
     }
     Ok(true)
 }
@@ -6006,17 +6251,14 @@ mod tests {
     }
 
     async fn close_test_peer(pc: &Arc<RTCPeerConnection>) {
+        // The daemon's side is closed first in these cleanup paths, so this
+        // close of the test's browser-side peer races the remote shutdown
+        // and reports whichever part it reached already gone ("sending reset
+        // packet in non-Established state", "data_channels: Stream closed",
+        // ...). `close` tears every part down regardless, and no test checks
+        // how this peer's own teardown went, so its errors are ignored.
         if let Err(error) = pc.close().await {
-            // The server peer is closed first in these cleanup paths.  The
-            // webrtc crate can race the corresponding SCTP shutdown and report
-            // this specific reset error even though the remote close already
-            // completed successfully.
-            assert!(
-                error
-                    .to_string()
-                    .contains("sending reset packet in non-Established state"),
-                "closing RTC test peer failed: {error}"
-            );
+            eprintln!("ignoring the test peer's close error: {error}");
         }
     }
 
@@ -6592,14 +6834,6 @@ mod tests {
         .expect("RTC resident session count did not converge");
     }
 
-    fn built_worker_bin() -> std::path::PathBuf {
-        let exe = std::env::current_exe().expect("current_exe");
-        exe.parent()
-            .and_then(|deps| deps.parent())
-            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
-            .expect("worker bin path")
-    }
-
     struct WorkerTestEnv {
         old_dir: Option<std::ffi::OsString>,
         old_bin: Option<std::ffi::OsString>,
@@ -6631,7 +6865,10 @@ mod tests {
             #[cfg(not(windows))]
             let worker_dir = dir.path();
             std::env::set_var("SPAWND_WORKER_DIR", worker_dir);
-            std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
+            std::env::set_var(
+                "SPAWND_WORKER_BIN",
+                crate::worker_backend::built_worker_bin(),
+            );
             Self {
                 old_dir,
                 old_bin,
@@ -9507,6 +9744,419 @@ mod tests {
         adopted_ws_drain.abort();
     }
 
+    /// Send a `history` request and return its JSON reply, whatever it says.
+    #[cfg(unix)]
+    async fn history_reply(client: &mut RtcTestClient) -> serde_json::Value {
+        let request_id = Uuid::new_v4().to_string();
+        client
+            .ctl
+            .send_text(format!(
+                r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"history","lines":400,"plain":false}}"#
+            ))
+            .await
+            .expect("history request");
+        loop {
+            let value = next_ctl_json(&mut client.ctl_messages).await;
+            if value["request_id"] == request_id.as_str() {
+                return value;
+            }
+        }
+    }
+
+    /// A session days old on a Mac: the OS temp cleaner has deleted the
+    /// oldest scrollback segment its worker still lists. Every attach used to
+    /// fail at the replay barrier ("worker replay barrier failed") and the
+    /// terminal never opened. It now opens with the newest history that can
+    /// still be read; a tampered segment still fails closed; and with no
+    /// readable history left at all it opens on the live stream. The worker
+    /// is the real, unchanged `spawn-worker`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_whose_old_scrollback_was_deleted_still_opens() {
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let env = WorkerTestEnv::install();
+        let session_id = Uuid::new_v4();
+        let argv = ["/bin/sh", "-c", "printf 'worker-ready\\n'; exec cat"]
+            .map(String::from)
+            .to_vec();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        );
+        vars.insert("TERM".to_string(), "xterm-256color".to_string());
+        let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
+            session_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &vars,
+        })
+        .await
+        .expect("launch real worker");
+        let handle = launched.handle;
+        let _worker_cleanup = WorkerCleanupGuard::new(session_id, &handle);
+        let control = handle.control.clone();
+        let (ws_tx, mut ws_rx) = mpsc::channel(1024);
+        control.set_sink(ws_tx).await;
+        let ws_drain = tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
+
+        // Fill the first segment until the worker rotates to a second one.
+        let scrollback = env.path().join(format!("{session_id}.scrollback"));
+        let oldest = scrollback.join("seg-00000001.log");
+        let newest = scrollback.join("seg-00000002.log");
+        let type_and_wait = |text: String| {
+            let expected = control.source_offset() + text.len() as u64;
+            handle.write_stdin(text.as_bytes()).expect("worker input");
+            let control = control.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    control.wait_source_offset(expected),
+                )
+                .await
+                .expect("worker echo never arrived");
+            }
+        };
+        let mut line = 0;
+        while !newest.exists() {
+            assert!(line < 50_000, "the worker never rotated its scrollback");
+            let mut batch = String::new();
+            for _ in 0..40 {
+                batch.push_str(&format!("early-{line:05} {}\n", "x".repeat(60)));
+                line += 1;
+            }
+            type_and_wait(batch).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Then a little more, into the second segment only.
+        let mut late = String::new();
+        for index in 0..40 {
+            late.push_str(&format!("late-{index:02}\n"));
+        }
+        late.push_str("newest-marker\n");
+        type_and_wait(late).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::metadata(&newest).map(|m| m.len()).unwrap_or(0) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "nothing committed after rotation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The temp cleaner takes the full segment nobody writes any more.
+        std::fs::remove_file(&oldest).expect("delete the oldest segment");
+        // The worker's own words for it, which the daemon reads.
+        let refusal = handle
+            .replay(64 * 1024)
+            .expect("replay request")
+            .await
+            .expect("replay response")
+            .expect_err("the barrier's walk reaches the deleted segment");
+        let refusal = format!("{refusal:#}");
+        assert!(
+            refusal.contains("seg-00000001.log: No such file or directory (os error 2)"),
+            "{refusal}"
+        );
+
+        let registry = SessionRegistry::new();
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(session_id).await;
+        registry.insert(handle);
+        drop(transition);
+
+        // The attach that never completed.
+        let mut viewer =
+            connect_rtc_session(&sessions, &registry, session_id, "reaped-first", "g").await;
+        let history = request_history(&mut viewer).await;
+        let has = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            has(&history, b"newest-marker"),
+            "the live screen is missing"
+        );
+        assert!(
+            has(&history, b"\x1b_sp:h1\x1b\\"),
+            "not the worker's own replay"
+        );
+        assert!(
+            !has(&history, b"early-00000 "),
+            "history from the deleted segment"
+        );
+        viewer
+            .pty
+            .send(&Bytes::from_static(b"typed-after-open\n"))
+            .await
+            .expect("input");
+        collect_pty_until(&mut viewer.pty_messages, b"typed-after-open").await;
+
+        // Tampering is still refused: flip a byte of the remaining segment's
+        // first record, in place.
+        {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&newest)
+                .expect("open the newest segment");
+            let mut byte = [0u8; 1];
+            file.read_exact_at(&mut byte, 20)
+                .expect("read a ciphertext byte");
+            byte[0] ^= 0xff;
+            file.write_all_at(&byte, 20).expect("tamper");
+        }
+        let reply = history_reply(&mut viewer).await;
+        assert_eq!(reply["ok"], false, "tampered history was replayed: {reply}");
+        assert_eq!(reply["error"]["code"], "replay_failed", "{reply}");
+        assert!(
+            reply["error"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("failed authentication")),
+            "{reply}"
+        );
+
+        // Nothing left to read: the segment the worker appends to is gone
+        // too. The next output scrolls a line into history; appending it
+        // finds no newest segment and disables the worker's log, before the
+        // output is forwarded.
+        std::fs::remove_file(&newest).expect("delete the newest segment");
+        viewer
+            .pty
+            .send(&Bytes::from_static(b"after-the-last-segment\n"))
+            .await
+            .expect("input");
+        collect_pty_until(&mut viewer.pty_messages, b"after-the-last-segment").await;
+        let mut raw = None;
+        registry.with_handle(session_id, |handle| raw = handle.replay(1));
+        let refusal = raw
+            .expect("replay request")
+            .await
+            .expect("replay response")
+            .expect_err("a log with no segment replayed");
+        let refused = refusal
+            .downcast_ref::<crate::pty::WorkerReplayRefused>()
+            .expect("the worker's own refusal");
+        // The real worker's words, exactly, and read as a disabled log.
+        assert_eq!(
+            refused.message(),
+            spawnd::sessiond::worker::REPLAY_UNAVAILABLE
+        );
+        assert_eq!(
+            crate::pty::unreadable_history(refused.message()),
+            Some(crate::pty::UnreadableHistory::LogDisabled)
+        );
+
+        let mut late_viewer =
+            connect_rtc_session(&sessions, &registry, session_id, "reaped-second", "g").await;
+        let reply = history_reply(&mut late_viewer).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["total_bytes"], 0, "{reply}");
+        // The first viewer holds input; the session's output reaches both.
+        assert!(registry.with_handle(session_id, |handle| {
+            handle.write_stdin(b"still-a-terminal\n").expect("input");
+        }));
+        collect_pty_until(&mut late_viewer.pty_messages, b"still-a-terminal").await;
+
+        sessions.close("reaped-second", "g", session_id).await;
+        close_test_peer(&late_viewer.pc).await;
+        sessions.close("reaped-first", "g", session_id).await;
+        close_test_peer(&viewer.pc).await;
+        ws_drain.abort();
+    }
+
+    /// Only a replay with no screen leaves the pane blank, and not when the
+    /// request's own size changed the PTY with nothing from the program
+    /// before the replay's anchor: that repaint reaches the viewer.
+    #[test]
+    fn only_an_empty_replay_without_a_repaint_coming_needs_one() {
+        use crate::pty::WorkerReplay;
+        assert!(!replay_needs_repaint(
+            &WorkerReplay::new(7, b"screen".to_vec()),
+            None
+        ));
+        assert!(!replay_needs_repaint(
+            &WorkerReplay::new(7, b"screen".to_vec()),
+            Some(3)
+        ));
+        assert!(replay_needs_repaint(&WorkerReplay::live_only(7), None));
+        // Output arrived between the resize and the anchor: it may have been
+        // the repaint, which the viewer drops as lying before its anchor.
+        assert!(replay_needs_repaint(&WorkerReplay::live_only(7), Some(3)));
+        assert!(!replay_needs_repaint(&WorkerReplay::live_only(7), Some(7)));
+    }
+
+    /// On one attach: an empty `history` asks, the `snapshot` web sends
+    /// after it does not, and a second empty `history` (the reload after a
+    /// gap in the live stream) asks again. A `snapshot` on an attach with no
+    /// empty replay yet asks once. A replay with a screen never asks, and an
+    /// empty `history` whose own width change brings a repaint still marks
+    /// the attach.
+    #[test]
+    fn history_always_asks_and_snapshot_only_on_an_attach_not_yet_asked() {
+        use crate::pty::WorkerReplay;
+        let empty = WorkerReplay::live_only(7);
+        let screen = WorkerReplay::new(7, b"screen".to_vec());
+
+        let attach = AtomicBool::new(false);
+        assert!(!asks_for_repaint(
+            &screen,
+            None,
+            RepaintAsk::Always,
+            &attach
+        ));
+        assert!(asks_for_repaint(&empty, None, RepaintAsk::Always, &attach));
+        assert!(!asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+        assert!(asks_for_repaint(&empty, None, RepaintAsk::Always, &attach));
+
+        let attach = AtomicBool::new(false);
+        assert!(!asks_for_repaint(
+            &screen,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+        assert!(asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+        assert!(!asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+
+        let attach = AtomicBool::new(false);
+        assert!(!asks_for_repaint(
+            &empty,
+            Some(7),
+            RepaintAsk::Always,
+            &attach
+        ));
+        assert!(!asks_for_repaint(
+            &empty,
+            None,
+            RepaintAsk::UnlessAsked,
+            &attach
+        ));
+    }
+
+    /// What a viewer's `spawn.pty` receives within `window`, as text.
+    #[cfg(unix)]
+    async fn pty_text_for(messages: &mut mpsc::Receiver<Vec<u8>>, window: Duration) -> String {
+        let mut text = Vec::new();
+        let _ = tokio::time::timeout(window, async {
+            while let Some(chunk) = messages.recv().await {
+                text.extend_from_slice(&chunk);
+            }
+        })
+        .await;
+        String::from_utf8_lossy(&text).into_owned()
+    }
+
+    /// What a viewer's `spawn.pty` receives until `needle` arrives, as text;
+    /// fails after thirty seconds, a bound on a stalled runner, not a step
+    /// the test's order depends on.
+    #[cfg(unix)]
+    async fn pty_text_until(messages: &mut mpsc::Receiver<Vec<u8>>, needle: &str) -> String {
+        let mut text = String::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !text.contains(needle) {
+                let chunk = messages.recv().await.expect("spawn.pty closed");
+                text.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {needle:?} on spawn.pty; got {text:?}"));
+        text
+    }
+
+    /// A viewer handed a replay with no screen used to look at a blank pane
+    /// until someone resized the window. Now the session's program is made
+    /// to repaint: the PTY goes one column narrower and back, which the
+    /// program sees as two `SIGWINCH` — and never for a replay that has a
+    /// screen. The worker is the real, unchanged `spawn-worker`, and the
+    /// program reports each size it is given. The order is fixed by the
+    /// program, not by timers: the narrower size stands until the program's
+    /// own report of it arrives (`hold_repaint_until_output_for_test`), and that
+    /// report is printed after `stty` has read the size, so the restore's
+    /// `SIGWINCH` comes after it and runs the trap again. Sharing, the budget
+    /// and a viewer leaving are covered with paused time in `pty::tests`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_viewer_given_no_screen_gets_a_repaint_and_the_size_comes_back() {
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let env = WorkerTestEnv::install();
+        let session_id = Uuid::new_v4();
+        let script = r#"trap 'printf "winch %s\n" "$(stty size)"' WINCH; printf 'trap-ready\n'; while :; do sleep 0.05; done"#;
+        let argv = ["/bin/sh", "-c", script].map(String::from).to_vec();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        );
+        vars.insert("TERM".to_string(), "xterm-256color".to_string());
+        let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
+            session_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &vars,
+        })
+        .await
+        .expect("launch real worker");
+        let mut handle = launched.handle;
+        handle.hold_repaint_until_output_for_test();
+        let _worker_cleanup = WorkerCleanupGuard::new(session_id, &handle);
+        let (ws_tx, mut ws_rx) = mpsc::channel(1024);
+        handle.control.set_sink(ws_tx).await;
+        let ws_drain = tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
+        let registry = SessionRegistry::new();
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(session_id).await;
+        registry.insert(handle);
+        drop(transition);
+
+        // A replay with a screen: nothing to repaint.
+        let mut viewer =
+            connect_rtc_session(&sessions, &registry, session_id, "repaint-viewer", "g").await;
+        let history = request_history(&mut viewer).await;
+        assert!(String::from_utf8_lossy(&history).contains("trap-ready"));
+        let quiet = pty_text_for(&mut viewer.pty_messages, Duration::from_millis(1500)).await;
+        assert!(
+            !quiet.contains("winch"),
+            "a healthy replay was nudged: {quiet:?}"
+        );
+
+        // Nothing readable any more: the next replay has no screen.
+        let scrollback = env.path().join(format!("{session_id}.scrollback"));
+        for entry in std::fs::read_dir(&scrollback).expect("scrollback directory") {
+            std::fs::remove_file(entry.expect("segment").path()).expect("delete segment");
+        }
+        let reply = history_reply(&mut viewer).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["total_bytes"], 0, "{reply}");
+        let seen = pty_text_until(&mut viewer.pty_messages, "winch 24 80").await;
+        let narrow = seen.find("winch 24 79").expect("never one column narrower");
+        assert!(narrow < seen.find("winch 24 80").unwrap(), "{seen:?}");
+        assert_eq!(seen.matches("winch").count(), 2, "{seen:?}");
+        let after = pty_text_for(&mut viewer.pty_messages, Duration::from_millis(2500)).await;
+        assert!(!after.contains("winch"), "nudged more than once: {after:?}");
+
+        sessions.close("repaint-viewer", "g", session_id).await;
+        close_test_peer(&viewer.pc).await;
+        ws_drain.abort();
+    }
+
     #[tokio::test]
     async fn replacement_fences_stale_peer_input_control_and_output() {
         let registry = SessionRegistry::new();
@@ -9516,10 +10166,14 @@ mod tests {
         assert_ne!(old, current);
 
         let (out_tx, _out_rx) = mpsc::channel(4);
-        assert!(
-            forward_bound_data_channel_input(old, false, b"stale input", &registry, &out_tx)
-                .is_none()
-        );
+        assert!(forward_bound_data_channel_input(
+            old,
+            false,
+            b"stale input",
+            &registry,
+            Some(&out_tx)
+        )
+        .is_none());
         assert!(current_commands.try_recv().is_err());
 
         assert!(forward_bound_data_channel_input(
@@ -9527,7 +10181,7 @@ mod tests {
             false,
             b"current input",
             &registry,
-            &out_tx,
+            Some(&out_tx),
         )
         .expect("current binding")
         .expect("current input write"));
@@ -9560,6 +10214,7 @@ mod tests {
                 effect: &effect,
                 uploads: &uploads,
                 upload_capability: Uuid::new_v4(),
+                repaint_asked: &AtomicBool::new(false),
             },
             request,
         )
@@ -9587,6 +10242,7 @@ mod tests {
                 effect: &effect,
                 uploads: &uploads,
                 upload_capability: bound_capability,
+                repaint_asked: &AtomicBool::new(false),
             },
             upload_request,
         )
@@ -9684,6 +10340,85 @@ mod tests {
         assert_eq!(status["status"], "failed");
         assert_eq!(sessions.resident_session_count().await, 0);
         offer_pc.close().await.unwrap();
+    }
+
+    /// The offer half of the one lock order: a session-scope offer waiting
+    /// on its session's transition — held for a whole restart — does not
+    /// hold the admission lock while it waits. Taken the other way round,
+    /// it holds admission for the length of the restart, and with an attach
+    /// for the same session (transition, then admission) the two deadlock
+    /// and every offer and attach on the daemon with them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_offer_waiting_on_a_session_transition_does_not_hold_admission() {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offer_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        offer_pc
+            .create_data_channel(PTY_DATA_CHANNEL_LABEL, None)
+            .await
+            .unwrap();
+        let offer = offer_pc.create_offer(None).await.unwrap();
+        let mut gathered = offer_pc.gathering_complete_promise().await;
+        offer_pc.set_local_description(offer).await.unwrap();
+        let _ = gathered.recv().await;
+        let offer_sdp = offer_pc.local_description().await.unwrap().sdp;
+
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (_binding, _commands) = insert_test_worker(&registry, session_id);
+        let sessions = RtcSessions::new();
+        let transition = registry.lock_generation_transition(session_id).await;
+        let (out_tx, _out_rx) = mpsc::channel(16);
+        let offer_sessions = sessions.clone();
+        let offer_registry = registry.clone();
+        let offer_task = tokio::spawn(async move {
+            offer_sessions
+                .handle_offer(
+                    RtcSignalBinding::new(
+                        "waiting-offer".to_string(),
+                        "offer-generation".to_string(),
+                        session_id,
+                    ),
+                    offer_sdp,
+                    Vec::new(),
+                    None,
+                    false,
+                    None,
+                    offer_registry,
+                    out_tx,
+                    None,
+                )
+                .await;
+        });
+        // Whatever the offer holds while it waits on the transition, it
+        // holds once the lock has a second holder: its own wait.
+        let parked = tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.generation_transition_holders(session_id) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let admission_free = sessions.admission.try_lock().is_ok();
+        drop(transition);
+        tokio::time::timeout(Duration::from_secs(10), offer_task)
+            .await
+            .expect("the offer finished once the transition was free")
+            .unwrap();
+        sessions.close_all().await;
+        offer_pc.close().await.unwrap();
+        assert!(
+            parked.is_ok(),
+            "the offer never reached its session's transition"
+        );
+        assert!(
+            admission_free,
+            "an offer waiting on a session's transition holds the admission lock"
+        );
     }
 
     #[tokio::test]
@@ -9861,6 +10596,225 @@ mod tests {
         sessions.close_all().await;
     }
 
+    /// A session peer standing in for one that arrived while a close was
+    /// waiting: never connected, never closed by anything but the test.
+    async fn resident_test_peer(
+        sessions: &RtcSessions,
+        session: SessionBinding,
+        control: crate::pty::ForwarderControl,
+    ) -> RtcPeer {
+        RtcPeer {
+            pair_channels: None,
+            pc: Arc::new(
+                APIBuilder::new()
+                    .build()
+                    .new_peer_connection(RTCConfiguration::default())
+                    .await
+                    .unwrap(),
+            ),
+            session,
+            generation: "arrived".to_string(),
+            active: Arc::new(AtomicBool::new(true)),
+            control,
+            channels: Arc::new(RequiredSessionChannels::default()),
+            close: Arc::new(PeerCloseCoordinator::default()),
+            offer_key: None,
+            remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+            restart_lock: Arc::new(Mutex::new(())),
+            admission: sessions.peer_admission.try_acquire().unwrap(),
+            fence: Arc::new(tokio::sync::RwLock::new(())),
+        }
+    }
+
+    /// `close_for_session` decides whether the session's control state goes
+    /// once before it waits for the session's control transaction and again
+    /// once it holds it, and holds the peer map at neither wait. A peer of
+    /// the session that arrives in between keeps the state its viewers
+    /// register into — a new generation either prevents the cleanup or
+    /// registers after it, as when the map was held across the wait.
+    #[tokio::test]
+    async fn a_peer_that_arrives_while_a_close_waits_keeps_the_session_state() {
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, _commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
+        let sessions = RtcSessions::new();
+        let viewer = format!("pair/{}/view", "ab".repeat(32));
+        let (display, _display_rx) = tokio::sync::watch::channel(None);
+        sessions
+            .controls
+            .register(session_id, viewer.clone(), display)
+            .await;
+        // A viewer request in flight on a worker that stopped answering.
+        let stuck = sessions
+            .controls
+            .lock_transaction(session_id, "request history viewer=stuck")
+            .await;
+
+        let closing = tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                sessions
+                    .close_for_session(session_id, session.generation(), "session ended")
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sessions
+                .controls
+                .until_waiting(session_id, "remove_session"),
+        )
+        .await
+        .expect("the close found no peer and is waiting for the transaction");
+        // Not held while the close waits: a peer can be admitted.
+        let arrived = resident_test_peer(&sessions, session, control).await;
+        tokio::time::timeout(Duration::from_secs(1), sessions.peers.lock())
+            .await
+            .expect("a close waiting for a session's transaction holds the peer map")
+            .insert("arrived".to_string(), arrived);
+
+        drop(stuck);
+        let announcements = tokio::time::timeout(Duration::from_secs(10), closing)
+            .await
+            .expect("the close finishes once the transaction is free")
+            .unwrap();
+        assert_eq!(announcements.len(), 0);
+        assert!(
+            sessions.controls.contains_viewer(session_id, &viewer).await,
+            "the session's control state went from under a peer that arrived while the close waited"
+        );
+        let arrived = sessions.peers.lock().await.remove("arrived").unwrap();
+        let _ = arrived.pc.close().await;
+    }
+
+    /// The viewer side of a stalled worker: a `history` request on a worker
+    /// that never finishes its replay — `worker_reply`: it took the request
+    /// and never answered; `live_stream`: it answered, and its output never
+    /// reached the answer's watermark. The request holds the session's
+    /// control transaction while it waits, which is what a restart's
+    /// removal of the session queues behind; it gives up at
+    /// `WORKER_REPLAY_DEADLINE`, the transaction free at that moment, and
+    /// the viewer is told `request_timeout`: what it was always told at this
+    /// bound (web opens the pane on the live stream from there).
+    async fn stalled_replay_request(worker_answers: bool) {
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, mut commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
+        let worker_control = control.clone();
+        let worker = tokio::spawn(async move {
+            let mut unanswered = Vec::new();
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    if worker_answers {
+                        let ahead = worker_control.source_offset() + 1;
+                        let _ = resp.send(Ok(crate::pty::WorkerReplay::new(ahead, Vec::new())));
+                    } else {
+                        unanswered.push(resp);
+                    }
+                }
+            }
+        });
+        let viewer_id = "stalled-viewer";
+        let _direct = control.add_direct_sink(viewer_id.to_string()).await;
+        let controls = SessionControlHub::default();
+        let (sender, mut outbound) = mpsc::channel(session_ctl::OUTBOUND_QUEUE_DEPTH);
+        let channels = Arc::new(RequiredSessionChannels::default());
+        assert!(channels.register(SessionChannel::Pty).await);
+        assert!(channels.register(SessionChannel::Control).await);
+        channels.mark_open(SessionChannel::Pty).await;
+        channels.mark_open(SessionChannel::Control).await;
+        let effect = channels.permit().await.expect("ready effect permit");
+        let uploads = UploadHub::default();
+        let repaint_asked = AtomicBool::new(false);
+        let request_id = Uuid::new_v4();
+        let request = ControlRequest::decode(&format!(
+            r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"history","lines":400,"plain":false}}"#
+        ))
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let request = handle_control_request(
+            ControlRequestContext {
+                session,
+                viewer_id,
+                registry: &registry,
+                controls: &controls,
+                sender: &sender,
+                effect: &effect,
+                uploads: &uploads,
+                upload_capability: Uuid::new_v4(),
+                repaint_asked: &repaint_asked,
+            },
+            request,
+        );
+        tokio::pin!(request);
+        tokio::select! {
+            () = &mut request => panic!("the replay finished without the worker"),
+            () = tokio::time::sleep(WORKER_REPLAY_DEADLINE - Duration::from_millis(1)) => {}
+        }
+        assert_eq!(
+            controls.current_holder(session_id).as_deref(),
+            Some("request history viewer=stalled-viewer"),
+            "the waiting request holds the session's transaction"
+        );
+        request.await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= WORKER_REPLAY_DEADLINE
+                && waited < WORKER_REPLAY_DEADLINE + Duration::from_secs(1),
+            "the request gave up after {waited:?}"
+        );
+        assert_eq!(controls.current_holder(session_id), None);
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            controls.remove_session(session_id),
+        )
+        .await
+        .expect("the session's removal waits for nothing once the request gave up");
+
+        let reply = outbound.try_recv().expect("the viewer was answered");
+        let ControlOutbound::Text(text) = &reply else {
+            panic!("the answer is a text response");
+        };
+        let reply: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["request_id"], request_id.to_string());
+        assert_eq!(reply["error"]["code"], "request_timeout");
+        assert!(outbound.try_recv().is_err(), "one answer, nothing after it");
+        worker.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_the_worker_never_answers_gives_up_at_its_deadline() {
+        stalled_replay_request(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_the_live_stream_never_reaches_gives_up_at_its_deadline() {
+        stalled_replay_request(true).await;
+    }
+
+    /// One warning per worker connection per interval, however many
+    /// viewers' waits on it run out, and the next one counts the rest.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_worker_is_reported_once_per_interval() {
+        let control = crate::pty::ForwarderControl::new();
+        assert_eq!(control.worker_stall_report(), Some(0));
+        assert_eq!(control.worker_stall_report(), None);
+        tokio::time::advance(crate::pty::WORKER_STALL_REPORT_EVERY - Duration::from_millis(1))
+            .await;
+        assert_eq!(control.worker_stall_report(), None);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(control.worker_stall_report(), Some(2));
+        assert_eq!(
+            crate::pty::ForwarderControl::new().worker_stall_report(),
+            Some(0),
+            "another worker connection reports its own"
+        );
+    }
+
     #[test]
     fn rtc_binary_input_writes_and_emits_one_throttled_content_free_signal() {
         let session_id = Uuid::new_v4();
@@ -9874,7 +10828,7 @@ mod tests {
                 false,
                 data,
                 &control,
-                &out_tx,
+                Some(&out_tx),
                 |bytes| {
                     writes.lock().unwrap().push(bytes.to_vec());
                     Ok(())
@@ -9904,26 +10858,36 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let write_calls = std::sync::atomic::AtomicUsize::new(0);
 
-        assert!(
-            !forward_data_channel_input(session_id, true, b"text", &control, &out_tx, |_| {
+        assert!(!forward_data_channel_input(
+            session_id,
+            true,
+            b"text",
+            &control,
+            Some(&out_tx),
+            |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
-            },)
-            .unwrap()
-        );
-        assert!(
-            !forward_data_channel_input(session_id, false, b"", &control, &out_tx, |_| {
+            },
+        )
+        .unwrap());
+        assert!(!forward_data_channel_input(
+            session_id,
+            false,
+            b"",
+            &control,
+            Some(&out_tx),
+            |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
-            },)
-            .unwrap()
-        );
+            },
+        )
+        .unwrap());
         assert!(forward_data_channel_input(
             session_id,
             false,
             b"failed secret",
             &control,
-            &out_tx,
+            Some(&out_tx),
             |_| anyhow::bail!("write failed"),
         )
         .is_err());
@@ -9960,7 +10924,7 @@ mod tests {
             false,
             &oversized,
             &control,
-            &activity_tx,
+            Some(&activity_tx),
             |bytes| handle.write_stdin(bytes),
         )
         .is_err());

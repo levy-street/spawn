@@ -37,6 +37,91 @@ fixture_module = load("native-acceptance-fixture")
 suite = load("native-acceptance-suite")
 
 
+class ShortBackgroundAttempts(unittest.IsolatedAsyncioTestCase):
+    """An over-long cycle is an unmet precondition; a short one is the verdict."""
+
+    def cycles(self, *results):
+        script = list(results)
+        calls = []
+
+        async def cycle():
+            calls.append(len(calls) + 1)
+            result = script.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            measured, same_parent = result
+            return {
+                "background_ms": 0,
+                "measured_background_ms": measured,
+                "same_parent": same_parent,
+                "recovery_ms": 1.0,
+            }
+
+        return cycle, calls
+
+    async def test_over_long_cycle_is_repeated_and_every_measurement_recorded(self):
+        # The app retired its parent after 3.6 s, as it should: not a verdict.
+        cycle, calls = self.cycles((3646.0, False), (3000.0, True), (812.0, True))
+        result = await suite.short_background(cycle)
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual(result["measured_background_ms"], 812.0)
+        self.assertEqual(
+            result["background_attempts"],
+            [
+                {"measured_background_ms": 3646.0, "within_grace": False, "kept_parent": False},
+                {"measured_background_ms": 3000.0, "within_grace": False, "kept_parent": True},
+                {"measured_background_ms": 812.0, "within_grace": True, "kept_parent": True},
+            ],
+        )
+
+    async def test_first_short_cycle_that_retires_the_parent_fails_without_a_retry(self):
+        cycle, calls = self.cycles((900.0, False), (900.0, True))
+        with self.assertRaisesRegex(
+            AssertionError, r"retired the parent \(attempt 1 of 3; measured 900 ms\)"
+        ):
+            await suite.short_background(cycle)
+        self.assertEqual(calls, [1])
+
+    async def test_short_cycle_after_an_over_long_one_is_still_judged(self):
+        cycle, calls = self.cycles((3646.0, False), (812.0, False), (700.0, True))
+        with self.assertRaisesRegex(
+            AssertionError, r"retired the parent \(attempt 2 of 3; measured 3646, 812 ms\)"
+        ):
+            await suite.short_background(cycle)
+        self.assertEqual(calls, [1, 2])
+
+    async def test_no_short_cycle_fails_after_the_bounded_attempts(self):
+        cycle, calls = self.cycles((3646.0, False), (3100.0, False), (4200.0, False), (1.0, True))
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"exceeded the grace interval on all 3 attempts \(measured 3646, 3100, 4200 ms\)",
+        ):
+            await suite.short_background(cycle)
+        self.assertEqual(calls, [1, 2, 3])
+
+    async def test_a_failure_inside_an_over_long_cycle_is_not_retried(self):
+        # Shell survival, launch identity and recovery are checked inside every
+        # cycle, whatever its length; such a failure ends the case at once.
+        cycle, calls = self.cycles(
+            AssertionError("backgrounding replaced a live shell"), (812.0, True)
+        )
+        with self.assertRaisesRegex(AssertionError, "^backgrounding replaced a live shell$"):
+            await suite.short_background(cycle)
+        self.assertEqual(calls, [1])
+        cycle, calls = self.cycles(
+            (3646.0, False),
+            AssertionError("two sessions did not recover on one measured peer"),
+            (812.0, True),
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"did not recover on one measured peer \(attempt 2 of 3; "
+            r"earlier cycles measured 3646 ms\)",
+        ):
+            await suite.short_background(cycle)
+        self.assertEqual(calls, [1, 2])
+
+
 class FixtureBoundaries(unittest.IsolatedAsyncioTestCase):
     def test_lifecycle_interval_uses_retained_callbacks_after_the_case_start(self):
         before = {"launchId": "same-process", "lifecycleSequence": 3}

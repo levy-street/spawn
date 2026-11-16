@@ -46,10 +46,20 @@ src/
                  CODEX_HOME name, by Claude Code's exact folder rule — pinned
                  by proto/claude-project-folder.json; reading stays with
                  host_files.rs; host_conv.rs answers `conv.inspect` from a
-                 window's process tree and Claude Code's live-session
-                 registry, and executes nothing), codex_home.rs (a skilled
-                 window's own CODEX_HOME, reconciled against the user's — see
-                 "A skilled window's home"), upload.rs, sessions.rs,
+                 window's process tree, Claude Code's live-session
+                 registry and the thread files a Codex holds open (none,
+                 when Codex keeps its threads in its shared background
+                 server: then it names no thread), notes each Codex
+                 window's thread for restarts after Codex has gone —
+                 `<config>/conversations/<session id>.json`, dropped on the
+                 window's every `session.kill`, archiving included — and
+                 executes nothing), codex_launch.rs (whether a window's
+                 `codex` accepts `--no-daemon`, for `conv.launch`: `codex
+                 --no-daemon --version` with the environment its shell was
+                 started with, in its folder; nothing kept, no timer),
+                 codex_home.rs (a skilled window's own CODEX_HOME,
+                 reconciled against the user's — see "A skilled window's
+                 home"), upload.rs, sessions.rs,
                  service.rs + service/ (launchd/systemd dispatch, Windows Task
                  Scheduler/Run watchdog and control pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
@@ -74,14 +84,23 @@ tests/           integration tests (worker_e2e.rs), and
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
                  currently webrtc-sctp 0.17.2 plus the #822 re-admission fix,
-                 a read/reset missed-notification fix, and closing the
+                 a read/reset missed-notification fix, closing the
                  association closing its pending queue (a writer waiting on a
                  silent peer gets `ErrStreamClosed` instead of holding the
                  stream shutdowns, and so the peer connection close, forever),
+                 and closing the association closing its accept queue
+                 (`accept_stream` returns `None` instead of waiting for ever,
+                 which is how a channel acceptor learns the association under
+                 a connected transport is gone),
                  webrtc-ice 0.17.2
                  with temporary UDP route errors treated as datagram loss
                  (ice/PATCHES.md), and webrtc 0.17.2
-                 with closed-channel registry pruning (webrtc/PATCHES.md).
+                 with closed-channel registry pruning and a channel acceptor
+                 that outlives a stream that never became a channel (and
+                 resets it, stopping the association once 64 in a row have
+                 failed with no channel opened between),
+                 admits each channel in its own task, and reports its own
+                 end (webrtc/PATCHES.md).
                  SCTP and ICE also allow clippy::double_must_use at the
                  crate root: Rust 1.99 Clippy flags the #[must_use] that
                  async_trait puts on every boxed future it generates.
@@ -438,7 +457,34 @@ A duplicate close of a transport some other teardown owns — a reaper firing
 for a pc already leaving — does nothing at all. No path awaits a transport close while holding the
 admission lock, which every offer serializes on, or ahead of an answer: a
 superseded pair closes in a tracked task after the lock drops, and trust
-invalidation waits for host closes only until the teardown deadline. A
+invalidation waits for host closes only until the teardown deadline. Nor
+does any path wait for a session's generation transition while holding it:
+a restart holds the transition across the session's peer closes, TERM and
+the wait for its worker, so both inserters (`attach_pair_channel`,
+`create_answer`) take the transition first and the admission lock second —
+one order in both, or they deadlock against each other. That order has a
+price, bounded and without a cycle: an attach holds its session's
+transition while it queues on admission, and trust invalidation holds
+admission for up to the teardown deadline (`invalidate_trust_and_close_all`),
+so that session's restart or exit can wait that long behind them. Nothing
+that holds admission waits on a transition. Nothing that holds the peer
+map waits on a session's control transaction (`session_ctl.rs`), and what
+holds admission waits on one only under the teardown deadline (trust
+invalidation's `close_all`, through each peer's `settle_detached_peer` →
+`unregister_viewer`): a `history` or `snapshot` request holds the
+transaction through up to 3 s for its `spawn.pty` channel, up to
+`WORKER_REPLAY_DEADLINE` on the session's worker and then while its reply is
+queued, which a slowly draining viewer stretches to minutes; and every
+offer and attach takes the peer map under admission. So
+`close_for_session` decides under the map whether the session's control
+state goes, lets the map go, and decides again holding the transaction
+(`remove_session_unless`): transaction, then peer map, never the reverse.
+It lets its session closer go first, since trust invalidation takes
+closers under admission. A host-control channel refused at admission is
+closed once the lock is released — the close is an SCTP reset the device
+has to answer. A lock guard made in an `if let` or `match` scrutinee lives
+to the end of the block (edition 2021), so a map lookup that leads to an
+await gets its own `let`. A
 device re-attaching a view of its superseded connection (the mobile client
 keeps its attachment ids across a reconnect) finds nothing stale: the old
 attachment left the peer map when its pair was superseded, and one another
@@ -451,10 +497,28 @@ acknowledging those wait behind a writer that never gets room; the closed
 association releases the writer and the shutdowns bail on state. Every
 retirement the daemon starts on its own — the reaper's never-connected,
 failed, and stayed-disconnected closes, a session that ended, was replaced,
-or is restarting, and a device connection superseded by a newer one — tells
+or is restarting, a device connection superseded by a newer one, and a host
+peer whose channel acceptor ended — tells
 the server `unavailable` for that binding, once it has claimed the peer
 (`reap_session_peer`, `close_for_session`, `retire_host_if_same`,
-`take_device_pair`). A session close hands its announcements back
+`take_device_pair`). The acceptor ends when the SCTP association does, and
+an association can end under a transport that stays connected (the device's
+SCTP went away; the write loop closed it over a send error ICE recovered
+from): nothing opens on that peer again and the reaper, which watches the
+connection state, never hears of it, so `install_host_acceptor_watch`
+retires it from the SCTP transport's `on_error`. The acceptor also stops
+the association itself once `MAX_FAILED_DATA_CHANNEL_STREAMS` streams in a
+row have failed to become channels (a channel that opens starts the count
+again), and that peer is retired the same way. A peer the daemon is
+already closing has, as a rule, left the host map before its association
+stopped, and the watch does nothing for it. The exception is a protocol-1
+host peer whose handler refuses a channel: the handler closes the
+connection while the peer is still in the map, and the watch can then be
+what retires it and tells the server `unavailable`, which is true of a
+connection that is gone and which the reaper, ignoring a closed
+connection, would not say. A device's own close ends the association too
+when word of it arrives (a DTLS close_notify, an SCTP ABORT), and that peer
+is retired the same way, ahead of the reaper's grace. A session close hands its announcements back
 (`Announcements`, sent on drop if never sent) for the caller in `run.rs` to
 send once the exit or the replacement is on the wire: sent earlier, a device
 re-offers into a session that is not running, is refused with `failed`, and
@@ -468,7 +532,17 @@ active binding is a refusal of its offer and it drops its trust verdict,
 while `unavailable` is a connection that is gone, answered with a new one.
 No status goes out before a connection's registration is acknowledged
 (`deferred_pruned`): the server refuses frames before `register`, and one
-refused would be one never deferred. A status deferred for that, or for
+refused would be one never deferred. A peer outlives the control connection
+its offer arrived on, so nothing it says later goes through a sender
+captured at admission — after a reconnect that is a socket nobody reads,
+which is where every input-activity ping from a surviving peer went. The
+ping goes out on `registered_sender`, the live connection once registered;
+`PairContext.out_tx` and the `out_tx` a session handler is built with are
+the offer's; nothing sends through them once the peer is admitted. Nor
+does an offer handler install its `out_tx` as the signalling sender:
+`run.rs` installs each control connection's at connect, and an offer job,
+which outlives the dispatch loop that queued it, can start after the next
+connect and would put a dead sender back. A status deferred for that, or for
 want of channel room, is retried from the control connection's heartbeat
 once registration's replay has run; at reconnect a deferred terminal
 status is replayed only for a binding the register frame carried (the
@@ -575,6 +649,21 @@ ICE recovery; they must not close the shared association. Other IO errors
 and explicit connection closure still fail. The tests inject the route error
 and require the next datagram to reach a real receiver on the same connection.
 
+A channel's admission runs in a task of its own (the vendored WebRTC accept
+loop, webrtc/PATCHES.md): the future an `on_data_channel` handler returns
+completes before that channel opens or delivers a message, as always, but
+the futures for different channels of one connection run concurrently and
+finish in any order. A handler must not assume the channel before it has
+been admitted, and may wait — on the admission lock, on a session's
+transition — without holding up any other channel on the connection. What
+SCTP no longer bounds the daemon does: at most `MAX_PAIR_PENDING_CHANNELS`
+of one device connection's channels wait at once (every channel the pair
+could hold together: two per terminal attachment, its host consumers, its
+root), and one past that is refused there and then. A terminal label
+naming a session the daemon neither runs nor has a transition in progress
+for is refused before the transition is taken, so a device cannot mint a
+lock per made-up id.
+
 Stored channel handlers capture their channel weakly, including `on_open`
 handlers that may never fire. The vendored WebRTC registry prunes closed
 channels on each local or remote admission, preserving cumulative close stats
@@ -634,6 +723,43 @@ the units (`LimitNOFILE=65536:infinity`, launchd `SoftResourceLimits`) —
 never a hard limit, which every shell in a terminal would inherit. For
 temporary SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
+
+`host.agents.check` runs off the dispatch loop (`AgentCheckFlights`): the
+loop reads every frame on the socket, and a check runs programs — the
+user's shell for its PATH, each agent's version flags one after another,
+`npm view` or `pip index` beside them — that took up to half a minute
+inline, while every offer waited behind it and was answered after the
+browser had given up. A request for targets already being checked joins
+that check rather than starting another (clients ask every minute, and
+again after a 504). At most `MAX_CONCURRENT_AGENT_CHECKS` (2) run at once
+— only the host's owner can ask, so one target set is the norm — and one
+that gets no place by its deadline answers nothing (the server's 504);
+at most `MAX_AGENTS_PROBED_AT_ONCE` (8) of a check's agents are probed at
+once, and a frame naming more than `proto::MAX_HOST_AGENT_TARGETS` (64) is
+refused whole. The whole check answers within `HOST_AGENTS_CHECK_DEADLINE`
+(10 s, inside the server's 15 s), the shell getting at most
+`HOST_AGENTS_ENV_SHARE` of it; a probe still running then is stopped with
+its process group and its agent's version reported unknown (`version:
+null`, installed by the PATH lookup — both clients show that as
+installed), with a warning per agent and probe at most every ten minutes.
+The reply's send is bounded too.
+
+Every capture (`run_until_exit`) returns once its program has exited and
+its own output is read (`EXITED_PROGRAM_DRAIN`), never waiting for its
+pipes to close: a background server a CLI starts with the stdout it
+inherited holds that pipe for as long as it lives. What it left holding
+them is not touched before the program's own timeout, as when the capture
+waited for them: `finish_leftovers` reads on until then and stops the
+program's group only if the pipes are still held. A group is only ever
+signalled while its leader is unreaped — the exit is observed with
+`waitid(WNOWAIT)` (`platform::exited_unreaped`) and the leader reaped after
+— so its id cannot have been handed to another process; never group 0 or
+1. At most `MAX_PENDING_LEFTOVERS` (16) such programs wait at once, each a
+zombie for at most its timeout; past that a capture waits out its own, as
+every capture did before. The shell PATH probe is in spawnd's own group
+and is never group-signalled. Session create, restart and kill are still
+awaited on the loop: they need a per-session lifecycle queue to leave it in
+order.
 
 `host.agents.install` is a refusal-only compatibility frame: server identity
 does not authorize running an installer or self-updater. Never restore its

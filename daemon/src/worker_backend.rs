@@ -60,6 +60,49 @@ fn worker_frame_limit(frame_type: u8) -> Option<usize> {
 #[cfg(test)]
 pub(crate) static WORKER_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The `spawn-worker` Cargo built with this test binary, for the tests that
+/// launch a real worker.
+///
+/// Cargo puts the finished worker in the profile directory (`target/debug/`)
+/// and a test binary somewhere below it, and where below is Cargo's to
+/// change: `deps/` through Rust 1.99, `build/<package>/<hash>/out/` from
+/// 1.100. Counting two levels up found nothing there, and a worker that is
+/// not found is reported as one that "does not match this spawnd build". So
+/// the worker is looked for beside each directory above this binary, nearest
+/// first, up to Cargo's target directory and no further, and a missing one is
+/// named as missing.
+#[cfg(test)]
+pub(crate) fn built_worker_bin() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let name = crate::platform::executable_name("spawn-worker");
+    built_beside(&exe, &name).unwrap_or_else(|| {
+        panic!(
+            "no {} in any directory above {} up to Cargo's target directory; `cargo test` without a target filter builds it, as does `cargo build`",
+            name.to_string_lossy(),
+            exe.display()
+        )
+    })
+}
+
+/// The nearest directory above `exe` that holds a file called `name`, up to
+/// and including Cargo's target directory — `target/`, or a CARGO_TARGET_DIR
+/// of any name, which Cargo marks with `CACHEDIR.TAG` — and never above it,
+/// where a file of that name (in a home directory, say) is not this build's.
+#[cfg(test)]
+fn built_beside(exe: &std::path::Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    for dir in exe.ancestors().skip(1) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.file_name().is_some_and(|dir| dir == "target") || dir.join("CACHEDIR.TAG").is_file()
+        {
+            return None;
+        }
+    }
+    None
+}
+
 /// Directory holding worker sockets or Windows endpoint metadata:
 /// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir on
 /// Unix, or `%LOCALAPPDATA%/spawn/state/<instance>/workers` on Windows. Unix
@@ -434,6 +477,118 @@ pub fn discover_ids() -> Vec<Uuid> {
     endpoint::discover_ids(&dir, &endpoint::config_root_tag())
 }
 
+/// How often `spawnd` refreshes the timestamps of its workers' files (see
+/// [`refresh_worker_files`]); it also does so once when it starts. macOS
+/// deletes a file in `/tmp` that nothing has touched for three days, and the
+/// XDG runtime directory asks for one touch every six hours.
+pub const WORKER_FILE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Keep the OS temp cleaner off the files live workers depend on. Where the
+/// worker directory is a temporary location (the short `/tmp` directory macOS
+/// is diverted to, the system temp directory, or the XDG runtime directory),
+/// set the access and modification times of each live session's reservation
+/// file and scrollback segments to now. A full segment is never written
+/// again, and a reservation file never is, so without this the cleaner
+/// deletes them while their worker runs: the session's history becomes
+/// unreadable and its reservation stops proving anything.
+///
+/// Every session with a `<id>.sock` in the directory counts, the set startup
+/// adoption tries: that includes a crashed worker's leftovers until an
+/// adoption attempt clears its sockets. Only regular files this user owns are
+/// touched, through a handle opened without following links; no file is
+/// created, read, or written. Returns how many files were refreshed.
+pub fn refresh_worker_files() -> usize {
+    #[cfg(unix)]
+    {
+        let Ok(dir) = worker_dir() else {
+            return 0;
+        };
+        if !is_temporary_location(&dir) {
+            return 0;
+        }
+        let ids = endpoint::discover_ids(&dir, &endpoint::config_root_tag());
+        refresh_worker_files_in(&dir, &ids, std::time::SystemTime::now())
+    }
+    // Windows keeps worker files under %LOCALAPPDATA%, which nothing cleans.
+    #[cfg(windows)]
+    {
+        0
+    }
+}
+
+/// Whether `dir` lies under a directory the OS may clean by age.
+#[cfg(unix)]
+fn is_temporary_location(dir: &std::path::Path) -> bool {
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = canonical(dir);
+    let mut roots = vec![
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+        std::env::temp_dir(),
+    ];
+    roots.extend(dirs::runtime_dir());
+    roots.iter().any(|root| dir.starts_with(canonical(root)))
+}
+
+#[cfg(unix)]
+fn refresh_worker_files_in(
+    dir: &std::path::Path,
+    ids: &[Uuid],
+    now: std::time::SystemTime,
+) -> usize {
+    let mut refreshed = 0;
+    for id in ids {
+        refreshed += usize::from(touch_owned_file(&dir.join(format!("{id}.lock")), now));
+        let scrollback = log_dir(dir, *id);
+        let Ok(metadata) = std::fs::symlink_metadata(&scrollback) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&scrollback) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("seg-") && name.ends_with(".log") {
+                refreshed += usize::from(touch_owned_file(&entry.path(), now));
+            }
+        }
+    }
+    refreshed
+}
+
+/// Set a file's access and modification times, only if it already is a
+/// regular file this user owns. Never creates, follows a link, or blocks on a
+/// FIFO; checks and touches the same open file.
+#[cfg(unix)]
+fn touch_owned_file(path: &std::path::Path, now: std::time::SystemTime) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.uid() != nix::unistd::Uid::effective().as_raw() {
+        return false;
+    }
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(now)
+            .set_modified(now),
+    )
+    .is_ok()
+}
+
 /// Wire a connected worker stream into the standard per-session plumbing:
 /// outbox → forwarder, a command channel for stdin/resize/replay, a separate
 /// acknowledged lifecycle channel, and an exit oneshot.
@@ -686,9 +841,18 @@ async fn run_reader(
             Ok(Some((wire::T_ERROR, payload))) => {
                 let payload = Zeroizing::new(payload);
                 if let Ok(err) = wire::decode_json::<wire::WorkerError>(&payload) {
-                    tracing::warn!(%session_id, message = %err.message, "worker error");
+                    // History the worker can no longer read is reported once
+                    // per session by the viewer replay that works around it
+                    // (`SessionHandle::viewer_replay`), not on every request.
+                    if pty::unreadable_history(&err.message).is_some() {
+                        tracing::debug!(%session_id, message = %err.message, "worker error");
+                    } else {
+                        tracing::warn!(%session_id, message = %err.message, "worker error");
+                    }
                     if let Some(waiter) = pending.lock().expect("pending lock").pop_front() {
-                        let _ = waiter.send(Err(anyhow!("worker replay failed: {}", err.message)));
+                        let _ = waiter.send(Err(anyhow::Error::new(
+                            pty::WorkerReplayRefused::new(err.message),
+                        )));
                     }
                 }
             }
@@ -730,7 +894,7 @@ async fn connect_with_retry(
 }
 
 fn cleanup_crashed_worker_endpoints(worker_endpoint: &endpoint::Endpoint) {
-    let Ok(LockAttempt::Acquired(lock)) = endpoint::try_reserve(worker_endpoint) else {
+    let Ok(LockAttempt::Acquired(lock)) = endpoint::try_reserve_stale(worker_endpoint) else {
         return;
     };
     let _ = endpoint::remove_stale(worker_endpoint, &lock);
@@ -1012,16 +1176,6 @@ mod tests {
         forwarder.await.unwrap();
     }
 
-    /// The spawn-worker binary as built alongside this test binary
-    /// (target/debug/deps/spawnd-<hash> → target/debug/spawn-worker).
-    fn built_worker_bin() -> PathBuf {
-        let exe = std::env::current_exe().expect("current_exe");
-        exe.parent()
-            .and_then(|deps| deps.parent())
-            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
-            .expect("worker bin path")
-    }
-
     /// Wait for `needle` on the direct sink.
     ///
     /// Callers must register the sink BEFORE taking the replay whose absence
@@ -1066,6 +1220,277 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Point the worker overrides at a short private directory and the built
+    /// worker for one test; restores both when dropped.
+    struct WorkerEnv {
+        old_dir: Option<std::ffi::OsString>,
+        old_bin: Option<std::ffi::OsString>,
+        dir: tempfile::TempDir,
+    }
+
+    impl WorkerEnv {
+        fn install(with_bin: bool) -> Self {
+            let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
+            let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
+            let dir = tempfile::Builder::new()
+                .prefix("spawn-wb-")
+                .tempdir_in("/tmp")
+                .expect("short tempdir");
+            std::env::set_var("SPAWND_WORKER_DIR", dir.path());
+            if with_bin {
+                std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
+            }
+            Self {
+                old_dir,
+                old_bin,
+                dir,
+            }
+        }
+    }
+
+    impl Drop for WorkerEnv {
+        fn drop(&mut self) {
+            match self.old_dir.take() {
+                Some(value) => std::env::set_var("SPAWND_WORKER_DIR", value),
+                None => std::env::remove_var("SPAWND_WORKER_DIR"),
+            }
+            match self.old_bin.take() {
+                Some(value) => std::env::set_var("SPAWND_WORKER_BIN", value),
+                None => std::env::remove_var("SPAWND_WORKER_BIN"),
+            }
+        }
+    }
+
+    /// The reservation file of a session days old is deleted by the OS temp
+    /// cleaner while its worker holds the lock. A daemon that then fails to
+    /// connect to that worker once must not take a lock on a new file as
+    /// proof it crashed: that removed a live session's sockets for good, and
+    /// let a second worker start for it and wipe its scrollback.
+    #[tokio::test]
+    async fn a_live_worker_whose_reservation_file_was_deleted_keeps_its_session() {
+        let _env_lock = WORKER_TEST_ENV_LOCK.lock().await;
+        let env = WorkerEnv::install(true);
+        let session_id = Uuid::new_v4();
+        let argv: Vec<String> = ["/bin/sh", "-c", "printf 'kept-alive\\n'; exec cat"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut env_vars = std::collections::BTreeMap::new();
+        env_vars.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        );
+        let spec = || pty::LaunchSpec {
+            session_id,
+            cwd: "/",
+            cols: 80,
+            rows: 24,
+            argv: &argv,
+            env: &env_vars,
+        };
+        let launched = launch(spec()).await.expect("worker launch");
+        let lifecycle = launched.handle.lifecycle();
+        let worker_endpoint = session_endpoint(env.dir.path(), session_id).unwrap();
+        let lock = env.dir.path().join(format!("{session_id}.lock"));
+        let segment = env
+            .dir
+            .path()
+            .join(format!("{session_id}.scrollback"))
+            .join("seg-00000001.log");
+        assert!(lock.exists() && segment.exists());
+
+        std::fs::remove_file(&lock).unwrap();
+        // What `adopt` does after a connection attempt fails.
+        cleanup_crashed_worker_endpoints(&worker_endpoint);
+        assert!(
+            socket_exists(session_id),
+            "a live worker's socket was removed as stale"
+        );
+        assert!(
+            env.dir
+                .path()
+                .join(format!("{session_id}.lifecycle.sock"))
+                .exists(),
+            "a live worker's lifecycle socket was removed as stale"
+        );
+        assert!(
+            !lock.exists(),
+            "a reservation file was created for a live worker"
+        );
+
+        let second = launch(spec()).await;
+        let refusal = match second {
+            Ok(_) => panic!("a second worker started for a live session"),
+            Err(error) => error,
+        };
+        assert_eq!(refusal.to_string(), "worker endpoint is already owned");
+        assert!(segment.exists(), "the live session's scrollback was wiped");
+
+        // The session is still the first worker's, and reachable.
+        drop(launched);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let adopted = adopt(session_id)
+            .await
+            .expect("adopt")
+            .expect("the live worker was lost");
+        let (ws_tx, mut ws_rx) = mpsc::channel(1024);
+        adopted.handle.control.set_sink(ws_tx).await;
+        tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
+        let replay = adopted
+            .handle
+            .replay(1 << 20)
+            .expect("replay request")
+            .await
+            .expect("replay response")
+            .expect("replay");
+        assert!(String::from_utf8_lossy(replay.bytes()).contains("kept-alive"));
+        drop(replay);
+
+        lifecycle
+            .shutdown(wire::LifecycleSignal::Kill)
+            .await
+            .expect("KILL delivery");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while socket_exists(session_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn set_age(path: &std::path::Path, age: Duration) {
+        let then = std::time::SystemTime::now() - age;
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(then)
+                    .set_modified(then),
+            )
+            .unwrap();
+    }
+
+    fn modified_within(path: &std::path::Path, window: Duration) -> bool {
+        let modified = std::fs::symlink_metadata(path).unwrap().modified().unwrap();
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age < window)
+    }
+
+    /// The refresh keeps a live worker's reservation and segments young, and
+    /// touches nothing else: not a session without a socket, not a file of
+    /// another name, not a link or its target, not a FIFO — and it creates
+    /// nothing, not even a reservation file that is missing.
+    #[test]
+    fn refresh_touches_only_live_workers_own_files_and_creates_none() {
+        let _env_lock = WORKER_TEST_ENV_LOCK.blocking_lock();
+        let env = WorkerEnv::install(false);
+        let dir = env.dir.path().to_path_buf();
+        endpoint::ensure_private_dir(&dir).unwrap();
+        let days = Duration::from_secs(5 * 24 * 60 * 60);
+        let fresh = Duration::from_secs(60);
+
+        let live = Uuid::new_v4();
+        let _live_socket =
+            std::os::unix::net::UnixListener::bind(dir.join(format!("{live}.sock"))).unwrap();
+        let lock = dir.join(format!("{live}.lock"));
+        std::fs::write(&lock, b"").unwrap();
+        let scrollback = dir.join(format!("{live}.scrollback"));
+        std::fs::create_dir(&scrollback).unwrap();
+        let segments = [
+            scrollback.join("seg-00000001.log"),
+            scrollback.join("seg-00000002.log"),
+        ];
+        for segment in &segments {
+            std::fs::write(segment, b"ciphertext").unwrap();
+        }
+        let other = scrollback.join("notes.txt");
+        std::fs::write(&other, b"").unwrap();
+        let outside = env.dir.path().join("outside");
+        std::fs::write(&outside, b"").unwrap();
+        let link = scrollback.join("seg-00000003.log");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let fifo = scrollback.join("seg-00000004.log");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        // A session whose reservation file the cleaner already took.
+        let reaped = Uuid::new_v4();
+        let _reaped_socket =
+            std::os::unix::net::UnixListener::bind(dir.join(format!("{reaped}.sock"))).unwrap();
+        // Leftovers of a session with no worker socket.
+        let dead = Uuid::new_v4();
+        let dead_lock = dir.join(format!("{dead}.lock"));
+        std::fs::write(&dead_lock, b"").unwrap();
+
+        for path in [
+            &lock,
+            &segments[0],
+            &segments[1],
+            &other,
+            &outside,
+            &dead_lock,
+        ] {
+            set_age(path, days);
+        }
+        let link_before = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let fifo_before = std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let entries_before = std::fs::read_dir(&dir).unwrap().count();
+
+        assert!(is_temporary_location(&dir));
+        assert_eq!(refresh_worker_files(), 3);
+
+        for path in [&lock, &segments[0], &segments[1]] {
+            assert!(
+                modified_within(path, fresh),
+                "{} was not refreshed",
+                path.display()
+            );
+            let accessed = std::fs::metadata(path).unwrap().accessed().unwrap();
+            assert!(std::time::SystemTime::now()
+                .duration_since(accessed)
+                .is_ok_and(|age| age < fresh));
+        }
+        for path in [&other, &outside, &dead_lock] {
+            assert!(
+                !modified_within(path, fresh),
+                "{} was touched",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            link_before
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            fifo_before
+        );
+        assert!(!dir.join(format!("{reaped}.lock")).exists());
+        assert!(!dir.join(format!("{reaped}.scrollback")).exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), entries_before);
+
+        // Elsewhere, nothing is touched at all.
+        assert!(!is_temporary_location(std::path::Path::new(
+            "/nonexistent-spawn-config/spawn/workers"
+        )));
     }
 
     /// Full supervisor-side round trip through the exact plumbing the
@@ -1288,6 +1713,90 @@ mod tests {
         match old_bin {
             Some(value) => std::env::set_var("SPAWND_WORKER_BIN", value),
             None => std::env::remove_var("SPAWND_WORKER_BIN"),
+        }
+    }
+}
+
+// Last in the file on every platform: `mod tests` above is Unix-only, and
+// Clippy refuses items after a test module (`items_after_test_module`).
+#[cfg(test)]
+mod built_worker_tests {
+    use super::built_beside;
+    use std::ffi::OsStr;
+
+    /// Both places Cargo has kept a test binary lead to the same worker, and
+    /// a profile directory without one leads nowhere rather than to some
+    /// other file.
+    #[test]
+    fn the_built_worker_is_found_from_either_cargo_test_layout() {
+        let target = tempfile::tempdir().unwrap();
+        let profile = target.path().join("debug");
+        let through_1_99 = profile.join("deps");
+        let from_1_100 = profile
+            .join("build")
+            .join("spawnd")
+            .join("47a0d17e")
+            .join("out");
+        std::fs::create_dir_all(&through_1_99).unwrap();
+        std::fs::create_dir_all(&from_1_100).unwrap();
+        let old_test = through_1_99.join("spawnd-6d610854");
+        let new_test = from_1_100.join("spawnd-47a0d17e");
+        assert_eq!(built_beside(&old_test, OsStr::new("spawn-worker")), None);
+        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
+
+        // The worker's own intermediate output is not beside anything the
+        // test binary sits under, and is not what is found.
+        let worker_unit = profile
+            .join("build")
+            .join("spawnd")
+            .join("f2563374")
+            .join("out");
+        std::fs::create_dir_all(&worker_unit).unwrap();
+        std::fs::write(worker_unit.join("spawn-worker"), b"").unwrap();
+        assert_eq!(built_beside(&new_test, OsStr::new("spawn-worker")), None);
+
+        let worker = profile.join("spawn-worker");
+        std::fs::write(&worker, b"").unwrap();
+        assert_eq!(
+            built_beside(&old_test, OsStr::new("spawn-worker")),
+            Some(worker.clone())
+        );
+        assert_eq!(
+            built_beside(&new_test, OsStr::new("spawn-worker")),
+            Some(worker)
+        );
+    }
+
+    /// The search ends at Cargo's target directory: a `spawn-worker` above
+    /// it (a home directory, `/usr/local`) is never taken for the build's.
+    #[test]
+    fn the_built_worker_is_never_found_above_the_target_directory() {
+        let above = tempfile::tempdir().unwrap();
+        std::fs::write(above.path().join("spawn-worker"), b"").unwrap();
+        // The default `target/`, and a CARGO_TARGET_DIR of any name, which
+        // Cargo marks with CACHEDIR.TAG.
+        for (target, tag) in [("target", false), ("ci-build", true)] {
+            let target = above.path().join(target);
+            let test = target.join("debug").join("deps").join("spawnd-6d610854");
+            std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+            if tag {
+                std::fs::write(
+                    target.join("CACHEDIR.TAG"),
+                    b"Signature: 8a477f597d28d172789f06886806bc55",
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                built_beside(&test, OsStr::new("spawn-worker")),
+                None,
+                "{}",
+                target.display()
+            );
+            std::fs::write(target.join("debug").join("spawn-worker"), b"").unwrap();
+            assert_eq!(
+                built_beside(&test, OsStr::new("spawn-worker")),
+                Some(target.join("debug").join("spawn-worker"))
+            );
         }
     }
 }

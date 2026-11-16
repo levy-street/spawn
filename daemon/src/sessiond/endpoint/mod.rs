@@ -79,6 +79,21 @@ pub fn try_reserve(endpoint: &Endpoint) -> Result<LockAttempt> {
     imp::try_reserve(endpoint)
 }
 
+/// Reserve the endpoint of a worker that could not be reached, to remove what
+/// it left. `Acquired` is proof that no live worker owns the endpoint.
+pub fn try_reserve_stale(endpoint: &Endpoint) -> Result<LockAttempt> {
+    #[cfg(unix)]
+    {
+        imp::try_reserve_stale(endpoint)
+    }
+    // A Windows reservation is opened with share mode zero and cannot be
+    // deleted while its worker holds it, so the plain reservation decides.
+    #[cfg(windows)]
+    {
+        imp::try_reserve(endpoint)
+    }
+}
+
 /// Adopt the exact reservation object inherited from the supervisor.
 ///
 /// # Safety

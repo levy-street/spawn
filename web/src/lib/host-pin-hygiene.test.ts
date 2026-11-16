@@ -20,7 +20,7 @@ describe("undelivered host approval alerts", () => {
       "The approval didn't reach mac-studio. mac-studio could not verify the approval. Approve the device again from a device mac-studio already trusts.",
     );
     expect(hostPinUndeliveredEventToast({ reason: "other" }, "mac-studio")).toBe(
-      "The approval didn't reach mac-studio. Try approving again; if it keeps failing, run spawnd doctor on mac-studio.",
+      "The approval didn't reach mac-studio. mac-studio could not save it and tries again the next time it connects, so there is no need to approve again. If this keeps happening, run spawnd doctor on mac-studio.",
     );
   });
 });

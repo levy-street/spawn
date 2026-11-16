@@ -54,6 +54,7 @@ import {
 import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE, isFilesWidget } from "@/lib/grid";
 import { sessionAgent } from "@/lib/sessions";
+import { splitStore } from "@/lib/split-store";
 import {
   addTab,
   allTiles,
@@ -78,7 +79,7 @@ import {
   workspaceFolder,
   workspaceLiveSessionCount,
 } from "@/lib/workspaces";
-import { agentLaunchCommand, newAgentConversationId } from "./agent-command";
+import { agentLaunchCommand, newAgentConversationId, queuedLaunch } from "./agent-command";
 import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
@@ -214,9 +215,10 @@ export function WorkspaceTabs({
   /** The focused session — a connected tab wears the same dim as the pane
    *  beneath it when that pane is not the focused one. */
   focusedId?: string | null;
-  /** Set only when this strip is one of two on screen: it grows a label saying
-   *  whose tabs these are and a control that keeps this half. Absent — every
-   *  ordinary window — the strip is exactly what it was before split view. */
+  /** Set only when this strip is one of several on screen: it grows a label
+   *  saying whose tabs these are and a control that keeps this column. Absent —
+   *  every ordinary window — the strip is exactly what it was before split
+   *  view. */
   splitChrome?: SplitChrome | null;
   /** The layout this strip's own gesture is promising — a tab dragged onto the
    *  canvas moves the windows already there aside to make its room, and the
@@ -973,7 +975,11 @@ export function WorkspaceTabs({
           created.push(copy.id);
           copiedIds.set(tile.session_id, copy.id);
           if (agent)
-            pendingLaunch.set(copy.id, copy.host_id, agentLaunchCommand(agent, conversation));
+            pendingLaunch.set(
+              copy.id,
+              copy.host_id,
+              queuedLaunch((options) => agentLaunchCommand(agent, conversation, options)),
+            );
         }
         const next = duplicateTab(
           layout,
@@ -1088,15 +1094,22 @@ export function WorkspaceTabs({
   };
 
   /**
-   * Where to go once this workspace has been archived or deleted. Only the
-   * half the address bar is about has anywhere to be: the other half of a
-   * split is not the page you are on, and the arrangement it was in is
-   * dissolved by the workspace list refresh above, which leaves the workspace
-   * you were actually working in filling the window.
+   * Where to go once this workspace has been archived or deleted.
+   *
+   * Out of a split it leaves its column straight away, rather than waiting
+   * for the workspace list refresh above to notice: the other columns stay
+   * split if there are still two of them, and a pair leaves the one that is
+   * left filling the window. Only the column the address bar is about has
+   * anywhere to be, and that is the column that took its place — still on
+   * screen, so the window carries on rather than jumping to whichever
+   * workspace `/app` would pick. A workspace that was in no split goes to
+   * `/app`, as it always did.
    */
   const leaveAfterRemoval = () => {
-    if (paneScope && !paneScope.routed) return;
-    router.replace("/app");
+    const routed = !paneScope || paneScope.routed;
+    const successor = splitStore.remove(workspace.id, routed ? workspace.id : null);
+    if (!routed) return;
+    router.replace(successor ? `/w/${successor}` : "/app");
   };
 
   const deleteWorkspace = async () => {
@@ -1481,7 +1494,7 @@ export function WorkspaceTabs({
         align="end"
         className={cn(
           "mb-0.5 ml-auto shrink-0",
-          // Pinned beside the unsplit control at a half-width strip's end.
+          // Pinned beside the unsplit control at a split column's strip end.
           // Left scrolling, it would come to rest exactly underneath that
           // button at full scroll and be unreachable; 2.125rem is that
           // button's width plus the strip's gap, so pinned and resting
@@ -1539,7 +1552,7 @@ export function WorkspaceTabs({
       {splitChrome && (
         <UnsplitButton
           workspaceName={splitChrome.workspaceName}
-          side={splitChrome.side}
+          edge={splitChrome.edge}
           onUnsplit={splitChrome.onUnsplit}
         />
       )}

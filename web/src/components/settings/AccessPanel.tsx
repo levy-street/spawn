@@ -13,6 +13,7 @@ import { IntroductionPanel } from "@/components/trust/introduction-panel";
 import { Button } from "@/components/ui/button";
 import { confirm as confirmAction } from "@/components/ui/confirm";
 import { Input } from "@/components/ui/input";
+import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { type AccessPinDetail, deriveAccessView } from "@/lib/access-view";
 import { type BrowserDevice, browserDevices, hosts as hostsApi, trust } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
@@ -25,7 +26,9 @@ import {
   useBrowserDeviceRegistration,
 } from "@/lib/browser-device-registration";
 import { browserHostPinServerOrigin } from "@/lib/browser-host-pins";
+import { NO_PASSKEY_WAITING_HINT } from "@/lib/device-storage-notice";
 import { removeAccountFromThisBrowser } from "@/lib/local-account-hygiene";
+import { useDeviceStoragePersistence } from "@/lib/persistent-storage";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
 import {
@@ -134,7 +137,7 @@ export function AccessPanel() {
   const roster = computeTrustRoster(
     devices.data ?? [],
     accountEdges.data ?? [],
-    trustMap.pinnedDeviceIds,
+    trustMap.anchorDeviceIds,
   );
 
   // The list is the single source of rows; when the current device is known
@@ -311,6 +314,10 @@ export function AccessPanel() {
   const [legacyApproveId, setLegacyApproveId] = useState<string | null>(null);
   const [legacyNote, setLegacyNote] = useState<string | null>(null);
   const [nudgeDismissed, setNudgeDismissed] = useState(true);
+  const storagePersistence = useDeviceStoragePersistence();
+  // Passkeys are unproven inside the desktop app's webview, so the waiting
+  // callout's passkey line stays out of it, as the storage notice does (#121).
+  const desktopShell = useDesktopShell(true);
   useEffect(() => {
     if (!user) return;
     setNudgeDismissed(window.localStorage.getItem(NUDGE_DISMISSED_KEY(user.id)) === "1");
@@ -449,6 +456,11 @@ export function AccessPanel() {
             Approve it from a device you already use — you'll type this device's number there
             {passkey.hasBundle ? ", or use your passkey here" : ""}.
           </p>
+          {passkey.bundle.data === null && !desktopShell && (
+            <p className="text-xs text-muted-foreground" data-testid="untrusted-passkey-hint">
+              {NO_PASSKEY_WAITING_HINT}
+            </p>
+          )}
           <div className="flex flex-wrap items-center gap-2">
             {passkey.hasBundle && (
               <Button
@@ -905,6 +917,7 @@ export function AccessPanel() {
                   Ed25519 key persists: {String(passkey.storage.data.probe.ed25519KeyPersists)}
                 </li>
                 <li>ECDSA key persists: {String(passkey.storage.data.probe.ecdsaKeyPersists)}</li>
+                <li>kept when the disk runs low: {storagePersistence ?? "not asked yet"}</li>
                 {passkey.storage.data.probe.failure !== null && (
                   <li className="text-destructive">
                     failure: {passkey.storage.data.probe.failure}

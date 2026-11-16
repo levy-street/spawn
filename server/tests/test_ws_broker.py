@@ -225,6 +225,81 @@ async def test_rtc_orphan_rebind_expiry_resume_and_user_isolation():
 
 
 @pytest.mark.asyncio
+async def test_rtc_orphan_expiry_after_a_rebind_is_sent_as_the_current_owner(monkeypatch):
+    """The `unavailable` that ends a binding a re-registered daemon carried
+    over goes out under that daemon's generation. The browser's pump takes a
+    status only from the binding's current owner, which `rebound` moved to
+    the new daemon; under the generation the binding was made with it is
+    dropped, and the device keeps a peer nobody answers (#120)."""
+    from types import SimpleNamespace
+
+    from spawn_server.ws import daemon as daemon_mod
+    from spawn_server.ws import host_signal
+    from spawn_server.ws.host_signal import RedisBrowserConn, decode_rtc_signal_dispatch
+
+    published: list[tuple[str, bytes]] = []
+
+    async def publish_channel(channel: str, payload: bytes) -> None:
+        published.append((channel, payload))
+
+    broker = Broker()
+    monkeypatch.setattr(
+        host_signal, "get_backend", lambda: SimpleNamespace(publish_channel=publish_channel)
+    )
+    monkeypatch.setattr(daemon_mod, "get_broker", lambda: broker)
+    old_daemon = DaemonConn("rebind-host", "owner", FakeWS())  # type: ignore[arg-type]
+    old_daemon.host_generation = 7
+    old_daemon.keeps_peers_across_reconnect = True
+    route = RedisBrowserConn("owner", "rebind-host", "browser-route", old_daemon.id, 7, "d" * 32)
+    assert await broker.register_rtc_session(
+        "binding-carried",
+        route,
+        daemon=old_daemon,
+        scope_type="host",
+        scope_id="rebind-host",
+        protocol="spawn.host.ctl",
+        protocol_version=2,
+        binding_nonce="d" * 32,
+    )
+    await broker.orphan_rtc_sessions_for_daemon(old_daemon, grace_seconds=60)
+    new_daemon = DaemonConn("rebind-host", "owner", FakeWS())  # type: ignore[arg-type]
+    new_daemon.host_generation = 8
+    new_daemon.keeps_peers_across_reconnect = True
+    rebound, absent, unknown = await broker.reconcile_daemon_live_bindings(
+        new_daemon,
+        [
+            {
+                "session_id": "binding-carried",
+                "binding_nonce": "d" * 32,
+                "binding_generation": 7,
+                "scope_type": "host",
+                "scope_id": "rebind-host",
+                "protocol": "spawn.host.ctl",
+                "protocol_version": 2,
+            }
+        ],
+    )
+    assert len(rebound) == 1 and absent == [] and unknown == []
+
+    [orphan] = await broker.orphan_rtc_sessions_for_daemon(new_daemon, grace_seconds=0)
+    previous = set(daemon_mod._daemon_orphan_expiry_tasks)
+    daemon_mod._schedule_daemon_orphan_expiry(orphan)
+    await asyncio.wait_for(
+        asyncio.gather(*(set(daemon_mod._daemon_orphan_expiry_tasks) - previous)), timeout=1
+    )
+
+    assert [channel for channel, _ in published] == ["browser-route"]
+    dispatch = decode_rtc_signal_dispatch(published[0][1])
+    assert dispatch is not None
+    assert dispatch.signal["status"] == "unavailable"
+    # The binding is still the one the browser knows ...
+    assert (dispatch.session_connection_id, dispatch.session_generation) == (old_daemon.id, 7)
+    # ... and the daemon speaking for it is the one that holds it now.
+    assert (dispatch.dispatch_connection_id, dispatch.dispatch_generation) == (new_daemon.id, 8)
+    assert await broker.rtc_session_for("binding-carried") is None
+
+
+@pytest.mark.asyncio
 async def test_rtc_live_binding_reconcile_revokes_absent_and_closes_unknown():
     broker = Broker()
     daemon = DaemonConn("reconcile-host", "owner", FakeWS())  # type: ignore[arg-type]

@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use futures_util::{stream::FuturesUnordered, StreamExt};
+use futures_util::StreamExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ use crate::proto::{
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
-use crate::sessions::SessionRegistry;
+use crate::sessions::{SessionLifecycleSnapshot, SessionRegistry};
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
 use spawnd::acct_endorsement::{signature_from_wire, AcctEndorsementTranscript};
@@ -50,6 +50,34 @@ const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
 const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The whole of a host agents check, from the request to the reply. The
+/// server stops waiting at 15 s and answers its caller 504; inside this the
+/// daemon answers with what it has found, and a probe still running then is
+/// stopped.
+const HOST_AGENTS_CHECK_DEADLINE: Duration = Duration::from_secs(10);
+/// The part of that deadline the user's shell gets to say which PATH the
+/// agents are looked up on: one shell, both modes, at their own timeout.
+const HOST_AGENTS_ENV_SHARE: Duration = Duration::from_secs(4);
+/// At most this many host agents checks run at once; one more waits for a
+/// place within its own deadline. Only the host's owner can ask
+/// (`routes/hosts.py`, `_get_owned_host`) and every ask from one owner names
+/// the same agents, which `AgentCheckFlights` runs once: two covers that
+/// list changing while a check runs.
+const MAX_CONCURRENT_AGENT_CHECKS: usize = 2;
+/// At most this many of one check's agents are probed at once; the five
+/// built-in agents all are.
+const MAX_AGENTS_PROBED_AT_ONCE: usize = 8;
+/// How long a check's reply may wait for room on the connection it answers.
+const AGENT_CHECK_REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// A probe that ran out of time is logged once per this interval for each
+/// agent and probe: the clients ask every minute.
+const PROBE_DEADLINE_WARN_EVERY: Duration = Duration::from_secs(600);
+/// How long a program's output is read after it exits. Its own output is in
+/// the pipe by then; what can hold a pipe open past this is something it
+/// started and left running with the output it inherited, and the caller
+/// does not wait for that (`finish_leftovers` does, until the program's own
+/// timeout).
+const EXITED_PROGRAM_DRAIN: Duration = Duration::from_millis(200);
 const DEFAULT_SESSION_COLS: u16 = 120;
 const DEFAULT_SESSION_ROWS: u16 = 32;
 /// Credential storage has no portable cross-process notification primitive.
@@ -611,6 +639,30 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             );
         }
     });
+    // Keep the OS temp cleaner off live workers' reservation files and
+    // scrollback: once at startup (the first tick is immediate), then hourly.
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(worker_backend::WORKER_FILE_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let refreshed = tokio::task::spawn_blocking(worker_backend::refresh_worker_files)
+                .await
+                .unwrap_or(0);
+            tracing::debug!(refreshed, "refreshed worker file timestamps");
+        }
+    });
+    // What each Codex window is in, kept on this host so a restart after
+    // Codex has gone still names its thread (`host_conv`).
+    if let Some(memory) = conversation_notes() {
+        let windows = registry.clone();
+        let runs = registry.clone();
+        tokio::spawn(crate::host_conv::watch(
+            move || windows.foregrounds(),
+            move |id| runs.shell_pid(id),
+            memory,
+        ));
+    }
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
     // reset it: a key revoked on one control connection stays revoked on every
@@ -2050,7 +2102,17 @@ async fn dispatch_loop(
                     request_id,
                     targets,
                 } => {
-                    handle_host_agents_check(request_id, targets, out_tx).await;
+                    // Off the loop, like an update: a check runs programs
+                    // for seconds, and this loop is how every other frame
+                    // on the socket — offers, pings, session frames — is
+                    // read. The reply is matched by its request id.
+                    AgentCheckFlights::global().request(
+                        request_id,
+                        targets,
+                        out_tx.clone(),
+                        tokio::time::Instant::now() + HOST_AGENTS_CHECK_DEADLINE,
+                        check_host_agents,
+                    );
                 }
                 Inbound::HostAgentsInstall { request_id, target } => {
                     handle_host_agents_install(request_id, target, out_tx).await;
@@ -2524,16 +2586,199 @@ async fn dispatch_loop(
     Ok(())
 }
 
-async fn handle_host_agents_check(
+/// A request waiting for a check: its id, the connection it came in on, and
+/// the order it named its agents in, which its reply keeps.
+struct AgentCheckWaiter {
     request_id: String,
-    targets: Vec<HostAgentTarget>,
-    out_tx: &mpsc::Sender<WsOutbound>,
-) {
-    let mut checks = FuturesUnordered::new();
-    let target_count = targets.len();
-    for (index, target) in targets.into_iter().enumerate() {
-        checks.push(async move { (index, check_host_agent(target).await) });
+    out_tx: mpsc::Sender<WsOutbound>,
+    order: Vec<String>,
+}
+
+type AgentCheckWaiters = Vec<AgentCheckWaiter>;
+
+/// Host agents checks in flight, by the targets they check. A request for
+/// targets already being checked is answered with that check's result
+/// instead of starting another: every client on a host page asks once a
+/// minute, and a request that comes in while a slow check runs must not
+/// stack a second set of probes on the first.
+#[derive(Clone)]
+struct AgentCheckFlights {
+    flights: Arc<StdMutex<HashMap<String, AgentCheckWaiters>>>,
+    /// Places for checks running at once (`MAX_CONCURRENT_AGENT_CHECKS`).
+    running: Arc<tokio::sync::Semaphore>,
+}
+
+impl AgentCheckFlights {
+    fn new(running_at_once: usize) -> Self {
+        Self {
+            flights: Arc::default(),
+            running: Arc::new(tokio::sync::Semaphore::new(running_at_once)),
+        }
     }
+
+    fn global() -> &'static Self {
+        static FLIGHTS: std::sync::OnceLock<AgentCheckFlights> = std::sync::OnceLock::new();
+        FLIGHTS.get_or_init(|| Self::new(MAX_CONCURRENT_AGENT_CHECKS))
+    }
+
+    /// Answer `request_id` on `out_tx` with a check of `targets` by
+    /// `deadline`: the one in flight for the same targets, or a new one,
+    /// which a task of its own runs through `check` once one of the places
+    /// for checks is free. One that gets no place by its deadline answers
+    /// nothing, which the server reports as the timeout it is. Returns the
+    /// task if this request started it.
+    fn request<F, Fut>(
+        &self,
+        request_id: String,
+        targets: Vec<HostAgentTarget>,
+        out_tx: mpsc::Sender<WsOutbound>,
+        deadline: tokio::time::Instant,
+        check: F,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        F: FnOnce(Vec<HostAgentTarget>, tokio::time::Instant) -> Fut + Send + 'static,
+        Fut: Future<Output = Vec<HostAgentStatus>> + Send + 'static,
+    {
+        // The same agents in any order are the same check: the server's
+        // query for them names no order.
+        let mut named = targets
+            .iter()
+            .map(|target| format!("{target:?}"))
+            .collect::<Vec<_>>();
+        named.sort();
+        let key = named.join("\n");
+        let waiter = AgentCheckWaiter {
+            request_id,
+            out_tx,
+            order: targets
+                .iter()
+                .map(|target| target.agent_id.clone())
+                .collect(),
+        };
+        {
+            let mut flights = self.lock();
+            if let Some(waiters) = flights.get_mut(&key) {
+                waiters.push(waiter);
+                return None;
+            }
+            flights.insert(key.clone(), vec![waiter]);
+        }
+        let mut landing = FlightLanding {
+            flights: self.clone(),
+            key,
+            landed: false,
+        };
+        let running = Arc::clone(&self.running);
+        Some(tokio::spawn(async move {
+            let Ok(Ok(place)) = tokio::time::timeout_at(deadline, running.acquire_owned()).await
+            else {
+                let waiters = landing.land();
+                if probe_deadline_warning_due("host agents check: no place".into()) {
+                    tracing::warn!(
+                        requests = waiters.len(),
+                        running_at_once = MAX_CONCURRENT_AGENT_CHECKS,
+                        "a host agents check could not start before its deadline, with as many running already; it is not answered, and the server reports it timed out"
+                    );
+                }
+                return;
+            };
+            let agents = check(targets, deadline).await;
+            // The check is done: the place goes to the next one now, not
+            // after the replies, each of which may wait for its connection.
+            drop(place);
+            let waiters = landing.land();
+            let found = agents
+                .iter()
+                .map(|agent| (agent.agent_id.as_str(), agent))
+                .collect::<HashMap<_, _>>();
+            futures_util::future::join_all(waiters.into_iter().map(|waiter| {
+                let frame = Outbound::HostAgentsCheckResult {
+                    request_id: waiter.request_id,
+                    agents: waiter
+                        .order
+                        .iter()
+                        .filter_map(|agent_id| {
+                            found.get(agent_id.as_str()).map(|&agent| agent.clone())
+                        })
+                        .collect(),
+                };
+                let out_tx = waiter.out_tx;
+                async move {
+                    // Bounded: a connection whose writer is stuck must not
+                    // keep this task, or the other waiters, for ever.
+                    if let Ok(text) = serde_json::to_string(&frame) {
+                        let _ = out_tx
+                            .send_timeout(WsOutbound::json(text), AGENT_CHECK_REPLY_SEND_TIMEOUT)
+                            .await;
+                    }
+                }
+            }))
+            .await;
+        }))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, AgentCheckWaiters>> {
+        self.flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A flight's end: it takes the waiters when the check is done, and frees
+/// the targets if the check never finishes (a panic, a runtime shutting
+/// down), so the next request starts a check of its own.
+struct FlightLanding {
+    flights: AgentCheckFlights,
+    key: String,
+    landed: bool,
+}
+
+impl FlightLanding {
+    fn land(&mut self) -> AgentCheckWaiters {
+        self.landed = true;
+        self.flights.lock().remove(&self.key).unwrap_or_default()
+    }
+}
+
+impl Drop for FlightLanding {
+    fn drop(&mut self) {
+        if !self.landed {
+            self.flights.lock().remove(&self.key);
+        }
+    }
+}
+
+/// Check `targets` and answer by `deadline`, whatever the programs do.
+async fn check_host_agents(
+    targets: Vec<HostAgentTarget>,
+    deadline: tokio::time::Instant,
+) -> Vec<HostAgentStatus> {
+    // One environment for every agent, from the user's shell, for at most
+    // its share of the deadline.
+    let env = if targets
+        .iter()
+        .any(|target| !target.command.trim().is_empty())
+    {
+        let asked_until = deadline.min(tokio::time::Instant::now() + HOST_AGENTS_ENV_SHARE);
+        resolved_command_env_until(asked_until).await
+    } else {
+        BTreeMap::new()
+    };
+    check_host_agents_in(targets, &env, deadline).await
+}
+
+/// `check_host_agents` in `env`: up to `MAX_AGENTS_PROBED_AT_ONCE` agents
+/// at a time, answered in the order asked.
+async fn check_host_agents_in(
+    targets: Vec<HostAgentTarget>,
+    env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
+) -> Vec<HostAgentStatus> {
+    let target_count = targets.len();
+    let mut checks = futures_util::stream::iter(targets.into_iter().enumerate().map(
+        |(index, target)| async move { (index, check_host_agent(target, env, deadline).await) },
+    ))
+    .buffer_unordered(MAX_AGENTS_PROBED_AT_ONCE);
 
     let mut indexed_agents: Vec<Option<HostAgentStatus>> =
         std::iter::repeat_with(|| None).take(target_count).collect();
@@ -2542,12 +2787,65 @@ async fn handle_host_agents_check(
             *slot = Some(agent);
         }
     }
-    let agents = indexed_agents.into_iter().flatten().collect();
+    indexed_agents.into_iter().flatten().collect()
+}
 
-    let frame = Outbound::HostAgentsCheckResult { request_id, agents };
-    if let Ok(s) = serde_json::to_string(&frame) {
-        let _ = out_tx.send(WsOutbound::json(s)).await;
+/// Run one of an agent's probes, for at most `TOOL_VERSION_TIMEOUT` and not
+/// past the check's `deadline`; None once the deadline has passed. A probe
+/// that runs out of time is logged, at most once per agent and probe per
+/// `PROBE_DEADLINE_WARN_EVERY`.
+async fn run_agent_probe(
+    target: &HostAgentTarget,
+    program: &str,
+    args: &[&str],
+    env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
+) -> Option<CommandCapture> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
     }
+    let timeout = TOOL_VERSION_TIMEOUT.min(remaining);
+    let capture = run_program_capture(program, args, timeout, 4096, Some(env)).await;
+    if capture.timed_out {
+        let probe = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if probe_deadline_warning_due(format!("{}\0{probe}", target.agent_id)) {
+            tracing::warn!(
+                agent_id = %target.agent_id,
+                agent = %target.agent_name,
+                probe = %probe,
+                timeout_ms = timeout.as_millis() as u64,
+                limit = if timeout < TOOL_VERSION_TIMEOUT {
+                    "the check's deadline"
+                } else {
+                    "the probe's own timeout"
+                },
+                "a host agents check probe ran out of time and was stopped; the agent's version is reported unknown"
+            );
+        }
+    }
+    Some(capture)
+}
+
+/// Whether a probe that ran out of time, named by `key`, is logged now: the
+/// first time, then once per `PROBE_DEADLINE_WARN_EVERY`.
+fn probe_deadline_warning_due(key: String) -> bool {
+    static WARNED: std::sync::OnceLock<StdMutex<HashMap<String, tokio::time::Instant>>> =
+        std::sync::OnceLock::new();
+    let now = tokio::time::Instant::now();
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    warned.retain(|_, at| now.duration_since(*at) < PROBE_DEADLINE_WARN_EVERY);
+    if warned.contains_key(&key) {
+        return false;
+    }
+    warned.insert(key, now);
+    true
 }
 
 async fn handle_host_agents_install(
@@ -2576,7 +2874,11 @@ async fn handle_host_agents_install(
     }
 }
 
-async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
+async fn check_host_agent(
+    target: HostAgentTarget,
+    env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
+) -> HostAgentStatus {
     let command = target.command.trim().to_string();
     if command.is_empty() {
         return HostAgentStatus {
@@ -2594,8 +2896,7 @@ async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
         };
     }
 
-    let env = resolved_command_env().await;
-    let path = binary_path(&command, &env).await;
+    let path = binary_path(&command, env).await;
     let Some(path) = path else {
         return HostAgentStatus {
             agent_id: target.agent_id,
@@ -2612,11 +2913,17 @@ async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
         };
     };
 
-    let (version, error) = match read_tool_version(&command, &env).await {
+    // Independent programs, so at once. A version neither finds in time is
+    // reported unknown (`None`) — what both clients show as installed with
+    // no version — never as missing: `installed` is the lookup above.
+    let (version, latest_version) = tokio::join!(
+        read_tool_version(&target, &command, env, deadline),
+        latest_tool_version(&target, env, deadline),
+    );
+    let (version, error) = match version {
         Ok(version) => (version, None),
         Err(e) => (None, Some(format!("version check failed: {e:#}"))),
     };
-    let latest_version = latest_tool_version(target.install.as_deref(), &env).await;
     let update_available = match (version.as_deref(), latest_version.as_deref()) {
         (Some(installed), Some(latest)) => version_suggests_update(installed, latest),
         _ => None,
@@ -2670,7 +2977,7 @@ fn env_insert_ci(env: &mut BTreeMap<String, String>, name: &str, value: String) 
     env.insert(key, value);
 }
 
-fn resolve_program_in_env(
+pub(crate) fn resolve_program_in_env(
     path: &Path,
     env: &BTreeMap<String, String>,
 ) -> Option<crate::platform::ResolvedProgram> {
@@ -2732,17 +3039,22 @@ fn resolve_program_in_env(
 }
 
 async fn read_tool_version(
+    target: &HostAgentTarget,
     command: &str,
     env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
 ) -> Result<Option<String>> {
+    // One after another: each flag is the fallback for the one before, and
+    // a tool can take one of them to mean something else.
     for args in [
         &["--version"][..],
         &["version"][..],
         &["-V"][..],
         &["-v"][..],
     ] {
-        let capture =
-            run_program_capture(command, args, TOOL_VERSION_TIMEOUT, 4096, Some(env)).await;
+        let Some(capture) = run_agent_probe(target, command, args, env, deadline).await else {
+            break;
+        };
         if capture.success {
             if let Some(version) = first_meaningful_line(&capture.output) {
                 return Ok(Some(version));
@@ -2753,10 +3065,11 @@ async fn read_tool_version(
 }
 
 async fn latest_tool_version(
-    install: Option<&str>,
+    target: &HostAgentTarget,
     env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
 ) -> Option<String> {
-    let install = install?.trim();
+    let install = target.install.as_deref()?.trim();
     if install.is_empty() {
         return None;
     }
@@ -2765,28 +3078,22 @@ async fn latest_tool_version(
         .map(str::to_string)
         .or_else(|| npm_package_from_install_command(install))
     {
-        let capture = run_program_capture(
-            "npm",
-            &["view", &package, "version"],
-            TOOL_VERSION_TIMEOUT,
-            4096,
-            Some(env),
-        )
-        .await;
+        let capture =
+            run_agent_probe(target, "npm", &["view", &package, "version"], env, deadline).await?;
         if capture.success {
             return first_meaningful_line(&capture.output);
         }
     }
 
     if let Some(package) = python_package_from_install_command(install) {
-        let capture = run_program_capture(
+        let capture = run_agent_probe(
+            target,
             "python3",
             &["-m", "pip", "index", "versions", &package],
-            TOOL_VERSION_TIMEOUT,
-            4096,
-            Some(env),
+            env,
+            deadline,
         )
-        .await;
+        .await?;
         if capture.success {
             return parse_pip_latest_version(&package, &capture.output);
         }
@@ -2943,17 +3250,317 @@ fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
 }
 
 #[derive(Debug)]
-struct CommandCapture {
-    success: bool,
-    output: String,
+pub(crate) struct CommandCapture {
+    pub(crate) success: bool,
+    pub(crate) output: String,
+    /// The program ran and exited on its own: not missing, not refused by
+    /// the system, not stopped at the timeout.
+    pub(crate) exited: bool,
+    /// The program was still running at the timeout and was stopped.
+    pub(crate) timed_out: bool,
 }
 
-async fn run_program_capture(
+impl CommandCapture {
+    fn failed() -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            exited: false,
+            timed_out: false,
+        }
+    }
+}
+
+/// How a program ended and what it wrote, read until it exited — not until
+/// its output pipes closed (`EXITED_PROGRAM_DRAIN`).
+struct ProgramRun {
+    /// None: still running at its timeout, and stopped.
+    status: Option<std::io::Result<std::process::ExitStatus>>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Whether a program leads a process group of its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgramGroup {
+    /// Started with `process_group(0)`: its id is its group's, and what it
+    /// starts is stopped with it.
+    Own,
+    /// In spawnd's own group (the shell PATH probe): never signalled as a
+    /// group; only the program itself is stopped.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Shared,
+}
+
+/// Most bytes kept from one of a program's pipes; the rest is read and
+/// dropped.
+const MAX_KEPT_OUTPUT: usize = 1 << 20;
+
+/// A program's output pipes, and what has been read from each.
+struct OutputPipes {
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    out: Vec<u8>,
+    err: Vec<u8>,
+}
+
+impl OutputPipes {
+    fn take(child: &mut tokio::process::Child) -> Self {
+        Self {
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+            out: Vec::new(),
+            err: Vec::new(),
+        }
+    }
+
+    fn open(&self) -> bool {
+        self.stdout.is_some() || self.stderr.is_some()
+    }
+
+    /// Read the next chunk from whichever pipe has one; a pipe that ends is
+    /// dropped. Never finishes once both have ended.
+    async fn read_next(&mut self) {
+        tokio::select! {
+            () = read_chunk(&mut self.stdout, &mut self.out) => {}
+            () = read_chunk(&mut self.stderr, &mut self.err) => {}
+        }
+    }
+}
+
+async fn read_chunk<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>, into: &mut Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let Some(reader) = pipe.as_mut() else {
+        return std::future::pending().await;
+    };
+    let mut chunk = [0u8; 8192];
+    match reader.read(&mut chunk).await {
+        Ok(0) | Err(_) => *pipe = None,
+        Ok(read) => {
+            let room = MAX_KEPT_OUTPUT.saturating_sub(into.len());
+            into.extend_from_slice(&chunk[..read.min(room)]);
+        }
+    }
+}
+
+/// Run `child` until it exits, or for `timeout`, reading what it writes,
+/// and return as soon as it has exited and its own output is read
+/// (`EXITED_PROGRAM_DRAIN`): a server a CLI starts in the background with
+/// the stdout it inherited holds that pipe for as long as it lives, and a
+/// probe that waited for the pipe to close (`wait_with_output`) ran to its
+/// timeout every time and counted as failed.
+async fn run_until_exit(
+    child: tokio::process::Child,
+    timeout: Duration,
+    group: ProgramGroup,
+) -> ProgramRun {
+    run_until_exit_draining(child, timeout, group, EXITED_PROGRAM_DRAIN).await
+}
+
+async fn run_until_exit_draining(
+    mut child: tokio::process::Child,
+    timeout: Duration,
+    group: ProgramGroup,
+    drain: Duration,
+) -> ProgramRun {
+    let deadline = tokio::time::Instant::now() + timeout;
+    #[cfg(unix)]
+    let own_group = group == ProgramGroup::Own;
+    // No process groups here: a program is stopped alone, as it always was.
+    #[cfg(not(unix))]
+    let _ = group;
+    let mut pipes = OutputPipes::take(&mut child);
+    let exited = {
+        // A group leader's exit is observed without reaping it, so its id —
+        // its group's — stays its own until whatever it left behind has
+        // been dealt with (`finish_leftovers`).
+        #[cfg(unix)]
+        let exit = async {
+            match (own_group, child.id()) {
+                (true, Some(pid)) => exited_unreaped(pid).await,
+                _ => child.wait().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let exit = child.wait();
+        tokio::pin!(exit);
+        loop {
+            tokio::select! {
+                status = &mut exit => break Some(status),
+                () = pipes.read_next(), if pipes.open() => {}
+                () = tokio::time::sleep_until(deadline) => break None,
+            }
+        }
+    };
+    let Some(status) = exited else {
+        // Still running at its timeout: stopped, with everything in its
+        // group. It has not been reaped, so the group's id is still its own.
+        #[cfg(unix)]
+        if own_group {
+            kill_program_group(child.id());
+        }
+        let _ = child.start_kill();
+        return ProgramRun {
+            status: None,
+            stdout: pipes.out,
+            stderr: pipes.err,
+        };
+    };
+    // Its own output is in the pipes by now: read what is there, for a
+    // moment and not past its timeout. Whatever happens here, it exited, and
+    // the run says so with what it said.
+    let drained_by = (tokio::time::Instant::now() + drain).min(deadline);
+    while pipes.open() {
+        tokio::select! {
+            () = pipes.read_next() => {}
+            () = tokio::time::sleep_until(drained_by) => break,
+        }
+    }
+    let stdout = std::mem::take(&mut pipes.out);
+    let stderr = std::mem::take(&mut pipes.err);
+    #[cfg(unix)]
+    if own_group && status.is_ok() && pipes.open() {
+        // Something it started still holds its output. Left alone until
+        // the program's own timeout, as it always was (`finish_leftovers`).
+        finish_leftovers_later(child, pipes, deadline).await;
+        return ProgramRun {
+            status: Some(status),
+            stdout,
+            stderr,
+        };
+    }
+    drop(pipes);
+    // Exited, so reaping it does not wait; bounded all the same, for a
+    // status that was an error rather than an exit.
+    let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+    ProgramRun {
+        status: Some(status),
+        stdout,
+        stderr,
+    }
+}
+
+/// How often an exit is looked for when no `SIGCHLD` says to look sooner.
+#[cfg(unix)]
+const EXIT_POLL: Duration = Duration::from_millis(100);
+
+/// `pid`'s exit, observed without reaping it (`platform::exited_unreaped`):
+/// looked for at each `SIGCHLD`, and every `EXIT_POLL` in case one was
+/// missed.
+#[cfg(unix)]
+async fn exited_unreaped(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut exits = signal(SignalKind::child()).ok();
+    loop {
+        if let Some(status) = crate::platform::exited_unreaped(pid)? {
+            return Ok(status);
+        }
+        let poll = tokio::time::sleep(EXIT_POLL);
+        match exits.as_mut() {
+            Some(exits) => {
+                tokio::select! {
+                    _ = exits.recv() => {}
+                    () = poll => {}
+                }
+            }
+            None => poll.await,
+        }
+    }
+}
+
+/// At most this many programs wait at once, exited but unreaped, for what
+/// they left holding their output (`finish_leftovers`). Each holds a zombie
+/// and two pipes for no longer than its timeout: 5 s for an agent probe.
+/// Past this a probe waits for its own leftovers, as every probe did before.
+#[cfg(unix)]
+const MAX_PENDING_LEFTOVERS: usize = 16;
+
+#[cfg(unix)]
+static PENDING_LEFTOVERS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_PENDING_LEFTOVERS);
+
+/// `finish_leftovers` in a task of its own when one of the
+/// `MAX_PENDING_LEFTOVERS` places is free, here and now when none is.
+#[cfg(unix)]
+async fn finish_leftovers_later(
+    child: tokio::process::Child,
+    pipes: OutputPipes,
+    deadline: tokio::time::Instant,
+) {
+    match PENDING_LEFTOVERS.try_acquire() {
+        Ok(place) => {
+            tokio::spawn(async move {
+                let _place = place;
+                finish_leftovers(child, pipes, deadline).await;
+            });
+        }
+        Err(_) => finish_leftovers(child, pipes, deadline).await,
+    }
+}
+
+/// What an exited program left holding its output gets until the program's
+/// own timeout, `deadline`, as it did when the probe itself waited for the
+/// pipes: one that lets go by then — a cache or telemetry writer finishing
+/// — is left alone; one still holding on is stopped with the program's
+/// group. The program stays unreaped until then, so its id is still its
+/// group's when the group is signalled; it is reaped after.
+#[cfg(unix)]
+async fn finish_leftovers(
+    mut child: tokio::process::Child,
+    mut pipes: OutputPipes,
+    deadline: tokio::time::Instant,
+) {
+    let released = tokio::time::timeout_at(deadline, async {
+        while pipes.open() {
+            pipes.out.clear();
+            pipes.err.clear();
+            pipes.read_next().await;
+        }
+    })
+    .await
+    .is_ok();
+    if !released {
+        kill_program_group(child.id());
+    }
+    drop(pipes);
+    let _ = child.wait().await;
+}
+
+/// SIGKILL the process group `leader` leads. Only ever called for a leader
+/// the caller has not reaped, whose id is therefore still its group's;
+/// never for spawnd's own group (0), init's (1), or any negative id.
+#[cfg(unix)]
+fn kill_program_group(leader: Option<u32>) {
+    let Some(group) = leader
+        .and_then(|id| i32::try_from(id).ok())
+        .filter(|id| *id > 1)
+    else {
+        return;
+    };
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(group),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
+pub(crate) async fn run_program_capture(
     program: &str,
     args: &[&str],
     timeout: Duration,
     output_limit: usize,
     env: Option<&BTreeMap<String, String>>,
+) -> CommandCapture {
+    run_program_capture_in(program, args, timeout, output_limit, env, None).await
+}
+
+/// `run_program_capture`, run in `cwd` where one is given.
+pub(crate) async fn run_program_capture_in(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    output_limit: usize,
+    env: Option<&BTreeMap<String, String>>,
+    cwd: Option<&Path>,
 ) -> CommandCapture {
     let process_env;
     let resolution_env = match env {
@@ -2964,19 +3571,13 @@ async fn run_program_capture(
         }
     };
     let Some(resolved) = resolve_program_in_env(Path::new(program), resolution_env) else {
-        return CommandCapture {
-            success: false,
-            output: String::new(),
-        };
+        return CommandCapture::failed();
     };
     #[cfg(windows)]
     if resolved.kind == crate::platform::ProgramKind::CmdShim
         && cmd_shim_command_line(args).is_none()
     {
-        return CommandCapture {
-            success: false,
-            output: String::new(),
-        };
+        return CommandCapture::failed();
     }
     #[cfg(unix)]
     let mut command = {
@@ -3020,29 +3621,41 @@ async fn run_program_capture(
     if let Some(env) = env {
         command.envs(env);
     }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    // A group of its own, so a timeout stops everything the program started
+    // (an npm launcher's native binary, a shell's children), not only it.
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            return CommandCapture {
-                success: false,
-                output: String::new(),
-            };
+    // `exec` of a file something still has open for writing — one just
+    // updated, or written by a test while another thread forks — fails with
+    // ETXTBSY for a moment (as `install::spawn_probe` knows): retried briefly.
+    let mut busy = 0;
+    let child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 40 => {
+                busy += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(_) => return CommandCapture::failed(),
         }
     };
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => CommandCapture {
-            success: output.status.success(),
-            output: combined_output(&output.stdout, &output.stderr, output_limit),
+    let run = run_until_exit(child, timeout, ProgramGroup::Own).await;
+    match run.status {
+        Some(Ok(status)) => CommandCapture {
+            success: status.success(),
+            output: combined_output(&run.stdout, &run.stderr, output_limit),
+            exited: true,
+            timed_out: false,
         },
-        Ok(Err(_)) => CommandCapture {
-            success: false,
-            output: String::new(),
-        },
-        Err(_) => CommandCapture {
-            success: false,
-            output: String::new(),
+        Some(Err(_)) => CommandCapture::failed(),
+        None => CommandCapture {
+            timed_out: true,
+            ..CommandCapture::failed()
         },
     }
 }
@@ -3248,7 +3861,18 @@ async fn handle_session_create(
         }
     };
 
-    register_attached(session_id, launched, registry, rtc_sessions, out_tx, true).await;
+    // Kept with the window: what a device asks this window's Codex with
+    // before typing it (`codex_launch`) is the environment its shell has.
+    register_attached(
+        session_id,
+        launched,
+        registry,
+        rtc_sessions,
+        out_tx,
+        true,
+        Some(Arc::new(env)),
+    )
+    .await;
 }
 
 /// Ask macOS for the folders this daemon reads — once, here, and never again.
@@ -3384,40 +4008,68 @@ fn login_shell_argv(shell: String) -> Vec<String> {
     }
 }
 
-async fn resolved_command_env() -> BTreeMap<String, String> {
+/// The environment agents run in, the user's shell asked for its PATH until
+/// `deadline` at the latest.
+async fn resolved_command_env_until(deadline: tokio::time::Instant) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
-    normalize_session_env(&mut env).await;
+    normalize_session_env_until(&mut env, Some(deadline)).await;
     env
 }
 
 async fn normalize_session_env(env: &mut BTreeMap<String, String>) {
+    normalize_session_env_until(env, None).await;
+}
+
+async fn normalize_session_env_until(
+    env: &mut BTreeMap<String, String>,
+    deadline: Option<tokio::time::Instant>,
+) {
     env_remove_ci(env, "NO_COLOR");
     env_insert_ci(env, "TERM", "xterm-256color".into());
     env_insert_ci(env, "COLORTERM", "truecolor".into());
     if env_get_ci(env, "CLICOLOR").is_none() {
         env_insert_ci(env, "CLICOLOR", "1".into());
     }
-    enrich_path_from_user_shell(env).await;
+    enrich_path_from_user_shell(env, deadline).await;
 }
 
-async fn enrich_path_from_user_shell(env: &mut BTreeMap<String, String>) {
-    let mut preferred = shell_path_entries(env).await;
+async fn enrich_path_from_user_shell(
+    env: &mut BTreeMap<String, String>,
+    deadline: Option<tokio::time::Instant>,
+) {
+    let mut preferred = shell_path_entries(env, deadline).await;
     preferred.extend(common_user_bin_entries(env));
     prepend_path_entries(env, preferred);
 }
 
 #[cfg(windows)]
-async fn shell_path_entries(_env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+async fn shell_path_entries(
+    _env: &BTreeMap<String, String>,
+    _deadline: Option<tokio::time::Instant>,
+) -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// The PATH the user's shell gives, asked of each candidate shell in both
+/// modes until one answers — and, with a `deadline`, not past it.
 #[cfg(not(windows))]
-async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+async fn shell_path_entries(
+    env: &BTreeMap<String, String>,
+    deadline: Option<tokio::time::Instant>,
+) -> Vec<PathBuf> {
     #[cfg(unix)]
     for shell in candidate_shells(env) {
         let mut entries = Vec::new();
         for mode in ["-ic", "-lc"] {
-            if let Some(path) = probe_shell_path(&shell, mode, env).await {
+            let now = tokio::time::Instant::now();
+            let mut asked_until = now + SHELL_PATH_PROBE_TIMEOUT;
+            if let Some(deadline) = deadline {
+                if deadline <= now {
+                    return entries;
+                }
+                asked_until = asked_until.min(deadline);
+            }
+            if let Some(path) = probe_shell_path(&shell, mode, env, asked_until).await {
                 entries.extend(std::env::split_paths(&path));
             }
         }
@@ -3426,7 +4078,7 @@ async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
         }
     }
     #[cfg(not(unix))]
-    let _ = env;
+    let _ = (env, deadline);
     Vec::new()
 }
 
@@ -3435,6 +4087,7 @@ async fn probe_shell_path(
     shell: &Path,
     mode: &str,
     env: &BTreeMap<String, String>,
+    deadline: tokio::time::Instant,
 ) -> Option<String> {
     let mut command = Command::new(shell);
     command
@@ -3446,14 +4099,27 @@ async fn probe_shell_path(
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(SHELL_PATH_PROBE_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
+    // Read until the shell exits, not until its output closes: a job an rc
+    // file starts in the background holds that output for as long as it
+    // runs. The shell is in spawnd's own process group, so no group is
+    // signalled here; only a shell still running at the deadline is killed.
+    let child = command.spawn().ok()?;
+    let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let run = run_until_exit(child, timeout, ProgramGroup::Shared).await;
+    if run.status.is_none() {
+        if probe_deadline_warning_due(format!("{}\0{mode}", shell.display())) {
+            tracing::warn!(
+                shell = %shell.display(),
+                mode,
+                "the user's shell did not say its PATH in time and was stopped; what it would have added is not used"
+            );
+        }
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
+    if !run.status?.ok()?.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&run.stdout)
         .lines()
         .rev()
         .map(str::trim)
@@ -3765,6 +4431,876 @@ mod tests {
     use futures_util::SinkExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+
+    /// A program that hangs past a capture's timeout is stopped with
+    /// everything it started: its process group goes whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_capture_that_times_out_takes_what_it_started_with_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let program = dir.path().join("hangs");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nPATH=/bin:/usr/bin\nsleep 30 &\necho $! > '{}'\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Generous, for a loaded runner: the grandchild's id is read as soon
+        // as it is written, while the capture waits out its timeout.
+        let timeout = Duration::from_secs(2);
+        let written = async {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return Some(pid);
+                }
+                if std::time::Instant::now() > deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let (capture, grandchild) = tokio::join!(
+            run_program_capture_in(
+                program.to_str().unwrap(),
+                &[],
+                timeout,
+                4096,
+                None,
+                Some(dir.path()),
+            ),
+            written,
+        );
+        assert!(!capture.exited);
+        let grandchild = grandchild.expect("the program never started its grandchild");
+        // Gone, or a zombie its new parent has yet to reap.
+        let running = |pid: i32| {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map_or(true, |stat| !stat.contains(") Z "))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(grandchild) {
+            if std::time::Instant::now() > deadline {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(grandchild),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                panic!("the capture's grandchild {grandchild} outlived its timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A program that says something and exits, on every platform: the
+    /// capture's ordinary path, run where `run_until_exit` has no process
+    /// groups too.
+    #[tokio::test]
+    async fn a_capture_returns_what_an_exited_program_said() {
+        #[cfg(unix)]
+        let (program, args) = ("/bin/sh", &["-c", "echo fixture-ok"][..]);
+        #[cfg(windows)]
+        let (program, args) = ("cmd", &["/d", "/c", "echo fixture-ok"][..]);
+        let capture = run_program_capture(program, args, Duration::from_secs(20), 4096, None).await;
+        assert!(
+            capture.exited && capture.success && !capture.timed_out,
+            "{capture:?}"
+        );
+        assert_eq!(capture.output, "fixture-ok");
+    }
+
+    /// A process id, read from a file the fixture wrote it to.
+    #[cfg(unix)]
+    fn written_pid(path: &Path) -> i32 {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap()
+    }
+
+    /// Whether `pid` is a process that has not ended: alive, or (on Linux,
+    /// where it can be told) not yet a zombie.
+    #[cfg(unix)]
+    fn still_running(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map_or(true, |stat| !stat.contains(") Z "))
+    }
+
+    /// Whether `pid` exists at all, a zombie included.
+    #[cfg(unix)]
+    fn exists(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    #[cfg(unix)]
+    async fn until_gone(pid: i32, what: &str, within: Duration) {
+        let deadline = std::time::Instant::now() + within;
+        while still_running(pid) {
+            if std::time::Instant::now() > deadline {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                panic!("{what} ({pid}) was never stopped");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join(name);
+        std::fs::write(&program, format!("#!/bin/sh\nPATH=/bin:/usr/bin\n{body}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    /// A program that prints and exits, leaving something it started
+    /// holding its output — a background server a CLI starts with the
+    /// stdout it inherited — is a program that answered: the capture
+    /// returns when it exits, with what it said. What it left is not
+    /// touched before the program's own timeout, and the program stays
+    /// unreaped until then, its id still its group's; at the timeout what
+    /// still holds the output goes with the group and the program is
+    /// reaped. Nothing outside the group is touched: not a process with a
+    /// group of its own, and not one in this test's (spawnd's) group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_leftover_is_stopped_at_the_programs_timeout_and_only_its_group() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let leader_file = dir.path().join("leader.pid");
+        let leftover_file = dir.path().join("leftover.pid");
+        let program = script(
+            dir.path(),
+            "cli",
+            &format!(
+                "echo $$ > '{}'\necho 'fixture-cli 2.0.0'\nsleep 30 &\necho $! > '{}'\nexit 0",
+                leader_file.display(),
+                leftover_file.display()
+            ),
+        );
+        let mut own_group = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut our_group = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+
+        let timeout = Duration::from_secs(6);
+        let started = std::time::Instant::now();
+        let capture = run_program_capture(
+            program.to_str().unwrap(),
+            &["--version"],
+            timeout,
+            4096,
+            None,
+        )
+        .await;
+        assert!(
+            capture.exited && capture.success && !capture.timed_out,
+            "a program that exited 0 was not taken at its word: {capture:?}"
+        );
+        assert_eq!(capture.output, "fixture-cli 2.0.0");
+        let leader = written_pid(&leader_file);
+        let leftover = written_pid(&leftover_file);
+        assert!(
+            started.elapsed() < timeout,
+            "the capture waited for what the program left behind"
+        );
+        // Time enough for any cleanup that would act early to have acted,
+        // well inside the program's timeout.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            still_running(leftover),
+            "what the program left was stopped before the program's timeout"
+        );
+        assert!(
+            exists(leader),
+            "the program was reaped before its group was dealt with"
+        );
+
+        until_gone(
+            leftover,
+            "what held the program's output",
+            timeout + Duration::from_secs(10),
+        )
+        .await;
+        let reaped_by = std::time::Instant::now() + Duration::from_secs(10);
+        while exists(leader) {
+            assert!(
+                std::time::Instant::now() < reaped_by,
+                "the program was never reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for bystander in [&mut own_group, &mut our_group] {
+            assert!(
+                bystander.try_wait().unwrap().is_none(),
+                "a process outside the program's group was stopped"
+            );
+            let _ = bystander.kill();
+            let _ = bystander.wait();
+        }
+    }
+
+    /// Something a program starts that finishes by itself within the
+    /// program's timeout — a cache or telemetry writer holding the output it
+    /// inherited — finishes: nothing stops it early.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_finishes_within_the_timeout_is_left_to_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("go");
+        let marker = dir.path().join("finished");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let program = script(
+            dir.path(),
+            "cli",
+            &format!(
+                "echo 'fixture-cli 1.0'\n(read line < '{}'; echo done > '{}') &\nexit 0",
+                fifo.display(),
+                marker.display()
+            ),
+        );
+        let capture = run_program_capture(
+            program.to_str().unwrap(),
+            &["--version"],
+            Duration::from_secs(30),
+            4096,
+            None,
+        )
+        .await;
+        assert!(capture.exited && capture.success, "{capture:?}");
+        // Time enough for any cleanup that would act early to have acted,
+        // well inside the program's timeout; only then may the helper finish.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            // Without waiting: with the helper gone there is no reader, and
+            // this fails at once instead of waiting for one for ever.
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&fifo)
+                .expect("the helper was stopped before it could finish");
+            writer.write_all(b"go\n").unwrap();
+        }
+        let finished_by = std::time::Instant::now() + Duration::from_secs(20);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < finished_by,
+                "the helper was stopped before it could finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The program exited and its timeout came while its output was still
+    /// being read: it still exited, and the run says so with what it said.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_during_the_drain_still_reports_the_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let leftover_file = dir.path().join("leftover.pid");
+        let program = script(
+            dir.path(),
+            "cli",
+            &format!(
+                "echo 'fixture-cli 3.0'\nsleep 30 &\necho $! > '{}'\nexit 0",
+                leftover_file.display()
+            ),
+        );
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        // A drain far longer than the timeout: the timeout ends it.
+        let run = run_until_exit_draining(
+            child,
+            Duration::from_secs(3),
+            ProgramGroup::Own,
+            Duration::from_secs(60),
+        )
+        .await;
+        let status = run
+            .status
+            .expect("an exited program was reported still running")
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "fixture-cli 3.0\n");
+        until_gone(
+            written_pid(&leftover_file),
+            "what held the program's output",
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+
+    /// The shell asked for its PATH (by every session launch, and by the
+    /// agents check) answers when it exits, though a job its rc file started
+    /// in the background holds its output — which the probe, in spawnd's
+    /// own process group, never signals.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_shell_path_probe_answers_though_a_background_job_holds_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_file = dir.path().join("job.pid");
+        let shell = script(
+            dir.path(),
+            "shell",
+            &format!(
+                "sleep 30 &\necho $! > '{}'\nprintf '%s\\n' /fixture/bin",
+                job_file.display()
+            ),
+        );
+        let env = BTreeMap::from([("PATH".to_string(), "/bin:/usr/bin".to_string())]);
+        let path = probe_shell_path(
+            &shell,
+            "-ic",
+            &env,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+        let job = written_pid(&job_file);
+        let job_alive = still_running(job);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(job),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_eq!(path.as_deref(), Some("/fixture/bin"));
+        assert!(job_alive, "the shell's background job was signalled");
+    }
+
+    #[cfg(unix)]
+    fn agent_fixture(dir: &Path, name: &str, script: &str) -> HostAgentTarget {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join(name);
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nPATH=/bin:/usr/bin\n{script}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        HostAgentTarget {
+            agent_id: format!("{name}-{}", Uuid::new_v4()),
+            agent_name: name.to_string(),
+            agent_kind: "cli".to_string(),
+            command: program.to_string_lossy().into_owned(),
+            install: None,
+        }
+    }
+
+    fn check_result(frame: WsOutbound) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_str(frame.as_str()).unwrap();
+        assert_eq!(value["type"], "host.agents.check_result");
+        value
+    }
+
+    /// A check whose agent never answers still answers its request, by the
+    /// check's deadline: the probe is stopped there and the agent is
+    /// reported installed with its version unknown — never missing — so
+    /// the server has a reply to give instead of a 504.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_whose_agent_never_answers_replies_by_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = agent_fixture(dir.path(), "silent-agent", "exec sleep 60");
+        let env = BTreeMap::from([("PATH".to_string(), "/bin:/usr/bin".to_string())]);
+        let flights = AgentCheckFlights::new(MAX_CONCURRENT_AGENT_CHECKS);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        flights
+            .request(
+                "silent".into(),
+                vec![target],
+                out_tx,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+                move |targets, deadline| async move {
+                    check_host_agents_in(targets, &env, deadline).await
+                },
+            )
+            .expect("the first request starts the check");
+
+        let reply = tokio::time::timeout(Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("a check whose agent never answers replied by its deadline")
+            .unwrap();
+        let reply = check_result(reply);
+        assert_eq!(reply["request_id"], "silent");
+        let agent = &reply["agents"][0];
+        assert_eq!(agent["installed"], true);
+        assert!(agent["version"].is_null(), "{agent}");
+        assert!(agent["error"].is_null(), "{agent}");
+    }
+
+    fn test_agent(id: &str) -> HostAgentTarget {
+        HostAgentTarget {
+            agent_id: id.into(),
+            agent_name: id.into(),
+            agent_kind: "cli".into(),
+            command: format!("{id}-agent"),
+            install: None,
+        }
+    }
+
+    /// A check that says it started on `started` and finishes when
+    /// `release` is sent, finding each agent at "1.0".
+    fn gated_check(
+        started: mpsc::UnboundedSender<String>,
+        release: oneshot::Receiver<()>,
+    ) -> impl FnOnce(
+        Vec<HostAgentTarget>,
+        tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = Vec<HostAgentStatus>> + Send>>
+           + Send
+           + 'static {
+        move |targets, _deadline| {
+            Box::pin(async move {
+                let _ = started.send(targets[0].agent_id.clone());
+                let _ = release.await;
+                targets
+                    .into_iter()
+                    .map(|target| HostAgentStatus {
+                        agent_id: target.agent_id,
+                        agent_name: target.agent_name,
+                        agent_kind: target.agent_kind,
+                        command: target.command,
+                        install: target.install,
+                        installed: true,
+                        path: None,
+                        version: Some("1.0".into()),
+                        latest_version: None,
+                        update_available: None,
+                        error: None,
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// Requests for targets already being checked join that check, whatever
+    /// order they name them in: one set of probes, every request answered by
+    /// its own id on its own connection, in the order it asked. A check that
+    /// never lands frees its targets.
+    #[tokio::test]
+    async fn overlapping_requests_for_the_same_agents_share_one_check() {
+        let flights = AgentCheckFlights::new(MAX_CONCURRENT_AGENT_CHECKS);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let (one, two) = (test_agent("one"), test_agent("two"));
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        let (release, released) = oneshot::channel::<()>();
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        let flight = flights
+            .request(
+                "first".into(),
+                vec![one.clone(), two.clone()],
+                first_tx,
+                deadline,
+                gated_check(started_tx.clone(), released),
+            )
+            .expect("the first request starts the check");
+        let (_unused_release, unused) = oneshot::channel::<()>();
+        assert!(
+            flights
+                .request(
+                    "second".into(),
+                    vec![two.clone(), one.clone()],
+                    second_tx,
+                    deadline,
+                    gated_check(started_tx.clone(), unused),
+                )
+                .is_none(),
+            "a request for agents being checked, named in another order, started a check of its own"
+        );
+        release.send(()).unwrap();
+        flight.await.unwrap();
+        for (rx, id, order) in [
+            (&mut first_rx, "first", ["one", "two"]),
+            (&mut second_rx, "second", ["two", "one"]),
+        ] {
+            let reply = check_result(rx.try_recv().expect("every waiting request is answered"));
+            assert_eq!(reply["request_id"], id);
+            let answered = reply["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|agent| agent["agent_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                answered, order,
+                "a reply out of the order its request asked"
+            );
+            assert_eq!(reply["agents"][0]["version"], "1.0");
+        }
+        assert_eq!(started.try_recv().unwrap(), "one");
+        assert!(started.try_recv().is_err(), "one set of probes, not two");
+
+        // Landed: the next request is a check of its own. One that never
+        // lands (aborted here) frees its targets all the same.
+        let (third_tx, _third_rx) = mpsc::channel(4);
+        let (_hold, held) = oneshot::channel::<()>();
+        let aborted = flights
+            .request(
+                "third".into(),
+                vec![one.clone(), two.clone()],
+                third_tx,
+                deadline,
+                gated_check(started_tx.clone(), held),
+            )
+            .expect("a check that landed is not joined");
+        aborted.abort();
+        let _ = aborted.await;
+        let (fourth_tx, _fourth_rx) = mpsc::channel(4);
+        let (_hold, held) = oneshot::channel::<()>();
+        let fourth = flights
+            .request(
+                "fourth".into(),
+                vec![one, two],
+                fourth_tx,
+                deadline,
+                gated_check(started_tx, held),
+            )
+            .expect("a check that never landed freed its targets");
+        fourth.abort();
+    }
+
+    /// A finished check gives its place to the next at once, not after its
+    /// replies: one waiting for room on a connection that is not reading
+    /// can take `AGENT_CHECK_REPLY_SEND_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_check_frees_its_place_before_it_replies() {
+        let flights = AgentCheckFlights::new(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        // A connection with no room: the first check's reply waits on it.
+        let (stuck_tx, _stuck_rx) = mpsc::channel(1);
+        stuck_tx.try_send(WsOutbound::json("{}".into())).unwrap();
+        let (release, released) = oneshot::channel::<()>();
+        release.send(()).unwrap();
+        let first = flights
+            .request(
+                "stuck".into(),
+                vec![test_agent("first")],
+                stuck_tx,
+                deadline,
+                gated_check(started_tx.clone(), released),
+            )
+            .unwrap();
+        assert_eq!(started.recv().await.unwrap(), "first");
+        let began = tokio::time::Instant::now();
+        let (next_tx, _next_rx) = mpsc::channel(4);
+        let (_hold, held) = oneshot::channel::<()>();
+        let next = flights
+            .request(
+                "next".into(),
+                vec![test_agent("second")],
+                next_tx,
+                deadline,
+                gated_check(started_tx, held),
+            )
+            .unwrap();
+        assert_eq!(started.recv().await.unwrap(), "second");
+        assert!(
+            began.elapsed() < AGENT_CHECK_REPLY_SEND_TIMEOUT,
+            "the next check waited for the first one's reply"
+        );
+        first.await.unwrap();
+        next.abort();
+    }
+
+    /// Checks of different agents run at most `running_at_once` at a time;
+    /// one more waits for a place, and starts when one frees within its
+    /// deadline. One that gets no place by its deadline answers nothing —
+    /// the server reports the timeout — and frees its targets.
+    #[tokio::test(start_paused = true)]
+    async fn checks_beyond_the_cap_wait_for_a_place_within_their_deadline() {
+        let flights = AgentCheckFlights::new(2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        let mut releases = HashMap::new();
+        let mut replies = HashMap::new();
+        for id in ["a", "b", "c"] {
+            let (release, released) = oneshot::channel::<()>();
+            let (out_tx, out_rx) = mpsc::channel(4);
+            flights
+                .request(
+                    id.into(),
+                    vec![test_agent(id)],
+                    out_tx,
+                    deadline,
+                    gated_check(started_tx.clone(), released),
+                )
+                .expect("different agents are different checks");
+            releases.insert(id, release);
+            replies.insert(id, out_rx);
+        }
+        // Everything runnable has run: two checks hold the places.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut running = vec![started.try_recv().unwrap(), started.try_recv().unwrap()];
+        running.sort();
+        assert_eq!(running, ["a", "b"]);
+        assert!(
+            started.try_recv().is_err(),
+            "a third check ran past the cap"
+        );
+
+        releases.remove("a").unwrap().send(()).unwrap();
+        let reply = check_result(replies.get_mut("a").unwrap().recv().await.unwrap());
+        assert_eq!(reply["request_id"], "a");
+        assert_eq!(
+            started.recv().await.unwrap(),
+            "c",
+            "the waiting check took the freed place"
+        );
+        for id in ["b", "c"] {
+            releases.remove(id).unwrap().send(()).unwrap();
+            let reply = check_result(replies.get_mut(id).unwrap().recv().await.unwrap());
+            assert_eq!(reply["request_id"], id);
+        }
+
+        // One place, held past the deadline of a check waiting for it.
+        let flights = AgentCheckFlights::new(1);
+        let (_hold, held) = oneshot::channel::<()>();
+        let (holder_tx, _holder_rx) = mpsc::channel(4);
+        let holder = flights
+            .request(
+                "holder".into(),
+                vec![test_agent("holder")],
+                holder_tx,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                gated_check(started_tx.clone(), held),
+            )
+            .unwrap();
+        let (late_tx, mut late_rx) = mpsc::channel(4);
+        let late = flights
+            .request(
+                "late".into(),
+                vec![test_agent("late")],
+                late_tx,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                gated_check(started_tx.clone(), oneshot::channel().1),
+            )
+            .unwrap();
+        late.await.unwrap();
+        assert!(
+            late_rx.recv().await.is_none(),
+            "a check that never got a place answered anyway"
+        );
+        let (again_tx, _again_rx) = mpsc::channel(4);
+        assert!(
+            flights
+                .request(
+                    "again".into(),
+                    vec![test_agent("late")],
+                    again_tx,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    gated_check(started_tx, oneshot::channel().1),
+                )
+                .is_some(),
+            "a check that never started freed its targets"
+        );
+        holder.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_that_runs_out_of_time_is_logged_once_per_interval() {
+        let key = format!("rate-limit-{}", Uuid::new_v4());
+        assert!(probe_deadline_warning_due(key.clone()));
+        assert!(!probe_deadline_warning_due(key.clone()));
+        tokio::time::advance(PROBE_DEADLINE_WARN_EVERY - Duration::from_millis(1)).await;
+        assert!(!probe_deadline_warning_due(key.clone()));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(probe_deadline_warning_due(key));
+    }
+
+    /// The agents check that made a host answer offers half a minute late:
+    /// run on the dispatch loop, it held every frame on the socket for as
+    /// long as its programs took. An agent here waits on a FIFO the test
+    /// opens only at the end, so the check is in progress for the whole
+    /// exchange; an offer and a ping sent meanwhile must be answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_agents_check_does_not_hold_up_offers_or_pings() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("release");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let target = agent_fixture(
+            dir.path(),
+            "waiting-agent",
+            &format!(
+                "read line < '{}'\necho 'waiting-agent 3.1.4'",
+                fifo.display()
+            ),
+        );
+        let host_id = Uuid::from_u128(43);
+        let record = credential_record(
+            1,
+            1,
+            "test-token",
+            host_id,
+            "https://spawn.example/control",
+            7,
+            &[],
+        );
+        let live = live_snapshot(record);
+        let registry = SessionRegistry::new();
+        let rtc_sessions = RtcSessions::new();
+        let mut revoked = RevocationSet::new();
+        let (in_tx, mut in_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+
+        let dispatch = dispatch_loop(
+            &mut in_rx,
+            &registry,
+            &rtc_sessions,
+            &out_tx,
+            &live,
+            &mut revoked,
+            Arc::new(StdMutex::new(None)),
+            std::collections::HashSet::new(),
+        );
+        let exercise = async move {
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::HostAgentsCheck {
+                    request_id: "slow-check".into(),
+                    targets: vec![target],
+                })))
+                .await
+                .unwrap();
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::RtcOffer {
+                    session_id: "offer-during-check".into(),
+                    binding_nonce: Some("n".repeat(32)),
+                    binding_generation: Some(1),
+                    scope_type: Some("host".into()),
+                    scope_id: Some(host_id),
+                    protocol: Some("spawn.host.ctl".into()),
+                    protocol_version: Some(2),
+                    sdp: None,
+                    signed_envelope: Some("{}".into()),
+                    carried_endorsements: Vec::new(),
+                    ice_servers: Vec::new(),
+                    ice_transport_policy: None,
+                    ice_restart: false,
+                })))
+                .await
+                .unwrap();
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::HostPing {
+                    request_id: "ping-during-check".into(),
+                })))
+                .await
+                .unwrap();
+            for expected in ["rtc.status", "host.pong"] {
+                let frame = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("{expected} waited on a host agents check still in progress")
+                    })
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(frame.as_str()).unwrap();
+                assert_eq!(value["type"], expected, "{value}");
+            }
+
+            // Now let the agent answer: the check finishes and replies.
+            let release = fifo.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(release)
+                    .unwrap();
+                writer.write_all(b"go\n").unwrap();
+            });
+            let reply = tokio::time::timeout(Duration::from_secs(20), out_rx.recv())
+                .await
+                .expect("the check replied once its agent answered")
+                .unwrap();
+            let reply = check_result(reply);
+            assert_eq!(reply["request_id"], "slow-check");
+            assert_eq!(reply["agents"][0]["version"], "waiting-agent 3.1.4");
+            drop(in_tx);
+        };
+
+        let (_, dispatch_result) = tokio::time::timeout(Duration::from_secs(40), async {
+            tokio::join!(exercise, dispatch)
+        })
+        .await
+        .expect("dispatch agents check test timeout");
+        dispatch_result.unwrap();
+    }
+
+    /// A deleted, archived or moved window leaves no note of its Codex
+    /// thread on this host: not the one it had, and not one a last look
+    /// wrote while its worker was stopping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_window_leaves_no_codex_note_behind() {
+        use crate::host_conv::{ConversationMemory, ConversationState, Inspection, Source};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let notes = tempfile::tempdir().unwrap();
+        let memory = ConversationMemory::new(notes.path().join("conversations"));
+        let window = Uuid::new_v4();
+        let codex = Inspection {
+            agent: Some("codex"),
+            conversation_id: Some("01a1851d-2f36-76d1-98ee-b27aeae4a30d".into()),
+            state: ConversationState::Unknown,
+            cli_version: None,
+            live_elsewhere: false,
+            fresh: false,
+            source: Source::OpenFile,
+            fresh_thread: None,
+            shared_server: false,
+        };
+        memory.note(window, &codex);
+        assert!(memory.recall(window).is_some());
+
+        let running = Arc::new(AtomicBool::new(true));
+        let stopping = tokio::spawn(forget_stopped_window(memory.clone(), window, {
+            let running = Arc::clone(&running);
+            move || running.load(Ordering::SeqCst)
+        }));
+        // Forgotten at once, while its worker is still stopping.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while memory.recall(window).is_some() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(memory.recall(window), None);
+        // A look that read the window's Codex before it stopped writes late.
+        memory.note(window, &codex);
+        running.store(false, Ordering::SeqCst);
+        stopping.await.unwrap();
+        assert_eq!(memory.recall(window), None);
+
+        // A window that does not run here is forgotten all the same.
+        memory.note(window, &codex);
+        forget_stopped_window(memory.clone(), window, || false).await;
+        assert_eq!(memory.recall(window), None);
+    }
 
     #[derive(Clone, Copy)]
     struct SelectDaemonSubprotocol;
@@ -6660,6 +8196,43 @@ async fn handle_session_restart(
     }
 }
 
+/// Where this daemon notes each Codex window's thread (`host_conv`), on a
+/// platform where it inspects windows at all.
+fn conversation_notes() -> Option<crate::host_conv::ConversationMemory> {
+    if !crate::host_conv::SUPPORTED {
+        return None;
+    }
+    config::conversation_notes_dir()
+        .ok()
+        .map(crate::host_conv::ConversationMemory::new)
+}
+
+/// How long a stopped window's worker is waited for before its note is
+/// forgotten a second time regardless.
+const STOPPED_WINDOW_WAIT: Duration = Duration::from_secs(10);
+
+/// A window stopped here for good — deleted, archived, or moved to another
+/// host; `session.kill` is only ever sent for those — forgets the Codex
+/// thread noted for it: at once, which is all a window that does not run
+/// here needs, and again once `running` says its worker has gone, so that a
+/// look that read the window's Codex just before it stopped cannot leave
+/// its note behind.
+async fn forget_stopped_window(
+    notes: crate::host_conv::ConversationMemory,
+    session_id: Uuid,
+    running: impl Fn() -> bool,
+) {
+    let forget = |notes: crate::host_conv::ConversationMemory| async move {
+        let _ = tokio::task::spawn_blocking(move || notes.forget(session_id)).await;
+    };
+    forget(notes.clone()).await;
+    let deadline = tokio::time::Instant::now() + STOPPED_WINDOW_WAIT;
+    while running() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    forget(notes).await;
+}
+
 async fn handle_session_kill(
     session_id: Uuid,
     signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
@@ -6672,7 +8245,15 @@ async fn handle_session_kill(
     if !registry.contains(session_id) {
         let _ = ensure_session_attached(session_id, registry, rtc_sessions, out_tx).await;
     }
-    let Some(snapshot) = registry.lifecycle_snapshot(session_id) else {
+    let stopping = registry.lifecycle_snapshot(session_id);
+    if let Some(notes) = conversation_notes() {
+        let registry = registry.clone();
+        let worker = stopping.as_ref().map(SessionLifecycleSnapshot::binding);
+        tokio::spawn(forget_stopped_window(notes, session_id, move || {
+            worker.is_some_and(|worker| registry.is_current(worker))
+        }));
+    }
+    let Some(snapshot) = stopping else {
         send_error(
             out_tx,
             Some(session_id),
@@ -6829,6 +8410,7 @@ async fn adopt_worker_session(
         rtc_sessions,
         out_tx,
         notify_started,
+        None,
     )
     .await;
     Ok(true)
@@ -6843,6 +8425,7 @@ async fn register_attached(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
+    launch_env: Option<crate::sessions::LaunchEnv>,
 ) {
     let pid = launched.pid;
     let exit_rx = launched.exit_rx;
@@ -6858,7 +8441,7 @@ async fn register_attached(
                 .await,
         );
     }
-    let generation = registry.insert(launched.handle);
+    let generation = registry.insert_launched(launched.handle, launch_env);
     drop(transition);
     crate::state::active_heartbeat(registry.ids().len());
 

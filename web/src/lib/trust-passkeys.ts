@@ -32,6 +32,7 @@ import {
 import { browserHostPinServerOrigin, listActiveBrowserHostPins } from "@/lib/browser-host-pins";
 import {
   addBackupPasskey,
+  describeLastPasskeyRemoval,
   describeUnlockImport,
   type HealOutcome,
   type PasskeyFlowsIo,
@@ -376,10 +377,9 @@ export function usePasskeyTrust() {
       acknowledgeUnreadable?: boolean;
     }) => removeLastPasskey(flowsIo(), target, { acknowledgeUnreadable }),
     onMutate: begin,
-    onSuccess: ({ skippedRootReason }) => {
-      setStatus(
-        "Passkey removed. Your devices keep working, but if you lose them all, nothing brings this account's hosts back.",
-      );
+    onSuccess: (outcome) => {
+      setStatus(describeLastPasskeyRemoval(outcome));
+      const { skippedRootReason } = outcome;
       // Loud skip (hardening B3): a live root row the sealed bundle did not
       // vouch for stays untouched, and the operator hears why.
       if (skippedRootReason !== null) setError(skippedRootReason);

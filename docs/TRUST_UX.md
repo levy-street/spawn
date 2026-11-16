@@ -47,7 +47,11 @@ Anything that needs an additional concept gets redesigned until it doesn't.
 - **device** — the phone or laptop you're holding. Not "browser" (users don't think of a
   phone as a browser), not "client". A host is colloquially also a device, but no screen
   ever mixes the two lists, so the collision is never experienced — and the guard below
-  keeps it that way.
+  keeps it that way. *(Exception, 2026-11-15, #121.)* Copy about the browser's own
+  storage says "browser": the notice *"This browser may forget its approval"* (§6) and
+  the passkey caption below. Only a browser's storage can be cleared out from under the
+  person, and the phone cannot use a passkey, so "device" there would promise the wrong
+  thing.
 - **host** — what your agents run on. The rest of the product already calls them Hosts
   (the sidebar, the pages), and it is the protocol's own word — one noun, one name,
   everywhere. "Your devices reach your hosts."
@@ -65,9 +69,11 @@ Anything that needs an additional concept gets redesigned until it doesn't.
 - **the number check** — the SAS. Never "SAS" or "fingerprint". One side shows it, the
   other *types* it — typing is what proves the human actually compared. Copy is always
   the imperative: *"Enter the number shown on the other device."*
-- **passkey** — used as-is, lowercase, exactly as the platform means it. Its one extra
-  power here gets one caption where passkeys are managed: *"Your passkey also restores
-  your devices and hosts if you lose everything."*
+- **passkey** — used as-is, lowercase, exactly as the platform means it. Its extra
+  powers get plain captions where passkeys are managed: *"Your passkey also restores
+  your devices and hosts if you lose everything."* and, since 2026-11-15 (#121), *"A
+  passkey lets a browser that has lost its approval get back in on its own."* (the
+  phone's Device trust screen says the same).
 
 Words that never appear: root, chain, anchor, pin, bundle, heal, endorsement, SAS,
 fingerprint, key, revoke, mesh, ceremony, tombstone, TOFU, signature, **recovery**.
@@ -169,7 +175,34 @@ terminal state precisely so the residual is a chosen, contained trade.
   yields the screen to the NumberCheck the moment an approver starts, and offers the
   two escapes that need no other device (the passkey, possessing a host from its
   terminal). The stamp is advisory in both directions: it grants nothing, and a device
-  that never stamps is still a visible waiting row (R4).
+  that never stamps is still a visible waiting row (R4). *(2026-11-15, #121)* On an
+  account with no passkey the card — and the Access panel's waiting callout — adds one
+  line: *"Once you're in, add a passkey in Account. Next time this device can get back
+  in without another one."* The phone's waiting sheet does not: the app cannot use a
+  passkey (below, §6), so the line would be untrue there. Nor does the desktop app,
+  where passkeys are unproven in its webview.
+- **approved is the account's word, not one host's** *(2026-11-16, #138)*: the card
+  and the phone's waiting sheet, and the ask they send, go up only when the account's own
+  records approve no way to the device: nothing approved it, it was removed, or it was
+  approved only through an approval a host rejected as unverifiable. The browser asks
+  that across the account; the phone asks it per host, of the approvals recorded on
+  the host it is about to use. Whether a particular host has confirmed an approval is
+  that host's state, not the device's. A host that has not confirmed one for a reason
+  that says nothing against it (it could not save it, or it is full) shows *Not
+  delivered* against that device on the host's page, and the device itself sees only
+  the terminal's own connection states (connecting, taking longer than usual, the host
+  offline — the same ones any slow or unreachable host gets, in each app's existing
+  words), never the waiting card: approving again would change nothing, since the
+  approval is already recorded. No new screen copy was added for this, and the toast
+  for a host that could not save an approval no longer suggests approving again. A host
+  that checked an approval and could not verify it has rejected it: that approval
+  counts for nothing anywhere, and a later failure on the same host to save anything
+  at all does not turn the rejection back into "not yet confirmed" (only the host
+  taking the approval in, or verifying it and finding itself full, clears it). The
+  screens decide only what they say: the host still checks every connection against
+  what it holds, so this admits no one. Before this, one host failing to take in one
+  device's approval put every device approved through it back on the card at once,
+  and approving them again from the phone did nothing.
 - existing device: the request arrives as a prompt (`ApproveRequest`) → NumberCheck
   (enter side). The roster's waiting row is the pull path to the same place. *(The
   desktop corner toast that offered "Enter its number" for every unapproved sign-in
@@ -267,6 +300,42 @@ result; a simultaneous update from another device is named as such. The blocked-
 card (§3) shows these failure lines too, so a failed passkey attempt is never a silent
 spinner.
 
+**Removing the only passkey** *(2026-11-15, #130)* revokes the root it sealed. Every
+browser that got in with that passkey, first time or returning, was approved through
+that root, and so was any device approved only from those browsers; all of them are
+refused until they are approved again. The confirmation says so — *"Browsers that got
+in with this passkey, and devices approved from them, will need approving again."* —
+and so does the status line after (*"Passkey removed. Browsers that got in with it,
+and devices approved from them, will need approving again. …"*). Only when no root was revoked (the saved protection could not be read)
+does the status line still say the devices keep working. Removing one of several
+passkeys keeps its wording. Keeping those browsers approved through the removal is
+#130.
+
+**A browser that may forget its approval** *(2026-11-15, #121; web only)*. A browser's
+device key lives in the origin's IndexedDB, which Chrome clears under disk pressure
+(cookies kept) unless the origin is persisted, and Chrome grants or refuses
+`navigator.storage.persist()` silently by heuristic. The app keeps the browser's answer
+(granted / refused / unsupported; Access shows it under "Browser storage") and asks
+again when notifications are allowed, since Chrome keeps the storage of a site that may
+notify. When the answer is *refused*, the account has no passkey, and this browser is
+approved now — by the waiting card's own test (§3), not by the host trust it holds,
+which outlives its removal — it shows one quiet notice in the ordinary notice place:
+*"This browser may forget its approval"* / *"Your browser can clear what marks it as
+approved. Add a passkey and it can get back in on its own, without another device."* —
+*Add passkey* (opens Account) and *Not now*. *Not now* and the notice's X are remembered
+in that browser; *Add passkey* puts it away until the next page load. It is raised once
+per page load and stays put across pages. It never appears while the passkey check is
+still loading or has failed, once the account has a passkey, in a browser that kept
+its storage, to a browser that is waiting for approval (the card says it there), or
+inside the desktop app (whose webview storage is a separate question). The phone's
+identity sits in the OS keychain/keystore and is not cleared this way.
+
+**As built on the phone:** the mobile app cannot add or use a passkey in any build —
+opening the sealed trust needs a WebAuthn PRF secret and a cipher it does not have
+(`passkeyPrfCapability` is hard `false`). Its Device trust screen says where passkeys
+work ("Passkeys are added and used in SPAWN D in a browser") instead of pointing at a
+build that would not help.
+
 ### 7. Connection refused — `AccessBlocked`
 - **removed** — *(refined 2026-08-21, owner review during field test)* there is no removed
   screen and no "Start over" button: a removed device that is still signed in seamlessly
@@ -278,8 +347,10 @@ spinner.
   ceremony. The disaster flow is the ordinary flow.
 - **not approved yet** — "One step left — approve from a device you already use, or sign
   in with your passkey." → *Use passkey*. As built, this state materializes where the
-  refusal actually bites: the `SessionApprovalGate` card over an agent session (§3),
-  which carries the same sentence and both escapes.
+  refusal would bite: the `SessionApprovalGate` card over an agent session (§3), which
+  carries the same sentence and both escapes. It is decided from the account's records,
+  not from a host's answer, so a host that has not yet confirmed an approval never
+  raises it; one that rejected the approval as unverifiable does (§3, #138).
 
 ### 8. History — `TrustHistory`
 - Plain sentences, newest first: "MacBook Pro approved iPhone", "Your passkey approved
@@ -300,6 +371,10 @@ spinner.
   cost: one click. The passkey nudge appears.
 - **Additional device, passkey.** Sign in with the passkey → done. Zero screens. (The
   heal endorses it off the root; the sealed vault delivers the hosts.)
+- **A browser that lost its key** *(as built, verified 2026-11-15, #121)*. Still signed
+  in, it registers a fresh key and opening a session shows the waiting card (§3); on an
+  account with a passkey, *Use passkey* → one touch → the card closes and the terminal
+  connects. No other device. Browser only: the phone cannot use a passkey (§6).
 - **Additional device, no passkey.** Sign in → it appears everywhere as *Waiting for
   approval* → the new device shows the number, a trusted one types it. One number (P4).
 - **Recovery after total loss.** Identical to "additional device, passkey". The disaster

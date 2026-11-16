@@ -33,6 +33,8 @@ function moduleSource(marker: string): string {
 
 const TRANSPORT_SOURCE = moduleSource("const CHANNEL_OPTIONS = Object.freeze({ ordered: true })");
 const HOST_SOURCE = moduleSource("const host = { binding: false, channel: false, hello: false }");
+const WATCH_SOURCE = moduleSource("const DAEMON_SPEAKS_FIRST = ");
+const PAIR_SOURCE = moduleSource("const MAX_RECEIVE = 2 * 1024 * 1024");
 
 interface FakeChannel {
   label: string;
@@ -334,6 +336,47 @@ describe("host-scoped signalling", () => {
     expect(harness.state["pc"]).toBeNull();
   });
 
+  test("a peer replaced because no channel opened on it closes its binding first", async () => {
+    for (const closePrevious of [true, false]) {
+      const harness = createHarness("host");
+      await connect(harness);
+      await signOffer(harness);
+      await harness.handleTransportMessage?.({ type: "signal-frame", frame: answerFrame() });
+      const first = FakePeerConnection.last;
+      if (first) first.connectionState = "connected";
+
+      await harness.handleTransportMessage?.({
+        type: "connect",
+        rtcSessionId: "rtc-session-rebuilt",
+        bindingNonce: SERVER_NONCE,
+        iceServers: [],
+        forceRelay: false,
+        forceRebuild: true,
+        ...(closePrevious ? { closePrevious: true } : {}),
+      });
+
+      expect(first?.connectionState).toBe("closed");
+      expect(FakePeerConnection.last).not.toBe(first);
+      const closes = emittedFrames(harness, "rtc.close");
+      if (closePrevious) {
+        // The old binding, as the server knows it, before the new offer.
+        expect(closes).toEqual([
+          expect.objectContaining({
+            session_id: RTC_SESSION_ID,
+            binding_nonce: CLIENT_NONCE,
+            scope_type: "host",
+            scope_id: HOST_ID,
+          }),
+        ]);
+      } else {
+        expect(closes).toEqual([]);
+      }
+      expect(posted(harness, "sign-request").at(-1)?.["transcript"]).toMatchObject({
+        sessionId: "rtc-session-rebuilt",
+      });
+    }
+  });
+
   test("still rejects a frame bound to a different host session", async () => {
     const harness = createHarness("host");
     await connect(harness);
@@ -345,6 +388,58 @@ describe("host-scoped signalling", () => {
     });
 
     expect(FakePeerConnection.last?.remoteDescription).toBeNull();
+  });
+});
+
+describe("the channel watch on the worker's real peer", () => {
+  test("a peer that leaves `connected` and comes back forgets what it was waiting on; one that stays probes", async () => {
+    jest.useFakeTimers();
+    try {
+      for (const leaves of [true, false]) {
+        const harness = createHarness("host");
+        new Function(WATCH_SOURCE)();
+        new Function(PAIR_SOURCE)();
+        const pairs = harness as unknown as {
+          handlePairMessage(message: Record<string, unknown>): boolean;
+          closePairChannels(): void;
+        };
+        await connect(harness);
+        await signOffer(harness);
+        await harness.handleTransportMessage?.({ type: "signal-frame", frame: answerFrame() });
+        const pc = FakePeerConnection.last;
+        if (!pc) throw new Error("no peer");
+        pc.connectionState = "connected";
+        const root = pc.channels[0];
+        if (root) root.readyState = "open";
+        pairs.handlePairMessage({
+          type: "pair-attach",
+          attachmentId: "00000000-0000-4000-8000-000000000001",
+          sessionId: SESSION_ID,
+          viewId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        });
+        expect(pc.channels.map((channel) => channel.label.split("/")[0])).toEqual([
+          "spawn.host.ctl",
+          "spawn.pty",
+          "spawn.ctl",
+        ]);
+        await jest.advanceTimersByTimeAsync(5_000);
+        if (leaves) {
+          // A short blip: ICE recovers the same peer before its restart.
+          pc.connectionState = "disconnected";
+          pc.onconnectionstatechange?.();
+          await jest.advanceTimersByTimeAsync(1_000);
+          pc.connectionState = "connected";
+          pc.onconnectionstatechange?.();
+        }
+        await jest.advanceTimersByTimeAsync(9_000);
+        const probes = pc.channels.filter((channel) => channel.label.startsWith("spawn.host.ctl/"));
+        expect(probes).toHaveLength(leaves ? 0 : 1);
+        pairs.closePairChannels();
+        await harness.handleTransportMessage?.({ type: "close" });
+      }
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 

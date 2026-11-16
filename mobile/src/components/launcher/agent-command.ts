@@ -9,6 +9,7 @@ export {
   agentLaunchCommand,
   agentResumeCommand,
   newAgentConversationId,
+  queuedLaunch,
 } from "@/data/selectors/agent";
 
 const SAFE_WORD = /^[A-Za-z0-9_@%+=:,./-]+$/;

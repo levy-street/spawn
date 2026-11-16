@@ -16,7 +16,7 @@ jest.mock("@/data/api/endpoints/devices", () => ({
 
 jest.mock("@/data/api/endpoints/trust", () => ({
   listAccountEndorsements: jest.fn(async () => []),
-  listHostPins: jest.fn(async () => []),
+  getHostPins: jest.fn(async () => ({ pins: [], capacity: null })),
 }));
 
 jest.mock("@/lib/crypto/identity", () => ({

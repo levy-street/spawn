@@ -29,6 +29,8 @@ src/
                   (grimoire/ is the frame and templates of the SEO pages;
                   hosts/ holds the sidebar's Hosts strip, the Hosts page's
                   cards and the shared host connection provider)
+  fonts/          the two brand faces (latin woff2 + OFL), loaded by
+                  lib/fonts.ts through next/font/local; the build fetches no font
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files
@@ -129,6 +131,15 @@ from the catalogue. Every claim about spawnd survives a diff against
   `lib/daemon-connection.ts` shares it across tabs with
   Web Locks and BroadcastChannel; terminal hooks and host/file consumers own
   channels only. Never create a peer or signaling websocket in a terminal.
+  The owner treats a peer as ready only while a child channel can open on it:
+  `lib/channel-watch.ts` probes a peer whose daemon-first channels go
+  unanswered and has `HostControlClient.rebuildPeer` replace it. A link that an
+  owner of any page-code age keeps announcing without it ever becoming usable
+  gets a fresh attempt from a visible tab (`stuck` in `lib/daemon-connection.ts`):
+  a waiting tab takes the lock, the owner replaces its own connection. Only on
+  the server's recent word that the host is online, and with a backoff every
+  tab shares. A snapshot whose owner's name does not end in its term comes from
+  a deposed tab on page code from before #101 and is never followed.
   Read `docs/DEVICE_CONNECTIONS.md` before changing attachment or control rules.
 
 ## Before calling a change done

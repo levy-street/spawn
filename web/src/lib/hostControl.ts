@@ -1,7 +1,9 @@
 import {
   CONVERSATION_INSPECT_OP,
+  CONVERSATION_LAUNCH_OP,
   type ConversationInspection,
   canonicalConversationId,
+  parseCodexNoDaemon,
   parseConversationInspection,
 } from "@/lib/conversation";
 import { parseCapabilities } from "@/lib/preview/capabilities";
@@ -430,6 +432,10 @@ export class HostControlClient {
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. Terminal: blocks auto-reconnect.
   private signedRtcRefusal: SignedRtcRefusalReason | null = null;
+  // When the server or daemon last answered an offer of this client's with
+  // `failed` or `disabled` (a host that has not approved this device answers
+  // so, without a reason): it retries, but it has been told no.
+  private offerFailedAt = 0;
   // A wire-version refusal is terminal too, but it is not a trust refusal and
   // must never be surfaced as one. The release watcher owns its recovery UI.
   private terminalReason: HostControlTerminalReason | null = null;
@@ -528,6 +534,21 @@ export class HostControlClient {
     }
     this.close();
     this.connect();
+  }
+
+  /**
+   * Replace a device connection's ready peer with a fresh one, on the same
+   * signalling socket: the owner's answer to a peer that is connected, its
+   * root channel answering, on which no new channel opens (`channel-watch.ts`).
+   * The server and daemon hear `rtc.close` for the old binding before the new
+   * offer. False when there is no ready peer of this client's own to replace.
+   */
+  rebuildPeer(): boolean {
+    const sessionId = this.sessionId;
+    if (this.options.sharedConnection || this.stopped || this.state !== "ready" || !sessionId)
+      return false;
+    this.fallBackToFreshRtc(sessionId);
+    return true;
   }
 
   private connectShared(): void {
@@ -775,6 +796,11 @@ export class HostControlClient {
 
   getConnectionError(): string | null {
     return this.connectionError;
+  }
+
+  /** When an offer was last refused (`failed` or `disabled`); 0 if never. */
+  getOfferFailedAt(): number {
+    return this.offerFailedAt;
   }
 
   private requireTransportUpdate(message: string): void {
@@ -1319,6 +1345,28 @@ export class HostControlClient {
   }
 
   /**
+   * Whether the Codex this window is about to run accepts `--no-daemon`: the
+   * daemon runs `codex --no-daemon --version` with the environment and in the
+   * folder the window's shell was started with. Null when it cannot tell.
+   * Gated on `conv.v1`; an older daemon answers `unsupported_operation`.
+   */
+  async codexNoDaemon(
+    sessionId: string,
+    options?: HostControlRequestOptions,
+  ): Promise<boolean | null> {
+    const result = await this.request<unknown>(
+      CONVERSATION_LAUNCH_OP,
+      { session_id: sessionId },
+      options,
+    );
+    const answer = parseCodexNoDaemon(result);
+    if (answer === undefined) {
+      throw new HostControlError("invalid_response", "Host returned an invalid launch report");
+    }
+    return answer;
+  }
+
+  /**
    * Select the file in the host's file manager.
    *
    * Reveal never executes the target, so unlike `openDefault` it is offered for
@@ -1780,6 +1828,8 @@ export class HostControlClient {
           this.fallBackFromResume();
           return;
         }
+        if (message.status === "failed" || message.status === "disabled")
+          this.offerFailedAt = Date.now();
         if (["failed", "disabled", "unavailable"].includes(message.status)) {
           if (this.iceRestartInFlight && message.status === "unavailable") {
             this.fallBackToFreshRtc(this.sessionId);

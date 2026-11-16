@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   macos:
-    runs-on: macos-14 # Apple Silicon; also cross-builds x86_64 from here
+    runs-on: macos-15 # Apple Silicon; also cross-builds x86_64 from here
     timeout-minutes: 40
     # The Apple Developer ID lives in the `macos-code-signing` environment,
     # whose deployment branch policy permits only `master`. Off master the job

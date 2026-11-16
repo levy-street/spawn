@@ -19,7 +19,9 @@ import {
 import {
   CONVERSATION_CAPABILITY,
   CONVERSATION_INSPECT_OP,
+  CONVERSATION_LAUNCH_OP,
   type ConversationInspection,
+  parseCodexNoDaemon,
   parseConversationInspection,
 } from "@/terminal/transport/conversation-codec";
 import { canonicalConversationId } from "@/terminal/transport/conversation-id";
@@ -76,6 +78,8 @@ import type {
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
 import {
+  CHANNELS_UNANSWERED_CODE,
+  CHANNELS_UNANSWERED_MESSAGE,
   CONNECT_TIMEOUT_MESSAGE,
   CONNECT_TIMEOUT_MS,
   iceServersNeedRefresh,
@@ -670,6 +674,22 @@ class WebViewHostTransport implements StreamingHostTransport {
     return parseConversationInspection(response);
   }
 
+  /**
+   * Whether the Codex this window is about to run accepts `--no-daemon`: the
+   * daemon runs `codex --no-daemon --version` with the environment and in the
+   * folder the window's shell was started with. Null when it cannot tell.
+   * Gated on `conv.v1`; an older daemon answers `unsupported_operation`.
+   */
+  async codexNoDaemon(sessionId: string, options?: HostRequestOptions): Promise<boolean | null> {
+    this.#requireCapability(CONVERSATION_CAPABILITY);
+    const response = await this.request<unknown>(
+      CONVERSATION_LAUNCH_OP,
+      { session_id: sessionId },
+      options,
+    );
+    return parseCodexNoDaemon(response);
+  }
+
   async readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile> {
     const opening: StreamOpening = { onChannel: false };
     try {
@@ -1214,7 +1234,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     }
   }
 
-  #startPeer(config: CachedRtcConfig, forceRebuild = false): void {
+  #startPeer(config: CachedRtcConfig, forceRebuild = false, closePrevious = false): void {
     if (this.#remainingConnectTime() === 0) {
       this.#fail(
         "connect_timeout",
@@ -1236,7 +1256,40 @@ class WebViewHostTransport implements StreamingHostTransport {
       iceTransportPolicy: config.iceTransportPolicy,
       forceRelay: this.options.forceRelay ?? false,
       ...(forceRebuild ? { forceRebuild: true } : {}),
+      ...(closePrevious ? { closePrevious: true } : {}),
     });
+  }
+
+  /**
+   * The host worker found a peer on which no new channel opens while its root
+   * channel answers (`worker/worker-channel-watch.js`, which owns the trigger
+   * and its backoff). Replace it on the same signalling socket: the worker
+   * closes the old binding, then offers a fresh peer. Views and tools leave
+   * `ready` with it and attach again once the new one is, as after any
+   * reconnect, and say why meanwhile.
+   */
+  #rebuildPeer(message: Extract<WorkerToNativeMessage, { type: "rebuild" }>): void {
+    // About a peer native has already replaced: the one it has now may be
+    // perfectly healthy.
+    if (message.rtcSessionId !== this.#activeRtcSessionId) return;
+    if (this.parent || this.#state !== "ready" || !this.#cachedConfig || !this.#workerStarted)
+      return;
+    // The daemon side of #120 stays visible from here: the host and how long
+    // each step waited, nothing a terminal carries.
+    console.warn(
+      `SPAWN D: host ${this.hostId}: no new channel opens on its connection ` +
+        `(one waited ${seconds(message.waitedMs)}, two probes ${seconds(message.probeMs)}, ` +
+        (message.rootAnswered === true
+          ? `while the root channel answered a ping in ${Math.round(message.rootMs)} ms); `
+          : `and the root channel did not answer two pings in ${seconds(message.rootMs)}); `) +
+        `making a new connection (${message.rebuilds} in a row).`,
+    );
+    this.#emitError({
+      code: CHANNELS_UNANSWERED_CODE,
+      message: CHANNELS_UNANSWERED_MESSAGE,
+      retryable: true,
+    });
+    this.#startPeer(this.#cachedConfig, true, true);
   }
 
   #handleSignalState(state: string): void {
@@ -1358,6 +1411,9 @@ class WebViewHostTransport implements StreamingHostTransport {
       }
       case "host-response":
         this.#handleHostResponse(message);
+        break;
+      case "rebuild":
+        this.#rebuildPeer(message);
         break;
       case "diagnostic":
         for (const listener of this.#diagnosticListeners) listener(message.diagnostic);
@@ -1602,9 +1658,9 @@ class WebViewHostTransport implements StreamingHostTransport {
         : this.options.probeTrust
           ? this.options
               .probeTrust(this.hostId)
-              .then((status) => ({ status, directlyPinned: false }))
+              .then((status) => ({ status, directlyPinned: false, confirmed: false }))
           : probeDeviceHostTrustResult(this.hostId)
-    ).catch(() => ({ status: "unknown" as const, directlyPinned: false }));
+    ).catch(() => ({ status: "unknown" as const, directlyPinned: false, confirmed: false }));
     void result.then(({ status }) => {
       if (epoch !== this.#prepareEpoch) return;
       if (status !== "untrusted") return;
@@ -1662,6 +1718,10 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#resolveOpen = null;
     this.#rejectOpen = null;
   }
+}
+
+function seconds(ms: number): string {
+  return `${(ms / 1000).toFixed(1)} s`;
 }
 
 export function createHostTransport(options: HostTransportOptions): StreamingHostTransport {

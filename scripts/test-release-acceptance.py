@@ -101,6 +101,29 @@ class EvidenceTests(unittest.TestCase):
             result["reports"]["ios"]["source_report_sha256"], r"^[a-f0-9]{64}$"
         )
 
+    def test_repeated_short_background_cycles_validate_without_being_promoted(self):
+        value = report("ios")
+        case = next(row for row in value["cases"] if row["id"] == "background_short")
+        case["metrics"] = {
+            "background_ms": 0,
+            "measured_background_ms": 812.0,
+            "background_attempts": [
+                {"measured_background_ms": 3646.0, "within_grace": False, "kept_parent": False},
+                {"measured_background_ms": 812.0, "within_grace": True, "kept_parent": True},
+            ],
+        }
+        self.write("ios", value)
+        result = self.verify()
+        self.assertNotIn("background_attempts", json.dumps(result))
+        self.assertIn(
+            {"id": "background_short", "status": "passed"},
+            result["reports"]["ios"]["cases"],
+        )
+        case["status"] = "failed"
+        self.write("ios", value)
+        with self.assertRaisesRegex(ValueError, "failed/skipped"):
+            self.verify()
+
     def test_missing_platform_and_duplicate_platform_refuse(self):
         (self.directory / "android" / "evidence.json").unlink()
         with self.assertRaisesRegex(ValueError, "absent"):
@@ -596,6 +619,8 @@ else:
     def test_resume_retries_failed_ota_even_when_remote_checkout_already_is_candidate(
         self,
     ):
+        # release.yml sets this only when its plan said mobile_native_build=no.
+        self.env["SPAWN_DEPLOY_MOBILE"] = "1"
         first = self.deploy("--resume")
         self.assertNotEqual(first.returncode, 0)
         self.assertIn("mobile OTA failed", first.stderr, first.stdout + first.stderr)
@@ -605,6 +630,37 @@ else:
         self.assertEqual(
             (self.directory / "ota-attempts").read_text(), "publish\npublish\n"
         )
+
+    def test_a_deploy_publishes_no_ota_unless_the_plan_said_the_shell_fits(self):
+        # A hand-run --resume must not publish what the release withheld: only
+        # the plan knows whether the phones' native shell can run this tree.
+        for value in (None, "0", "true", "yes"):
+            with self.subTest(SPAWN_DEPLOY_MOBILE=value):
+                (self.directory / "ota-attempts").unlink(missing_ok=True)
+                self.env.pop("SPAWN_DEPLOY_MOBILE", None)
+                if value is not None:
+                    self.env["SPAWN_DEPLOY_MOBILE"] = value
+                result = self.deploy("--resume")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("deploy-prod: complete", result.stdout)
+                self.assertIn("NOT published", result.stdout)
+                self.assertFalse((self.directory / "ota-attempts").exists())
+                # The three plan answers get three distinct lines, and the
+                # publish command is offered under "no" and nowhere else.
+                lines = result.stdout.splitlines()
+                answers = {
+                    answer: [line for line in lines if line.startswith(f"  - {answer}: ")]
+                    for answer in ("no", "yes", "unknown")
+                }
+                for answer, found in answers.items():
+                    self.assertEqual(len(found), 1, (answer, result.stdout))
+                offered = [line for line in lines if "update-mobile-prod.sh" in line]
+                self.assertEqual(offered, answers["no"], result.stdout)
+                self.assertIn("publish it with: scripts/update-mobile-prod.sh -m ", offered[0])
+                for answer in ("yes", "unknown"):
+                    self.assertIn("publish nothing", answers[answer][0])
+                self.assertIn("runtime warning", answers["yes"][0])
+                self.assertIn("ask the plan again", answers["unknown"][0])
 
 
 class CITests(unittest.TestCase):
