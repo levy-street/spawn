@@ -53,7 +53,9 @@ export function pinUndeliveredToast(
       ? "This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again."
       : event.reason === "invalid_chain"
         ? `${hostName} could not verify the approval. Approve the device again from a device ${hostName} already trusts.`
-        : `Try approving again; if it keeps failing, run spawnd doctor on ${hostName}.`;
+        : // `other` is a local failure on the host, not a verdict on the approval
+          // (#138): it stays recorded, so asking for it again would change nothing.
+          `${hostName} could not save it and tries again the next time it connects, so there is no need to approve again. If this keeps happening, run spawnd doctor on ${hostName}.`;
   return { message: `The approval didn't reach ${hostName}.`, detail };
 }
 

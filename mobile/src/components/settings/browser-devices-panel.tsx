@@ -47,6 +47,23 @@ interface HostDeviceTrust {
   confirmedIds: readonly string[];
 }
 
+/** One host's pins, split by `pinIdsByStanding`. */
+export type HostPinIds = Pick<HostDeviceTrust, "deviceIds" | "confirmedIds">;
+
+/** How many hosts the account has approved `deviceId` toward, confirmed or
+ * not: a host that has not confirmed is not a reason to read as waiting. */
+export function approvedHostCount(hostTrust: readonly HostPinIds[], deviceId: string): number {
+  return hostTrust.filter((record) => record.deviceIds.includes(deviceId)).length;
+}
+
+/** Whether this phone can approve `targetId` on this host the per-host way:
+ * the host has CONFIRMED this phone's own approval (an approval signed here
+ * reaches only what the host admits today), and does not already record the
+ * target, which would make approving again change nothing. */
+export function canApproveOnHost(record: HostPinIds, currentId: string, targetId: string): boolean {
+  return record.confirmedIds.includes(currentId) && !record.deviceIds.includes(targetId);
+}
+
 function derivedDeviceFingerprint(device: BrowserDeviceOut): string {
   try {
     return formatHostFingerprint(device.public_key);
@@ -126,17 +143,13 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     (devices.data ?? []).filter((device) => device.revoked_at === null && !device.is_root),
   );
   const revokedDevices = (devices.data ?? []).filter((device) => device.revoked_at !== null);
-  const trustedCount = (deviceId: string) =>
-    hostTrust.filter((record) => record.deviceIds.includes(deviceId)).length;
+  const trustedCount = (deviceId: string) => approvedHostCount(hostTrust, deviceId);
   const endorsableHosts = useMemo(() => {
     if (!currentDevice || !approveTarget) return [];
-    // This phone vouches only toward hosts that have confirmed its own
-    // approval; one that already records the target needs nothing more.
     return hostTrust.filter(
-      ({ host, deviceIds, confirmedIds }) =>
-        host.host_public_key !== null &&
-        confirmedIds.includes(currentDevice.id) &&
-        !deviceIds.includes(approveTarget.id),
+      (record) =>
+        record.host.host_public_key !== null &&
+        canApproveOnHost(record, currentDevice.id, approveTarget.id),
     );
   }, [approveTarget, currentDevice, hostTrust]);
 
@@ -331,10 +344,8 @@ export function BrowserDevicesPanel(): React.JSX.Element {
                 device.id !== currentDevice?.id &&
                 Boolean(
                   currentDevice &&
-                    hostTrust.some(
-                      (record) =>
-                        record.confirmedIds.includes(currentDevice.id) &&
-                        !record.deviceIds.includes(device.id),
+                    hostTrust.some((record) =>
+                      canApproveOnHost(record, currentDevice.id, device.id),
                     ),
                 )
               }

@@ -484,25 +484,57 @@ async def _handle_pin_adoption_result(
         return None
 
     known = False
+    recorded_reason: str | None = None
     async with _bounded_host_ownership_session() as session:
         pin = await session.get(HostBrowserPin, (conn.host_id, browser_device_id))
         if pin is not None:
             known = True
             if failed:
                 pin.delivered_at = None
-                pin.undelivered_reason = str(reason)
+                if not _nack_keeps_rejection(pin.undelivered_reason, str(reason)):
+                    pin.undelivered_reason = str(reason)
             else:
                 pin.delivered_at = _utcnow()
                 pin.undelivered_reason = None
+            recorded_reason = pin.undelivered_reason
             await session.commit()
     # An unknown device id carries no authority and produces no observable
     # account event. This also makes a late nack after revocation harmless.
+    # The event names the reason the row now carries, so a toast never says
+    # something other than what the host's page shows.
     if known and failed:
         await publish_trust_event(
             conn.user_id,
-            pin_undelivered_payload(conn.host_id, browser_device_id, str(reason)),
+            pin_undelivered_payload(conn.host_id, browser_device_id, str(recorded_reason)),
         )
     return True
+
+
+def _nack_keeps_rejection(stored: str | None, incoming: str) -> bool:
+    """Whether a nack must leave a stored ``invalid_chain`` in place (#138).
+
+    The rule: a nack's reason replaces the stored one, except that ``other``
+    never replaces ``invalid_chain``.
+
+    ``invalid_chain`` is the daemon's verdict that it checked this approval
+    and could not verify it; both frontends count such a pin as nothing.
+    ``other`` is what the daemon sends for EVERY pin it was proposed when its
+    whole reconcile could not run (``daemon/src/run.rs``), so it says nothing
+    about this pin — and both frontends count ``other`` as the account's
+    approval, merely unconfirmed. Since every push re-proposes every live pin,
+    letting a failed run relabel a rejection would make a device approved only
+    through a rejected pin read as approved again while the daemon still
+    refuses it.
+
+    A stored rejection is cleared only by an answer that looked at the
+    approval again: an ack (``host.pin_adopted``: the daemon holds the pin) or
+    ``pin_limit`` (sent only after the signature verified). ``other`` can also
+    mean the key is already pinned under another id, which is decided after
+    verification; keeping the rejection then errs toward asking for approval,
+    never toward reading as approved.
+    """
+
+    return stored == "invalid_chain" and incoming == "other"
 
 
 async def _configure_activation_timeouts(session: AsyncSession) -> None:

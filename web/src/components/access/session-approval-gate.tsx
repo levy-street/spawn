@@ -114,93 +114,110 @@ export function SessionApprovalGate() {
     request.mutate({ id: currentDevice.id, public_key: currentDevice.public_key });
   }, [show, currentDevice?.id]);
 
-  if (!show || ceremonyLive) return null;
+  // What the gate has decided, for tests and diagnostics: "deciding" until
+  // every query behind `approval` has answered, then "card" or "clear". A
+  // check that the card stayed away waits for "clear" rather than a timer.
+  const marker = enabled ? (
+    <span
+      hidden
+      data-testid="session-approval-state"
+      data-state={!approval.ready ? "deciding" : show ? "card" : "clear"}
+    />
+  ) : null;
+
+  if (!show || ceremonyLive) return marker;
 
   const deviceName = currentDevice.label ?? "This device";
   return (
-    <Dialog.Root open>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px]" />
-        <Dialog.Content
-          data-testid="session-approval-gate"
-          className="fixed left-1/2 top-1/2 z-50 w-[min(100vw-2rem,420px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-background p-6 shadow-2xl focus:outline-none"
-          onEscapeKeyDown={(event) => event.preventDefault()}
-          onPointerDownOutside={(event) => event.preventDefault()}
-          onInteractOutside={(event) => event.preventDefault()}
-        >
-          <Dialog.Title className="text-center text-base font-semibold">One step left</Dialog.Title>
-          <Dialog.Description className="mt-2 text-center text-sm leading-relaxed text-muted-foreground">
-            Approve {deviceName === "This device" ? "this device" : `“${deviceName}”`} from a device
-            you already use{passkey.hasBundle ? ", or sign in here with your passkey" : ""}.
-          </Dialog.Description>
-
-          {fingerprint.data !== undefined && (
-            <div className="mt-4 space-y-1.5" data-testid="session-gate-fingerprint">
-              <p className="text-center text-xs text-muted-foreground">
-                This device&apos;s fingerprint. The approving screen must show exactly this.
-              </p>
-              <p className="select-all break-all rounded-lg border border-border bg-muted/60 px-3 py-2 text-center font-mono text-sm font-semibold tracking-wide">
-                {fingerprint.data}
-              </p>
-            </div>
-          )}
-
-          <div
-            className="mt-4 flex items-center justify-center gap-2 text-sm text-muted-foreground"
-            role="status"
+    <>
+      {marker}
+      <Dialog.Root open>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px]" />
+          <Dialog.Content
+            data-testid="session-approval-gate"
+            className="fixed left-1/2 top-1/2 z-50 w-[min(100vw-2rem,420px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-background p-6 shadow-2xl focus:outline-none"
+            onEscapeKeyDown={(event) => event.preventDefault()}
+            onPointerDownOutside={(event) => event.preventDefault()}
+            onInteractOutside={(event) => event.preventDefault()}
           >
-            <Loader2 className="size-4 animate-spin" aria-hidden />
-            <span>
-              {request.isSuccess
-                ? "Your other devices have been asked. This closes on its own once one approves."
-                : "Waiting for approval…"}
-            </span>
-          </div>
+            <Dialog.Title className="text-center text-base font-semibold">
+              One step left
+            </Dialog.Title>
+            <Dialog.Description className="mt-2 text-center text-sm leading-relaxed text-muted-foreground">
+              Approve {deviceName === "This device" ? "this device" : `“${deviceName}”`} from a
+              device you already use{passkey.hasBundle ? ", or sign in here with your passkey" : ""}
+              .
+            </Dialog.Description>
 
-          {/* No passkey: nothing here can let this device in by itself, but
-              the next time it loses its approval can be one touch (#121). */}
-          {passkey.bundle.data === null && !desktopShell && (
-            <p
-              className="mt-3 text-center text-xs leading-relaxed text-muted-foreground"
-              data-testid="session-gate-passkey-hint"
-            >
-              {NO_PASSKEY_WAITING_HINT}
-            </p>
-          )}
-
-          {passkey.status !== null && (
-            <p className="mt-3 text-center text-sm font-medium" role="status">
-              {passkey.status}
-            </p>
-          )}
-          {/* A failed or partial passkey attempt must be visible here — the
-              card otherwise keeps saying "waiting" over a silent failure. */}
-          {passkey.error !== null && (
-            <p className="mt-3 text-center text-sm text-destructive" role="alert">
-              {passkey.error}
-            </p>
-          )}
-
-          <div className="mt-5 flex flex-col items-center gap-3">
-            {passkey.hasBundle && (
-              <Button
-                className="w-full"
-                disabled={!passkey.supported || passkey.busy}
-                onClick={() => passkey.unlock.mutate()}
-                data-testid="session-gate-passkey"
-              >
-                {passkey.unlock.isPending ? "Checking…" : "Use passkey"}
-              </Button>
+            {fingerprint.data !== undefined && (
+              <div className="mt-4 space-y-1.5" data-testid="session-gate-fingerprint">
+                <p className="text-center text-xs text-muted-foreground">
+                  This device&apos;s fingerprint. The approving screen must show exactly this.
+                </p>
+                <p className="select-all break-all rounded-lg border border-border bg-muted/60 px-3 py-2 text-center font-mono text-sm font-semibold tracking-wide">
+                  {fingerprint.data}
+                </p>
+              </div>
             )}
-            <Button variant="ghost" className="w-full" onClick={() => router.push("/app")}>
-              Go back
-            </Button>
-            <Link href="/device" className="text-xs text-muted-foreground underline">
-              No other device? Possess a host directly
-            </Link>
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+
+            <div
+              className="mt-4 flex items-center justify-center gap-2 text-sm text-muted-foreground"
+              role="status"
+            >
+              <Loader2 className="size-4 animate-spin" aria-hidden />
+              <span>
+                {request.isSuccess
+                  ? "Your other devices have been asked. This closes on its own once one approves."
+                  : "Waiting for approval…"}
+              </span>
+            </div>
+
+            {/* No passkey: nothing here can let this device in by itself, but
+              the next time it loses its approval can be one touch (#121). */}
+            {passkey.bundle.data === null && !desktopShell && (
+              <p
+                className="mt-3 text-center text-xs leading-relaxed text-muted-foreground"
+                data-testid="session-gate-passkey-hint"
+              >
+                {NO_PASSKEY_WAITING_HINT}
+              </p>
+            )}
+
+            {passkey.status !== null && (
+              <p className="mt-3 text-center text-sm font-medium" role="status">
+                {passkey.status}
+              </p>
+            )}
+            {/* A failed or partial passkey attempt must be visible here — the
+              card otherwise keeps saying "waiting" over a silent failure. */}
+            {passkey.error !== null && (
+              <p className="mt-3 text-center text-sm text-destructive" role="alert">
+                {passkey.error}
+              </p>
+            )}
+
+            <div className="mt-5 flex flex-col items-center gap-3">
+              {passkey.hasBundle && (
+                <Button
+                  className="w-full"
+                  disabled={!passkey.supported || passkey.busy}
+                  onClick={() => passkey.unlock.mutate()}
+                  data-testid="session-gate-passkey"
+                >
+                  {passkey.unlock.isPending ? "Checking…" : "Use passkey"}
+                </Button>
+              )}
+              <Button variant="ghost" className="w-full" onClick={() => router.push("/app")}>
+                Go back
+              </Button>
+              <Link href="/device" className="text-xs text-muted-foreground underline">
+                No other device? Possess a host directly
+              </Link>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </>
   );
 }

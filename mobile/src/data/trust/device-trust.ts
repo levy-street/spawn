@@ -79,7 +79,7 @@ const cache = new Map<string, CacheEntry>();
  * per host. Keyed on the loader function so a test's injected loaders never
  * see another test's result.
  */
-const SHARED_READ_TTL_MS = 1_000;
+export const SHARED_READ_TTL_MS = 1_000;
 const sharedReads = new WeakMap<
   () => Promise<unknown>,
   { atMs: number; promise: Promise<unknown> }

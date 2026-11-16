@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react-nativ
 import { Pressable, Text } from "react-native";
 
 import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
-import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
+import { invalidateDeviceHostTrust, SHARED_READ_TTL_MS } from "@/data/trust/device-trust";
 
 // #138, on the phone: the real gate, the real host probe and the real
 // endpoints and schemas, with only the HTTP client and the sheet's insides
@@ -90,8 +90,11 @@ function Harness() {
 }
 
 describe("the device approval gate when a host has not confirmed an approval", () => {
-  // The probe shares account-wide reads across a one-second burst; each case
-  // starts a minute later so it never sees the previous case's account.
+  // The probe shares its account-wide reads (devices, approvals) for
+  // SHARED_READ_TTL_MS, keyed on the loader, and invalidating a verdict does
+  // not drop them. Each case gives the account a different set of approvals,
+  // so each starts past that window: Date.now moves forward per case and
+  // otherwise runs as usual, so waitFor's own timing is untouched.
   const realNow = Date.now.bind(Date);
   let offsetMs = 0;
   beforeAll(() => {
@@ -101,7 +104,7 @@ describe("the device approval gate when a host has not confirmed an approval", (
 
   beforeEach(() => {
     jest.clearAllMocks();
-    offsetMs += 60_000;
+    offsetMs += SHARED_READ_TTL_MS + 1;
     mockWrites.length = 0;
     invalidateDeviceHostTrust();
   });

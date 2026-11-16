@@ -75,14 +75,27 @@ test("a trusted device never sees the gate", async ({ page }) => {
     sessions: [session()],
     hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
   });
+  const pinsAnswered = page.waitForResponse((response) =>
+    response.url().endsWith(`/api/trust/hosts/${HOST_ID}/pins`),
+  );
   await page.goto(`/sessions/${SESSION_ID}`);
+  await pinsAnswered;
 
-  // The session surface renders normally (header shows the agent) and the
-  // gate stays away through a couple of poll cycles.
+  // The session surface renders normally (header shows the agent), and the
+  // gate, once it has decided, keeps the card away.
   await expect(page.getByText("palette").first()).toBeVisible();
-  await page.waitForTimeout(1200);
-  await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
+  await expectGateClear(page);
 });
+
+/**
+ * Waits for the gate's own decision, then checks it kept the card away. Only
+ * meaningful once the pins have answered: before the host list loads the gate
+ * has no host to ask about and reads clear.
+ */
+async function expectGateClear(page: Page) {
+  await expect(page.getByTestId("session-approval-state")).toHaveAttribute("data-state", "clear");
+  await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
+}
 
 test("the card yields to the number check when an approver starts", async ({ page }) => {
   await mockApp(page, { hosts: [KEYED_HOST], sessions: [session()], hostPins: {} });
@@ -195,8 +208,7 @@ for (const reason of ["other", "pin_limit"] as const) {
     await openSessionAsRegisteredBrowser(page);
 
     await expect(page.getByText("palette").first()).toBeVisible();
-    await page.waitForTimeout(1200);
-    await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
+    await expectGateClear(page);
     expect(asks).toEqual([]);
   });
 }
@@ -215,8 +227,7 @@ test("a device whose own pin its host has not confirmed is not asked again", asy
   await openSessionAsRegisteredBrowser(page);
 
   await expect(page.getByText("palette").first()).toBeVisible();
-  await page.waitForTimeout(1200);
-  await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
+  await expectGateClear(page);
   expect(asks).toEqual([]);
 });
 
