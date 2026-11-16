@@ -6127,14 +6127,16 @@ mod tests {
 
     async fn close_test_peer(pc: &Arc<RTCPeerConnection>) {
         if let Err(error) = pc.close().await {
-            // The server peer is closed first in these cleanup paths.  The
-            // webrtc crate can race the corresponding SCTP shutdown and report
-            // this specific reset error even though the remote close already
-            // completed successfully.
-            assert!(
-                error
-                    .to_string()
-                    .contains("sending reset packet in non-Established state"),
+            // The server peer is closed first in these cleanup paths, so the
+            // browser side's own shutdown races the remote one, and a data
+            // channel or the SCTP association it reaches may already be gone
+            // ("sending reset packet in non-Established state", "Stream
+            // closed", ...). `close` tears down every part regardless and
+            // reports the first errors it met, so such an error is benign
+            // as long as the peer did end up closed.
+            assert_eq!(
+                pc.connection_state(),
+                RTCPeerConnectionState::Closed,
                 "closing RTC test peer failed: {error}"
             );
         }
