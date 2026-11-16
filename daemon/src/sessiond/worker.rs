@@ -1909,18 +1909,33 @@ mod tests {
             .expect("signal-resistant child");
         let mut asking = child.stdin.take().unwrap();
         let answers = std::io::BufReader::new(child.stdout.take().unwrap());
+        let pid = child.id();
+        // Each answer is waited for this long at most. A child that gives
+        // none (stopped, say) is killed, which ends the read waiting on it,
+        // and the test fails saying so instead of hanging.
+        const ANSWER_WITHIN: Duration = Duration::from_secs(30);
+        let stop_child = move || {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        };
         // However long the shell takes to start, nothing is sent before it
         // ignores TERM.
-        let mut answers = tokio::task::spawn_blocking(move || {
+        let ready = tokio::task::spawn_blocking(move || {
             let mut answers = answers;
             let mut line = String::new();
-            answers.read_line(&mut line).unwrap();
-            assert_eq!(line, "ready\n", "the child did not start");
-            answers
-        })
-        .await
-        .unwrap();
-        let pid = child.id();
+            let _ = answers.read_line(&mut line);
+            (answers, line)
+        });
+        let (mut answers, line) = match tokio::time::timeout(ANSWER_WITHIN, ready).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                stop_child();
+                panic!("the child never said it was ready");
+            }
+        };
+        assert_eq!(line, "ready\n", "the child did not start");
         let child_state = Arc::new(Mutex::new(ChildState::Running {
             child: Box::new(child),
             pid,
@@ -1985,15 +2000,20 @@ mod tests {
         // The TERM was signalled before it was acknowledged. A child that did
         // not ignore it is gone before it can answer: its answer is the end
         // of its output, not `alive`.
-        let (asking, answers, answer) = tokio::task::spawn_blocking(move || {
+        let asked = tokio::task::spawn_blocking(move || {
             let _ = writeln!(asking, "still there?");
             let _ = asking.flush();
             let mut answer = String::new();
             let _ = answers.read_line(&mut answer);
             (asking, answers, answer)
-        })
-        .await
-        .unwrap();
+        });
+        let (asking, answers, answer) = match tokio::time::timeout(ANSWER_WITHIN, asked).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                stop_child();
+                panic!("the child neither answered nor ended after the TERM");
+            }
+        };
         assert_eq!(answer, "alive\n", "TERM was not ignored");
         {
             let mut state = child_state.lock().unwrap();

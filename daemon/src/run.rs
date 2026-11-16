@@ -2586,9 +2586,15 @@ async fn dispatch_loop(
     Ok(())
 }
 
-/// The requests waiting for one check: each id, and the connection it came
-/// in on.
-type AgentCheckWaiters = Vec<(String, mpsc::Sender<WsOutbound>)>;
+/// A request waiting for a check: its id, the connection it came in on, and
+/// the order it named its agents in, which its reply keeps.
+struct AgentCheckWaiter {
+    request_id: String,
+    out_tx: mpsc::Sender<WsOutbound>,
+    order: Vec<String>,
+}
+
+type AgentCheckWaiters = Vec<AgentCheckWaiter>;
 
 /// Host agents checks in flight, by the targets they check. A request for
 /// targets already being checked is answered with that check's result
@@ -2633,14 +2639,29 @@ impl AgentCheckFlights {
         F: FnOnce(Vec<HostAgentTarget>, tokio::time::Instant) -> Fut + Send + 'static,
         Fut: Future<Output = Vec<HostAgentStatus>> + Send + 'static,
     {
-        let key = format!("{targets:?}");
+        // The same agents in any order are the same check: the server's
+        // query for them names no order.
+        let mut named = targets
+            .iter()
+            .map(|target| format!("{target:?}"))
+            .collect::<Vec<_>>();
+        named.sort();
+        let key = named.join("\n");
+        let waiter = AgentCheckWaiter {
+            request_id,
+            out_tx,
+            order: targets
+                .iter()
+                .map(|target| target.agent_id.clone())
+                .collect(),
+        };
         {
             let mut flights = self.lock();
             if let Some(waiters) = flights.get_mut(&key) {
-                waiters.push((request_id, out_tx));
+                waiters.push(waiter);
                 return None;
             }
-            flights.insert(key.clone(), vec![(request_id, out_tx)]);
+            flights.insert(key.clone(), vec![waiter]);
         }
         let mut landing = FlightLanding {
             flights: self.clone(),
@@ -2649,7 +2670,7 @@ impl AgentCheckFlights {
         };
         let running = Arc::clone(&self.running);
         Some(tokio::spawn(async move {
-            let Ok(Ok(_place)) = tokio::time::timeout_at(deadline, running.acquire_owned()).await
+            let Ok(Ok(place)) = tokio::time::timeout_at(deadline, running.acquire_owned()).await
             else {
                 let waiters = landing.land();
                 if probe_deadline_warning_due("host agents check: no place".into()) {
@@ -2662,12 +2683,26 @@ impl AgentCheckFlights {
                 return;
             };
             let agents = check(targets, deadline).await;
+            // The check is done: the place goes to the next one now, not
+            // after the replies, each of which may wait for its connection.
+            drop(place);
             let waiters = landing.land();
-            futures_util::future::join_all(waiters.into_iter().map(|(request_id, out_tx)| {
+            let found = agents
+                .iter()
+                .map(|agent| (agent.agent_id.as_str(), agent))
+                .collect::<HashMap<_, _>>();
+            futures_util::future::join_all(waiters.into_iter().map(|waiter| {
                 let frame = Outbound::HostAgentsCheckResult {
-                    request_id,
-                    agents: agents.clone(),
+                    request_id: waiter.request_id,
+                    agents: waiter
+                        .order
+                        .iter()
+                        .filter_map(|agent_id| {
+                            found.get(agent_id.as_str()).map(|&agent| agent.clone())
+                        })
+                        .collect(),
                 };
+                let out_tx = waiter.out_tx;
                 async move {
                     // Bounded: a connection whose writer is stuck must not
                     // keep this task, or the other waiters, for ever.
@@ -4865,14 +4900,15 @@ mod tests {
         }
     }
 
-    /// Requests for targets already being checked join that check: one set
-    /// of probes, every request answered by its own id on its own
-    /// connection. A check that never lands frees its targets.
+    /// Requests for targets already being checked join that check, whatever
+    /// order they name them in: one set of probes, every request answered by
+    /// its own id on its own connection, in the order it asked. A check that
+    /// never lands frees its targets.
     #[tokio::test]
     async fn overlapping_requests_for_the_same_agents_share_one_check() {
         let flights = AgentCheckFlights::new(MAX_CONCURRENT_AGENT_CHECKS);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        let target = test_agent("shared");
+        let (one, two) = (test_agent("one"), test_agent("two"));
         let (started_tx, mut started) = mpsc::unbounded_channel();
         let (release, released) = oneshot::channel::<()>();
         let (first_tx, mut first_rx) = mpsc::channel(4);
@@ -4880,7 +4916,7 @@ mod tests {
         let flight = flights
             .request(
                 "first".into(),
-                vec![target.clone()],
+                vec![one.clone(), two.clone()],
                 first_tx,
                 deadline,
                 gated_check(started_tx.clone(), released),
@@ -4891,22 +4927,35 @@ mod tests {
             flights
                 .request(
                     "second".into(),
-                    vec![target.clone()],
+                    vec![two.clone(), one.clone()],
                     second_tx,
                     deadline,
                     gated_check(started_tx.clone(), unused),
                 )
                 .is_none(),
-            "a request for targets being checked started a check of its own"
+            "a request for agents being checked, named in another order, started a check of its own"
         );
         release.send(()).unwrap();
         flight.await.unwrap();
-        for (rx, id) in [(&mut first_rx, "first"), (&mut second_rx, "second")] {
+        for (rx, id, order) in [
+            (&mut first_rx, "first", ["one", "two"]),
+            (&mut second_rx, "second", ["two", "one"]),
+        ] {
             let reply = check_result(rx.try_recv().expect("every waiting request is answered"));
             assert_eq!(reply["request_id"], id);
+            let answered = reply["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|agent| agent["agent_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                answered, order,
+                "a reply out of the order its request asked"
+            );
             assert_eq!(reply["agents"][0]["version"], "1.0");
         }
-        assert_eq!(started.try_recv().unwrap(), "shared");
+        assert_eq!(started.try_recv().unwrap(), "one");
         assert!(started.try_recv().is_err(), "one set of probes, not two");
 
         // Landed: the next request is a check of its own. One that never
@@ -4916,7 +4965,7 @@ mod tests {
         let aborted = flights
             .request(
                 "third".into(),
-                vec![target.clone()],
+                vec![one.clone(), two.clone()],
                 third_tx,
                 deadline,
                 gated_check(started_tx.clone(), held),
@@ -4929,13 +4978,57 @@ mod tests {
         let fourth = flights
             .request(
                 "fourth".into(),
-                vec![target],
+                vec![one, two],
                 fourth_tx,
                 deadline,
                 gated_check(started_tx, held),
             )
             .expect("a check that never landed freed its targets");
         fourth.abort();
+    }
+
+    /// A finished check gives its place to the next at once, not after its
+    /// replies: one waiting for room on a connection that is not reading
+    /// can take `AGENT_CHECK_REPLY_SEND_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_check_frees_its_place_before_it_replies() {
+        let flights = AgentCheckFlights::new(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        // A connection with no room: the first check's reply waits on it.
+        let (stuck_tx, _stuck_rx) = mpsc::channel(1);
+        stuck_tx.try_send(WsOutbound::json("{}".into())).unwrap();
+        let (release, released) = oneshot::channel::<()>();
+        release.send(()).unwrap();
+        let first = flights
+            .request(
+                "stuck".into(),
+                vec![test_agent("first")],
+                stuck_tx,
+                deadline,
+                gated_check(started_tx.clone(), released),
+            )
+            .unwrap();
+        assert_eq!(started.recv().await.unwrap(), "first");
+        let began = tokio::time::Instant::now();
+        let (next_tx, _next_rx) = mpsc::channel(4);
+        let (_hold, held) = oneshot::channel::<()>();
+        let next = flights
+            .request(
+                "next".into(),
+                vec![test_agent("second")],
+                next_tx,
+                deadline,
+                gated_check(started_tx, held),
+            )
+            .unwrap();
+        assert_eq!(started.recv().await.unwrap(), "second");
+        assert!(
+            began.elapsed() < AGENT_CHECK_REPLY_SEND_TIMEOUT,
+            "the next check waited for the first one's reply"
+        );
+        first.await.unwrap();
+        next.abort();
     }
 
     /// Checks of different agents run at most `running_at_once` at a time;

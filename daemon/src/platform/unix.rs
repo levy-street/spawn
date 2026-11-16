@@ -350,7 +350,6 @@ pub fn open_url(url: &str) -> io::Result<()> {
 /// leads — is not handed to any other process.
 pub fn exited_unreaped(pid: u32) -> io::Result<Option<std::process::ExitStatus>> {
     use nix::libc;
-    use std::os::unix::process::ExitStatusExt;
 
     // SAFETY: an all-zero `siginfo_t` is a valid value of it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -369,14 +368,28 @@ pub fn exited_unreaped(pid: u32) -> io::Result<Option<std::process::ExitStatus>>
     if from == 0 {
         return Ok(None);
     }
-    // The status `wait` would report: the exit code in the second byte, or
-    // the signal, with the core flag when it dumped one.
+    Ok(exit_from_child_code(code, status))
+}
+
+/// The exit `waitid` reported as `si_code` and `si_status`, as the status
+/// `wait` would give: the exit code in the second byte, or the signal, with
+/// the core flag when it dumped one. Any other code — stopped, continued,
+/// trapped, which macOS has reported even when only exits were asked for —
+/// is a child that has not exited.
+fn exit_from_child_code(
+    code: nix::libc::c_int,
+    status: nix::libc::c_int,
+) -> Option<std::process::ExitStatus> {
+    use nix::libc;
+    use std::os::unix::process::ExitStatusExt;
+
     let raw = match code {
         libc::CLD_EXITED => (status & 0xff) << 8,
+        libc::CLD_KILLED => status,
         libc::CLD_DUMPED => status | 0x80,
-        _ => status,
+        _ => return None,
     };
-    Ok(Some(std::process::ExitStatus::from_raw(raw)))
+    Some(std::process::ExitStatus::from_raw(raw))
 }
 
 pub fn process_alive(pid: u32) -> bool {
@@ -491,4 +504,31 @@ pub fn raise_open_file_limit(target: u64) -> io::Result<super::OpenFileLimit> {
         maximum: limit.maximum,
         refused,
     })
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::exit_from_child_code;
+    use nix::libc;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn only_an_exit_or_a_death_by_signal_is_an_exit() {
+        let exited = exit_from_child_code(libc::CLD_EXITED, 3).unwrap();
+        assert_eq!(exited.code(), Some(3));
+        let clean = exit_from_child_code(libc::CLD_EXITED, 0).unwrap();
+        assert!(clean.success());
+        let killed = exit_from_child_code(libc::CLD_KILLED, libc::SIGKILL).unwrap();
+        assert_eq!(killed.signal(), Some(libc::SIGKILL));
+        assert!(!killed.core_dumped());
+        let dumped = exit_from_child_code(libc::CLD_DUMPED, libc::SIGSEGV).unwrap();
+        assert_eq!(dumped.signal(), Some(libc::SIGSEGV));
+        assert!(dumped.core_dumped());
+        for not_yet in [libc::CLD_STOPPED, libc::CLD_CONTINUED, libc::CLD_TRAPPED, 0] {
+            assert!(
+                exit_from_child_code(not_yet, libc::SIGSTOP).is_none(),
+                "si_code {not_yet} read as an exit"
+            );
+        }
+    }
 }
