@@ -64,6 +64,9 @@ src/
                  Scheduler/Run watchdog and control pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
+  support_log.rs the support log: a second, bounded, sanitised record the
+                 daemon writes for itself — see "The support log"; its tests
+                 live in support_log_tests.rs
   state.rs       atomic local daemon heartbeat contract (`state.json`)
   status.rs      human/JSON status across local account instances, each
                  described by the daemon running for it, never by the command
@@ -152,7 +155,8 @@ Windows storage is local, not roaming:
 - config and the default single instance: `%LOCALAPPDATA%\spawn`
 - account instances: `%LOCALAPPDATA%\spawn\<account_id>`
 - service state/runtime files: `%LOCALAPPDATA%\spawn\state\<instance>`
-- daemon/worker logs: `%LOCALAPPDATA%\spawn\logs\<instance>`
+- daemon/worker logs: `%LOCALAPPDATA%\spawn\logs\<instance>` (the support log in its
+  owner-only `support\` folder)
 - installed command shims/binaries: `%LOCALAPPDATA%\spawn\bin`
 - user-home expansion: `%USERPROFILE%`
 - upload and preview staging: unique owner-DACL-protected children below
@@ -570,6 +574,65 @@ connection's, since peers keep opening and closing through a server outage
 leak — of slots, or of peers that never finish closing — shows while it is
 one peer. Never write the state file from the RTC path: that write is an
 fsync, and the offer path waits on the locks it would run under.
+
+## The support log
+
+`support_log.rs` writes a second log, separate from stderr, for the day
+someone has to work out what went wrong on a host. Nothing reads it yet:
+collecting it, with the owner's device-signed consent checked by the host,
+comes in later pull requests. Until then it never leaves the machine;
+`spawnd status` names its file.
+
+- **Where, and how much.** `support/support.jsonl` and `support.jsonl.1` under
+  the instance log directory (`~/.local/state/spawn/logs/<instance>/support/`
+  on Linux and macOS, `%LOCALAPPDATA%\spawn\logs\<instance>\support\` on
+  Windows), owner-only, rotated at 4 MiB: **at most 8 MiB per instance, for
+  ever.** `reset` and `exorcise` remove the folder
+  (`service::purge_local_instance_data`).
+- **Who writes it.** `spawnd run` and `spawnd login` install the layer
+  (`main.rs`); other commands do not, and workers write nothing to it.
+  `main.rs` composes a registry in which `RUST_LOG` and `-v` filter only the
+  stderr `fmt` layer — whose output is unchanged, byte for byte — and the
+  support layer carries its own fixed filter: `spawnd` at INFO (DEBUG in the
+  diagnostics variant), every other crate at WARN, events only, never a span.
+- **What goes in.** One JSON object per line, `{t, level, target, at, msg,
+  fields}`. A field whose name or one `_`/`.` part of it is in
+  `WITHHELD_FIELDS` (`sdp`, `token`, `content`, `input`, `output`, `text`,
+  `env`, `args`, `stdin`, `skill`, …) is written as `<withheld>` without being
+  formatted; numbers and booleans pass; byte slices are withheld. Every
+  other string, the message included, is sanitised: ANSI and control
+  characters stripped; bearer tokens, JWTs, long mixed-case base64,
+  secret-looking `KEY=VALUE`, URL userinfo, query strings and fragments, and
+  a join error's panic message redacted; 512 characters per value, 2 KiB per
+  event. A panic hook records the location and thread name only, never the
+  payload.
+- **The rule for every log statement.** Anything that could carry terminal
+  content, file content, a command line, an environment value or a
+  credential must use a withheld field name or not be logged. The sanitiser
+  is a backstop for text nobody expected, not a licence: it cannot recognise
+  a line of someone's terminal. The modules that handle contents
+  (`host_files.rs`, `host_control.rs`, `host_preview.rs`, `upload.rs`,
+  `host_transcripts.rs`, `activity.rs`, `sessions.rs`,
+  `sessiond/emulator.rs`, `sessiond/scrollback.rs`) make no tracing calls at
+  all.
+- **Never on the hot path's clock.** A dedicated writer thread owns the files,
+  fed by a bounded channel (1,024 events); a full channel drops the event and
+  counts it, and the writer records how many it lost. No task, and not the
+  dispatch loop, waits on that disk. Appends and rotation hold
+  `support.lock`, so two processes of one instance overlapping during a
+  self-update write whole lines and rotate once.
+- **The reader** (`read_window`, for the collection to come) opens exactly
+  the two file names through the verified folder, never follows a link, and
+  never lists a folder — so a diagnostics replay dump or a scrollback segment
+  can never be read through it.
+
+The canary tests type `CANARY-<uuid>` into a real worker, replay it (with the
+diagnostics replay dump on in that variant), break a Codex `config.toml` with
+it, and panic with it, and require it absent in plain, hex and base64 from
+the log and the reader's output. `scripts/check-support-log.sh` (with
+`--self-test`, run by `scripts/test-all.sh`) pins the rest literally: the
+two file names, no folder listing, no replay-dump or scrollback reference,
+no environment-driven filter, and no tracing in the content modules.
 
 ## A skilled window's home
 

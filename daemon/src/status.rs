@@ -53,6 +53,10 @@ struct InstanceStatus {
     launch: String,
     /// Whether the running daemon's spawn-worker matches it.
     pair: String,
+    /// The daemon's own support log (support_log.rs), which stays on this
+    /// machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    support_log: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +212,9 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
     });
     let launch = launch_text(build.live());
     let pair = pair_text(build.live());
+    let support_log = crate::support_log::current_path(dir)
+        .ok()
+        .map(|path| path.display().to_string());
     Ok(InstanceStatus {
         account: dir
             .file_name()
@@ -229,6 +236,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
         release,
         launch,
         pair,
+        support_log,
     })
 }
 
@@ -429,6 +437,9 @@ fn format_plain(output: &StatusOutput, verbose: u8) -> String {
         };
         let _ = writeln!(text, "  host key     {shown}");
         let _ = writeln!(text, "  browser pins {}", instance.browser_pins);
+        if let Some(path) = &instance.support_log {
+            let _ = writeln!(text, "  support log  {path} · kept on this machine");
+        }
     }
     let others = output.instances.len().saturating_sub(1);
     if others == 0 {
@@ -564,6 +575,9 @@ mod tests {
                 }),
                 launch: "release store".into(),
                 pair: "matches".into(),
+                support_log: Some(
+                    "/Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl".into(),
+                ),
             }],
         };
         let plain = format_plain(&output, 0);
@@ -580,6 +594,9 @@ mod tests {
             "  release      0.4.2+gabc.diagnostics-1234abcd (diagnostics) · /Users/x/.local/lib/spawn/releases/0.4.2+gabc.diagnostics-1234abcd\n"
         ));
         assert!(plain.contains("  pair         matches\n"));
+        assert!(plain.contains(
+            "  support log  /Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl · kept on this machine\n"
+        ));
         assert!(plain.contains("Other instances on this machine: none\n"));
         assert!(plain.ends_with(&format!(
             "This command: spawnd {}\n",
@@ -600,6 +617,10 @@ mod tests {
         assert_eq!(json["instances"][0]["running"]["worker_mismatch"], false);
         assert_eq!(json["instances"][0]["release"]["variant"], "diagnostics");
         assert_eq!(json["instances"][0]["launch"], "release store");
+        assert_eq!(
+            json["instances"][0]["support_log"],
+            "/Users/x/.local/state/spawn/logs/3f9ac3e1/support/support.jsonl"
+        );
     }
 
     #[test]

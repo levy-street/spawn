@@ -491,7 +491,7 @@ pub(crate) fn utc_fields_to_unix_seconds(
 
 // UTC civil-date conversion adapted from Howard Hinnant's public-domain
 // civil_from_days algorithm; avoids adding a clock/date dependency to spawnd.
-fn unix_seconds_rfc3339(seconds: u64) -> String {
+pub(crate) fn unix_seconds_rfc3339(seconds: u64) -> String {
     let days = (seconds / 86_400) as i64;
     let day_seconds = seconds % 86_400;
     let z = days + 719_468;

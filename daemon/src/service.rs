@@ -131,9 +131,13 @@ pub fn instance_log_dir(config_dir: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Purge only this instance's non-roaming Windows state and logs. Ordinary
-/// disconnect never calls this; exorcise/reset do so after manager/workers.
+/// Purge only this instance's non-roaming Windows state and logs, and its
+/// support log on every platform. Ordinary disconnect never calls this;
+/// exorcise/reset do so after manager/workers.
 pub fn purge_local_instance_data(config_dir: &Path) -> Result<()> {
+    // On Windows the whole log directory goes below as well; elsewhere the
+    // support folder is the one thing spawnd writes under it.
+    crate::support_log::remove(config_dir)?;
     #[cfg(windows)]
     {
         for path in [
@@ -147,8 +151,6 @@ pub fn purge_local_instance_data(config_dir: &Path) -> Result<()> {
             }
         }
     }
-    #[cfg(not(windows))]
-    let _ = config_dir;
     Ok(())
 }
 
