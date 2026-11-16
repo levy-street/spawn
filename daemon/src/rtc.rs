@@ -140,6 +140,16 @@ const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// five seconds, so the cost of a miss is bounded either way, and the peer
 /// connection has [`RTC_CONNECT_TIMEOUT`] to spare.
 const MDNS_CANDIDATE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a viewer's replay waits on the session's worker: for the worker's
+/// answer (every step of the `viewer_replay` ladder included), then for the
+/// live stream to reach the answer's watermark. A worker that is alive
+/// answers in milliseconds. A `history` or `snapshot` request waits holding
+/// its session's control transaction, which a restart's removal of the
+/// session waits for, so a worker that has stopped answering costs a request
+/// this long and no longer; the viewer is told `request_timeout`, as it
+/// always was at this bound. The attach barrier waits this long for each of
+/// the same two things.
+const WORKER_REPLAY_DEADLINE: Duration = Duration::from_secs(10);
 const DATA_CHANNEL_MESSAGE_BYTES: usize = 16 * 1024;
 const DATA_CHANNEL_BUFFER_LOW: usize = 64 * 1024;
 const DATA_CHANNEL_BUFFER_HIGH: usize = 512 * 1024;
@@ -1292,13 +1302,16 @@ impl RtcSessions {
         answer_signer: Option<RtcAnswerSigner>,
     ) -> Result<()> {
         let remote_ufrag = ice_ufrag(&sdp).context("offer SDP has no ICE ufrag")?;
-        if let Some(existing) = self
+        // Its own statement: a guard made in an `if let` scrutinee lives to
+        // the end of the block (edition 2021), and this one would hold the
+        // peer map across a renegotiation and the answer's send.
+        let existing = self
             .peers
             .lock()
             .await
             .get(&binding.signaling.signal_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(existing) = existing {
             let _restart = existing.restart_lock.lock().await;
             let ufrags = existing.remote_ufrags.lock().await;
             if !restart_offer_is_acceptable(
@@ -2642,18 +2655,25 @@ impl RtcSessions {
             }
             self.remove_if_same(&signal_id, &close).await;
         }
-        // An old exit task can race a replacement using the same UUID. Keep
-        // the peer map locked while deciding and clearing backend-wide hub
-        // state so a new generation either prevents cleanup or registers only
-        // after cleanup has completed.
-        let peers = self.peers.lock().await;
-        if !peers
-            .values()
-            .any(|peer| peer.session.session_id() == session_id)
-        {
-            self.controls.remove_session(session_id).await;
+        // The peers are settled; what is left is session-wide, and nothing
+        // here needs this generation's closer any more. Release it before the
+        // wait below, so no close of the session's peers — trust
+        // invalidation's, which holds the admission lock — waits that long.
+        drop(_closing);
+        // An old exit task can race a replacement using the same UUID: a new
+        // generation either prevents the cleanup of the session's hub state
+        // or registers only after it. Decided twice: here, so a session with
+        // a peer never waits for its transaction at all, and again by
+        // `remove_session_unless` once it holds the transaction, which every
+        // registration takes. Never while holding the peer map: the
+        // transaction can be held by a viewer request waiting on the
+        // session's worker (up to `WORKER_REPLAY_DEADLINE`), and every offer
+        // and attach on the daemon takes the peer map, under admission.
+        if !self.session_has_peers(session_id).await {
+            self.controls
+                .remove_session_unless(session_id, self.session_has_peers(session_id))
+                .await;
         }
-        drop(peers);
         self.uploads
             .remove_generation_until(session, upload_deadline)
             .await;
@@ -2661,6 +2681,16 @@ impl RtcSessions {
             frames: announcements.into(),
             sessions: self.clone(),
         }
+    }
+
+    /// Whether any peer of any generation of `session_id` is in the peer
+    /// map. The lock is held for the look and nothing else.
+    async fn session_has_peers(&self, session_id: Uuid) -> bool {
+        self.peers
+            .lock()
+            .await
+            .values()
+            .any(|peer| peer.session.session_id() == session_id)
     }
 
     /// Send statuses a caller held back until the moment was right.
@@ -3608,7 +3638,7 @@ fn session_data_channel_handler(
                         return;
                     };
                     let Ok(Some(Ok(replay))) =
-                        tokio::time::timeout(Duration::from_secs(10), replay_rx).await
+                        tokio::time::timeout(WORKER_REPLAY_DEADLINE, replay_rx).await
                     else {
                         let _ = sessions
                             .send_session_peer_status(
@@ -3657,7 +3687,7 @@ fn session_data_channel_handler(
                         return;
                     }
                     if tokio::time::timeout(
-                        Duration::from_secs(10),
+                        WORKER_REPLAY_DEADLINE,
                         control.wait_source_offset(watermark),
                     )
                     .await
@@ -4767,7 +4797,9 @@ async fn send_session_replay(
             "spawn.pty did not become ready for this control session",
         ));
     }
-    let capture = capture_session_replay(session, spec.lines, spec.plain, registry, &control);
+    // Bounded by `WORKER_REPLAY_DEADLINE` inside: this request holds its
+    // session's control transaction for as long as the capture waits.
+    let capture = capture_session_replay(session, spec.viewer_id, spec.lines, registry, &control);
     tokio::pin!(capture);
     let replay = tokio::select! {
         result = &mut capture => result?,
@@ -4776,13 +4808,6 @@ async fn send_session_replay(
                 Some(spec.request_id),
                 "request_cancelled",
                 "control channel closed while replay was in progress",
-            ));
-        }
-        _ = tokio::time::sleep(Duration::from_secs(10)) => {
-            return Err(ProtocolError::new(
-                Some(spec.request_id),
-                "request_timeout",
-                "replay did not complete within 10 seconds",
             ));
         }
     };
@@ -4844,10 +4869,12 @@ async fn send_session_replay(
     Ok(())
 }
 
+/// Capture a viewer's replay from the session's worker, waiting on it for at
+/// most [`WORKER_REPLAY_DEADLINE`] in all.
 async fn capture_session_replay(
     session: SessionBinding,
+    viewer_id: &str,
     lines: u16,
-    _plain: bool,
     registry: &SessionRegistry,
     control: &crate::pty::ForwarderControl,
 ) -> Result<crate::pty::WorkerReplay, ProtocolError> {
@@ -4862,29 +4889,84 @@ async fn capture_session_replay(
     registry.with_bound_handle(session, |handle| {
         replay_rx = handle.viewer_replay(max_bytes);
     });
-    match replay_rx {
-        Some(receiver) => match receiver.await {
-            Some(Ok(replay)) => {
-                control.wait_source_offset(replay.watermark()).await;
-                Ok(replay)
-            }
-            Some(Err(error)) => Err(ProtocolError::new(
-                None,
-                "replay_failed",
-                &format!("worker replay failed: {error:#}"),
-            )),
-            None => Err(ProtocolError::new(
-                None,
-                "replay_unavailable",
-                "worker replay channel closed",
-            )),
-        },
-        None => Err(ProtocolError::new(
+    let Some(receiver) = replay_rx else {
+        return Err(ProtocolError::new(
             None,
             "replay_unavailable",
             "worker replay is unavailable",
-        )),
+        ));
+    };
+    let deadline = tokio::time::Instant::now() + WORKER_REPLAY_DEADLINE;
+    let replay = match tokio::time::timeout_at(deadline, receiver).await {
+        Ok(Some(Ok(replay))) => replay,
+        Ok(Some(Err(error))) => {
+            return Err(ProtocolError::new(
+                None,
+                "replay_failed",
+                &format!("worker replay failed: {error:#}"),
+            ))
+        }
+        Ok(None) => {
+            return Err(ProtocolError::new(
+                None,
+                "replay_unavailable",
+                "worker replay channel closed",
+            ))
+        }
+        Err(_elapsed) => {
+            return Err(worker_replay_timed_out(
+                session,
+                viewer_id,
+                control,
+                "worker_reply",
+            ))
+        }
+    };
+    if tokio::time::timeout_at(deadline, control.wait_source_offset(replay.watermark()))
+        .await
+        .is_err()
+    {
+        return Err(worker_replay_timed_out(
+            session,
+            viewer_id,
+            control,
+            "live_stream",
+        ));
     }
+    Ok(replay)
+}
+
+/// A viewer's replay that ran out of [`WORKER_REPLAY_DEADLINE`] waiting on
+/// `wait`: the worker's answer (`worker_reply`), or the live stream reaching
+/// its watermark (`live_stream`). Logged at warning level, at most once per
+/// worker connection per [`crate::pty::WORKER_STALL_REPORT_EVERY`]: a hung
+/// worker meets every viewer that asks, and one line names it. The viewer is
+/// told what it was told at this bound before: `request_timeout`.
+fn worker_replay_timed_out(
+    session: SessionBinding,
+    viewer_id: &str,
+    control: &crate::pty::ForwarderControl,
+    wait: &'static str,
+) -> ProtocolError {
+    if let Some(held_back) = control.worker_stall_report() {
+        tracing::warn!(
+            session_id = %session.session_id(),
+            viewer_id,
+            wait,
+            deadline_secs = WORKER_REPLAY_DEADLINE.as_secs(),
+            held_back,
+            "a viewer's replay waited its deadline on the session's worker and gave up; \
+             the session's control transaction is free again"
+        );
+    }
+    ProtocolError::new(
+        None,
+        "request_timeout",
+        &format!(
+            "replay did not complete within {} seconds",
+            WORKER_REPLAY_DEADLINE.as_secs()
+        ),
+    )
 }
 
 /// Apply a viewer's size to the session's PTY; true when it changed the
@@ -10511,6 +10593,225 @@ mod tests {
                 .await
         );
         sessions.close_all().await;
+    }
+
+    /// A session peer standing in for one that arrived while a close was
+    /// waiting: never connected, never closed by anything but the test.
+    async fn resident_test_peer(
+        sessions: &RtcSessions,
+        session: SessionBinding,
+        control: crate::pty::ForwarderControl,
+    ) -> RtcPeer {
+        RtcPeer {
+            pair_channels: None,
+            pc: Arc::new(
+                APIBuilder::new()
+                    .build()
+                    .new_peer_connection(RTCConfiguration::default())
+                    .await
+                    .unwrap(),
+            ),
+            session,
+            generation: "arrived".to_string(),
+            active: Arc::new(AtomicBool::new(true)),
+            control,
+            channels: Arc::new(RequiredSessionChannels::default()),
+            close: Arc::new(PeerCloseCoordinator::default()),
+            offer_key: None,
+            remote_ufrags: Arc::new(Mutex::new(HashSet::new())),
+            restart_lock: Arc::new(Mutex::new(())),
+            admission: sessions.peer_admission.try_acquire().unwrap(),
+            fence: Arc::new(tokio::sync::RwLock::new(())),
+        }
+    }
+
+    /// `close_for_session` decides whether the session's control state goes
+    /// once before it waits for the session's control transaction and again
+    /// once it holds it, and holds the peer map at neither wait. A peer of
+    /// the session that arrives in between keeps the state its viewers
+    /// register into — a new generation either prevents the cleanup or
+    /// registers after it, as when the map was held across the wait.
+    #[tokio::test]
+    async fn a_peer_that_arrives_while_a_close_waits_keeps_the_session_state() {
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, _commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
+        let sessions = RtcSessions::new();
+        let viewer = format!("pair/{}/view", "ab".repeat(32));
+        let (display, _display_rx) = tokio::sync::watch::channel(None);
+        sessions
+            .controls
+            .register(session_id, viewer.clone(), display)
+            .await;
+        // A viewer request in flight on a worker that stopped answering.
+        let stuck = sessions
+            .controls
+            .lock_transaction(session_id, "request history viewer=stuck")
+            .await;
+
+        let closing = tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                sessions
+                    .close_for_session(session_id, session.generation(), "session ended")
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sessions
+                .controls
+                .until_waiting(session_id, "remove_session"),
+        )
+        .await
+        .expect("the close found no peer and is waiting for the transaction");
+        // Not held while the close waits: a peer can be admitted.
+        let arrived = resident_test_peer(&sessions, session, control).await;
+        tokio::time::timeout(Duration::from_secs(1), sessions.peers.lock())
+            .await
+            .expect("a close waiting for a session's transaction holds the peer map")
+            .insert("arrived".to_string(), arrived);
+
+        drop(stuck);
+        let announcements = tokio::time::timeout(Duration::from_secs(10), closing)
+            .await
+            .expect("the close finishes once the transaction is free")
+            .unwrap();
+        assert_eq!(announcements.len(), 0);
+        assert!(
+            sessions.controls.contains_viewer(session_id, &viewer).await,
+            "the session's control state went from under a peer that arrived while the close waited"
+        );
+        let arrived = sessions.peers.lock().await.remove("arrived").unwrap();
+        let _ = arrived.pc.close().await;
+    }
+
+    /// The viewer side of a stalled worker: a `history` request on a worker
+    /// that never finishes its replay — `worker_reply`: it took the request
+    /// and never answered; `live_stream`: it answered, and its output never
+    /// reached the answer's watermark. The request holds the session's
+    /// control transaction while it waits, which is what a restart's
+    /// removal of the session queues behind; it gives up at
+    /// `WORKER_REPLAY_DEADLINE`, the transaction free at that moment, and
+    /// the viewer is told `request_timeout`: what it was always told at this
+    /// bound (web opens the pane on the live stream from there).
+    async fn stalled_replay_request(worker_answers: bool) {
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, mut commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
+        let worker_control = control.clone();
+        let worker = tokio::spawn(async move {
+            let mut unanswered = Vec::new();
+            while let Some(command) = commands.recv().await {
+                if let crate::pty::WorkerCmd::Replay { resp, .. } = command {
+                    if worker_answers {
+                        let ahead = worker_control.source_offset() + 1;
+                        let _ = resp.send(Ok(crate::pty::WorkerReplay::new(ahead, Vec::new())));
+                    } else {
+                        unanswered.push(resp);
+                    }
+                }
+            }
+        });
+        let viewer_id = "stalled-viewer";
+        let _direct = control.add_direct_sink(viewer_id.to_string()).await;
+        let controls = SessionControlHub::default();
+        let (sender, mut outbound) = mpsc::channel(session_ctl::OUTBOUND_QUEUE_DEPTH);
+        let channels = Arc::new(RequiredSessionChannels::default());
+        assert!(channels.register(SessionChannel::Pty).await);
+        assert!(channels.register(SessionChannel::Control).await);
+        channels.mark_open(SessionChannel::Pty).await;
+        channels.mark_open(SessionChannel::Control).await;
+        let effect = channels.permit().await.expect("ready effect permit");
+        let uploads = UploadHub::default();
+        let repaint_asked = AtomicBool::new(false);
+        let request_id = Uuid::new_v4();
+        let request = ControlRequest::decode(&format!(
+            r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"history","lines":400,"plain":false}}"#
+        ))
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let request = handle_control_request(
+            ControlRequestContext {
+                session,
+                viewer_id,
+                registry: &registry,
+                controls: &controls,
+                sender: &sender,
+                effect: &effect,
+                uploads: &uploads,
+                upload_capability: Uuid::new_v4(),
+                repaint_asked: &repaint_asked,
+            },
+            request,
+        );
+        tokio::pin!(request);
+        tokio::select! {
+            () = &mut request => panic!("the replay finished without the worker"),
+            () = tokio::time::sleep(WORKER_REPLAY_DEADLINE - Duration::from_millis(1)) => {}
+        }
+        assert_eq!(
+            controls.current_holder(session_id).as_deref(),
+            Some("request history viewer=stalled-viewer"),
+            "the waiting request holds the session's transaction"
+        );
+        request.await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= WORKER_REPLAY_DEADLINE
+                && waited < WORKER_REPLAY_DEADLINE + Duration::from_secs(1),
+            "the request gave up after {waited:?}"
+        );
+        assert_eq!(controls.current_holder(session_id), None);
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            controls.remove_session(session_id),
+        )
+        .await
+        .expect("the session's removal waits for nothing once the request gave up");
+
+        let reply = outbound.try_recv().expect("the viewer was answered");
+        let ControlOutbound::Text(text) = &reply else {
+            panic!("the answer is a text response");
+        };
+        let reply: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["request_id"], request_id.to_string());
+        assert_eq!(reply["error"]["code"], "request_timeout");
+        assert!(outbound.try_recv().is_err(), "one answer, nothing after it");
+        worker.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_the_worker_never_answers_gives_up_at_its_deadline() {
+        stalled_replay_request(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_the_live_stream_never_reaches_gives_up_at_its_deadline() {
+        stalled_replay_request(true).await;
+    }
+
+    /// One warning per worker connection per interval, however many
+    /// viewers' waits on it run out, and the next one counts the rest.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_worker_is_reported_once_per_interval() {
+        let control = crate::pty::ForwarderControl::new();
+        assert_eq!(control.worker_stall_report(), Some(0));
+        assert_eq!(control.worker_stall_report(), None);
+        tokio::time::advance(crate::pty::WORKER_STALL_REPORT_EVERY - Duration::from_millis(1))
+            .await;
+        assert_eq!(control.worker_stall_report(), None);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(control.worker_stall_report(), Some(2));
+        assert_eq!(
+            crate::pty::ForwarderControl::new().worker_stall_report(),
+            Some(0),
+            "another worker connection reports its own"
+        );
     }
 
     #[test]

@@ -467,7 +467,20 @@ price, bounded and without a cycle: an attach holds its session's
 transition while it queues on admission, and trust invalidation holds
 admission for up to the teardown deadline (`invalidate_trust_and_close_all`),
 so that session's restart or exit can wait that long behind them. Nothing
-that holds admission waits on a transition. A
+that holds admission waits on a transition. Nor does anything that holds
+the peer map or admission wait on a session's control transaction
+(`session_ctl.rs`): a `history` or `snapshot` request holds it while it
+waits on the session's worker, up to `WORKER_REPLAY_DEADLINE`, and every
+offer and attach takes the peer map under admission. So
+`close_for_session` decides under the map whether the session's control
+state goes, lets the map go, and decides again holding the transaction
+(`remove_session_unless`): transaction, then peer map, never the reverse.
+It lets its session closer go first, since trust invalidation takes
+closers under admission. A host-control channel refused at admission is
+closed once the lock is released — the close is an SCTP reset the device
+has to answer. A lock guard made in an `if let` or `match` scrutinee lives
+to the end of the block (edition 2021), so a map lookup that leads to an
+await gets its own `let`. A
 device re-attaching a view of its superseded connection (the mobile client
 keeps its attachment ids across a reconnect) finds nothing stale: the old
 attachment left the peer map when its pair was superseded, and one another

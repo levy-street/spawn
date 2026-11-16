@@ -634,6 +634,20 @@ and pinned by a test, because running workers keep the binary they started
 with. Authentication, sequence, and framing failures are returned unchanged:
 tampered history still fails the replay closed.
 
+Every wait a viewer replay makes on the worker — each step of that ladder,
+then the live stream reaching the replay's watermark — runs under one
+deadline, `WORKER_REPLAY_DEADLINE` (10 s, `rtc.rs`). A worker that is alive
+answers in milliseconds; one that has stopped answering costs a viewer that
+long and no longer. A `history` or `snapshot` request waits holding its
+session's control transaction, which the session's other requests and a
+restart's removal of its control state queue behind, so the deadline is what
+bounds them. At the deadline the request answers `request_timeout`, as it
+always did at this bound (web then opens the pane on the live stream), and
+spawnd logs at warning level which wait ran out — `worker_reply` or
+`live_stream` — once per worker connection per minute, counting the ones it
+held back. The attach barrier waits the same deadline for each of the two
+and fails the attach, naming which, at warning level too.
+
 An empty replay carries no screen either (`WorkerReplay::has_screen`), so a
 program that is not printing — a full-screen one waiting for a key, or Claude
 Code at its prompt — would leave that viewer's pane blank until something
